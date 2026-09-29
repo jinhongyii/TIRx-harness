@@ -124,3 +124,11 @@ development/contribute-kernel
 development/report-and-fix-bugs
 development/build-the-docs
 ```
+
+```{toctree}
+:hidden:
+:maxdepth: 2
+:caption: Reference
+
+api/index
+```

@@ -4,6 +4,8 @@ accessible-pygments==0.0.5
     # via furo
 alabaster==1.0.0
     # via sphinx
+astroid==4.3.2
+    # via sphinx-autoapi
 babel==2.18.0
     # via sphinx
 beautifulsoup4==4.15.0
@@ -26,6 +28,7 @@ jinja2==3.1.6
     # via
     #   myst-parser
     #   sphinx
+    #   sphinx-autoapi
 markdown-it-py==4.2.0
     # via
     #   mdit-py-plugins
@@ -46,7 +49,9 @@ pygments==2.21.0
     #   furo
     #   sphinx
 pyyaml==6.0.3
-    # via myst-parser
+    # via
+    #   myst-parser
+    #   sphinx-autoapi
 requests==2.34.2
     # via sphinx
 roman-numerals==4.1.0
@@ -60,9 +65,12 @@ sphinx==9.1.0
     #   -r docs/requirements.in
     #   furo
     #   myst-parser
+    #   sphinx-autoapi
     #   sphinx-basic-ng
     #   sphinx-copybutton
     #   sphinx-design
+sphinx-autoapi==3.8.1
+    # via -r docs/requirements.in
 sphinx-basic-ng==1.0.0b2
     # via furo
 sphinx-copybutton==0.5.2

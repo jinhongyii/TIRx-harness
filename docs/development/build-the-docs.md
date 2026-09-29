@@ -53,19 +53,20 @@ container must be reachable from the SSH host for forwarding to work.
 
 ## Maintain the documentation
 
-- `index.md` owns the overview and the Get Started, Components, and Development
+- `index.md` owns the overview and the Get Started, Components, Development, and Reference
   navigation groups.
 - `installation.md` owns prerequisites, package installation, and skill installation.
 - `quick-start.md` introduces using the skills with an agent on a concrete kernel.
 - `optimization-runs.md` covers optimization runs under Get Started. Its diagram is
   maintained in `_static/agent-loop.svg` and included directly in the page.
 - `components/` introduces kernel authoring, analysis, and remote execution.
+- `api/` selects the user-facing Python objects documented from source.
 - `development/` covers workload registration, contributions, fixes, and this guide.
 - `_static/custom.css` extends Furo's color variables for cards and the diagram.
   Check light and dark modes, narrow screens, and keyboard navigation after
   changing the styles. The theme supplies search and mobile navigation.
 
-Add every new page to a `toctree` in `index.md`. Use relative Markdown links
+Add every new page to a `toctree` reachable from `index.md`. Use relative Markdown links
 between pages so Sphinx checks their targets. Preserve heading anchors when
 other pages link to them.
 
@@ -75,6 +76,33 @@ definitions remain in their owning repositories.
 Source links to `main` show current source; readers must match interfaces to
 their installed package revision. Dependency lists and task declarations
 remain authoritative for package versions and workload contracts.
+
+### Maintain the Python API reference
+
+[Sphinx AutoAPI](https://sphinx-autoapi.readthedocs.io/) reads
+`tirx_harness/src/tirx_harness/` without importing the package. The pages in
+`api/` select entry points, input types, results, and exceptions used by callers.
+Private implementation modules, native engine internals, and external projects
+are not published as a module catalog.
+
+Keep signatures and docstrings in Python source. To include an object in a
+reference page, use an AutoAPI directive inside a MyST `eval-rst` block:
+
+````markdown
+```{eval-rst}
+.. autoapifunction:: tirx_harness.synccheck
+```
+````
+
+For a class, use `autoapiclass` with an explicit `:members:` list when only
+part of its surface is relevant to callers. Use `:undoc-members:` to include
+typed fields that do not have docstrings. Prefer public import paths for
+re-exported objects; `conf.py` resolves references to their implementation types
+back to those public entries. Descriptions around the generated blocks explain
+usage and scope. No generated API files are checked in, and the existing strict
+build checks the reference along with the rest of the site.
+
+### Update dependencies
 
 Update `docs/requirements.in`, then regenerate the dependency lock file:
 

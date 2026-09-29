@@ -20,6 +20,8 @@ running it on a GPU. The package also exports generated-code inspection.
 
 NumSim, Synccheck, and Racecheck run on the CPU. See the
 [installation guide](../installation.md#install-python-packages) to get started.
+The [Python API reference](../api/index.md) provides generated signatures,
+defaults, and return types for these tools.
 
 ## NumSim
 
