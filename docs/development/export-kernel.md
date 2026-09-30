@@ -128,8 +128,9 @@ artifact. Shipping `.cu` lets consumers rebuild for their deployment environment
 - TMA tensor-map encoding must use `tirx.tensormap_encode_tiled`. The older
   `call_packed("runtime.cuTensorMapEncodeTiled", ...)` form is rejected with
   `cuda_host requires tensormap_encode_tiled instead of a packed tensor-map encoder`.
-  For example, the FP16/BF16 GEMM in `tirx-kernels` 0.1.2 needs this migration
-  before it can be exported. If the generated wrapper encodes tensor maps, add
+  TIRx-lite provides `txl.cu_tensor_map_encode_tiled(...)` for this purpose;
+  `tirx-kernels` 0.1.2.post1 includes the migration for FP16/BF16 GEMM and
+  DeepSeek-V4 MLA. If the generated wrapper encodes tensor maps, add
   `extra_ldflags=["-lcuda"]` to `tvm_ffi.cpp.build` to link the CUDA driver
   library. Any tensor-map arguments prepared outside the exported function
   still need equivalent preparation in the consumer application.

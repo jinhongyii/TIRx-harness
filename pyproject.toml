@@ -26,7 +26,7 @@ common = [
   # The TVM IKET profile checks these exact versions.
   "nvidia-cuda-nvrtc==13.2.78",
   "nvidia-cuda-nvdisasm==13.3.73",
-  "tirx-kernels>=0.1.2",
+  "tirx-kernels>=0.1.2.post1",
   "kcoral>=0.1.0",
 ]
 # setup.py also publishes this group as the package's default dependencies.
