@@ -19,7 +19,7 @@ test = ["pytest>=8", "pytest-xdist>=3", "setuptools>=64", "pip>=25.1", "ml-dtype
 [dependency-groups]
 # Shared compiler/runtime requirements. Keep both installation groups standalone.
 common = [
-  "apache-tvm==0.27.0",
+  "apache-tvm==0.27.0.post1",
   "apache-tvm-ffi==0.1.14.post0",
   "numpy>=2.5.3",
   "nvidia-cutlass-dsl[cu13]==4.7.0",

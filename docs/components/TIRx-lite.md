@@ -95,6 +95,10 @@ The result is a printed TIRx function, not a GPU launch. Compiling with
 `zero.compile()` additionally needs a compatible CUDA toolchain; running the
 result needs a GPU supporting the kernel's target.
 
+To distribute a kernel for use with `tvm-ffi`, follow
+[Export a kernel](../development/export-kernel.md). It covers exporting CUDA
+source with its host wrapper, building a shared library, and calling it without TVM.
+
 ```{note}
 Keep kernel definitions in a Python file and use live type annotations.
 Do not enable `from __future__ import annotations` in a TIRx-lite module.
