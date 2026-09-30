@@ -7,8 +7,7 @@ can skip compilation.
 
 This workflow uses TVM's
 [`export_cuda_host`](https://github.com/apache/tvm/blob/ea0cfa320fcdea0567e2f4c19d363625c66630d1/python/tvm/backend/cuda/host.py)
-API, available in the harness's pinned TVM `0.27.0.post1` dependency.
-The example targets NVIDIA B200 (`sm_100a`) on Linux.
+API.
 
 ## Export in the development environment
 
