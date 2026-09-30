@@ -42,7 +42,7 @@ wheels = [
 
 [[package]]
 name = "apache-tvm"
-version = "0.27.0"
+version = "0.27.0.post1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -51,7 +51,7 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d9/4e/3285d220b5cc95160a780a54f871b9c0c3334e6186033365a066a166f787/apache_tvm-0.27.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c119f33459a098e87022b10b90e0bf83dadaf240c03091dbc84c211e96d38f7b", size = 100539451, upload-time = "2026-09-25T20:33:47.2Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/17/f5f4dd5e309dc938911a7b83c8d06a3111232d11c4b6a2c88c485e030338/apache_tvm-0.27.0.post1-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f503fc903b6e16fda5daacac6698ecb8bc38937f57da7aa29f6c7ab169d08657", size = 100544100, upload-time = "2026-09-29T21:06:25.705Z" },
 ]
 
 [[package]]
@@ -1239,7 +1239,7 @@ server = [
 
 [package.metadata]
 requires-dist = [
-    { name = "apache-tvm", specifier = "==0.27.0" },
+    { name = "apache-tvm", specifier = "==0.27.0.post1" },
     { name = "apache-tvm-ffi", specifier = "==0.1.14.post0" },
     { name = "kcoral", specifier = ">=0.1.0" },
     { name = "ml-dtypes", marker = "extra == 'test'" },
@@ -1254,13 +1254,13 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "setuptools", marker = "extra == 'test'", specifier = ">=64" },
     { name = "threadpoolctl", specifier = ">=3.6,<4" },
-    { name = "tirx-kernels", specifier = ">=0.1.2" },
+    { name = "tirx-kernels", specifier = ">=0.1.2.post1" },
 ]
 provides-extras = ["test"]
 
 [package.metadata.requires-dev]
 benchmark = [
-    { name = "apache-tvm", specifier = "==0.27.0" },
+    { name = "apache-tvm", specifier = "==0.27.0.post1" },
     { name = "apache-tvm-ffi", specifier = "==0.1.14.post0" },
     { name = "cupti-python", specifier = "==13.2.0" },
     { name = "deep-gemm", marker = "python_full_version == '3.12.*'", url = "https://github.com/mlc-ai/package/releases/download/deepgemm-2.6.1-559d79f-cu132/deep_gemm-2.6.1%2B559d79f-cp312-cp312-linux_x86_64.whl" },
@@ -1275,24 +1275,24 @@ benchmark = [
     { name = "nvidia-cuda-nvrtc", specifier = "==13.2.78" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = "==4.7.0" },
     { name = "safetensors", specifier = "==0.8.0" },
-    { name = "tirx-kernels", specifier = ">=0.1.2" },
+    { name = "tirx-kernels", specifier = ">=0.1.2.post1" },
     { name = "torch", marker = "python_full_version == '3.12.*'", url = "https://download.pytorch.org/whl/cu132/torch-2.14.0%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl" },
     { name = "torch", marker = "python_full_version == '3.13.*'", url = "https://download.pytorch.org/whl/cu132/torch-2.14.0%2Bcu132-cp313-cp313-manylinux_2_28_x86_64.whl" },
     { name = "torch-c-dlpack-ext", specifier = "==0.1.5" },
     { name = "triton", specifier = "==3.8.0" },
 ]
 common = [
-    { name = "apache-tvm", specifier = "==0.27.0" },
+    { name = "apache-tvm", specifier = "==0.27.0.post1" },
     { name = "apache-tvm-ffi", specifier = "==0.1.14.post0" },
     { name = "kcoral", specifier = ">=0.1.0" },
     { name = "numpy", specifier = ">=2.5.3" },
     { name = "nvidia-cuda-nvdisasm", specifier = "==13.3.73" },
     { name = "nvidia-cuda-nvrtc", specifier = "==13.2.78" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = "==4.7.0" },
-    { name = "tirx-kernels", specifier = ">=0.1.2" },
+    { name = "tirx-kernels", specifier = ">=0.1.2.post1" },
 ]
 harness = [
-    { name = "apache-tvm", specifier = "==0.27.0" },
+    { name = "apache-tvm", specifier = "==0.27.0.post1" },
     { name = "apache-tvm-ffi", specifier = "==0.1.14.post0" },
     { name = "kcoral", specifier = ">=0.1.0" },
     { name = "numpy", specifier = ">=2.5.3" },
@@ -1302,10 +1302,10 @@ harness = [
     { name = "pypandoc-binary", specifier = ">=1.17" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "threadpoolctl", specifier = ">=3.6,<4" },
-    { name = "tirx-kernels", specifier = ">=0.1.2" },
+    { name = "tirx-kernels", specifier = ">=0.1.2.post1" },
 ]
 server = [
-    { name = "apache-tvm", specifier = "==0.27.0" },
+    { name = "apache-tvm", specifier = "==0.27.0.post1" },
     { name = "apache-tvm-ffi", specifier = "==0.1.14.post0" },
     { name = "cupti-python", specifier = "==13.2.0" },
     { name = "deep-gemm", marker = "python_full_version == '3.12.*'", url = "https://github.com/mlc-ai/package/releases/download/deepgemm-2.6.1-559d79f-cu132/deep_gemm-2.6.1%2B559d79f-cp312-cp312-linux_x86_64.whl" },
@@ -1321,7 +1321,7 @@ server = [
     { name = "nvidia-cuda-nvrtc", specifier = "==13.2.78" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = "==4.7.0" },
     { name = "safetensors", specifier = "==0.8.0" },
-    { name = "tirx-kernels", specifier = ">=0.1.2" },
+    { name = "tirx-kernels", specifier = ">=0.1.2.post1" },
     { name = "torch", marker = "python_full_version == '3.12.*'", url = "https://download.pytorch.org/whl/cu132/torch-2.14.0%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl" },
     { name = "torch", marker = "python_full_version == '3.13.*'", url = "https://download.pytorch.org/whl/cu132/torch-2.14.0%2Bcu132-cp313-cp313-manylinux_2_28_x86_64.whl" },
     { name = "torch-c-dlpack-ext", specifier = "==0.1.5" },
@@ -1330,16 +1330,16 @@ server = [
 
 [[package]]
 name = "tirx-kernels"
-version = "0.1.2"
+version = "0.1.2.post1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "kcoral" },
     { name = "packaging" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e7/f6/8347bbfd4bcc85fc2dd57c8063d0275ae2b2f66326a3171dfc5b09cd8397/tirx_kernels-0.1.2.tar.gz", hash = "sha256:7f4c93bfca1a2a7fbfd0761f3615602582a2a312197444fecd71e306938438b0", size = 2364494, upload-time = "2026-09-29T16:10:48.245Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/66/6e/cdd8c626e89cb7a93112e642840a2b144452c2d023b237006ad9a4c39bc4/tirx_kernels-0.1.2.post1.tar.gz", hash = "sha256:6966c975b93db82f3a630bf0c17385e8c18e0eb130648379ca5041ec1e3cd127", size = 2365994, upload-time = "2026-09-30T22:06:29.728Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/61/5b/5e88d54d2702e6cc928ca66cde6653a2b29e82978fded468c6eb510704a4/tirx_kernels-0.1.2-py3-none-any.whl", hash = "sha256:58106055a5f585d647b9a49bad36f83ea7ae9b45868457fa540f50d15c84b8ed", size = 2535420, upload-time = "2026-09-29T16:10:45.572Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/8a/ea2f2963b66c9c32819773f73dea6322ea0b1cd419baae14ec0087b0722b/tirx_kernels-0.1.2.post1-py3-none-any.whl", hash = "sha256:619d9aee9e96d86e2504cba07b3e5b44289b362883ca6708ad2d743fdfe6bd01", size = 2536018, upload-time = "2026-09-30T22:06:27.588Z" },
 ]
 
 [[package]]

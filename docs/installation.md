@@ -7,6 +7,9 @@ Install the components for your own agent workflow or a kcoral GPU server.
 For [optimization runs](optimization-runs.md), setup prepares the packages and
 skills automatically.
 
+To run an exported kernel with `tvm-ffi`, follow
+[Export a kernel](development/export-kernel.md) for the consumer dependencies.
+
 ## Before you start
 
 - Linux x86_64, Python 3.12 or 3.13, and pip 25.1 or later.
