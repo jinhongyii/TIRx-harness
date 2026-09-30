@@ -59,8 +59,11 @@ Copy `zero.cu` to the consumer's project. In a separate Python environment,
 install the FFI package with its build dependencies:
 
 ```bash
-python -m pip install "apache-tvm-ffi[cpp]==0.1.14.post0"
+python -m pip install "apache-tvm-ffi[cpp]>=0.1.14.post0,<0.2"
 ```
+
+This range starts at the tested baseline and allows updates within the `0.1.x`
+ABI, following [TVM-FFI's versioning policy](https://github.com/apache/tvm-ffi#status-and-release-versioning).
 
 Building requires a C++ compiler and a CUDA Toolkit with `nvcc` that supports
 the kernel's architecture. Set `CUDA_HOME` if the toolkit is outside the
@@ -117,7 +120,7 @@ shape, dtype, layout, and device requirements. Launches use the CUDA stream
 provided through `tvm-ffi`; synchronize before reading results on the CPU.
 
 To ship a binary, distribute `zero.so` and use only the load-and-call step.
-Install `apache-tvm-ffi==0.1.14.post0` without the `[cpp]` extra on machines
+Install `apache-tvm-ffi>=0.1.14.post0,<0.2` without the `[cpp]` extra on machines
 that only load the library. They need compatible GPU, CUDA runtime, host
 platform, and FFI versions; they do not need `nvcc` or a C++ compiler.
 Document those requirements and the kernel's argument contract alongside the
