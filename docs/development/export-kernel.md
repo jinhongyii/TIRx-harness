@@ -59,9 +59,6 @@ install the FFI package with its build dependencies:
 python -m pip install "apache-tvm-ffi[cpp]>=0.1.14.post0,<0.2"
 ```
 
-This range starts at the tested baseline and allows updates within the `0.1.x`
-ABI, following [TVM-FFI's versioning policy](https://github.com/apache/tvm-ffi#status-and-release-versioning).
-
 Building requires a C++ compiler and a CUDA Toolkit with `nvcc` that supports
 the kernel's architecture. Set `CUDA_HOME` if the toolkit is outside the
 default location. Save this as `build_zero.py` beside `zero.cu`:
