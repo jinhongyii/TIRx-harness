@@ -11,9 +11,7 @@ API.
 
 ## Export in the development environment
 
-Use the [harness development environment](../installation.md#install-python-packages)
-with the updated dependencies. From a source checkout, `uv sync --locked`
-installs the versions in `uv.lock`. Exporting requires a compatible CUDA
+Exporting requires a compatible CUDA
 toolchain because `tvm.compile` also compiles the device code.
 
 Save this as `export_zero.py`:
