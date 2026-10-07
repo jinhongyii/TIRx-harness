@@ -527,12 +527,14 @@ fn named_contribution() -> impl Strategy<Value = named::Contribution> {
         prop::sample::select(vec![FULL_MASK, FULL_MASK, FULL_MASK, 0x0000_ffff, 1, 0]),
         prop::sample::select(vec![FULL_MASK, FULL_MASK, FULL_MASK, 0x0000_ffff]),
         prop::sample::select(vec![32u64, 64, 64, 96, 128, 160, 48]),
+        any::<bool>(),
     )
-        .prop_map(|(warp, mask, live, count)| named::Contribution {
+        .prop_map(|(warp, mask, live, count, aligned)| named::Contribution {
             warp,
             mask,
             live,
             count,
+            aligned,
         })
 }
 
@@ -579,6 +581,7 @@ fn named_producer_consumer_arrive_then_sync() {
         mask: FULL_MASK,
         live: FULL_MASK,
         count: 160,
+        aligned: true,
     };
     let mut s = named::State::default();
     for w in 0..4 {
@@ -614,6 +617,7 @@ fn named_elected_lane_and_red_mixing_are_errors() {
         mask: 1,
         live: FULL_MASK,
         count: 64,
+        aligned: false,
     };
     assert_eq!(
         named::step(&mut s, Cmd::Arrive(elected)),
@@ -628,6 +632,7 @@ fn named_elected_lane_and_red_mixing_are_errors() {
         mask: 0xffff,
         live: 0xffff,
         count: 64,
+        aligned: false,
     };
     named::step(&mut s, Cmd::Sync(partial_live)).unwrap();
     let red = Contribution {
@@ -635,6 +640,7 @@ fn named_elected_lane_and_red_mixing_are_errors() {
         mask: FULL_MASK,
         live: FULL_MASK,
         count: 64,
+        aligned: false,
     };
     assert_eq!(
         named::step(&mut s, Cmd::Red(red)),

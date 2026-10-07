@@ -13,7 +13,9 @@
 //! toward `b`, which must be a multiple of the warp size.
 //!
 //! `.aligned` is a convergence promise, not barrier state. Mixing aligned and
-//! unaligned forms on one barrier is legal. Mixing `.red` with `sync`/`arrive`
+//! unaligned forms on one barrier is legal. `Contribution::aligned` is carried
+//! for the checkers (the synccheck aligned-site rule) and never changes a
+//! transition. Mixing `.red` with `sync`/`arrive`
 //! on one active barrier is "unpredictable" and is rejected.
 //!
 //! Blocking: `Sync`/`Red` contribute and return `Registered { gen }`, or
@@ -45,6 +47,8 @@ pub struct Contribution {
     pub live: LaneMask,
     /// Thread count `b`. Whole CTA when the source omitted it.
     pub count: u64,
+    /// `bar.*` / `barrier.*.aligned` form. No effect on the transition.
+    pub aligned: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

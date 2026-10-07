@@ -13,10 +13,24 @@
 //!
 //! so production `step` (W3) is differentially tested against the reference
 //! mechanically. Rules: transactional (`Err` leaves state unchanged),
-//! deterministic, total (never panics). A blocking command returns the
-//! protocol's `Outcome::Blocked` with the state unchanged; the scheduler
-//! retries later (no wakers, no waiter registry). [`SyncTable::step`] lifts
-//! that to [`Step::Blocked`] naming the resource.
+//! deterministic, total (never panics).
+//!
+//! **Blocking.** A blocking command returns the protocol's `Outcome::Blocked`
+//! and the scheduler retries it later (no wakers, no waiter registry).
+//! [`SyncTable::step`] lifts that to [`Step::Blocked`] naming the resource.
+//! A blocked `step` commits exactly one thing: the mbarrier `armed` flag set
+//! by a blocked `WaitParity`, which makes the phase count as observed when
+//! it completes (strict consumption, sync-semantics §2.3). Every other
+//! protocol's `Blocked` leaves its state unchanged, and a resource created
+//! for a blocked command is not kept. [`SyncTable::step_all`] discards *all*
+//! staged state when any command blocks, including `armed`, so lane-varying
+//! waits must be issued as one `step` per (barrier, phase) group, not as a
+//! batch. Retrying a blocked command is idempotent.
+//!
+//! **Logging of queries.** `TestParity` / `TestState` (test_wait / try_wait)
+//! return `NotReady` without blocking. The engine records them as protocol
+//! events (`SyncKind::Protocol`, observed parity) only when they succeed
+//! (`Ready`); a failed poll is not logged, it only feeds spin parking.
 //!
 //! Lane aggregation, address resolution, multicast expansion and collective
 //! rendezvous (setmaxnreg warpgroups, cta_group::2 pairs) happen *before*
@@ -67,7 +81,9 @@ pub const FULL_MASK: LaneMask = u32::MAX;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Step<O> {
     Done(O),
-    /// Cannot proceed; state unchanged; retry after `ResourceId` changes.
+    /// Cannot proceed; retry after `ResourceId` changes. State is unchanged
+    /// except for a blocked mbarrier `WaitParity`'s `armed` flag (via
+    /// [`SyncTable::step`] only; [`SyncTable::step_all`] keeps nothing).
     Blocked(ResourceId),
 }
 
@@ -109,6 +125,7 @@ impl Outcome {
                 | Outcome::Named(named::Outcome::Blocked)
                 | Outcome::Cluster(cluster::Outcome::Blocked)
                 | Outcome::AsyncGroup(async_group::Outcome::Blocked)
+                | Outcome::Tcgen(tcgen::Outcome::Blocked)
                 | Outcome::RegPool(setmaxnreg::Outcome::Blocked)
         )
     }
@@ -251,10 +268,10 @@ impl SyncTable {
 
     /// Apply `cmd` to resource `id` (created on first use).
     ///
-    /// Transactional: on `Err` the table is unchanged (a resource created for
-    /// this command is not kept). A `Blocked` outcome keeps the protocol's
-    /// own bookkeeping, e.g. a parked mbarrier wait (`armed`) that consumes
-    /// the phase when it completes; the retry is idempotent.
+    /// Transactional: on `Err` the table is unchanged, and a resource created
+    /// for this command is not kept. On `Blocked` the only committed change is
+    /// a blocked mbarrier `WaitParity` setting `armed` (see the module docs).
+    /// A resource created for a blocked command is not kept either.
     ///
     /// A `Tcgen` lifecycle command first checks the kernel-wide `.cta_group`
     /// (see [`SyncCmd::TcgenGroup`]); both commit together or not at all.
@@ -270,7 +287,9 @@ impl SyncTable {
             None => {
                 let mut res = self.fresh(id).ok_or(SyncError::WrongResource { resource: id })?;
                 let out = Self::apply(&mut res, id, cmd)?;
-                self.resources.insert(id, res);
+                if !out.is_blocked() {
+                    self.resources.insert(id, res);
+                }
                 out
             }
         };
@@ -278,8 +297,10 @@ impl SyncTable {
     }
 
     /// All-or-nothing multi-target step (multicast arrive, lane-varying
-    /// batches, 2-CTA ops): applies to clones and commits only if every
-    /// command succeeded and none blocked. Each `Tcgen` lifecycle command is
+    /// arrive batches, 2-CTA ops): applies to clones and commits only if every
+    /// command succeeded and none blocked. On `Blocked` all staged state is
+    /// discarded, including an mbarrier `armed` flag, so blocking waits go
+    /// through [`SyncTable::step`]. Each `Tcgen` lifecycle command is
     /// preceded by an implicit `TcgenGroup` check on `TcgenKernel`; only the
     /// listed commands produce outcomes.
     pub fn step_all(&mut self, cmds: &[(ResourceId, SyncCmd)]) -> Result<Step<Vec<Outcome>>, SyncError> {

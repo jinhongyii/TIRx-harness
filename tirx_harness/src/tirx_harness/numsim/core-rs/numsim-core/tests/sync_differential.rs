@@ -37,8 +37,14 @@ fn dbg<T: std::fmt::Debug>(v: &T) -> String {
 /// Compare one step.
 macro_rules! diff_step {
     ($module:ident, $rs:expr, $cs:expr, $rc:expr, $cc:expr, $ctx:expr) => {{
+        let before = dbg(&$cs);
         let r = spec::$module::step(&mut $rs, $rc);
         let c = prod::$module::step(&mut $cs, $cc);
+        if matches!(&c, Ok(o) if dbg(o) == "Blocked") {
+            // A blocked step commits nothing except mbarrier `armed`.
+            let unarm = |s: String| s.replace("armed: true", "armed: false");
+            prop_assert_eq!(unarm(before), unarm(dbg(&$cs)), "blocked step changed state at {}", $ctx);
+        }
         prop_assert_eq!(dbg(&r), dbg(&c), "result differs at {}", $ctx);
         prop_assert_eq!(dbg(&$rs), dbg(&$cs), "state differs at {}", $ctx);
         prop_assert_eq!(
@@ -141,15 +147,15 @@ proptest! {
 
 // ---------------------------------------------------------------- named
 
-fn named_op() -> impl Strategy<Value = (u8, u32, u32, u32, u64, u64)> {
-    (
+fn named_op() -> impl Strategy<Value = ((u8, u32, u32, u32, u64, u64), bool)> {
+    ((
         0u8..4,
         0u32..5,
         prop::sample::select(vec![u32::MAX, u32::MAX, u32::MAX, 0xffff, 1, 0]),
         prop::sample::select(vec![u32::MAX, u32::MAX, 0xffff]),
         prop::sample::select(vec![32u64, 64, 64, 96, 128, 160, 0, 48]),
         0u64..4,
-    )
+    ), any::<bool>())
 }
 
 proptest! {
@@ -159,11 +165,11 @@ proptest! {
     fn named_matches_reference(ops in prop::collection::vec(named_op(), 0..MAX_LEN)) {
         let mut rs = spec::named::State::default();
         let mut cs = prod::named::State::default();
-        for (i, &(kind, warp, mask, live, count, gen)) in ops.iter().enumerate() {
+        for (i, &((kind, warp, mask, live, count, gen), aligned)) in ops.iter().enumerate() {
             let (rc, cc) = match kind {
-                0 => both!(named, Cmd::Arrive(Contribution { warp, mask, live, count })),
-                1 => both!(named, Cmd::Sync(Contribution { warp, mask, live, count })),
-                2 => both!(named, Cmd::Red(Contribution { warp, mask, live, count })),
+                0 => both!(named, Cmd::Arrive(Contribution { warp, mask, live, count, aligned })),
+                1 => both!(named, Cmd::Sync(Contribution { warp, mask, live, count, aligned })),
+                2 => both!(named, Cmd::Red(Contribution { warp, mask, live, count, aligned })),
                 _ => both!(named, Cmd::Resume { gen }),
             };
             diff_step!(named, rs, cs, rc, cc, format!("#{i}"));
@@ -363,7 +369,7 @@ mod table {
                 let c = table.step(id, SyncCmd::Mbarrier(cc));
                 match (&r, &c) {
                     (Ok(spec::mbarrier::Outcome::Blocked), Ok(Step::Blocked(b))) => prop_assert_eq!(*b, id),
-                    (Ok(ro), Ok(Step::Done(prod::Outcome::Mbarrier(co)))) => prop_assert_eq!(dbg(ro), dbg(co)),
+                    (Ok(ro), Ok(Step::Done(prod::Outcome::Mbarrier(co)))) if *ro != spec::mbarrier::Outcome::Blocked => prop_assert_eq!(dbg(ro), dbg(co)),
                     (Err(re), Err(prod::SyncError::Mbarrier(ce))) => {
                         prop_assert_eq!(dbg(re), dbg(ce));
                         prop_assert_eq!(dbg(&before), dbg(&table.get(id).cloned()), "table changed on error");
@@ -476,7 +482,7 @@ mod table {
                     let c = table.step(life, SyncCmd::Tcgen(cc));
                     match (&r, &c) {
                         (Ok(spec::tcgen::Outcome::Blocked), Ok(Step::Blocked(b))) => prop_assert_eq!(*b, life),
-                        (Ok(ro), Ok(Step::Done(prod::Outcome::Tcgen(co)))) => prop_assert_eq!(dbg(ro), dbg(co)),
+                        (Ok(ro), Ok(Step::Done(prod::Outcome::Tcgen(co)))) if *ro != spec::tcgen::Outcome::Blocked => prop_assert_eq!(dbg(ro), dbg(co)),
                         (Err(re), Err(prod::SyncError::Tcgen(ce))) => prop_assert_eq!(dbg(re), dbg(ce)),
                         _ => prop_assert!(false, "#{} lifecycle {:?} vs {:?}", i, r, c),
                     }
@@ -493,5 +499,28 @@ mod table {
                 }
             }
         }
+    }
+
+    /// `step` commits a blocked wait's `armed` flag; `step_all` discards it.
+    #[test]
+    fn blocked_commit_rules() {
+        let id = mbar_id();
+        let init = SyncCmd::Mbarrier(prod::mbarrier::Cmd::Init { count: 1, layout_v1: false });
+        let wait = SyncCmd::Mbarrier(prod::mbarrier::Cmd::WaitParity { parity: 0 });
+        let armed = |t: &SyncTable| matches!(t.get(id), Some(Resource::Mbarrier(s)) if s.armed);
+        let mut single = SyncTable::new(ResourceInit::default());
+        single.step(id, init).unwrap();
+        assert_eq!(single.step(id, wait).unwrap(), Step::Blocked(id));
+        assert!(armed(&single));
+        let mut batch = SyncTable::new(ResourceInit::default());
+        batch.step(id, init).unwrap();
+        assert_eq!(batch.step_all(&[(id, wait)]).unwrap(), Step::Blocked(id));
+        assert!(!armed(&batch));
+        // A blocked command on a fresh resource leaves no resource behind.
+        let pair = ResourceId::TcgenLifecycle { pair: CtaId(0) };
+        let mut t = SyncTable::new(ResourceInit::default());
+        let alloc = |columns| SyncCmd::Tcgen(prod::tcgen::Cmd::Alloc { who: prod::tcgen::Who::One(0), columns, exclusive: false });
+        assert!(matches!(t.step(pair, alloc(512)).unwrap(), Step::Done(_)));
+        assert_eq!(t.step(pair, alloc(256)).unwrap(), Step::Blocked(pair));
     }
 }

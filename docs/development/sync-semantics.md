@@ -99,7 +99,7 @@ Each `step` takes one resource state and one already-resolved command:
 | tcgen work | `(warp, lane)` | `tcgen::WorkState` | `Issue`, `Load`, `Store`, `Commit`, `WaitLd`, `WaitSt` |
 | setmaxnreg | `cta` | `setmaxnreg::State` | `Configure{count}`, `Set{wg,inc,count}`, `WarpgroupSync{wg}`, `Grant{wg}`, `Poll{wg}` |
 
-`Contribution` is `{warp, mask, live, count}`, where `live` is the warp's non-exited lane mask.
+`Contribution` is `{warp, mask, live, count, aligned}`, where `live` is the warp's non-exited lane mask and `aligned` is informational.
 
 Every tcgen05 instruction (lifecycle, mma, cp, shift, commit) first steps the kernel-wide `tcgen::KernelState` with `use_cta_group(g)`.
 
@@ -559,7 +559,7 @@ The strict kinds are 11 (SNB:136-206):
 
 - **Unit.** A contribution must be executed by exactly the warp's non-exited lanes (`mask == live`). The warp's arrival then counts 32 threads toward `b`. There is no lane accumulation across contributions, so lanes reaching different barrier instructions fail closed as `PartialWarp`. The engine's unaligned full-CTA recombination (KE:4158-4176) is therefore not reproduced.
 - **Flavors.** `Arrive`, `Sync` and `Red`. One warp may arrive and then sync in one generation; the CUTLASS producer/consumer idiom depends on this. The ISA warns against it ("care must be taken") without forbidding it. Mixing `Red` with the other two flavors is `RedMixed`.
-- **`.aligned`** carries no barrier state. It does not appear in `Contribution`.
+- **`.aligned`** carries no barrier state. `Contribution::aligned` is carried only for the checkers (the synccheck aligned-site rule, W6-1) and never changes a transition.
 - **Not modeled: whole-warp exit.** A barrier whose missing warps have all exited should be released (§9.7.14.7). With an explicit `b` this needs the scheduler to know which warps were expected. That is gap G8; the SyncTable's deadlock check must treat such a hang as `incomplete`, not as success.
 
 ## 4. Cluster barrier
