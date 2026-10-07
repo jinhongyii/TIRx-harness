@@ -124,6 +124,10 @@ pub struct Access<'a> {
     /// Meaningful when `atomic || sem != Weak` (W5 `scope: Option`).
     pub scope: Scope,
     pub atomic: bool,
+    /// For RMW accesses: `true` for `atom` (returns the old value and can
+    /// form an acquire pattern), `false` for `red` (never an acquire
+    /// pattern, PTX ISA §8.8). Ignored for plain loads and stores.
+    pub returns_value: bool,
     pub proxy: Proxy,
     pub window: Option<Window>,
     /// Allocation-relative ranges, sorted by (lane, start); lanes are the
