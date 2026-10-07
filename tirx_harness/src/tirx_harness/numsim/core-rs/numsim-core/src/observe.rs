@@ -170,6 +170,26 @@ pub struct Counts {
     pub participants: Option<u32>,
 }
 
+/// One target of a committed protocol instruction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProtocolCmd {
+    pub res: ResourceId,
+    pub cmd: SyncCmd,
+    pub counts: Counts,
+    /// Successful `test_wait`/`try_wait` on `res`: the parity observed (W6
+    /// point 8). Failed polls are never logged.
+    pub observed_parity: Option<u8>,
+}
+
+/// Predicate verdicts for one group of lanes that accepted the same write.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LaneVerdict {
+    pub lanes: LaneMask,
+    pub accepted: Vec<u64>,
+    /// Index of the history entry whose value these lanes observed.
+    pub observed: u32,
+}
+
 /// A warp-collective rendezvous (setmaxnreg warpgroup, cta_group::2 tcgen).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Collective {
@@ -247,13 +267,13 @@ pub enum SyncKind {
     /// One committed instruction's protocol commands: all targets of an
     /// atomic multi-resource instruction (W6 point 5) in one event.
     Protocol {
-        cmds: Vec<(ResourceId, SyncCmd)>,
-        counts: Counts,
+        /// One entry per target resource; counts and observed parity are
+        /// per target so lane-varying wait batches carry per-barrier values
+        /// (contract review item 4).
+        cmds: Vec<ProtocolCmd>,
         collective: Option<Collective>,
         /// Async completions this instruction issued (TMA, commit, ...).
         issued: Vec<AsyncTarget>,
-        /// Successful `test_wait`/`try_wait`: the parity observed (W6 point 8).
-        observed_parity: Option<u8>,
         status: ProtocolStatus,
     },
 
@@ -262,10 +282,12 @@ pub enum SyncKind {
     WarpSync { mask: LaneMask },
     /// Arrive into `phase` of `obj` (bar.arrive/sync, mbarrier arrive,
     /// cluster arrive). `release = false` for `.relaxed`.
-    Arrive { obj: ResourceId, phase: u64, release: bool },
+    /// `release`/`scope` are `None` when lowering lost the qualifier; the
+    /// checker then reports `incomplete`, never assumes relaxed (ISA R5).
+    Arrive { obj: ResourceId, phase: u64, release: Option<bool>, scope: Option<Scope> },
     /// Observed completed `phase` of `obj` (bar wait, successful mbarrier
-    /// wait/test, cluster wait).
-    Wait { obj: ResourceId, phase: u64, acquire: bool },
+    /// wait/test, cluster wait). Named barriers use `scope: None`.
+    Wait { obj: ResourceId, phase: u64, acquire: Option<bool>, scope: Option<Scope> },
     Fence(FenceEvent),
     AsyncIssue {
         op: AsyncId,
@@ -279,14 +301,17 @@ pub enum SyncKind {
         targets: Vec<AsyncTarget>,
     },
     AsyncComplete { op: AsyncId, milestone: Side, target: PublishTarget },
-    /// A `WaitUntil` succeeded (plan 2.5). `accepted` bit i = history entry i
-    /// satisfies the predicate (lane-wise conjunction over `lanes`).
+    /// A `WaitUntil` succeeded for the lanes in `verdicts` (plan 2.5).
+    /// Verdicts are PER LANE GROUP: lanes that accepted different writes get
+    /// separate entries, never a lane-wise conjunction (contract review item 6).
+    /// `accepted` bit 0 = launch value, bit i = i-th write in delivery order
+    /// of the word's history as of this wait; the engine evaluates the
+    /// predicate incrementally (only writes newer than the last verdict).
     WaitVerdicts {
         alloc: AllocId,
         span: ByteSpan,
         scope: Scope,
-        accepted: Vec<u64>,
-        observed: u32,
+        verdicts: Vec<LaneVerdict>,
         /// Memory the predicate sub-program read (`PredProgram::reads_memory`).
         pred_reads: Vec<(AllocId, ByteSpan)>,
     },
@@ -295,6 +320,8 @@ pub enum SyncKind {
 /// One cold-path event.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SyncEvent {
+    /// Kernel index within the `Module` (W6-1 item 5).
+    pub kernel: u32,
     pub actor: Actor,
     /// Per-warp sequence of committed `Protocol` events (W6 cursor);
     /// for other kinds, the warp's next protocol seq (not incremented).

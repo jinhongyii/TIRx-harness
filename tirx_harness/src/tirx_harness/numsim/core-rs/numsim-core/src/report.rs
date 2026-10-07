@@ -10,6 +10,7 @@ use crate::arena::{AllocId, ByteSpan, Space};
 use crate::observe::Actor;
 use crate::site::SiteId;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Status {
@@ -35,6 +36,8 @@ pub enum FindingKind {
     RuntimeError,
     // synccheck
     Deadlock,
+    /// Two complete interleavings reached different final protocol states (synccheck Phase B).
+    NonConfluent,
     BarrierMismatch,
     MbarrierMisuse,
     AsyncGroupMisuse,
@@ -72,6 +75,11 @@ pub struct Finding {
     pub kind: FindingKind,
     pub status: Status,
     pub message: String,
+    /// Structured, tool-specific attributes (legacy payload keys such as
+    /// `reason`, `cause`, `access_pair`, `ordering_*`), serialized verbatim
+    /// into the payload (W6-1 item 2, contract review item 8).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attrs: BTreeMap<String, serde_json::Value>,
     /// Every causal source site (deduplicated, sorted).
     pub sites: Vec<SiteId>,
     pub evidence: Vec<Evidence>,
@@ -115,11 +123,14 @@ pub struct Report {
     pub findings: Vec<Finding>,
     /// What was covered (e.g. explored states, launches), free-form.
     pub coverage: Vec<(String, u64)>,
+    /// Non-numeric coverage facts (termination kind, algorithm name, ...).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub meta: BTreeMap<String, serde_json::Value>,
 }
 
 impl Report {
     pub fn new(tool: &str, findings: Vec<Finding>) -> Report {
-        Report { tool: tool.to_string(), launch: 0, verdict: Verdict::of(&findings), findings, coverage: Vec::new() }
+        Report { tool: tool.to_string(), launch: 0, verdict: Verdict::of(&findings), findings, coverage: Vec::new(), meta: BTreeMap::new() }
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("Report is serializable")

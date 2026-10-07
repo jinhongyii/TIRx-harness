@@ -33,6 +33,7 @@ use std::fmt;
 
 /// Allocation space (where bytes physically live).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Space {
     Global,
     Shared,
@@ -209,6 +210,9 @@ pub enum ValidityPolicy {
     Error,
     /// Return whatever bytes are stored (zero for fresh allocations).
     Allow,
+    /// Read invalid bytes as zero; the engine reports one `UninitRead`
+    /// review finding per read range (NumSim-mode default, W8-5).
+    ZeroAndReport,
 }
 
 /// Initial contents of a new allocation.
@@ -402,9 +406,70 @@ impl Arena {
             }
             let n = s.len as usize;
             dst[pos..pos + n].copy_from_slice(&a.bytes[abs.start as usize..abs.end() as usize]);
+            if self.policy == ValidityPolicy::ZeroAndReport {
+                let mut i = abs.start;
+                while let Some(off) = a.valid.first_clear(i, abs.end() - i) {
+                    dst[pos + (off - abs.start) as usize] = 0;
+                    i = off + 1;
+                }
+            }
             pos += n;
         }
         Ok(())
+    }
+
+    /// First invalid byte (allocation-relative) of a view-relative span.
+    pub fn first_invalid(&self, view: View, span: ByteSpan) -> Option<u64> {
+        let a = self.get(view.alloc);
+        if a.metadata_only {
+            return None;
+        }
+        let abs = view.absolute(span);
+        if abs.end() > a.size {
+            return None;
+        }
+        a.valid.first_clear(abs.start, abs.len)
+    }
+
+    /// Raw copy between allocations that carries validity (async payloads):
+    /// destination bytes become valid exactly where the source was valid.
+    pub fn copy_with_validity(&mut self, src: (AllocId, ByteSpan), dst: (AllocId, u64)) -> Result<(), ArenaError> {
+        let (sid, sspan) = src;
+        let (did, doff) = dst;
+        self.check_oob(self.view(sid), &[sspan])?;
+        self.check_oob(self.view(did), &[ByteSpan::new(doff, sspan.len)])?;
+        let n = sspan.len as usize;
+        let s = &self.allocs[sid.0 as usize];
+        if s.metadata_only {
+            return Err(ArenaError::MetadataOnly { alloc: sid });
+        }
+        let bytes = s.bytes[sspan.start as usize..sspan.end() as usize].to_vec();
+        let valid: Vec<bool> = (0..sspan.len).map(|i| s.valid.get(sspan.start + i)).collect();
+        let d = &mut self.allocs[did.0 as usize];
+        if d.metadata_only {
+            return Err(ArenaError::MetadataOnly { alloc: did });
+        }
+        d.bytes[doff as usize..doff as usize + n].copy_from_slice(&bytes);
+        let mut i = 0usize;
+        while i < n {
+            let v = valid[i];
+            let mut j = i;
+            while j < n && valid[j] == v {
+                j += 1;
+            }
+            d.valid.set_range(doff + i as u64, (j - i) as u64, v);
+            i = j;
+        }
+        Ok(())
+    }
+
+    /// Reset an allocation to all-invalid zero bytes (CTA-private memory
+    /// reused by a later CTA).
+    pub fn reset(&mut self, id: AllocId) {
+        let a = self.get_mut(id);
+        a.bytes.fill(0);
+        let n = a.size;
+        a.valid.set_range(0, n, false);
     }
 
     /// Write the concatenation of `src` into `spans` (view-relative, in
