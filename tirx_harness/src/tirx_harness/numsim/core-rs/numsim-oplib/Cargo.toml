@@ -1,0 +1,24 @@
+[package]
+name = "numsim-oplib"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Engine-independent numerical and addressing kernels for NumSim (cvt, fp8/fp4/bf16, MMA, TMA/im2col/swizzle, warp lane math)."
+
+[lib]
+name = "numsim_oplib"
+path = "src/lib.rs"
+
+[features]
+default = []
+# NumPy-backed MatmulBackend (needs a Python with numpy at build/run time).
+numpy = ["dep:pyo3"]
+# Embed an interpreter so the NumPy tests can run under `cargo test`.
+numpy-embed = ["numpy", "pyo3/auto-initialize"]
+
+[dependencies]
+libm = "=0.2.16"
+pyo3 = { version = "=0.29.0", optional = true }
+
+# Standalone until the coordinator adds this crate to the core-rs workspace.
+[workspace]
