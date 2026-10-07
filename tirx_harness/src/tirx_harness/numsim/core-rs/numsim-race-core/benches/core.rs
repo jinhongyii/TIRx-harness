@@ -9,6 +9,9 @@ use numsim_race_core::clock::{Clock, JoinMemo, Stamp};
 use numsim_race_core::input::*;
 use numsim_race_core::shadow::IntervalShadow;
 use numsim_race_core::Checker;
+use numsim_core::observe::CtaId;
+
+const BAR: SyncObjId = SyncObjId::Named { cta: CtaId(0), id: 0 };
 
 fn clock_with(actors: u32, base: u32) -> Clock {
     let mut c = Clock::default();
@@ -151,7 +154,7 @@ fn join_memo(c: &mut Criterion) {
 /// End-to-end: a tiled producer/consumer loop through the whole checker.
 fn checker_loop(c: &mut Criterion) {
     let topo = Topology { warps_per_cta: 4, ctas_per_cluster: 1, num_ctas: 1 };
-    let mut ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: 1, space: Space::Shared, size: 1 << 16, cta: 0 })];
+    let mut ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: 1 << 16, cta: 0 })];
     let mut epoch = [0u32; 4];
     let lanes: Vec<u8> = (0..32).collect();
     for it in 0..64u32 {
@@ -161,7 +164,7 @@ fn checker_loop(c: &mut Criterion) {
                 let off = (w as u64 * 32 + l as u64) * 16;
                 ev.push(Event::Access(Access {
                     who: Who::Lane { warp: w, lane: l, epoch: epoch[w as usize] },
-                    alloc: 1,
+                    alloc: AllocId(1),
                     range: off..off + 16,
                     kind: if it % 2 == 0 { AccessKind::Write } else { AccessKind::Read },
                     order: MemOrder::Weak,
@@ -169,17 +172,18 @@ fn checker_loop(c: &mut Criterion) {
                     atomic: false,
                     proxy: Proxy::Generic,
                     domain: Some(Domain::SharedCta),
-                    site: w,
+                    site: SiteId(w),
+                    returns_value: false,
                 }));
             }
         }
         for w in 0..4u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::FULL, obj: 0, phase: it, release: Some(true), scope: None, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: it as u64, release: Some(true), scope: None, epoch: epoch[w as usize] }));
         }
         for w in 0..4u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::FULL, obj: 0, phase: it, acquire: Some(true), scope: None, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: it as u64, acquire: Some(true), scope: None, epoch: epoch[w as usize] }));
         }
     }
     let n = ev.len();
@@ -191,5 +195,72 @@ fn checker_loop(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop);
+/// Reader-heavy: 16 warps × 32 lanes read one tile concurrently, then a
+/// barrier and a write; stresses frontier size (witness footprint).
+fn checker_readers(c: &mut Criterion) {
+    let topo = Topology { warps_per_cta: 16, ctas_per_cluster: 1, num_ctas: 1 };
+    let mut ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: 1 << 16, cta: 0 })];
+    let mut epoch = [0u32; 16];
+    for it in 0..16u32 {
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            for l in 0..32u8 {
+                ev.push(Event::Access(Access {
+                    who: Who::Lane { warp: w, lane: l, epoch: epoch[w as usize] },
+                    alloc: AllocId(1),
+                    range: (l as u64 * 4)..(l as u64 * 4 + 4),
+                    kind: AccessKind::Read,
+                    order: MemOrder::Weak,
+                    scope: None,
+                    atomic: false,
+                    proxy: Proxy::Generic,
+                    domain: Some(Domain::SharedCta),
+                    site: SiteId(w),
+                    returns_value: false,
+                }));
+            }
+        }
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64, release: Some(true), scope: None, epoch: epoch[w as usize] }));
+        }
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64, acquire: Some(true), scope: None, epoch: epoch[w as usize] }));
+        }
+        epoch[0] += 1;
+        for l in 0..32u8 {
+            ev.push(Event::Access(Access {
+                who: Who::Lane { warp: 0, lane: l, epoch: epoch[0] },
+                alloc: AllocId(1),
+                range: (l as u64 * 4)..(l as u64 * 4 + 4),
+                kind: AccessKind::Write,
+                order: MemOrder::Weak,
+                scope: None,
+                atomic: false,
+                proxy: Proxy::Generic,
+                domain: Some(Domain::SharedCta),
+                site: SiteId(99),
+                returns_value: false,
+            }));
+        }
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64 + 1, release: Some(true), scope: None, epoch: epoch[w as usize] }));
+        }
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64 + 1, acquire: Some(true), scope: None, epoch: epoch[w as usize] }));
+        }
+    }
+    let n = ev.len();
+    c.bench_function(&format!("checker_readers_{n}_events"), |b| {
+        b.iter(|| {
+            let r = Checker::run(topo, ev.iter().cloned());
+            assert!(r.is_clean());
+        })
+    });
+}
+
+criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers);
 criterion_main!(benches);

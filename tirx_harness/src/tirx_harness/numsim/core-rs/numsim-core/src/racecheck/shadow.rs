@@ -107,6 +107,14 @@ impl<C: Clone + Default + PartialEq> IntervalShadow<C> {
         self.merge_at(range.end);
     }
 
+    /// Mutable visit of every segment; segments for which `f` returns
+    /// `false` are dropped (GC). Returns the number dropped.
+    pub fn retain_mut(&mut self, mut f: impl FnMut(&mut C) -> bool) -> usize {
+        let before = self.map.len();
+        self.map.retain(|_, (_, c)| f(c));
+        before - self.map.len()
+    }
+
     /// Remove everything in `range` (allocation end / reuse).
     pub fn clear(&mut self, range: Range<u64>) {
         self.split_at(range.start);

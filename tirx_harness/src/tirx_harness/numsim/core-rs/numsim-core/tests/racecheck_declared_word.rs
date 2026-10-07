@@ -3,10 +3,9 @@
 //! test_native_global_scoped_hb_matrix.py.
 //!
 //! History indices: 0 = launch value, i = i-th write to the word.
+#[path = "racecheck_common/mod.rs"]
 mod common;
 use common::*;
-use numsim_race_core::input::*;
-use numsim_race_core::*;
 
 const FLAG: std::ops::Range<u64> = 0..4;
 
@@ -180,18 +179,7 @@ fn pred_reads(stable: bool) -> Report {
         k.a(1, 0, ld(MemOrder::Acquire, Scope::Gpu), GMEM, 128..132);
     }
     k.st(0, 0, GMEM, 0..4).a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, FLAG);
-    let e = k.tick(1);
-    k.raw(SyncEvent::WaitVerdicts {
-        warp: 1,
-        lanes: LaneMask::lane(0),
-        alloc: GMEM2,
-        range: FLAG,
-        scope: Scope::Gpu,
-        accepted: vec![0b10],
-        observed: 1,
-        pred_reads: vec![(GMEM, 64..68)],
-        epoch: e,
-    });
+    k.wait_until_pred(1, 0, GMEM2, FLAG, Scope::Gpu, 0b10, 1, &[(GMEM, 64..68)]);
     k.run()
 }
 

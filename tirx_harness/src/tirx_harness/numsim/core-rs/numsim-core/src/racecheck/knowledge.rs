@@ -20,12 +20,19 @@
 //!   through *every* thread sync, including relaxed arrives / relaxed waits
 //!   (PTX 9.7.18.6.4.4), and is moved into `tcgen` by `after_thread_sync`.
 //!
+//! * `tmap_rel` / `g2t` — the tensormap proxy (descriptor bytes written
+//!   generically, read by TMA through the tensormap proxy).
+//!   `fence.proxy.tensormap::generic.release` snapshots `hb` into
+//!   `tmap_rel` (propagating like a bridge); the consuming thread's
+//!   `.acquire` moves what reached it into its local `g2t` view, which a
+//!   TMA issued afterwards inherits (PTX §9.7.15.4).
+//!
 //! Shared memory, TMEM and global memory use this one structure; their
 //! differences are which slots are ever consulted (TMEM: `tcgen`; shared and
 //! global: `hb` + bridges for their domain).
 
-use crate::clock::{Clock, JoinMemo, Stamp};
-use crate::input::{Domain, Proxy, Scope};
+use super::clock::{Clock, JoinMemo, Stamp};
+use super::input::{Domain, Proxy, Scope};
 
 pub const NDOM: usize = 3;
 
@@ -36,6 +43,8 @@ pub struct Knowledge {
     pub a2g: [Clock; NDOM],
     pub tcgen: Clock,
     pub tcgen_rel: Clock,
+    pub tmap_rel: Clock,
+    pub g2t: Clock,
 }
 
 /// The release heads a write carries: its own head plus the heads it
@@ -58,6 +67,7 @@ pub enum View {
     G2a(usize),
     A2g(usize),
     Tcgen,
+    G2t,
 }
 
 /// Which clock judges "prior (in `prior` proxy, domain `d`) before current
@@ -66,6 +76,8 @@ pub enum View {
 pub fn select_view(prior: Proxy, cur: Proxy, d: Option<Domain>) -> View {
     match (prior, cur) {
         (Proxy::Tcgen, Proxy::Tcgen) => View::Tcgen,
+        (Proxy::Generic, Proxy::TensorMap) => View::G2t,
+        (Proxy::TensorMap, Proxy::Generic) => d.map_or(View::Hb, |d| View::A2g(d as usize)),
         (Proxy::Generic, Proxy::Async) => d.map_or(View::Hb, |d| View::G2a(d as usize)),
         (Proxy::Async, Proxy::Generic) => d.map_or(View::Hb, |d| View::A2g(d as usize)),
         _ => View::Hb,
@@ -97,6 +109,7 @@ impl Knowledge {
             View::G2a(d) => &self.g2a[d],
             View::A2g(d) => &self.a2g[d],
             View::Tcgen => &self.tcgen,
+            View::G2t => &self.g2t,
         }
     }
 
@@ -106,6 +119,7 @@ impl Knowledge {
             View::G2a(d) => &mut self.g2a[d],
             View::A2g(d) => &mut self.a2g[d],
             View::Tcgen => &mut self.tcgen,
+            View::G2t => &mut self.g2t,
         }
     }
 
@@ -122,11 +136,13 @@ impl Knowledge {
             self.a2g[d].join(&o.a2g[d], memo);
         }
         self.tcgen_rel.join(&o.tcgen_rel, memo);
+        self.tmap_rel.join(&o.tmap_rel, memo);
     }
 
     pub fn join_all(&mut self, o: &Knowledge, memo: &JoinMemo) {
         self.join_propagating(o, memo);
         self.tcgen.join(&o.tcgen, memo);
+        self.g2t.join(&o.g2t, memo);
     }
 
     /// The parts an acquire propagates, without `tcgen`.
@@ -137,6 +153,8 @@ impl Knowledge {
             a2g: self.a2g.clone(),
             tcgen: Clock::default(),
             tcgen_rel: self.tcgen_rel.clone(),
+            tmap_rel: self.tmap_rel.clone(),
+            g2t: Clock::default(),
         }
     }
 }

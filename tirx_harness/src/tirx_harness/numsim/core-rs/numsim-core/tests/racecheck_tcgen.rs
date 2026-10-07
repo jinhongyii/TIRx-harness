@@ -1,10 +1,9 @@
 //! Translated from test_native_tcgen_thread_fence.py,
 //! test_native_async_lifetime_contracts.py (tcgen rows) and
 //! test_native_same_warp_tmem_review.py.
+#[path = "racecheck_common/mod.rs"]
 mod common;
 use common::*;
-use numsim_race_core::input::*;
-use numsim_race_core::*;
 
 /// A tcgen05 op writing TMEM bytes `r` (and optionally reading smem).
 fn tc(k: &mut K, w: WarpId, kind: AsyncKind, preds: &[AsyncId], write: Option<std::ops::Range<u64>>, read: Option<std::ops::Range<u64>>) -> AsyncId {

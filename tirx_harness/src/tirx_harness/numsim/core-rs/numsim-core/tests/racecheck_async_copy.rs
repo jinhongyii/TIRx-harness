@@ -1,9 +1,8 @@
 //! Translated from test_native_raw_async_copy_footprints.py and the copy
 //! rows of test_native_async_lifetime_contracts.py.
+#[path = "racecheck_common/mod.rs"]
 mod common;
 use common::*;
-use numsim_race_core::input::*;
-use numsim_race_core::*;
 
 /// cp.async.mbarrier.arrive: the copy's completion arrives on the barrier.
 fn cp_async_arrive(read_before_wait: bool) -> Report {
@@ -234,7 +233,7 @@ fn reuse_and_oob() {
     let mut k = K::one_warp();
     let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16)]);
     k.ar(op, Proxy::Async, GMEM, 0..16);
-    k.raw(SyncEvent::AllocEnd { alloc: SMEM, site: 1 });
+    k.alloc_end(SMEM);
     k.st(0, 0, GMEM, 4090..4100);
     let r = k.run();
     assert!(r.findings.iter().any(|f| matches!(f.kind, FindingKind::AsyncLifetime { .. })));

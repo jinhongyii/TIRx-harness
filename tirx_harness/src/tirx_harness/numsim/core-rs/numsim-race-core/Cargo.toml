@@ -3,13 +3,14 @@ name = "numsim-race-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Standalone prototype of the unified FastTrack-style racecheck core (plan section 2.5): one Clock, one IntervalShadow, one Cell rule for shared, TMEM and global memory."
+description = "Benchmarks for the racecheck core (numsim_core::racecheck): packed stamps, exact-hit update, chunk join memo, witness packing."
 
 [lib]
 name = "numsim_race_core"
 path = "src/lib.rs"
 
 [dependencies]
+numsim-core = { path = "../numsim-core" }
 
 [dev-dependencies]
 criterion = { version = "=0.5.1", default-features = false }

@@ -3,10 +3,9 @@
 //! test_native_racecheck_release_rmw_handoff.py,
 //! test_native_shared_publication.py, test_native_racecheck_arrive_snapshot.py,
 //! test_native_sub_word_accesses.py and test_native_matrix_collective_sync.py.
+#[path = "racecheck_common/mod.rs"]
 mod common;
 use common::*;
-use numsim_race_core::input::*;
-use numsim_race_core::*;
 
 const FLAG: std::ops::Range<u64> = 0..4;
 

@@ -980,6 +980,12 @@ Roughly ordered by impact.
 | i | `red` never forms an acquire pattern (§8.8) | The input needs a `returns_value` bit (atom vs red). Today a relaxed RMW parks its read heads for a later `fence.acquire`, which is wrong for `red`. |
 | h | tcgen state is per warp in the prototype | The elected issuing lane makes this exact for current kernels. Per-lane tcgen is a mechanical extension. |
 
+**Phase 3 (integration) status.** The core now lives in
+`numsim-core/src/racecheck/`. `RaceObserver: Observer` adapts contract events;
+see §11. The open items d, e and h are implemented there: TensorMap, GC,
+slot reclaim and per-lane tcgen. Item i is also done: `red` never acquires,
+using `Access::returns_value`.
+
 **Input shape needed from the contract.** It is defined in
 `numsim-race-core/src/input.rs`, the only file to change when the contract lands.
 
@@ -1015,3 +1021,109 @@ The SyncTable resolves:
 - the ops a commit tracks.
 
 The checker sees only resolved milestones.
+
+
+---
+
+## 11. Integration with the contract (phase 3)
+
+### Layout
+
+| Path | What it is |
+| --- | --- |
+| `numsim-core/src/racecheck/` | the core: `clock`, `knowledge`, `shadow`, `cell`, `checker`; an alias layer `input`; the adapter `observer`; and `payload` |
+| `numsim-race-core/` | re-exports the core and keeps the criterion benches |
+| `numsim-core/tests/racecheck_*.rs` | 80 scenario tests that drive `RaceObserver` through contract `Access`/`SyncEvent` values |
+
+### Adapter (`observer.rs`)
+
+- A contract `Access` batch is split per `LaneSpan`.
+- `Sem` is normalised:
+  - `Volatile` and `Mmio` → relaxed at `.sys`;
+  - `Sc` → an SC fence followed by `AcqRel`.
+- `Proxy::ReadOnly` is checked as generic.
+- `Local`, `Param` and `Reg` accesses are skipped, because they are
+  thread-private.
+- `Protocol` events, `FenceEvent::MbarrierInit` and `FenceEvent::ProxyAlias` are
+  ignored. Synccheck owns mbarrier init. The shadow is keyed by physical bytes,
+  so virtual aliases need nothing.
+- `begin_launch` registers every arena allocation in the global, shared and
+  tmem spaces.
+- `end_launch` runs a final GC and finalises the launch. Outstanding async
+  work becomes `AsyncNeverCompleted`.
+- Events outside a launch become `EventOutsideLaunch`.
+
+### Merge design
+
+The scheduler is single-threaded, so there is one shadow and it is always
+merged; `inbox_drain` is only a GC safe point. When CTA parallelism lands:
+- shared memory and TMEM stay CTA-private;
+- the global shadow is partitioned by stripe;
+- a round's global accesses are applied at the receiving CTA's next drain, in
+  `(round, cta, seq)` order;
+- `end_launch` drains every buffer before finalising.
+
+### View-aware GC (`Checker::gc`, every `gc_every` events and at drains)
+
+1. Compute the meet, per view, of what every live actor knows:
+   - for each warp, its `base` knowledge;
+   - for lane-local tcgen state, the meet over the warp's lanes;
+   - each in-flight async op's `k`.
+2. A witness is **fully dead** when, for every proxy a future access to its
+   space can use, the view `select_view(witness proxy, that proxy, domain)`
+   observes it. Fully dead witnesses are dropped. The proxies per space are:
+   - TMEM: tcgen;
+   - otherwise: generic, async and tensormap.
+3. Generic witnesses get a narrower rule while the allocation is not yet proxy
+   sensitive. If such a witness is dead in its own proxy but not bridged:
+   - it is folded into a per-allocation summary, one entry per
+     `(actor, lane, write, window)`, holding the latest stamp and the byte hull;
+   - the first non-generic access to the allocation is checked against the
+     summary and marks the allocation sensitive.
+
+   This is RS's `RetiredGenericHistory`, made view-correct; legacy G's
+   proxy-blind floor is fixed.
+4. The latest write that carries release heads is never dropped.
+
+### Async-slot reclaim
+
+- Once an op has fully completed and no witness names it, its slot is reused
+  with `gen_base += 2`.
+- A view that carries a newer generation was snapshotted after every live
+  actor's `hb` observed the old one. Comparing an old summary stamp against it
+  is therefore sound.
+- Reclaimed `AsyncId`s are remembered, so a late predecessor reference is not
+  reported as unknown.
+
+### Further ports
+
+- **TensorMap.**
+  - `TensormapRelease` snapshots `hb` into `tmap_rel`, a propagating bridge
+    with own-warp rows.
+  - `TensormapAcquire` moves what reached the lane into its local `g2t`.
+  - A TMA inherits `g2t` and reads the descriptor through `Proxy::TensorMap`.
+  - A consume without acquire is a `missing_proxy_bridge` race. Legacy aborted
+    with a hard error.
+- **Per-lane tcgen.** `tcgen`, `tcgen_in`, `tcgen_issued`, `tcgen_waited` and
+  `tcgen_pub` are kept per PTX thread.
+- **16-byte witnesses** (`cell::Witness`):
+  - the layout is a packed stamp plus one metadata word;
+  - spans that are too wide go to a side table;
+  - sites come from a per-warp `(epoch, site)` table, pruned by GC, and from
+    the async slot.
+
+### Benchmarks
+
+`numsim-race-core/benches/core.rs`, same machine. "Before" is the phase-2
+prototype with 48-byte witnesses; "after" is the phase-3 core.
+
+| Benchmark | Before | After |
+| --- | --- | --- |
+| `checker_tile_loop` (8.7K events) | 1.62 ms | 1.46 ms |
+| `checker_readers` (9.7K events, 512-way read frontiers) | 4.01 ms | 2.77 ms |
+
+The "after" column also includes two other optimisations:
+- barrier arrivals are grouped by `(CTA, scope)`, so a wait costs O(groups);
+- empty tcgen frontiers are skipped.
+
+The micro-benches are unchanged: packed stamps, exact hits and the join memo.

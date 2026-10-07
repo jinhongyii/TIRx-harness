@@ -97,10 +97,20 @@ that a future change is caught.
 | S5 | `bar.warp.sync` and in-flight async ops | No ordering for in-flight async ops | B6 (R7) |
 | S6 | Whether `fence.sc` is also an `acq_rel` fence | Treated as `acq_rel` at its scope | A5 (R8) |
 
+## Phase 3 (integration)
+
+| ID | Change | Legacy | New | ISA basis |
+| --- | --- | --- | --- | --- |
+| I1 | TensorMap consume without `fence.proxy.tensormap::generic.acquire` | G: hard `Err` (aborts the run) | `missing_proxy_bridge` data race. A release without an acquire, or an acquire without a release, is reported as a race. | §9.7.15.4 |
+| I2 | `red` never acquires | G: `can_acquire` = Atomic class only | Same (confirmed), using `Access::returns_value`. A relaxed `red` + `fence.acquire` gives no edge. | §8.8 |
+| I3 | mbarrier scope not carried by the contract | — | Assumed `.cta`. A cross-CTA arrival that fails the check → `Incomplete::MbarrierScopeUnknown` (temporary; CONTRACT_REQUESTS W5-1) | §9.7.15.16.16 |
+| I4 | GC of generic witnesses | RS: retired generic history with 64-range coalescing (spurious errors possible). G: proxy-blind floor. | Per-`(actor, lane, kind, window)` summary with a byte hull, checked on the first non-generic access. Fully-dead witnesses are dropped only when every view observes them. | §8.9.5 |
+| I5 | tcgen ordering state | Per warp in RS lane-order layers; per thread in TG | Per lane (PTX thread) | §9.7.18 |
+
 ## Known gaps (not deltas yet)
 
-- **`red` must never form an acquire pattern (§8.8).** The input shape lacks an
-  atom-vs-red bit, so a relaxed `red` currently parks its read heads for a later
-  `fence.acquire`, exactly as `atom` does.
-- **Not ported:** TensorMap release/acquire/consume, view-aware GC, and
-  inbox-drain merge.
+- **CTA-parallel inbox-drain merge.** The scheduler is single-threaded today,
+  so there is nothing to merge yet. The design is in `racecheck-semantics.md`
+  §11.
+- **mbarrier scope and lost `.sem` qualifiers.** These need a contract change
+  (W5-1).

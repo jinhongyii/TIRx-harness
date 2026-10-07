@@ -141,7 +141,7 @@ impl JoinMemo {
 /// Scalar components in shared immutable chunks. `None` chunk = zeros.
 #[derive(Clone, Debug, Default)]
 pub struct Epochs {
-    chunks: Option<Arc<[Option<Arc<Chunk>>]>>,
+    pub(crate) chunks: Option<Arc<[Option<Arc<Chunk>>]>>,
 }
 
 impl Epochs {
@@ -157,7 +157,7 @@ impl Epochs {
         }
     }
 
-    fn ptr_eq(&self, other: &Self) -> bool {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
         match (&self.chunks, &other.chunks) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             (None, None) => true,
@@ -293,6 +293,12 @@ pub struct Clock {
 }
 
 impl Clock {
+    /// No component at all (never joined or raised).
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.epochs.chunks.is_none() && self.lanes.is_none()
+    }
+
     #[inline(always)]
     pub fn get(&self, actor: ActorId) -> Epoch {
         self.epochs.get(actor)
@@ -380,6 +386,23 @@ impl Clock {
             }
         }
         changed
+    }
+
+    /// Component-wise minimum (lane entries dropped: a lower bound). Used by
+    /// the dominated-frontier GC; O(nonzero components).
+    pub fn meet(&self, other: &Clock) -> Clock {
+        let mut out = Clock::default();
+        if self.epochs.ptr_eq(&other.epochs) {
+            out.epochs = self.epochs.clone();
+            return out;
+        }
+        for (a, e) in self.epochs.nonzero() {
+            let m = e.min(other.get(a));
+            if m > 0 {
+                out.epochs.raise(a, m);
+            }
+        }
+        out
     }
 
     pub fn leq(&self, other: &Clock, memo: &JoinMemo) -> bool {

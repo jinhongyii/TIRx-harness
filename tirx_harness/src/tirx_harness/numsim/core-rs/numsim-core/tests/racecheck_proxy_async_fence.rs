@@ -1,9 +1,8 @@
 //! Translated from tests/analysis_tools/racecheck/test_native_proxy_async_fence.py
 //! and the proxy rows of test_native_shared_publication.py.
+#[path = "racecheck_common/mod.rs"]
 mod common;
 use common::*;
-use numsim_race_core::input::*;
-use numsim_race_core::*;
 
 const BAR: SyncObjId = 7;
 
