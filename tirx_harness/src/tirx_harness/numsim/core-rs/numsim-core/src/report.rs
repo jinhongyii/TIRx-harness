@@ -156,6 +156,7 @@ mod tests {
             kind: FindingKind::DataRace,
             status,
             message: String::new(),
+            attrs: BTreeMap::new(),
             sites: vec![],
             evidence: vec![],
         };
