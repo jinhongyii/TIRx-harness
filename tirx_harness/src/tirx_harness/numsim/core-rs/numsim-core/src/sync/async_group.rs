@@ -143,7 +143,76 @@ impl super::Protocol for AsyncGroup {
 }
 
 pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
-    unimplemented!("W3: async_group::step")
+    match cmd {
+        Cmd::Issue => {
+            state.open += 1;
+            Ok(Outcome::Done)
+        }
+        Cmd::Commit => {
+            let g = close(state, true, 0);
+            Ok(Outcome::Committed { ordinal: g.ordinal, empty: g.ops == 0 })
+        }
+        Cmd::ArriveOn => {
+            if state.domain != Domain::CpAsync {
+                return Err(Error::InvalidForm);
+            }
+            if state.open != 0 {
+                let g = close(state, false, 1);
+                return Ok(Outcome::ArriveOn { group: Some(g.ordinal) });
+            }
+            // FIFO completion: the newest unfinished group completes last.
+            let newest = state.groups.iter_mut().rev().find(|g| g.milestone != Milestone::FullyDone);
+            Ok(Outcome::ArriveOn {
+                group: newest.map(|g| {
+                    g.arrivals += 1;
+                    g.ordinal
+                }),
+            })
+        }
+        Cmd::Complete { ordinal, milestone } => {
+            let Some(i) = enabled_index(state, milestone).filter(|&i| state.groups[i].ordinal == ordinal) else {
+                return Err(Error::NotEnabled { ordinal, milestone });
+            };
+            let g = &mut state.groups[i];
+            g.milestone = milestone;
+            let arrivals = if milestone == Milestone::FullyDone { std::mem::take(&mut g.arrivals) } else { 0 };
+            Ok(Outcome::Completed { arrivals })
+        }
+        Cmd::Wait { n, read } => {
+            if read && state.domain == Domain::CpAsync {
+                return Err(Error::InvalidForm);
+            }
+            let acquired = if read { Milestone::ReadsDone } else { Milestone::FullyDone };
+            let prefix = wait_prefix_len(state, n);
+            if state.groups.range(..prefix).any(|g| g.milestone < acquired) {
+                return Ok(Outcome::Blocked);
+            }
+            let retired = if read {
+                // `.read` retires only empty (complete) groups of the prefix.
+                let mut kept = VecDeque::with_capacity(state.groups.len());
+                let mut retired = 0u32;
+                for (i, g) in std::mem::take(&mut state.groups).into_iter().enumerate() {
+                    if i < prefix && g.ops == 0 {
+                        retired += 1;
+                    } else {
+                        kept.push_back(g);
+                    }
+                }
+                state.groups = kept;
+                retired
+            } else {
+                state.groups.drain(..prefix);
+                prefix as u32
+            };
+            Ok(Outcome::Ready { retired, acquired })
+        }
+        Cmd::Exit => {
+            if state.domain == Domain::Bulk && state.open != 0 {
+                close(state, true, 0);
+            }
+            Ok(Outcome::Done)
+        }
+    }
 }
 
 
@@ -151,7 +220,17 @@ pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
 /// Number of oldest groups a `wait_group n` must cover: everything up to and
 /// including the (n+1)-th newest closing group (`async_groups.rs:897-909`).
 pub fn wait_prefix_len(s: &State, n: u64) -> usize {
-    unimplemented!("W3: async_group::wait_prefix_len")
+    let mut remaining = n;
+    for (i, g) in s.groups.iter().enumerate().rev() {
+        if !g.closes {
+            continue;
+        }
+        if remaining == 0 {
+            return i + 1;
+        }
+        remaining -= 1;
+    }
+    0
 }
 
 /// Review-level lint. The ISA does not require a commit before exit
@@ -162,15 +241,83 @@ pub enum Lint {
 }
 
 pub fn exit_lint(s: &State) -> Option<Lint> {
-    unimplemented!("W3: async_group::exit_lint")
+    (s.open != 0).then_some(Lint::UncommittedAtExit { open: s.open })
 }
 
 /// Run after the completion pump has drained. Committed groups always
 /// complete, so an error here is an infrastructure fault.
 pub fn quiescent(s: &State) -> Result<(), Error> {
-    unimplemented!("W3: async_group::quiescent")
+    match s.groups.iter().find(|g| g.milestone != Milestone::FullyDone) {
+        Some(g) => Err(Error::PendingAtExit { ordinal: g.ordinal }),
+        None => Ok(()),
+    }
 }
 
 pub fn check_invariants(s: &State) -> Result<(), String> {
-    unimplemented!("W3: async_group::check_invariants")
+    let mut last_ordinal = None;
+    let mut last_nonempty = None;
+    for g in &s.groups {
+        if last_ordinal.is_some_and(|o| o >= g.ordinal) || g.ordinal >= s.next_ordinal {
+            return Err("ordinals not increasing".into());
+        }
+        last_ordinal = Some(g.ordinal);
+        if g.ops == 0 && g.milestone != Milestone::FullyDone {
+            return Err("empty group not complete".into());
+        }
+        if g.milestone == Milestone::FullyDone && g.arrivals != 0 {
+            return Err("arrivals held past full completion".into());
+        }
+        if g.ops != 0 {
+            if last_nonempty.is_some_and(|m| m < g.milestone) {
+                return Err("milestone overtook an older group (FIFO)".into());
+            }
+            last_nonempty = Some(g.milestone);
+        }
+    }
+    Ok(())
+}
+
+/// Move the open issues into a new group. Empty groups are born complete.
+fn close(s: &mut State, closes: bool, arrivals: u32) -> Group {
+    let ops = std::mem::take(&mut s.open);
+    let milestone = if ops == 0 { Milestone::FullyDone } else { Milestone::Pending };
+    let g = Group { ordinal: s.next_ordinal, closes, ops, milestone, arrivals };
+    s.next_ordinal += 1;
+    s.groups.push_back(g);
+    g
+}
+
+/// Index of the group whose `milestone` may fire next: reads on the oldest
+/// pending group; full completion on the oldest unfinished group once its
+/// reads are done (`async_groups.rs:794-817`).
+fn enabled_index(s: &State, milestone: Milestone) -> Option<usize> {
+    match milestone {
+        Milestone::ReadsDone => s.groups.iter().position(|g| g.milestone == Milestone::Pending),
+        Milestone::FullyDone => s
+            .groups
+            .iter()
+            .position(|g| g.milestone != Milestone::FullyDone)
+            .filter(|&i| s.groups[i].milestone == Milestone::ReadsDone),
+        Milestone::Pending => None,
+    }
+}
+
+/// Is `Complete { ordinal, milestone }` enabled now?
+pub fn milestone_enabled(s: &State, ordinal: u64, milestone: Milestone) -> bool {
+    enabled_index(s, milestone).is_some_and(|i| s.groups[i].ordinal == ordinal)
+}
+
+use crate::report::FindingKind;
+
+/// Map a protocol error to its report kind.
+pub fn finding_kind(e: &Error) -> FindingKind {
+    match e {
+        Error::InvalidForm => FindingKind::AsyncGroupMisuse,
+        Error::NotEnabled { .. } | Error::PendingAtExit { .. } => FindingKind::RuntimeError,
+    }
+}
+
+/// Report kind of an exit lint (reported with `Status::Review`).
+pub fn lint_kind(_l: &Lint) -> FindingKind {
+    FindingKind::UnwaitedAsync
 }

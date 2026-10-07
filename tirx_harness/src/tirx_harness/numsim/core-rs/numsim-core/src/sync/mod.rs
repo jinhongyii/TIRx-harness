@@ -28,6 +28,7 @@ pub mod cluster;
 pub mod completion;
 pub mod mbarrier;
 pub mod named;
+pub mod query;
 pub mod setmaxnreg;
 pub mod tcgen;
 
@@ -141,6 +142,27 @@ pub enum Resource {
     RegPool(setmaxnreg::State),
 }
 
+impl SyncError {
+    /// Report kind of this error. Kinds mapped to `RuntimeError` are engine
+    /// or scheduler faults, not kernel errors.
+    pub fn finding_kind(&self) -> crate::report::FindingKind {
+        match self {
+            SyncError::Mbarrier(e) => mbarrier::finding_kind(e),
+            SyncError::Named(e) => named::finding_kind(e),
+            SyncError::Cluster(e) => cluster::finding_kind(e),
+            SyncError::AsyncGroup(e) => async_group::finding_kind(e),
+            SyncError::Tcgen(e) => tcgen::finding_kind(e),
+            SyncError::RegPool(e) => setmaxnreg::finding_kind(e),
+            SyncError::WrongResource { .. } => crate::report::FindingKind::RuntimeError,
+        }
+    }
+
+    /// An engine/scheduler fault rather than a property of the kernel.
+    pub fn is_infrastructure(&self) -> bool {
+        self.finding_kind() == crate::report::FindingKind::RuntimeError
+    }
+}
+
 /// Launch facts needed to create resources implicitly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct ResourceInit {
@@ -218,13 +240,21 @@ impl SyncTable {
     }
 
     /// Apply `cmd` to resource `id` (created on first use).
+    ///
+    /// Transactional: on `Err` the table is unchanged (a resource created for
+    /// this command is not kept). A `Blocked` outcome keeps the protocol's
+    /// own bookkeeping, e.g. a parked mbarrier wait (`armed`) that consumes
+    /// the phase when it completes; the retry is idempotent.
     pub fn step(&mut self, id: ResourceId, cmd: SyncCmd) -> Result<Step<Outcome>, SyncError> {
-        if !self.resources.contains_key(&id) {
-            let r = self.fresh(id).ok_or(SyncError::WrongResource { resource: id })?;
-            self.resources.insert(id, r);
-        }
-        let res = self.resources.get_mut(&id).expect("inserted above");
-        let out = Self::apply(res, id, cmd)?;
+        let out = match self.resources.get_mut(&id) {
+            Some(res) => Self::apply(res, id, cmd)?,
+            None => {
+                let mut res = self.fresh(id).ok_or(SyncError::WrongResource { resource: id })?;
+                let out = Self::apply(&mut res, id, cmd)?;
+                self.resources.insert(id, res);
+                out
+            }
+        };
         Ok(if out.is_blocked() { Step::Blocked(id) } else { Step::Done(out) })
     }
 
@@ -258,9 +288,31 @@ impl SyncTable {
 
     /// Is this completion enabled now (W3 spec 1.3 rules: mbarrier action
     /// generation, async-group FIFO, grant availability)?
+    ///
+    /// "Enabled" means applying it now cannot be premature. A completion that
+    /// can never become applicable (stale generation, landing on an already
+    /// completed phase, unknown resource) is enabled, so that applying it
+    /// reports the protocol error at landing (behaviour deltas M9/M10)
+    /// instead of leaving it queued until the exit check.
     pub fn enabled(&self, c: &Completion) -> bool {
-        let _ = c;
-        unimplemented!("W3: SyncTable::enabled")
+        let res = self.resources.get(&c.resource());
+        match (*c, res) {
+            (Completion::MbarTx { gen, .. } | Completion::MbarArrive { gen, .. }, Some(Resource::Mbarrier(s))) => {
+                // Bound at issue to `gen + complete`; it cannot land beyond
+                // the phase after the current one (hardware_barriers.rs:2643-2653).
+                !s.live || gen <= s.gen + u64::from(s.complete)
+            }
+            (Completion::GroupMilestone { ordinal, milestone, .. }, Some(Resource::AsyncGroup(s))) => {
+                async_group::milestone_enabled(s, ordinal, milestone)
+            }
+            (Completion::SetmaxGrant { wg, .. }, Some(Resource::RegPool(s))) => {
+                s.pending.get(wg as usize).copied().flatten().is_some_and(|p| p.required <= s.available)
+            }
+            // FIFO milestones and grants wait for their resource; anything
+            // else (missing or mismatched resource) errors when applied.
+            (Completion::GroupMilestone { .. } | Completion::SetmaxGrant { .. }, None) => false,
+            _ => true,
+        }
     }
 
     /// Apply a completion through the protocol `step`.
@@ -276,6 +328,29 @@ impl SyncTable {
             Completion::SetmaxGrant { wg, .. } => SyncCmd::RegPool(setmaxnreg::Cmd::Grant { wg }),
         };
         self.step(c.resource(), cmd)
+    }
+
+    /// Review-level exit lints (dangling named-barrier generations,
+    /// uncommitted async issues), sorted by resource.
+    pub fn exit_lints(&self) -> Vec<(ResourceId, crate::report::FindingKind, String)> {
+        let mut out = Vec::new();
+        for (id, r) in &self.resources {
+            match r {
+                Resource::Named(s) => {
+                    if let Some(l) = named::exit_lint(s) {
+                        out.push((*id, named::lint_kind(&l), format!("{l:?}")));
+                    }
+                }
+                Resource::AsyncGroup(s) => {
+                    if let Some(l) = async_group::exit_lint(s) {
+                        out.push((*id, async_group::lint_kind(&l), format!("{l:?}")));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.sort_by_cached_key(|(id, _, _)| format!("{id:?}"));
+        out
     }
 
     /// Exit check over every resource (after the queues drained): each

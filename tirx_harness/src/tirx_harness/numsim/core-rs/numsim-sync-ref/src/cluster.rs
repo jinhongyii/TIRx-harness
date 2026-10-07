@@ -204,6 +204,11 @@ fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
     }
 }
 
+/// Launch-exit check. Never an error: exit-aware membership completes every generation by kernel exit.
+pub fn quiescent(_s: &State) -> Result<(), Error> {
+    Ok(())
+}
+
 pub fn check_invariants(s: &State) -> Result<(), String> {
     if s.all_arrived() {
         return Err("a complete generation was not rolled".into());

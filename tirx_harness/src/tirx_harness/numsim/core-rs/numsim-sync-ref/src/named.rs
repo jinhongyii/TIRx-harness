@@ -228,6 +228,11 @@ pub fn exit_lint(s: &State) -> Option<Lint> {
     }
 }
 
+/// Launch-exit check. Never an error: a dangling generation is reported by [`exit_lint`] instead.
+pub fn quiescent(_s: &State) -> Result<(), Error> {
+    Ok(())
+}
+
 pub fn check_invariants(s: &State) -> Result<(), String> {
     let Some(expected) = s.expected else {
         return (s.gen == 0 && !s.complete && s.arrived == 0 && s.warps.is_empty())

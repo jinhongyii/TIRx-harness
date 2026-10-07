@@ -655,7 +655,10 @@ pub struct MbarArriveArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MbarQueryOp {
     PendingCount { state: Operand },
-    CheckLayout { mbar: Operand, space: AddrSpace },
+    /// `layout_v1` is the layout the kernel declared for this barrier
+    /// (`true` = `.layout::v1`, 511-arrival limit); the query reports
+    /// whether the live object matches (W3-4).
+    CheckLayout { mbar: Operand, space: AddrSpace, layout_v1: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

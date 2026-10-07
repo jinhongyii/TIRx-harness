@@ -985,3 +985,20 @@ The open questions Q1–Q7 are answered in `sync-isa-answers.md` (PTX 9.4). The 
 3. assert equal results and an equal projected state after every step.
 
 Per redesign §2.6, this runs under `cfg(test)` and nightly.
+
+### 9.1 Production implementation (`numsim-core::sync`)
+
+The production bodies in `numsim-core/src/sync/*.rs` implement the reference semantics. They validate against `&State` and then commit, with no per-step state clone.
+
+`tests/sync_differential.rs` feeds random sequences to both implementations: 4096 cases per property, up to 80 commands each. After every command it requires identical results, states and exit checks. Coverage:
+
+- every protocol, with mbarrier under both policies;
+- the tcgen kernel group and work queues;
+- the `SyncTable` dispatch (transactional on error, `Blocked` lifting);
+- `SyncTable::enabled`. An mbarrier completion is enabled unless landing it now would be premature. A completion that can never apply is enabled, so it errors at landing. A milestone or grant is enabled exactly when applying it succeeds.
+
+Eight seeded mutations of the production code were each caught.
+
+Side queries are pinned in `sync/query.rs`: the state-token layout, `pending_count`, and `check_layout`.
+
+Error mapping: `SyncError::finding_kind` maps each error to a report kind. `RuntimeError` marks infrastructure faults. Exit lints go through `SyncTable::exit_lints` and are reported as Review.

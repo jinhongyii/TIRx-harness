@@ -6,7 +6,7 @@
 //! precise advisory; `Incomplete` means coverage cannot support a claim and
 //! is never success.
 
-use crate::arena::ByteSpan;
+use crate::arena::{AllocId, ByteSpan, Space};
 use crate::observe::Actor;
 use crate::site::SiteId;
 use serde::{Deserialize, Serialize};
@@ -54,10 +54,15 @@ pub enum FindingKind {
 pub struct Evidence {
     /// Role in the finding (`"first_access"`, `"second_access"`, `"waiter"`, ...).
     pub role: String,
+    /// Index of the kernel (within the `Module`) whose `sites` table `site` indexes (W8-2).
+    pub kernel: u32,
     pub site: SiteId,
     pub actor: Option<Actor>,
     /// Buffer name and allocation-relative bytes, when relevant.
     pub buffer: Option<String>,
+    /// Memory space and allocation of `bytes` (W8-2; legacy payloads always carry `space`).
+    pub space: Option<Space>,
+    pub alloc: Option<AllocId>,
     pub bytes: Option<ByteSpan>,
     pub detail: Option<String>,
 }
@@ -104,6 +109,8 @@ impl Verdict {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     pub tool: String,
+    /// Launch (kernel index within the `Module`) this report covers; one `Report` per launch (W8-2).
+    pub launch: u32,
     pub verdict: Verdict,
     pub findings: Vec<Finding>,
     /// What was covered (e.g. explored states, launches), free-form.
@@ -112,7 +119,7 @@ pub struct Report {
 
 impl Report {
     pub fn new(tool: &str, findings: Vec<Finding>) -> Report {
-        Report { tool: tool.to_string(), verdict: Verdict::of(&findings), findings, coverage: Vec::new() }
+        Report { tool: tool.to_string(), launch: 0, verdict: Verdict::of(&findings), findings, coverage: Vec::new() }
     }
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("Report is serializable")

@@ -141,16 +141,104 @@ impl super::Protocol for Cluster {
 }
 
 pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
-    unimplemented!("W3: cluster::step")
+    match cmd {
+        Cmd::Arrive { warp, mask, .. } => {
+            participation(state, warp, mask)?;
+            if state.arrived.contains(&warp) {
+                return Err(Error::EarlyArrival { warp });
+            }
+            let gen = state.gen;
+            let previous = state.last_arrival.insert(warp, gen);
+            let rearrival_without_wait = previous.is_some() && state.last_waited.get(&warp) != previous.as_ref();
+            state.arrived.insert(warp);
+            let completed = roll_if_complete(state);
+            Ok(Outcome::Arrived { gen, completed, rearrival_without_wait })
+        }
+        Cmd::Wait { warp, mask, .. } => {
+            participation(state, warp, mask)?;
+            let gen = *state.last_arrival.get(&warp).ok_or(Error::WaitBeforeArrival { warp })?;
+            if matches!(state.last_waited.get(&warp), Some(&w) if w >= gen) {
+                return Err(Error::DuplicateWait { warp, gen });
+            }
+            if gen >= state.gen {
+                return Ok(Outcome::Blocked);
+            }
+            state.last_waited.insert(warp, gen);
+            Ok(Outcome::Ready { gen })
+        }
+        Cmd::Exit { warp, lanes } => {
+            if live_lanes(state, warp) == 0 {
+                return Err(Error::UnexpectedParticipant { warp });
+            }
+            state.live[warp as usize] &= !lanes;
+            Ok(Outcome::Exited { completed: roll_if_complete(state) })
+        }
+    }
 }
 
 
+
+/// Launch-exit check. Never an error: exit-aware membership completes every generation by kernel exit.
+pub fn quiescent(_s: &State) -> Result<(), Error> {
+    Ok(())
+}
 
 pub fn check_invariants(s: &State) -> Result<(), String> {
-    unimplemented!("W3: cluster::check_invariants")
+    if complete(s) {
+        return Err("a complete generation was not rolled".into());
+    }
+    for (w, &g) in &s.last_arrival {
+        if g > s.gen || (g == s.gen) != s.arrived.contains(w) {
+            return Err("arrival bookkeeping out of step".into());
+        }
+    }
+    for (w, &g) in &s.last_waited {
+        if g >= s.gen || s.last_arrival.get(w).is_none_or(|&a| a < g) {
+            return Err("wait on an incomplete or unarrived generation".into());
+        }
+    }
+    Ok(())
 }
 
-/// End-of-launch check (contract addition; not yet in the reference).
-pub fn quiescent(s: &State) -> Result<(), Error> {
-    unimplemented!("W3: cluster::quiescent")
+fn live_lanes(s: &State, warp: Warp) -> LaneMask {
+    s.live.get(warp as usize).copied().unwrap_or(0)
+}
+
+/// PTX §9.7.15.3: the instruction is executed by exactly the warp's
+/// non-exited lanes.
+fn participation(s: &State, warp: Warp, mask: LaneMask) -> Result<(), Error> {
+    let live = live_lanes(s, warp);
+    if live == 0 {
+        return Err(Error::UnexpectedParticipant { warp });
+    }
+    if mask != live {
+        return Err(Error::PartialWarp { mask, live });
+    }
+    Ok(())
+}
+
+/// All non-exited member warps arrived (and at least one warp arrived).
+fn complete(s: &State) -> bool {
+    let members = s.live.iter().filter(|&&m| m != 0).count();
+    let arrived_members = s.arrived.iter().filter(|&&w| live_lanes(s, w) != 0).count();
+    !s.arrived.is_empty() && arrived_members == members
+}
+
+fn roll_if_complete(s: &mut State) -> bool {
+    let done = complete(s);
+    if done {
+        s.gen += 1;
+        s.arrived.clear();
+    }
+    done
+}
+
+use crate::report::FindingKind;
+
+/// Map a protocol error to its report kind.
+pub fn finding_kind(e: &Error) -> FindingKind {
+    match e {
+        Error::UnexpectedParticipant { .. } => FindingKind::RuntimeError,
+        _ => FindingKind::BarrierMismatch,
+    }
 }

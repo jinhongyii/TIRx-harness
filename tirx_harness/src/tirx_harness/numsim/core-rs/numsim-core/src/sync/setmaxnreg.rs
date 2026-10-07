@@ -118,7 +118,69 @@ impl super::Protocol for Setmaxnreg {
 }
 
 pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
-    unimplemented!("W3: setmaxnreg::step")
+    match cmd {
+        Cmd::Configure { count } => {
+            if !valid_count(count) || count > default_count(state.warps_per_cta) {
+                return Err(Error::InvalidCount { count });
+            }
+            if state.started || state.configured.is_some_and(|c| c != count) {
+                return Err(Error::ConfigureConflict);
+            }
+            state.configured = Some(count);
+            state.current.fill(count);
+            state.available = 0;
+            Ok(Outcome::Done)
+        }
+        Cmd::Set { wg, inc, count } => {
+            if !valid_count(count) {
+                return Err(Error::InvalidCount { count });
+            }
+            let i = warpgroup(state, wg)?;
+            if state.pending[i].is_some() {
+                return Err(Error::WarpgroupPending { wg });
+            }
+            if state.needs_sync[i] {
+                return Err(Error::MissingWarpgroupSync { wg });
+            }
+            let current = state.current[i];
+            let legal = if inc { count >= current } else { count <= current };
+            if !legal {
+                return Err(Error::InvalidDirection { inc, current, count });
+            }
+            state.started = true;
+            state.needs_sync[i] = true;
+            if !inc {
+                state.available += current - count;
+                state.current[i] = count;
+                return Ok(Outcome::Applied { count });
+            }
+            let required = count - current;
+            if required > state.available {
+                state.pending[i] = Some(Pending { target: count, required });
+                return Ok(Outcome::Pending { required });
+            }
+            state.available -= required;
+            state.current[i] = count;
+            Ok(Outcome::Applied { count })
+        }
+        Cmd::WarpgroupSync { wg } => {
+            let i = warpgroup(state, wg)?;
+            state.needs_sync[i] = false;
+            Ok(Outcome::Done)
+        }
+        Cmd::Grant { wg } => {
+            let i = warpgroup(state, wg)?;
+            let p = state.pending[i].filter(|p| p.required <= state.available).ok_or(Error::GrantNotEnabled { wg })?;
+            state.available -= p.required;
+            state.current[i] = p.target;
+            state.pending[i] = None;
+            Ok(Outcome::Applied { count: p.target })
+        }
+        Cmd::Poll { wg } => {
+            let i = warpgroup(state, wg)?;
+            Ok(if state.pending[i].is_some() { Outcome::Blocked } else { Outcome::Ready })
+        }
+    }
 }
 
 
@@ -126,18 +188,58 @@ pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
 /// Grants the scheduler may fire now. The legacy hub fires only the one with
 /// the lowest hashed action id per pump; the verifier explores all of them.
 pub fn enabled_grants(s: &State) -> Vec<u32> {
-    unimplemented!("W3: setmaxnreg::enabled_grants")
+    (0..s.pending.len())
+        .filter(|&i| s.pending[i].is_some_and(|p| p.required <= s.available))
+        .map(|i| i as u32)
+        .collect()
 }
 
 pub fn quiescent(s: &State) -> Result<(), Error> {
-    unimplemented!("W3: setmaxnreg::quiescent")
+    match s.pending.iter().position(Option::is_some) {
+        Some(i) => Err(Error::PendingAtExit { wg: i as u32 }),
+        None => Ok(()),
+    }
 }
 
 /// The initial pool total, which every transition conserves.
 pub fn initial_total(s: &State) -> u32 {
-    unimplemented!("W3: setmaxnreg::initial_total")
+    s.configured.unwrap_or_else(|| default_count(s.warps_per_cta)) * s.current.len() as u32
 }
 
 pub fn check_invariants(s: &State) -> Result<(), String> {
-    unimplemented!("W3: setmaxnreg::check_invariants")
+    let total = s.available + s.current.iter().sum::<u32>();
+    if total != initial_total(s) {
+        return Err("register pool not conserved".into());
+    }
+    if total > CTA_REGISTER_POOL {
+        return Err("register oversubscription".into());
+    }
+    if s.current.iter().zip(&s.pending).any(|(c, p)| p.is_some_and(|p| p.target != c + p.required)) {
+        return Err("pending target inconsistent".into());
+    }
+    Ok(())
+}
+
+fn valid_count(count: u32) -> bool {
+    (MIN_COUNT..=MAX_COUNT).contains(&count) && count.is_multiple_of(GRANULARITY)
+}
+
+fn warpgroup(s: &State, wg: u32) -> Result<usize, Error> {
+    let complete = wg.checked_add(1).and_then(|n| n.checked_mul(WARPS_PER_GROUP)).is_some_and(|end| end <= s.warps_per_cta);
+    if complete {
+        Ok(wg as usize)
+    } else {
+        Err(Error::IncompleteWarpgroup { wg })
+    }
+}
+
+use crate::report::FindingKind;
+
+/// Map a protocol error to its report kind.
+pub fn finding_kind(e: &Error) -> FindingKind {
+    match e {
+        Error::PendingAtExit { .. } => FindingKind::Deadlock,
+        Error::GrantNotEnabled { .. } => FindingKind::RuntimeError,
+        _ => FindingKind::RegPoolMisuse,
+    }
 }

@@ -147,21 +147,106 @@ impl super::Protocol for Named {
 }
 
 pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
-    unimplemented!("W3: named::step")
+    let (c, flavor) = match cmd {
+        Cmd::Resume { gen } => {
+            return match state.expected {
+                Some(_) if gen < state.gen || (gen == state.gen && state.complete) => Ok(Outcome::Ready { gen }),
+                Some(_) if gen == state.gen => Ok(Outcome::Blocked),
+                _ => Err(Error::ResumeFuture { gen }),
+            };
+        }
+        Cmd::Arrive(c) => (c, Flavor::Arrive),
+        Cmd::Sync(c) => (c, Flavor::Sync),
+        Cmd::Red(c) => (c, Flavor::Red),
+    };
+    if c.count == 0 || c.count % WARP_SIZE != 0 {
+        return Err(Error::InvalidCount { count: c.count });
+    }
+    // PTX §9.7.15.1: every non-exited lane of the warp executes the barrier.
+    if c.mask == 0 || c.mask != c.live {
+        return Err(Error::PartialWarp { mask: c.mask, live: c.live });
+    }
+    // Validate against the generation this contribution joins: a fresh one
+    // (first use or after completion) or the current one.
+    let fresh = state.complete || state.expected.is_none();
+    let expected = if fresh { c.count } else { state.expected.unwrap_or(c.count) };
+    if expected != c.count {
+        return Err(Error::ContractMismatch { expected, observed: c.count });
+    }
+    let (arrived_before, warps_empty) = if fresh { (0, true) } else { (state.arrived, state.warps.is_empty()) };
+    if !warps_empty {
+        if state.warps.contains_key(&(c.warp, flavor)) {
+            return Err(Error::Duplicate { warp: c.warp });
+        }
+        let red = flavor == Flavor::Red;
+        if state.warps.keys().any(|&(_, f)| (f == Flavor::Red) != red) {
+            return Err(Error::RedMixed { warp: c.warp });
+        }
+    }
+    let arrived = arrived_before + WARP_SIZE;
+    if arrived > expected {
+        return Err(Error::ArrivalOverflow { expected, arrived });
+    }
+    if fresh {
+        if state.complete {
+            state.gen += 1;
+        }
+        state.expected = Some(expected);
+        state.warps.clear();
+    }
+    state.arrived = arrived;
+    state.warps.insert((c.warp, flavor), ());
+    state.complete = arrived == expected;
+    let (gen, completed) = (state.gen, state.complete);
+    Ok(match (flavor, completed) {
+        (Flavor::Arrive, _) => Outcome::Arrived { gen, completed },
+        (_, true) => Outcome::Ready { gen },
+        (_, false) => Outcome::Registered { gen },
+    })
 }
 
 
 
 /// Exit check. An incomplete generation is never an error, only a lint.
 pub fn exit_lint(s: &State) -> Option<Lint> {
-    unimplemented!("W3: named::exit_lint")
+    let expected = s.expected?;
+    (!s.complete).then_some(Lint::DanglingAtExit { gen: s.gen, arrived: s.arrived, expected })
+}
+
+/// Launch-exit check. Never an error: a dangling generation is reported by [`exit_lint`] instead.
+pub fn quiescent(_s: &State) -> Result<(), Error> {
+    Ok(())
 }
 
 pub fn check_invariants(s: &State) -> Result<(), String> {
-    unimplemented!("W3: named::check_invariants")
+    let Some(expected) = s.expected else {
+        let pristine = s.gen == 0 && !s.complete && s.arrived == 0 && s.warps.is_empty();
+        return if pristine { Ok(()) } else { Err("state before first use".into()) };
+    };
+    if s.arrived > expected || s.complete != (s.arrived == expected) {
+        return Err("complete iff arrived == expected".into());
+    }
+    if s.arrived != WARP_SIZE * s.warps.len() as u64 {
+        return Err("warp bookkeeping disagrees with count".into());
+    }
+    let reds = s.warps.keys().filter(|(_, f)| *f == Flavor::Red).count();
+    if reds != 0 && reds != s.warps.len() {
+        return Err(".red mixed with sync/arrive".into());
+    }
+    Ok(())
 }
 
-/// End-of-launch check (contract addition; not yet in the reference).
-pub fn quiescent(s: &State) -> Result<(), Error> {
-    unimplemented!("W3: named::quiescent")
+use crate::report::FindingKind;
+
+/// Map a protocol error to its report kind.
+pub fn finding_kind(e: &Error) -> FindingKind {
+    match e {
+        Error::ResumeFuture { .. } => FindingKind::RuntimeError,
+        _ => FindingKind::BarrierMismatch,
+    }
+}
+
+/// Report kind of an exit lint (reported with `Status::Review`).
+pub fn lint_kind(_l: &Lint) -> FindingKind {
+    FindingKind::BarrierMismatch
 }

@@ -240,6 +240,18 @@ pub enum Error {
         gen: u64,
         current: u64,
     },
+    /// Launch exit with in-flight or unresolved work on a live slot: an
+    /// issued completion that never landed, bytes buffered for a phase that
+    /// never started, or a tx-count left unresolved while arrivals are still
+    /// missing (`hardware_barriers.rs:2348-2396`). A phase whose arrivals are
+    /// all in but whose bytes are missing is a tolerated terminal
+    /// reservation (`hardware_barriers.rs:2364-2373`).
+    IncompleteAtExit {
+        gen: u64,
+        outstanding: u32,
+        buffered: u64,
+        tx_count: i64,
+    },
 }
 
 pub struct Mbarrier;
@@ -582,6 +594,25 @@ fn query_parity(s: &mut State, parity: u64, blocking: bool) -> Result<Outcome, E
     } else {
         Ok(Outcome::NotReady)
     }
+}
+
+/// Launch-exit check, run after the completion queue has drained.
+pub fn quiescent(s: &State) -> Result<(), Error> {
+    if !s.live {
+        return Ok(());
+    }
+    let outstanding = s.outstanding_total();
+    let tx = tx_count(s);
+    let unresolved_tx = !s.complete && tx != 0 && s.arrived < s.required();
+    if outstanding != 0 || s.buffered_next != 0 || unresolved_tx {
+        return Err(Error::IncompleteAtExit {
+            gen: s.gen,
+            outstanding: outstanding.min(u64::from(u32::MAX)) as u32,
+            buffered: s.buffered_next,
+            tx_count: tx.clamp(i64::MIN.into(), i64::MAX.into()) as i64,
+        });
+    }
+    Ok(())
 }
 
 /// Invariants every reachable state satisfies (checked by the property tests).

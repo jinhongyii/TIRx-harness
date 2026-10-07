@@ -167,21 +167,97 @@ impl super::Protocol for Tcgen {
 /// Non-exclusive widths are powers of two in [32, 512]. Exclusive widths are
 /// multiples of 32 in [32, exclusive_max].
 pub fn valid_columns(s: &State, columns: u32, exclusive: bool) -> bool {
-    unimplemented!("W3: tcgen::valid_columns")
+    let (max, shape_ok) = if exclusive {
+        (s.exclusive_max, columns.is_multiple_of(32))
+    } else {
+        (s.capacity, columns.is_power_of_two())
+    };
+    columns >= 32 && columns <= max && shape_ok
 }
 
 pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
-    unimplemented!("W3: tcgen::step")
+    match cmd {
+        Cmd::Alloc { who, columns, exclusive } => {
+            let ctas = participants(who)?;
+            if !valid_columns(state, columns, exclusive) {
+                return Err(Error::InvalidColumns { columns });
+            }
+            for &i in ctas {
+                let cta = &state.ctas[i];
+                if cta.relinquished {
+                    return Err(Error::AllocAfterRelinquish);
+                }
+                if let Some(previous) = cta.last_alloc_columns.filter(|&p| columns > p) {
+                    return Err(Error::AllocationSizeIncrease { previous, requested: columns });
+                }
+            }
+            // PTX §9.7.18.7.1: alloc blocks until the columns are free.
+            let Some(base) = free_base(state, ctas, columns, exclusive) else {
+                return Ok(Outcome::Blocked);
+            };
+            for &i in ctas {
+                let cta = &mut state.ctas[i];
+                let at = cta.allocations.partition_point(|a| a.base < base);
+                cta.allocations.insert(at, Allocation { base, columns, exclusive });
+                cta.last_alloc_columns = Some(columns);
+            }
+            Ok(Outcome::Allocated { base })
+        }
+        Cmd::Dealloc { who, taddr, columns, exclusive } => {
+            let ctas = participants(who)?;
+            let wanted = Allocation { base: taddr, columns, exclusive };
+            let mut found = [0usize; 2];
+            for (k, &i) in ctas.iter().enumerate() {
+                found[k] = state.ctas[i]
+                    .allocations
+                    .iter()
+                    .position(|a| *a == wanted)
+                    .ok_or(Error::DeallocationMismatch { taddr, columns })?;
+            }
+            for (k, &i) in ctas.iter().enumerate() {
+                state.ctas[i].allocations.remove(found[k]);
+            }
+            Ok(Outcome::Done)
+        }
+        Cmd::Relinquish { who } => {
+            for &i in participants(who)? {
+                state.ctas[i].relinquished = true;
+            }
+            Ok(Outcome::Done)
+        }
+    }
 }
 
 
 
 pub fn quiescent(s: &State) -> Result<(), Error> {
-    unimplemented!("W3: tcgen::quiescent")
+    match s.ctas.iter().position(|c| !c.allocations.is_empty()) {
+        Some(i) => Err(Error::LiveAllocationsAtExit { cta: i as u8 }),
+        None => Ok(()),
+    }
 }
 
 pub fn check_invariants(s: &State) -> Result<(), String> {
-    unimplemented!("W3: tcgen::check_invariants")
+    for cta in &s.ctas {
+        for w in cta.allocations.windows(2) {
+            if w[0].base + w[0].columns > w[1].base {
+                return Err("overlapping or unsorted allocations".into());
+            }
+        }
+        for a in &cta.allocations {
+            let limit = if a.exclusive { s.exclusive_max } else { s.capacity };
+            if a.base % 32 != 0 || a.base + a.columns > limit {
+                return Err("allocation outside TMEM or misaligned".into());
+            }
+            if a.exclusive && cta.allocations.len() != 1 {
+                return Err("exclusive allocation is not the sole live allocation".into());
+            }
+        }
+        if !cta.allocations.is_empty() && cta.last_alloc_columns.is_none() {
+            return Err("allocation without a recorded width".into());
+        }
+    }
+    Ok(())
 }
 
 /// Kernel-wide `.cta_group` uniformity across every tcgen05 instruction.
@@ -191,7 +267,14 @@ pub struct KernelState {
 }
 
 pub fn use_cta_group(k: &mut KernelState, cta_group: u8) -> Result<(), Error> {
-    unimplemented!("W3: tcgen::use_cta_group")
+    if cta_group != 1 && cta_group != 2 {
+        return Err(Error::InvalidCtaGroup);
+    }
+    if let Some(established) = k.cta_group.filter(|&g| g != cta_group) {
+        return Err(Error::CtaGroupMismatch { established, requested: cta_group });
+    }
+    k.cta_group = Some(cta_group);
+    Ok(())
 }
 
 /// Per-thread tcgen05 work queues (`ordering.rs:67-99`). Tokens are counted
@@ -224,5 +307,61 @@ pub enum WorkOutcome {
 }
 
 pub fn work_step(s: &mut WorkState, cmd: WorkCmd) -> WorkOutcome {
-    unimplemented!("W3: tcgen::work_step")
+    let counter = match cmd {
+        WorkCmd::Issue | WorkCmd::Commit => &mut s.uncommitted,
+        WorkCmd::Load | WorkCmd::WaitLd => &mut s.loads,
+        WorkCmd::Store | WorkCmd::WaitSt => &mut s.stores,
+    };
+    match cmd {
+        WorkCmd::Issue | WorkCmd::Load | WorkCmd::Store => {
+            *counter += 1;
+            WorkOutcome::Queued
+        }
+        WorkCmd::Commit | WorkCmd::WaitLd | WorkCmd::WaitSt => WorkOutcome::Drained { tokens: std::mem::take(counter) },
+    }
+}
+
+fn participants(who: Who) -> Result<&'static [usize], Error> {
+    match who {
+        Who::One(0) => Ok(&[0]),
+        Who::One(1) => Ok(&[1]),
+        Who::Pair => Ok(&[0, 1]),
+        Who::One(_) => Err(Error::InvalidCtaGroup),
+    }
+}
+
+/// Lowest 32-aligned base free in every participating CTA; `None` = block.
+/// `.exclusive` needs no live allocation at all; any allocation blocks while
+/// an exclusive one is live.
+fn free_base(s: &State, ctas: &[usize], columns: u32, exclusive: bool) -> Option<u32> {
+    let live = |i: usize| s.ctas[i].allocations.iter();
+    if exclusive {
+        return ctas.iter().all(|&i| live(i).next().is_none()).then_some(0);
+    }
+    if ctas.iter().any(|&i| live(i).any(|a| a.exclusive)) {
+        return None;
+    }
+    let mut base = 0u32;
+    while base + columns <= s.capacity {
+        // Jump past the first conflicting allocation instead of probing
+        // every 32-column step.
+        let conflict = ctas
+            .iter()
+            .flat_map(|&i| live(i))
+            .filter(|a| base < a.base + a.columns && a.base < base + columns)
+            .map(|a| a.base + a.columns)
+            .max();
+        match conflict {
+            None => return Some(base),
+            Some(end) => base = end.div_ceil(32) * 32,
+        }
+    }
+    None
+}
+
+use crate::report::FindingKind;
+
+/// Map a protocol error to its report kind.
+pub fn finding_kind(_e: &Error) -> FindingKind {
+    FindingKind::TmemMisuse
 }
