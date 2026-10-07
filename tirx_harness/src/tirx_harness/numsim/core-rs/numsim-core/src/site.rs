@@ -32,7 +32,9 @@ impl fmt::Display for SiteId {
 
 /// One source span (1-based lines/columns; 0 = unknown).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Span {
+    #[serde(deserialize_with = "crate::program::required")]
     pub file: Option<String>,
     pub line: u32,
     pub col: u32,
@@ -41,7 +43,10 @@ pub struct Span {
 }
 
 /// Static facts about one site.
+/// Serde: unknown fields are rejected and `Option` fields must be present
+/// (`null` for none), like every program type.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SiteInfo {
     /// IR node `type_key` (`tirx.Call`, `tirx.BufferStore`, ...).
     pub kind: String,
@@ -52,6 +57,8 @@ pub struct SiteInfo {
     pub op_name: String,
     /// Short TVMScript rendering (<= 200 chars, children elided).
     pub text: String,
+    #[serde(deserialize_with = "crate::program::required")]
     pub dtype: Option<String>,
+    #[serde(deserialize_with = "crate::program::required")]
     pub buffer: Option<String>,
 }

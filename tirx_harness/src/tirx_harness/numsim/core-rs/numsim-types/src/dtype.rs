@@ -53,6 +53,18 @@ pub enum Dtype {
     /// 4-bit integers (mma .s4/.u4; ldmatrix s8.s4).
     U4,
     S4,
+    /// 6-bit unsigned integer (TVM `uint6`; packed unpack/cvt payloads).
+    U6,
+    /// float8 e3m4 (TVM `float8_e3m4`; storage/cvt only).
+    E3M4,
+    /// float8 e4m3 IEEE-like, with infinities (TVM `float8_e4m3`; storage).
+    E4M3Ieee,
+    /// float8 e4m3 bias-11 finite/no-negative-zero (TVM `float8_e4m3b11fnuz`; storage).
+    E4M3B11Fnuz,
+    /// float8 e4m3 finite/no-negative-zero (TVM `float8_e4m3fnuz`; storage).
+    E4M3Fnuz,
+    /// float8 e5m2 finite/no-negative-zero (TVM `float8_e5m2fnuz`; storage).
+    E5M2Fnuz,
 }
 
 impl Dtype {
@@ -60,6 +72,8 @@ impl Dtype {
         use Dtype::*;
         match self {
             Pred | U8 | S8 | E4M3 | E5M2 | UE8M0 | UE4M3 => 8,
+            E3M4 | E4M3Ieee | E4M3B11Fnuz | E4M3Fnuz | E5M2Fnuz => 8,
+            U6 => 6,
             U16 | S16 | F16 | BF16 => 16,
             U32 | S32 | F32 | TF32 => 32,
             U64 | S64 | F64 => 64,
@@ -70,8 +84,10 @@ impl Dtype {
         }
     }
 
-    /// Bytes this element occupies in memory (sub-byte types round up to 1;
-    /// packed sub-byte memory layouts are described by the instruction).
+    /// Bytes ONE element occupies when stored alone (sub-byte types round
+    /// up to 1). Arrays of sub-byte elements are packed densely: use
+    /// [`Dtype::array_bytes`] / bit offsets (`offset * bits()`), never
+    /// `index * mem_bytes()`.
     pub const fn mem_bytes(self) -> u32 {
         let b = self.bits();
         if b < 8 {
@@ -81,21 +97,54 @@ impl Dtype {
         }
     }
 
+    /// Bytes of a densely packed array of `n` elements (`ceil(n * bits / 8)`).
+    pub const fn array_bytes(self, n: u64) -> u64 {
+        (n * self.bits() as u64).div_ceil(8)
+    }
+
+    /// Sub-byte element (packed densely in memory and in register lanes).
+    pub const fn is_sub_byte(self) -> bool {
+        self.bits() < 8
+    }
+
     pub const fn is_float(self) -> bool {
         use Dtype::*;
         matches!(
             self,
-            F16 | BF16 | TF32 | F32 | F64 | E4M3 | E5M2 | UE8M0 | UE4M3 | UE5M3 | E2M3 | E3M2 | S2F6 | E2M1
+            F16 | BF16
+                | TF32
+                | F32
+                | F64
+                | E4M3
+                | E5M2
+                | UE8M0
+                | UE4M3
+                | UE5M3
+                | E2M3
+                | E3M2
+                | S2F6
+                | E2M1
+                | E3M4
+                | E4M3Ieee
+                | E4M3B11Fnuz
+                | E4M3Fnuz
+                | E5M2Fnuz
         )
     }
 
     pub const fn is_signed_int(self) -> bool {
-        matches!(self, Dtype::S8 | Dtype::S16 | Dtype::S32 | Dtype::S64 | Dtype::S4)
+        matches!(
+            self,
+            Dtype::S8 | Dtype::S16 | Dtype::S32 | Dtype::S64 | Dtype::S4
+        )
     }
 
     pub const fn is_int(self) -> bool {
         use Dtype::*;
-        matches!(self, U8 | U16 | U32 | U64 | S8 | S16 | S32 | S64 | U4 | S4)
+        matches!(
+            self,
+            U8 | U16 | U32 | U64 | S8 | S16 | S32 | S64 | U4 | S4 | U6
+        )
     }
 
     /// Number of 64-bit registers one element of this type occupies (1, or 2 for B128).
@@ -137,6 +186,12 @@ impl Dtype {
             E2M1 => "e2m1",
             U4 => "u4",
             S4 => "s4",
+            U6 => "u6",
+            E3M4 => "e3m4",
+            E4M3Ieee => "e4m3ieee",
+            E4M3B11Fnuz => "e4m3b11fnuz",
+            E4M3Fnuz => "e4m3fnuz",
+            E5M2Fnuz => "e5m2fnuz",
         }
     }
 
@@ -166,6 +221,12 @@ impl Dtype {
             "float4_e2m1fn" => E2M1,
             "int4" => S4,
             "uint4" => U4,
+            "uint6" => U6,
+            "float8_e3m4" => E3M4,
+            "float8_e4m3" => E4M3Ieee,
+            "float8_e4m3b11fnuz" => E4M3B11Fnuz,
+            "float8_e4m3fnuz" => E4M3Fnuz,
+            "float8_e5m2fnuz" => E5M2Fnuz,
             _ => return None,
         })
     }
@@ -185,9 +246,13 @@ impl fmt::Display for Dtype {
 /// `uint32x4` = `Ty{U32, 4}` (128 bits), `uint128` = `Ty{B128, 1}`,
 /// `float32x8` (ld.v8 / ld_vec256) = `Ty{F32, 8}` (256 bits).
 ///
-/// Invariant: `1 <= lanes`, `elem.bits() * lanes <= 256`. A value occupies
-/// [`Ty::slots`] 64-bit register slots (see [`crate::value`]).
+/// Invariant: `1 <= lanes`, `elem.bits() * lanes <= 256`
+/// (`numsim_core::program::Program::validate` enforces it). A value
+/// occupies [`Ty::slots`] 64-bit register slots (see [`crate::value`]).
+/// [`Ty::bits`] is the dense payload width: sub-byte lanes pack with no
+/// padding (`float4_e2m1fnx32` = 128 bits). `Pred` lanes count 8 bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ty {
     pub elem: Dtype,
     pub lanes: u8,
@@ -276,5 +341,9 @@ mod tests {
         assert_eq!(Ty::from_tvm("float32x8").unwrap().slots(), 4);
         assert_eq!(Dtype::B128.regs(), 2);
         assert_eq!(Dtype::from_tvm("float32"), Some(Dtype::F32));
+        assert_eq!(Dtype::from_tvm("uint6"), Some(Dtype::U6));
+        assert_eq!(Dtype::from_tvm("float8_e3m4"), Some(Dtype::E3M4));
+        assert_eq!(Dtype::E2M1.array_bytes(3), 2);
+        assert_eq!(Ty::from_tvm("float4_e2m1fnx32").unwrap().bits(), 128);
     }
 }

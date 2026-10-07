@@ -90,7 +90,19 @@ use std::fmt;
 
 /// Serialization format version of [`Module`]/[`Program`]. Bump on any
 /// change to the types in this file.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Serde rule for `Option` fields of program types: the field must be
+/// present (JSON `null` for `None`). Every program struct also has
+/// `deny_unknown_fields`, so a misspelled or omitted field is a decode
+/// error instead of a silent default (contract review item 7).
+pub(crate) fn required<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d)
+}
 
 // ---------------------------------------------------------------------------
 // Indices
@@ -139,6 +151,7 @@ index_type!(
 
 /// A source operand: a register or an interned constant (broadcast to all lanes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Operand {
     Reg(Reg),
     Const(ConstId),
@@ -167,8 +180,11 @@ impl fmt::Display for Operand {
 
 /// An interned constant: raw bits of `ty` (floats as bit patterns; vector
 /// lanes packed, element 0 low). Up to 128 bits; wider vector constants are
-/// built with `Ptx` pack ops.
+/// built with `Ptx` pack ops. Signed values are stored as two's complement
+/// *masked to `ty.bits()`* (e.g. `-1i32` = `0xffff_ffff`); `validate`
+/// rejects bits above `ty.bits()`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Const {
     pub ty: Ty,
     pub bits: u128,
@@ -181,6 +197,7 @@ pub struct Const {
 /// State space named by an instruction (PTX spelling). Allocations live in
 /// [`Space`]; `Generic` and `SharedCluster` resolve at execution time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum AddrSpace {
     Generic,
     Global,
@@ -212,6 +229,7 @@ impl AddrSpace {
 
 /// Memory-ordering semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub enum Sem {
     #[default]
     Weak,
@@ -226,7 +244,10 @@ pub enum Sem {
 }
 
 /// Memory-ordering scope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
+#[serde(deny_unknown_fields)]
 pub enum Scope {
     Cta,
     Cluster,
@@ -237,6 +258,7 @@ pub enum Scope {
 
 /// Memory proxy an access goes through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub enum Proxy {
     #[default]
     Generic,
@@ -252,6 +274,7 @@ pub enum Proxy {
 
 /// Cache operator (ordering-only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub enum CacheOp {
     #[default]
     Default,
@@ -266,6 +289,7 @@ pub enum CacheOp {
 
 /// Eviction priority (ordering-only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub enum Evict {
     #[default]
     Normal,
@@ -278,12 +302,14 @@ pub enum Evict {
 /// Memory-instruction modifiers. Only `nc` (proxy) and `uniform` (ldu
 /// requires warp-uniform addresses) change engine behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MemMods {
     pub cache: CacheOp,
     pub evict: Evict,
     /// `.L2::64B/128B/256B`, 0 = none.
     pub l2_prefetch: u16,
     /// `.L2::cache_hint` policy operand.
+    #[serde(deserialize_with = "required")]
     pub policy: Option<Operand>,
     pub nc: bool,
     pub uniform: bool,
@@ -295,6 +321,7 @@ pub struct MemMods {
 
 /// Rounding modifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub enum Rounding {
     /// TIR/C semantics: round-to-nearest-even for float results,
     /// truncation toward zero for float->int.
@@ -309,11 +336,14 @@ pub enum Rounding {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum UnOp {
     Neg,
     Abs,
-    /// Bitwise not (logical not for `Pred`).
+    /// Logical not (`prim.Not`): operand and result are `Pred`.
     Not,
+    /// Bitwise not (`prim.BitwiseNot`, `~x`) on integer / `Pred` types.
+    BitNot,
     Sqrt,
     Rsqrt,
     Exp,
@@ -337,6 +367,7 @@ pub enum UnOp {
 /// TIR binary ops. Integer division/modulo follow TIR (`Div`/`Mod` truncate
 /// like C; `FloorDiv`/`FloorMod` floor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum BinOp {
     Add,
     Sub,
@@ -359,12 +390,14 @@ pub enum BinOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TerOp {
     /// Fused multiply-add, single rounding.
     Fma,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -376,6 +409,7 @@ pub enum CmpOp {
 
 /// Special registers (`ReadSpecial`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SpecialReg {
     LaneId,
     /// `tid / 32` within the CTA.
@@ -415,6 +449,7 @@ pub enum SpecialReg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Axis {
     X,
     Y,
@@ -426,6 +461,7 @@ pub enum Axis {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ShflMode {
     Idx,
     Up,
@@ -434,6 +470,7 @@ pub enum ShflMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum VoteMode {
     All,
     Any,
@@ -442,6 +479,7 @@ pub enum VoteMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ReduxOp {
     Add,
     Min,
@@ -452,6 +490,7 @@ pub enum ReduxOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum MatrixShape {
     M8N8,
     M8N16,
@@ -460,6 +499,7 @@ pub enum MatrixShape {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum MatrixFmt {
     B16,
     B8,
@@ -476,6 +516,7 @@ pub enum MatrixFmt {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum AtomOp {
     Add,
     Min,
@@ -491,6 +532,7 @@ pub enum AtomOp {
 
 /// How a bulk/tensor async copy reports completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum BulkCompletion {
     /// `.mbarrier::complete_tx::bytes [mbar]`.
     Mbarrier { mbar: Operand, space: AddrSpace },
@@ -500,6 +542,7 @@ pub enum BulkCompletion {
 
 /// `cp.async.bulk` / `cp.reduce.async.bulk` (non-tensor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BulkCopyArgs {
     pub dst: Operand,
     pub dst_space: AddrSpace,
@@ -508,12 +551,15 @@ pub struct BulkCopyArgs {
     pub size: Operand,
     pub completion: BulkCompletion,
     /// `.multicast::cluster` CTA mask.
+    #[serde(deserialize_with = "required")]
     pub multicast: Option<Operand>,
+    #[serde(deserialize_with = "required")]
     pub reduce: Option<(AtomOp, Dtype)>,
     pub mods: MemMods,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TmaDir {
     /// global -> shared
     Load,
@@ -526,6 +572,7 @@ pub enum TmaDir {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TmaMode {
     Tile,
     Im2col,
@@ -538,6 +585,7 @@ pub enum TmaMode {
 
 /// A tensor-map field (`tensormap.replace`, per-instruction overrides).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TmapField {
     GlobalAddress,
     Rank,
@@ -553,8 +601,10 @@ pub enum TmapField {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TmapOverride {
     pub field: TmapField,
+    #[serde(deserialize_with = "required")]
     pub ord: Option<u8>,
     pub value: Operand,
     /// `_b8`/`_b16` spelling width, 0 = n/a.
@@ -563,6 +613,7 @@ pub struct TmapOverride {
 
 /// `cp.async.bulk.tensor` / `cp.reduce.async.bulk.tensor` / tensor prefetch.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TmaArgs {
     pub dir: TmaDir,
     pub mode: TmaMode,
@@ -576,6 +627,7 @@ pub struct TmaArgs {
     pub smem: Operand,
     pub smem_space: AddrSpace,
     pub completion: BulkCompletion,
+    #[serde(deserialize_with = "required")]
     pub multicast: Option<Operand>,
     /// `.cta_group::1/2`, 0 = unspecified.
     pub cta_group: u8,
@@ -585,17 +637,20 @@ pub struct TmaArgs {
 
 /// `st.async` / `red.async` into a (remote) CTA's shared memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StAsyncArgs {
     pub ty: Ty,
     pub value: Operand,
     pub addr: Operand,
     pub mbar: Operand,
+    #[serde(deserialize_with = "required")]
     pub red: Option<AtomOp>,
     pub sem: Sem,
     pub scope: Scope,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum BarRedOp {
     Popc,
     And,
@@ -604,6 +659,7 @@ pub enum BarRedOp {
 
 /// What a named-barrier instruction does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum BarKind {
     /// `bar.sync` / `barrier.sync` / `__syncthreads`.
     Sync,
@@ -611,11 +667,16 @@ pub enum BarKind {
     Arrive,
     /// `bar.red.{popc,and,or}` (also syncthreads_and/or, cta_reduce):
     /// reduces `pred` and writes `dst`.
-    Red { op: BarRedOp, pred: Operand, dst: Reg },
+    Red {
+        op: BarRedOp,
+        pred: Operand,
+        dst: Reg,
+    },
 }
 
 /// mbarrier wait phase argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum PhaseArg {
     /// State token from an earlier arrive.
     State(Operand),
@@ -624,12 +685,14 @@ pub enum PhaseArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum WaitKind {
     Test,
     Try,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TxOp {
     Expect,
     Complete,
@@ -637,31 +700,44 @@ pub enum TxOp {
 
 /// `mbarrier.arrive` family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MbarArriveArgs {
     pub mbar: Operand,
     pub space: AddrSpace,
     /// None = 1.
+    #[serde(deserialize_with = "required")]
     pub count: Option<Operand>,
+    #[serde(deserialize_with = "required")]
     pub expect_tx: Option<Operand>,
     pub drop: bool,
     pub no_complete: bool,
     pub sem: Sem,
     pub scope: Scope,
+    #[serde(deserialize_with = "required")]
     pub multicast: Option<Operand>,
     /// State-token destination (None = sink).
+    #[serde(deserialize_with = "required")]
     pub state: Option<Reg>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum MbarQueryOp {
-    PendingCount { state: Operand },
+    PendingCount {
+        state: Operand,
+    },
     /// `layout_v1` is the layout the kernel declared for this barrier
     /// (`true` = `.layout::v1`, 511-arrival limit); the query reports
     /// whether the live object matches (W3-4).
-    CheckLayout { mbar: Operand, space: AddrSpace, layout_v1: bool },
+    CheckLayout {
+        mbar: Operand,
+        space: AddrSpace,
+        layout_v1: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum FenceKind {
     /// membar / fence.sc / fence.acq_rel / __threadfence*.
     Thread,
@@ -669,7 +745,10 @@ pub enum FenceKind {
     ProxyAsync(Option<AddrSpace>),
     ProxyAlias,
     TensormapRelease,
-    TensormapAcquire { addr: Operand, space: AddrSpace },
+    TensormapAcquire {
+        addr: Operand,
+        space: AddrSpace,
+    },
     Tcgen05Before,
     Tcgen05After,
 }
@@ -679,6 +758,7 @@ pub enum FenceKind {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TcShape {
     S32x32b,
     S16x64b,
@@ -688,6 +768,7 @@ pub enum TcShape {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcgenLdArgs {
     pub dsts: Vec<Reg>,
     pub taddr: Operand,
@@ -695,11 +776,13 @@ pub struct TcgenLdArgs {
     pub num: u16,
     pub pack: bool,
     /// `.red.{min,max}`: op and reduced destinations.
+    #[serde(deserialize_with = "required")]
     pub red: Option<(ReduxOp, Vec<Reg>)>,
     pub spcompress: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcgenStArgs {
     pub srcs: Vec<Operand>,
     pub taddr: Operand,
@@ -709,6 +792,7 @@ pub struct TcgenStArgs {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcgenCpArgs {
     pub taddr: Operand,
     pub sdesc: Operand,
@@ -723,6 +807,7 @@ pub struct TcgenCpArgs {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TcA {
     /// Shared-memory descriptor (`_ss`).
     Smem(Operand),
@@ -731,6 +816,7 @@ pub enum TcA {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TcMmaKind {
     F16,
     Tf32,
@@ -742,6 +828,7 @@ pub enum TcMmaKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub enum CollectorOp {
     #[default]
     None,
@@ -753,6 +840,7 @@ pub enum CollectorOp {
 
 /// `tcgen05.mma` (all ss/ts/ws/sp/block-scale/collector/lut/ashift forms).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcgenMmaArgs {
     pub kind: TcMmaKind,
     pub cta_group: u8,
@@ -764,14 +852,18 @@ pub struct TcgenMmaArgs {
     pub ws: bool,
     pub ws_b_buffer: u8,
     /// (scale_A taddr, scale_B taddr, block size 16/32).
+    #[serde(deserialize_with = "required")]
     pub block_scale: Option<(Operand, Operand, u8)>,
+    #[serde(deserialize_with = "required")]
     pub scale_input_d: Option<Operand>,
+    #[serde(deserialize_with = "required")]
     pub sparse_meta: Option<Operand>,
     pub disable_output_lane: Vec<Operand>,
     pub collector_a: CollectorOp,
     pub collector_b: CollectorOp,
     pub ashift: bool,
     /// `lut_b` / `ti16` qualifiers, interpreted by oplib.
+    #[serde(deserialize_with = "required")]
     pub variant: Option<StrId>,
 }
 
@@ -780,6 +872,7 @@ pub struct TcgenMmaArgs {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ExecScope {
     Thread,
     Warp,
@@ -789,6 +882,7 @@ pub enum ExecScope {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TileOp {
     Add,
     Sub,
@@ -817,25 +911,36 @@ pub enum TileOp {
 
 /// A tile region: buffer + base element offset + element map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TileArg {
-    Region { buf: Buf, base: Operand, map: LayoutId },
-    Frag { first: Reg, map: LayoutId },
+    Region {
+        buf: Buf,
+        base: Operand,
+        map: LayoutId,
+    },
+    Frag {
+        first: Reg,
+        map: LayoutId,
+    },
     Scalar(Operand),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TileArgs {
     pub op: TileOp,
     pub scope: ExecScope,
     /// Destination first, then sources in TIRx call order.
     pub args: Vec<TileArg>,
     pub axes: Vec<u8>,
+    #[serde(deserialize_with = "required")]
     pub completion: Option<BulkCompletion>,
 }
 
 /// Element map computed at lowering time (W1 B.7): `entries[lane * slots +
 /// slot]` = element offset relative to the region base, or -1 (none).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TileLayout {
     pub lanes: u32,
     pub slots: u32,
@@ -877,125 +982,453 @@ pub struct TileLayout {
 /// scheduler re-executes the same pc. Lowering never duplicates them and
 /// they are the only effectful work in their instruction.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Instr {
     // ----- control -----
     /// No effect (profiling markers, printf, nanosleep representatives).
     Nop,
-    If { cond: Operand, else_pc: Pc, end_pc: Pc, elect: bool },
-    Else { end_pc: Pc },
+    If {
+        cond: Operand,
+        else_pc: Pc,
+        end_pc: Pc,
+        elect: bool,
+    },
+    Else {
+        end_pc: Pc,
+    },
     EndIf,
-    LoopBegin { end_pc: Pc },
-    LoopIf { cond: Operand, end_pc: Pc },
-    LoopEnd { head_pc: Pc },
+    LoopBegin {
+        end_pc: Pc,
+    },
+    LoopIf {
+        cond: Operand,
+        end_pc: Pc,
+    },
+    LoopEnd {
+        head_pc: Pc,
+    },
     Break,
     Continue,
     Exit,
     /// Error finding for every active lane where `cond` is false.
-    Assert { cond: Operand, msg: Option<StrId> },
+    Assert {
+        cond: Operand,
+        #[serde(deserialize_with = "required")]
+        msg: Option<StrId>,
+    },
     /// Fail closed (incomplete) if any lane reaches it (`strict=False` lowering).
-    Unsupported { reason: StrId },
+    Unsupported {
+        reason: StrId,
+    },
 
     // ----- registers / TIR arithmetic -----
-    Mov { dst: Reg, src: Operand },
-    ReadSpecial { dst: Reg, sreg: SpecialReg },
+    Mov {
+        dst: Reg,
+        src: Operand,
+    },
+    ReadSpecial {
+        dst: Reg,
+        sreg: SpecialReg,
+    },
     /// Read a scalar host parameter (uniform).
-    ReadParam { dst: Reg, slot: ParamId },
-    Unary { op: UnOp, ty: Ty, dst: Reg, a: Operand },
-    Binary { op: BinOp, ty: Ty, dst: Reg, a: Operand, b: Operand },
-    Ternary { op: TerOp, ty: Ty, dst: Reg, a: Operand, b: Operand, c: Operand },
+    ReadParam {
+        dst: Reg,
+        slot: ParamId,
+    },
+    Unary {
+        op: UnOp,
+        ty: Ty,
+        dst: Reg,
+        a: Operand,
+    },
+    Binary {
+        op: BinOp,
+        ty: Ty,
+        dst: Reg,
+        a: Operand,
+        b: Operand,
+    },
+    Ternary {
+        op: TerOp,
+        ty: Ty,
+        dst: Reg,
+        a: Operand,
+        b: Operand,
+        c: Operand,
+    },
     /// Predicate result.
-    Compare { op: CmpOp, ty: Ty, dst: Reg, a: Operand, b: Operand },
+    Compare {
+        op: CmpOp,
+        ty: Ty,
+        dst: Reg,
+        a: Operand,
+        b: Operand,
+    },
     /// `cond ? a : b` (TIR `Select` / `if_then_else`).
-    Select { ty: Ty, dst: Reg, cond: Operand, a: Operand, b: Operand },
+    Select {
+        ty: Ty,
+        dst: Reg,
+        cond: Operand,
+        a: Operand,
+        b: Operand,
+    },
     /// TIR `Cast` (C semantics by default; `reinterpret` uses `Mov`).
-    Cast { from: Ty, to: Ty, dst: Reg, src: Operand, rnd: Rounding, sat: bool },
+    Cast {
+        from: Ty,
+        to: Ty,
+        dst: Reg,
+        src: Operand,
+        rnd: Rounding,
+        sat: bool,
+    },
     /// Generic pure PTX / CUDA-helper op from `Program::ops`.
     /// `pred`: PTX guard; lanes where it is false do not execute and keep
     /// their destinations if `keep_dst`, else get a zero representative.
-    Ptx { op: OpId, dsts: Vec<Reg>, srcs: Vec<Operand>, pred: Option<Operand>, keep_dst: bool },
+    Ptx {
+        op: OpId,
+        dsts: Vec<Reg>,
+        srcs: Vec<Operand>,
+        #[serde(deserialize_with = "required")]
+        pred: Option<Operand>,
+        keep_dst: bool,
+    },
     /// Dynamic index into a register-promoted local array `base..base+len`
     /// (all same type). OOB = error finding.
-    LoadRegIndexed { dst: Reg, base: Reg, len: u32, idx: Operand },
-    StoreRegIndexed { base: Reg, len: u32, idx: Operand, value: Operand },
+    LoadRegIndexed {
+        dst: Reg,
+        base: Reg,
+        len: u32,
+        idx: Operand,
+    },
+    StoreRegIndexed {
+        base: Reg,
+        len: u32,
+        idx: Operand,
+        value: Operand,
+    },
 
     // ----- warp collectives -----
-    Shfl { mode: ShflMode, ty: Ty, dst: Reg, dst_pred: Option<Reg>, src: Operand, lane: Operand, clamp: Operand, membermask: Operand },
-    Vote { mode: VoteMode, dst: Reg, pred: Operand, membermask: Operand },
-    Redux { op: ReduxOp, ty: Ty, dst: Reg, src: Operand, membermask: Operand },
+    Shfl {
+        mode: ShflMode,
+        ty: Ty,
+        dst: Reg,
+        #[serde(deserialize_with = "required")]
+        dst_pred: Option<Reg>,
+        src: Operand,
+        lane: Operand,
+        clamp: Operand,
+        membermask: Operand,
+    },
+    Vote {
+        mode: VoteMode,
+        dst: Reg,
+        pred: Operand,
+        membermask: Operand,
+    },
+    Redux {
+        op: ReduxOp,
+        ty: Ty,
+        dst: Reg,
+        src: Operand,
+        membermask: Operand,
+    },
     /// `elect.sync`: `dst_pred` = 1 in the elected lane.
-    Elect { dst_pred: Reg, dst_lane: Option<Reg>, membermask: Operand },
-    WarpSync { membermask: Operand },
-    LdMatrix { dsts: Vec<Reg>, addr: Operand, space: AddrSpace, shape: MatrixShape, num: u8, trans: bool, fmt: MatrixFmt },
-    StMatrix { srcs: Vec<Operand>, addr: Operand, space: AddrSpace, shape: MatrixShape, num: u8, trans: bool },
+    Elect {
+        dst_pred: Reg,
+        #[serde(deserialize_with = "required")]
+        dst_lane: Option<Reg>,
+        membermask: Operand,
+    },
+    WarpSync {
+        membermask: Operand,
+    },
+    LdMatrix {
+        dsts: Vec<Reg>,
+        addr: Operand,
+        space: AddrSpace,
+        shape: MatrixShape,
+        num: u8,
+        trans: bool,
+        fmt: MatrixFmt,
+    },
+    StMatrix {
+        srcs: Vec<Operand>,
+        addr: Operand,
+        space: AddrSpace,
+        shape: MatrixShape,
+        num: u8,
+        trans: bool,
+    },
 
     // ----- memory -----
-    /// `dst = buf[offset]`; `offset` in elements of `buffers[buf].dtype`
-    /// (byte address = offset * elem bytes); `ty` may differ (reinterpret,
-    /// vector loads). Space from the buffer declaration.
-    Load { ty: Ty, dst: Reg, buf: Buf, offset: Operand, sem: Sem, scope: Scope, mods: MemMods },
-    Store { ty: Ty, buf: Buf, offset: Operand, value: Operand, sem: Sem, scope: Scope, mods: MemMods },
+    /// `dst = buf[offset]`. `offset` counts elements of the buffer's
+    /// element type `buffers[buf].dtype.elem`, so the access starts at
+    /// *bit* `offset * elem.bits()` of the buffer ([`BufferDecl::bit_offset`]);
+    /// for byte-sized elements that is byte `offset * elem.bits()/8`. For
+    /// sub-byte elements (fp4, fp6, u4, u6) the bit offset must be
+    /// byte-aligned and `ty.bits()` a multiple of 8, else the access is a
+    /// `Misaligned` error (no sub-byte read-modify-write). `ty` may differ
+    /// from the buffer dtype (reinterpret, vector loads). Space from the
+    /// buffer declaration.
+    Load {
+        ty: Ty,
+        dst: Reg,
+        buf: Buf,
+        offset: Operand,
+        sem: Sem,
+        scope: Scope,
+        mods: MemMods,
+    },
+    /// `buf[offset] = value`; offset rules as `Load`.
+    Store {
+        ty: Ty,
+        buf: Buf,
+        offset: Operand,
+        value: Operand,
+        sem: Sem,
+        scope: Scope,
+        mods: MemMods,
+    },
     /// Raw-address load (`addr` value in `space`'s encoding).
-    LoadAddr { ty: Ty, dst: Reg, addr: Operand, space: AddrSpace, sem: Sem, scope: Scope, mods: MemMods },
-    StoreAddr { ty: Ty, addr: Operand, space: AddrSpace, value: Operand, sem: Sem, scope: Scope, mods: MemMods },
+    LoadAddr {
+        ty: Ty,
+        dst: Reg,
+        addr: Operand,
+        space: AddrSpace,
+        sem: Sem,
+        scope: Scope,
+        mods: MemMods,
+    },
+    StoreAddr {
+        ty: Ty,
+        addr: Operand,
+        space: AddrSpace,
+        value: Operand,
+        sem: Sem,
+        scope: Scope,
+        mods: MemMods,
+    },
     /// `dst` (u64 generic) = address of `buf[offset]`.
-    AddrOf { dst: Reg, buf: Buf, offset: Operand },
+    AddrOf {
+        dst: Reg,
+        buf: Buf,
+        offset: Operand,
+    },
     /// `atom` (dst Some) / `red` / bitbucket (dst None). Vector `ty` = one
     /// RMW per lane-element. `cmp` only for Cas.
-    Atom { op: AtomOp, ty: Ty, dst: Option<Reg>, addr: Operand, space: AddrSpace, value: Operand, cmp: Option<Operand>, sem: Sem, scope: Scope, ftz: bool },
-    StBulk { addr: Operand, space: AddrSpace, size: Operand },
+    Atom {
+        op: AtomOp,
+        ty: Ty,
+        #[serde(deserialize_with = "required")]
+        dst: Option<Reg>,
+        addr: Operand,
+        space: AddrSpace,
+        value: Operand,
+        #[serde(deserialize_with = "required")]
+        cmp: Option<Operand>,
+        sem: Sem,
+        scope: Scope,
+        ftz: bool,
+    },
+    StBulk {
+        addr: Operand,
+        space: AddrSpace,
+        size: Operand,
+    },
     /// Contents become undefined (validity cleared).
-    Discard { addr: Operand, space: AddrSpace, size: u32 },
+    Discard {
+        addr: Operand,
+        space: AddrSpace,
+        size: u32,
+    },
     /// `cvta`: `to_generic` = space -> generic.
-    Cvta { dst: Reg, src: Operand, space: AddrSpace, to_generic: bool },
-    Isspacep { dst: Reg, src: Operand, space: AddrSpace },
-    Mapa { dst: Reg, src: Operand, rank: Operand, space: AddrSpace },
-    GetCtaRank { dst: Reg, src: Operand, space: AddrSpace },
+    Cvta {
+        dst: Reg,
+        src: Operand,
+        space: AddrSpace,
+        to_generic: bool,
+    },
+    Isspacep {
+        dst: Reg,
+        src: Operand,
+        space: AddrSpace,
+    },
+    Mapa {
+        dst: Reg,
+        src: Operand,
+        rank: Operand,
+        space: AddrSpace,
+    },
+    GetCtaRank {
+        dst: Reg,
+        src: Operand,
+        space: AddrSpace,
+    },
 
     // ----- async copies -----
-    CpAsync { dst: Operand, src: Operand, cp_size: u8, src_size: Option<Operand>, ignore_src: Option<Operand>, mods: MemMods },
+    CpAsync {
+        dst: Operand,
+        src: Operand,
+        cp_size: u8,
+        #[serde(deserialize_with = "required")]
+        src_size: Option<Operand>,
+        #[serde(deserialize_with = "required")]
+        ignore_src: Option<Operand>,
+        mods: MemMods,
+    },
     /// `cp.async.commit_group` / `cp.async.bulk.commit_group`.
-    AsyncCommit { domain: Domain },
+    AsyncCommit {
+        domain: Domain,
+    },
     /// `*.wait_group{.read} n` (`cp.async.wait_all` = commit + wait 0).
-    AsyncWait { domain: Domain, n: u32, read: bool },
-    CpAsyncMbarArrive { mbar: Operand, space: AddrSpace, noinc: bool },
+    AsyncWait {
+        domain: Domain,
+        n: u32,
+        read: bool,
+    },
+    CpAsyncMbarArrive {
+        mbar: Operand,
+        space: AddrSpace,
+        noinc: bool,
+    },
     BulkCopy(BulkCopyArgs),
     Tma(Box<TmaArgs>),
     StAsync(StAsyncArgs),
-    TensorMapReplace { tmap: Operand, space: AddrSpace, field: TmapField, ord: Option<u8>, value: Operand },
-    TensorMapCopyFence { dst: Operand, src: Operand, size: u32, scope: Scope },
+    TensorMapReplace {
+        tmap: Operand,
+        space: AddrSpace,
+        field: TmapField,
+        #[serde(deserialize_with = "required")]
+        ord: Option<u8>,
+        value: Operand,
+    },
+    TensorMapCopyFence {
+        dst: Operand,
+        src: Operand,
+        size: u32,
+        scope: Scope,
+    },
 
     // ----- synchronization -----
-    Barrier { kind: BarKind, id: Operand, count: Option<Operand>, aligned: bool },
-    ClusterArrive { sem: Sem, aligned: bool },
-    ClusterWait { acquire: bool, aligned: bool },
+    Barrier {
+        kind: BarKind,
+        id: Operand,
+        #[serde(deserialize_with = "required")]
+        count: Option<Operand>,
+        aligned: bool,
+    },
+    ClusterArrive {
+        sem: Sem,
+        aligned: bool,
+    },
+    ClusterWait {
+        acquire: bool,
+        aligned: bool,
+    },
     GridSync,
-    MbarInit { mbar: Operand, space: AddrSpace, count: Operand, layout_v1: bool },
-    MbarInval { mbar: Operand, space: AddrSpace },
+    MbarInit {
+        mbar: Operand,
+        space: AddrSpace,
+        count: Operand,
+        layout_v1: bool,
+    },
+    MbarInval {
+        mbar: Operand,
+        space: AddrSpace,
+    },
     MbarArrive(MbarArriveArgs),
-    MbarTx { op: TxOp, mbar: Operand, space: AddrSpace, bytes: Operand, multicast: Option<Operand>, scope: Scope },
+    MbarTx {
+        op: TxOp,
+        mbar: Operand,
+        space: AddrSpace,
+        bytes: Operand,
+        #[serde(deserialize_with = "required")]
+        multicast: Option<Operand>,
+        scope: Scope,
+    },
     /// Non-blocking `test_wait` / `try_wait`; `dst` = ready predicate.
-    MbarTestWait { kind: WaitKind, mbar: Operand, space: AddrSpace, phase: PhaseArg, sem: Sem, scope: Scope, dst: Option<Reg> },
+    MbarTestWait {
+        kind: WaitKind,
+        mbar: Operand,
+        space: AddrSpace,
+        phase: PhaseArg,
+        sem: Sem,
+        scope: Scope,
+        #[serde(deserialize_with = "required")]
+        dst: Option<Reg>,
+    },
     /// Blocking wait (`cuda.mbarrier_wait*`).
-    MbarWait { mbar: Operand, space: AddrSpace, phase: PhaseArg, sem: Sem, scope: Scope },
-    MbarQuery { dst: Reg, op: MbarQueryOp },
-    Fence { kind: FenceKind, sem: Sem, scope: Scope },
-    SetMaxNReg { inc: bool, count: u32 },
+    MbarWait {
+        mbar: Operand,
+        space: AddrSpace,
+        phase: PhaseArg,
+        sem: Sem,
+        scope: Scope,
+    },
+    MbarQuery {
+        dst: Reg,
+        op: MbarQueryOp,
+    },
+    Fence {
+        kind: FenceKind,
+        sem: Sem,
+        scope: Scope,
+    },
+    SetMaxNReg {
+        inc: bool,
+        count: u32,
+    },
     /// Block until predicate `pred` accepts the word at `addr`; then `dst`
     /// holds the accepted value. `captures` are snapshotted at issue.
-    WaitUntil { dst: Reg, addr: Operand, ty: Ty, space: AddrSpace, sem: Sem, scope: Scope, pred: PredId, captures: Vec<Reg> },
-    GridDepControl { launch_dependents: bool },
-    ClcTryCancel { resp: Operand, mbar: Operand, multicast: bool },
+    WaitUntil {
+        dst: Reg,
+        addr: Operand,
+        ty: Ty,
+        space: AddrSpace,
+        sem: Sem,
+        scope: Scope,
+        pred: PredId,
+        captures: Vec<Reg>,
+    },
+    GridDepControl {
+        launch_dependents: bool,
+    },
+    ClcTryCancel {
+        resp: Operand,
+        mbar: Operand,
+        multicast: bool,
+    },
 
     // ----- tcgen05 -----
     /// Writes the allocated taddr to shared memory at `dst`.
-    TcgenAlloc { dst: Operand, ncols: Operand, cta_group: u8, exclusive: bool },
-    TcgenDealloc { taddr: Operand, ncols: Operand, cta_group: u8, exclusive: bool },
-    TcgenRelinquish { cta_group: u8 },
-    TcgenCommit { mbar: Operand, space: AddrSpace, cta_group: u8, multicast: Option<Operand> },
+    TcgenAlloc {
+        dst: Operand,
+        ncols: Operand,
+        cta_group: u8,
+        exclusive: bool,
+    },
+    TcgenDealloc {
+        taddr: Operand,
+        ncols: Operand,
+        cta_group: u8,
+        exclusive: bool,
+    },
+    TcgenRelinquish {
+        cta_group: u8,
+    },
+    TcgenCommit {
+        mbar: Operand,
+        space: AddrSpace,
+        cta_group: u8,
+        #[serde(deserialize_with = "required")]
+        multicast: Option<Operand>,
+    },
     TcgenLd(Box<TcgenLdArgs>),
     TcgenSt(Box<TcgenStArgs>),
     /// `wait::ld` (`st = false`) / `wait::st`.
-    TcgenWait { st: bool },
+    TcgenWait {
+        st: bool,
+    },
     TcgenCp(TcgenCpArgs),
     TcgenMma(Box<TcgenMmaArgs>),
 
@@ -1102,8 +1535,14 @@ impl Instr {
             | TcgenWait { .. }
             | WaitUntil { .. }
             | WarpSync { .. } => true,
-            SetMaxNReg { inc, .. } => *inc,
-            Tile(t) => matches!(t.op, TileOp::Gemm | TileOp::Copy | TileOp::Sum) || t.scope != ExecScope::Thread,
+            // setmaxnreg (inc and dec) is a warpgroup rendezvous;
+            // cta_group::2 dealloc/relinquish rendezvous with the peer CTA.
+            SetMaxNReg { .. } => true,
+            TcgenDealloc { cta_group, .. } | TcgenRelinquish { cta_group } => *cta_group == 2,
+            Tile(t) => {
+                matches!(t.op, TileOp::Gemm | TileOp::Copy | TileOp::Sum)
+                    || t.scope != ExecScope::Thread
+            }
             _ => false,
         }
     }
@@ -1158,8 +1597,10 @@ impl Instr {
 
 /// Register declaration.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegDecl {
     pub ty: Ty,
+    #[serde(deserialize_with = "required")]
     pub name: Option<String>,
     /// Static hint: every write is warp-uniform. Engines must be correct
     /// when ignoring it.
@@ -1168,6 +1609,7 @@ pub struct RegDecl {
 
 /// A small expression over scalar host parameters (dynamic extents).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum DimExpr {
     Const(i64),
     Param(ParamId),
@@ -1213,6 +1655,7 @@ impl DimExpr {
 
 /// A declared buffer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BufferDecl {
     pub name: String,
     pub space: Space,
@@ -1221,14 +1664,17 @@ pub struct BufferDecl {
     /// Element strides (row-major when empty).
     pub strides: Vec<DimExpr>,
     /// Host parameter backing this buffer (global buffers, tensor maps).
+    #[serde(deserialize_with = "required")]
     pub param_slot: Option<ParamId>,
     /// Byte offset of the buffer in its backing: shared-window offset for
     /// shared buffers; offset within `view_of` for views; 0 otherwise.
     pub base: u64,
     /// Total bytes; None = taken from the bound host argument.
+    #[serde(deserialize_with = "required")]
     pub byte_len: Option<DimExpr>,
     pub align: u32,
     /// This buffer is a view (DeclBuffer) of another buffer's storage.
+    #[serde(deserialize_with = "required")]
     pub view_of: Option<Buf>,
     /// Lowering hint: the buffer holds declared synchronization words
     /// (an `AddrOf` of it reaches a `WaitUntil`). The engine emits
@@ -1239,10 +1685,13 @@ pub struct BufferDecl {
     pub sync_words: bool,
 }
 
-/// Interned generic op: canonical op name + canonical modifier tuple
-/// (`tirx.ptx.cvt`, `["rn", "f16x2", "f32"]`). Resolved to an oplib function
-/// at load (`oplib::resolve_ptx`).
+/// Interned generic op: canonical op name + canonical modifier tuple.
+/// Each modifier SHOULD be spelled `"slot=token"` (TVM PTX-table slot name,
+/// e.g. `["rnd=rn", "dtype=f16x2", "src=f32"]`) so the key does not depend on
+/// slot order (W4-2); bare tokens are still accepted by `oplib::resolve_ptx`
+/// and assigned to slots in table order. Resolved once at load.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpKey {
     pub name: String,
     pub mods: Vec<String>,
@@ -1254,6 +1703,7 @@ pub struct OpKey {
 /// LoadRegIndexed`. The engine writes the candidate word into `arg`, runs
 /// the range, reads the predicate from `result`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PredProgram {
     pub arg: Reg,
     pub start: Pc,
@@ -1266,6 +1716,7 @@ pub struct PredProgram {
 
 /// Launch topology.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Launch {
     /// Grid in CTAs (linear grids use `[n, 1, 1]`).
     pub grid: [DimExpr; 3],
@@ -1276,6 +1727,7 @@ pub struct Launch {
     /// Static shared bytes (lowering's pool layout).
     pub static_smem_bytes: u32,
     pub dyn_smem_bytes: DimExpr,
+    #[serde(deserialize_with = "required")]
     pub min_blocks_per_sm: Option<u32>,
     pub cooperative: bool,
     /// Per-thread register budget at launch (setmaxnreg `Configure`), 0 = default.
@@ -1284,6 +1736,7 @@ pub struct Launch {
 
 /// Concrete launch shape after evaluating `DimExpr`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchShape {
     pub grid: [u32; 3],
     pub cluster: [u32; 3],
@@ -1318,6 +1771,7 @@ impl LaunchShape {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ParamKind {
     Buffer,
     Pointer,
@@ -1327,6 +1781,7 @@ pub enum ParamKind {
 
 /// Host-prelude tensor-map encoding facts (`tensormap_encode_tiled`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TensorMapSpec {
     pub dtype: Dtype,
     pub rank: u8,
@@ -1346,25 +1801,34 @@ pub struct TensorMapSpec {
 
 /// One host parameter, in kernel signature order.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParamSlot {
     /// Canonical name (binding key, unique within a Module).
     pub name: String,
     pub local_name: String,
     pub aliases: Vec<String>,
     pub kind: ParamKind,
+    #[serde(deserialize_with = "required")]
     pub dtype: Option<Ty>,
     pub shape: Vec<DimExpr>,
-    /// Tensor maps encoded by the host prelude.
+    /// Tensor maps encoded by the host prelude. When set, the host binds no
+    /// value for this slot: the engine encodes the 128-byte map at bind time
+    /// from `implicit_base`'s allocation (its engine VA + `base_offset`) and
+    /// this spec (W8-3).
+    #[serde(deserialize_with = "required")]
     pub tensor_map: Option<TensorMapSpec>,
     /// Implicit tensor map: the buffer parameter it describes.
+    #[serde(deserialize_with = "required")]
     pub implicit_base: Option<ParamId>,
     /// Buffer declared for this parameter (Buffer kind: global buffer;
     /// TensorMap kind: 128-byte Param-space buffer usable with `AddrOf`).
+    #[serde(deserialize_with = "required")]
     pub buf: Option<Buf>,
 }
 
 /// Feature requirements a program declares (engines reject what they lack).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Requirements {
     pub implicit_tmem: bool,
     pub dynamic_tmem_lifecycle: bool,
@@ -1375,6 +1839,7 @@ pub struct Requirements {
 
 /// One kernel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Program {
     pub name: String,
     pub code: Vec<Instr>,
@@ -1391,6 +1856,7 @@ pub struct Program {
     pub topology: Launch,
     pub host_abi: Vec<ParamSlot>,
     /// Target arch (`sm_100a`, ...).
+    #[serde(deserialize_with = "required")]
     pub arch: Option<String>,
     pub requirements: Requirements,
     /// Lowering's collected unsupported reasons (`site#N kind: reason`);
@@ -1400,6 +1866,7 @@ pub struct Program {
 
 /// Kernels launched in order, sharing host bindings by name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Module {
     pub format_version: u32,
     pub kernels: Vec<Program>,
@@ -1419,7 +1886,10 @@ impl fmt::Display for ProgramError {
             ProgramError::Version { found, expected } => {
                 write!(f, "program format version {found}, expected {expected}")
             }
-            ProgramError::Invalid { pc: Some(pc), message } => write!(f, "invalid program at @{pc}: {message}"),
+            ProgramError::Invalid {
+                pc: Some(pc),
+                message,
+            } => write!(f, "invalid program at @{pc}: {message}"),
             ProgramError::Invalid { pc: None, message } => write!(f, "invalid program: {message}"),
         }
     }
@@ -1429,13 +1899,17 @@ impl std::error::Error for ProgramError {}
 
 impl Module {
     pub fn new(kernels: Vec<Program>) -> Module {
-        Module { format_version: FORMAT_VERSION, kernels }
+        Module {
+            format_version: FORMAT_VERSION,
+            kernels,
+        }
     }
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_stdvec(self).expect("Module is serializable")
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Module, ProgramError> {
-        let m: Module = postcard::from_bytes(bytes).map_err(|e| ProgramError::Decode(e.to_string()))?;
+        let m: Module =
+            postcard::from_bytes(bytes).map_err(|e| ProgramError::Decode(e.to_string()))?;
         m.check_version()?;
         Ok(m)
     }
@@ -1449,7 +1923,10 @@ impl Module {
     }
     fn check_version(&self) -> Result<(), ProgramError> {
         if self.format_version != FORMAT_VERSION {
-            return Err(ProgramError::Version { found: self.format_version, expected: FORMAT_VERSION });
+            return Err(ProgramError::Version {
+                found: self.format_version,
+                expected: FORMAT_VERSION,
+            });
         }
         Ok(())
     }
@@ -1488,7 +1965,10 @@ impl Program {
     }
 
     pub fn site_of(&self, pc: Pc) -> SiteId {
-        self.code_sites.get(pc.0 as usize).copied().unwrap_or(SiteId::NONE)
+        self.code_sites
+            .get(pc.0 as usize)
+            .copied()
+            .unwrap_or(SiteId::NONE)
     }
 
     /// First register slot of each register, plus the total slot count as
@@ -1511,146 +1991,863 @@ impl Program {
         postcard::from_bytes(bytes).map_err(|e| ProgramError::Decode(e.to_string()))
     }
 
-    /// Structural validation: parallel arrays, table indices, control-flow
-    /// nesting/targets and predicate sub-program ranges. Backends may assume
-    /// a validated program.
+    /// Full structural validation. Backends may assume a validated program;
+    /// lowering output that fails here is a lowering bug. Checks:
+    /// * parallel arrays (`code_sites`) and every nested index: registers
+    ///   (including `base..base+len` ranges), consts, buffers, strings,
+    ///   layouts, ops, preds, params, sites, `DimExpr` params;
+    /// * `Ty` invariants (`lanes >= 1`, `bits <= MAX_VALUE_BITS`) everywhere
+    ///   and `Const` bits fit `ty.bits()` (and <= 128);
+    /// * every destination's value type fits its register (`bits` and
+    ///   therefore `slots`), so no write spills into the next register;
+    /// * structured control flow: every target is the matching instruction
+    ///   of *its own* frame (`If.else_pc/end_pc`, `Else.end_pc`,
+    ///   `LoopBegin.end_pc`, `LoopIf.end_pc`, `LoopEnd.head_pc`),
+    ///   `LoopIf` is directly inside its loop, `Break`/`Continue` inside a
+    ///   loop, frames balanced;
+    /// * `PredProgram` ranges are disjoint, cover exactly the tail
+    ///   `code[main_end..]`, contain only allowed instructions, and the main
+    ///   body ends in `Exit` or `Unsupported` so it cannot fall through.
     pub fn validate(&self) -> Result<(), ProgramError> {
-        let err = |pc: usize, m: String| ProgramError::Invalid { pc: Some(pc as u32), message: m };
-        if self.code_sites.len() != self.code.len() {
-            return Err(ProgramError::Invalid {
-                pc: None,
-                message: format!("code_sites has {} entries for {} instrs", self.code_sites.len(), self.code.len()),
-            });
-        }
+        let at = |pc: usize, m: String| ProgramError::Invalid {
+            pc: Some(pc as u32),
+            message: m,
+        };
+        let glob = |m: String| ProgramError::Invalid {
+            pc: None,
+            message: m,
+        };
         let n = self.code.len();
-        let is = |pc: Pc, f: fn(&Instr) -> bool| (pc.0 as usize) < n && f(&self.code[pc.0 as usize]);
-        // Predicate ranges are excluded from the structured walk.
-        let mut in_pred = vec![false; n];
-        for (i, p) in self.preds.iter().enumerate() {
-            if p.start.0 > p.end.0 || p.end.0 as usize > n {
-                return Err(ProgramError::Invalid { pc: None, message: format!("pred {i}: bad range") });
+        if self.code_sites.len() != n {
+            return Err(glob(format!(
+                "code_sites has {} entries for {n} instrs",
+                self.code_sites.len()
+            )));
+        }
+        let nregs = self.regs.len();
+        let ty_ok = |t: Ty| t.lanes >= 1 && t.bits() <= crate::dtype::MAX_VALUE_BITS;
+        // ---- tables ----
+        for (i, r) in self.regs.iter().enumerate() {
+            if !ty_ok(r.ty) {
+                return Err(glob(format!("r{i}: invalid type {}", r.ty)));
             }
-            for pc in p.start.0..p.end.0 {
-                in_pred[pc as usize] = true;
-                let ok = matches!(
-                    self.code[pc as usize],
-                    Instr::Mov { .. }
-                        | Instr::Unary { .. }
-                        | Instr::Binary { .. }
-                        | Instr::Ternary { .. }
-                        | Instr::Compare { .. }
-                        | Instr::Select { .. }
-                        | Instr::Cast { .. }
-                        | Instr::Ptx { .. }
-                        | Instr::Load { .. }
-                        | Instr::LoadAddr { .. }
-                        | Instr::LoadRegIndexed { .. }
-                );
-                if !ok {
-                    return Err(err(pc as usize, format!("instruction not allowed in predicate {i}")));
+        }
+        for (i, k) in self.consts.iter().enumerate() {
+            if !ty_ok(k.ty)
+                || k.ty.bits() > 128
+                || (k.ty.bits() < 128 && k.bits >> k.ty.bits() != 0)
+            {
+                return Err(glob(format!(
+                    "k{i}: bits {:#x} do not fit {}",
+                    k.bits, k.ty
+                )));
+            }
+        }
+        let np = self.host_abi.len();
+        let mut dim_err: Option<String> = None;
+        let mut check_dim = |e: &DimExpr, what: &str| {
+            fn walk(e: &DimExpr, np: usize) -> bool {
+                use DimExpr::*;
+                match e {
+                    Const(_) => true,
+                    Param(p) => (p.0 as usize) < np,
+                    Add(a, b)
+                    | Sub(a, b)
+                    | Mul(a, b)
+                    | FloorDiv(a, b)
+                    | CeilDiv(a, b)
+                    | Min(a, b)
+                    | Max(a, b) => walk(a, np) && walk(b, np),
+                }
+            }
+            if dim_err.is_none() && !walk(e, np) {
+                dim_err = Some(format!("{what}: DimExpr parameter out of range"));
+            }
+        };
+        let t = &self.topology;
+        for (i, d) in t.grid.iter().enumerate() {
+            check_dim(d, &format!("grid[{i}]"));
+        }
+        check_dim(&t.dyn_smem_bytes, "dyn_smem_bytes");
+        for (i, b) in self.buffers.iter().enumerate() {
+            if !ty_ok(b.dtype) {
+                return Err(glob(format!("b{i}: invalid dtype {}", b.dtype)));
+            }
+            if b.param_slot.is_some_and(|p| p.0 as usize >= np)
+                || b.view_of
+                    .is_some_and(|v| v.0 as usize >= self.buffers.len() || v.0 as usize == i)
+            {
+                return Err(glob(format!("b{i}: param_slot/view_of out of range")));
+            }
+            for d in b.shape.iter().chain(&b.strides).chain(b.byte_len.as_ref()) {
+                check_dim(d, &format!("b{i}"));
+            }
+        }
+        for (i, slot) in self.host_abi.iter().enumerate() {
+            if slot.dtype.is_some_and(|t| !ty_ok(t))
+                || slot.buf.is_some_and(|b| b.0 as usize >= self.buffers.len())
+                || slot.implicit_base.is_some_and(|p| p.0 as usize >= np)
+            {
+                return Err(glob(format!("param{i}: dtype/buf/implicit_base invalid")));
+            }
+            for d in &slot.shape {
+                check_dim(d, &format!("param{i}"));
+            }
+            if let Some(m) = &slot.tensor_map {
+                for d in m
+                    .global_dim
+                    .iter()
+                    .chain(&m.global_stride)
+                    .chain(std::iter::once(&m.base_offset))
+                {
+                    check_dim(d, &format!("param{i}.tensor_map"));
                 }
             }
         }
-        let nregs = self.regs.len() as u32;
-        let op_ok = |o: &Operand| match o {
-            Operand::Reg(r) => r.0 < nregs,
-            Operand::Const(c) => (c.0 as usize) < self.consts.len(),
-        };
-        enum Open {
-            If,
-            Else,
-            Loop,
+        if let Some(e) = dim_err {
+            return Err(glob(e));
         }
-        let mut stack: Vec<Open> = Vec::new();
+        for (i, l) in self.layouts.iter().enumerate() {
+            if l.entries.len() as u64 != l.lanes as u64 * l.slots as u64 {
+                return Err(glob(format!("L{i}: entries length != lanes * slots")));
+            }
+        }
+        // ---- predicate sub-programs at the tail ----
+        let mut ranges: Vec<(u32, u32, usize)> = self
+            .preds
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.start.0, p.end.0, i))
+            .collect();
+        ranges.sort_unstable();
+        let main_end = ranges.first().map_or(n, |r| r.0 as usize);
+        let mut cursor = main_end;
+        for &(start, end, i) in &ranges {
+            if start as usize != cursor || end < start || end as usize > n {
+                return Err(glob(format!(
+                    "pred {i}: ranges must be disjoint and tile code[{main_end}..]"
+                )));
+            }
+            cursor = end as usize;
+            let p = &self.preds[i];
+            if p.arg.0 as usize >= nregs || p.result.0 as usize >= nregs {
+                return Err(glob(format!("pred {i}: arg/result register out of range")));
+            }
+        }
+        if cursor != n {
+            return Err(glob(format!(
+                "code[{cursor}..{n}] is neither main body nor a predicate"
+            )));
+        }
+        if main_end > 0
+            && !self.preds.is_empty()
+            && !matches!(
+                self.code[main_end - 1],
+                Instr::Exit | Instr::Unsupported { .. }
+            )
+        {
+            return Err(at(
+                main_end - 1,
+                "main body must end in Exit/Unsupported before predicate code".into(),
+            ));
+        }
+        for pc in main_end..n {
+            let ok = matches!(
+                self.code[pc],
+                Instr::Mov { .. }
+                    | Instr::Unary { .. }
+                    | Instr::Binary { .. }
+                    | Instr::Ternary { .. }
+                    | Instr::Compare { .. }
+                    | Instr::Select { .. }
+                    | Instr::Cast { .. }
+                    | Instr::Ptx { .. }
+                    | Instr::Load { .. }
+                    | Instr::LoadAddr { .. }
+                    | Instr::LoadRegIndexed { .. }
+            );
+            if !ok {
+                return Err(at(
+                    pc,
+                    "instruction not allowed in a predicate sub-program".into(),
+                ));
+            }
+        }
+        // ---- per-instruction references ----
         for (pc, ins) in self.code.iter().enumerate() {
             let s = self.code_sites[pc];
             if !s.is_none() && s.0 as usize >= self.sites.len() {
-                return Err(err(pc, format!("site {s} out of range")));
+                return Err(at(pc, format!("site {s} out of range")));
             }
-            if in_pred[pc] {
-                continue;
+            let mut bad: Option<String> = None;
+            ins.refs(&mut |r| {
+                if bad.is_some() {
+                    return;
+                }
+                let reg_ok = |x: Reg| (x.0 as usize) < nregs;
+                bad = match r {
+                    Ref::Use(Operand::Reg(x)) | Ref::Def(x, None) if !reg_ok(x) => {
+                        Some(format!("{x} out of range"))
+                    }
+                    Ref::Use(Operand::Const(k)) if k.0 as usize >= self.consts.len() => {
+                        Some(format!("{k} out of range"))
+                    }
+                    Ref::Def(x, Some(ty)) => {
+                        if !reg_ok(x) {
+                            Some(format!("{x} out of range"))
+                        } else if !ty_ok(ty) || ty.bits() > self.regs[x.0 as usize].ty.bits() {
+                            Some(format!(
+                                "{ty} does not fit {x}: {}",
+                                self.regs[x.0 as usize].ty
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    Ref::Regs(base, len) if len == 0 || base.0 as usize + len as usize > nregs => {
+                        Some(format!("register range {base}+{len} out of range"))
+                    }
+                    Ref::Ty(ty) if !ty_ok(ty) => Some(format!("invalid type {ty}")),
+                    Ref::Buf(b) if b.0 as usize >= self.buffers.len() => {
+                        Some(format!("{b} out of range"))
+                    }
+                    Ref::Str(x) if x.0 as usize >= self.strings.len() => {
+                        Some(format!("{x} out of range"))
+                    }
+                    Ref::Layout(x) if x.0 as usize >= self.layouts.len() => {
+                        Some(format!("{x} out of range"))
+                    }
+                    Ref::Op(x) if x.0 as usize >= self.ops.len() => {
+                        Some(format!("{x} out of range"))
+                    }
+                    Ref::Pred(x) if x.0 as usize >= self.preds.len() => {
+                        Some(format!("{x} out of range"))
+                    }
+                    Ref::Param(x) if x.0 as usize >= np => Some(format!("{x} out of range")),
+                    _ => None,
+                };
+            });
+            if let Instr::LoadRegIndexed { dst, base, .. } = ins {
+                if bad.is_none()
+                    && self.regs[base.0 as usize].ty.bits() > self.regs[dst.0 as usize].ty.bits()
+                {
+                    bad = Some(format!("{dst} cannot hold an element of {base}"));
+                }
             }
+            if let Some(m) = bad {
+                return Err(at(pc, m));
+            }
+        }
+        // ---- structured control flow (main body only) ----
+        enum Open {
+            If {
+                else_pc: Pc,
+                end_pc: Pc,
+            },
+            Else {
+                end_pc: Pc,
+            },
+            Loop {
+                begin: Pc,
+                end_pc: Pc,
+                cond_seen: bool,
+            },
+        }
+        let mut stack: Vec<Open> = Vec::new();
+        for (pc, ins) in self.code[..main_end].iter().enumerate() {
+            let here = Pc(pc as u32);
             match ins {
-                Instr::If { cond, else_pc, end_pc, .. } => {
-                    if !op_ok(cond) {
-                        return Err(err(pc, "bad If cond".into()));
-                    }
-                    if !is(*end_pc, |i| matches!(i, Instr::EndIf))
-                        || !(is(*else_pc, |i| matches!(i, Instr::Else { .. })) || else_pc == end_pc)
+                Instr::If {
+                    else_pc, end_pc, ..
+                } => {
+                    if else_pc.0 <= here.0 || end_pc.0 < else_pc.0 || end_pc.0 as usize >= main_end
                     {
-                        return Err(err(pc, "bad If targets".into()));
+                        return Err(at(pc, "bad If targets".into()));
                     }
-                    stack.push(Open::If);
+                    stack.push(Open::If {
+                        else_pc: *else_pc,
+                        end_pc: *end_pc,
+                    });
                 }
-                Instr::Else { end_pc } => {
-                    if !matches!(stack.pop(), Some(Open::If)) {
-                        return Err(err(pc, "Else without If".into()));
+                Instr::Else { end_pc } => match stack.pop() {
+                    Some(Open::If {
+                        else_pc,
+                        end_pc: if_end,
+                    }) if else_pc == here && if_end == *end_pc => {
+                        stack.push(Open::Else { end_pc: *end_pc })
                     }
-                    if !is(*end_pc, |i| matches!(i, Instr::EndIf)) {
-                        return Err(err(pc, "Else end_pc is not an EndIf".into()));
-                    }
-                    stack.push(Open::Else);
-                }
-                Instr::EndIf => {
-                    if !matches!(stack.pop(), Some(Open::If) | Some(Open::Else)) {
-                        return Err(err(pc, "EndIf without If".into()));
-                    }
-                }
+                    _ => return Err(at(pc, "Else does not match its If (else_pc/end_pc)".into())),
+                },
+                Instr::EndIf => match stack.pop() {
+                    Some(Open::If { else_pc, end_pc }) if else_pc == here && end_pc == here => {}
+                    Some(Open::Else { end_pc }) if end_pc == here => {}
+                    _ => return Err(at(pc, "EndIf does not match its If/Else".into())),
+                },
                 Instr::LoopBegin { end_pc } => {
-                    if !is(*end_pc, |i| matches!(i, Instr::LoopEnd { .. })) {
-                        return Err(err(pc, "LoopBegin end_pc is not a LoopEnd".into()));
+                    if end_pc.0 <= here.0 || end_pc.0 as usize >= main_end {
+                        return Err(at(pc, "bad LoopBegin end_pc".into()));
                     }
-                    stack.push(Open::Loop);
+                    stack.push(Open::Loop {
+                        begin: here,
+                        end_pc: *end_pc,
+                        cond_seen: false,
+                    });
                 }
-                Instr::LoopIf { cond, end_pc } => {
-                    if !op_ok(cond) || !is(*end_pc, |i| matches!(i, Instr::LoopEnd { .. })) {
-                        return Err(err(pc, "bad LoopIf".into()));
-                    }
-                }
+                Instr::LoopIf { end_pc, .. } => match stack.last_mut() {
+                    Some(Open::Loop {
+                        end_pc: e,
+                        cond_seen,
+                        ..
+                    }) if e == end_pc && !*cond_seen => *cond_seen = true,
+                    _ => return Err(at(
+                        pc,
+                        "LoopIf must be directly inside its own loop (once), end_pc = its LoopEnd"
+                            .into(),
+                    )),
+                },
                 Instr::Break | Instr::Continue => {
-                    if !stack.iter().any(|o| matches!(o, Open::Loop)) {
-                        return Err(err(pc, "Break/Continue outside a loop".into()));
+                    if !stack.iter().any(|o| matches!(o, Open::Loop { .. })) {
+                        return Err(at(pc, "Break/Continue outside a loop".into()));
                     }
                 }
-                Instr::LoopEnd { head_pc } => {
-                    if !matches!(stack.pop(), Some(Open::Loop)) {
-                        return Err(err(pc, "LoopEnd without LoopBegin".into()));
+                Instr::LoopEnd { head_pc } => match stack.pop() {
+                    Some(Open::Loop {
+                        begin,
+                        end_pc,
+                        cond_seen,
+                    }) if end_pc == here && cond_seen => {
+                        if head_pc.0 <= begin.0 || head_pc.0 >= here.0 {
+                            return Err(at(pc, "LoopEnd head_pc must lie inside its loop".into()));
+                        }
                     }
-                    if head_pc.0 as usize >= pc {
-                        return Err(err(pc, "LoopEnd head_pc must precede it".into()));
+                    _ => {
+                        return Err(at(
+                            pc,
+                            "LoopEnd does not match its LoopBegin (or the loop has no LoopIf)"
+                                .into(),
+                        ))
                     }
-                }
-                Instr::Mov { dst, src } => {
-                    if dst.0 >= nregs || !op_ok(src) {
-                        return Err(err(pc, "bad Mov operands".into()));
-                    }
-                }
-                Instr::Load { dst, buf, offset, .. } => {
-                    if dst.0 >= nregs || buf.0 as usize >= self.buffers.len() || !op_ok(offset) {
-                        return Err(err(pc, "bad Load operands".into()));
-                    }
-                }
-                Instr::Store { buf, offset, value, .. } => {
-                    if buf.0 as usize >= self.buffers.len() || !op_ok(offset) || !op_ok(value) {
-                        return Err(err(pc, "bad Store operands".into()));
-                    }
-                }
-                Instr::Ptx { op, .. } if op.0 as usize >= self.ops.len() => {
-                    return Err(err(pc, "Ptx op out of range".into()));
-                }
-                Instr::WaitUntil { pred, .. } if pred.0 as usize >= self.preds.len() => {
-                    return Err(err(pc, "WaitUntil pred out of range".into()));
-                }
-                Instr::ReadParam { slot, .. } if slot.0 as usize >= self.host_abi.len() => {
-                    return Err(err(pc, "ReadParam slot out of range".into()));
-                }
+                },
                 _ => {}
             }
         }
         if !stack.is_empty() {
-            return Err(ProgramError::Invalid { pc: None, message: "unterminated control-flow frame".into() });
+            return Err(glob("unterminated control-flow frame".into()));
         }
         Ok(())
+    }
+}
+
+/// One reference made by an instruction (see [`Instr::refs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ref {
+    /// Operand read.
+    Use(Operand),
+    /// Register written, with the value type written when known.
+    Def(Reg, Option<Ty>),
+    /// A register range `base..base+len` (promoted local arrays).
+    Regs(Reg, u32),
+    Ty(Ty),
+    Buf(Buf),
+    Str(StrId),
+    Layout(LayoutId),
+    Op(OpId),
+    Pred(PredId),
+    Param(ParamId),
+}
+
+impl Instr {
+    /// Visit every register, constant, table index and type the instruction
+    /// references (used by `validate`; usable by printers and analyses).
+    pub fn refs(&self, f: &mut dyn FnMut(Ref)) {
+        use Instr::*;
+        use Ref::*;
+        fn opt(o: &Option<Operand>, f: &mut dyn FnMut(Ref)) {
+            if let Some(o) = o {
+                f(Use(*o));
+            }
+        }
+        fn mods(m: &MemMods, f: &mut dyn FnMut(Ref)) {
+            opt(&m.policy, f);
+        }
+        fn completion(c: &BulkCompletion, f: &mut dyn FnMut(Ref)) {
+            if let BulkCompletion::Mbarrier { mbar, .. } = c {
+                f(Use(*mbar));
+            }
+        }
+        fn phase(p: &PhaseArg, f: &mut dyn FnMut(Ref)) {
+            match p {
+                PhaseArg::State(o) | PhaseArg::Parity(o) => f(Use(*o)),
+            }
+        }
+        let pred_ty = |t: crate::dtype::Ty| crate::dtype::Ty::vector(Dtype::Pred, t.lanes);
+        match self {
+            Nop
+            | Else { .. }
+            | EndIf
+            | LoopBegin { .. }
+            | LoopEnd { .. }
+            | Break
+            | Continue
+            | Exit
+            | GridSync => {}
+            AsyncCommit { .. } | AsyncWait { .. } | ClusterArrive { .. } | ClusterWait { .. } => {}
+            SetMaxNReg { .. }
+            | GridDepControl { .. }
+            | TcgenRelinquish { .. }
+            | TcgenWait { .. } => {}
+            If { cond, .. } | LoopIf { cond, .. } => f(Use(*cond)),
+            Assert { cond, msg } => {
+                f(Use(*cond));
+                if let Some(m) = msg {
+                    f(Str(*m));
+                }
+            }
+            Unsupported { reason } => f(Str(*reason)),
+            Mov { dst, src } => {
+                f(Def(*dst, None));
+                f(Use(*src));
+            }
+            ReadSpecial { dst, .. } => f(Def(*dst, None)),
+            ReadParam { dst, slot } => {
+                f(Def(*dst, None));
+                f(Param(*slot));
+            }
+            Unary { op, ty, dst, a } => {
+                f(Ty(*ty));
+                let out = if matches!(op, UnOp::IsNan | UnOp::IsInf | UnOp::IsFinite) {
+                    pred_ty(*ty)
+                } else {
+                    *ty
+                };
+                f(Def(*dst, Some(out)));
+                f(Use(*a));
+            }
+            Binary { ty, dst, a, b, .. } => {
+                f(Ty(*ty));
+                f(Def(*dst, Some(*ty)));
+                f(Use(*a));
+                f(Use(*b));
+            }
+            Ternary {
+                ty, dst, a, b, c, ..
+            } => {
+                f(Ty(*ty));
+                f(Def(*dst, Some(*ty)));
+                f(Use(*a));
+                f(Use(*b));
+                f(Use(*c));
+            }
+            Compare { ty, dst, a, b, .. } => {
+                f(Ty(*ty));
+                f(Def(*dst, Some(pred_ty(*ty))));
+                f(Use(*a));
+                f(Use(*b));
+            }
+            Select {
+                ty,
+                dst,
+                cond,
+                a,
+                b,
+            } => {
+                f(Ty(*ty));
+                f(Def(*dst, Some(*ty)));
+                f(Use(*cond));
+                f(Use(*a));
+                f(Use(*b));
+            }
+            Cast {
+                from, to, dst, src, ..
+            } => {
+                f(Ty(*from));
+                f(Def(*dst, Some(*to)));
+                f(Use(*src));
+            }
+            Ptx {
+                op,
+                dsts,
+                srcs,
+                pred,
+                ..
+            } => {
+                f(Op(*op));
+                dsts.iter().for_each(|d| f(Def(*d, None)));
+                srcs.iter().for_each(|s| f(Use(*s)));
+                opt(pred, f);
+            }
+            LoadRegIndexed {
+                dst,
+                base,
+                len,
+                idx,
+            } => {
+                f(Def(*dst, None));
+                f(Regs(*base, *len));
+                f(Use(*idx));
+            }
+            StoreRegIndexed {
+                base,
+                len,
+                idx,
+                value,
+            } => {
+                f(Regs(*base, *len));
+                f(Use(*idx));
+                f(Use(*value));
+            }
+            Shfl {
+                ty,
+                dst,
+                dst_pred,
+                src,
+                lane,
+                clamp,
+                membermask,
+                ..
+            } => {
+                f(Ty(*ty));
+                f(Def(*dst, Some(*ty)));
+                if let Some(p) = dst_pred {
+                    f(Def(*p, None));
+                }
+                [src, lane, clamp, membermask]
+                    .iter()
+                    .for_each(|o| f(Use(**o)));
+            }
+            Vote {
+                dst,
+                pred,
+                membermask,
+                ..
+            } => {
+                f(Def(*dst, None));
+                f(Use(*pred));
+                f(Use(*membermask));
+            }
+            Redux {
+                ty,
+                dst,
+                src,
+                membermask,
+                ..
+            } => {
+                f(Ty(*ty));
+                f(Def(*dst, Some(*ty)));
+                f(Use(*src));
+                f(Use(*membermask));
+            }
+            Elect {
+                dst_pred,
+                dst_lane,
+                membermask,
+            } => {
+                f(Def(*dst_pred, None));
+                if let Some(l) = dst_lane {
+                    f(Def(*l, None));
+                }
+                f(Use(*membermask));
+            }
+            WarpSync { membermask } => f(Use(*membermask)),
+            LdMatrix { dsts, addr, .. } => {
+                dsts.iter().for_each(|d| f(Def(*d, None)));
+                f(Use(*addr));
+            }
+            StMatrix { srcs, addr, .. } => {
+                srcs.iter().for_each(|s| f(Use(*s)));
+                f(Use(*addr));
+            }
+            Load {
+                ty,
+                dst,
+                buf,
+                offset,
+                mods: m,
+                ..
+            } => {
+                f(Def(*dst, Some(*ty)));
+                f(Buf(*buf));
+                f(Use(*offset));
+                mods(m, f);
+            }
+            Store {
+                ty,
+                buf,
+                offset,
+                value,
+                mods: m,
+                ..
+            } => {
+                f(Ty(*ty));
+                f(Buf(*buf));
+                f(Use(*offset));
+                f(Use(*value));
+                mods(m, f);
+            }
+            LoadAddr {
+                ty,
+                dst,
+                addr,
+                mods: m,
+                ..
+            } => {
+                f(Def(*dst, Some(*ty)));
+                f(Use(*addr));
+                mods(m, f);
+            }
+            StoreAddr {
+                ty,
+                addr,
+                value,
+                mods: m,
+                ..
+            } => {
+                f(Ty(*ty));
+                f(Use(*addr));
+                f(Use(*value));
+                mods(m, f);
+            }
+            AddrOf { dst, buf, offset } => {
+                f(Def(*dst, Some(crate::dtype::Ty::U64)));
+                f(Buf(*buf));
+                f(Use(*offset));
+            }
+            Atom {
+                ty,
+                dst,
+                addr,
+                value,
+                cmp,
+                ..
+            } => {
+                f(Ty(*ty));
+                if let Some(d) = dst {
+                    f(Def(*d, Some(*ty)));
+                }
+                f(Use(*addr));
+                f(Use(*value));
+                opt(cmp, f);
+            }
+            StBulk { addr, size, .. } => {
+                f(Use(*addr));
+                f(Use(*size));
+            }
+            Discard { addr, .. } => f(Use(*addr)),
+            Cvta { dst, src, .. } | Isspacep { dst, src, .. } | GetCtaRank { dst, src, .. } => {
+                f(Def(*dst, None));
+                f(Use(*src));
+            }
+            Mapa { dst, src, rank, .. } => {
+                f(Def(*dst, None));
+                f(Use(*src));
+                f(Use(*rank));
+            }
+            CpAsync {
+                dst,
+                src,
+                src_size,
+                ignore_src,
+                mods: m,
+                ..
+            } => {
+                f(Use(*dst));
+                f(Use(*src));
+                opt(src_size, f);
+                opt(ignore_src, f);
+                mods(m, f);
+            }
+            CpAsyncMbarArrive { mbar, .. } => f(Use(*mbar)),
+            BulkCopy(a) => {
+                [a.dst, a.src, a.size].iter().for_each(|o| f(Use(*o)));
+                completion(&a.completion, f);
+                opt(&a.multicast, f);
+                mods(&a.mods, f);
+            }
+            Tma(a) => {
+                f(Use(a.tmap));
+                a.coords
+                    .iter()
+                    .chain(&a.im2col_offsets)
+                    .for_each(|o| f(Use(*o)));
+                f(Use(a.smem));
+                completion(&a.completion, f);
+                opt(&a.multicast, f);
+                a.overrides.iter().for_each(|o| f(Use(o.value)));
+                mods(&a.mods, f);
+            }
+            StAsync(a) => {
+                f(Ty(a.ty));
+                [a.value, a.addr, a.mbar].iter().for_each(|o| f(Use(*o)));
+            }
+            TensorMapReplace { tmap, value, .. } => {
+                f(Use(*tmap));
+                f(Use(*value));
+            }
+            TensorMapCopyFence { dst, src, .. } => {
+                f(Use(*dst));
+                f(Use(*src));
+            }
+            Barrier {
+                kind, id, count, ..
+            } => {
+                if let BarKind::Red { pred, dst, .. } = kind {
+                    f(Use(*pred));
+                    f(Def(*dst, None));
+                }
+                f(Use(*id));
+                opt(count, f);
+            }
+            MbarInit { mbar, count, .. } => {
+                f(Use(*mbar));
+                f(Use(*count));
+            }
+            MbarInval { mbar, .. } => f(Use(*mbar)),
+            MbarArrive(a) => {
+                f(Use(a.mbar));
+                opt(&a.count, f);
+                opt(&a.expect_tx, f);
+                opt(&a.multicast, f);
+                if let Some(s) = a.state {
+                    f(Def(s, None));
+                }
+            }
+            MbarTx {
+                mbar,
+                bytes,
+                multicast,
+                ..
+            } => {
+                f(Use(*mbar));
+                f(Use(*bytes));
+                opt(multicast, f);
+            }
+            MbarTestWait {
+                mbar,
+                phase: p,
+                dst,
+                ..
+            } => {
+                f(Use(*mbar));
+                phase(p, f);
+                if let Some(d) = dst {
+                    f(Def(*d, None));
+                }
+            }
+            MbarWait { mbar, phase: p, .. } => {
+                f(Use(*mbar));
+                phase(p, f);
+            }
+            MbarQuery { dst, op } => {
+                f(Def(*dst, None));
+                match op {
+                    MbarQueryOp::PendingCount { state } => f(Use(*state)),
+                    MbarQueryOp::CheckLayout { mbar, .. } => f(Use(*mbar)),
+                }
+            }
+            Fence { kind, .. } => {
+                if let FenceKind::TensormapAcquire { addr, .. } = kind {
+                    f(Use(*addr));
+                }
+            }
+            WaitUntil {
+                dst,
+                addr,
+                ty,
+                pred,
+                captures,
+                ..
+            } => {
+                f(Def(*dst, Some(*ty)));
+                f(Use(*addr));
+                f(Pred(*pred));
+                captures.iter().for_each(|c| f(Use(Operand::Reg(*c))));
+            }
+            ClcTryCancel { resp, mbar, .. } => {
+                f(Use(*resp));
+                f(Use(*mbar));
+            }
+            TcgenAlloc { dst, ncols, .. } => {
+                f(Use(*dst));
+                f(Use(*ncols));
+            }
+            TcgenDealloc { taddr, ncols, .. } => {
+                f(Use(*taddr));
+                f(Use(*ncols));
+            }
+            TcgenCommit {
+                mbar, multicast, ..
+            } => {
+                f(Use(*mbar));
+                opt(multicast, f);
+            }
+            TcgenLd(a) => {
+                a.dsts.iter().for_each(|d| f(Def(*d, None)));
+                f(Use(a.taddr));
+                if let Some((_, regs)) = &a.red {
+                    regs.iter().for_each(|d| f(Def(*d, None)));
+                }
+            }
+            TcgenSt(a) => {
+                a.srcs.iter().for_each(|s| f(Use(*s)));
+                f(Use(a.taddr));
+            }
+            TcgenCp(a) => {
+                f(Use(a.taddr));
+                f(Use(a.sdesc));
+            }
+            TcgenMma(a) => {
+                let ta = match a.a {
+                    TcA::Smem(o) | TcA::Tmem(o) => o,
+                };
+                [a.d, ta, a.b_desc, a.idesc, a.enable_input_d]
+                    .iter()
+                    .for_each(|o| f(Use(*o)));
+                if let Some((x, y, _)) = a.block_scale {
+                    f(Use(x));
+                    f(Use(y));
+                }
+                opt(&a.scale_input_d, f);
+                opt(&a.sparse_meta, f);
+                a.disable_output_lane.iter().for_each(|o| f(Use(*o)));
+                if let Some(v) = a.variant {
+                    f(Str(v));
+                }
+            }
+            Tile(t) => {
+                for arg in &t.args {
+                    match *arg {
+                        TileArg::Region { buf, base, map } => {
+                            f(Buf(buf));
+                            f(Use(base));
+                            f(Layout(map));
+                        }
+                        TileArg::Frag { first, map } => {
+                            f(Use(Operand::Reg(first)));
+                            f(Layout(map));
+                        }
+                        TileArg::Scalar(o) => f(Use(o)),
+                    }
+                }
+                if let Some(c) = &t.completion {
+                    completion(c, f);
+                }
+            }
+        }
+    }
+}
+
+impl BufferDecl {
+    /// Bit offset of element `offset` (in units of `dtype.elem`) from the
+    /// buffer base: `offset * dtype.elem.bits()`. See `Instr::Load` for the
+    /// sub-byte alignment rule.
+    pub fn bit_offset(&self, offset: i64) -> Option<i64> {
+        offset.checked_mul(self.dtype.elem.bits() as i64)
+    }
+    /// Byte offset of element `offset`, or `None` if it is not byte-aligned
+    /// (sub-byte element at an odd position) or overflows.
+    pub fn byte_offset(&self, offset: i64) -> Option<i64> {
+        let bits = self.bit_offset(offset)?;
+        (bits % 8 == 0).then_some(bits / 8)
     }
 }
 
@@ -1673,8 +2870,17 @@ impl fmt::Display for Instr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use Instr::*;
         match self {
-            If { cond, else_pc, end_pc, elect } => {
-                write!(f, "If {cond}{} else={else_pc} end={end_pc}", if *elect { " elect" } else { "" })
+            If {
+                cond,
+                else_pc,
+                end_pc,
+                elect,
+            } => {
+                write!(
+                    f,
+                    "If {cond}{} else={else_pc} end={end_pc}",
+                    if *elect { " elect" } else { "" }
+                )
             }
             Else { end_pc } => write!(f, "Else end={end_pc}"),
             LoopBegin { end_pc } => write!(f, "LoopBegin end={end_pc}"),
@@ -1685,11 +2891,32 @@ impl fmt::Display for Instr {
             ReadParam { dst, slot } => write!(f, "ReadParam {dst} <- {slot}"),
             Unary { op, ty, dst, a } => write!(f, "Unary {op:?}.{ty} {dst} <- {a}"),
             Binary { op, ty, dst, a, b } => write!(f, "Binary {op:?}.{ty} {dst} <- {a}, {b}"),
-            Ternary { op, ty, dst, a, b, c } => write!(f, "Ternary {op:?}.{ty} {dst} <- {a}, {b}, {c}"),
+            Ternary {
+                op,
+                ty,
+                dst,
+                a,
+                b,
+                c,
+            } => write!(f, "Ternary {op:?}.{ty} {dst} <- {a}, {b}, {c}"),
             Compare { op, ty, dst, a, b } => write!(f, "Compare {op:?}.{ty} {dst} <- {a}, {b}"),
-            Select { ty, dst, cond, a, b } => write!(f, "Select.{ty} {dst} <- {cond} ? {a} : {b}"),
-            Cast { from, to, dst, src, .. } => write!(f, "Cast {to}.{from} {dst} <- {src}"),
-            Ptx { op, dsts, srcs, pred, .. } => {
+            Select {
+                ty,
+                dst,
+                cond,
+                a,
+                b,
+            } => write!(f, "Select.{ty} {dst} <- {cond} ? {a} : {b}"),
+            Cast {
+                from, to, dst, src, ..
+            } => write!(f, "Cast {to}.{from} {dst} <- {src}"),
+            Ptx {
+                op,
+                dsts,
+                srcs,
+                pred,
+                ..
+            } => {
                 if let Some(p) = pred {
                     write!(f, "@{p} ")?;
                 }
@@ -1703,20 +2930,72 @@ impl fmt::Display for Instr {
                 }
                 Ok(())
             }
-            Load { ty, dst, buf, offset, sem, scope, .. } => {
-                write!(f, "Load{} {ty} {dst} <- {buf}[{offset}]", sem_scope(*sem, *scope))
+            Load {
+                ty,
+                dst,
+                buf,
+                offset,
+                sem,
+                scope,
+                ..
+            } => {
+                write!(
+                    f,
+                    "Load{} {ty} {dst} <- {buf}[{offset}]",
+                    sem_scope(*sem, *scope)
+                )
             }
-            Store { ty, buf, offset, value, sem, scope, .. } => {
-                write!(f, "Store{} {ty} {buf}[{offset}] <- {value}", sem_scope(*sem, *scope))
+            Store {
+                ty,
+                buf,
+                offset,
+                value,
+                sem,
+                scope,
+                ..
+            } => {
+                write!(
+                    f,
+                    "Store{} {ty} {buf}[{offset}] <- {value}",
+                    sem_scope(*sem, *scope)
+                )
             }
-            LoadAddr { ty, dst, addr, space, sem, scope, .. } => {
-                write!(f, "LoadAddr{} {} {ty} {dst} <- [{addr}]", sem_scope(*sem, *scope), space.name())
+            LoadAddr {
+                ty,
+                dst,
+                addr,
+                space,
+                sem,
+                scope,
+                ..
+            } => {
+                write!(
+                    f,
+                    "LoadAddr{} {} {ty} {dst} <- [{addr}]",
+                    sem_scope(*sem, *scope),
+                    space.name()
+                )
             }
-            StoreAddr { ty, addr, space, value, sem, scope, .. } => {
-                write!(f, "StoreAddr{} {} {ty} [{addr}] <- {value}", sem_scope(*sem, *scope), space.name())
+            StoreAddr {
+                ty,
+                addr,
+                space,
+                value,
+                sem,
+                scope,
+                ..
+            } => {
+                write!(
+                    f,
+                    "StoreAddr{} {} {ty} [{addr}] <- {value}",
+                    sem_scope(*sem, *scope),
+                    space.name()
+                )
             }
             AddrOf { dst, buf, offset } => write!(f, "AddrOf {dst} <- {buf}[{offset}]"),
-            Barrier { kind, id, count, .. } => {
+            Barrier {
+                kind, id, count, ..
+            } => {
                 write!(f, "Barrier {kind:?} id={id}")?;
                 if let Some(c) = count {
                     write!(f, " count={c}")?;
@@ -1743,7 +3022,11 @@ impl fmt::Display for Instr {
 impl fmt::Display for Program {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let t = &self.topology;
-        writeln!(f, "kernel {} grid={:?} cluster={:?} block={:?}", self.name, t.grid, t.cluster, t.block)?;
+        writeln!(
+            f,
+            "kernel {} grid={:?} cluster={:?} block={:?}",
+            self.name, t.grid, t.cluster, t.block
+        )?;
         for (i, k) in self.consts.iter().enumerate() {
             writeln!(f, "  k{i} = {} {:#x}", k.ty, k.bits)?;
         }
@@ -1751,20 +3034,34 @@ impl fmt::Display for Program {
             writeln!(f, "  param{i} {}: {:?}", p.name, p.kind)?;
         }
         for (i, b) in self.buffers.iter().enumerate() {
-            writeln!(f, "  b{i} {}: {:?} {} base={}", b.name, b.space, b.dtype, b.base)?;
+            writeln!(
+                f,
+                "  b{i} {}: {:?} {} base={}",
+                b.name, b.space, b.dtype, b.base
+            )?;
         }
         for (i, o) in self.ops.iter().enumerate() {
             writeln!(f, "  op{i} = {} {:?}", o.name, o.mods)?;
         }
         let mut depth = 0usize;
         for (pc, ins) in self.code.iter().enumerate() {
-            if matches!(ins, Instr::Else { .. } | Instr::EndIf | Instr::LoopEnd { .. }) {
+            if matches!(
+                ins,
+                Instr::Else { .. } | Instr::EndIf | Instr::LoopEnd { .. }
+            ) {
                 depth = depth.saturating_sub(1);
             }
             let site = self.code_sites.get(pc).copied().unwrap_or(SiteId::NONE);
-            let at = if site.is_none() { String::new() } else { format!("  @{site}") };
+            let at = if site.is_none() {
+                String::new()
+            } else {
+                format!("  @{site}")
+            };
             writeln!(f, "{pc:04}  {}{ins}{at}", "  ".repeat(depth))?;
-            if matches!(ins, Instr::If { .. } | Instr::Else { .. } | Instr::LoopBegin { .. }) {
+            if matches!(
+                ins,
+                Instr::If { .. } | Instr::Else { .. } | Instr::LoopBegin { .. }
+            ) {
                 depth += 1;
             }
         }
@@ -1778,7 +3075,10 @@ mod tests {
 
     #[test]
     fn dim_expr_eval() {
-        let e = DimExpr::CeilDiv(Box::new(DimExpr::Param(ParamId(0))), Box::new(DimExpr::Const(128)));
+        let e = DimExpr::CeilDiv(
+            Box::new(DimExpr::Param(ParamId(0))),
+            Box::new(DimExpr::Const(128)),
+        );
         assert_eq!(e.eval(&|_| Some(1000)), Some(8));
         let e = DimExpr::FloorDiv(Box::new(DimExpr::Const(-7)), Box::new(DimExpr::Const(2)));
         assert_eq!(e.eval(&|_| None), Some(-4));
@@ -1787,7 +3087,162 @@ mod tests {
 
     #[test]
     fn instr_size_is_bounded() {
-        assert!(std::mem::size_of::<Instr>() <= 128, "Instr is {} bytes", std::mem::size_of::<Instr>());
+        assert!(
+            std::mem::size_of::<Instr>() <= 128,
+            "Instr is {} bytes",
+            std::mem::size_of::<Instr>()
+        );
+    }
+
+    fn base() -> Program {
+        let mut p = Program::empty("t", 32);
+        p.regs.push(RegDecl {
+            ty: Ty::U32,
+            name: None,
+            uniform: false,
+        });
+        p.regs.push(RegDecl {
+            ty: Ty::PRED,
+            name: None,
+            uniform: false,
+        });
+        p.consts.push(Const {
+            ty: Ty::U32,
+            bits: 7,
+        });
+        p
+    }
+
+    fn with_code(mut p: Program, code: Vec<Instr>) -> Program {
+        p.code_sites = vec![SiteId::NONE; code.len()];
+        p.code = code;
+        p
+    }
+
+    #[test]
+    fn validate_rejects_corrupt_programs() {
+        let k = Operand::Const(ConstId(0));
+        // A 128-bit write into a 32-bit register.
+        let p = with_code(
+            base(),
+            vec![Instr::Binary {
+                op: BinOp::Add,
+                ty: Ty::vector(Dtype::U32, 4),
+                dst: Reg(0),
+                a: k,
+                b: k,
+            }],
+        );
+        assert!(p.validate().is_err());
+        // lanes = 0.
+        let p = with_code(
+            base(),
+            vec![Instr::Binary {
+                op: BinOp::Add,
+                ty: Ty::vector(Dtype::U32, 0),
+                dst: Reg(0),
+                a: k,
+                b: k,
+            }],
+        );
+        assert!(p.validate().is_err());
+        // Const wider than its type.
+        let mut p = base();
+        p.consts[0].bits = 1 << 40;
+        assert!(p.validate().is_err());
+        // Else pointing at another frame's EndIf.
+        let c = Operand::Reg(Reg(1));
+        let p = with_code(
+            base(),
+            vec![
+                Instr::If {
+                    cond: c,
+                    else_pc: Pc(1),
+                    end_pc: Pc(4),
+                    elect: false,
+                },
+                Instr::Else { end_pc: Pc(3) },
+                Instr::If {
+                    cond: c,
+                    else_pc: Pc(3),
+                    end_pc: Pc(3),
+                    elect: false,
+                },
+                Instr::EndIf,
+                Instr::EndIf,
+            ],
+        );
+        assert!(p.validate().is_err());
+        // Main body falling through into predicate code.
+        let mut p = with_code(
+            base(),
+            vec![
+                Instr::Nop,
+                Instr::Mov {
+                    dst: Reg(0),
+                    src: k,
+                },
+            ],
+        );
+        p.preds.push(PredProgram {
+            arg: Reg(0),
+            start: Pc(1),
+            end: Pc(2),
+            result: Reg(1),
+            reads_memory: false,
+        });
+        assert!(p.validate().is_err());
+        let mut p = with_code(
+            base(),
+            vec![
+                Instr::Exit,
+                Instr::Mov {
+                    dst: Reg(0),
+                    src: k,
+                },
+            ],
+        );
+        p.preds.push(PredProgram {
+            arg: Reg(0),
+            start: Pc(1),
+            end: Pc(2),
+            result: Reg(1),
+            reads_memory: false,
+        });
+        assert!(p.validate().is_ok());
+        // Out-of-range string.
+        let p = with_code(base(), vec![Instr::Unsupported { reason: StrId(3) }]);
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn serde_is_strict() {
+        let ok = r#"{"Assert":{"cond":{"Reg":0},"msg":null}}"#;
+        assert!(serde_json::from_str::<Instr>(ok).is_ok());
+        let missing = r#"{"Assert":{"cond":{"Reg":0}}}"#;
+        assert!(serde_json::from_str::<Instr>(missing).is_err());
+        let unknown = r#"{"Assert":{"cond":{"Reg":0},"msg":null,"mesage":null}}"#;
+        assert!(serde_json::from_str::<Instr>(unknown).is_err());
+        assert!(serde_json::from_str::<Ty>(r#"{"elem":"F32","lanes":1,"x":0}"#).is_err());
+    }
+
+    #[test]
+    fn sub_byte_offsets() {
+        let b = BufferDecl {
+            name: "a".into(),
+            space: Space::Shared,
+            dtype: Ty::scalar(Dtype::E2M1),
+            shape: vec![],
+            strides: vec![],
+            param_slot: None,
+            base: 0,
+            byte_len: None,
+            align: 16,
+            view_of: None,
+            sync_words: false,
+        };
+        assert_eq!(b.byte_offset(6), Some(3));
+        assert_eq!(b.byte_offset(5), None);
     }
 
     #[test]

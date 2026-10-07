@@ -60,7 +60,7 @@ pub enum Side {
 pub enum Actor {
     /// A warp instruction; `epoch` is per instruction (lanes in the event's
     /// lane set/spans).
-    Warp { warp: WarpId, epoch: u32 },
+    Warp { warp: WarpId, epoch: u64 },
     /// The virtual actor of an async op (TMA, cp.async(.bulk), st.async,
     /// tcgen05.*), and which side of it.
     Async { op: AsyncId, side: Side },

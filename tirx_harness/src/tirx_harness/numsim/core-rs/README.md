@@ -104,3 +104,13 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
     later internal change.
 11. **Tile ops** remain as a provisional `Instr::Tile` with W1's element-map
     `TileLayout`; W1 prefers lowering through TVM's dispatch to PTX-level IR.
+12. **Strict serde, `FORMAT_VERSION` 2** (contract review item 7): every
+    program type rejects unknown fields and every `Option` field must be
+    present (`null`), so a misspelled or dropped field is a decode error, not
+    a silent default. `Program::validate` is exhaustive (indices, type widths,
+    destination fit, frame-matched targets, predicate sub-program layout).
+13. **Register width limit is 256 bits**; buffer/param dtypes may be wider
+    (`boolx128` lowers to a `u8[128]` buffer, never a register value).
+14. **Epochs are `u64`**; declared-word history bit 0 = launch value, bit i =
+    the i-th (Access, lane) write in delivery order, lanes ascending, value =
+    byte-merged post-image.
