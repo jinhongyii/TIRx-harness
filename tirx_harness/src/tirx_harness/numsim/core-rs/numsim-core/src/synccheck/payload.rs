@@ -1,10 +1,11 @@
 //! Mapping explorer results onto `report::{Finding, Evidence}` and rendering
 //! a [`Report`] as today's native Synccheck payload (spec section 4).
 //!
-//! Each finding carries one `Evidence { role: "payload", detail: <json> }`
-//! holding its legacy payload entry (with a private `_slot` key naming the
-//! list it belongs to), plus `operation` / `witness` evidence for renderers.
-//! Search statistics and limits travel in `Report::coverage`.
+//! Each finding's legacy payload entry is `Finding::attrs` (with a private
+//! `_slot` key naming the payload list it belongs to, stripped by
+//! [`serialize`]); `operation` / `witness` evidence serves renderers.
+//! Search statistics and echoed limits travel in `Report::coverage`; the
+//! algorithm, execution model and termination in `Report::meta`.
 
 use std::time::Instant;
 
@@ -37,12 +38,14 @@ pub struct Builder<'c> {
     pub stats: Stats,
     findings: Vec<Finding>,
     commands: u64,
+    /// Kernel index of the launch (from `SyncEvent::kernel`).
+    pub kernel: u32,
 }
 
 fn op_json(program: &Program, cmd: usize) -> Value {
     let c = &program.commands[cmd];
     json!({
-        "kernel_index": Value::Null,
+        "kernel_index": program.kernel,
         "global_warp_id": c.warp.0,
         "per_warp_sequence": c.seq,
         "source_op_id": c.site.0,
@@ -70,9 +73,6 @@ fn op_evidence(program: &Program, cmd: usize, role: &str) -> Evidence {
     ev(0, role, c.site, Some(Actor::Warp { warp: c.warp, epoch: c.epoch }), None)
 }
 
-fn payload_evidence(payload: &Value) -> Evidence {
-    ev(0, "payload", SiteId::NONE, None, Some(payload.to_string()))
-}
 
 fn ts_error_message(e: &TsError) -> (String, Option<&'static str>) {
     match &e.kind {
@@ -110,15 +110,18 @@ fn render(ts: &Ts<'_>, witness: &[Transition]) -> (Vec<String>, Vec<Value>, Vec<
 
 impl<'c> Builder<'c> {
     pub fn new(config: &'c SynccheckConfig) -> Self {
-        Self { config, stats: Stats::default(), findings: Vec::new(), commands: 0 }
+        Self { config, stats: Stats::default(), findings: Vec::new(), commands: 0, kernel: 0 }
     }
 
-    fn push(&mut self, kind: FindingKind, status: Status, message: String, mut evidence: Vec<Evidence>, payload: Value) {
+    fn push(&mut self, kind: FindingKind, status: Status, message: String, evidence: Vec<Evidence>, payload: Value) {
         let mut sites = evidence.iter().map(|e| e.site).filter(|s| *s != SiteId::NONE).collect::<Vec<_>>();
         sites.sort_unstable_by_key(|s| s.0);
         sites.dedup();
-        evidence.push(payload_evidence(&payload));
-        self.findings.push(Finding { kind, status, message, sites, evidence });
+        let attrs = match payload {
+            Value::Object(map) => map.into_iter().collect(),
+            _ => Default::default(),
+        };
+        self.findings.push(Finding { kind, status, message, attrs, sites, evidence });
     }
 
     fn incomplete(&mut self, kind: FindingKind, message: String, evidence: Vec<Evidence>, mut payload: Value) {
@@ -153,21 +156,22 @@ impl<'c> Builder<'c> {
         for f in failures {
             let crate::observe::SyncKind::Protocol { cmds, .. } = &f.event.kind else { continue };
             let Actor::Warp { warp, epoch } = f.event.actor else { continue };
+            self.kernel = f.event.kernel;
             let operation = json!({
-                "kernel_index": Value::Null,
+                "kernel_index": f.event.kernel,
                 "global_warp_id": warp.0,
                 "per_warp_sequence": f.event.seq,
                 "source_op_id": f.event.site.0,
                 "loop_frames": f.event.frames.iter().map(|fr| json!({"loop_site_id": fr.site.0, "iteration_ordinal": fr.iteration})).collect::<Vec<_>>(),
             });
-            let evidence = ev(self.config.launch, "operation", f.event.site, Some(f.event.actor), None);
+            let evidence = ev(0, "operation", f.event.site, Some(f.event.actor), None);
             match &f.error {
                 Some(error) => {
                     let effect = cmds
                         .iter()
-                        .find(|(_, c)| kinds::same_protocol(c, error))
+                        .find(|pc| kinds::same_protocol(&pc.cmd, error))
                         .or(cmds.first())
-                        .map_or("unknown", |(_, c)| kinds::effect_name(c));
+                        .map_or("unknown", |pc| kinds::effect_name(&pc.cmd));
                     let message = format!("synccheck rejected {effect} at warp {} #{}: {error:?}", warp.0, f.event.seq);
                     let payload = json!({
                         "_slot": "findings",
@@ -181,7 +185,7 @@ impl<'c> Builder<'c> {
                 None => {
                     blocked.push(json!({
                         "warp_id": warp.0,
-                        "awaited_operation": format!("{:?}", cmds.iter().map(|(r, c)| (r, c)).collect::<Vec<_>>()),
+                        "awaited_operation": format!("{:?}", cmds.iter().map(|pc| (pc.res, pc.cmd)).collect::<Vec<_>>()),
                         "phase": Value::Null,
                         "description": format!("warp {} #{} (epoch {epoch}) blocked at exit", warp.0, f.event.seq),
                         "operation": operation,
@@ -328,6 +332,26 @@ impl<'c> Builder<'c> {
         self.push(kinds::protocol_finding_kind(e.protocol), Status::Error, message, evidence, payload);
     }
 
+    /// A schedule-independent violation found on the whole program
+    /// (kernel-wide tcgen05 `.cta_group`).
+    pub fn static_error(&mut self, program: &Program, cmd: usize, error: crate::sync::SyncError) {
+        let message = format!("fixed {} protocol rejected the program: {error:?}", kinds::protocol_name(&error));
+        let payload = json!({
+            "_slot": "findings",
+            "kind": "fixed_sync_protocol_error",
+            "protocol": kinds::protocol_name(&error),
+            "transition": Value::Null,
+            "source": format!("{error:?}"),
+            "source_kind": kinds::error_kind(&error),
+            "message": message.clone(),
+            "operation": op_json(program, cmd),
+            "related_operations": [],
+            "witness": [],
+            "witness_evidence": [],
+        });
+        self.push(kinds::finding_kind(&error), Status::Error, message, vec![op_evidence(program, cmd, "operation")], payload);
+    }
+
     /// Review-level exit lints (only reported when nothing else was found).
     pub fn lints(&mut self, program: &Program, reference: &ReferenceRun) {
         if !self.findings.is_empty() {
@@ -380,7 +404,7 @@ impl<'c> Builder<'c> {
                     "witnesses": rendered.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
                     "witnesses_evidence": rendered.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
                 });
-                self.push(FindingKind::Other("fixed_sync_nonconfluent".into()), Status::Error, message, evidence, payload);
+                self.push(FindingKind::NonConfluent, Status::Error, message, evidence, payload);
                 true
             }
             Termination::FirstFailure => {
@@ -402,11 +426,15 @@ impl<'c> Builder<'c> {
         let mut findings = std::mem::take(&mut self.findings);
         for f in &mut findings {
             for e in &mut f.evidence {
-                e.kernel = c.launch;
+                e.kernel = self.kernel;
             }
         }
         let mut report = Report::new("synccheck", findings);
-        report.launch = c.launch;
+        report.launch = self.kernel;
+        report.meta.insert("algorithm".into(), json!("fixed_sync_state"));
+        let (kind, limit) = termination(&report);
+        report.meta.insert("termination".into(), json!({"kind": kind, "resource_limit": limit}));
+        report.meta.insert("execution_model".into(), json!("direct_fixed_sync_state"));
         report.coverage = vec![
             ("program_count".into(), self.stats.programs),
             ("reused_clean_program_count".into(), self.stats.reused),
@@ -433,16 +461,40 @@ fn coverage(report: &Report, key: &str) -> u64 {
 }
 
 fn finding_payload(f: &Finding) -> Value {
-    f.evidence
-        .iter()
-        .find(|e| e.role == "payload")
-        .and_then(|e| e.detail.as_deref())
-        .and_then(|d| serde_json::from_str(d).ok())
-        .unwrap_or_else(|| {
+    if !f.attrs.is_empty() {
+        return Value::Object(f.attrs.clone().into_iter().collect());
+    }
+    {
             let kind = serde_json::to_value(&f.kind).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| format!("{:?}", f.kind));
             let slot = if f.status == Status::Incomplete { "incomplete" } else { "findings" };
             json!({"_slot": slot, "kind": kind, "message": f.message})
-        })
+    }
+}
+
+/// `coverage.termination` of a finished report: `(kind, resource_limit)`.
+fn termination(report: &Report) -> (&'static str, Value) {
+    let visited = coverage(report, "visited_state_count");
+    let transitions = coverage(report, "explored_transition_count");
+    let incomplete = report.findings.iter().filter(|f| f.status == Status::Incomplete).collect::<Vec<_>>();
+    if report.verdict == Verdict::Error {
+        return ("finding", Value::Null);
+    }
+    if let Some(hit) = incomplete.iter().find(|f| f.attrs.get("reason") == Some(&json!("resource_limit"))) {
+        let (resource, usage) = match hit.attrs.get("resource").and_then(Value::as_str) {
+            Some("fixed_sync_states") => ("backtrack_nodes", visited),
+            Some("fixed_sync_transitions") => ("loop_steps", transitions),
+            Some(other) => (if other == "wall_time" { "wall_time" } else { "unknown" }, 0),
+            None => ("unknown", 0),
+        };
+        let limit = hit.attrs.get("limit").cloned().unwrap_or(Value::Null);
+        let limit = if limit.is_object() { limit } else { json!({"kind": "count", "value": limit}) };
+        let usage = hit.attrs.get("usage").cloned().unwrap_or(json!({"kind": "count", "value": usage}));
+        return ("resource_limit", json!({"resource": resource, "limit": limit, "usage": usage}));
+    }
+    if !incomplete.is_empty() {
+        return ("unsupported", Value::Null);
+    }
+    ("worklist_exhausted", Value::Null)
 }
 
 /// Render a Synccheck [`Report`] as today's native payload (the keys the
@@ -475,27 +527,17 @@ pub fn serialize(report: &Report) -> Value {
         Verdict::Incomplete => "incomplete",
         Verdict::Error => "error",
     };
-    let limit_hit = incomplete.iter().find(|p| p["reason"] == "resource_limit").cloned();
+    let (termination_kind, resource_limit) = match report.meta.get("termination") {
+        Some(t) => (t["kind"].as_str().unwrap_or("unsupported").to_owned(), t["resource_limit"].clone()),
+        None => {
+            let (k, l) = termination(report);
+            (k.to_owned(), l)
+        }
+    };
+    let termination_kind = termination_kind.as_str();
     let visited = coverage(report, "visited_state_count");
     let transitions = coverage(report, "explored_transition_count");
     let wall_ms = coverage(report, "wall_time_us") / 1000;
-    let (termination_kind, resource_limit) = if report.verdict == Verdict::Error {
-        ("finding", Value::Null)
-    } else if let Some(hit) = &limit_hit {
-        let (resource, usage) = match hit["resource"].as_str() {
-            Some("fixed_sync_states") => ("backtrack_nodes", visited),
-            Some("fixed_sync_transitions") => ("loop_steps", transitions),
-            Some(other) => (other, 0),
-            None => ("unknown", 0),
-        };
-        let limit = hit.get("limit").cloned().unwrap_or(Value::Null);
-        let limit = if limit.is_object() { limit } else { json!({"kind": "count", "value": limit}) };
-        ("resource_limit", json!({"resource": resource, "limit": limit, "usage": hit.get("usage").cloned().unwrap_or(json!({"kind": "count", "value": usage}))}))
-    } else if !incomplete.is_empty() {
-        ("unsupported", Value::Null)
-    } else {
-        ("worklist_exhausted", Value::Null)
-    };
     let run_status = match termination_kind {
         "finding" => "finding",
         "worklist_exhausted" => "complete",

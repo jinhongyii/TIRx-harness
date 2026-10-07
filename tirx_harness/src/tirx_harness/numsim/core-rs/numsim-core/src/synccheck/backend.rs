@@ -15,6 +15,9 @@ pub enum Res {
     Tcgen(p::tcgen::State),
     TcgenWork(p::tcgen::WorkState),
     RegPool(p::setmaxnreg::State),
+    /// Kernel-wide `.cta_group`; normally checked statically
+    /// (`Program::cta_group_error`) and never explored.
+    TcgenKernel(p::tcgen::KernelState),
 }
 
 /// Fresh state on first use. The offline explorer runs the `Strict` policy.
@@ -27,9 +30,7 @@ pub fn fresh(id: ResourceId, init: &ResourceInit) -> Option<Res> {
         ResourceId::TcgenLifecycle { .. } => Res::Tcgen(p::tcgen::State::default()),
         ResourceId::TcgenWork { .. } => Res::TcgenWork(p::tcgen::WorkState::default()),
         ResourceId::RegPool { .. } => Res::RegPool(p::setmaxnreg::State::new(init.warps_per_cta)),
-        // W3-3: the kernel-wide tcgen05 `.cta_group` resource is not explored
-        // yet (W6 to model when swapping to `crate::sync`).
-        ResourceId::TcgenKernel => return None,
+        ResourceId::TcgenKernel => Res::TcgenKernel(p::tcgen::KernelState::default()),
         ResourceId::Word { .. } | ResourceId::Grid | ResourceId::WarpSync { .. } => return None,
     })
 }
@@ -56,6 +57,9 @@ pub fn step(res: &mut Res, id: ResourceId, cmd: SyncCmd) -> Result<Outcome, Sync
         (Res::RegPool(s), SyncCmd::RegPool(c)) => p::setmaxnreg::step(s, c)
             .map(Outcome::RegPool)
             .map_err(SyncError::RegPool),
+        (Res::TcgenKernel(k), SyncCmd::TcgenGroup(g)) => p::tcgen::use_cta_group(k, g)
+            .map(|()| Outcome::Tcgen(p::tcgen::Outcome::Done))
+            .map_err(SyncError::Tcgen),
         _ => Err(SyncError::WrongResource { resource: id }),
     }
 }
@@ -68,7 +72,7 @@ pub fn quiescent(res: &Res) -> Result<(), SyncError> {
         Res::Cluster(s) => p::cluster::quiescent(s).map_err(SyncError::Cluster),
         Res::AsyncGroup(s) => p::async_group::quiescent(s).map_err(SyncError::AsyncGroup),
         Res::Tcgen(s) => p::tcgen::quiescent(s).map_err(SyncError::Tcgen),
-        Res::TcgenWork(_) => Ok(()),
+        Res::TcgenWork(_) | Res::TcgenKernel(_) => Ok(()),
         Res::RegPool(s) => p::setmaxnreg::quiescent(s).map_err(SyncError::RegPool),
     }
 }

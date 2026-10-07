@@ -256,7 +256,7 @@ fn named_arrive_reuse_without_ordering_is_an_error() {
 #[test]
 fn named_partial_warp_is_an_error() {
     let mut log = LogBuilder::new();
-    let c = named::Contribution { warp: 0, mask: 1, live: FULL_MASK, count: 32 };
+    let c = named::Contribution { warp: 0, mask: 1, live: FULL_MASK, count: 32, aligned: true };
     log.cmd(0, 1, named_bar(0, 1), SyncCmd::Named(named::Cmd::Sync(c)));
     for (name, r) in run_all(&log.build(), one(), Verdict::Error) {
         assert_eq!(kind(&r), "named_barrier_invalid_arrival_count", "{name}");
@@ -564,4 +564,36 @@ fn dangling_named_arrive_is_review() {
     let p = serialize(&r[0].1);
     assert_eq!(p["review"][0]["kind"], "sync_exit_lint");
     assert_eq!(p["findings"], serde_json::json!([]));
+}
+
+
+/// Kernel-wide tcgen05 `.cta_group` (W3-3): one group per kernel, checked
+/// once over the program; explicit `TcgenGroup` commands are stripped.
+#[test]
+fn tcgen_cta_group_mismatch_is_an_error() {
+    let mut log = LogBuilder::new();
+    log.cmds(0, 1, vec![(numsim_core::sync::ResourceId::TcgenKernel, SyncCmd::TcgenGroup(1)), (tmem(0), tmem_alloc(32))]);
+    log.cmd(0, 2, tmem(0), tmem_dealloc(0, 32));
+    log.cmd(1, 3, tmem(0), SyncCmd::Tcgen(tcgen::Cmd::Relinquish { who: tcgen::Who::Pair }));
+    for (name, r) in run_all(&log.build(), cta(2), Verdict::Error) {
+        assert_eq!(kind(&r), "tcgen_cta_group_mismatch", "{name}");
+        assert_eq!(payload(&r, Status::Error)["protocol"], "TcgenLifecycle");
+    }
+}
+
+/// `SyncEvent::kernel` becomes `Report::launch`, `Evidence::kernel` and the
+/// payload's `operation.kernel_index`; the legacy entry is `Finding::attrs`.
+#[test]
+fn kernel_index_and_attrs_flow_into_the_report() {
+    let mut log = LogBuilder::new();
+    log.kernel = 3;
+    log.cmd(0, 1, mbar(0, 0), wait(0)).cmd(0, 2, mbar(0, 0), init(1));
+    let r = check(&log.build(), &config(one()));
+    assert_eq!(r.launch, 3);
+    let f = &r.findings[0];
+    assert_eq!(f.attrs["kind"], "fixed_sync_protocol_error");
+    assert!(f.evidence.iter().all(|e| e.kernel == 3 && e.role != "payload"));
+    assert_eq!(serialize(&r)["findings"][0]["operation"]["kernel_index"], 3);
+    assert_eq!(r.meta["algorithm"], "fixed_sync_state");
+    assert_eq!(r.meta["termination"]["kind"], "finding");
 }

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::observe::{Actor, Collective, LoopFrame, ProtocolStatus, RecordingObserver, SyncEvent, SyncKind, WarpId};
 use crate::site::SiteId;
-use crate::sync::{mbarrier, named, setmaxnreg, ResourceId, SyncCmd, SyncError};
+use crate::sync::{mbarrier, named, setmaxnreg, tcgen, ResourceId, SyncCmd, SyncError};
 
 /// One committed instruction (or one collective rendezvous) in the fixed program.
 #[derive(Clone, Debug)]
@@ -24,10 +24,14 @@ pub struct Command {
     /// A recorded successful `test_wait`/`try_wait`: only schedules where it
     /// succeeds belong to this fixed program.
     pub conditional: bool,
+    /// `.cta_group` values this instruction uses (kernel-wide rule).
+    pub tcgen_groups: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Program {
+    /// Kernel index within the `Module` (from `SyncEvent::kernel`).
+    pub kernel: u32,
     pub warp_ids: Vec<WarpId>,
     pub warp_programs: Vec<Vec<usize>>,
     pub commands: Vec<Command>,
@@ -74,11 +78,13 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
         issued: Vec<(usize, u64, u64)>,
         conditional: bool,
         collective: Option<Collective>,
+        tcgen_groups: Vec<u8>,
     }
+    let mut kernel = None::<u32>;
     let mut raws = Vec::<Raw>::new();
     for events in &log.per_warp {
         for event in events {
-            let SyncKind::Protocol { cmds, collective, issued, observed_parity, status, .. } = &event.kind else {
+            let SyncKind::Protocol { cmds, collective, issued, status } = &event.kind else {
                 continue;
             };
             let Actor::Warp { warp, epoch } = event.actor else {
@@ -95,20 +101,35 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                     continue;
                 }
             }
+            kernel.get_or_insert(event.kernel);
+            // The kernel-wide `.cta_group` rule is order-independent (any
+            // two distinct groups fail whichever comes first), so it is
+            // checked once over the program instead of explored.
+            let mut tcgen_groups = Vec::new();
+            for pc in cmds {
+                match pc.cmd {
+                    SyncCmd::TcgenGroup(g) => tcgen_groups.push(g),
+                    SyncCmd::Tcgen(tcgen::Cmd::Alloc { who, .. } | tcgen::Cmd::Dealloc { who, .. } | tcgen::Cmd::Relinquish { who }) => {
+                        tcgen_groups.push(who.group())
+                    }
+                    _ => {}
+                }
+            }
+            let conditional = cmds.iter().any(|pc| {
+                pc.observed_parity.is_some() || matches!(pc.cmd, SyncCmd::Mbarrier(mbarrier::Cmd::TestState { .. }))
+            });
             let kept = cmds
                 .iter()
-                .filter(|(_, cmd)| keep(cmd, *observed_parity))
-                .map(|&(id, cmd)| (intern(id), cmd))
+                .filter(|pc| keep(&pc.cmd, pc.observed_parity) && !matches!(pc.cmd, SyncCmd::TcgenGroup(_)))
+                .map(|pc| (intern(pc.res), pc.cmd))
                 .collect::<Vec<_>>();
             let issued = issued
                 .iter()
                 .map(|t| (intern(t.res), t.bytes, t.arrivals))
                 .collect::<Vec<_>>();
-            if kept.is_empty() && issued.is_empty() {
+            if kept.is_empty() && issued.is_empty() && tcgen_groups.is_empty() {
                 continue;
             }
-            let conditional = observed_parity.is_some()
-                || kept.iter().any(|(_, c)| matches!(c, SyncCmd::Mbarrier(mbarrier::Cmd::TestState { .. })));
             raws.push(Raw {
                 warp,
                 seq: event.seq,
@@ -119,6 +140,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                 issued,
                 conditional,
                 collective: collective.clone(),
+                tcgen_groups,
             });
         }
     }
@@ -165,6 +187,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                 cmds: raw.cmds,
                 issued: raw.issued,
                 conditional: raw.conditional,
+                tcgen_groups: raw.tcgen_groups,
             });
             continue;
         }
@@ -179,6 +202,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
             cmds: raw.cmds,
             issued: raw.issued,
             conditional: raw.conditional,
+            tcgen_groups: raw.tcgen_groups,
         });
     }
     for (id, (command, seen)) in &collectives {
@@ -198,7 +222,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
         }
         warp_programs.push(list.into_iter().map(|(_, c)| c).collect());
     }
-    Ok((Program { warp_ids, warp_programs, commands, resources }, failures))
+    Ok((Program { kernel: kernel.unwrap_or(0), warp_ids, warp_programs, commands, resources }, failures))
 }
 
 impl Program {
@@ -214,5 +238,22 @@ impl Program {
         out.sort_unstable();
         out.dedup();
         out
+    }
+}
+
+impl Program {
+    /// The kernel-wide tcgen05 `.cta_group` rule, through the production
+    /// `tcgen::use_cta_group` over every use in program order. Order does not
+    /// matter: any two distinct groups (or an invalid one) fail.
+    pub fn cta_group_error(&self) -> Option<(usize, SyncError)> {
+        let mut k = tcgen::KernelState::default();
+        for (c, cmd) in self.commands.iter().enumerate() {
+            for &g in &cmd.tcgen_groups {
+                if let Err(e) = tcgen::use_cta_group(&mut k, g) {
+                    return Some((c, SyncError::Tcgen(e)));
+                }
+            }
+        }
+        None
     }
 }

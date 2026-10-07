@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use crate::arena::AllocId;
 use crate::observe::{
-    Actor, AsyncTarget, Collective, Counts, CtaId, Observer, ProtocolStatus, RecordingObserver, SyncEvent, SyncKind,
-    WarpId,
+    Actor, AsyncTarget, Collective, Counts, CtaId, Observer, ProtocolCmd, ProtocolStatus, RecordingObserver, SyncEvent,
+    SyncKind, WarpId,
 };
 use crate::site::SiteId;
 use crate::sync::{async_group, cluster, mbarrier, named, setmaxnreg, tcgen, ResourceId, SyncCmd, SyncError, FULL_MASK};
@@ -13,6 +13,8 @@ use crate::value::WarpMask;
 
 #[derive(Default)]
 pub struct LogBuilder {
+    /// `SyncEvent::kernel` of every event.
+    pub kernel: u32,
     obs: RecordingObserver,
     seq: BTreeMap<u32, u32>,
     epoch: BTreeMap<u32, u32>,
@@ -24,27 +26,33 @@ impl LogBuilder {
         Self::default()
     }
 
-    /// One `Protocol` event with full control over its fields.
+    /// One `Protocol` event with full control over its fields; `observed`
+    /// is the parity a successful test/try_wait observed (every target).
     pub fn event(
         &mut self,
         warp: u32,
         site: u32,
         cmds: Vec<(ResourceId, SyncCmd)>,
         issued: Vec<AsyncTarget>,
-        observed_parity: Option<u8>,
+        observed: Option<u8>,
         collective: Option<Collective>,
         status: ProtocolStatus,
     ) -> &mut Self {
+        let cmds = cmds
+            .into_iter()
+            .map(|(res, cmd)| ProtocolCmd { res, cmd, counts: Counts::default(), observed_parity: observed })
+            .collect();
         let epoch = self.epoch.entry(warp).or_insert(0);
         *epoch += 1;
         let seq = self.seq.entry(warp).or_insert(0);
         let event = SyncEvent {
+            kernel: self.kernel,
             actor: Actor::Warp { warp: WarpId(warp), epoch: *epoch },
             seq: *seq,
             site: SiteId(site),
             frames: Vec::new(),
             lanes: WarpMask(u32::MAX),
-            kind: SyncKind::Protocol { cmds, counts: Counts::default(), collective, issued, observed_parity, status: status.clone() },
+            kind: SyncKind::Protocol { cmds, collective, issued, status: status.clone() },
         };
         if status == ProtocolStatus::Committed {
             *seq += 1;
@@ -144,7 +152,7 @@ pub fn test_parity(parity: u8) -> SyncCmd {
     SyncCmd::Mbarrier(mbarrier::Cmd::TestParity { parity: u64::from(parity) })
 }
 fn contribution(warp: u32, count: u64) -> named::Contribution {
-    named::Contribution { warp, mask: FULL_MASK, live: FULL_MASK, count }
+    named::Contribution { warp, mask: FULL_MASK, live: FULL_MASK, count, aligned: true }
 }
 pub fn bar_sync(warp_in_cta: u32, count: u64) -> SyncCmd {
     SyncCmd::Named(named::Cmd::Sync(contribution(warp_in_cta, count)))

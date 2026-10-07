@@ -71,9 +71,6 @@ impl Default for EchoLimits {
 
 #[derive(Clone, Debug)]
 pub struct SynccheckConfig {
-    /// Kernel index within the `Module` this launch runs (`Report::launch`,
-    /// `Evidence::kernel`).
-    pub launch: u32,
     /// Max distinct states per projection (`ResourceLimits.max_backtrack_nodes`).
     pub state_budget: u64,
     /// Max explored transitions per projection (`ResourceLimits.max_loop_steps`).
@@ -90,7 +87,6 @@ pub struct SynccheckConfig {
 impl Default for SynccheckConfig {
     fn default() -> SynccheckConfig {
         SynccheckConfig {
-            launch: 0,
             state_budget: 1_000_000,
             transition_budget: 10_000_000,
             init: ResourceInit::default(),
@@ -119,7 +115,12 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
         out.phase_a(&failures);
         return out.finish(started);
     }
+    out.kernel = program.kernel;
     if program.commands.is_empty() {
+        return out.finish(started);
+    }
+    if let Some((cmd, error)) = program.cta_group_error() {
+        out.static_error(&program, cmd, error);
         return out.finish(started);
     }
     let reference = match reference::run(&program, &config.init) {

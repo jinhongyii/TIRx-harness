@@ -373,3 +373,130 @@ a multi-lane per-thread async op into one virtual actor per issuing lane. This
 requires either one `AsyncId` per (instruction, lane), or `LaneSpan.lane` set
 to the issuing lane on async spans. `ALL_LANES` spans on a multi-lane op are
 `incomplete` (`async_lane_unknown`), never merged.
+
+## W6-1 resolved (2026-10-07)
+
+Adopted in `synccheck/`: per-target `ProtocolCmd` (counts and observed
+parity per target; a recorded `observed_parity` or a `TestState` marks the
+instruction conditional), `SyncEvent.kernel` -> `Report.launch` /
+`Evidence.kernel` / payload `operation.kernel_index`, `Finding.attrs` holds the
+legacy payload entry (the `Evidence{role:"payload"}` workaround is gone),
+`FindingKind::NonConfluent`, and `Report.meta` with `algorithm`,
+`execution_model` and `termination`. Kernel-wide `.cta_group` (item 10) is
+checked once over the program with `tcgen::use_cta_group`, because the rule
+does not depend on order. Explicit `TcgenGroup` commands are stripped, and
+`ResourceId::TcgenKernel` is never explored. Named `Resume` and setmaxnreg
+`Poll` commands are still dropped defensively, as the ruling expects.
+
+## Contract changes for W1 (coordinator, review items 7 and 10)
+
+All of these are JSON-visible. `FORMAT_VERSION` is now **2**.
+
+1. **Strict serde.** Every program type in `program.rs`, `site.rs`
+   (`SiteInfo`, `Span`) and `Ty` carries `#[serde(deny_unknown_fields)]`:
+   a misspelled field is a decode error.
+2. **Every `Option` field must be present.** Use JSON `null` for `None`.
+   A missing `Option` field is now an error (`deserialize_with =
+   "required"`). This applies to every `Option` in
+   `Instr` variants, the arg structs (`TmaArgs`, `BulkCopyArgs`,
+   `MbarArriveArgs`, `TcgenMmaArgs`, `TcgenLdArgs`, `TileArgs`,
+   `TmapOverride`), `MemMods.policy`, `BufferDecl`
+   (`param_slot`, `byte_len`, `view_of`), `ParamSlot` (`dtype`,
+   `tensor_map`, `implicit_base`, `buf`), `Launch.min_blocks_per_sm`,
+   `Program.arch`, `SiteInfo.dtype/buffer` and `Span.file`. Examples:
+   `"multicast": null`, `"msg": null`, `"pred": null`.
+3. **`UnOp::BitNot` added; `UnOp::Not` is now logical-only.** `prim.Not`
+   becomes `"Not"` and must have a `Pred` operand. `prim.BitwiseNot` must
+   emit `"BitNot"`. `ir_walk.py:503` currently emits `Not` for both.
+   Remaining TIR coverage: `_BINARY`/`_COMPARE` in `ir_walk.py`, the unary
+   ops in `builtins.UNARY_OPS`, `prim.Select`, `prim.Cast`,
+   `prim.Broadcast`/`Shuffle` (through `Ptx` pack) and `prim.Let` are all
+   representable. `tirx.sigmoid/exp10/log10/erf/nearbyint` already go
+   through `Ptx`.
+4. **Constants.** `Const.bits` must fit `ty.bits()`, so signed values are
+   masked to their width (`-1i32` = `4294967295`). `validate` rejects
+   wider bits and any `Const` type wider than 128 bits.
+5. **New `Dtype` variants (JSON names):**
+
+   | Variant | TVM dtype |
+   | --- | --- |
+   | `U6` | `uint6` |
+   | `E3M4` | `float8_e3m4` |
+   | `E4M3Ieee` | `float8_e4m3` |
+   | `E4M3B11Fnuz` | `float8_e4m3b11fnuz` |
+   | `E4M3Fnuz` | `float8_e4m3fnuz` |
+   | `E5M2Fnuz` | `float8_e5m2fnuz` |
+
+   `Dtype::from_tvm` now covers all 24 `dtype_registry.json` types.
+6. **Sub-byte buffers.** `Load`/`Store.offset` stays in elements of the
+   buffer's `dtype.elem`. The access starts at *bit* `offset * elem.bits()`
+   (`BufferDecl::bit_offset` / `byte_offset`). For fp4/fp6/u4/u6 buffers
+   that bit offset must be byte-aligned and `ty.bits()` a multiple of 8;
+   otherwise the access is `Misaligned`. Byte lengths of packed arrays use
+   `Dtype::array_bytes(n)`; `index * mem_bytes()` is wrong for these
+   buffers. Emit `AddrOf` element offsets the same way.
+7. **`validate` is now exhaustive.** It checks:
+   - every nested index (registers, register ranges, consts, buffers,
+     strings, layouts, ops, preds, params, `DimExpr` params);
+   - `Ty` invariants (`lanes >= 1`, at most 256 bits);
+   - that each destination's written type fits the register's declared
+     bits: `Compare` writes `Pred x lanes`, `AddrOf` writes `U64`, `Cast`
+     writes `to`;
+   - frame-matched control-flow targets. `Else.end_pc` must equal its
+     `If.end_pc`. A no-else `If` must have `else_pc == end_pc ==` its own
+     `EndIf`. `LoopIf` must sit directly in its loop, exactly once, with
+     `end_pc` = its `LoopEnd`. `LoopEnd.head_pc` must lie strictly inside
+     its loop;
+   - **`PredProgram` placement.** Predicate ranges tile `code[main_end..]`
+     exactly, disjoint and in any order. The main body must end in `Exit`
+     or `Unsupported` when preds exist.
+8. **`may_block()`** is now also true for `SetMaxNReg { inc: false }` and
+   for `TcgenDealloc`/`TcgenRelinquish` with `cta_group == 2`. Lowering
+   must treat them as scheduling points.
+9. **`OpKey.mods`:** please emit `"slot=token"` (W4-2). Bare tokens still
+   resolve.
+10. **`ParamSlot.tensor_map`:** a slot with `tensor_map: Some(spec)` gets no
+    host value. The engine encodes the map from `implicit_base` at bind
+    time (W8-3; implementation W2).
+
+## Review item 10 residue: requests for non-coordinator-file owners
+
+These are outside `program.rs`, `dtype.rs`, `value.rs`, `site.rs` and
+`lib.rs`, so they were not applied.
+
+- **W3, `sync/completion.rs`:** `ResourceId::TcgenLifecycle { pair }`
+  should identify the pair by cluster rank,
+  `{ cluster: u32, pair_rank: u8 }` with `pair_rank = ctarank >> 1`, the
+  peer being `ctarank ^ 1`. It should not be "the global id of the even
+  CTA".
+- **Coordinator, `observe.rs` + W2, `interp`:** widen
+  `Actor::Warp.epoch` and `WarpState::epoch` to `u64` (no
+  `wrapping_add`).
+- **Coordinator, `observe.rs`:** reword the declared-word history doc to
+  say: "bit 0 = the word's value at launch start (or at declaration); bit
+  i >= 1 = the i-th (Access, lane) write overlapping the word, in delivery
+  order, lanes ascending within an Access, value = byte-merged
+  post-image". `LaneVerdict` should cite the same rule.
+- **W2, `arena.rs`:** `addr::shared_cluster(rank, offset)` must return
+  `Option<u32>`, giving `None` when `offset >= 1 << 24` or the rank does
+  not fit, never masking. The decode side should likewise reject
+  out-of-window offsets.
+- **Not applied (needs a decision):** `boolx128` exceeds
+  `MAX_VALUE_BITS = 256` (`Pred` counts 8 bits per lane). Either lower
+  `boolx128` params as `B128`-packed bit vectors, or reject them. Today it
+  is rejected by `Ty::from_tvm` and `validate`. `float4_e2m1fnx32` is 128
+  bits and fits.
+
+## Sweep of W2/W5/W6/W7/W8 requests against program/dtype/value/site
+
+- **W4-5 `BitNot`:** applied (item 3 above).
+- **W4-2 `OpKey.mods`:** documented on `OpKey` (item 9).
+- **W8-3:** documented on `ParamSlot.tensor_map` (item 10).
+- **W5-4:** applies to `observe::FenceEvent`, already resolved. The
+  instruction-level `FenceKind::TensormapAcquire { addr, space }` keeps its
+  implicit 128-byte size, and `Fence.scope` carries the scope. No change.
+- **W8-2:** `SiteId` stays per kernel. Kernel attribution is
+  `SyncEvent.kernel` / `Evidence.kernel` (done elsewhere). No change to
+  `site.rs`.
+- **W7-1..6, W6-1, W5-1..3, W5-5, W3-*:** these target observe, report,
+  sync, sched, oplib or Cargo. None touches the files above; no action.
