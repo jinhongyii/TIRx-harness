@@ -123,3 +123,36 @@ No new `report::FindingKind` variants are needed. Each module has
 `lint_kind` and are reported with `Status::Review`; see
 `SyncTable::exit_lints`. `RuntimeError` marks errors that can only come from an
 engine or scheduler fault.
+
+## 2026-10-07 — W7 (codegen)
+
+1. **Panics across the cdylib boundary (sched, W2).** The generated cdylib
+   statically links its own std; a Rust panic unwinding from it into the
+   host aborts the process ("Rust cannot catch foreign exceptions"), and
+   vice versa. Generated step functions therefore catch panics and return
+   `StepResult::Error(ExecErrorKind::Internal, "panic: <msg>")`
+   (`codegen::rt::guard` / `rt::panic_error`). Request: the scheduler wraps
+   the *interpreter* slice the same way (call `codegen::rt::guard(ctx, q,
+   interp::step_warp)` or an equivalent in `interp`), so a handler bug
+   yields the identical `RunStatus` on both backends. Until then the
+   differential test treats "interp panicked with M" == "codegen Internal
+   error `panic: M`".
+2. **Observers and resolved `PtxFn`s must not panic** when the codegen
+   backend is active (a host panic unwinding through generated frames
+   aborts). Please state this on `observe::Observer` and `oplib::PtxFn`.
+3. **Host allocator.** Heap blocks cross the boundary (Vec growth in
+   handlers, error strings), so the host must use the system allocator (no
+   `#[global_allocator]` in numsim-py).
+4. **Handlers must not write `ctx.warp.pc`** (already in the handlers
+   contract); generated code keeps the pc in a local updated only through
+   `interp::end_instr`. Thanks for `begin_instr`/`end_instr`/`fall_off_end`
+   — the printer calls exactly those.
+5. **Shared test programs (W2).** Please expose the programs your interp
+   tests build (e.g. `testutil::scenarios() -> Vec<(name, Module, Inputs)>`)
+   so `tests/codegen_equivalence.rs` can run all of them on both backends
+   without editing your tests. W7's own scenarios live in
+   `tests/codegen_scenarios/mod.rs`.
+6. **Cargo.toml (coordinator).** W7 added to `numsim-core/Cargo.toml`:
+   `libloading = "=0.8.6"`, `sha2 = "=0.10.8"`, dev-dep
+   `criterion = "=0.5.1"` (default-features off) and `[[bench]] codegen`
+   (harness = false).
