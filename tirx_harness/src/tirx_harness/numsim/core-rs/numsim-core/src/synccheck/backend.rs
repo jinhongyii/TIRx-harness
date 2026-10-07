@@ -1,0 +1,123 @@
+//! The protocol `step` functions the explorer drives: the production
+//! `crate::sync::*::step` (the same functions the engine calls). This is the
+//! only file in `synccheck/` that names them.
+
+use crate::sync::{Outcome, Policy, ResourceId, ResourceInit, SyncCmd, SyncError};
+use crate::sync as p;
+
+/// Abstract state of one resource (the production `State` types after the swap).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Res {
+    Mbarrier(p::mbarrier::State),
+    Named(p::named::State),
+    Cluster(p::cluster::State),
+    AsyncGroup(p::async_group::State),
+    Tcgen(p::tcgen::State),
+    TcgenWork(p::tcgen::WorkState),
+    RegPool(p::setmaxnreg::State),
+}
+
+/// Fresh state on first use. The offline explorer runs the `Strict` policy.
+pub fn fresh(id: ResourceId, init: &ResourceInit) -> Option<Res> {
+    Some(match id {
+        ResourceId::Mbarrier { .. } => Res::Mbarrier(p::mbarrier::State::new(Policy::Strict)),
+        ResourceId::Named { .. } => Res::Named(p::named::State::default()),
+        ResourceId::Cluster { .. } => Res::Cluster(p::cluster::State::new(init.cluster_warps)),
+        ResourceId::AsyncGroup { domain, .. } => Res::AsyncGroup(p::async_group::State::new(domain)),
+        ResourceId::TcgenLifecycle { .. } => Res::Tcgen(p::tcgen::State::default()),
+        ResourceId::TcgenWork { .. } => Res::TcgenWork(p::tcgen::WorkState::default()),
+        ResourceId::RegPool { .. } => Res::RegPool(p::setmaxnreg::State::new(init.warps_per_cta)),
+        // W3-3: the kernel-wide tcgen05 `.cta_group` resource is not explored
+        // yet (W6 to model when swapping to `crate::sync`).
+        ResourceId::TcgenKernel => return None,
+        ResourceId::Word { .. } | ResourceId::Grid | ResourceId::WarpSync { .. } => return None,
+    })
+}
+
+/// One transactional protocol step (`Err` leaves `res` unchanged).
+pub fn step(res: &mut Res, id: ResourceId, cmd: SyncCmd) -> Result<Outcome, SyncError> {
+    match (res, cmd) {
+        (Res::Mbarrier(s), SyncCmd::Mbarrier(c)) => p::mbarrier::step(s, c)
+            .map(Outcome::Mbarrier)
+            .map_err(SyncError::Mbarrier),
+        (Res::Named(s), SyncCmd::Named(c)) => p::named::step(s, c)
+            .map(Outcome::Named)
+            .map_err(SyncError::Named),
+        (Res::Cluster(s), SyncCmd::Cluster(c)) => p::cluster::step(s, c)
+            .map(Outcome::Cluster)
+            .map_err(SyncError::Cluster),
+        (Res::AsyncGroup(s), SyncCmd::AsyncGroup(c)) => p::async_group::step(s, c)
+            .map(Outcome::AsyncGroup)
+            .map_err(SyncError::AsyncGroup),
+        (Res::Tcgen(s), SyncCmd::Tcgen(c)) => p::tcgen::step(s, c)
+            .map(Outcome::Tcgen)
+            .map_err(SyncError::Tcgen),
+        (Res::TcgenWork(s), SyncCmd::TcgenWork(c)) => Ok(Outcome::TcgenWork(p::tcgen::work_step(s, c))),
+        (Res::RegPool(s), SyncCmd::RegPool(c)) => p::setmaxnreg::step(s, c)
+            .map(Outcome::RegPool)
+            .map_err(SyncError::RegPool),
+        _ => Err(SyncError::WrongResource { resource: id }),
+    }
+}
+
+/// End-of-launch check.
+pub fn quiescent(res: &Res) -> Result<(), SyncError> {
+    match res {
+        Res::Mbarrier(s) => p::mbarrier::quiescent(s).map_err(SyncError::Mbarrier),
+        Res::Named(s) => p::named::quiescent(s).map_err(SyncError::Named),
+        Res::Cluster(s) => p::cluster::quiescent(s).map_err(SyncError::Cluster),
+        Res::AsyncGroup(s) => p::async_group::quiescent(s).map_err(SyncError::AsyncGroup),
+        Res::Tcgen(s) => p::tcgen::quiescent(s).map_err(SyncError::Tcgen),
+        Res::TcgenWork(_) => Ok(()),
+        Res::RegPool(s) => p::setmaxnreg::quiescent(s).map_err(SyncError::RegPool),
+    }
+}
+
+/// setmaxnreg grants the scheduler may fire now.
+pub fn enabled_grants(res: &Res) -> Vec<u32> {
+    match res {
+        Res::RegPool(s) => p::setmaxnreg::enabled_grants(s),
+        _ => Vec::new(),
+    }
+}
+
+/// Async-group bookkeeping the explorer needs: `next_ordinal` and whether
+/// group `ordinal` has reached full completion (or was retired).
+pub fn async_next_ordinal(res: &Res) -> Option<u64> {
+    match res {
+        Res::AsyncGroup(s) => Some(s.next_ordinal),
+        _ => None,
+    }
+}
+
+pub fn async_group_pending(res: &Res, ordinal: u64) -> bool {
+    match res {
+        Res::AsyncGroup(s) => s
+            .groups
+            .iter()
+            .any(|g| g.ordinal == ordinal && g.milestone != p::async_group::Milestone::FullyDone),
+        _ => false,
+    }
+}
+
+/// Non-empty groups created with ordinals in `from..` (they need milestones).
+pub fn async_new_groups(res: &Res, from: u64) -> Vec<u64> {
+    match res {
+        Res::AsyncGroup(s) => s
+            .groups
+            .iter()
+            .filter(|g| g.ordinal >= from && g.milestone == p::async_group::Milestone::Pending)
+            .map(|g| g.ordinal)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Review-level exit lint of a terminal resource state (W3 `exit_lint`).
+pub fn exit_lint(res: &Res) -> Option<(crate::report::FindingKind, String)> {
+    match res {
+        Res::Named(s) => p::named::exit_lint(s).map(|l| (p::named::lint_kind(&l), format!("{l:?}"))),
+        Res::AsyncGroup(s) => p::async_group::exit_lint(s).map(|l| (p::async_group::lint_kind(&l), format!("{l:?}"))),
+        _ => None,
+    }
+}

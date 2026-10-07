@@ -736,3 +736,42 @@ seq, site, resource, lanes, cmd, outcome}`):
 9. **Not needed:** vector clocks, observed generations, outcomes of successful
    steps. The explorer recomputes them. Observed generations are still useful
    as a debug cross-check.
+
+### 5.4 Integration status (phase 2)
+
+The explorer now lives in `numsim-core/src/synccheck/` and runs on the
+production `crate::sync::*::step` functions (`backend.rs` is the only file
+that names them). `numsim-sync-explore/` only hosts the pipeline bench.
+
+* Entry points: `synccheck::check(&RecordingObserver, &SynccheckConfig) -> report::Report`
+  and `synccheck::serialize(&Report) -> serde_json::Value` (today's payload
+  keys, §4).
+* Phase A: `Protocol` events with `status: Failed` or `BlockedAtExit` are
+  reported as-is, with today's strict kinds and effect names (`kinds.rs`).
+  Phase B runs only after a clean Phase A.
+* Ported protocols: mbarrier (including inval/re-init, `.noinc`,
+  `IncPending`, deferred arrivals, multi-target waits, conditional
+  `try_wait` successes), named (lane-mask rule from the `step`), cluster,
+  setmaxnreg (collective `Set`, grants as transitions), TMEM lifecycle,
+  tcgen05 work/commit, and async groups (milestones as completions).
+* Arming change: a blocked parity wait that sets mbarrier `armed` is one
+  `Arm(resource)` transition, not one transition per waiting warp. Per-warp
+  arming broke strong diamonds and made the 16-warp ring exponential in
+  the number of consumers.
+* Contract gaps: `numsim-core/CONTRACT_REQUESTS.md` W6-1 (non-confluence
+  kind, structured payload, `.aligned`, kernel index, `TestState` success
+  flag).
+* Tests: `numsim-core/tests/synccheck_scenarios.rs` (40),
+  `synccheck_equivalence.rs` (1,500 random logs), `synccheck_payload.rs` (3),
+  plus the explorer unit tests in `synccheck/explore.rs` (3).
+
+Bench (`cargo bench -p numsim-sync-explore --bench pipeline`), 16 warps × 4
+stages × 32 iterations, 1,044 contract events, 100k-state budget:
+
+| config | states | verdict |
+| --- | --- | --- |
+| whole program, any reductions | >100k | incomplete |
+| per-resource, plain or sleep sets only | >100k | incomplete |
+| per-resource + strong diamonds | 4,209 | clean |
+| + fingerprint | 1,180 (6 of 9 reused) | clean |
+| + certificates | 9 (all certified, 10 ms) | clean |

@@ -27,8 +27,4 @@ impl Clock {
     pub fn hb(&self, other: &Self) -> bool {
         self.leq(other) && self != other
     }
-
-    pub fn component(&self, warp: usize) -> u32 {
-        self.0[warp]
-    }
 }

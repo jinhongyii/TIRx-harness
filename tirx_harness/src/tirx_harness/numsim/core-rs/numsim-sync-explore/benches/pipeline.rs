@@ -1,109 +1,87 @@
 //! Visited states and time for a synthetic 16-warp x 4-stage x 32-iteration
-//! producer/consumer pipeline under each reduction.
+//! producer/consumer pipeline (contract `SyncEvent` log) under each reduction.
 //!
-//! `cargo bench --bench pipeline` first prints a reduction table (visited
-//! states, explored transitions, verdict) and then runs criterion timings.
-//! Configurations without projection exhaust the state budget: that is the
-//! point of the table.
+//! `cargo bench -p numsim-sync-explore --bench pipeline` first prints the
+//! reduction tables, then runs criterion timings. Unprojected configurations
+//! exhaust the state budget: that is the point of the table.
 
 use std::time::{Duration, Instant};
 
 use criterion::{black_box, BenchmarkId, Criterion};
-use numsim_sync_explore::explore::{Limits, Options};
-use numsim_sync_explore::projection::ProjectionMode;
-use numsim_sync_explore::synth::{pipeline, PipelineShape};
-use numsim_sync_explore::{check, CheckConfig, SyncEvent};
+use numsim_core::observe::RecordingObserver;
+use numsim_core::sync::ResourceInit;
+use numsim_sync_explore::build::pipeline;
+use numsim_sync_explore::explore::Options;
+use numsim_sync_explore::{check, ProjectionMode, SynccheckConfig};
 
-const SHAPE: PipelineShape = PipelineShape {
-    warps: 16,
-    stages: 4,
-    iterations: 32,
-    tma_bytes: 0,
-};
-
-const BUDGET: Limits = Limits {
-    max_states: 100_000,
-    max_transitions: 2_000_000,
-};
-
-fn configs() -> Vec<(&'static str, CheckConfig)> {
-    let sleep = Options { sleep_sets: true, ..Options::NONE };
-    let raw = CheckConfig {
+fn configs(warps: u32) -> Vec<(&'static str, SynccheckConfig)> {
+    let raw = SynccheckConfig {
         mode: ProjectionMode::Whole,
         certificates: false,
         fingerprints: false,
         explore: Options::NONE,
-        limits: BUDGET,
+        state_budget: 100_000,
+        transition_budget: 2_000_000,
+        init: ResourceInit { warps_per_cta: warps, cluster_warps: warps, ..ResourceInit::default() },
+        ..SynccheckConfig::default()
     };
-    let per_resource = CheckConfig { mode: ProjectionMode::PerResource, ..raw };
+    let sleep = Options { sleep_sets: true, ..Options::NONE };
+    let per = SynccheckConfig { mode: ProjectionMode::PerResource, ..raw.clone() };
     vec![
-        ("whole/plain", raw),
-        ("whole/sleep", CheckConfig { explore: sleep, ..raw }),
-        ("whole/sleep+diamond+persistent", CheckConfig { explore: Options::ALL, ..raw }),
-        ("components/sleep+diamond+persistent", CheckConfig { mode: ProjectionMode::Components, explore: Options::ALL, ..raw }),
-        ("per-resource/plain", per_resource),
-        ("per-resource/sleep", CheckConfig { explore: sleep, ..per_resource }),
-        ("per-resource/diamond", CheckConfig { explore: Options { strong_diamonds: true, ..Options::NONE }, ..per_resource }),
-        ("per-resource/sleep+diamond+persistent", CheckConfig { explore: Options::ALL, ..per_resource }),
-        ("per-resource/all+fingerprint", CheckConfig { explore: Options::ALL, fingerprints: true, ..per_resource }),
-        ("per-resource/all+fingerprint+certificates", CheckConfig { explore: Options::ALL, fingerprints: true, certificates: true, ..per_resource }),
+        ("whole/plain", raw.clone()),
+        ("whole/sleep", SynccheckConfig { explore: sleep, ..raw.clone() }),
+        ("whole/sleep+diamond+persistent", SynccheckConfig { explore: Options::ALL, ..raw.clone() }),
+        ("components/sleep+diamond+persistent", SynccheckConfig { mode: ProjectionMode::Components, explore: Options::ALL, ..raw }),
+        ("per-resource/plain", per.clone()),
+        ("per-resource/sleep", SynccheckConfig { explore: sleep, ..per.clone() }),
+        ("per-resource/diamond", SynccheckConfig { explore: Options { strong_diamonds: true, ..Options::NONE }, ..per.clone() }),
+        ("per-resource/sleep+diamond+persistent", SynccheckConfig { explore: Options::ALL, ..per.clone() }),
+        ("per-resource/all+fingerprint", SynccheckConfig { explore: Options::ALL, fingerprints: true, ..per.clone() }),
+        ("per-resource/all+fingerprint+certificates", SynccheckConfig { explore: Options::ALL, fingerprints: true, certificates: true, ..per }),
     ]
 }
 
-fn table(name: &str, events: &[SyncEvent]) {
-    eprintln!("\n== {name}: {} events ==", events.len());
-    eprintln!(
-        "{:<44} {:>10} {:>12} {:>6} {:>6} {:>6} {:>10}  verdict",
-        "config", "states", "transitions", "progs", "reused", "cert", "time"
-    );
-    for (label, config) in configs() {
-        let started = Instant::now();
-        let report = check(events, &config);
-        let elapsed = started.elapsed();
+fn stat(r: &numsim_core::report::Report, key: &str) -> u64 {
+    r.coverage.iter().find(|(k, _)| k == key).map_or(0, |(_, v)| *v)
+}
+
+fn table(name: &str, warps: u32, log: &RecordingObserver) {
+    eprintln!("\n== {name}: {} events ==", log.total());
+    eprintln!("{:<44} {:>10} {:>12} {:>6} {:>6} {:>6} {:>10}  verdict", "config", "states", "transitions", "progs", "reused", "cert", "time");
+    for (label, cfg) in configs(warps) {
+        let t = Instant::now();
+        let r = check(log, &cfg);
         eprintln!(
-            "{:<44} {:>10} {:>12} {:>6} {:>6} {:>6} {:>9.1?}  {:?} ({})",
-            label,
-            report.stats.visited_states,
-            report.stats.explored_transitions,
-            report.stats.programs,
-            report.stats.reused_clean_programs,
-            report.stats.certified_programs,
-            elapsed,
-            report.verdict,
-            report.termination,
+            "{label:<44} {:>10} {:>12} {:>6} {:>6} {:>6} {:>9.1?}  {:?}",
+            stat(&r, "visited_state_count"),
+            stat(&r, "explored_transition_count"),
+            stat(&r, "program_count"),
+            stat(&r, "reused_clean_program_count"),
+            stat(&r, "certified_program_count"),
+            t.elapsed(),
+            r.verdict,
         );
     }
 }
 
 fn main() {
-    let plain = pipeline(SHAPE);
-    let tma = pipeline(PipelineShape { tma_bytes: 4096, ..SHAPE });
-    // Small enough that the unprojected product space fits the budget.
-    table(
-        "4 warps x 2 stages x 8 iterations",
-        &pipeline(PipelineShape { warps: 4, stages: 2, iterations: 8, tma_bytes: 0 }),
-    );
-    table("16 warps x 4 stages x 32 iterations", &plain);
-    table("same, TMA producer (arrive.expect_tx + async completion)", &tma);
+    let plain = pipeline(16, 4, 32, 0);
+    let tma = pipeline(16, 4, 32, 4096);
+    table("4 warps x 2 stages x 8 iterations", 4, &pipeline(4, 2, 8, 0));
+    table("16 warps x 4 stages x 32 iterations", 16, &plain);
+    table("same, TMA producer (arrive.expect_tx + async completion)", 16, &tma);
 
     let mut criterion = Criterion::default()
         .sample_size(10)
         .warm_up_time(Duration::from_millis(200))
         .measurement_time(Duration::from_secs(2))
         .configure_from_args();
-    let mut group = criterion.benchmark_group("pipeline_16x4x32");
-    for (label, config) in configs() {
-        group.bench_with_input(BenchmarkId::from_parameter(label), &plain, |b, events| {
-            b.iter(|| black_box(check(events, &config)))
-        });
+    for (group_name, log) in [("pipeline_16x4x32", &plain), ("pipeline_16x4x32_tma", &tma)] {
+        let mut group = criterion.benchmark_group(group_name);
+        for (label, cfg) in configs(16).into_iter().skip(6) {
+            group.bench_with_input(BenchmarkId::from_parameter(label), log, |b, log| b.iter(|| black_box(check(log, &cfg))));
+        }
+        group.finish();
     }
-    group.finish();
-    let mut group = criterion.benchmark_group("pipeline_16x4x32_tma");
-    for (label, config) in configs().into_iter().skip(7) {
-        group.bench_with_input(BenchmarkId::from_parameter(label), &tma, |b, events| {
-            b.iter(|| black_box(check(events, &config)))
-        });
-    }
-    group.finish();
     criterion.final_summary();
 }

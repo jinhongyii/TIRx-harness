@@ -177,3 +177,127 @@ To keep the build green I added one match arm to each of two W6 files:
 The differential test `table_tcgen_kernel_group` compares the `SyncTable`
 against the reference composition `use_cta_group`, then `tcgen::step`,
 committed only on a non-blocked success.
+
+## W6-1 (2026-10-07): synccheck integration — contract gaps and local workarounds
+
+`synccheck::check(&RecordingObserver, &SynccheckConfig) -> Report` and
+`synccheck::serialize(&Report) -> serde_json::Value` are implemented on the
+production `crate::sync` step functions (no `numsim-sync-ref` dependency).
+Gaps found while integrating, each with the workaround in place:
+
+1. **`FindingKind` has no non-confluence kind.** Distinct terminal protocol
+   states (legacy payload kind `fixed_sync_nonconfluent`) are reported as
+   `FindingKind::Other("fixed_sync_nonconfluent")`. Request: `NonConfluent`.
+2. **No structured per-finding payload.** The legacy keys Python pins
+   (`kind`, `reason`, `resource`, `protocol`, `source`, `witness`,
+   `witness_evidence`, `related_operations`, ...) travel as one
+   `Evidence { role: "payload", detail: Some(<json>) }` per finding, which
+   `synccheck::serialize` unpacks. Request: `Finding.details:
+   Option<serde_json::Value>` (or a string map) so the payload is not
+   smuggled through `Evidence.detail`.
+3. **`Report.coverage` is `Vec<(String, u64)>`.** Search stats and echoed
+   limits fit; the termination kind does not and is re-derived in
+   `serialize` from the findings. Fine unless W8 needs it verbatim.
+4. **`named::Cmd` has no `.aligned` flag.** The legacy aligned-site rule (all
+   blocking syncs of a generation aligned, one static site per warp;
+   `sync_fixed_unified.rs:1180-1236`) cannot be checked. Request:
+   `aligned: bool` on `named::Contribution` (or on the `Protocol` event).
+   Until then the rule is not enforced offline.
+5. **`SyncEvent` carries no kernel index.** `SynccheckConfig.launch` sets
+   `Report.launch` / `Evidence.kernel`; payload operations carry
+   `kernel_index: null` for W8 to fill.
+6. **Two-phase blocking commands.** The explorer drops logged named
+   `Resume` and setmaxnreg `Poll` commands and re-derives them from the
+   `Registered` / `Pending` outcome, so either logging convention works.
+   Please document which one the engine uses.
+7. **Successful `TestState`.** `observed_parity` exists only for parity
+   tests; every logged `TestState` is treated as a recorded success
+   (conditional: only schedules where it succeeds are explored). Request:
+   log only successful `TestState`, or add `observed: bool`. Failed parity
+   polls (`observed_parity: None`) are dropped as no-ops; the engine need not
+   log them.
+8. **mbarrier `armed` on `Blocked`.** `WaitParity` returns `Blocked` *and*
+   sets `armed` (single-target `SyncTable::step` commits it, `step_all`
+   discards it). The explorer models arming as one transition per resource
+   (`Transition::Arm`), not per warp; per-warp arming made the K-stage
+   pipeline exponential in the number of consumer warps. W3: please confirm
+   the step/step_all asymmetry is intended.
+9. **Async-group milestones are not in `issued`.** The explorer derives the
+   `ReadsDone` / `FullyDone` completions of every non-empty committed group
+   from the `async_group` state after `Commit` / `ArriveOn` / `Exit`, and
+   gates a `cp.async.mbarrier.arrive` deferred arrival on its group's full
+   completion (`ArriveOn { group: Some(o) }`). No contract change needed if
+   the engine follows the same rule.
+10. **Kernel-wide tcgen05 `cta_group`** (W3-3) is not explored either; it is
+    deterministic per command, so Phase A covers it once W3-3 lands.
+
+## W5-1: mbarrier arrive/wait scope and lost qualifiers
+
+PTX ISA §9.7.15.16.16 and §9.7.15.16.19: `mbarrier.arrive` defaults to
+`.release.cta` and `try_wait`/`test_wait` default to `.acquire.cta`. The edge
+exists only when the arrive scope and the wait scope mutually include each
+other's thread (§8.9.4; `racecheck-isa-answers.md` R4). `SyncKind::Arrive`
+and `SyncKind::Wait` carry `release`/`acquire: bool` but no scope. They also
+cannot say that lowering lost the `.sem` qualifier (R5: never assume relaxed).
+
+Request: `Arrive { obj, phase, release: Option<bool>, scope: Option<Scope> }`
+and `Wait { obj, phase, acquire: Option<bool>, scope: Option<Scope> }`:
+- `scope = None` for named barriers (participants, no scope);
+- `Some(Cluster)` for `barrier.cluster`;
+- the explicit or default scope for mbarrier;
+- `release`/`acquire = None` when the qualifier is unknown.
+
+Workaround (`racecheck::observer::barrier_scope`): mbarrier is assumed `.cta`
+and a named barrier is scopeless. A cross-CTA mbarrier arrival that fails the
+assumed check reports `Incomplete::MbarrierScopeUnknown`, never a race or a
+silent pass. A lost qualifier cannot be detected.
+
+## W5-2: typed racecheck facts on `report::Finding`
+
+Racecheck findings carry facts the Python layer pins:
+- `access_pair`
+- `ordering_domain`
+- `ordering_failure`
+- `proxy_bridge{prior,current}_{proxy,domain}`
+- `hint`
+- `occurrences`
+- per-witness lane / access kind / proxy / scope
+
+`Finding`/`Evidence` have no typed slot for them. Request either
+`Finding.data: serde_json::Value` (checker-owned and schema-versioned) or
+typed fields.
+
+Workaround: one `Evidence { role: "race", detail: <JSON object> }` per finding,
+plus `prior`/`current`/`overlap` evidence whose `detail` is JSON.
+`racecheck::serialize` parses these back.
+
+## W5-3: finding kinds
+
+Request these `FindingKind` variants. Today they use `Other(..)`:
+
+| Kind | Status | Meaning |
+| --- | --- | --- |
+| `TmemLifetimeReview` | review | Unwaited `tcgen05.ld` vs reuse |
+| `ScopeMismatch` | error | A release/acquire pair whose scopes do not mutually include the other thread |
+| `UndeclaredProtocolWord` | review | A strong poll on a word not declared for `wait_until` (R9) |
+| `CrossCtaAsyncOrder` | review | Async-proxy writers from different CTAs ordered only by base causality (R3, ISA-silent) |
+
+The async-lifetime finding (an allocation ended under an in-flight async
+footprint) currently maps to `AsyncRace`. An `AsyncLifetime` variant would be
+clearer.
+
+## W5-4: tensormap proxy fences
+
+`FenceEvent::TensormapRelease` / `TensormapAcquire` carry neither scope nor
+the acquired address range (`fence.proxy.tensormap::generic.acquire.<scope>
+[addr], size`). The checker therefore models them as thread-local
+bridges over all tensormap bytes, without a scope check. Request
+`TensormapRelease(Scope)` and `TensormapAcquire { scope, alloc, span }`.
+
+## W5-5: per-launch reports for numsim-py
+
+`RaceObserver` keeps one result per launch (`launches`), and
+`racecheck::payload::reports()` returns one `Report` per launch. Today
+`Racecheck::finish()` (used by numsim-py) returns them merged, with `launch` set
+to the last launch. Request that numsim-py switch to
+`racecheck::payload::reports(&obs)` when it maps phases (W8-2).
