@@ -250,8 +250,10 @@ pub enum FenceEvent {
     TcgenAfter,
     MbarrierInit,
     ProxyAlias,
-    TensormapRelease,
-    TensormapAcquire,
+    /// `fence.proxy.tensormap::generic.release.<scope>` (W5-4).
+    TensormapRelease { scope: Scope },
+    /// `fence.proxy.tensormap::generic.acquire.<scope> [addr], size` (W5-4).
+    TensormapAcquire { scope: Scope, alloc: AllocId, span: ByteSpan },
 }
 
 /// Payload of a [`SyncEvent`].

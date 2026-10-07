@@ -38,6 +38,16 @@ pub enum FindingKind {
     Deadlock,
     /// Two complete interleavings reached different final protocol states (synccheck Phase B).
     NonConfluent,
+    /// Memory reused while an unfinished async op may still access it (W5-3).
+    AsyncLifetime,
+    /// TMEM lifetime advisory (W5-3).
+    TmemLifetimeReview,
+    /// Release/acquire pair whose scopes do not mutually include each other (W5-3).
+    ScopeMismatch,
+    /// Strong load observed an unordered morally-strong write on a word not declared for `wait_until` (W5-3).
+    UndeclaredProtocolWord,
+    /// Async-proxy writers from several CTAs ordered only by base causality (W5-3).
+    CrossCtaAsyncOrder,
     BarrierMismatch,
     MbarrierMisuse,
     AsyncGroupMisuse,
