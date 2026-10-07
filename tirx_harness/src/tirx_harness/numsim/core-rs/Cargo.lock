@@ -356,6 +356,7 @@ name = "numsim-race-core"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "numsim-core",
 ]
 
 [[package]]
@@ -363,6 +364,7 @@ name = "numsim-sync-explore"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "numsim-core",
 ]
 
 [[package]]

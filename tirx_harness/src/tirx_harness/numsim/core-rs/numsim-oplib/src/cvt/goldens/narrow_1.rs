@@ -382,7 +382,7 @@ pub(super) static EXPECTED_UE8M0X2_BF16X2_RP_SATFINITE: [u64; 256] = [
     0x0000cfaa, 0x00007d4f, 0x0000c9fc, 0x0000b27f, 0x0000c25c, 0x0000bbe8,
 ];
 
-pub(super) static FORMS: &[GoldenForm] = &[
+pub(crate) static FORMS: &[GoldenForm] = &[
     GoldenForm {
         name: "e2m1x4.f32.rs.relu",
         spelling: "cvt.rs.relu.satfinite.e2m1x4.f32",

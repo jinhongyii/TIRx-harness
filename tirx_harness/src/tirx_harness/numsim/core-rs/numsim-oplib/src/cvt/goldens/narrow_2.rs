@@ -382,7 +382,7 @@ pub(super) static EXPECTED_BF16X2_E2M1X2_SCALED_RELU_SATFINITE: [u64; 256] = [
     0x7fff0000, 0x7fff0000, 0x7fff0000, 0x7fff0000, 0x7fff0000, 0x7fff7fff,
 ];
 
-pub(super) static FORMS: &[GoldenForm] = &[
+pub(crate) static FORMS: &[GoldenForm] = &[
     GoldenForm {
         name: "bf16x2.ue8m0x2",
         spelling: "cvt.rn.bf16x2.ue8m0x2",

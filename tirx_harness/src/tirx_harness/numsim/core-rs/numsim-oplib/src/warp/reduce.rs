@@ -85,7 +85,7 @@ pub fn warp_reduce<T: Copy>(
     let mut delta = width / 2;
     while delta > 0 {
         let previous = result;
-        for lane in active_mask.iter() {
+        for lane in active_mask.lanes() {
             let group_base = (lane / width) * width;
             let source_lane = group_base + ((lane - group_base) ^ delta);
             result[lane] = combine(previous[lane], previous[source_lane]);
@@ -159,8 +159,8 @@ mod tests {
             5 => nan_b,
             _ => lane as f64,
         });
-        let maximum = warp_reduce_max(WarpMask::FULL, &values, 2).unwrap();
-        let minimum = warp_reduce_min(WarpMask::FULL, &values, 2).unwrap();
+        let maximum = warp_reduce_max(WarpMask::ALL, &values, 2).unwrap();
+        let minimum = warp_reduce_min(WarpMask::ALL, &values, 2).unwrap();
         assert_eq!(maximum[0].to_bits(), 0.0_f64.to_bits());
         assert_eq!(maximum[1].to_bits(), 0.0_f64.to_bits());
         assert_eq!(minimum[0].to_bits(), (-0.0_f64).to_bits());
@@ -174,9 +174,9 @@ mod tests {
     #[test]
     fn butterfly_reductions_support_integer_and_float_groups() {
         let integers = from_fn(|lane| lane as u32);
-        let sums = warp_reduce_sum(WarpMask::FULL, &integers, 8).unwrap();
-        let maxima = warp_reduce_max(WarpMask::FULL, &integers, 8).unwrap();
-        let minima = warp_reduce_min(WarpMask::FULL, &integers, 8).unwrap();
+        let sums = warp_reduce_sum(WarpMask::ALL, &integers, 8).unwrap();
+        let maxima = warp_reduce_max(WarpMask::ALL, &integers, 8).unwrap();
+        let minima = warp_reduce_min(WarpMask::ALL, &integers, 8).unwrap();
         for lane in 0..WARP_SIZE {
             let group = lane / 8;
             assert_eq!(sums[lane], (group * 64 + 28) as u32);
@@ -185,9 +185,9 @@ mod tests {
         }
 
         let floats = from_fn(|lane| lane as f32 - 16.0);
-        let sums = warp_reduce_sum(WarpMask::FULL, &floats, 32).unwrap();
-        let maxima = warp_reduce_max(WarpMask::FULL, &floats, 32).unwrap();
-        let minima = warp_reduce_min(WarpMask::FULL, &floats, 32).unwrap();
+        let sums = warp_reduce_sum(WarpMask::ALL, &floats, 32).unwrap();
+        let maxima = warp_reduce_max(WarpMask::ALL, &floats, 32).unwrap();
+        let minima = warp_reduce_min(WarpMask::ALL, &floats, 32).unwrap();
         for lane in 0..WARP_SIZE {
             assert_eq!(sums[lane], -16.0);
             assert_eq!(maxima[lane], 15.0);
@@ -195,9 +195,9 @@ mod tests {
         }
 
         let doubles = from_fn(|lane| lane as f64 * 0.5 - 8.0);
-        let sums = warp_reduce_sum(WarpMask::FULL, &doubles, 32).unwrap();
-        let maxima = warp_reduce_max(WarpMask::FULL, &doubles, 32).unwrap();
-        let minima = warp_reduce_min(WarpMask::FULL, &doubles, 32).unwrap();
+        let sums = warp_reduce_sum(WarpMask::ALL, &doubles, 32).unwrap();
+        let maxima = warp_reduce_max(WarpMask::ALL, &doubles, 32).unwrap();
+        let minima = warp_reduce_min(WarpMask::ALL, &doubles, 32).unwrap();
         for lane in 0..WARP_SIZE {
             assert_eq!(sums[lane], -8.0);
             assert_eq!(maxima[lane], 7.5);
@@ -213,7 +213,7 @@ mod tests {
             error.to_string(),
             "cuda_warp_reduce requires all 32 lanes, got mask 0x0000ffff"
         );
-        let error = warp_reduce_sum(WarpMask::FULL, &values, 3).unwrap_err();
+        let error = warp_reduce_sum(WarpMask::ALL, &values, 3).unwrap_err();
         assert!(error.to_string().contains("width must be a power of two"));
     }
 
@@ -221,9 +221,9 @@ mod tests {
     fn narrow_reductions_round_every_step() {
         // 2048 + 1 is not representable in fp16; each step rounds back to 2048.
         let values = from_fn(|lane| if lane == 0 { 2048.0 } else { 1.0 });
-        let sums = warp_reduce_sum_fp16(WarpMask::FULL, &values, 2).unwrap();
+        let sums = warp_reduce_sum_fp16(WarpMask::ALL, &values, 2).unwrap();
         assert_eq!(sums[0], 2048.0);
-        let bf = warp_reduce_max_bf16(WarpMask::FULL, &from_fn(|lane| lane as f32), 32).unwrap();
+        let bf = warp_reduce_max_bf16(WarpMask::ALL, &from_fn(|lane| lane as f32), 32).unwrap();
         assert_eq!(bf[0], 31.0);
     }
 }

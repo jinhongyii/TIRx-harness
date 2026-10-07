@@ -5,7 +5,7 @@ use super::*;
 use crate::layout::element::ElementRef;
 
 const WARP: TileWarp = TileWarp {
-    active_mask: WarpMask::FULL,
+    active_mask: WarpMask::ALL,
     warp_id_in_cta: 0,
     warps_per_cta: 4,
 };
@@ -127,13 +127,13 @@ fn gemm_maps_check_targets_and_unique_register_owners() {
             ElementRef::out_of_bounds(None)
         })
     };
-    let registers = map_register_gemm_matrix(&owner, WarpMask::FULL, 2, 2, false, "d").unwrap();
+    let registers = map_register_gemm_matrix(&owner, WarpMask::ALL, 2, 2, false, "d").unwrap();
     assert_eq!(
         registers.iter().map(|e| e.execution_lane).collect::<Vec<_>>(),
         vec![0, 1, 2, 3]
     );
     let everyone = |_: &[i64], _: usize| Ok(ElementRef::byte(0));
-    assert!(map_register_gemm_matrix(&everyone, WarpMask::FULL, 1, 1, false, "d")
+    assert!(map_register_gemm_matrix(&everyone, WarpMask::ALL, 1, 1, false, "d")
         .unwrap_err()
         .to_string()
         .contains("more than one owning lane at (0, 0)"));
@@ -195,7 +195,7 @@ fn m64_elements(base_lane: i64, base_tcol: i64, warp: usize) -> (Vec<MappedEleme
 fn fast_m64_recognizer_accepts_only_the_canonical_slice() {
     let (source, destination) = m64_elements(64, 16, 1);
     assert_eq!(
-        fast_tmem_f32_m64_load(WarpMask::FULL, 1, &source, &destination),
+        fast_tmem_f32_m64_load(WarpMask::ALL, 1, &source, &destination),
         Some(FastTmemF32M64Load {
             base_lane: 64,
             base_tcol: 16,
@@ -205,12 +205,12 @@ fn fast_m64_recognizer_accepts_only_the_canonical_slice() {
     assert_eq!(fast_tmem_f32_m64_load(WarpMask(1), 1, &source, &destination), None);
     // Wrong warp -> lane offsets disagree.
     assert_eq!(
-        fast_tmem_f32_m64_load(WarpMask::FULL, 0, &source, &destination).map(|b| b.base_lane),
+        fast_tmem_f32_m64_load(WarpMask::ALL, 0, &source, &destination).map(|b| b.base_lane),
         Some(96)
     );
     let mut swapped = destination.clone();
     swapped.swap(0, 1);
-    assert_eq!(fast_tmem_f32_m64_load(WarpMask::FULL, 1, &source, &swapped), None);
+    assert_eq!(fast_tmem_f32_m64_load(WarpMask::ALL, 1, &source, &swapped), None);
 }
 
 #[test]

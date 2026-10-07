@@ -338,7 +338,7 @@ pub fn sparse_metadata_source_mask(
             bits |= 1 << lane;
         }
     }
-    Ok(WarpMask::from_bits(bits))
+    Ok(WarpMask(bits))
 }
 
 fn sparse_metadata_code(

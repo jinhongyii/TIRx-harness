@@ -301,3 +301,64 @@ bridges over all tensormap bytes, without a scope check. Request
 `Racecheck::finish()` (used by numsim-py) returns them merged, with `launch` set
 to the last launch. Request that numsim-py switch to
 `racecheck::payload::reports(&obs)` when it maps phases (W8-2).
+
+## W4 (2026-10-07): oplib wiring, numsim-types, resolve_ptx
+
+### W4-1: new leaf crate `numsim-types` (done, please review)
+`numsim-oplib` must share the contract `Dtype`/`Ty`/`WarpValue`/`WarpMask`, and
+`numsim-core` now depends on `numsim-oplib`, so the types moved to a new
+workspace member `numsim-types` (`src/{dtype.rs,value.rs}`; serde only).
+`numsim-core/src/dtype.rs` is now `pub use numsim_types::dtype::*;`;
+`numsim-core/src/value.rs` re-exports `numsim_types::value::*` and keeps
+`RegFile` (it needs `oplib::Scalar`). No API change. Workspace `Cargo.toml`
+gained the `numsim-types` member; `numsim-core` gained deps `numsim-types`,
+`numsim-oplib` and dev-dep `numsim-oplib[goldens]`.
+
+### W4-2: `OpKey.mods` format
+W1's `ptx_lower.py` emits bare tokens (`d.mod_tokens`: `["rn","ftz","f32"]`),
+`calls.py` emits `(slot, token)` pairs for helpers. `resolve_ptx` accepts both
+`"slot=token"` and bare tokens; bare tokens are assigned to TVM-table slots in
+table order (unambiguous for every table op today), unknown/duplicate/missing
+fail closed. Request: lowering emits `"slot=token"` everywhere so the key is
+self-describing and does not depend on slot order.
+
+### W4-3: `PtxFn` cannot carry data
+`PtxFn = fn(&mut PtxIo)` has no environment, so every modifier combination
+needs its own fn item. Adapted locally: parameterized forms resolve once into a
+boxed closure, interned process-wide by (key, tys), and returned as one of 2048
+pre-instantiated trampolines (`ptx/tramp_table.rs`; exhaustion fails closed).
+Hot forms (mov/pack/unpack, f32 add/mul/fma, ex2, ...) are direct fn items.
+Request: `PtxFn = Arc<dyn Fn(&mut PtxIo) -> OpResult + Send + Sync>` (or
+`(fn, &'static OpData)`), which removes the global table.
+
+### W4-4: `oplib::OPS` static removed
+The empty `pub static OPS: &[OpEntry]` is replaced by `registry()` (built once
+from `numsim_oplib::registry::OPS`, 600 rows). `render_supported_ops_md`
+reproduces the legacy `engine-rs/SUPPORTED_OPS.md` byte-for-byte (ABI v38
+header, CUDA/PTX table then tile table) — tested. `OpEntry.instr` is derived
+from W1's `builtins.py` family table; `""` for rejected ops.
+
+### W4-5: smaller signature issues
+- `shfl(...) -> (WarpValue, WarpMask)` cannot report legacy's
+  "warp shuffle reads a non-participant lane"; a non-member source returns the
+  source's value with predicate false. Request `OpResult<..>`.
+  (`tirx.ptx.shfl_sync` through `resolve_ptx` does return the error.)
+- `redux(op, ty, ..)`: `.NaN`/`.abs` f32 forms are not expressible through
+  `ReduxOp`; they resolve via `resolve_ptx` (`redux_sync_f32`, `.abs` fails
+  closed as legacy had no variant).
+- `FloatScalar::from_f64(x, Rounding::Rs, _)` cannot fail; falls back to Rn.
+- `unary` with `IsNan/IsInf/IsFinite` writes `Ty{Pred, lanes}`; handlers must
+  size `out` by the destination type (same for `cast`). `Cast.sat` is
+  implemented as saturate-to-finite for float destinations and range clamp for
+  int destinations (not PTX `.sat` = clamp to [0,1]).
+- Lowering emits `Unary op="BitNot"` (`ir_walk.py`); `UnOp` only has `Not`.
+- `tma_plan` has no direction (load plan returned; `Im2colNoOffs` = store
+  plan); `TmaPlan` cannot express NaN OOB fill or the TF32 load rounding (both
+  fail closed); `TensorMapDesc` lacks im2col corners/`wide` and a separate
+  swizzle atomicity; `TensorMapDesc::encode` cannot fail (unencodable -> zeros,
+  rejected by `decode`). Request `dir`, fill pattern, im2col fields,
+  `OpResult<[u8;128]>`.
+- `tc_mma` closures address one CTA (no cta_group::2) and oplib cannot resolve
+  `args.variant: StrId` (lut_b/ti16) or the target arch; `decode_instr_desc`
+  has no `cta_group`. Request a CTA index in the closures and the arch/variant
+  string in the payload.

@@ -407,7 +407,7 @@ impl CtaVoteOp {
 
 /// Warp-local contribution of `syncthreads_and/or`: fold over active lanes.
 pub fn cta_vote_local(op: CtaVoteOp, active_mask: WarpMask, predicates: &WarpValue<bool>) -> i32 {
-    let mut lanes = active_mask.iter();
+    let mut lanes = active_mask.lanes();
     i32::from(match op {
         CtaVoteOp::And => lanes.all(|lane| predicates[lane]),
         CtaVoteOp::Or => lanes.any(|lane| predicates[lane]),
@@ -567,9 +567,9 @@ mod tests {
             "cuda_cta_reduce expected 4 warps"
         );
         let predicates: WarpValue<bool> = std::array::from_fn(|lane| lane < 3);
-        assert_eq!(cta_vote_local(CtaVoteOp::And, WarpMask::from_bits(0b111), &predicates), 1);
-        assert_eq!(cta_vote_local(CtaVoteOp::And, WarpMask::FULL, &predicates), 0);
-        assert_eq!(cta_vote_local(CtaVoteOp::Or, WarpMask::FULL, &predicates), 1);
+        assert_eq!(cta_vote_local(CtaVoteOp::And, WarpMask(0b111), &predicates), 1);
+        assert_eq!(cta_vote_local(CtaVoteOp::And, WarpMask::ALL, &predicates), 0);
+        assert_eq!(cta_vote_local(CtaVoteOp::Or, WarpMask::ALL, &predicates), 1);
         assert_eq!(bar_red_local(BarRedOp::Popc, &predicates), 3);
         assert_eq!(bar_red_local(BarRedOp::And, &predicates), 0);
         assert_eq!(bar_red_local(BarRedOp::And, &[true; 32]), 1);

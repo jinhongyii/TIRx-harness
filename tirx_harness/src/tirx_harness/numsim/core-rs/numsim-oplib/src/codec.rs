@@ -7,7 +7,6 @@
 //!   `dtype_registry.json`). Membership says nothing about arithmetic.
 //! - Little-endian scalar byte transport lives in `crate::scalar::RuntimeScalar`.
 
-use crate::types::Dtype;
 
 pub const fn tcgen_runtime_instruction_descriptor(bits: u32, sf_id: u32) -> u32 {
     (bits & !0x6000_0030_u32) | sf_id.wrapping_shl(29) | sf_id.wrapping_shl(4)
@@ -74,13 +73,126 @@ pub const fn shared_address(address: u64) -> u32 {
     address as u32
 }
 
+/// Storage dtypes from `numsim/dtype_registry.json` (TVM spellings), used by
+/// the dtype-ABI classification. Distinct from the contract `Dtype`, which
+/// has no storage-only fp8 variants (`float8_e3m4`, `*fnuz`, ...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StorageDtype {
+    Bool,
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+    U32,
+    I64,
+    U64,
+    I128,
+    U128,
+    F16,
+    Bf16,
+    F32,
+    F64,
+    F8E3M4,
+    F8E4M3,
+    F8E4M3B11Fnuz,
+    F8E4M3Fn,
+    F8E4M3Fnuz,
+    F8E5M2,
+    F8E5M2Fnuz,
+    F8E8M0Fnu,
+    F4E2M1Fn,
+}
+
+impl StorageDtype {
+    pub const ALL: [StorageDtype; 24] = [
+        StorageDtype::Bool,
+        StorageDtype::I8,
+        StorageDtype::U8,
+        StorageDtype::I16,
+        StorageDtype::U16,
+        StorageDtype::I32,
+        StorageDtype::U32,
+        StorageDtype::I64,
+        StorageDtype::U64,
+        StorageDtype::I128,
+        StorageDtype::U128,
+        StorageDtype::F16,
+        StorageDtype::Bf16,
+        StorageDtype::F32,
+        StorageDtype::F64,
+        StorageDtype::F8E3M4,
+        StorageDtype::F8E4M3,
+        StorageDtype::F8E4M3B11Fnuz,
+        StorageDtype::F8E4M3Fn,
+        StorageDtype::F8E4M3Fnuz,
+        StorageDtype::F8E5M2,
+        StorageDtype::F8E5M2Fnuz,
+        StorageDtype::F8E8M0Fnu,
+        StorageDtype::F4E2M1Fn,
+    ];
+
+    /// Storage width in bits.
+    pub const fn bits(self) -> u32 {
+        match self {
+            StorageDtype::Bool | StorageDtype::I8 | StorageDtype::U8 => 8,
+            StorageDtype::F8E3M4
+            | StorageDtype::F8E4M3
+            | StorageDtype::F8E4M3B11Fnuz
+            | StorageDtype::F8E4M3Fn
+            | StorageDtype::F8E4M3Fnuz
+            | StorageDtype::F8E5M2
+            | StorageDtype::F8E5M2Fnuz
+            | StorageDtype::F8E8M0Fnu => 8,
+            StorageDtype::I16 | StorageDtype::U16 | StorageDtype::F16 | StorageDtype::Bf16 => 16,
+            StorageDtype::I32 | StorageDtype::U32 | StorageDtype::F32 => 32,
+            StorageDtype::I64 | StorageDtype::U64 | StorageDtype::F64 => 64,
+            StorageDtype::I128 | StorageDtype::U128 => 128,
+            StorageDtype::F4E2M1Fn => 4,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            StorageDtype::Bool => "bool",
+            StorageDtype::I8 => "int8",
+            StorageDtype::U8 => "uint8",
+            StorageDtype::I16 => "int16",
+            StorageDtype::U16 => "uint16",
+            StorageDtype::I32 => "int32",
+            StorageDtype::U32 => "uint32",
+            StorageDtype::I64 => "int64",
+            StorageDtype::U64 => "uint64",
+            StorageDtype::I128 => "int128",
+            StorageDtype::U128 => "uint128",
+            StorageDtype::F16 => "float16",
+            StorageDtype::Bf16 => "bfloat16",
+            StorageDtype::F32 => "float32",
+            StorageDtype::F64 => "float64",
+            StorageDtype::F8E3M4 => "float8_e3m4",
+            StorageDtype::F8E4M3 => "float8_e4m3",
+            StorageDtype::F8E4M3B11Fnuz => "float8_e4m3b11fnuz",
+            StorageDtype::F8E4M3Fn => "float8_e4m3fn",
+            StorageDtype::F8E4M3Fnuz => "float8_e4m3fnuz",
+            StorageDtype::F8E5M2 => "float8_e5m2",
+            StorageDtype::F8E5M2Fnuz => "float8_e5m2fnuz",
+            StorageDtype::F8E8M0Fnu => "float8_e8m0fnu",
+            StorageDtype::F4E2M1Fn => "float4_e2m1fn",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|dtype| dtype.name() == name)
+    }
+}
+
 /// Packed-vector widths the ordinary vector ABI admits.
 pub const PACKED_VECTOR_WIDTHS: [u32; 4] = [16, 32, 64, 128];
 
 /// Fixed-width storage ABI of one ordinary vector dtype such as `float16x2`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VectorDtypeAbi {
-    pub element: Dtype,
+    pub element: StorageDtype,
     pub lanes: u32,
     pub element_bits: u32,
     pub total_bits: u32,
@@ -94,8 +206,8 @@ impl VectorDtypeAbi {
 
 /// Scalar storage width for byte-addressable dtypes (sub-byte types excluded).
 pub fn scalar_dtype_bits(name: &str) -> Option<u32> {
-    Dtype::from_name(name)
-        .map(Dtype::bits)
+    StorageDtype::from_name(name)
+        .map(StorageDtype::bits)
         .filter(|bits| *bits >= 8)
 }
 
@@ -123,7 +235,7 @@ pub fn vector_dtype_abi(dtype: &str) -> Option<VectorDtypeAbi> {
         return None;
     }
     Some(VectorDtypeAbi {
-        element: Dtype::from_name(element_name)?,
+        element: StorageDtype::from_name(element_name)?,
         lanes,
         element_bits,
         total_bits,
@@ -133,7 +245,7 @@ pub fn vector_dtype_abi(dtype: &str) -> Option<VectorDtypeAbi> {
 /// Every vector dtype name [`vector_dtype_abi`] accepts, sorted by name.
 pub fn vector_dtype_abis() -> Vec<(String, VectorDtypeAbi)> {
     let mut out = Vec::new();
-    for dtype in Dtype::ALL {
+    for dtype in StorageDtype::ALL {
         let bits = dtype.bits();
         if bits < 8 {
             continue;
@@ -215,7 +327,7 @@ mod tests {
     #[test]
     fn vector_dtype_abi_matches_python_classification() {
         let abi = vector_dtype_abi("float16x2").unwrap();
-        assert_eq!((abi.element, abi.lanes, abi.total_bits, abi.itemsize()), (Dtype::F16, 2, 32, 4));
+        assert_eq!((abi.element, abi.lanes, abi.total_bits, abi.itemsize()), (StorageDtype::F16, 2, 32, 4));
         assert_eq!(vector_dtype_abi("int8x16").unwrap().total_bits, 128);
         assert_eq!(vector_dtype_abi("float32x3"), None);
         assert_eq!(vector_dtype_abi("boolx4"), None);
@@ -233,6 +345,6 @@ mod tests {
         // Same 61 entries as Python `vector_dtype_abis()`.
         assert_eq!(all.len(), 61);
         assert_eq!(all[0].0, "bfloat16x2");
-        assert_eq!(all.iter().filter(|(_, abi)| abi.element == Dtype::I8).count(), 4);
+        assert_eq!(all.iter().filter(|(_, abi)| abi.element == StorageDtype::I8).count(), 4);
     }
 }

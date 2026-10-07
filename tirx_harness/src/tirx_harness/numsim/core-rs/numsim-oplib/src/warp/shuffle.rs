@@ -50,7 +50,7 @@ pub fn shuffle_sources(
     let participant_mask = validate_participants(active_mask, participant_masks, "shfl.sync")?;
     let mut source_lanes = [0_usize; WARP_SIZE];
     let mut in_range = [false; WARP_SIZE];
-    for lane in active_mask.iter() {
+    for lane in active_mask.lanes() {
         let lane5 = lane & 0x1f;
         let selector = selectors[lane] as usize & 0x1f;
         let control = controls[lane] as usize;
@@ -100,10 +100,10 @@ pub fn shuffle_source_mask(
     let (source_lanes, _in_range) =
         shuffle_sources(active_mask, participant_masks, selectors, controls, mode)?;
     let mut bits = 0_u32;
-    for lane in active_mask.iter() {
+    for lane in active_mask.lanes() {
         bits |= 1_u32 << source_lanes[lane];
     }
-    Ok(WarpMask::from_bits(bits))
+    Ok(WarpMask(bits))
 }
 
 /// One `shfl.sync.mode.b32` returning `(d, p)`.
@@ -118,7 +118,7 @@ pub fn shfl_sync<T: Copy + Default>(
     let (source_lanes, in_range) =
         shuffle_sources(active_mask, participant_masks, selectors, controls, mode)?;
     let mut result = [T::default(); WARP_SIZE];
-    for lane in active_mask.iter() {
+    for lane in active_mask.lanes() {
         result[lane] = values[source_lanes[lane]];
     }
     Ok((result, in_range))
@@ -174,14 +174,14 @@ mod tests {
         let participants = [u32::MAX; 32];
         let values = iota();
         let (shuffled, _) = shfl_idx(
-            WarpMask::FULL,
+            WarpMask::ALL,
             &participants,
             &values,
             &std::array::from_fn(|lane| 31 - lane as u32),
             &[31; 32],
         )
         .unwrap();
-        let (xored, _) = shfl_bfly(WarpMask::FULL, &participants, &values, &[1; 32], &[31; 32]).unwrap();
+        let (xored, _) = shfl_bfly(WarpMask::ALL, &participants, &values, &[1; 32], &[31; 32]).unwrap();
         for lane in 0..WARP_SIZE {
             assert_eq!(shuffled[lane], (31 - lane) as u32);
             assert_eq!(xored[lane], (lane ^ 1) as u32);
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn shuffle_xor_width_allows_later_groups_to_read_earlier_groups() {
         let (result, _) = shfl_bfly(
-            WarpMask::FULL,
+            WarpMask::ALL,
             &[u32::MAX; 32],
             &iota(),
             &[16; 32],
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn raw_shuffle_consumes_packed_ptx_control_and_returns_optional_predicate() {
         let (values, predicates) =
-            shfl_down(WarpMask::FULL, &[u32::MAX; 32], &iota(), &[1; 32], &[31; 32]).unwrap();
+            shfl_down(WarpMask::ALL, &[u32::MAX; 32], &iota(), &[1; 32], &[31; 32]).unwrap();
         assert_eq!(values[0], 1);
         assert!(predicates[0]);
         assert_eq!(values[31], 31);
@@ -226,12 +226,12 @@ mod tests {
     #[test]
     fn shuffle_up_out_of_range_keeps_own_value_and_source_mask_tracks_reads() {
         let (values, predicates) =
-            shfl_up(WarpMask::FULL, &[u32::MAX; 32], &iota(), &[2; 32], &[0; 32]).unwrap();
+            shfl_up(WarpMask::ALL, &[u32::MAX; 32], &iota(), &[2; 32], &[0; 32]).unwrap();
         assert_eq!((values[0], predicates[0]), (0, false));
         assert_eq!((values[1], predicates[1]), (1, false));
         assert_eq!((values[5], predicates[5]), (3, true));
         let mask = shuffle_source_mask(
-            WarpMask::FULL,
+            WarpMask::ALL,
             &[u32::MAX; 32],
             &[0; 32],
             &[31; 32],

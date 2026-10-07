@@ -127,7 +127,7 @@ pub fn mapped_sync_copy_plan(
     destination_lane_private: bool,
 ) -> OpResult<CopyPlan> {
     let count = element_count_for(extents)?;
-    let active_lanes: Vec<_> = warp.active_mask.iter().collect();
+    let active_lanes: Vec<_> = warp.active_mask.lanes().collect();
     let mut elements = Vec::new();
     let mut destination_rank = None;
 
@@ -287,7 +287,7 @@ pub fn mapped_tcgen_elements(
     for linear in 0..element_count_for(extents)? {
         let coordinates = coordinates_for(extents, linear)?;
         let owners = WarpMask(wrap(view.owners(&coordinates), label)?.bits() & active_mask.bits());
-        for lane in owners.iter() {
+        for lane in owners.lanes() {
             let reference = wrap(view.map(&coordinates, lane), label)?;
             if !reference.in_bounds {
                 continue;
@@ -393,7 +393,7 @@ pub fn map_register_gemm_matrix(
                 [row, column]
             };
             let mut owner = None;
-            for lane in active_mask.iter() {
+            for lane in active_mask.lanes() {
                 let reference = wrap(view.map(&coordinates, lane), label)?;
                 if !reference.in_bounds {
                     continue;
@@ -524,7 +524,7 @@ pub fn fast_tmem_f32_m64_load(
     const ELEMENTS_PER_LANE: usize = 32;
     const ELEMENT_COUNT: usize = WARP_SIZE * ELEMENTS_PER_LANE;
 
-    if active_mask != WarpMask::FULL
+    if active_mask != WarpMask::ALL
         || source.len() != ELEMENT_COUNT
         || destination.len() != ELEMENT_COUNT
     {
@@ -605,7 +605,7 @@ pub fn canonical_32x32b_tmem_rows(
         .checked_mul(WARP_SIZE)
         .ok_or_else(|| OpError::message(format!("{mnemonic} warp offset overflow")))?;
     let mut rows = Vec::with_capacity(WARP_SIZE);
-    for execution_lane in active_mask.iter() {
+    for execution_lane in active_mask.lanes() {
         let lane_offset = warp_lane_offset
             .checked_add(execution_lane)
             .ok_or_else(|| OpError::message(format!("{mnemonic} lane offset overflow")))?;

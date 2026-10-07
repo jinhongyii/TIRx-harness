@@ -62,7 +62,7 @@ pub fn scope_lanes(
     linear: usize,
 ) -> OpResult<Vec<usize>> {
     match scope {
-        TileScope::Thread => Ok(active_mask.iter().collect()),
+        TileScope::Thread => Ok(active_mask.lanes().collect()),
         TileScope::Warp => {
             let lane = linear % WARP_SIZE;
             Ok(active_mask.contains(lane).then_some(lane).into_iter().collect())
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn scope_partitions_assign_each_element_to_one_thread() {
-        let full = WarpMask::FULL;
+        let full = WarpMask::ALL;
         assert_eq!(scope_lanes(TileScope::Thread, WarpMask(0b101), 0, 4, 9).unwrap(), vec![0, 2]);
         assert_eq!(scope_lanes(TileScope::Warp, full, 0, 4, 33).unwrap(), vec![1]);
         assert!(scope_lanes(TileScope::Warp, WarpMask(1), 0, 4, 33).unwrap().is_empty());

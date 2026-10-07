@@ -19,6 +19,15 @@
 //! * The op registry ([`registry`]) is the single source of
 //!   `SUPPORTED_OPS.md` ([`render_supported_ops_md`]).
 
+mod ptx;
+mod registry;
+mod tc;
+mod tir;
+mod tma;
+mod warp;
+#[cfg(test)]
+mod tests;
+
 use crate::dtype::{Dtype, Ty};
 use crate::program::{BinOp, CmpOp, OpKey, ReduxOp, Rounding, ShflMode, TerOp, TmapField, UnOp};
 use crate::value::{WarpMask, WarpValue};
@@ -160,8 +169,7 @@ impl FloatScalar for f32 {
         self as f64
     }
     fn from_f64(x: f64, rnd: Rounding, sat: bool) -> Self {
-        let _ = (x, rnd, sat);
-        unimplemented!("W4: f32::from_f64 with rounding modes")
+        tir::f32_from_f64(x, rnd, sat)
     }
 }
 
@@ -209,6 +217,26 @@ impl fmt::Display for OpError {
 
 impl std::error::Error for OpError {}
 
+/// Lift a `numsim-oplib` error (plain message) into the contract error.
+/// Messages naming an unmodeled/unsupported form fail closed as
+/// `Unsupported`; everything else is an operand error (`Invalid`).
+impl From<numsim_oplib::types::OpError> for OpError {
+    fn from(error: numsim_oplib::types::OpError) -> OpError {
+        let message = error.0;
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("unsupported")
+            || lower.contains("unmodeled")
+            || lower.contains("not modeled")
+            || lower.contains("no legacy")
+            || lower.contains("cannot parse")
+        {
+            OpError::unsupported(message)
+        } else {
+            OpError::invalid(message)
+        }
+    }
+}
+
 pub type OpResult<T = ()> = Result<T, OpError>;
 
 // ---------------------------------------------------------------------------
@@ -221,8 +249,7 @@ pub type OpResult<T = ()> = Result<T, OpError>;
 /// `Instr::Unary` (TIR semantics; vector `ty` = element-wise).
 #[inline]
 pub fn unary(op: UnOp, ty: Ty, a: &[WarpValue<u64>], out: &mut [WarpValue<u64>], mask: WarpMask) -> OpResult {
-    let _ = (op, ty, a, out, mask);
-    unimplemented!("W4: oplib::unary")
+    tir::unary(op, ty, a, out, mask)
 }
 
 /// `Instr::Binary`.
@@ -235,8 +262,7 @@ pub fn binary(
     out: &mut [WarpValue<u64>],
     mask: WarpMask,
 ) -> OpResult {
-    let _ = (op, ty, a, b, out, mask);
-    unimplemented!("W4: oplib::binary")
+    tir::binary(op, ty, a, b, out, mask)
 }
 
 /// `Instr::Ternary`.
@@ -250,15 +276,13 @@ pub fn ternary(
     out: &mut [WarpValue<u64>],
     mask: WarpMask,
 ) -> OpResult {
-    let _ = (op, ty, a, b, c, out, mask);
-    unimplemented!("W4: oplib::ternary")
+    tir::ternary(op, ty, a, b, c, out, mask)
 }
 
 /// `Instr::Compare`: lanes (within `mask`) where `a op b` holds.
 #[inline]
 pub fn compare(op: CmpOp, ty: Ty, a: &[WarpValue<u64>], b: &[WarpValue<u64>], mask: WarpMask) -> OpResult<WarpMask> {
-    let _ = (op, ty, a, b, mask);
-    unimplemented!("W4: oplib::compare")
+    tir::compare(op, ty, a, b, mask)
 }
 
 /// `Instr::Cast` (TIR/C semantics with optional rounding/saturation).
@@ -272,14 +296,12 @@ pub fn cast(
     out: &mut [WarpValue<u64>],
     mask: WarpMask,
 ) -> OpResult {
-    let _ = (from, to, rnd, sat, src, out, mask);
-    unimplemented!("W4: oplib::cast")
+    tir::cast(from, to, rnd, sat, src, out, mask)
 }
 
 /// Single-value conversion of raw bits (tile ops, TMA/MMA element paths).
 pub fn convert_bits(from: Ty, to: Ty, rnd: Rounding, sat: bool, src: u128) -> OpResult<u128> {
-    let _ = (from, to, rnd, sat, src);
-    unimplemented!("W4: oplib::convert_bits")
+    tir::convert_bits(from, to, rnd, sat, src)
 }
 
 // ---------------------------------------------------------------------------
@@ -307,21 +329,7 @@ pub type PtxFn = fn(&mut PtxIo<'_>) -> OpResult;
 /// `Unsupported` (fail closed); this is also the acceptance table lowering
 /// mirrors.
 pub fn resolve_ptx(key: &OpKey, dst_tys: &[Ty], src_tys: &[Ty]) -> OpResult<PtxFn> {
-    match key.name.as_str() {
-        // Trivial examples; W4 owns the table.
-        "tirx.cuda.float_as_uint" | "tirx.cuda.uint_as_float" => Ok(ptx_bitcast32),
-        _ => {
-            let _ = (dst_tys, src_tys);
-            Err(OpError::unsupported(format!("no oplib implementation for {} {:?}", key.name, key.mods)))
-        }
-    }
-}
-
-fn ptx_bitcast32(io: &mut PtxIo<'_>) -> OpResult {
-    for l in io.mask.lanes() {
-        io.dsts[0][l] = io.srcs[0][l] & 0xffff_ffff;
-    }
-    Ok(())
+    ptx::resolve(key, dst_tys, src_tys)
 }
 
 // ---------------------------------------------------------------------------
@@ -337,15 +345,13 @@ pub fn shfl(
     clamp: &WarpValue<u64>,
     members: WarpMask,
 ) -> (WarpValue<u64>, WarpMask) {
-    let _ = (mode, src, lane, clamp, members);
-    unimplemented!("W4: oplib::shfl")
+    warp::shfl(mode, src, lane, clamp, members)
 }
 
 /// `redux.sync` over `members`.
 #[inline]
 pub fn redux(op: ReduxOp, ty: Ty, src: &WarpValue<u64>, members: WarpMask) -> OpResult<u64> {
-    let _ = (op, ty, src, members);
-    unimplemented!("W4: oplib::redux")
+    warp::redux(op, ty, src, members)
 }
 
 // ---------------------------------------------------------------------------
@@ -377,16 +383,14 @@ pub struct TensorMapDesc {
 impl TensorMapDesc {
     pub const BYTES: usize = 128;
     pub fn encode(&self) -> [u8; 128] {
-        unimplemented!("W4: TensorMapDesc::encode")
+        tma::encode(self)
     }
     pub fn decode(bytes: &[u8; 128]) -> OpResult<TensorMapDesc> {
-        let _ = bytes;
-        unimplemented!("W4: TensorMapDesc::decode")
+        tma::decode(bytes)
     }
     /// `tensormap.replace` / per-instruction override.
     pub fn replace(&mut self, field: TmapField, ord: Option<u8>, value: u64) -> OpResult {
-        let _ = (field, ord, value);
-        unimplemented!("W4: TensorMapDesc::replace")
+        tma::replace(self, field, ord, value)
     }
 }
 
@@ -410,8 +414,7 @@ pub fn tma_plan(
     im2col_offsets: &[i64],
     smem_offset: u64,
 ) -> OpResult<TmaPlan> {
-    let _ = (map, mode, coords, im2col_offsets, smem_offset);
-    unimplemented!("W4: oplib::tma_plan")
+    tma::plan(map, mode, coords, im2col_offsets, smem_offset)
 }
 
 /// Decoded tcgen05/wgmma shared-memory matrix descriptor.
@@ -427,8 +430,7 @@ pub struct SmemDesc {
 }
 
 pub fn decode_smem_desc(desc: u64) -> OpResult<SmemDesc> {
-    let _ = desc;
-    unimplemented!("W4: decode_smem_desc")
+    tc::decode_smem_desc(desc)
 }
 
 /// tcgen05 instruction descriptor fields (idesc).
@@ -449,8 +451,7 @@ pub struct InstrDesc {
 }
 
 pub fn decode_instr_desc(idesc: u32, kind: crate::program::TcMmaKind) -> OpResult<InstrDesc> {
-    let _ = (idesc, kind);
-    unimplemented!("W4: decode_instr_desc")
+    tc::decode_instr_desc(idesc, kind)
 }
 
 /// tcgen05.mma numerics: reads A/B (and scales) through the closures, reads
@@ -461,8 +462,7 @@ pub fn tc_mma(
     tmem_read: &dyn Fn(u32, u32, &mut [u8]) -> OpResult,
     tmem_write: &mut dyn FnMut(u32, u32, &[u8]) -> OpResult,
 ) -> OpResult {
-    let _ = (payload, smem, tmem_read, tmem_write);
-    unimplemented!("W4: oplib::tc_mma")
+    tc::tc_mma(payload, smem, tmem_read, tmem_write)
 }
 
 // ---------------------------------------------------------------------------
@@ -503,54 +503,16 @@ pub struct OpEntry {
     pub instr: &'static str,
 }
 
-/// The registry (W4 fills; lowering checks membership).
-pub static OPS: &[OpEntry] = &[];
-
+/// The registry: every TIRx op of the legacy `SUPPORTED_OPS.md` (generated
+/// from `numsim-oplib`'s op table), with the `Instr::family()` it lowers to.
 pub fn registry() -> &'static [OpEntry] {
-    OPS
+    registry::entries()
 }
 
-/// Render SUPPORTED_OPS.md from registry entries (stable order: by name).
+/// Render SUPPORTED_OPS.md from registry entries. With [`registry()`] this
+/// reproduces the legacy file byte-for-byte (NumSim ABI v38 header, CUDA/PTX
+/// table then tile table, each sorted by name).
 pub fn render_supported_ops_md(entries: &[OpEntry]) -> String {
-    let mut ops: Vec<&OpEntry> = entries.iter().filter(|e| !e.name.starts_with("tirx.tile.")).collect();
-    ops.sort_by_key(|e| e.name);
-    let mut tiles: Vec<&OpEntry> = entries.iter().filter(|e| e.name.starts_with("tirx.tile.")).collect();
-    tiles.sort_by_key(|e| e.name);
-    let mut s = String::from("# NumSim Engine Operation Support\n\n");
-    s.push_str("This file is generated from NumSim's operation registry and is checked by tests.\n\n");
-    s.push_str("## TIRx CUDA/PTX Ops\n\n| Operation | Family | Fidelity | Notes |\n| --- | --- | --- | --- |\n");
-    for e in ops {
-        s.push_str(&format!("| `{}` | {} | {} | {} |\n", e.name, e.family, e.fidelity.name(), e.notes));
-    }
-    s.push_str("\n## CUDA Tile Primitives\n\n| Operation | Fidelity | Notes |\n| --- | --- | --- |\n");
-    for e in tiles {
-        s.push_str(&format!("| `{}` | {} | {} |\n", e.name, e.fidelity.name(), e.notes));
-    }
-    s
+    registry::render(entries)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scalar_roundtrip() {
-        assert_eq!(i32::from_bits((-5i32).to_bits()), -5);
-        assert_eq!((-1i8).to_bits(), 0xff);
-        assert_eq!(<f32 as Scalar>::from_bits(Scalar::to_bits(1.5f32)), 1.5);
-        assert_eq!(E2M1::from_bits(0xff), E2M1(0xf));
-        let key = OpKey { name: "tirx.cuda.float_as_uint".into(), mods: vec![] };
-        assert!(resolve_ptx(&key, &[Ty::U32], &[Ty::F32]).is_ok());
-    }
-
-    #[test]
-    fn render_md() {
-        let e = [
-            OpEntry { name: "tirx.ptx.ld", family: "raw_memory", fidelity: Fidelity::Modeled, notes: "", instr: "ld" },
-            OpEntry { name: "tirx.tile.add", family: "modeled", fidelity: Fidelity::Modeled, notes: "", instr: "tile" },
-        ];
-        let md = render_supported_ops_md(&e);
-        assert!(md.contains("| `tirx.ptx.ld` | raw_memory | modeled |  |"));
-        assert!(md.contains("| `tirx.tile.add` | modeled |  |"));
-    }
-}

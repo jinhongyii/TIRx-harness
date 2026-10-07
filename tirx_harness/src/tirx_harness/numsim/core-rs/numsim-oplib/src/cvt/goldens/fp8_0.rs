@@ -353,7 +353,7 @@ pub(super) static EXPECTED_E5M2X2_BF16X2_RELU: [u64; 256] = [
     0x0000007b, 0x0000007b, 0x00000000, 0x00007b7b, 0x00007b00, 0x00004800,
 ];
 
-pub(super) static FORMS: &[GoldenForm] = &[
+pub(crate) static FORMS: &[GoldenForm] = &[
     GoldenForm {
         name: "e4m3x2.f32",
         spelling: "cvt.rn.satfinite.e4m3x2.f32",

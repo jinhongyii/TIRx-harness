@@ -12,8 +12,10 @@ mod int;
 mod narrow;
 mod spelling;
 
-#[cfg(test)]
-mod goldens;
+/// GPU-recorded cvt golden rows (tests, and the `goldens` feature for
+/// contract-boundary replays in `numsim-core`).
+#[cfg(any(test, feature = "goldens"))]
+pub mod goldens;
 
 pub(crate) use bindings::BINDINGS;
 pub use float::*;

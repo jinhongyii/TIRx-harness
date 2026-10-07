@@ -78,7 +78,7 @@ pub fn vote_ballot(
 ) -> OpResult<WarpValue<u32>> {
     let participant_mask = validate_participants(active_mask, participant_masks, "warp ballot")?;
     let mut result = [0_u32; WARP_SIZE];
-    for lane in active_mask.iter() {
+    for lane in active_mask.lanes() {
         let mut bits = 0_u32;
         for source_lane in 0..WARP_SIZE {
             if participant_mask & (1_u32 << source_lane) != 0 && predicates[source_lane] {
@@ -99,7 +99,7 @@ pub fn match_any<T: Copy + PartialEq>(
 ) -> OpResult<WarpValue<u32>> {
     let members = validate_participants(active_mask, member_masks, "match.sync")?;
     let mut matching = [0_u32; WARP_SIZE];
-    for destination_lane in active_mask.iter() {
+    for destination_lane in active_mask.lanes() {
         let destination_value = values[destination_lane];
         matching[destination_lane] = (0..WARP_SIZE)
             .filter(|source_lane| members & (1_u32 << source_lane) != 0)
@@ -117,8 +117,8 @@ pub fn match_all<T: Copy + PartialEq>(
     values: &WarpValue<T>,
 ) -> OpResult<(WarpValue<u32>, WarpValue<bool>)> {
     let members = validate_participants(active_mask, member_masks, "match.sync")?;
-    let first = WarpMask::from_bits(members)
-        .first_active()
+    let first = WarpMask(members)
+        .first()
         .expect("validated member mask is nonempty");
     let all_equal = (first + 1..WARP_SIZE)
         .filter(|lane| members & (1_u32 << lane) != 0)
@@ -158,8 +158,8 @@ fn redux_fold<T: Copy>(
     combine: impl Fn(T, T) -> T,
 ) -> OpResult<T> {
     let members = validate_participants(active_mask, member_masks, "redux.sync")?;
-    let first = WarpMask::from_bits(members)
-        .first_active()
+    let first = WarpMask(members)
+        .first()
         .expect("validated member mask is nonempty");
     Ok((first + 1..WARP_SIZE)
         .filter(|lane| members & (1_u32 << lane) != 0)
@@ -231,8 +231,8 @@ pub fn elect_sync(
     member_masks: &WarpValue<u32>,
 ) -> OpResult<(WarpValue<u32>, WarpValue<bool>)> {
     let members = validate_participants(active_mask, member_masks, "elect.sync")?;
-    let elected = WarpMask::from_bits(members)
-        .first_active()
+    let elected = WarpMask(members)
+        .first()
         .ok_or_else(|| OpError::message("elect.sync has no participating lane"))?;
     Ok((
         [elected as u32; WARP_SIZE],
@@ -248,7 +248,7 @@ pub fn fns_b32(
     offsets: &WarpValue<i32>,
 ) -> OpResult<WarpValue<u32>> {
     let mut result = [0_u32; WARP_SIZE];
-    for lane in active_mask.iter() {
+    for lane in active_mask.lanes() {
         if bases[lane] >= 32 {
             return Err(OpError::message("fns.b32 base is outside the defined 0..31 range"));
         }
@@ -297,24 +297,24 @@ mod tests {
     // `vote_match_and_redux_are_one_instruction_over_the_runtime_member_mask`.
     #[test]
     fn vote_match_and_redux_are_one_instruction_over_the_runtime_member_mask() {
-        let ballot = vote_ballot(WarpMask::FULL, &FULL, &from_fn(|lane| lane % 2 == 0)).unwrap();
+        let ballot = vote_ballot(WarpMask::ALL, &FULL, &from_fn(|lane| lane % 2 == 0)).unwrap();
         assert_eq!(ballot[0], 0x5555_5555);
-        let sum = redux_sync_u32(WarpMask::FULL, &FULL, &[1; 32], ReduxIntOp::Add).unwrap();
+        let sum = redux_sync_u32(WarpMask::ALL, &FULL, &[1; 32], ReduxIntOp::Add).unwrap();
         assert_eq!(sum[0], 32);
-        let matches = match_any(WarpMask::FULL, &FULL, &from_fn(|lane| (lane % 4) as u32)).unwrap();
+        let matches = match_any(WarpMask::ALL, &FULL, &from_fn(|lane| (lane % 4) as u32)).unwrap();
         assert_eq!(matches[0], 0x1111_1111);
         assert_eq!(matches[1], 0x2222_2222);
         let iota = from_fn(|lane| lane as u32);
-        let sums = redux_sync_u32(WarpMask::FULL, &FULL, &iota, ReduxIntOp::Add).unwrap();
-        let minima = redux_sync_u32(WarpMask::FULL, &FULL, &iota, ReduxIntOp::Min).unwrap();
-        let any = vote_any(WarpMask::FULL, &FULL, &from_fn(|lane| lane == 31)).unwrap();
+        let sums = redux_sync_u32(WarpMask::ALL, &FULL, &iota, ReduxIntOp::Add).unwrap();
+        let minima = redux_sync_u32(WarpMask::ALL, &FULL, &iota, ReduxIntOp::Min).unwrap();
+        let any = vote_any(WarpMask::ALL, &FULL, &from_fn(|lane| lane == 31)).unwrap();
         for lane in 0..32 {
             assert_eq!(sums[lane], 496);
             assert_eq!(minima[lane], 0);
             assert!(any[lane]);
             assert_eq!(ballot[lane], 0x5555_5555);
         }
-        let active = WarpMask::from_bits((1 << 3) | (1 << 7) | (1 << 12));
+        let active = WarpMask((1 << 3) | (1 << 7) | (1 << 12));
         let (leader, elected) = elect_sync(active, &[active.bits(); 32]).unwrap();
         for lane in 0..32 {
             assert_eq!(leader[lane], 3);
@@ -327,18 +327,18 @@ mod tests {
         let masks = [0b10110_u32; 32];
         let bases = [1_u32; 32];
         let offsets = from_fn(|lane| if lane % 2 == 0 { 1 } else { 2 });
-        let result = fns_b32(WarpMask::FULL, &masks, &bases, &offsets).unwrap();
+        let result = fns_b32(WarpMask::ALL, &masks, &bases, &offsets).unwrap();
         for lane in 0..WARP_SIZE {
             assert_eq!(result[lane], if lane % 2 == 0 { 1 } else { 2 });
         }
         let invalid_bases = from_fn(|lane| if lane == 7 { 32 } else { 0 });
-        let error = fns_b32(WarpMask::FULL, &masks, &invalid_bases, &offsets).unwrap_err();
+        let error = fns_b32(WarpMask::ALL, &masks, &invalid_bases, &offsets).unwrap_err();
         assert_eq!(error.to_string(), "fns.b32 base is outside the defined 0..31 range");
     }
 
     #[test]
     fn vote_variants_use_only_member_lanes() {
-        let active = WarpMask::from_bits(0xff);
+        let active = WarpMask(0xff);
         let members = [0xff_u32; 32];
         let predicates = from_fn(|lane| lane < 8 || lane == 20);
         assert_eq!(vote_all(active, &members, &predicates).unwrap(), [true; 32]);
@@ -355,29 +355,29 @@ mod tests {
 
     #[test]
     fn match_all_reports_mask_and_predicate() {
-        let (mask, pred) = match_all(WarpMask::FULL, &FULL, &[5_u64; 32]).unwrap();
+        let (mask, pred) = match_all(WarpMask::ALL, &FULL, &[5_u64; 32]).unwrap();
         assert_eq!((mask[9], pred[9]), (u32::MAX, true));
         let (mask, pred) =
-            match_all(WarpMask::FULL, &FULL, &from_fn(|lane| u64::from(lane == 4))).unwrap();
+            match_all(WarpMask::ALL, &FULL, &from_fn(|lane| u64::from(lane == 4))).unwrap();
         assert_eq!((mask[0], pred[0]), (0, false));
     }
 
     #[test]
     fn redux_variants_cover_bitwise_signed_and_float_nan_rules() {
         let values = from_fn(|lane| 1_u32 << (lane % 4));
-        assert_eq!(redux_sync_u32(WarpMask::FULL, &FULL, &values, ReduxIntOp::Or).unwrap()[0], 0xf);
-        assert_eq!(redux_sync_u32(WarpMask::FULL, &FULL, &values, ReduxIntOp::And).unwrap()[0], 0);
-        assert_eq!(redux_sync_u32(WarpMask::FULL, &FULL, &values, ReduxIntOp::Xor).unwrap()[0], 0);
+        assert_eq!(redux_sync_u32(WarpMask::ALL, &FULL, &values, ReduxIntOp::Or).unwrap()[0], 0xf);
+        assert_eq!(redux_sync_u32(WarpMask::ALL, &FULL, &values, ReduxIntOp::And).unwrap()[0], 0);
+        assert_eq!(redux_sync_u32(WarpMask::ALL, &FULL, &values, ReduxIntOp::Xor).unwrap()[0], 0);
         let signed = from_fn(|lane| lane as i32 - 16);
-        assert_eq!(redux_sync_i32(WarpMask::FULL, &FULL, &signed, ReduxIntOp::Min).unwrap()[0], -16);
-        assert_eq!(redux_sync_i32(WarpMask::FULL, &FULL, &signed, ReduxIntOp::Max).unwrap()[0], 15);
-        assert!(redux_sync_i32(WarpMask::FULL, &FULL, &signed, ReduxIntOp::Xor).is_err());
+        assert_eq!(redux_sync_i32(WarpMask::ALL, &FULL, &signed, ReduxIntOp::Min).unwrap()[0], -16);
+        assert_eq!(redux_sync_i32(WarpMask::ALL, &FULL, &signed, ReduxIntOp::Max).unwrap()[0], 15);
+        assert!(redux_sync_i32(WarpMask::ALL, &FULL, &signed, ReduxIntOp::Xor).is_err());
         let floats = from_fn(|lane| if lane == 5 { f32::NAN } else { lane as f32 });
-        assert_eq!(redux_sync_f32(WarpMask::FULL, &FULL, &floats, ReduxF32Op::Max).unwrap()[0], 31.0);
-        let nan = redux_sync_f32(WarpMask::FULL, &FULL, &floats, ReduxF32Op::MaxNan).unwrap()[0];
+        assert_eq!(redux_sync_f32(WarpMask::ALL, &FULL, &floats, ReduxF32Op::Max).unwrap()[0], 31.0);
+        let nan = redux_sync_f32(WarpMask::ALL, &FULL, &floats, ReduxF32Op::MaxNan).unwrap()[0];
         assert_eq!(nan.to_bits(), 0x7fff_ffff);
         // A single NaN member is canonicalized without combine.
-        let single = WarpMask::from_bits(1 << 5);
+        let single = WarpMask(1 << 5);
         let only = redux_sync_f32(single, &[1 << 5; 32], &floats, ReduxF32Op::Min).unwrap()[0];
         assert_eq!(only.to_bits(), 0x7fff_ffff);
     }
@@ -391,13 +391,13 @@ mod tests {
             let col = (lane % 4) * 2;
             ((row * 8 + col) as u32) | (((row * 8 + col + 1) as u32) << 16)
         });
-        let transposed = movmatrix_m8n8_trans_b16(WarpMask::FULL, &values).unwrap();
+        let transposed = movmatrix_m8n8_trans_b16(WarpMask::ALL, &values).unwrap();
         for lane in 0..32 {
             let row = lane / 4;
             let col = (lane % 4) * 2;
             assert_eq!(transposed[lane] & 0xffff, (col * 8 + row) as u32);
             assert_eq!(transposed[lane] >> 16, ((col + 1) * 8 + row) as u32);
         }
-        assert!(movmatrix_m8n8_trans_b16(WarpMask::from_bits(0xffff), &values).is_err());
+        assert!(movmatrix_m8n8_trans_b16(WarpMask(0xffff), &values).is_err());
     }
 }

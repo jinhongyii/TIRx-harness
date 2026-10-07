@@ -36,7 +36,7 @@ fn warp_collective_divergence_with_detail(
 
 /// Require every lane of the warp to be active (`require_full_warp_sync`).
 pub fn require_full_warp(active_mask: WarpMask, operation: &str) -> OpResult<()> {
-    if active_mask != WarpMask::FULL {
+    if active_mask != WarpMask::ALL {
         return Err(warp_collective_divergence(operation, active_mask));
     }
     Ok(())
@@ -62,7 +62,7 @@ pub fn validate_participants(
     operation: &str,
 ) -> OpResult<u32> {
     let first_lane = active_mask
-        .first_active()
+        .first()
         .ok_or_else(|| OpError::message(format!("{operation} has no active lane")))?;
     let expected = participant_masks[first_lane];
     if expected == 0 {
@@ -77,7 +77,7 @@ pub fn validate_participants(
             format_args!(" participant mask names an inactive lane"),
         ));
     }
-    for lane in active_mask.iter() {
+    for lane in active_mask.lanes() {
         let actual = participant_masks[lane];
         if actual != expected {
             return Err(warp_collective_divergence_with_detail(
@@ -102,10 +102,10 @@ pub fn validate_participants(
 /// Require an `i64` operand to be uniform across the active lanes and return it.
 pub fn require_uniform_i64(values: &WarpValue<i64>, mask: WarpMask, label: &str) -> OpResult<i64> {
     let first_lane = mask
-        .first_active()
+        .first()
         .ok_or_else(|| OpError::message(format!("{label} has no active lane")))?;
     let expected = values[first_lane];
-    for lane in mask.iter() {
+    for lane in mask.lanes() {
         if values[lane] != expected {
             return Err(OpError::message(format!(
                 "{label} must agree across active lanes: lane {lane} has {}, expected {expected}",
@@ -124,7 +124,7 @@ pub fn activemask(active_mask: WarpMask) -> WarpValue<u32> {
 #[cfg(test)]
 /// Mask containing lanes `0..count` (`WarpMask::from_lanes(0..count)` in legacy).
 pub(crate) fn lanes_below(count: usize) -> WarpMask {
-    WarpMask::from_predicate(|lane| lane < count)
+    WarpMask::first_n(count as u32)
 }
 
 #[cfg(test)]
@@ -136,21 +136,21 @@ mod tests {
         let label = "collective";
         let active = lanes_below(16);
         assert!(validate_participants(active, &[u32::MAX; 32], label).is_err());
-        assert!(validate_participants(WarpMask::FULL, &[0; 32], label).is_err());
+        assert!(validate_participants(WarpMask::ALL, &[0; 32], label).is_err());
         let missing_self = [!(1_u32 << 7); 32];
-        let error = validate_participants(WarpMask::FULL, &missing_self, label).unwrap_err();
+        let error = validate_participants(WarpMask::ALL, &missing_self, label).unwrap_err();
         assert!(error.to_string().contains("executing lane 7 is absent"));
         let inconsistent: WarpValue<u32> =
             std::array::from_fn(|lane| if lane == 7 { !(1_u32 << 0) } else { u32::MAX });
-        let error = validate_participants(WarpMask::FULL, &inconsistent, label).unwrap_err();
+        let error = validate_participants(WarpMask::ALL, &inconsistent, label).unwrap_err();
         assert!(error.to_string().contains("participant masks disagree"));
     }
 
     #[test]
     fn participant_diagnostics_match_legacy_rendering() {
-        let error = validate_participants(WarpMask::EMPTY, &[1; 32], "vote.sync").unwrap_err();
+        let error = validate_participants(WarpMask::NONE, &[1; 32], "vote.sync").unwrap_err();
         assert_eq!(error.to_string(), "vote.sync has no active lane");
-        let error = validate_participants(WarpMask::FULL, &[0; 32], "vote.sync").unwrap_err();
+        let error = validate_participants(WarpMask::ALL, &[0; 32], "vote.sync").unwrap_err();
         assert_eq!(error.to_string(), "vote.sync participant mask must not be zero");
         let active = lanes_below(16);
         let error = validate_participants(active, &[u32::MAX; 32], "shfl.sync").unwrap_err();
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn full_warp_requirement_renders_divergence() {
-        assert!(require_full_warp(WarpMask::FULL, "op").is_ok());
+        assert!(require_full_warp(WarpMask::ALL, "op").is_ok());
         let error = require_full_warp(lanes_below(16), "cuda_warp_reduce").unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -176,11 +176,11 @@ mod tests {
     #[test]
     fn uniform_values_preserve_diagnostics() {
         let uniform = [7_i64; 32];
-        assert_eq!(require_uniform_i64(&uniform, WarpMask::FULL, "field").unwrap(), 7);
-        let error = require_uniform_i64(&uniform, WarpMask::EMPTY, "field").unwrap_err();
+        assert_eq!(require_uniform_i64(&uniform, WarpMask::ALL, "field").unwrap(), 7);
+        let error = require_uniform_i64(&uniform, WarpMask::NONE, "field").unwrap_err();
         assert_eq!(error.to_string(), "field has no active lane");
         let disagreeing: WarpValue<i64> = std::array::from_fn(|lane| if lane == 3 { 9 } else { 7 });
-        let error = require_uniform_i64(&disagreeing, WarpMask::FULL, "field").unwrap_err();
+        let error = require_uniform_i64(&disagreeing, WarpMask::ALL, "field").unwrap_err();
         assert_eq!(
             error.to_string(),
             "field must agree across active lanes: lane 3 has 9, expected 7"
@@ -189,6 +189,6 @@ mod tests {
 
     #[test]
     fn activemask_splats_active_bits() {
-        assert_eq!(activemask(WarpMask::from_bits(0x1088)), [0x1088; 32]);
+        assert_eq!(activemask(WarpMask(0x1088)), [0x1088; 32]);
     }
 }

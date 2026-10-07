@@ -11,13 +11,16 @@ mod narrow_1;
 mod narrow_2;
 mod narrow_sources;
 mod scalar;
+#[cfg(test)]
 mod tests;
 
-use crate::cvt::{ptx_cvt, CvtOperands};
+use crate::cvt::CvtOperands;
+#[cfg(test)]
+use crate::cvt::ptx_cvt;
 
 /// How one golden row's operands were formed by its `.cu` harness kernel.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Layout {
+pub enum Layout {
     /// `d, a` with `a = primary[i]`.
     Unary,
     /// `d, a, b` with `a = primary[i]`, `b = primary[(i + 1) % n]`.
@@ -28,7 +31,7 @@ pub(super) enum Layout {
     Scaled,
 }
 
-pub(super) struct GoldenForm {
+pub struct GoldenForm {
     pub name: &'static str,
     pub spelling: &'static str,
     pub layout: Layout,
@@ -37,7 +40,8 @@ pub(super) struct GoldenForm {
     pub expected: &'static [u64],
 }
 
-fn operands(form: &GoldenForm, index: usize) -> CvtOperands {
+/// Operands of row `index` exactly as the `.cu` harness formed them.
+pub fn operands(form: &GoldenForm, index: usize) -> CvtOperands {
     let source = form.primary;
     let at = |offset: usize| source[(index + offset) % source.len()];
     let mut operands = CvtOperands::unary(at(0));
@@ -55,6 +59,7 @@ fn operands(form: &GoldenForm, index: usize) -> CvtOperands {
     operands
 }
 
+#[cfg(test)]
 pub(super) fn check(form: &GoldenForm) {
     let mut mismatches = Vec::new();
     for (index, &expected) in form.expected.iter().enumerate() {
@@ -75,4 +80,11 @@ pub(super) fn check(form: &GoldenForm) {
         form.expected.len(),
         mismatches.iter().take(12).cloned().collect::<Vec<_>>().join("\n")
     );
+}
+
+/// Every golden form (scalar, fp8, narrow), in file order.
+pub fn all_forms() -> impl Iterator<Item = &'static GoldenForm> {
+    [scalar::FORMS, fp8_0::FORMS, fp8_1::FORMS, narrow_0::FORMS, narrow_1::FORMS, narrow_2::FORMS]
+        .into_iter()
+        .flatten()
 }

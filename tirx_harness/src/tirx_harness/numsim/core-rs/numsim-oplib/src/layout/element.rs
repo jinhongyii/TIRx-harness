@@ -79,7 +79,7 @@ pub trait ElementMap {
     /// Lanes in the current warp that own this logical element (default:
     /// every lane, i.e. probe with [`ElementMap::map`]).
     fn owners(&self, _logical: &[i64]) -> OpResult<WarpMask> {
-        Ok(WarpMask::FULL)
+        Ok(WarpMask::ALL)
     }
 
     fn map(&self, logical: &[i64], lane: usize) -> OpResult<ElementRef>;

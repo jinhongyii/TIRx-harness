@@ -384,7 +384,7 @@ pub(super) static EXPECTED_69: [u64; 16] = [
     0x33000000, 0x7f7fe000, 0xff7fe000, 0x7f7fe000, 0xff7fe000, 0x7fbfe000,
 ];
 
-pub(super) static FORMS: &[GoldenForm] = &[
+pub(crate) static FORMS: &[GoldenForm] = &[
     GoldenForm {
         name: "cvt.rni.s32.f32",
         spelling: "cvt.rni.s32.f32",
