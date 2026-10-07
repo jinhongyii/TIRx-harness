@@ -130,28 +130,46 @@ impl K {
         *p - 1
     }
 
-    /// bar.sync / cluster barrier over whole warps.
+    /// Named barrier `bar.sync` over whole warps (no scope, participants).
     pub fn bar(&mut self, obj: SyncObjId, warps: &[WarpId]) -> &mut Self {
         let p = self.next_phase(obj);
         for &w in warps {
-            self.arrive(w, u32::MAX, obj, p, true);
+            self.arrive_s(w, u32::MAX, obj, p, Some(true), None);
         }
         for &w in warps {
-            self.wait(w, u32::MAX, obj, p, true);
+            self.wait_s(w, u32::MAX, obj, p, Some(true), None);
+        }
+        self
+    }
+    /// `barrier.cluster.arrive` + `wait` (defaults release/acquire, cluster).
+    pub fn cluster_bar(&mut self, obj: SyncObjId, warps: &[WarpId]) -> &mut Self {
+        let p = self.next_phase(obj);
+        for &w in warps {
+            self.arrive_s(w, u32::MAX, obj, p, Some(true), Some(Scope::Cluster));
+        }
+        for &w in warps {
+            self.wait_s(w, u32::MAX, obj, p, Some(true), Some(Scope::Cluster));
         }
         self
     }
 
-    pub fn arrive(&mut self, w: WarpId, lanes: u32, obj: SyncObjId, phase: u32, release: bool) -> &mut Self {
+    /// mbarrier arrive with an explicit scope (`.cta` is the PTX default).
+    pub fn arrive_s(&mut self, w: WarpId, lanes: u32, obj: SyncObjId, phase: u32, release: Option<bool>, scope: Option<Scope>) -> &mut Self {
         let e = self.tick(w);
-        self.ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask(lanes), obj, phase, release, epoch: e }));
+        self.ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask(lanes), obj, phase, release, scope, epoch: e }));
         self
     }
-
-    pub fn wait(&mut self, w: WarpId, lanes: u32, obj: SyncObjId, phase: u32, acquire: bool) -> &mut Self {
+    pub fn wait_s(&mut self, w: WarpId, lanes: u32, obj: SyncObjId, phase: u32, acquire: Option<bool>, scope: Option<Scope>) -> &mut Self {
         let e = self.tick(w);
-        self.ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask(lanes), obj, phase, acquire, epoch: e }));
+        self.ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask(lanes), obj, phase, acquire, scope, epoch: e }));
         self
+    }
+    /// mbarrier arrive / wait at the default `.cta` scope.
+    pub fn arrive(&mut self, w: WarpId, lanes: u32, obj: SyncObjId, phase: u32, release: bool) -> &mut Self {
+        self.arrive_s(w, lanes, obj, phase, Some(release), Some(Scope::Cta))
+    }
+    pub fn wait(&mut self, w: WarpId, lanes: u32, obj: SyncObjId, phase: u32, acquire: bool) -> &mut Self {
+        self.wait_s(w, lanes, obj, phase, Some(acquire), Some(Scope::Cta))
     }
 
     pub fn fence(&mut self, w: WarpId, lanes: u32, kind: FenceKind) -> &mut Self {
@@ -247,8 +265,14 @@ pub fn races(r: &Report) -> Vec<&Finding> {
     r.races().collect()
 }
 
+/// No error and no incomplete. Review advisories (e.g. polling an
+/// undeclared word) are allowed; tests that care assert them explicitly.
 pub fn clean(r: &Report) -> bool {
-    r.is_clean()
+    r.errors().next().is_none() && r.incomplete.is_empty() && r.findings.iter().all(|f| matches!(f.kind, FindingKind::Advisory { .. }))
+}
+
+pub fn has_advisory(r: &Report, kind: AdvisoryKind) -> bool {
+    r.findings.iter().any(|f| f.kind == FindingKind::Advisory { kind })
 }
 
 pub fn has_failure(r: &Report, pred: impl Fn(OrderingFailure) -> bool) -> bool {

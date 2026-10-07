@@ -253,18 +253,34 @@ fn atomic_poll_does_not_publish_shared() {
     assert_eq!(races(&r)[0].prior.as_ref().unwrap().warp, 1);
 }
 
-/// test_native_racecheck_release_rmw_handoff.py asserts a race here
-/// ("same-address RMW serialization is not HB"). Under PTX release-sequence
-/// rules L0's atom.release heads a sequence that every later RMW of the
-/// chain continues, so L1's ld.acquire synchronises with L0. This core
-/// follows PTX; the divergence is listed in the spec (§7).
+/// test_native_racecheck_release_rmw_handoff.py: same-address RMWs of one
+/// instruction are 32 independent threads with unconstrained coherence
+/// order (PTX §8.9.1, §8.9.2; racecheck-isa-answers.md R1), so L1's acquire
+/// may read from an RMW coherence-before L0's: no observation-order chain,
+/// race. With warp_sync after the RMWs it is ordered.
 #[test]
-fn release_rmw_handoff_follows_release_sequence() {
-    let mut k = K::one_warp();
+fn release_rmw_handoff_sibling_lanes_race() {
     let all: Vec<u8> = (0..32).collect();
+    let mut k = K::one_warp();
     k.st(0, 0, GMEM, 0..4);
     k.inst(0, &all, atom(MemOrder::Release, Scope::Gpu), |_| (GMEM2, FLAG));
     k.a(0, 1, ld(MemOrder::Acquire, Scope::Gpu), GMEM2, FLAG).ld(0, 1, GMEM, 0..4);
+    let r = k.run();
+    let f = races(&r);
+    assert_eq!(f.len(), 1);
+    assert_eq!((f[0].prior.as_ref().unwrap().lane, f[0].current.as_ref().unwrap().lane), (0, 1));
+    let mut k = K::one_warp();
+    k.st(0, 0, GMEM, 0..4);
+    k.inst(0, &all, atom(MemOrder::Release, Scope::Gpu), |_| (GMEM2, FLAG));
+    k.syncwarp(0, u32::MAX);
+    k.a(0, 1, ld(MemOrder::Acquire, Scope::Gpu), GMEM2, FLAG).ld(0, 1, GMEM, 0..4);
+    assert!(clean(&k.run()));
+    // A chain across *different*, ordered instructions does extend it.
+    let mut k = K::new(1, 1, 3);
+    k.st(0, 0, GMEM, 0..4).a(0, 0, atom(MemOrder::Release, Scope::Gpu), GMEM2, FLAG);
+    k.bar(0, &[0, 1]);
+    k.a(1, 0, atom(MemOrder::Relaxed, Scope::Gpu), GMEM2, FLAG);
+    k.a(2, 0, ld(MemOrder::Acquire, Scope::Gpu), GMEM2, FLAG).ld(2, 0, GMEM, 0..4);
     assert!(clean(&k.run()));
     // Without any release the same shape races.
     let mut k = K::one_warp();

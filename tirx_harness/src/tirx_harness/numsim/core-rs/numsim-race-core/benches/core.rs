@@ -175,11 +175,11 @@ fn checker_loop(c: &mut Criterion) {
         }
         for w in 0..4u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::FULL, obj: 0, phase: it, release: true, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::FULL, obj: 0, phase: it, release: Some(true), scope: None, epoch: epoch[w as usize] }));
         }
         for w in 0..4u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::FULL, obj: 0, phase: it, acquire: true, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::FULL, obj: 0, phase: it, acquire: Some(true), scope: None, epoch: epoch[w as usize] }));
         }
     }
     let n = ev.len();

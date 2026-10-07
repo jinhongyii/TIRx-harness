@@ -18,4 +18,4 @@ pub mod input;
 pub mod knowledge;
 pub mod shadow;
 
-pub use checker::{Checker, Finding, FindingKind, Incomplete, OrderingFailure, RaceClass, Report, Severity};
+pub use checker::{AdvisoryKind, Checker, Finding, FindingKind, Incomplete, OrderingFailure, RaceClass, Report, Severity};

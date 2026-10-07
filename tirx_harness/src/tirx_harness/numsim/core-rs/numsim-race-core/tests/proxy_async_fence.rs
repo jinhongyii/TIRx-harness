@@ -56,7 +56,10 @@ fn shared_cta_proxy_fence_modes() {
     let none = shared_cta_proxy_fence(None, false);
     assert!(has_class(&none, RaceClass::WriteRead));
     assert!(clean(&shared_cta_proxy_fence(Some(FenceKind::ProxyAsync(Some(Domain::SharedCta))), false)));
-    assert!(has_race(&shared_cta_proxy_fence(Some(FenceKind::ProxyAsync(Some(Domain::SharedCluster))), false)));
+    // Delta vs legacy (which reports a race): the shared::cta window lies
+    // inside the shared::cluster window (PTX §5.1.7), so a
+    // .shared::cluster fence covers shared::cta objects.
+    assert!(clean(&shared_cta_proxy_fence(Some(FenceKind::ProxyAsync(Some(Domain::SharedCluster))), false)));
     assert!(clean(&shared_cta_proxy_fence(Some(FenceKind::ProxyAsync(None)), false)));
     assert!(has_race(&shared_cta_proxy_fence(Some(FenceKind::ProxyAsync(Some(Domain::SharedCta))), true)));
 }
@@ -129,14 +132,22 @@ fn mbarrier_completion_acquire_lane() {
     assert!(clean(&completion_lane(1)));
 }
 
-/// raw try_wait variants: async completion is visible to a relaxed query,
-/// a generic arrive's release is not.
+/// raw try_wait variants. A `.relaxed` wait synchronises nothing, not even
+/// the copy completion, unless followed by `fence.acquire` (PTX §8.8,
+/// §9.7.15.16.19). Delta vs legacy, which let relaxed waits see completions.
 fn try_wait(acquire: bool, read_ordinary: bool) -> Report {
+    try_wait_f(acquire, read_ordinary, false)
+}
+
+fn try_wait_f(acquire: bool, read_ordinary: bool, fence_after: bool) -> Report {
     let mut k = K::new(2, 1, 1);
     k.st(0, 0, GMEM, 0..4).arrive(0, 1, BAR, 0, true);
     let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16)]);
     k.ar(op, Proxy::Async, GMEM2, 0..16).aw(op, Proxy::Async, SMEM, 0..16).done_phase(op, Milestone::Write, BAR, 0);
     k.wait(1, 1, BAR, 0, acquire);
+    if fence_after {
+        k.fence(1, 1, FenceKind::AcqRel(Scope::Cta));
+    }
     if read_ordinary {
         k.ld(1, 0, GMEM, 0..4);
     } else {
@@ -147,10 +158,13 @@ fn try_wait(acquire: bool, read_ordinary: bool) -> Report {
 
 #[test]
 fn raw_try_wait_acquire_variants() {
-    assert!(clean(&try_wait(false, false)));
+    assert!(has_class(&try_wait(false, false), RaceClass::WriteRead));
     assert!(clean(&try_wait(true, false)));
     assert!(has_class(&try_wait(false, true), RaceClass::WriteRead));
     assert!(clean(&try_wait(true, true)));
+    // relaxed wait + fence.acquire is an acquire pattern
+    assert!(clean(&try_wait_f(false, false, true)));
+    assert!(clean(&try_wait_f(false, true, true)));
 }
 
 /// clc_response_reuse: generic read of an async-written response, then a

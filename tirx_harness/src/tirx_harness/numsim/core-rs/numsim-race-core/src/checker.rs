@@ -99,6 +99,8 @@ pub enum Incomplete {
     UnknownAlloc { alloc: AllocId },
     /// `wait_until` exited but no history entry explains it.
     WaitExitUnproven { warp: WarpId },
+    /// A barrier arrive/wait whose `.sem` qualifier was lost in lowering.
+    SyncQualifierUnknown { warp: WarpId },
     /// A `wait_until` predicate read memory that was written concurrently
     /// with the wait, so the verdict bitset does not determine the exit.
     WaitPredicateReadsUnstable { warp: WarpId },
@@ -259,7 +261,13 @@ struct Alloc {
 
 #[derive(Default)]
 struct Phase {
-    arrive: Knowledge,
+    /// Release arrivals with the arriver's scope (mutual inclusion with the
+    /// waiter is required, PTX §8.9.4 / §9.7.15.16.16).
+    arrivals: Vec<(WarpId, Option<Scope>, Arc<Knowledge>)>,
+    /// tcgen05 fence frontier carried by every arrive, relaxed included.
+    tcgen_rel: Clock,
+    /// Async completions (complete-tx: release at cluster scope for the op's
+    /// own bytes; accepted by an acquire wait of any scope).
     completion: Knowledge,
 }
 
@@ -289,7 +297,8 @@ pub struct Checker {
     async_index: HashMap<AsyncId, usize>,
     allocs: HashMap<AllocId, Alloc>,
     phases: HashMap<(SyncObjId, u32), Phase>,
-    sc: HashMap<(Scope, u32), Knowledge>,
+    /// Latest `fence.sc` per thread `(warp, lane)` with its scope.
+    sc: HashMap<(WarpId, u8), (Scope, Arc<Knowledge>)>,
     words: Vec<Word>,
     report: Report,
     dedup: HashMap<(AllocId, RaceClass, SiteId, SiteId, Option<AsyncId>), usize>,
@@ -802,32 +811,62 @@ impl Checker {
                     }
                 }
             }
-            SyncEvent::Arrive { warp, lanes, obj, phase, release, epoch } => {
+            SyncEvent::Arrive { warp, lanes, obj, phase, release, scope, epoch } => {
                 if !self.tick(warp, epoch) {
                     return;
                 }
+                let Some(release) = release else {
+                    self.report.incomplete.push(Incomplete::SyncQualifierUnknown { warp });
+                    return;
+                };
                 let w = &self.warps[warp as usize];
-                let pubk = if release {
-                    w.publication(lanes, epoch, &self.memo)
-                } else {
-                    Knowledge { tcgen_rel: w.base.tcgen_rel.clone(), ..Default::default() }
+                let tc = w.base.tcgen_rel.clone();
+                let pubk = release.then(|| Arc::new(w.publication(lanes, epoch, &self.memo)));
+                let ph = self.phases.entry((obj, phase)).or_default();
+                ph.tcgen_rel.join(&tc, &self.memo);
+                if let Some(k) = pubk {
+                    ph.arrivals.push((warp, scope, k));
+                }
+            }
+            SyncEvent::Wait { warp, lanes, obj, phase, acquire, scope, epoch } => {
+                if !self.tick(warp, epoch) {
+                    return;
+                }
+                let Some(acquire) = acquire else {
+                    self.report.incomplete.push(Incomplete::SyncQualifierUnknown { warp });
+                    return;
                 };
                 let ph = self.phases.entry((obj, phase)).or_default();
-                ph.arrive.join_propagating(&pubk, &self.memo);
-            }
-            SyncEvent::Wait { warp, lanes, obj, phase, acquire, epoch } => {
-                if !self.tick(warp, epoch) {
-                    return;
-                }
-                let ph = self.phases.entry((obj, phase)).or_default();
+                let topo = self.topo;
                 let memo = &self.memo;
                 let w = &mut self.warps[warp as usize];
-                if acquire {
-                    w.acquire(lanes, &ph.arrive, memo);
-                } else {
-                    w.tcgen_in.join(&ph.arrive.tcgen_rel, memo);
+                w.tcgen_in.join(&ph.tcgen_rel, memo);
+                for (aw, ascope, k) in &ph.arrivals {
+                    if acquire {
+                        let ok = match (ascope, scope) {
+                            (Some(a), Some(s)) => *a >= required_scope(&topo, *aw, warp) && s >= required_scope(&topo, warp, *aw),
+                            _ => true, // named barrier: participants, no scope
+                        };
+                        if ok {
+                            w.acquire(lanes, k, memo);
+                        }
+                    } else {
+                        let rel = Arc::new(Rel { k: (**k).clone(), scope: Some(ascope.unwrap_or(Scope::Cta)), warp: *aw });
+                        for c in lanes.lanes() {
+                            w.pending_acq.push((c, rel.clone()));
+                        }
+                    }
                 }
-                w.acquire(lanes, &ph.completion, memo);
+                if acquire {
+                    w.acquire(lanes, &ph.completion, memo);
+                } else {
+                    // Any later acquire fence of the waiter suffices for the
+                    // copy's own bytes: scope Sys, attributed to the waiter.
+                    let rel = Arc::new(Rel { k: ph.completion.clone(), scope: Some(Scope::Sys), warp });
+                    for c in lanes.lanes() {
+                        w.pending_acq.push((c, rel.clone()));
+                    }
+                }
             }
             SyncEvent::Fence { warp, lanes, kind, epoch } => {
                 if !self.tick(warp, epoch) {
@@ -968,19 +1007,26 @@ impl Checker {
                 }
                 self.warps[warp as usize].pending_acq = keep;
                 if let FenceKind::Sc(_) = kind {
-                    // SC fences of one scope instance are totally ordered by
-                    // their runtime linearisation (delivery order).
-                    let inst = match scope {
-                        Scope::Cta => self.topo.cta_of(warp),
-                        Scope::Cluster => self.topo.cluster_of(warp),
-                        _ => 0,
-                    };
-                    let k = self.sc.remove(&(scope, inst)).unwrap_or_default();
-                    self.warps[warp as usize].acquire(lanes, &k, &self.memo);
-                    let mut k2 = k;
-                    let pubk = self.warps[warp as usize].publication(lanes, epoch, &self.memo);
-                    k2.join_propagating(&pubk, &self.memo);
-                    self.sc.insert((scope, inst), k2);
+                    // Fence-SC order relates every pair of *morally strong*
+                    // fence.sc (PTX §8.9.3): each scope must include the
+                    // other thread. Delivery order is a legal runtime order.
+                    for c in lanes.lanes() {
+                        let incoming: Vec<Arc<Knowledge>> = self
+                            .sc
+                            .iter()
+                            .filter(|((ow, ol), (os, _))| {
+                                (*ow, *ol) != (warp, c) && self.covers(*os, *ow, warp) && self.covers(scope, warp, *ow)
+                            })
+                            .map(|(_, (_, k))| k.clone())
+                            .collect();
+                        for k in incoming {
+                            self.warps[warp as usize].acquire(LaneMask::lane(c), &k, &self.memo);
+                        }
+                    }
+                    for c in lanes.lanes() {
+                        let k = Arc::new(self.warps[warp as usize].publication(LaneMask::lane(c), epoch, &self.memo));
+                        self.sc.insert((warp, c), (scope, k));
+                    }
                 }
                 // Release half: the head a later relaxed strong write carries.
                 let w = &mut self.warps[warp as usize];

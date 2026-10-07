@@ -17,8 +17,3 @@ criterion = { version = "=0.5.1", default-features = false }
 [[bench]]
 name = "core"
 harness = false
-
-[profile.bench]
-debug = false
-
-# Standalone until the coordinator adds this crate to the core-rs workspace.

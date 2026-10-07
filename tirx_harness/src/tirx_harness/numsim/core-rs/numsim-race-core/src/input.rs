@@ -185,14 +185,22 @@ pub enum SyncEvent {
     AllocEnd { alloc: AllocId, site: SiteId },
     /// `__syncwarp(mask)` and warp collectives (shfl, vote, ldmatrix, ...).
     WarpSync { warp: WarpId, mask: LaneMask, epoch: u32 },
-    /// Arrive into a phase (bar arrive, mbarrier arrive, cluster arrive).
-    /// `release == false` for `.relaxed` arrives: they carry only the
-    /// tcgen05 fence frontier, not generic happens-before.
-    Arrive { warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u32, release: bool, epoch: u32 },
-    /// Observe a completed phase (bar wait, successful mbarrier try/test
-    /// wait). Async completions joined into the phase are always acquired;
-    /// arrivals only when `acquire`.
-    Wait { warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u32, acquire: bool, epoch: u32 },
+    /// Arrive into a phase.
+    /// * `release`: `Some(true)` for release arrives (mbarrier default,
+    ///   `bar.*`, `barrier.cluster.arrive` default), `Some(false)` for
+    ///   `.relaxed` (carries only the tcgen05 fence frontier), `None` when
+    ///   lowering lost the qualifier — reported `incomplete`, never assumed
+    ///   relaxed.
+    /// * `scope`: `Some(s)` for mbarrier (default `.cta`) and cluster
+    ///   barrier (`.cluster`); `None` for named barriers, which synchronise
+    ///   their participants without a scope (PTX §9.7.15.1).
+    Arrive { warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u32, release: Option<bool>, scope: Option<Scope>, epoch: u32 },
+    /// Observe a completed phase (bar.sync/red, successful mbarrier
+    /// try/test wait, barrier.cluster.wait). `acquire == Some(false)`
+    /// (`.relaxed`) synchronises nothing by itself: arrivals and async
+    /// completions are parked until a later `fence.acquire`/`acq_rel`
+    /// (PTX §8.8). A `bar.arrive`-only thread emits no `Wait`.
+    Wait { warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u32, acquire: Option<bool>, scope: Option<Scope>, epoch: u32 },
     Fence { warp: WarpId, lanes: LaneMask, kind: FenceKind, epoch: u32 },
     AsyncIssue {
         op: AsyncId,
