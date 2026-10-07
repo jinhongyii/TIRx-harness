@@ -84,9 +84,11 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
 7. **Blocking**: `Instr::may_block()` derived from the variant; handlers
    return `Flow::Blocked(ResourceId)`, the scheduler re-runs the same pc.
    `Instr::is_progress()` feeds spin parking in `LoopEnd`.
-8. **Sync**: protocol shapes are verbatim copies of `numsim-sync-ref`
-   (regenerate with the coordinator's port script when the reference
-   changes). `SyncTable::step` lifts `Outcome::Blocked` to
+8. **Sync**: protocol shapes were seeded as verbatim copies of
+   `numsim-sync-ref` by `tools/port_sync.py`. That script was ONE-SHOT:
+   production bodies now live in `numsim-core/src/sync/*.rs` and re-running
+   it would delete them. Type changes are applied by hand in both crates and
+   guarded by `tests/sync_differential.rs`. `SyncTable::step` lifts `Outcome::Blocked` to
    `Step::Blocked(ResourceId)`; `step_all` is all-or-nothing for
    multi-target instructions. Two queues: sync `Completion`s
    (`MbarTx/MbarArrive/GroupMilestone/SetmaxGrant`, generation captured at
