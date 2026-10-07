@@ -4,6 +4,8 @@ Status: specification for redesign worker W3 (`numsim-redesign.md` §2.1 SyncTab
 
 Executable form: `tirx_harness/src/tirx_harness/numsim/core-rs/numsim-sync-ref/`, run with `cargo test --release` in that directory.
 
+ISA resolutions: `sync-isa-answers.md` (PTX 9.4) answers the open questions Q1–Q7 of §8. The reference crate and this document follow those answers. Every resulting change against the legacy engine and strict models is listed, with its ISA cite, in `sync-behaviour-deltas.md`. Sections 2–7 still describe the legacy models faithfully. The **Reference** column or paragraph in each section gives the resolved semantics.
+
 This document records how the legacy engine implements each synchronization protocol today, and how the legacy strict synccheck models re-implement it. It then states the semantics the new `SyncTable::step` functions must have. Where the engine and strict models disagree, both readings are kept and a resolution is proposed. The disagreements are the "second reading of the ISA" that the redesign must not lose.
 
 ## 0. Conventions
@@ -34,14 +36,20 @@ Source paths are relative to `tirx_harness/src/tirx_harness/numsim/engine-rs/src
 
 ### 0.2 PTX claims
 
-PTX ISA statements are paraphrased. **[VERIFY]** marks wording that has not been checked against the ISA text. Per the numsim guide, such claims need the ISA, a canonical implementation, or a GPU microtest before they justify an `error` verdict.
+PTX ISA statements are paraphrased. Where `sync-isa-answers.md` settles a point, the cite is "ISA §x" (PTX 9.4 numbering). **[VERIFY]** marks wording that is still unchecked. Per the numsim guide, such claims need the ISA, a canonical implementation, or a GPU microtest before they justify an `error` verdict.
 
 ### 0.3 Policies
 
-Every reference module that has two readings carries a `Policy`:
+The ISA answers showed that almost every legacy strict-only rule is ISA-backed. Those rules now hold in **every** mode, including NumSim. Examples:
 
-- **`Numeric`**: what NumSim executes. It rejects exactly what the engine's numeric path rejects, plus the bug fixes listed below.
-- **`Strict`**: Numeric plus the strict-synccheck protocol rules.
+- mbarrier consumption before the next arrive-on (ISA §9.7.15.16.5.1).
+- Re-init only after `inval` (ISA §9.7.15.16.12).
+- Full non-exited warp participation for named and cluster barriers (ISA §9.7.15.1, §9.7.15.3).
+
+Only the mbarrier module keeps a `Policy`:
+
+- **`Numeric`**: what NumSim and the online checkers execute.
+- **`Strict`**: Numeric plus the single policy extension left, `ExpectTxBeforeConsumption`. ISA §9.7.15.16.5.1 names arrive-on operations only; Strict extends the consumption rule to `expect_tx`.
 
 Strict refines Numeric. For any command sequence, while Strict accepts every command, Numeric returns identical outcomes and reaches an identical state. This is property-tested.
 
@@ -64,7 +72,8 @@ pub trait Protocol {
     fn step(state: &mut Self::State, cmd: Self::Cmd) -> Result<Self::Outcome, Self::Error>;
 }
 // Exit check per resource, run after the completion queue drains:
-fn quiescent(&State) -> Result<(), Error>;
+fn quiescent(&State) -> Result<(), Error>;      // mbarrier (via SyncTable), tcgen, setmaxnreg, async_group
+fn exit_lint(&State) -> Option<Lint>;           // named (dangling arrive), async_group (uncommitted)
 ```
 
 ### 1.1 Resources and commands
@@ -78,14 +87,17 @@ Each `step` takes one resource state and one already-resolved command:
 | Protocol | ResourceId | State | Cmd |
 | --- | --- | --- | --- |
 | mbarrier | `(alloc, offset, cta)` | `mbarrier::State` | `Init{count,layout_v1}`, `Inval`, `Arrive{count,tx,drop,no_complete}`, `ExpectTx{bytes}`, `IncPending{count}`, `Issue`, `CompleteTx{gen,bytes}`, `DeferredArrive{gen,count}`, `TestParity{parity}`, `WaitParity{parity}`, `TestState{gen}` |
-| named barrier | `(cta, id 0..15)` | `named::State` | `Arrive(Contribution)`, `Sync(Contribution)`, `Resume{gen}` |
-| cluster barrier | `cluster` | `cluster::State` | `Arrive{warp,mask,aligned}`, `Wait{warp,mask,aligned}` |
+| named barrier | `(cta, id 0..15)` | `named::State` | `Arrive(Contribution)`, `Sync(Contribution)`, `Red(Contribution)`, `Resume{gen}` |
+| cluster barrier | `cluster` | `cluster::State` | `Arrive{warp,mask,aligned}`, `Wait{warp,mask,aligned}`, `Exit{warp,lanes}` |
 | async group | `(warp, lane, domain)` | `async_group::State` | `Issue`, `Commit`, `ArriveOn`, `Complete{ordinal,milestone}`, `Wait{n,read}`, `Exit` |
-| tcgen lifecycle | `cta pair` | `tcgen::State` | `Alloc{who,columns,exclusive}`, `Dealloc{who,taddr,columns}`, `Relinquish{who}` |
-| tcgen work | `(warp, lane)` | `tcgen::WorkState` | `Issue{cta_group}`, `Load`, `Store`, `Commit{cta_group}`, `WaitLd`, `WaitSt` |
+| tcgen kernel | `kernel` | `tcgen::KernelState` | `use_cta_group(g)` |
+| tcgen lifecycle | `cta pair` | `tcgen::State` (`exclusive_max`: 512 or 576) | `Alloc{who,columns,exclusive}` → `Allocated{base}` or `Blocked`, `Dealloc{who,taddr,columns,exclusive}`, `Relinquish{who}` |
+| tcgen work | `(warp, lane)` | `tcgen::WorkState` | `Issue`, `Load`, `Store`, `Commit`, `WaitLd`, `WaitSt` |
 | setmaxnreg | `cta` | `setmaxnreg::State` | `Configure{count}`, `Set{wg,inc,count}`, `WarpgroupSync{wg}`, `Grant{wg}`, `Poll{wg}` |
 
-`Contribution` is `{warp, mask, count, aligned, elect_entry: Option<LaneMask>, site}`.
+`Contribution` is `{warp, mask, live, count}`, where `live` is the warp's non-exited lane mask.
+
+Every tcgen05 instruction (lifecycle, mma, cp, shift, commit) first steps the kernel-wide `tcgen::KernelState` with `use_cta_group(g)`.
 
 ### 1.2 Outcomes
 
@@ -132,6 +144,8 @@ The legacy engine used Rust Futures with wakers. The table below records what wo
 | cluster wait | The arrive that completes the generation, from any CTA of the cluster, under the per-cluster mutex (CB:215-235). Clusters are pinned to one worker FIFO (`executor.rs:298-303`). | That arrive |
 | async-group wait | After each applied milestone, the hub re-checks waiters of that warp only (AG:1547-1571, 1745-1757). | The milestone that satisfies the last lane |
 | tcgen `cta_group::2` lifecycle | `CollectiveHub` publish once both warps contribute; the pump publishes (TG:617-619). | Collective layer, outside `step` |
+| `tcgen05.alloc` with no free columns | Never blocked: `AllocationUnavailable` (TG:952-966) | A `Dealloc` in either CTA of the pair that frees enough columns (or the last live allocation, for `.exclusive`) |
+| cluster wait on exited members | Never released: a deadlock with exit evidence (`executor.rs:822-878`) | The `Exit` that leaves every remaining member arrived |
 | setmaxnreg `inc` | `SetmaxnregHub::pump` grants the lowest action id among enabled pendings, one per pump (SR:795-826, 1410-1420; `mode_completions.rs:311-349`). | `Grant` |
 
 **Deadlock** is declared when no warp is runnable and a full completion-pump round makes no progress (`executor.rs:516-527`, 1464-1480; pump cadence `executor.rs:1301-1303`). In the redesign, a round with every live warp `Blocked` and no enabled completion is a deadlock. Per the numsim guide, a single spinning warp is not proof.
@@ -206,13 +220,13 @@ After `Init`:
 
 - Rule: if the phase is complete, then `gen += 1`, all counters reset, and `tx_completed = buffered[gen]` (HB:2628-2641, SM:1615-1644).
 - It runs at the start of: `Arrive` (HB:2124), `ExpectTx` (HB:2222), `IncPending` (HB:2192), the drop half of an arrive (HB:1202), and a `DeferredArrive` landing (HB:2523).
-- Strict additionally requires `consumed` (§2.5 S1).
+- The reference requires `consumed` before every arrive-on (`Arrive`, `IncPending`, `DeferredArrive`) under both policies. Strict also requires it before `ExpectTx` (§2.5 S1).
 
 **`Init{count, layout_v1}`** (HB:889-966; SM:846-871, 1517-1582).
 
 - Precondition: `1 <= count <= limit(layout_v1)`, where the limit is 2^20-1, or 511 for v1 (HB:16-25, 900; RS:371-385).
 - If the slot is live, the checks run in this order:
-  1. **Strict only:** the phase is `CompletedUnconsumed` → `ReinitBeforeConsumption` (SM:1543-1550).
+  1. The phase is `CompletedUnconsumed` → `ReinitBeforeConsumption` (SM:1543-1550). Strict-only in legacy.
   2. Waiters exist → engine `BarrierReinitializedWhileWaiting` (HB:916-921).
   3. Queued completions, an active phase, or buffered bytes → `ReinitActive` (HB:922-939; SM:1551-1574).
      - "Active" means: not complete, and any of arrivals, extra, `tx_expected`, `tx_completed` is nonzero (HB:2655-2661).
@@ -221,7 +235,7 @@ After `Init`:
      - Engine analysis modes return `BarrierReinitializedWithoutInvalidation` (HB:940-944).
      - Engine NumSim mode permits the re-init (`init_numeric_layout`, HB:874-887; RS:1806).
      - Strict always rejects it (SM:1575-1581).
-     - **Reference:** Numeric allows, Strict rejects (`ReinitWithoutInval`).
+     - **Reference:** both policies reject it. ISA §9.7.15.16.12 says "performing an mbarrier.init operation on a memory location containing a valid mbarrier object is undefined", whether or not the object is in use. The reference reports the most specific kind: `ReinitBeforeConsumption`, then `ReinitActive`, then `ReinitWithoutInval`.
 - Duplicate same-address lanes collapse. Distinct lane targets are validated transactionally (HB:849-856, SM:843-871).
 
 **`Inval`** (HB:807-835; SM:798-831).
@@ -312,29 +326,34 @@ After `Init`:
 | Case | Engine | Strict | Reference |
 | --- | --- | --- | --- |
 | `expect_tx` before `arrive` (same phase) | Accumulates on the pending phase (HB:2222-2242) | Same (SM:972-987) | Same |
-| `expect_tx` or `arrive.expect_tx` after the phase completed, before any wait | Rolls to `gen+1` and applies there | `ExpectTxBeforeConsumption` / `ArriveBeforeConsumption` (SM:963-970, 1038-1045) | Numeric rolls; Strict `ReuseBeforeConsumption{op}` |
+| `expect_tx` or `arrive.expect_tx` after the phase completed, before any wait | Rolls to `gen+1` and applies there | `ExpectTxBeforeConsumption` / `ArriveBeforeConsumption` (SM:963-970, 1038-1045) | `arrive.expect_tx`: `ReuseBeforeConsumption{Arrive}`, both policies (ISA §9.7.15.16.5.1). Standalone `expect_tx`: Numeric rolls, Strict `ReuseBeforeConsumption{ExpectTx}`. |
 | Bytes land before `expect_tx` (tx-count transiently negative) | Allowed while arrivals are incomplete (HB:2614-2624) | Same (SM:1277-1288) | Same (test `mbarrier_early_bytes_then_expectation`) |
 | Bytes exceed the expectation once arrivals are complete | `TransactionOverflow` | `TransactionOverDelivery` | `TxOverDelivery`. Checked when arrivals become complete and on each landing afterwards. |
 | Under-delivery (arrivals complete, bytes missing) | Phase stays pending. A waiter makes it deadlock. At exit, an incomplete phase with no waiters, no buffered bytes and all arrivals issued is tolerated as a "terminal reservation" (HB:2361-2373). | No exit rule | Pending. `quiescent` is left to the SyncTable (§2.8 G4). |
-| Phase total > 2^20-1 | `expect_tx`: checked against the phase total (HB:2214-2241). `arrive.expect_tx`: only the per-instruction aggregate is checked (RS:1522-1533). | Only u64 overflow (`CounterOverflow`) | Phase total checked for both (`TxOverflow`). This unifies the engine. |
+| tx-count range | `expect_tx`: checked against the phase total (HB:2214-2241). `arrive.expect_tx`: only the per-instruction aggregate is checked (RS:1522-1533). Each operand is checked ≤ 2^20-1 (RS:33-42). | Only u64 overflow (`CounterOverflow`) | The signed **state** `tx_expected - tx_completed` must stay in ±(2^20-1) after every op (`TxCountOutOfRange`, ISA §9.7.15.16.3 Table 43). Bytes buffered for the next phase count as its negative tx-count. The u32 operand is not range-checked. |
 | `MAX_MBARRIER_EXPECTED_ARRIVALS` | 2^20-1, or 511 for `layout::v1` (HB:16-25) | 2^20-1 regardless of layout (SM:856, 1523) | Layout-dependent |
 | `IncPending` beyond the limit | `BarrierArrivalOverflow` (HB:2194-2203) | Only u64 overflow | `PendingOverflow` |
 | Arrival over `required` | `BarrierArrivalOverflow` | `ArrivalOverflow` | `ArrivalOverflow` |
-| `arrive_drop` to `expected == 0` | Allowed. The next phase is dead: any arrive overflows and a wait hangs. | Allowed | Allowed. **[VERIFY]** whether PTX defines it. |
+| `arrive_drop` to `expected == 0` | Allowed. The next phase is dead: any arrive overflows and a wait hangs. | Allowed | `DropUnderflow` ("If the decrement causes the expected arrivals count to be zero, the behavior is undefined", ISA §9.7.15.16.17) |
 | Parity vs phase | `completed_parity = gen & 1`; initial value 1 | `last_completed_phase`, initial 1 | `completed_parity()` |
 | `try_wait` vs `test_wait` | Identical readiness (IS:1072-1112) | Both are `Wait`, consumed when ready | Both `TestParity` |
 | Invalidate while pending | OK if there are no waiters and no queued completions | OK if there are no waiters and no outstanding tokens | Same (`InvalWithOutstanding`) |
-| Re-init with an unconsumed completed phase | NumSim: allowed. Analysis: `WithoutInvalidation`. | `ReinitializeBeforeConsumption` | Numeric allows; Strict `ReinitBeforeConsumption` |
+| Re-init with an unconsumed completed phase | NumSim: allowed. Analysis: `WithoutInvalidation`. | `ReinitializeBeforeConsumption` | `ReinitBeforeConsumption`, both policies (ISA §9.7.15.16.12) |
+| `.noComplete` arrive that would complete the phase | Untyped `EngineError` (HB:1157-1184) | Not checked | Typed `NoCompleteWouldComplete` ("must not cause the mbarrier to complete its current phase, otherwise the behavior is undefined", ISA §9.7.15.16.16). Keeps the engine's conservative "pending > count" rule. |
+| Parity names a phase two or more behind | Aliases | Aliases | Aliases. Only the current or immediately preceding phase is valid (ISA §9.7.15.16.19), which the state-token form enforces with `InvalidStateToken`. A parity query cannot detect it. |
 | Deferred arrival bound to `g`, but `g` completed through other arrivals before it lands | Action still enabled (`gen == current`). `begin_next_generation` rolls to `g+1` and the arrival lands **there**; only a `debug_assert` catches it (HB:2523-2524). | `CompletionAfterGenerationComplete` (SM:1254-1263) | **Both policies reject it** (`CompletionAfterComplete`). The engine behaviour is a bug. |
 | Stale completion (bound generation < current) | Never enabled. It stays queued until `validate_quiescent` fails (HB:2348-2355). | `StaleCompletion`, immediately | `StaleCompletion`, immediately (fail closed earlier) |
 
-### 2.5 Strict-only protocol rules (S) and fixes (F)
+### 2.5 Protocol rules (S) and fixes (F)
 
 - **S1 Consumption before reuse.** A completed phase may not be advanced, by arrive, expect_tx, pending increment, deferred arrival or re-init, until a wait has observed it (SM:937-944, 1038-1049, 1543-1550).
+  - This is ISA-backed for arrive-on operations: "For each primary phase of the mbarrier object, at least one test_wait or try_wait operation must be performed which returns True for waitComplete before an arrive-on operation in the subsequent primary phase" (ISA §9.7.15.16.5.1).
+  - It therefore holds under both policies for `Arrive`, `IncPending` (the non-`.noinc` increment is part of an arrive-on) and `DeferredArrive`.
+  - It stays Strict-only for `ExpectTx`.
   - Consumption is per slot, not per consumer: one observing wait suffices.
   - Buffering bytes for the next phase does not require consumption.
-- **S2 Re-init requires `inval`** (SM:1575-1581).
-- **F1** (strict bug). `increase_pending_arrivals` on a `CompletedUnconsumed` slot raises the increment on the **completed** phase (SM:1143-1157), because there is no roll and no consumption check. The roll that follows drops it, so the deferred arrival then counts as a real arrival on `gen+1`. The engine rolls first (HB:2192). The reference rolls first, and Strict rejects the case under S1.
+- **S2 Re-init requires `inval`** (SM:1575-1581; ISA §9.7.15.16.12). It now holds under both policies.
+- **F1** (strict bug). `increase_pending_arrivals` on a `CompletedUnconsumed` slot raises the increment on the **completed** phase (SM:1143-1157), because there is no roll and no consumption check. The roll that follows drops it, so the deferred arrival then counts as a real arrival on `gen+1`. The engine rolls first (HB:2192). The reference rolls first. Under S1 it rejects the case in both policies, because the increment is part of an arrive-on.
 - **F2** (engine bug). Deferred arrival into the next generation, as described in the §2.4 table.
 - **F3** (engine). The drop half of an arrive is non-transactional. The reference is transactional.
 
@@ -350,12 +369,12 @@ After `Init`:
 | 4 | `AcquireBeforeCompletion` (276) | The engine reported an acquired generation beyond the last completed one | None: it cross-checks engine against strict | dropped (no second machine) |
 | 5 | `InvalidExpectedArrivals` (282) | Init count ∉ 1..=2^20-1 | Count range of `mbarrier.init` | `InvalidCount` (layout-aware) |
 | 6 | `ReinitializeBeforeConsumption` (287) | Init over `CompletedUnconsumed` | Policy S1 (a phase completion would be lost unobserved) | `ReinitBeforeConsumption` (Strict) |
-| 7 | `ReinitializeWhileActive` (293) | Init over an active phase, waiters, tokens or buffered bytes | Re-init of an in-use object discards pending arrivals and in-flight tx: UB **[VERIFY]** | `ReinitActive` |
-| 8 | `ReinitializeWithoutInvalidation` (302) | Init over any live slot | PTX wants `inval` before re-purposing the memory. Whether re-init *as an mbarrier* without `inval` is UB is **[VERIFY]**; NumSim allows it. | `ReinitWithoutInval` (Strict) |
-| 9 | `ArriveBeforeConsumption` (309) | Arrive on `CompletedUnconsumed` | S1. Advancing twice without a wait makes parity waits alias. | `ReuseBeforeConsumption{Arrive \| DeferredArrive}` |
+| 7 | `ReinitializeWhileActive` (293) | Init over an active phase, waiters, tokens or buffered bytes | UB: init on a valid object (ISA §9.7.15.16.12) | `ReinitActive` |
+| 8 | `ReinitializeWithoutInvalidation` (302) | Init over any live slot | "The behavior of performing an mbarrier.init operation on a memory location containing a valid mbarrier object is undefined" (ISA §9.7.15.16.12) | `ReinitWithoutInval` (both policies) |
+| 9 | `ArriveBeforeConsumption` (309) | Arrive on `CompletedUnconsumed` | ISA §9.7.15.16.5.1: at least one successful wait per phase before the next arrive-on | `ReuseBeforeConsumption{Arrive \| DeferredArrive}` |
 | 10 | `ExpectTxBeforeConsumption` (315) | `expect_tx` on `CompletedUnconsumed` | S1 | `ReuseBeforeConsumption{ExpectTx}` |
-| 11 | `ArrivalOverflow` (321) | Arrivals > required, or a drop larger than expected | Pending count underflow is UB | `ArrivalOverflow`, `DropUnderflow` |
-| 12 | `CounterOverflow` (328) | u64 overflow of any counter | None (implementation guard). Superseded by the 2^20-1 limits. | `TxOverflow`, `PendingOverflow` |
+| 11 | `ArrivalOverflow` (321) | Arrivals > required, or a drop larger than expected | Pending count underflow is UB. Dropping the expected count to 0 is UB (ISA §9.7.15.16.17). | `ArrivalOverflow`, `DropUnderflow` |
+| 12 | `CounterOverflow` (328) | u64 overflow of any counter | None (implementation guard). Superseded by the state ranges of ISA Table 43. | `TxCountOutOfRange`, `PendingOverflow` |
 | 13 | `TransactionOverDelivery` (334) | `completed_tx > expected_tx` once arrivals are complete | tx-count would go negative at phase completion: UB | `TxOverDelivery` |
 | 14 | `DuplicateWaiter` (341) | Second wait registration by the same warp | None (implementation) | impossible by construction (no registry) |
 | 15 | `CompletionAfterGenerationComplete` (347) | Completion bound to an already completed phase | The async op was counted in a phase that already completed: the program over-delivered | `CompletionAfterComplete` |
@@ -390,6 +409,8 @@ The following untyped `EngineError` messages are also raised:
 - "pending count requires a noComplete state"
 
 **Reference.** `mbarrier::Error` has 19 kinds. Each one maps to a row above.
+
+`TxCountOutOfRange` replaces the legacy operand-level tx check. `NoCompleteWouldComplete` is the typed form of the engine's untyped noComplete error.
 
 ### 2.7 Engine vs strict: disagreements
 
@@ -481,18 +502,17 @@ The engine's `register_contribution` (HB:2951-3070) and strict's `contribute` (S
 
 ### 3.4 Errors and PTX basis
 
-| Reference kind | Engine | Strict | PTX basis |
+| Reference kind | Engine | Strict | PTX basis (ISA §9.7.15.1 unless noted) |
 | --- | --- | --- | --- |
-| `InvalidCount` | plan `"positive multiple of 32"`; hub `InvalidBarrierArrivalCount` | `InvalidExpectedArrivals` | "b must be a multiple of warp size" |
-| `EmptyMask` | `InvalidBarrierArrivalCount{0}` | `InvalidArrivalCount` | — |
-| `PartialWarp` | `warp_collective_divergence` | — | `.aligned`: all threads of the warp execute the same barrier instruction, else UB |
-| `ElectSyncParticipation` | — (elect *waives* the check) | SNB:350-369 (marked [VERIFY] in source) | **[VERIFY]** |
-| `ContractMismatch` | `ContractMismatch` | `ContractMismatch` | All participants use the same `b` **[VERIFY]** wording |
-| `Duplicate` | `DuplicateArrival` | `DuplicateContribution` | Re-arrival in one phase completes it early: UB **[VERIFY]** |
-| `ArrivalOverflow` | `BarrierArrivalOverflow` | `ArrivalOverflow` / `CounterOverflow` | Same |
-| `AlignedSyncContractMismatch` | — | SNB:719-773 | `.aligned`: the same instruction across threads; no mixing aligned and unaligned |
+| `InvalidCount` | plan `"positive multiple of 32"`; hub `InvalidBarrierArrivalCount` | `InvalidExpectedArrivals` | "the value must be a multiple of the warp size" |
+| `PartialWarp{mask, live}` | `warp_collective_divergence`, waived under `elect.sync`; hub `InvalidBarrierArrivalCount{0}` for an empty mask | `ElectSyncParticipation` (elect entry mask); `InvalidArrivalCount` | "causes executing thread to wait for all non-exited threads from its warp and marks warps' arrival". A strict subset of the non-exited lanes is UB (`.aligned`) or a hang (unaligned). Lanes at different barrier instructions fail closed (sync-isa-answers Q3/Q5). |
+| `ContractMismatch` | `ContractMismatch` | `ContractMismatch` | "using the same barrier name and thread count" |
+| `Duplicate` | `DuplicateArrival` (lane overlap) | `DuplicateContribution` | "keep a warp from executing more barrier instructions than intended … prior to the reset of the barrier" |
+| `RedMixed` | — | — | "barrier{.cta}.red should not be intermixed with barrier{.cta}.sync or barrier{.cta}.arrive using the same active barrier. Execution in this case is unpredictable." |
+| `ArrivalOverflow` | `BarrierArrivalOverflow` | `ArrivalOverflow` / `CounterOverflow` | More warp arrivals than `b` |
+| *(dropped)* | — | `AlignedSyncContractMismatch` (SNB:719-773) | "Different warps may execute different forms of the barrier{.cta} instruction using the same barrier name and thread count". Mixing aligned and unaligned forms is allowed. |
 | `ResumeFuture` | `UndefinedOccurrence` | `ResumeWithoutRegistration` / `ResumeBeforeCompletion` | Internal |
-| `IncompleteAtExit` | `validate_quiescent` (HB:3132-3154) | only `FullCtaAlignedMissingParticipants` (SNB:779-824) | Hardware never releases. Exiting with a dangling arrive is not UB **[VERIFY]**. |
+| Lint `DanglingAtExit` | `validate_quiescent` error (HB:3132-3154) | only `FullCtaAlignedMissingParticipants` (SNB:779-824) | "Barriers exclusively waiting on arrivals from exited threads are always released" (§9.7.14.7). A dangling arrive at exit is a Review lint, not an error. |
 
 The strict kinds are 11 (SNB:136-206):
 
@@ -513,23 +533,30 @@ The strict kinds are 11 (SNB:136-206):
 1. **elect.sync is opposite in spirit.**
    - The engine waives the full-warp requirement under `elect.sync`.
    - Strict demands that the participation mask equals the elect entry mask, and applies this to arrive and aligned sync only.
+   - Resolved (Q5): both are wrong. The reference requires the participation mask to equal the warp's non-exited lanes, independent of `elect.sync` (§3.6).
    - Reference: Numeric waives the requirement; Strict also checks `ElectSyncParticipation`.
 2. **Full-warp requirement.**
-   - The engine applies it to every arrive, including unaligned `barrier.arrive`, which the frontend collapses to `bar_arrive`. It also applies it to `barrier.red`. Both are stricter than the ISA.
+   - The engine applies it to every arrive, including unaligned `barrier.arrive`, which the frontend collapses to `bar_arrive`. It also applies it to `barrier.red`. Per the ISA answers this is correct in *what* it requires (all non-exited lanes). It is stricter only in requiring one convergent instance, which the reference adopts as the fail-closed rule.
    - Strict has no such check.
 3. **Aligned-origin contract.** Strict only. It rejects the completing contribution.
 4. **Unaligned recombination.**
    - Engine: only for full-CTA counts, where partial paths do not block.
    - Strict: allows a partitioned resume for every unaligned count.
-   - Reference: models no recombination. This is a scheduler and mask-stack concern; it is open question Q3.
+   - Reference: no recombination. Lanes at different instructions fail closed (§3.6).
 5. **Exit.** The engine flags any incomplete generation. Strict flags only full-CTA all-aligned generations, and only when no other finding exists.
 6. **Error granularity.** Strict splits overflow into `CounterOverflow` and `ArrivalOverflow`, and has `GenerationOverflow`.
 7. **Waiter retention.** The engine keeps only `completed_through`. Strict keeps exact per-generation waiter sets. The reference needs neither, because readiness is a function of `gen`.
 8. **`bar.red`.**
    - The engine reduces over `arrived_warps`, which includes arrive-only warps.
-   - Neither model rejects mixing `bar.red` with sync or arrive on one generation. PTX calls that unpredictable **[VERIFY]**.
-   - Gap G5: add a `Reduce` flavor that is disjoint from `Sync`.
+   - Neither model rejects mixing `bar.red` with sync or arrive on one generation. The ISA calls that unpredictable; the reference rejects it (`RedMixed`).
 9. **Possible race (unverified).** `accumulated_arrival_mask` is called after `register` without holding the hub lock (KE:4133-4134; HB:3198-3201).
+
+### 3.6 Reference (ISA-resolved)
+
+- **Unit.** A contribution must be executed by exactly the warp's non-exited lanes (`mask == live`). The warp's arrival then counts 32 threads toward `b`. There is no lane accumulation across contributions, so lanes reaching different barrier instructions fail closed as `PartialWarp`. The engine's unaligned full-CTA recombination (KE:4158-4176) is therefore not reproduced.
+- **Flavors.** `Arrive`, `Sync` and `Red`. One warp may arrive and then sync in one generation; the CUTLASS producer/consumer idiom depends on this. The ISA warns against it ("care must be taken") without forbidding it. Mixing `Red` with the other two flavors is `RedMixed`.
+- **`.aligned`** carries no barrier state. It does not appear in `Contribution`.
+- **Not modeled: whole-warp exit.** A barrier whose missing warps have all exited should be released (§9.7.14.7). With an explicit `b` this needs the scheduler to know which warps were expected. That is gap G8; the SyncTable's deadlock check must treat such a hang as `incomplete`, not as success.
 
 ## 4. Cluster barrier
 
@@ -577,10 +604,10 @@ The strict kinds are 11 (SNB:136-206):
 | --- | --- | --- | --- |
 | `UnexpectedParticipant` | `ClusterBarrierContextMismatch` | `UnexpectedParticipant` / `ContractMismatch` | Internal |
 | `PartialWarp` | `PartialWarpSynchronization` | `PartialWarpParticipation` | `.aligned`: all threads of the warp execute the same instruction |
-| `EarlyArrival` | `DuplicateArrival` | `EarlyArrival` | Arriving twice in one phase before completion: UB **[VERIFY]** |
-| `WaitBeforeArrival` | `ClusterBarrierWaitBeforeArrival` | `WaitBeforeArrival` | A wait must follow an arrive of the same thread **[VERIFY]** |
+| `EarlyArrival` | `DuplicateArrival` | `EarlyArrival` | "Each thread must arrive at the barrier only once before the barrier completes" (ISA §9.7.15.3) |
+| `WaitBeforeArrival` | `ClusterBarrierWaitBeforeArrival` | `WaitBeforeArrival` | Derived: a wait before one's own arrive is a self-deadlock |
 | `DuplicateWait` | `DuplicateWaiter` | `DuplicateWait` | Model rule: one arrive, one wait |
-| `IncompleteAtExit` | `CompletionSourceNotQuiescent`, or a deadlock with exit evidence (`executor.rs:822-878`) | `incomplete_generations()` → incomplete verdict | Hardware counts **exited** threads as arrived; neither model does |
+| `IncompleteAtExit` | `CompletionSourceNotQuiescent`, or a deadlock with exit evidence (`executor.rs:822-878`) | `incomplete_generations()` → incomplete verdict | Not an error: exited threads leave the membership (ISA §9.7.15.3, §9.7.14.7). The reference has no such kind. |
 
 The strict kinds are 9: the five in the table, plus `ResumeWithoutRegistration`, `ResumeBeforeCompletion`, `GenerationOverflow` and `ContractMismatch`.
 
@@ -594,7 +621,17 @@ The strict kinds are 9: the five in the table, plus `ResumeWithoutRegistration`,
 2. **Unaligned partial arrive.** The engine accumulates lanes; strict rejects. In checker modes the engine's analysis-gap gate masks the difference (KE:4237-4249).
 3. **Rearrival without wait.** The engine accepts silently; strict marks it as unmodeled.
 4. **Duplicate wait.** The engine detects it at poll; strict detects it at register.
-5. **Exit.** The engine raises an error; strict yields incomplete. Exit-aware membership is unmodeled in both; this is open question Q4.
+5. **Exit.** The engine raises an error; strict yields incomplete. Both are wrong: membership is exit-aware (§4.5).
+
+### 4.5 Reference (ISA-resolved)
+
+- **Exit-aware membership.** `State.live[w]` holds each participant warp's non-exited lanes. `Cmd::Exit{warp, lanes}` removes lanes. A warp with no live lane leaves the membership. If every remaining member has arrived, the exit completes the generation (`Outcome::Exited{completed: true}`). "wait for all non-exited threads of the cluster to perform barrier.cluster.arrive" (ISA §9.7.15.3); "Barriers exclusively waiting on arrivals from exited threads are always released" (§9.7.14.7).
+- **Participation.** Arrive and wait must be executed by exactly the warp's non-exited lanes ("wait for all non-exited threads from its warp"). A strict subset is `PartialWarp`. This replaces both the engine's unaligned lane accumulation and strict's blanket full-mask rule.
+- **Error bases.**
+  - `EarlyArrival`: "Each thread must arrive at the barrier only once before the barrier completes".
+  - `WaitBeforeArrival`: derived. The waiter waits on itself, a guaranteed hang.
+- **Rearrival without a wait** is reported in `Outcome::Arrived` and treated as unmodeled by checkers; the ISA is silent.
+- **Exit check.** There is no exit error: at kernel exit every thread has exited, so every generation completes.
 
 ## 5. Async groups
 
@@ -660,7 +697,7 @@ The mbarrier half is separate: `IncPending` (unless `.noinc`) and `Issue`.
 | --- | --- | --- |
 | `InvalidForm` | `.read` on cp.async; Release-domain wait (AG:1078-1105) | `.read` exists only on `cp.async.bulk.wait_group` |
 | `NotEnabled` | "blocked by FIFO milestone order", unknown action, already completed (AG:831-877) | Internal |
-| `UncommittedAtExit` | `CompletionSourceNotQuiescent` "uncommitted issue(s)" | **[VERIFY]**: PTX does not require committing before exit. This is engine policy. |
+| Lint `UncommittedAtExit` | `CompletionSourceNotQuiescent` "uncommitted issue(s)" | The ISA does not require committing before exit, so this is a lint (§5.5). |
 | `PendingAtExit` | "pending full completion" | — |
 
 Mask, issuer and footprint validation errors (AG:213-313, 1131-1280) belong to the issue layer, not to `step`.
@@ -672,7 +709,13 @@ Mask, issuer and footprint validation errors (AG:213-313, 1131-1280) belong to t
   - The reference `async_group` module is the first independent model of these rules.
 - **Racecheck** orders `cp.async` bytes at milestones, while the engine moves them at issue.
   - One merged warp clock is acquired by the whole wait mask (`race_shadow.rs:9243-9257`). This lets lane A acquire lane B's copies, which is more permissive than PTX per-thread semantics.
-  - Gap G6: decide this in W5.
+  - Gap G6 is resolved: acquire per lane (§5.5).
+
+### 5.5 Reference (ISA-resolved)
+
+- **Granularity.** Async-groups and their visibility are per thread (ISA §9.7.10.28.1.1, §9.7.10.28.3.3). State is per (warp, lane, domain), with separate read and write milestones.
+- **`.read` waits.** `Wait{read: true}` reports `acquired: ReadsDone`. It releases only the source and tensormap reads; it never makes destination writes visible (ISA §9.7.10.28.6.2). Racecheck must acquire per lane, and must not publish destinations on `.read`. That closes gap G6.
+- **Exit.** Uncommitted issues at exit are a lint (`exit_lint`, `UncommittedAtExit`), not an error: the ISA does not require a commit before exit. `quiescent` keeps only the infrastructure check that every committed group completed.
 
 ## 6. tcgen05
 
@@ -702,8 +745,8 @@ Sources: `runtime/instructions/tcgen05.rs`.
 2. The sticky `cta_group` matches → `CtaGroupMismatch`. This is checked only across lifecycle operations.
 3. Column rule (TG:703-710): a power of two in [32, min(cap, 512)]; with `.exclusive`, any multiple of 32 in that range.
 4. Alloc after relinquish → `AllocAfterRelinquish`.
-5. Columns larger than the last allocation → `AllocationSizeIncrease`. **[VERIFY]**: no PTX basis was found.
-6. First-fit 32-aligned base, common to both CTAs for a pair → `AllocationUnavailable`.
+5. Columns larger than the last allocation → `AllocationSizeIncrease` (ISA §9.7.18.7.1: "should not increase between any two allocations").
+6. First-fit 32-aligned base, common to both CTAs for a pair → `AllocationUnavailable` (the reference returns `Blocked`, §6.6).
 7. Dealloc must match an exact live `(base, cols)` → `DeallocationMismatch`.
 
 After the checks:
@@ -715,7 +758,7 @@ After the checks:
 
 - `cta_group::1` is immediate (TG:572-588).
 - `cta_group::2` is a two-warp collective keyed by static op and loop path (TG:735-766).
-  - The peer must use the same `warp_id_in_cta` (TG:757-759). That is stricter than PTX **[VERIFY]**.
+  - The peer must use the same `warp_id_in_cta` (TG:757-759). This has no ISA basis and is dropped (§6.6).
 
 ### 6.3 Work tokens and commit
 
@@ -746,11 +789,23 @@ The fixed verifier is SFU:3803-3955 and 4832-4986.
 ### 6.5 Disagreements with PTX
 
 1. **Allocation blocking.** PTX `alloc` blocks until columns are free; both models error immediately.
-   - **Decision needed (Q1):** keep the error (fail closed), or return `Blocked` and let the scheduler retry. Retrying needs deadlock reporting when no dealloc can happen.
+   - **Resolved (Q1):** return `Blocked` and let the scheduler retry (§6.6).
 2. **One `cta_group` per kernel.** PTX wants it across all tcgen05 ops. The engine checks it across lifecycle ops only, and commit silently ignores work of the other group.
 3. **Single-lane commit.** PTX commit is per-thread; the engine allows one issuing lane only.
 4. **Pending work at exit.** Uncommitted or unwaited tcgen work at exit is not diagnosed (ordering.rs:1036+). This is gap G7.
 5. **TMEM memo.** The `Immediate` `cta_group::1` path does not bump the hub generation (TG:651-669 vs 242-246). The cached bounds check uses the constant 512 rather than the capacity (TG:397 vs 475). These are bugs to avoid in the port.
+
+### 6.6 Reference (ISA-resolved)
+
+- **Blocking alloc.** `Alloc` returns `Blocked` when no common free interval exists. An `.exclusive` alloc also blocks while any allocation is live, and every alloc blocks while an exclusive allocation is live. "The tcgen05.alloc blocks if the requested amount of Tensor Memory is not available"; "An exclusive allocation operation blocks until there is no other live allocation" (ISA §9.7.18.7.1). The scheduler reports a deadlock only when nothing can progress. `AllocationUnavailable` is gone.
+- **Exclusivity.** Allocations record `exclusive`. A dealloc must match base, width **and** exclusivity: "Memory must be deallocated with .exclusive if and only if it is allocated with .exclusive".
+- **Width rules.**
+  - Non-exclusive: a power of two in [32, 512].
+  - Exclusive: a multiple of 32 in [32, `exclusive_max`], where `exclusive_max` is 512 on sm_100f/103/110 and 576 on sm_107f (PTX Table 58). It is a `State` parameter.
+- **`AllocationSizeIncrease`** is kept. "The number of columns allocated should not increase between any two allocations in the execution order within the CTA." `last_alloc_columns` is sticky across deallocs.
+- **`AllocAfterRelinquish`** is kept ("illegal").
+- **`cta_group` uniformity is kernel-wide.** It covers lifecycle, mma, cp, shift and commit: "All tcgen05 instructions within a kernel must specify the same value for the .cta_group qualifier". It lives in `tcgen::KernelState`. A commit or mma with the other group is `CtaGroupMismatch`, not ignored. `WorkState` therefore has a single uncommitted queue.
+- **Peer warp index.** The same-`warp_id_in_cta` requirement for `cta_group::2` (TG:757-759) is dropped. The ISA asks only for "one warp from each of the peer CTAs".
 
 ## 7. setmaxnreg
 
@@ -830,27 +885,35 @@ The reference follows the hub. Its commands are `Configure`, `Set`, `WarpgroupSy
 
 The redesign runs one numeric path in every mode (numsim CLAUDE.md, "System Design"). The reference therefore adopts the hub semantics as the only semantics, with no `Policy`. This is an intentional NumSim behaviour change: NumSim can now report `InvalidDirection` or a pool deadlock. It needs an explicit test delta.
 
-## 8. Consolidated decisions and open questions
+## 8. Consolidated decisions
 
-**Decided in the reference.** Each item is a behaviour change relative to at least one legacy model.
+The open questions Q1–Q7 are answered in `sync-isa-answers.md` (PTX 9.4). The complete list of behaviour changes relative to legacy, each with its ISA cite, is `sync-behaviour-deltas.md`. In summary:
 
-- **D1.** mbarrier late deferred arrival → `CompletionAfterComplete`, in both policies (fixes F2).
-- **D2.** mbarrier stale completion is rejected at landing, not at quiescence.
-- **D3.** The mbarrier tx limit applies to the phase total for both `expect_tx` and `arrive.expect_tx`. The pending-increment and layout-v1 limits apply under Strict too.
-- **D4.** mbarrier `IncPending` rolls the phase first (fixes F1). Strict rejects it on an unconsumed completion.
-- **D5.** The drop half of an arrive is transactional.
-- **D6.** setmaxnreg uses pool semantics in every mode.
-- **D7.** Waiter registries are removed: no `DuplicateWaiter`, no resume-registration errors. A strict pre-registered waiter is modeled by `armed`, which consumes at completion. This keeps the strict rule that a producer may reuse the barrier before the woken warp is rescheduled.
+| | Decision | Basis |
+| --- | --- | --- |
+| D1 | mbarrier late deferred arrival → `CompletionAfterComplete` (fixes F2) | Over-delivery to a completed phase |
+| D2 | Stale completion rejected at landing | Fail closed earlier |
+| D3 | Signed tx-count **state** range ±(2^20-1), checked after every op; no operand check | ISA §9.7.15.16.3 Table 43, §9.7.15.16.14 |
+| D4 | `IncPending` rolls first (fixes F1) and needs consumption (S1) | ISA §9.7.15.16.5.1, §9.7.15.16.18 |
+| D5 | Transactional drop | — |
+| D6 | setmaxnreg pool semantics in every mode | §7.6 |
+| D7 | No waiter registries; `armed` models a pre-registered strict waiter | §1.4 |
+| Q1 | `tcgen05.alloc` blocks (`Blocked`); `.exclusive` waits for no live allocation; relinquish → later alloc is an error | ISA §9.7.18.7.1 |
+| Q2 | mbarrier re-init without `inval` is an error under every policy | ISA §9.7.15.16.12 |
+| Q3 | Named: `b` is a multiple of 32; every form needs all non-exited lanes; aligned/unaligned mixing is allowed; `.red` mixing is an error; lanes at different instructions fail closed; dangling arrive at exit is a lint | ISA §9.7.15.1, §9.7.14.7 |
+| Q4 | Cluster membership drops exited threads | ISA §9.7.15.3, §9.7.14.7 |
+| Q5 | A barrier executed by a strict subset of the warp's non-exited lanes is an error; the elect waiver and the entry-mask rule are both dropped | ISA §9.7.15.1, §9.7.15.15 |
+| Q6 | `AllocationSizeIncrease` is kept, sticky | ISA §9.7.18.7.1 |
+| Q7 | Async-group completion and visibility are per lane; `.read` releases sources only | ISA §9.7.10.28.1.1, §9.7.10.28.6.2 |
+| L1 | Arrival limits 1..2^20-1 (v0) and 1..511 (v1); pending overflow is an error; `drop` to 0 is an error; typed `NoCompleteWouldComplete` | ISA §9.7.15.16.3, .12, .16, .17, .18 |
+| L2 | S1 holds under both policies for arrive-on ops; `ExpectTxBeforeConsumption` is Strict-only | ISA §9.7.15.16.5.1 |
+| L3 | `cta_group` is uniform across all tcgen05 ops; the same-warp-id peer check is dropped; `exclusive_max` is a parameter (512 or 576) | ISA §9.7.18.7.1, Table 58 |
 
-**Open.** These need the ISA, a GPU microtest, or an owner decision.
+**Still open.**
 
-- **Q1.** `tcgen05.alloc` blocking vs. error (§6.5).
-- **Q2.** mbarrier re-init without `inval`: UB or legal (§2.6 #8)?
-- **Q3.** Unaligned named-barrier recombination semantics (§3.5.4).
-- **Q4.** Exit-aware cluster membership: PTX counts exited threads (§4.4.5).
-- **Q5.** Named-barrier `elect.sync`: waive the full-warp check (engine) or require entry-mask equality (strict) (§3.5.1)?
-- **Q6.** `AllocationSizeIncrease`: is there a PTX basis, or should it be deleted?
-- **Q7.** Per-lane vs. per-warp acquire for async-group waits in racecheck (§5.4).
+- **G8.** Named-barrier release when the missing warps have all exited.
+- **setmaxnreg** equal-count and direction semantics (§7.4).
+- **Copy-report / conditional parity (G1).**
 
 ## 9. Reference crate and tests
 
@@ -858,11 +921,11 @@ The redesign runs one numeric path in every mode (numsim CLAUDE.md, "System Desi
 
 | Module | Lines | Covers |
 | --- | --- | --- |
-| `mbarrier.rs` | ~550 | §2, both policies |
-| `named.rs` | ~275 | §3, both policies |
-| `cluster.rs` | ~210 | §4, both policies |
+| `mbarrier.rs` | ~600 | §2, both policies |
+| `named.rs` | ~230 | §3 |
+| `cluster.rs` | ~230 | §4, exit-aware |
 | `async_group.rs` | ~305 | §5 |
-| `tcgen.rs` | ~310 | §6, lifecycle and work queues |
+| `tcgen.rs` | ~340 | §6, kernel `cta_group`, lifecycle and work queues |
 | `setmaxnreg.rs` | ~245 | §7 |
 
 `tests/properties.rs` runs 2048 random sequences per protocol. Each sequence is up to 60 commands, and token and ordinal operands are resolved against the live state.
@@ -888,15 +951,18 @@ The redesign runs one numeric path in every mode (numsim CLAUDE.md, "System Desi
 - **named / cluster:**
   - The generation is monotone.
   - Ready only for completed generations.
-  - Strict refines Numeric.
+  - No accepted contribution has a partial warp.
+  - Named: `.red` never mixes. Cluster: exits release waiters.
 - **async groups:**
   - FIFO milestones.
-  - A ready wait has its prefix satisfied.
+  - A ready wait has its prefix satisfied, and `.read` acquires only `ReadsDone`.
   - Deferred arrive-ons are conserved (attached = released + held).
 - **tcgen:**
   - Allocations stay inside TMEM and do not overlap.
-  - No alloc after relinquish.
-  - `cta_group` and relinquish are sticky.
+  - An exclusive allocation is the only live one.
+  - A blocked alloc leaves the state unchanged.
+  - No alloc after relinquish, and allocation widths never increase.
+  - Relinquish is sticky; `cta_group` is kernel-wide.
 - **setmaxnreg:**
   - Pool conservation and no oversubscription.
   - A successful grant clears the pending increase.

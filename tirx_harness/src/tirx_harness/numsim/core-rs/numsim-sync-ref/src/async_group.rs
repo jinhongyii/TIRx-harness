@@ -1,10 +1,13 @@
 //! Reference model of one thread's async-group queue in one domain
 //! (`cp.async` or `cp.async.bulk`).
 //!
-//! Spec: `docs/development/sync-semantics.md` §5. The legacy engine keeps
-//! this state per lane (`async_groups.rs:987-1022`). A warp-level wait blocks
-//! until every lane in its mask is ready. The caller builds that from 32
-//! instances of this model.
+//! Spec: `docs/development/sync-semantics.md` §5, with the ISA answers in
+//! `sync-isa-answers.md` Q7. Async-groups are per thread (PTX 9.4
+//! §9.7.10.28.1.1), so this state lives per (warp, lane, domain). A wait
+//! makes completions visible only to the executing lane. The legacy engine
+//! keeps the same per-lane state (`async_groups.rs:987-1022`). A warp-level
+//! wait blocks until every lane in its mask is ready; the caller builds that
+//! from 32 instances of this model.
 //!
 //! Each committed group passes through two milestones in FIFO order: source
 //! reads done, then full completion. Read milestones may run ahead of full
@@ -97,8 +100,12 @@ pub enum Outcome {
     Completed {
         arrivals: u32,
     },
+    /// `acquired` is the milestone the wait guarantees for this thread only.
+    /// `ReadsDone` (`.read`) releases the sources for reuse and never makes
+    /// destination writes visible (PTX 9.4 §9.7.10.28.6.2).
     Ready {
         retired: u32,
+        acquired: Milestone,
     },
     Blocked,
 }
@@ -110,9 +117,6 @@ pub enum Error {
     NotEnabled {
         ordinal: u64,
         milestone: Milestone,
-    },
-    UncommittedAtExit {
-        open: u32,
     },
     PendingAtExit {
         ordinal: u64,
@@ -257,6 +261,7 @@ fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
             };
             Ok(Outcome::Ready {
                 retired: retired as u32,
+                acquired: need,
             })
         }
         Cmd::Exit => {
@@ -283,11 +288,20 @@ pub fn wait_prefix_len(s: &State, n: u64) -> usize {
     0
 }
 
-/// Run after the completion pump has drained.
+/// Review-level lint. The ISA does not require a commit before exit
+/// (sync-isa-answers Q7); the legacy engine treated this as an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Lint {
+    UncommittedAtExit { open: u32 },
+}
+
+pub fn exit_lint(s: &State) -> Option<Lint> {
+    (s.open > 0).then_some(Lint::UncommittedAtExit { open: s.open })
+}
+
+/// Run after the completion pump has drained. Committed groups always
+/// complete, so an error here is an infrastructure fault.
 pub fn quiescent(s: &State) -> Result<(), Error> {
-    if s.open > 0 {
-        return Err(Error::UncommittedAtExit { open: s.open });
-    }
     if let Some(g) = s
         .groups
         .iter()

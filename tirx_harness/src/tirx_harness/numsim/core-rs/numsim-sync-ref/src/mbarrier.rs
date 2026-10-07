@@ -1,6 +1,7 @@
 //! Reference model of one physical shared-memory `mbarrier` slot.
 //!
-//! Spec: `docs/development/sync-semantics.md` §2. Arrival counts are already
+//! Spec: `docs/development/sync-semantics.md` §2, with the ISA answers in
+//! `sync-isa-answers.md` (Q2, limits, S1, noComplete). Arrival counts are already
 //! aggregated per instruction and target. Operand validation is done by the
 //! caller: lane-uniformity, address space, and the rule that a lane-varying
 //! instruction resolves to distinct targets.
@@ -24,8 +25,9 @@ use crate::Policy;
 pub const MAX_COUNT: u64 = (1 << 20) - 1;
 /// Limit under `mbarrier.init.layout::v1`. `hardware_barriers.rs:19-25`.
 pub const MAX_COUNT_V1: u64 = (1 << 9) - 1;
-/// tx-count limit per phase and per operand. `hardware_barriers.rs:17`,
-/// `runtime/sync.rs:16,33-42`.
+/// The tx-count is signed and its state range is `-(2^20-1) ..= 2^20-1`
+/// (PTX 9.4 §9.7.15.16.3, Table 43). The range is checked on the barrier
+/// state, never on the 32-bit `txCount` operand.
 pub const MAX_TX: u64 = (1 << 20) - 1;
 
 pub const fn arrival_limit(layout_v1: bool) -> u64 {
@@ -180,24 +182,64 @@ pub enum Outcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
     Uninitialized,
-    InvalidCount { count: u64, limit: u64 },
-    InvalidPhase { parity: u64 },
-    InvalidStateToken { gen: u64, current: u64 },
+    InvalidCount {
+        count: u64,
+        limit: u64,
+    },
+    InvalidPhase {
+        parity: u64,
+    },
+    InvalidStateToken {
+        gen: u64,
+        current: u64,
+    },
     ReinitActive,
     ReinitWithoutInval,
-    ReinitBeforeConsumption { gen: u64 },
+    ReinitBeforeConsumption {
+        gen: u64,
+    },
     InvalWithOutstanding,
-    ArrivalOverflow { required: u64, arrived: u64 },
-    DropUnderflow { expected: u64, count: u64 },
-    NoCompleteWouldComplete { count: u64, pending: u64 },
-    TxOverflow { total: u64 },
-    TxOverDelivery { expected: u64, completed: u64 },
-    PendingOverflow { required: u64 },
-    ReuseBeforeConsumption { op: Op, gen: u64 },
-    UnknownToken { gen: u64 },
-    StaleCompletion { gen: u64, current: u64 },
-    CompletionAfterComplete { gen: u64 },
-    FutureNotBufferable { gen: u64, current: u64 },
+    ArrivalOverflow {
+        required: u64,
+        arrived: u64,
+    },
+    DropUnderflow {
+        expected: u64,
+        count: u64,
+    },
+    NoCompleteWouldComplete {
+        count: u64,
+        pending: u64,
+    },
+    /// Net tx-count (expected minus completed) left `±(2^20-1)`.
+    TxCountOutOfRange {
+        tx_count: i64,
+    },
+    TxOverDelivery {
+        expected: u64,
+        completed: u64,
+    },
+    PendingOverflow {
+        required: u64,
+    },
+    ReuseBeforeConsumption {
+        op: Op,
+        gen: u64,
+    },
+    UnknownToken {
+        gen: u64,
+    },
+    StaleCompletion {
+        gen: u64,
+        current: u64,
+    },
+    CompletionAfterComplete {
+        gen: u64,
+    },
+    FutureNotBufferable {
+        gen: u64,
+        current: u64,
+    },
 }
 
 pub struct Mbarrier;
@@ -243,15 +285,9 @@ fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
             no_complete,
         } => arrive(s, count, tx, drop, no_complete),
         Cmd::ExpectTx { bytes } => {
-            if bytes > MAX_TX {
-                return Err(Error::TxOverflow { total: bytes });
-            }
             begin(s, Op::ExpectTx)?;
-            let total = s.tx_expected + bytes;
-            if total > MAX_TX {
-                return Err(Error::TxOverflow { total });
-            }
-            s.tx_expected = total;
+            s.tx_expected = s.tx_expected.saturating_add(bytes);
+            check_tx(s)?;
             Ok(Outcome::Updated { gen: s.gen })
         }
         Cmd::IncPending { count } => {
@@ -286,6 +322,7 @@ fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
                         });
                     }
                     s.tx_completed = completed;
+                    check_tx(s)?;
                     Ok(Outcome::Landed {
                         completed: maybe_complete(s).then_some(s.gen),
                     })
@@ -293,7 +330,13 @@ fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
                 Target::Next => {
                     // Buffering does not advance the phase, so strict does not
                     // require consumption here (strict_mbarrier.rs:1291-1330).
-                    s.buffered_next += bytes;
+                    // These bytes become the next phase's negative tx-count.
+                    s.buffered_next = s.buffered_next.saturating_add(bytes);
+                    if s.buffered_next > MAX_TX {
+                        return Err(Error::TxCountOutOfRange {
+                            tx_count: -(s.buffered_next.min(i64::MAX as u64) as i64),
+                        });
+                    }
                     Ok(Outcome::Landed { completed: None })
                 }
             }
@@ -343,15 +386,15 @@ fn init(s: &mut State, count: u64, layout_v1: bool) -> Result<Outcome, Error> {
         return Err(Error::InvalidCount { count, limit });
     }
     if s.live {
-        if s.strict() && s.complete && !s.consumed {
+        // PTX §9.7.15.16.12: init on a valid mbarrier object is UB under
+        // every policy. Report the most specific diagnosis.
+        if s.complete && !s.consumed {
             return Err(Error::ReinitBeforeConsumption { gen: s.gen });
         }
         if s.active() {
             return Err(Error::ReinitActive);
         }
-        if s.strict() {
-            return Err(Error::ReinitWithoutInval);
-        }
+        return Err(Error::ReinitWithoutInval);
     }
     *s = State {
         policy: s.policy,
@@ -368,7 +411,12 @@ fn begin(s: &mut State, op: Op) -> Result<(), Error> {
     if !s.complete {
         return Ok(());
     }
-    if s.strict() && !s.consumed {
+    // PTX §9.7.15.16.5.1: at least one successful test_wait/try_wait per
+    // primary phase before an arrive-on in the next phase. Arrive-on
+    // operations (arrive, pending increment, deferred arrive-on) are
+    // checked under every policy. Extending the rule to expect_tx is Strict
+    // only.
+    if !s.consumed && (op != Op::ExpectTx || s.strict()) {
         return Err(Error::ReuseBeforeConsumption { op, gen: s.gen });
     }
     s.gen += 1;
@@ -395,11 +443,6 @@ fn arrive(
             completed: false,
         });
     }
-    if let Some(bytes) = tx {
-        if bytes > MAX_TX {
-            return Err(Error::TxOverflow { total: bytes });
-        }
-    }
     if no_complete {
         // hardware_barriers.rs:1157-1184: computed before roll-over and drop.
         let pending = if s.complete {
@@ -415,7 +458,8 @@ fn arrive(
     if drop {
         // Future phases expect `count` fewer arrivals; this phase is
         // unchanged because the same count is added to the phase-only extra.
-        if count > s.expected {
+        // PTX §9.7.15.16.17: dropping the expected count to zero is UB.
+        if count >= s.expected {
             return Err(Error::DropUnderflow {
                 expected: s.expected,
                 count,
@@ -441,10 +485,7 @@ fn add_arrivals(s: &mut State, count: u64, tx: u64) -> Result<(u64, bool), Error
             arrived,
         });
     }
-    let tx_expected = s.tx_expected + tx;
-    if tx_expected > MAX_TX {
-        return Err(Error::TxOverflow { total: tx_expected });
-    }
+    let tx_expected = s.tx_expected.saturating_add(tx);
     if arrived == s.required() && s.tx_completed > tx_expected {
         return Err(Error::TxOverDelivery {
             expected: tx_expected,
@@ -453,7 +494,23 @@ fn add_arrivals(s: &mut State, count: u64, tx: u64) -> Result<(u64, bool), Error
     }
     s.arrived = arrived;
     s.tx_expected = tx_expected;
+    check_tx(s)?;
     Ok((s.gen, maybe_complete(s)))
+}
+
+/// Signed tx-count of the current phase.
+pub fn tx_count(s: &State) -> i128 {
+    i128::from(s.tx_expected) - i128::from(s.tx_completed)
+}
+
+fn check_tx(s: &State) -> Result<(), Error> {
+    let tx_count = tx_count(s);
+    if tx_count.unsigned_abs() > u128::from(MAX_TX) {
+        return Err(Error::TxCountOutOfRange {
+            tx_count: tx_count.clamp(i64::MIN.into(), i64::MAX.into()) as i64,
+        });
+    }
+    Ok(())
 }
 
 fn maybe_complete(s: &mut State) -> bool {
@@ -540,7 +597,10 @@ pub fn check_invariants(s: &State) -> Result<(), String> {
         "expected above limit",
     )?;
     ensure(s.arrived <= s.required(), "arrived > required")?;
-    ensure(s.tx_expected <= MAX_TX, "tx_expected above limit")?;
+    ensure(
+        tx_count(s).unsigned_abs() <= u128::from(MAX_TX) && s.buffered_next <= MAX_TX,
+        "tx-count out of range",
+    )?;
     ensure(
         !s.complete || (s.arrived == s.required() && s.tx_completed == s.tx_expected),
         "complete without balanced counters",

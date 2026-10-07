@@ -19,7 +19,7 @@
 被核实为**不成立**的说法，以免再次误导：
 
 - 生成代码不是 `M` 泛型的，它用具体别名（`artifact_support.rs:222-230`）。去掉 `M` 不会让 per-kernel 编译变快。
-- racecheck 发现 race **不会**中止运行，是 `findings.push` 后继续（`race_check.rs:3165` 等）。方案里不需要也不允许"首个 race 即中止"。
+- racecheck 发现 race 的处理分两种：全局内存的 race 是 `findings.push` 后继续；共享内存和 TMEM 的 race 在 push 之后返回 `Err` 中止执行（`race_check.rs:3163-3167`，11 处）。新核心统一为继续执行，这是一处行为变化（见 racecheck-semantics.md §8）；"写清掉所有 reader"的规则只在 fail-fast 下成立，新核心只清掉已被该写排序的 reader。
 - declared word 的"用本次运行观察到的版本当 HB 边"是**退化回退**，不是主路径（`global_race.rs:8779-8800` 注释）。主路径扫描完整写历史取谓词接受的最早一次写，schedule 无关。
 
 ## 1. 设计原则
@@ -87,13 +87,16 @@ pub struct Program {
 - 保留的剪枝技巧，各有 criterion 基准：打包 `(actor, epoch)` u64 时间戳与单分量比较；每 range 每 actor 单 witness，写清掉读；exact-hit 原地更新；Arc 共享 memo 的 clock chunk。
 - declared word：引擎在每次 wait 记录**谓词对该字写历史的判定位图**，checker 恢复最早接受的写，保住 schedule 无关的 HB 边。
 - 全局 shadow 在 inbox 排空时合并（跨 CTA acquire 到达之处）；launch 结束时未合并的 shadow 是一个合并点，不是默默通过。
-- 异步 op 是虚拟 actor，read-side 和 write-side 两个完成里程碑。
+- 异步 op 是虚拟 actor，read-side 和 write-side 两个完成里程碑。async group 的完成可见性按 ISA 是**逐线程**的（PTX ISA §9.7.10.28，见 sync-isa-answers.md Q7）：group 按 (warp, lane, domain) 建模，wait 逐 lane acquire，`bulk.wait_group.read` 只加入 read 里程碑。旧实现合并成整 warp 时钟是过于宽松的。
+- 共享/TMEM 与全局内存可以统一：15 处差异全部归为 actor 集合、fence/scope 表、表示方式、或需要修正的旧有不一致（racecheck-semantics.md §8），原型用一个 `Checker` 跑通三种空间。
 
 ### 2.6 Synccheck 核心
 
 - 输入只有 `Vec<SyncEvent>`。
-- 按 warp↔resource 连通分量独立探索；状态 = per-warp 游标 + 资源状态 + 待完成多重集；DFS + 状态哈希 + sleep set。
-- 保留：按资源投影、因果证书（作为快路径，等 corpus 需要时加）、指纹去重。
+- 按**资源**投影加上从观测运行取得的 HB gate（不是连通分量：流水线 kernel 的所有 warp 和 barrier 是一个分量，分量投影省不下任何状态；原型在 3000 个随机日志上验证了带 gate 的按资源判定与全程序判定一致）。状态 = per-warp 游标 + 资源状态 + 待完成多重集。
+- DFS + 状态哈希 + **strong diamond + 因果证书 + 指纹去重必须与 DFS 一起上线**：16 warp × 4 级 × 32 迭代的流水线上，sleep set 单独仍击穿 10 万状态预算（15 个并发 consumer wait = 每代 2^15），strong diamond 把每代变成链（1062 状态），指纹去重再降到 279，证书降到 9。见 synccheck-explorer.md §3。
+- 今天 mbarrier 证书有一个假阳性（"wait 可被越过"在下一代永不完成时也触发，`sync_fixed_unified.rs:1997-2066`）；新实现只在下一代完成时应用。
+- clock 和 generation 不需要记录：从一次完整的轮转 schedule 重算，证书再证明对所有 schedule 成立。在线因果追踪器（`sync_causality.rs`）不再需要。
 - 预算耗尽 → `incomplete` 并报告覆盖。
 - 正控制：生产里不再有 strict 副本。保留**一个**几百行的独立参考状态机（无 footprint、无 waiter），仅在 `cfg(test)` 和 nightly 下做 model-based test，随机命令序列驱动真实 `step` 比对。
 
@@ -174,7 +177,19 @@ pub struct Program {
 - Synccheck 状态爆炸：16 warp、K 级、N 迭代流水线可能击穿 sleep set，届时加按资源相位计数证书。
 - 单 CTA 的 lockstep 意味着大 CTA 小 grid 的 kernel 只用一个核；今天也是如此，不是回归。
 
-## 7. 环境备忘
+## 7. 规格文档索引
+
+重构期间产出的规格，都是从旧代码抽取并对照 PTX ISA 核实过的：
+
+- `sync-semantics.md`：六个同步协议的状态、命令、前提、转移、完成、错误；引擎模型与 strict 模型的全部不一致。参考状态机在 `core-rs/numsim-sync-ref/`。
+- `sync-isa-answers.md`：七个开放语义问题的 ISA 裁定。四个问题两边模型都错：`tcgen05.alloc` 应阻塞、cluster barrier 要排除已退出线程、elect 后单 lane 进 barrier 是 UB、async group 等待逐线程。
+- `sync-behaviour-deltas.md`：相对旧行为的变更清单，供快照 diff 审查。
+- `racecheck-semantics.md`：33 条 HB 边、冲突规则、时钟表示技巧与操作数论证、22 条旧有不合理行为。原型在 `core-rs/numsim-race-core/`。
+- `racecheck-isa-answers.md`：release sequence、moral strength、proxy 规则等的 ISA 裁定。
+- `synccheck-explorer.md`：两阶段算法、投影、证书、指纹、DFS 剪枝表与测量。原型在 `core-rs/numsim-sync-explore/`。
+- `lowering-inventory.md`：194 个 corpus PrimFunc 的 IR 节点、builtin、dtype、layout、控制流统计；lowering 设计与三个 worked example。
+
+## 8. 环境备忘
 
 - 本机 shell 的 `PYTHONPATH`、`TVM_HOME`、`TVM_LIBRARY_PATH`、`LD_LIBRARY_PATH` 指向本地 0.26 的 TVM 开发树，会让 frontend panic（`sym.Analyzer is not registered`）。运行测试前清掉这四个变量，用 `.venv`（`uv sync --locked --extra test`，Python 3.12）。
 - 测试从 `tirx_harness/` 目录运行，总是带 `-n`，设 `NUMSIM_WORKER_AFFINITY=off`。

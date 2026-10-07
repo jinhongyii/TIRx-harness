@@ -33,16 +33,14 @@ pub mod tcgen;
 
 /// Which reading of the ISA a protocol state enforces.
 ///
-/// `Numeric` is what NumSim executes. It rejects only behaviour that the
-/// legacy engine rejects in its numeric path.
+/// After the ISA answers (`docs/development/sync-isa-answers.md`), nearly
+/// every legacy strict-only rule turned out to be ISA-backed. Those rules
+/// now hold under both policies. The one Strict-only rule left is mbarrier
+/// `ExpectTxBeforeConsumption`. It extends PTX §9.7.15.16.5.1, which names
+/// arrive-on operations only.
 ///
-/// `Strict` adds the protocol rules that the legacy strict synccheck models
-/// enforced on top of the numeric ones. One example is mbarrier phase
-/// consumption before reuse.
-///
-/// Invariant (tested): whenever `Strict` accepts a command sequence, `Numeric`
-/// accepts it with identical outcomes. That makes strict a refinement of
-/// numeric.
+/// Invariant (tested): whenever `Strict` accepts a command sequence,
+/// `Numeric` accepts it with identical outcomes. Strict refines Numeric.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Policy {
     #[default]

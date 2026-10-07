@@ -1,74 +1,70 @@
-//! Reference model of one CTA-local named barrier (`bar.sync`, `bar.arrive`,
-//! `barrier.sync[.aligned]`, `bar.red` without the reduction value).
+//! Reference model of one CTA-local named barrier: `bar.sync`, `bar.arrive`,
+//! `bar.red`, and `barrier.{sync,arrive,red}[.aligned]`.
 //!
-//! Spec: `docs/development/sync-semantics.md` §3. Arrivals are counted per
-//! active lane (`hardware_barriers.rs:3019-3036`). A generation completes when
-//! its lane count reaches the count `b` carried by its contributions. The next
-//! contribution then rolls lazily to a fresh generation, which may use a
-//! different `b` (`hardware_barriers.rs:2983-2997`).
+//! Spec: `docs/development/sync-semantics.md` §3, with the ISA answers in
+//! `sync-isa-answers.md` Q3/Q5.
 //!
-//! Blocking: `Sync` contributes and returns `Registered { gen }`, or `Ready`
-//! when it completed the generation. The warp then retries `Resume { gen }`
-//! until it is `Ready`. Readiness is a pure function of `(gen, state)`, so the
-//! model needs no waiter registry.
+//! A barrier instruction makes each executing thread wait for all non-exited
+//! threads of its warp, then marks the **warp's** arrival (PTX 9.4 §9.7.15.1).
+//! The model therefore requires each contribution's lane mask to equal the
+//! warp's non-exited lanes. A strict subset is an error. That covers the
+//! elect-gated single-lane case and lanes that reach different barrier
+//! instructions; the latter fail closed. A warp arrival counts 32 threads
+//! toward `b`, which must be a multiple of the warp size.
+//!
+//! `.aligned` is a convergence promise, not barrier state. Mixing aligned and
+//! unaligned forms on one barrier is legal. Mixing `.red` with `sync`/`arrive`
+//! on one active barrier is "unpredictable" and is rejected.
+//!
+//! Blocking: `Sync`/`Red` contribute and return `Registered { gen }`, or
+//! `Ready` when they complete the generation. The warp then retries
+//! `Resume { gen }`. Readiness is a pure function of `gen`, so no waiter
+//! registry is needed.
 
 use std::collections::BTreeMap;
 
-use crate::{LaneMask, Policy, Warp, FULL_MASK};
+use crate::{LaneMask, Warp};
 
 /// Hardware barrier ids are `0..16`; the caller resolves the id to a `State`.
 pub const NUM_IDS: u32 = 16;
+pub const WARP_SIZE: u64 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Flavor {
     Arrive,
     Sync,
+    Red,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Contribution {
     pub warp: Warp,
+    /// Lanes executing this barrier instruction.
     pub mask: LaneMask,
-    /// Thread count operand `b` (whole CTA when the source omitted it).
+    /// Non-exited lanes of the warp at this point.
+    pub live: LaneMask,
+    /// Thread count `b`. Whole CTA when the source omitted it.
     pub count: u64,
-    /// `bar.*` and `barrier.*.aligned` forms.
-    pub aligned: bool,
-    /// Entry mask of an enclosing `elect.sync` region, if any. The engine
-    /// waives the full-warp check under elect (`kernel_engine.rs:7902-7915`);
-    /// strict requires the participation to equal that entry mask
-    /// (`strict_named_barrier.rs:350-369`).
-    pub elect_entry: Option<LaneMask>,
-    /// Static instruction identity, for the strict aligned-origin contract.
-    pub site: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct State {
-    pub policy: Policy,
-    /// Count `b` of the current generation; `None` before first use.
+    /// `b` of the current generation; `None` before first use.
     pub expected: Option<u64>,
     pub gen: u64,
     pub complete: bool,
+    /// Threads counted so far (32 per warp arrival).
     pub arrived: u64,
-    pub lanes: BTreeMap<(Warp, Flavor), LaneMask>,
-    /// Strict only: aligned flag and static sites of sync contributions.
-    pub sync_origins: BTreeMap<Warp, Vec<(bool, u32)>>,
-}
-
-impl State {
-    pub fn new(policy: Policy) -> Self {
-        Self {
-            policy,
-            ..Self::default()
-        }
-    }
+    /// Warp arrivals of the current generation, by flavor.
+    pub warps: BTreeMap<(Warp, Flavor), ()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cmd {
     Arrive(Contribution),
     Sync(Contribution),
-    /// Retry of a blocked `Sync` that registered on `gen`.
+    Red(Contribution),
+    /// Retry of a blocked `Sync`/`Red` that registered on `gen`.
     Resume {
         gen: u64,
     },
@@ -84,45 +80,47 @@ pub enum Outcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
-    /// `b == 0` or `b % 32 != 0` (`runtime/sync.rs:1427-1436`).
+    /// `b == 0` or `b` not a multiple of 32 (PTX §9.7.15.1).
     InvalidCount {
         count: u64,
     },
-    EmptyMask,
-    /// `.aligned` with a partial warp outside an elect region.
+    /// Executed by no lane, or by a strict subset of the warp's non-exited
+    /// lanes (PTX §9.7.15.1, sync-isa-answers Q3/Q5).
     PartialWarp {
         mask: LaneMask,
+        live: LaneMask,
     },
-    /// Strict: an elect-gated participation differs from the elect entry mask.
-    ElectSyncParticipation {
-        entry: LaneMask,
-        mask: LaneMask,
-    },
-    /// Contributions to one generation carry different `b`.
+    /// Contributions to one generation carry different `b`
+    /// ("using the same barrier name and thread count").
     ContractMismatch {
         expected: u64,
         observed: u64,
     },
-    /// The same lanes contributed twice with the same flavor in one generation.
+    /// One warp contributed twice with the same flavor in one generation
+    /// ("keep a warp from executing more barrier instructions than intended").
     Duplicate {
         warp: Warp,
-        overlap: LaneMask,
+    },
+    /// `.red` mixed with `sync`/`arrive` on one active barrier.
+    RedMixed {
+        warp: Warp,
     },
     ArrivalOverflow {
         expected: u64,
         arrived: u64,
     },
-    /// Strict: aligned and unaligned syncs mixed, or one warp's aligned syncs
-    /// from different static instructions.
-    AlignedSyncContractMismatch {
-        warp: Warp,
-    },
     /// `Resume` on a generation that this barrier never reached.
     ResumeFuture {
         gen: u64,
     },
-    /// Exit with an incomplete generation (`hardware_barriers.rs:3132-3154`).
-    IncompleteAtExit {
+}
+
+/// Review-level lint: not a kernel error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Lint {
+    /// Generation left incomplete at exit (a dangling `bar.arrive`). PTX
+    /// releases barriers waiting only on exited threads (§9.7.14.7).
+    DanglingAtExit {
         gen: u64,
         arrived: u64,
         expected: u64,
@@ -149,19 +147,20 @@ pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
 }
 
 fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
+    let blocking = |(gen, completed)| {
+        if completed {
+            Outcome::Ready { gen }
+        } else {
+            Outcome::Registered { gen }
+        }
+    };
     match cmd {
         Cmd::Arrive(c) => {
             let (gen, completed) = contribute(s, c, Flavor::Arrive)?;
             Ok(Outcome::Arrived { gen, completed })
         }
-        Cmd::Sync(c) => {
-            let (gen, completed) = contribute(s, c, Flavor::Sync)?;
-            Ok(if completed {
-                Outcome::Ready { gen }
-            } else {
-                Outcome::Registered { gen }
-            })
-        }
+        Cmd::Sync(c) => contribute(s, c, Flavor::Sync).map(blocking),
+        Cmd::Red(c) => contribute(s, c, Flavor::Red).map(blocking),
         Cmd::Resume { gen } => {
             if gen > s.gen || s.expected.is_none() {
                 Err(Error::ResumeFuture { gen })
@@ -175,27 +174,14 @@ fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
 }
 
 fn contribute(s: &mut State, c: Contribution, flavor: Flavor) -> Result<(u64, bool), Error> {
-    if c.count == 0 || !c.count.is_multiple_of(32) {
+    if c.count == 0 || !c.count.is_multiple_of(WARP_SIZE) {
         return Err(Error::InvalidCount { count: c.count });
     }
-    if c.mask == 0 {
-        return Err(Error::EmptyMask);
-    }
-    // Engine: every arrive and every aligned sync is warp-collective unless
-    // elect-gated (kernel_engine.rs:4191-4228, 7902-7915).
-    let collective = flavor == Flavor::Arrive || c.aligned;
-    if collective && c.mask != FULL_MASK && c.elect_entry.is_none() {
-        return Err(Error::PartialWarp { mask: c.mask });
-    }
-    if s.policy == Policy::Strict && collective {
-        if let Some(entry) = c.elect_entry {
-            if entry != c.mask {
-                return Err(Error::ElectSyncParticipation {
-                    entry,
-                    mask: c.mask,
-                });
-            }
-        }
+    if c.mask == 0 || c.mask != c.live {
+        return Err(Error::PartialWarp {
+            mask: c.mask,
+            live: c.live,
+        });
     }
     if s.complete || s.expected.is_none() {
         if s.complete {
@@ -204,8 +190,7 @@ fn contribute(s: &mut State, c: Contribution, flavor: Flavor) -> Result<(u64, bo
         s.complete = false;
         s.expected = Some(c.count);
         s.arrived = 0;
-        s.lanes.clear();
-        s.sync_origins.clear();
+        s.warps.clear();
     }
     let expected = s.expected.expect("set above");
     if expected != c.count {
@@ -214,88 +199,50 @@ fn contribute(s: &mut State, c: Contribution, flavor: Flavor) -> Result<(u64, bo
             observed: c.count,
         });
     }
-    let prior = s.lanes.get(&(c.warp, flavor)).copied().unwrap_or(0);
-    if prior & c.mask != 0 {
-        return Err(Error::Duplicate {
-            warp: c.warp,
-            overlap: prior & c.mask,
-        });
+    if s.warps.contains_key(&(c.warp, flavor)) {
+        return Err(Error::Duplicate { warp: c.warp });
     }
-    let arrived = s.arrived + u64::from(c.mask.count_ones());
+    let red_now = flavor == Flavor::Red;
+    if s.warps.keys().any(|&(_, f)| (f == Flavor::Red) != red_now) {
+        return Err(Error::RedMixed { warp: c.warp });
+    }
+    let arrived = s.arrived + WARP_SIZE;
     if arrived > expected {
         return Err(Error::ArrivalOverflow { expected, arrived });
     }
     s.arrived = arrived;
-    s.lanes.insert((c.warp, flavor), prior | c.mask);
-    if flavor == Flavor::Sync {
-        s.sync_origins
-            .entry(c.warp)
-            .or_default()
-            .push((c.aligned, c.site));
-    }
-    if arrived == expected {
-        if s.policy == Policy::Strict {
-            check_aligned_origins(s)?;
-        }
-        s.complete = true;
-    }
+    s.warps.insert((c.warp, flavor), ());
+    s.complete = arrived == expected;
     Ok((s.gen, s.complete))
 }
 
-/// `strict_named_barrier.rs:719-773`: if any sync of the generation is
-/// aligned, every sync is aligned, and each warp uses one static site.
-fn check_aligned_origins(s: &State) -> Result<(), Error> {
-    let any_aligned = s
-        .sync_origins
-        .values()
-        .flatten()
-        .any(|&(aligned, _)| aligned);
-    if !any_aligned {
-        return Ok(());
-    }
-    for (&warp, origins) in &s.sync_origins {
-        let first_site = origins[0].1;
-        if origins
-            .iter()
-            .any(|&(aligned, site)| !aligned || site != first_site)
-        {
-            return Err(Error::AlignedSyncContractMismatch { warp });
-        }
-    }
-    Ok(())
-}
-
-/// Launch-exit check: an incomplete generation is an error, including one fed
-/// only by `bar.arrive`.
-pub fn quiescent(s: &State) -> Result<(), Error> {
+/// Exit check. An incomplete generation is never an error, only a lint.
+pub fn exit_lint(s: &State) -> Option<Lint> {
     match s.expected {
-        Some(expected) if !s.complete => Err(Error::IncompleteAtExit {
+        Some(expected) if !s.complete => Some(Lint::DanglingAtExit {
             gen: s.gen,
             arrived: s.arrived,
             expected,
         }),
-        _ => Ok(()),
+        _ => None,
     }
 }
 
 pub fn check_invariants(s: &State) -> Result<(), String> {
-    let expected = match s.expected {
-        None => {
-            return (s.gen == 0 && !s.complete && s.arrived == 0 && s.lanes.is_empty())
-                .then_some(())
-                .ok_or_else(|| "state before first use".into())
-        }
-        Some(e) => e,
+    let Some(expected) = s.expected else {
+        return (s.gen == 0 && !s.complete && s.arrived == 0 && s.warps.is_empty())
+            .then_some(())
+            .ok_or_else(|| "state before first use".into());
     };
-    if s.arrived > expected {
-        return Err("arrived > expected".into());
-    }
-    if s.complete != (s.arrived == expected) {
+    if s.arrived > expected || s.complete != (s.arrived == expected) {
         return Err("complete iff arrived == expected".into());
     }
-    let lanes: u64 = s.lanes.values().map(|m| u64::from(m.count_ones())).sum();
-    if lanes != s.arrived {
-        return Err("lane bookkeeping disagrees with count".into());
+    if s.arrived != WARP_SIZE * s.warps.len() as u64 {
+        return Err("warp bookkeeping disagrees with count".into());
+    }
+    let reds = s.warps.keys().filter(|&&(_, f)| f == Flavor::Red).count();
+    if reds != 0 && reds != s.warps.len() {
+        return Err(".red mixed with sync/arrive".into());
     }
     Ok(())
 }

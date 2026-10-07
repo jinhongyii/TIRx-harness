@@ -1,17 +1,25 @@
-//! Reference model of the tcgen05 TMEM lifecycle of one CTA pair, plus the
-//! per-thread work queues that `tcgen05.commit` drains.
+//! Reference model of the tcgen05 TMEM lifecycle of one CTA pair, the
+//! kernel-wide `cta_group` rule, and the per-thread work queues that
+//! `tcgen05.commit` drains.
 //!
-//! Spec: `docs/development/sync-semantics.md` §6. Index 0 of `ctas` is the
-//! even CTA of the pair and index 1 is its peer. A `cta_group::2` command has
-//! already been matched by the collective layer. That layer rejects
-//! `CollectiveArgumentMismatch`, `MissingPeerCta`, and a peer that never
-//! arrives. The command then mutates both CTAs atomically at one common base
-//! (`tcgen.rs:713-733, 798-950`).
+//! Spec: `docs/development/sync-semantics.md` §6, with the ISA answers in
+//! `sync-isa-answers.md` Q1/Q6. All PTX citations refer to PTX 9.4
+//! §9.7.18.7.1.
 //!
-//! Numerics are eager. "Pending" tcgen work exists only as tokens that
-//! `commit` and `wait::ld/st` drain. The `commit` arrival itself is
-//! `mbarrier::Cmd::{Issue, DeferredArrive { count: 1 }}` on each target
-//! barrier.
+//! - `tcgen05.alloc` blocks until the columns are free. An `.exclusive`
+//!   allocation blocks until no other allocation is live. While one is live,
+//!   every other allocation blocks.
+//! - The allocated column count may not increase between any two allocations
+//!   of a CTA, in execution order. The last count is sticky across deallocs.
+//! - Allocating after `relinquish_alloc_permit` is illegal.
+//!
+//! In `ctas`, index 0 is the even CTA of the pair and index 1 is its peer.
+//! A `cta_group::2` command has already been matched by the collective layer.
+//! That layer requires one warp from each peer CTA and no particular warp
+//! index. The command mutates both CTAs atomically, at one common base.
+//!
+//! Every tcgen05 instruction of a kernel first steps the kernel-wide
+//! [`KernelState`], because all of them must use the same `.cta_group`.
 
 pub const TMEM_COLUMNS: u32 = 512;
 
@@ -19,6 +27,7 @@ pub const TMEM_COLUMNS: u32 = 512;
 pub struct Allocation {
     pub base: u32,
     pub columns: u32,
+    pub exclusive: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -26,22 +35,30 @@ pub struct CtaTmem {
     /// Sorted by base.
     pub allocations: Vec<Allocation>,
     pub relinquished: bool,
-    /// Sticky after the first lifecycle action (`tcgen.rs:844-858`).
-    pub cta_group: Option<u8>,
-    /// Engine rule: later allocations may not be wider (`tcgen.rs:871-887`).
     pub last_alloc_columns: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
+    /// Columns available to non-exclusive allocations (512).
     pub capacity: u32,
+    /// Largest `.exclusive` allocation: 512 on sm_100f/103/110, 576 on
+    /// sm_107f (PTX Table 58).
+    pub exclusive_max: u32,
     pub ctas: [CtaTmem; 2],
 }
 
 impl Default for State {
     fn default() -> Self {
+        Self::new(TMEM_COLUMNS)
+    }
+}
+
+impl State {
+    pub fn new(exclusive_max: u32) -> Self {
         Self {
             capacity: TMEM_COLUMNS,
+            exclusive_max,
             ctas: Default::default(),
         }
     }
@@ -57,32 +74,39 @@ pub enum Who {
 }
 
 impl Who {
-    fn group(self) -> u8 {
+    pub fn group(self) -> u8 {
         match self {
             Who::One(_) => 1,
             Who::Pair => 2,
         }
     }
 
-    fn indices(self) -> &'static [usize] {
+    fn indices(self) -> Result<&'static [usize], Error> {
         match self {
-            Who::One(0) => &[0],
-            Who::One(_) => &[1],
-            Who::Pair => &[0, 1],
+            Who::One(0) => Ok(&[0]),
+            Who::One(1) => Ok(&[1]),
+            Who::One(_) => Err(Error::InvalidCtaGroup),
+            Who::Pair => Ok(&[0, 1]),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cmd {
-    /// `tcgen05.alloc[.exclusive?].cta_group::N.sync.aligned` (full warp).
+    /// `tcgen05.alloc[.exclusive].cta_group::N.sync.aligned`, by a full warp.
+    /// Retried while `Blocked`.
     Alloc {
         who: Who,
         columns: u32,
         exclusive: bool,
     },
-    /// `tcgen05.dealloc.cta_group::N.sync.aligned` with the base `taddr`.
-    Dealloc { who: Who, taddr: u32, columns: u32 },
+    /// `tcgen05.dealloc[.exclusive].cta_group::N.sync.aligned` at `taddr`.
+    Dealloc {
+        who: Who,
+        taddr: u32,
+        columns: u32,
+        exclusive: bool,
+    },
     /// `tcgen05.relinquish_alloc_permit.cta_group::N.sync.aligned`.
     Relinquish { who: Who },
 }
@@ -90,31 +114,30 @@ pub enum Cmd {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Outcome {
     Allocated { base: u32 },
+    Blocked,
     Done,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
     InvalidCtaGroup,
-    InvalidColumns {
-        columns: u32,
-    },
+    /// "All tcgen05 instructions within a kernel must specify the same value
+    /// for the .cta_group qualifier."
     CtaGroupMismatch {
         established: u8,
         requested: u8,
+    },
+    InvalidColumns {
+        columns: u32,
     },
     AllocAfterRelinquish,
     AllocationSizeIncrease {
         previous: u32,
         requested: u32,
     },
+    /// No live allocation with this base, width and exclusivity.
     DeallocationMismatch {
         taddr: u32,
-        columns: u32,
-    },
-    /// PTX alloc blocks until columns are free. The engine and verifier fail
-    /// instead (`tcgen.rs:952-966`), so this model does too; see spec §6.5.
-    AllocationUnavailable {
         columns: u32,
     },
     LiveAllocationsAtExit {
@@ -134,15 +157,14 @@ impl crate::Protocol for Tcgen {
     }
 }
 
-/// `tcgen.rs:703-710`: a power of two in `[32, 512]`, or any multiple of 32
-/// for `.exclusive`, bounded by the TMEM capacity.
-pub fn valid_columns(columns: u32, exclusive: bool, capacity: u32) -> bool {
-    (32..=capacity.min(TMEM_COLUMNS)).contains(&columns)
-        && if exclusive {
-            columns.is_multiple_of(32)
-        } else {
-            columns.is_power_of_two()
-        }
+/// Non-exclusive widths are powers of two in [32, 512]. Exclusive widths are
+/// multiples of 32 in [32, exclusive_max].
+pub fn valid_columns(s: &State, columns: u32, exclusive: bool) -> bool {
+    if exclusive {
+        (32..=s.exclusive_max).contains(&columns) && columns.is_multiple_of(32)
+    } else {
+        (32..=s.capacity).contains(&columns) && columns.is_power_of_two()
+    }
 }
 
 pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
@@ -153,33 +175,17 @@ pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
 }
 
 fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
-    let who = match cmd {
-        Cmd::Alloc { who, .. } | Cmd::Dealloc { who, .. } | Cmd::Relinquish { who } => who,
-    };
-    if let Who::One(i) = who {
-        if i > 1 {
-            return Err(Error::InvalidCtaGroup);
-        }
-    }
-    let group = who.group();
-    for &i in who.indices() {
-        if let Some(established) = s.ctas[i].cta_group {
-            if established != group {
-                return Err(Error::CtaGroupMismatch {
-                    established,
-                    requested: group,
-                });
-            }
-        }
-    }
-    let outcome = match cmd {
+    match cmd {
         Cmd::Alloc {
-            columns, exclusive, ..
+            who,
+            columns,
+            exclusive,
         } => {
-            if !valid_columns(columns, exclusive, s.capacity) {
+            let idx = who.indices()?;
+            if !valid_columns(s, columns, exclusive) {
                 return Err(Error::InvalidColumns { columns });
             }
-            for &i in who.indices() {
+            for &i in idx {
                 let cta = &s.ctas[i];
                 if cta.relinquished {
                     return Err(Error::AllocAfterRelinquish);
@@ -193,55 +199,71 @@ fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
                     }
                 }
             }
-            let base =
-                first_fit(s, who, columns).ok_or(Error::AllocationUnavailable { columns })?;
-            for &i in who.indices() {
+            let Some(base) = first_fit(s, idx, columns, exclusive) else {
+                return Ok(Outcome::Blocked);
+            };
+            for &i in idx {
                 let cta = &mut s.ctas[i];
-                cta.allocations.push(Allocation { base, columns });
+                cta.allocations.push(Allocation {
+                    base,
+                    columns,
+                    exclusive,
+                });
                 cta.allocations.sort_by_key(|a| a.base);
                 cta.last_alloc_columns = Some(columns);
             }
-            Outcome::Allocated { base }
+            Ok(Outcome::Allocated { base })
         }
-        Cmd::Dealloc { taddr, columns, .. } => {
+        Cmd::Dealloc {
+            who,
+            taddr,
+            columns,
+            exclusive,
+        } => {
+            let idx = who.indices()?;
             let wanted = Allocation {
                 base: taddr,
                 columns,
+                exclusive,
             };
-            for &i in who.indices() {
+            for &i in idx {
                 if !s.ctas[i].allocations.contains(&wanted) {
                     return Err(Error::DeallocationMismatch { taddr, columns });
                 }
             }
-            for &i in who.indices() {
+            for &i in idx {
                 s.ctas[i].allocations.retain(|a| *a != wanted);
             }
-            Outcome::Done
+            Ok(Outcome::Done)
         }
-        Cmd::Relinquish { .. } => {
-            for &i in who.indices() {
+        Cmd::Relinquish { who } => {
+            for &i in who.indices()? {
                 s.ctas[i].relinquished = true;
             }
-            Outcome::Done
+            Ok(Outcome::Done)
         }
-    };
-    for &i in who.indices() {
-        s.ctas[i].cta_group = Some(group);
     }
-    Ok(outcome)
 }
 
-/// Lowest 32-aligned base free in every participating CTA.
-fn first_fit(s: &State, who: Who, columns: u32) -> Option<u32> {
-    let limit = s.capacity.min(TMEM_COLUMNS);
-    (0..=limit.checked_sub(columns)?).step_by(32).find(|&base| {
-        who.indices().iter().all(|&i| {
-            s.ctas[i]
-                .allocations
-                .iter()
-                .all(|a| base + columns <= a.base || a.base + a.columns <= base)
+/// Lowest 32-aligned base that is free in every participating CTA, or
+/// `None` while the allocation must block.
+fn first_fit(s: &State, idx: &[usize], columns: u32, exclusive: bool) -> Option<u32> {
+    let ctas = || idx.iter().map(|&i| &s.ctas[i]);
+    if exclusive {
+        return ctas().all(|c| c.allocations.is_empty()).then_some(0);
+    }
+    if ctas().any(|c| c.allocations.iter().any(|a| a.exclusive)) {
+        return None;
+    }
+    (0..=s.capacity.checked_sub(columns)?)
+        .step_by(32)
+        .find(|&base| {
+            ctas().all(|c| {
+                c.allocations
+                    .iter()
+                    .all(|a| base + columns <= a.base || a.base + a.columns <= base)
+            })
         })
-    })
 }
 
 pub fn quiescent(s: &State) -> Result<(), Error> {
@@ -257,43 +279,70 @@ pub fn check_invariants(s: &State) -> Result<(), String> {
     for cta in &s.ctas {
         let mut end = 0;
         for a in &cta.allocations {
-            if a.base < end {
-                return Err("overlapping or unsorted allocations".into());
+            if a.base < end || !a.base.is_multiple_of(32) {
+                return Err("overlapping, unsorted or misaligned allocations".into());
             }
-            if !a.base.is_multiple_of(32) || a.base + a.columns > s.capacity.min(TMEM_COLUMNS) {
+            let limit = if a.exclusive {
+                s.exclusive_max
+            } else {
+                s.capacity
+            };
+            if a.base + a.columns > limit {
                 return Err("allocation outside TMEM".into());
             }
             end = a.base + a.columns;
         }
-        if !cta.allocations.is_empty() && cta.cta_group.is_none() {
-            return Err("allocation without established cta_group".into());
+        if cta.allocations.iter().any(|a| a.exclusive) && cta.allocations.len() != 1 {
+            return Err("exclusive allocation is not the sole live allocation".into());
+        }
+        if !cta.allocations.is_empty() && cta.last_alloc_columns.is_none() {
+            return Err("allocation without a recorded width".into());
         }
     }
     Ok(())
 }
 
+/// Kernel-wide `.cta_group` uniformity across every tcgen05 instruction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct KernelState {
+    pub cta_group: Option<u8>,
+}
+
+pub fn use_cta_group(k: &mut KernelState, cta_group: u8) -> Result<(), Error> {
+    if !matches!(cta_group, 1 | 2) {
+        return Err(Error::InvalidCtaGroup);
+    }
+    match k.cta_group {
+        Some(established) if established != cta_group => Err(Error::CtaGroupMismatch {
+            established,
+            requested: cta_group,
+        }),
+        _ => {
+            k.cta_group = Some(cta_group);
+            Ok(())
+        }
+    }
+}
+
 /// Per-thread tcgen05 work queues (`ordering.rs:67-99`). Tokens are counted
-/// because the lifecycle model has no footprints.
+/// because the lifecycle model has no footprints. Kernel-wide `cta_group`
+/// uniformity is checked through [`use_cta_group`] before every command.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WorkState {
-    /// mma / cp / shift issued per cta_group, not yet committed.
-    pub uncommitted: [u32; 2],
+    /// mma / cp / shift issued, not yet committed.
+    pub uncommitted: u32,
     pub loads: u32,
     pub stores: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WorkCmd {
-    Issue {
-        cta_group: u8,
-    },
+    Issue,
     Load,
     Store,
-    /// `tcgen05.commit.cta_group::N`: drains only that group's work. Work
-    /// issued under the other group stays (`ordering.rs:815-849`).
-    Commit {
-        cta_group: u8,
-    },
+    /// `tcgen05.commit`. The arrive-on is
+    /// `mbarrier::Cmd::{Issue, DeferredArrive { count: 1 }}`.
+    Commit,
     WaitLd,
     WaitSt,
 }
@@ -304,15 +353,13 @@ pub enum WorkOutcome {
     Drained { tokens: u32 },
 }
 
-pub fn work_step(s: &mut WorkState, cmd: WorkCmd) -> Result<WorkOutcome, Error> {
-    let slot = |g: u8| match g {
-        1 => Ok(0),
-        2 => Ok(1),
-        _ => Err(Error::InvalidCtaGroup),
+pub fn work_step(s: &mut WorkState, cmd: WorkCmd) -> WorkOutcome {
+    let drain = |n: &mut u32| WorkOutcome::Drained {
+        tokens: std::mem::take(n),
     };
-    Ok(match cmd {
-        WorkCmd::Issue { cta_group } => {
-            s.uncommitted[slot(cta_group)?] += 1;
+    match cmd {
+        WorkCmd::Issue => {
+            s.uncommitted += 1;
             WorkOutcome::Queued
         }
         WorkCmd::Load => {
@@ -323,14 +370,8 @@ pub fn work_step(s: &mut WorkState, cmd: WorkCmd) -> Result<WorkOutcome, Error> 
             s.stores += 1;
             WorkOutcome::Queued
         }
-        WorkCmd::Commit { cta_group } => WorkOutcome::Drained {
-            tokens: std::mem::take(&mut s.uncommitted[slot(cta_group)?]),
-        },
-        WorkCmd::WaitLd => WorkOutcome::Drained {
-            tokens: std::mem::take(&mut s.loads),
-        },
-        WorkCmd::WaitSt => WorkOutcome::Drained {
-            tokens: std::mem::take(&mut s.stores),
-        },
-    })
+        WorkCmd::Commit => drain(&mut s.uncommitted),
+        WorkCmd::WaitLd => drain(&mut s.loads),
+        WorkCmd::WaitSt => drain(&mut s.stores),
+    }
 }
