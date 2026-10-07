@@ -1,0 +1,25 @@
+[package]
+name = "numsim-race-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Standalone prototype of the unified FastTrack-style racecheck core (plan section 2.5): one Clock, one IntervalShadow, one Cell rule for shared, TMEM and global memory."
+
+[lib]
+name = "numsim_race_core"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "=0.5.1", default-features = false }
+
+[[bench]]
+name = "core"
+harness = false
+
+[profile.bench]
+debug = false
+
+# Standalone until the coordinator adds this crate to the core-rs workspace.
+[workspace]
