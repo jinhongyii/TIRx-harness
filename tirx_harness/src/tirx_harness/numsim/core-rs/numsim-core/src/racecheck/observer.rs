@@ -140,6 +140,18 @@ impl Default for RaceObserver {
     }
 }
 
+/// The core packs a 32-bit epoch into its stamps (2^32 instructions per warp
+/// per launch). Beyond that the run is `incomplete`, never truncated.
+fn core_epoch(c: &mut Checker, warp: u32, epoch: u64) -> Option<u32> {
+    match u32::try_from(epoch) {
+        Ok(e) => Some(e),
+        Err(_) => {
+            c.note_incomplete(Incomplete::EpochOverflow { warp });
+            None
+        }
+    }
+}
+
 fn span_range(s: ByteSpan) -> std::ops::Range<u64> {
     s.start..s.end()
 }
@@ -207,6 +219,7 @@ impl Observer for RaceObserver {
         };
         match a.actor {
             Actor::Warp { warp, epoch } => {
+                let Some(epoch) = core_epoch(c, warp.0, epoch) else { return };
                 if sc {
                     let mut lanes = LaneMask::NONE;
                     for s in a.spans {
@@ -255,7 +268,10 @@ impl Observer for RaceObserver {
             return;
         };
         let wa = match e.actor {
-            Actor::Warp { warp, epoch } => Some((warp.0, epoch)),
+            Actor::Warp { warp, epoch } => match core_epoch(c, warp.0, epoch) {
+                Some(epoch) => Some((warp.0, epoch)),
+                None => return,
+            },
             _ => None,
         };
         let lanes = e.lanes;

@@ -1095,6 +1095,16 @@ merged; `inbox_drain` is only a GC safe point. When CTA parallelism lands:
 - Reclaimed `AsyncId`s are remembered, so a late predecessor reference is not
   reported as unknown.
 
+### Epoch bound
+
+The contract's `Actor::Warp.epoch` is a `u64`. The core keeps 32-bit epochs
+inside its packed `(actor, epoch)` stamps, so it checks at most 2^32
+instructions per warp per launch (in practice 2^32 − 2, because the core
+reserves the top values). The adapter converts the epoch with
+`u32::try_from`. On overflow it records `Incomplete::EpochOverflow` and skips
+the event; it never truncates or panics. Async-slot epochs share the same
+32-bit field, at 2 per slot generation.
+
 ### Contract update (e2551cf, b3c72f3)
 
 - Arrive/Wait carry qualifiers and scope. There is no adapter-side

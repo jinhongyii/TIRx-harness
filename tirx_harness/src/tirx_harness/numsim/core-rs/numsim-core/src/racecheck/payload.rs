@@ -114,7 +114,7 @@ fn incomplete_reason(i: &Incomplete) -> (String, Value) {
 fn actor_of(w: &WitnessInfo) -> Actor {
     match w.async_op {
         Some(op) => Actor::Async { op, side: if w.kind == AccessKind::Read { Side::Read } else { Side::Write } },
-        None => Actor::Warp { warp: CWarpId(w.warp), epoch: w.epoch },
+        None => Actor::Warp { warp: CWarpId(w.warp), epoch: u64::from(w.epoch) },
     }
 }
 

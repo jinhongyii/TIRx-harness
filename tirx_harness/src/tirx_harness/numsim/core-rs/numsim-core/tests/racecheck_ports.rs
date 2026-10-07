@@ -329,3 +329,35 @@ fn new_kinds_and_attrs() {
     let rep = report(&k.observe());
     assert!(rep.findings.iter().any(|f| f.kind == CK::AsyncLifetime));
 }
+
+/// Epochs beyond the core's 32-bit stamp field are incomplete, never
+/// truncated.
+#[test]
+fn epoch_beyond_32_bits_is_incomplete() {
+    use numsim_core::observe::{Access as CAccess, AccessSeq, Actor, LaneSpan, Observer, WarpId as CW};
+    use numsim_core::program::Sem;
+    use numsim_core::site::SiteId;
+    let k = K::one_warp();
+    let mut obs = RaceObserver::new(RacecheckConfig::default());
+    obs.start_launch(k.topo, 0);
+    obs.register_alloc(SMEM, Space::Shared, 4096, "smem");
+    let spans = [LaneSpan { lane: 0, span: numsim_core::arena::ByteSpan::new(0, 4) }];
+    obs.access(&CAccess {
+        seq: AccessSeq(0),
+        actor: Actor::Warp { warp: CW(0), epoch: 1 << 32 },
+        site: SiteId(0),
+        alloc: SMEM,
+        space: Space::Shared,
+        kind: AccessKind::Write,
+        sem: Sem::Weak,
+        scope: Scope::Gpu,
+        atomic: false,
+        returns_value: false,
+        proxy: Proxy::Generic,
+        window: None,
+        spans: &spans,
+        declared_word: false,
+    });
+    obs.finish_launch();
+    assert!(obs.launches[0].report.incomplete.iter().any(|i| matches!(i, Incomplete::EpochOverflow { .. })));
+}

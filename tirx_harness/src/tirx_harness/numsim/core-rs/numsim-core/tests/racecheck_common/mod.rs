@@ -153,7 +153,7 @@ impl K {
 
     fn wactor(&mut self, w: WarpId) -> Actor {
         let e = self.tick(w);
-        Actor::Warp { warp: CWarpId(w), epoch: e }
+        Actor::Warp { warp: CWarpId(w), epoch: u64::from(e) }
     }
 
     fn window(&self, alloc: AllocId) -> Option<Window> {
@@ -186,7 +186,7 @@ impl K {
         let window = window.or(self.window(alloc));
         self.ev.push(Ev::Access {
             actor,
-            site: SiteId(w * 1000 + epoch),
+            site: SiteId(w * 1000 + epoch as u32),
             alloc,
             space,
             kind: op.kind,
