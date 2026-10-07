@@ -1,0 +1,31 @@
+{
+ "case": "cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "amax": {
+   "dtype": "float32",
+   "sha256": "9e1c55f5f531b18e5b93335ccc4a08562b206d64e67291c2155aeeefd32d8146",
+   "shape": [
+    1
+   ]
+  },
+  "c": {
+   "dtype": "uint8",
+   "sha256": "c0a47c68767130a772729b0231c09574a324d38377b51267932613abc3f799e3",
+   "shape": [
+    524288
+   ]
+  },
+  "d": {
+   "dtype": "uint8",
+   "sha256": "9d181d6ff3e4521a0f4fd75dd7c337164c51d7441b88c8f5f996994275030172",
+   "shape": [
+    262144
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

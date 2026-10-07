@@ -1,0 +1,11 @@
+{
+ "case": "kda_backward_packed",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

@@ -1,0 +1,24 @@
+{
+ "case": "cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "ab12": {
+   "dtype": "uint8",
+   "sha256": "21920a22319d622b88050eb4c287998fdf5ba38f0a7a26f5ce46cf6e9e5f1716",
+   "shape": [
+    131072
+   ]
+  },
+  "c": {
+   "dtype": "uint8",
+   "sha256": "de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31",
+   "shape": [
+    65536
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

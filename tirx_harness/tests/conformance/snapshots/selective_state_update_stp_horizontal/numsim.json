@@ -1,0 +1,24 @@
+{
+ "case": "selective_state_update_stp_horizontal",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "66011bcba7716d41dd413e5afbebcb06f1f25181eaabbee65232bcc9b9a89fd5",
+   "shape": [
+    64
+   ]
+  },
+  "state": {
+   "dtype": "uint16",
+   "sha256": "1248832d76599b4e9f73ad3859fc90a40e5ab4cce41cae9a2ffff2a4a5f80664",
+   "shape": [
+    4096
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

@@ -1,0 +1,36 @@
+{
+ "case": "cudnn_sm100_bsa_forward_combine_blk64",
+ "diagnostics": [
+  {
+   "anchors": [],
+   "bytes": {
+    "shared#0": "2688-2944,6784-7040",
+    "shared#1": "2688-2944,6784-7040"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "shared",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "lse": {
+   "dtype": "float32",
+   "sha256": "d4f8fc799266ecbc182835ea3ef9765fdfac7130ed327d8bf28100448d5be643",
+   "shape": [
+    1
+   ]
+  },
+  "out": {
+   "dtype": "uint16",
+   "sha256": "875f5319c66638a1ce4386360100079ba29834a8d01770fda233b75e00ffc9c9",
+   "shape": [
+    128
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "review"
+}

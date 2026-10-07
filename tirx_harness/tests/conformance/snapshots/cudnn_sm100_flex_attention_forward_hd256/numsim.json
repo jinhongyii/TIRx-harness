@@ -1,0 +1,24 @@
+{
+ "case": "cudnn_sm100_flex_attention_forward_hd256",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "lse": {
+   "dtype": "float32",
+   "sha256": "cc49637da04dbb62596a7553d8f936843c6cfde5229f1a9e04a42d1bbd44d1f8",
+   "shape": [
+    128
+   ]
+  },
+  "out": {
+   "dtype": "uint16",
+   "sha256": "d453c8da820e19ebc8d23fcf458062d5124bec2917bc925425d23121190317aa",
+   "shape": [
+    32768
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

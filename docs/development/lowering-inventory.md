@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Lowering: TIRx inventory and `Program` design (W1)
 
 Status: draft, 2026-10-07, branch `refactor/clean-core`. This is the W1 input to

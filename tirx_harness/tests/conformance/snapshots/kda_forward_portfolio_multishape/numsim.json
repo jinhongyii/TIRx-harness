@@ -1,0 +1,6 @@
+{
+ "case": "kda_forward_portfolio_multishape",
+ "error": "NumSimExecutionError",
+ "mode": "numsim",
+ "schema": 1
+}

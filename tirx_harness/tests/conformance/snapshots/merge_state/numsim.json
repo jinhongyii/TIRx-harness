@@ -1,0 +1,24 @@
+{
+ "case": "merge_state",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "s_merged": {
+   "dtype": "float32",
+   "sha256": "815d17c61d3264d18f6c04c45b48f95c88ad84c0fd9dd767f8466cc4275d3f33",
+   "shape": [
+    6
+   ]
+  },
+  "v_merged": {
+   "dtype": "float16",
+   "sha256": "f696fb5baded417297255552cb1adfddfc6bb650696d5b2808e0ef34d0b61dea",
+   "shape": [
+    384
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

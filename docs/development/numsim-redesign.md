@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # NumSim / Racecheck / Synccheck 重构方案
 
 状态：草案，2026-10-07。分支 `refactor/clean-core`。

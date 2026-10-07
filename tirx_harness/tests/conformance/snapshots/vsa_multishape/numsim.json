@@ -1,0 +1,19 @@
+{
+ "case": "vsa_multishape",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "35be255a1f9937f982a02eb25beda95c85f28f646e9677545a1fdc969c34cdb7",
+   "shape": [
+    2,
+    384,
+    64
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

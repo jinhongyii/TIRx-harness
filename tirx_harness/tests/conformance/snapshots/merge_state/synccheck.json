@@ -1,0 +1,11 @@
+{
+ "case": "merge_state",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

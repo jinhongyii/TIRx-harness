@@ -1,0 +1,17 @@
+{
+ "case": "bmm_fp8_rubin",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "c": {
+   "dtype": "uint8",
+   "sha256": "c2668719acb9f8ed51484cb309518e0a2458c66e22b0239540d4275df37b76a3",
+   "shape": [
+    65536
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

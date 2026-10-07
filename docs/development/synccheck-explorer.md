@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Synccheck explorer: spec of today's algorithm and the plan for the rewrite
 
 Status: draft, 2026-10-07, branch `refactor/clean-core`, worker W6.

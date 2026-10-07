@@ -1,0 +1,11 @@
+{
+ "case": "dense_blockscaled_gemm_sm107",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

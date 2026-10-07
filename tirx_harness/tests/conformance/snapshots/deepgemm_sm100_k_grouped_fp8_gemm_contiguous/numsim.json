@@ -1,0 +1,18 @@
+{
+ "case": "deepgemm_sm100_k_grouped_fp8_gemm_contiguous",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "D": {
+   "dtype": "float32",
+   "sha256": "04b53ea887201c6e365ce984682e87d645527ddf37e218026fb6c8cff9aca801",
+   "shape": [
+    256,
+    128
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

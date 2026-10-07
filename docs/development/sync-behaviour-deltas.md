@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Sync behaviour deltas vs. legacy
 
 Use this list to review conformance-snapshot diffs. The new `SyncTable::step` behaviour is defined by `core-rs/numsim-sync-ref/`, with the full specification in `sync-semantics.md`. Each row says which legacy model changes: E is the engine checker path, N is the engine NumSim path, S is strict synccheck. A snapshot diff that matches no row here is a regression.

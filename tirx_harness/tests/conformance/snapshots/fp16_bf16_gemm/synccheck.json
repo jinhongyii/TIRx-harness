@@ -1,0 +1,6 @@
+{
+ "case": "fp16_bf16_gemm",
+ "error": "UnsupportedTIRxError",
+ "mode": "synccheck",
+ "schema": 1
+}

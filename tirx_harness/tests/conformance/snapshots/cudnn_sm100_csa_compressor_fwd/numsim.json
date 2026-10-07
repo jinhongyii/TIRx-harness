@@ -1,0 +1,17 @@
+{
+ "case": "cudnn_sm100_csa_compressor_fwd",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out": {
+   "dtype": "uint16",
+   "sha256": "1bc9dac614e3c966620e0c7640f6b4c957e8826eb1bd59b6ed6a7ec2bd6ce791",
+   "shape": [
+    65
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

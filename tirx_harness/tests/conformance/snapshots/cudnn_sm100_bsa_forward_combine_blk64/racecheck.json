@@ -1,0 +1,23 @@
+{
+ "case": "cudnn_sm100_bsa_forward_combine_blk64",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [],
+     "bytes": {
+      "shared#0": "2688-2944,6784-7040",
+      "shared#1": "2688-2944,6784-7040"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

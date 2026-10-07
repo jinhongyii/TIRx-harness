@@ -1,0 +1,24 @@
+{
+ "case": "stable_sort_topk_by_value",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out_idx": {
+   "dtype": "int32",
+   "sha256": "43538e096e5a0c4f8f701a145f5ed12b43b37b762a518407c95723d104bdf054",
+   "shape": [
+    2
+   ]
+  },
+  "out_val": {
+   "dtype": "float32",
+   "sha256": "33354eb9f08c1fb05a874db88f3305edd97bfd4812ed22cd37caed79015c614b",
+   "shape": [
+    2
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

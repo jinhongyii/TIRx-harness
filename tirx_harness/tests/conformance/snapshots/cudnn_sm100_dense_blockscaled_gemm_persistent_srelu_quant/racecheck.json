@@ -1,0 +1,11 @@
+{
+ "case": "cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

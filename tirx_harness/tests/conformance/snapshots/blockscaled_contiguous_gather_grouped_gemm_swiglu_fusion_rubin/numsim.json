@@ -1,0 +1,24 @@
+{
+ "case": "blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "c": {
+   "dtype": "uint8",
+   "sha256": "fb54d370a7c2068bae497ab5f9f20b66002cc935c2a3e3966b8a7f948b720ade",
+   "shape": [
+    8192
+   ]
+  },
+  "sfc": {
+   "dtype": "uint8",
+   "sha256": "27aed94dafb1bbfdb25dd33eec9db88341c3137c98c04c7f890fa7131e40e2d2",
+   "shape": [
+    1024
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

@@ -1,0 +1,23 @@
+{
+ "case": "gdn_cp_prefill_sm100",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  },
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  },
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  },
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

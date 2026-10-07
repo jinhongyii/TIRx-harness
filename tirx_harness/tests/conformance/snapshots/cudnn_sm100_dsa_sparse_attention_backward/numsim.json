@@ -1,0 +1,31 @@
+{
+ "case": "cudnn_sm100_dsa_sparse_attention_backward",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "d_sink": {
+   "dtype": "float32",
+   "sha256": "296ff4484927433b707bb9194d984c15572e7070b52d7a6c5188f84fd15fe866",
+   "shape": [
+    64
+   ]
+  },
+  "dkv": {
+   "dtype": "uint16",
+   "sha256": "4b895b79558ee8d007f00d62205cee694f7d21ba91cfea7f99f16cd2c660bab2",
+   "shape": [
+    32768
+   ]
+  },
+  "dq": {
+   "dtype": "uint16",
+   "sha256": "9488685ae80da1340b27e300e5f261badac783f57f5b85cfa16e4169301097d5",
+   "shape": [
+    32768
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

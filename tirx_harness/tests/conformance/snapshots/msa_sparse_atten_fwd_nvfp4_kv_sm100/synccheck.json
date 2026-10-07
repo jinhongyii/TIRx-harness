@@ -1,0 +1,11 @@
+{
+ "case": "msa_sparse_atten_fwd_nvfp4_kv_sm100",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

@@ -1,0 +1,24 @@
+{
+ "case": "cudnn_sm100_dense_blockscaled_gemm_persistent_amax",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "amax": {
+   "dtype": "float32",
+   "sha256": "4f4b9b7d8b86633e2824e2f439819357b0cd010ab410ea1a691b12c5f94e91e0",
+   "shape": [
+    1
+   ]
+  },
+  "c": {
+   "dtype": "uint8",
+   "sha256": "a27b399bf5c5ab0c841ace2841692b0fc416198091da969f4569133fd1fbb916",
+   "shape": [
+    262144
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

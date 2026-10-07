@@ -1,0 +1,11 @@
+{
+ "case": "kda_decode_multishape",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

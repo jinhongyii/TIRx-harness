@@ -1,0 +1,45 @@
+{
+ "case": "cudnn_sm100_kda_bprop_f16",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "dbeta": {
+   "dtype": "float32",
+   "sha256": "f5f9ddc37d9d4bd436e2292667542851f94944c3266113957e9887cf5ce08092",
+   "shape": [
+    1
+   ]
+  },
+  "dgate": {
+   "dtype": "float32",
+   "sha256": "d43f5f7f0ff194f078096ca537ac9d5cec4283257549f7942fcfb5cbc797e3fe",
+   "shape": [
+    128
+   ]
+  },
+  "dk": {
+   "dtype": "uint8",
+   "sha256": "f79e323fa3064222d09e0161af521272d5aedf361bf01eae1d47cda5718b24cf",
+   "shape": [
+    256
+   ]
+  },
+  "dq": {
+   "dtype": "uint8",
+   "sha256": "f79e323fa3064222d09e0161af521272d5aedf361bf01eae1d47cda5718b24cf",
+   "shape": [
+    256
+   ]
+  },
+  "dv": {
+   "dtype": "uint8",
+   "sha256": "a2e7574e4c750d197443b78220c9addbdaa48e2f3423d7a52700639dd8c3a80f",
+   "shape": [
+    256
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

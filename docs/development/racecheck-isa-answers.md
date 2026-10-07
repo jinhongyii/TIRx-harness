@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Racecheck semantics: ISA answers to memory-model questions R1–R9
 
 These answers resolve the open items in `racecheck-semantics.md` §8, §9 and §10

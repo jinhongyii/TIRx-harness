@@ -1,0 +1,30 @@
+{
+ "case": "deepgemm_sm100_m_grouped_fp8_gemm_masked",
+ "diagnostics": [
+  {
+   "anchors": [],
+   "bytes": {
+    "shared#0": "213120-213504",
+    "shared#1": "213120-213504"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "shared",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "D": {
+   "dtype": "uint16",
+   "sha256": "cd712cf238bddf5949124fe9ef29a02a879419301f79a7b675531b5a82be8a9d",
+   "shape": [
+    8192,
+    128
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "review"
+}

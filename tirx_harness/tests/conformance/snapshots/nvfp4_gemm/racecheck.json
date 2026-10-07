@@ -1,0 +1,11 @@
+{
+ "case": "nvfp4_gemm",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

@@ -1,0 +1,20 @@
+{
+ "case": "msa_prefill_multishape",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "8cc25918bc1fb8ce63c6f6c9bee83a7a97e6e519438be0e2aa3791d2e78199a5",
+   "shape": [
+    2,
+    32,
+    16,
+    64
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

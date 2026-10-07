@@ -1,0 +1,11 @@
+{
+ "case": "stable_sort_topk_by_value",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

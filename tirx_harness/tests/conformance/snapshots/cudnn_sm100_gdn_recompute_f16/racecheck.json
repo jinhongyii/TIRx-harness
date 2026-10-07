@@ -1,0 +1,26 @@
+{
+ "case": "cudnn_sm100_gdn_recompute_f16",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  },
+  {
+   "diagnostics": [
+    {
+     "anchors": [],
+     "bytes": {
+      "shared#0": "11264-19456,27648-35840"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

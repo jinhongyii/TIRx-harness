@@ -1,0 +1,25 @@
+{
+ "case": "sm100_fp8_fp4_mega_moe",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:132:1-132:101",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:2459:1-2459:39"
+     ],
+     "bytes": {
+      "shared#0": "0-8"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

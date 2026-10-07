@@ -1,0 +1,82 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUST_TOOLCHAIN: '1.89.0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust engines
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # engine-rs dev-dependencies embed CPython through pyo3.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Test the legacy engine (engine-rs)
+        working-directory: tirx_harness/src/tirx_harness/numsim/engine-rs
+        run: cargo test --all-features
+      - name: Test the new core (core-rs)
+        run: |
+          core=tirx_harness/src/tirx_harness/numsim/core-rs
+          if [ -f "$core/Cargo.toml" ]; then
+            (cd "$core" && cargo test)
+          else
+            echo "core-rs is not present; skipping"
+          fi
+
+  python:
+    name: Python suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      # Many engine processes share the runner under -n auto.
+      NUMSIM_WORKER_AFFINITY: 'off'
+      NUMSIM_CACHE_DIR: ${{ github.workspace }}/.local/numsim-cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Initialize the TVM Rust frontend submodule
+        run: git submodule update --init thirdparty/tvm-rust-ext
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      # The canonical tirx-kernels modules import torch at module scope, so the
+      # corpus suites need the benchmark group in addition to the test extra.
+      - name: Install the locked environment
+        run: uv sync --locked --python 3.12 --extra test --group benchmark
+      - name: Run the test suite
+        working-directory: tirx_harness
+        run: |
+          ../.venv/bin/python -m pytest -q -n auto --dist=worksteal \
+            -m "not numsim_gpu and not performance"

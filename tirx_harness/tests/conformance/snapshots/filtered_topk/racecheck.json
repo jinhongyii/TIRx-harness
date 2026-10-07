@@ -1,0 +1,11 @@
+{
+ "case": "filtered_topk",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

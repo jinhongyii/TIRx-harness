@@ -1,0 +1,6 @@
+{
+ "case": "mla_dsv4_multishape",
+ "error": "UnsupportedTIRxError",
+ "mode": "synccheck",
+ "schema": 1
+}

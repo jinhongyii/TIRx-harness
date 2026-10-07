@@ -1,0 +1,11 @@
+{
+ "case": "fast_topk_clusters",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

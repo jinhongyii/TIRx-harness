@@ -1,0 +1,23 @@
+{
+ "case": "deepgemm_sm100_m_grouped_fp8_gemm_contiguous",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [],
+     "bytes": {
+      "shared#0": "189312-189440",
+      "shared#1": "189312-189440"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

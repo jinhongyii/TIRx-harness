@@ -1,0 +1,24 @@
+{
+ "case": "gdn_decode_bf16_ilp4",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "610d0d80e34684b5524eed710a4c52ad97856bd22eaf58148e68007fad87fa65",
+   "shape": [
+    512
+   ]
+  },
+  "state": {
+   "dtype": "uint16",
+   "sha256": "f2c546664b149eb6f751db5b8c7c08092cbdefb41a0c21c992f8b448b8a6b0a9",
+   "shape": [
+    65536
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

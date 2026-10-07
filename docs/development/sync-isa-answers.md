@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Sync semantics: ISA answers to open questions Q1–Q7
 
 These answers resolve the open questions in `sync-semantics.md` §8, and the

@@ -1,0 +1,6 @@
+{
+ "case": "mla_dsv4_multishape",
+ "error": "UnsupportedTIRxError",
+ "mode": "racecheck",
+ "schema": 1
+}

@@ -1,0 +1,11 @@
+{
+ "case": "silu_and_mul_nvfp4_experts_quantize",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

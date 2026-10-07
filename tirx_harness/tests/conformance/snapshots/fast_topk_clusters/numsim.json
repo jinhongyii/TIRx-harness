@@ -1,0 +1,31 @@
+{
+ "case": "fast_topk_clusters",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "indices": {
+   "dtype": "int32",
+   "sha256": "f23a45a726eac4901f973fdd6af7cf77124dfff514f4902a5f37d6f82d847b71",
+   "shape": [
+    2
+   ]
+  },
+  "overflow": {
+   "dtype": "int32",
+   "sha256": "fa43239bcee7b97ca62f007cc68487560a39e19f74f3dde7486db3f98df8e471",
+   "shape": [
+    32768
+   ]
+  },
+  "values": {
+   "dtype": "float32",
+   "sha256": "d96ddad28d86700c7040dc3d71e6575c2c48aabfe49e60f19226e5e42dfdfc7a",
+   "shape": [
+    2
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

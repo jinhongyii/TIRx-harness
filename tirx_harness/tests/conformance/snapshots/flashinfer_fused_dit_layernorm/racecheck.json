@@ -1,0 +1,11 @@
+{
+ "case": "flashinfer_fused_dit_layernorm",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

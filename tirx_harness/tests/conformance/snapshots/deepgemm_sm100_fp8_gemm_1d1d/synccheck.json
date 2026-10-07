@@ -1,0 +1,23 @@
+{
+ "case": "deepgemm_sm100_fp8_gemm_1d1d",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [],
+     "bytes": {
+      "shared#0": "217152-217600",
+      "shared#1": "217152-217600"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

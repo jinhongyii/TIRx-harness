@@ -1,0 +1,25 @@
+{
+ "case": "sparse_flashmla_prefill_head128_small_topk_phase1",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:1092:1-1092:62",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:1191:1-1191:43"
+     ],
+     "bytes": {
+      "shared#0": "222208-222212,222216-222220"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

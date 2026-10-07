@@ -1,0 +1,11 @@
+{
+ "case": "fastcu_nvfp4_gemm_gb300",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

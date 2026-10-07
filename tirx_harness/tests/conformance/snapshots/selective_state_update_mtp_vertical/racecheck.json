@@ -1,0 +1,27 @@
+{
+ "case": "selective_state_update_mtp_vertical",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "<TensorLoad> buffer[v, v_1]"
+     ],
+     "bytes": {
+      "register#992": "0-2048",
+      "register#993": "0-2048",
+      "register#994": "0-2048",
+      "register#995": "0-2048"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "register",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

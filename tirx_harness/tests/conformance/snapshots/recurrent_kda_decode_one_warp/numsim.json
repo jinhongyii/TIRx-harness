@@ -1,0 +1,17 @@
+{
+ "case": "recurrent_kda_decode_one_warp",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out": {
+   "dtype": "uint16",
+   "sha256": "6c745eca037e2ddeaeb3b4e84c7cc17416efb123fe7b06a3d025b01ea7b774d3",
+   "shape": [
+    16384
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

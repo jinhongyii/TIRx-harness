@@ -1,0 +1,107 @@
+{
+ "case": "sparse_flashmla_decode_head64",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1285:1-1285:58",
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1719:1-1719:58"
+     ],
+     "bytes": {
+      "shared#0": "215552-215568,215808-215824,216064-216080"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1296:1-1296:66",
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1719:1-1719:58"
+     ],
+     "bytes": {
+      "shared#0": "215568-215808,215824-216064,216080-216320"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1363:1-1363:58",
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1719:1-1719:58"
+     ],
+     "bytes": {
+      "shared#0": "215552-215568,215808-215824,216064-216080"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1374:1-1374:66",
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1719:1-1719:58"
+     ],
+     "bytes": {
+      "shared#0": "215568-215808,215824-216064,216080-216320"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1709:1-1709:62",
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1863:1-1863:55"
+     ],
+     "bytes": {
+      "shared#0": "216576-216608,216704-216736,216832-216864,216960-216992,217088-217120,217216-217248,217344-217376,217472-217504,217600-217632,217728-217760,217856-217888,217984-218016"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:1725:1-1725:58",
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:713:1-713:47"
+     ],
+     "bytes": {
+      "shared#0": "215520-215524,215528-215532,215536-215540"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:674:1-674:54",
+      "tirx_kernels/ported/flashmla/sparse_decode_head64.py:688:1-688:54"
+     ],
+     "bytes": {
+      "shared#0": "198624-202720"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  },
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

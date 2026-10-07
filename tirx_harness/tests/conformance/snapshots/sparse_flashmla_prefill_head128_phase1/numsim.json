@@ -1,0 +1,35 @@
+{
+ "case": "sparse_flashmla_prefill_head128_phase1",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "lse": {
+   "dtype": "float32",
+   "sha256": "f50961dd2a3ef79d474d5a255fd867225b980d5e0934a00062281eec2c7d9752",
+   "shape": [
+    1,
+    128
+   ]
+  },
+  "max_logits": {
+   "dtype": "float32",
+   "sha256": "b13f0f345aa7d198dcceda0d7f2b255048569635bb1157d8a5e35cf6f1573ff9",
+   "shape": [
+    1,
+    128
+   ]
+  },
+  "out": {
+   "dtype": "uint16",
+   "sha256": "5154bfe5501503bcb4a3f169fced16437358f56e066ab7c1535aac15fc92b151",
+   "shape": [
+    1,
+    128,
+    512
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

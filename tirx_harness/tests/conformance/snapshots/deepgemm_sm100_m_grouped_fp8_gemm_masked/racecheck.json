@@ -1,0 +1,23 @@
+{
+ "case": "deepgemm_sm100_m_grouped_fp8_gemm_masked",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [],
+     "bytes": {
+      "shared#0": "213120-213504",
+      "shared#1": "213120-213504"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

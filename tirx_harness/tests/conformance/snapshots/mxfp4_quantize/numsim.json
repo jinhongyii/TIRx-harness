@@ -1,0 +1,24 @@
+{
+ "case": "mxfp4_quantize",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out_global": {
+   "dtype": "uint8",
+   "sha256": "6ec95dbdca4af6f4ee9f1dd161d57d124148df309e916ae83573ed165c1d9f29",
+   "shape": [
+    16
+   ]
+  },
+  "sf_out": {
+   "dtype": "uint8",
+   "sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+   "shape": [
+    1
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

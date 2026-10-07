@@ -1,0 +1,11 @@
+{
+ "case": "deepgemm_sm100_fp4_mqa_logits",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

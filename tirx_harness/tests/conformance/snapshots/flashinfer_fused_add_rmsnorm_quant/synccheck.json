@@ -1,0 +1,22 @@
+{
+ "case": "flashinfer_fused_add_rmsnorm_quant",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [],
+     "bytes": {
+      "shared#0": "256-2048,2304-4096"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

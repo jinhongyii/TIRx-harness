@@ -1,0 +1,11 @@
+{
+ "case": "sm100_fp8_fp4_mega_moe",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

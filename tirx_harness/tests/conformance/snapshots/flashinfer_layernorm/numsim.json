@@ -1,0 +1,17 @@
+{
+ "case": "flashinfer_layernorm",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out": {
+   "dtype": "uint16",
+   "sha256": "2fb92a80be3e3fce915d0c69f1d79dfe4d92a6525ae4bc4347476ccb66feefb1",
+   "shape": [
+    128
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

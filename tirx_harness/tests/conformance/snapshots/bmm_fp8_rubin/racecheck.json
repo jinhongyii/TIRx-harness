@@ -1,0 +1,11 @@
+{
+ "case": "bmm_fp8_rubin",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

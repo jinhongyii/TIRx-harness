@@ -1,0 +1,153 @@
+{
+ "case": "gdn_cp_prefill_sm100",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  },
+  {
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:709:1-709:55",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:717:1-717:55"
+     ],
+     "bytes": {
+      "tmem-columns#0": "0-1024"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  },
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  },
+  {
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:1263:1-1263:55",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:733:1-733:55"
+     ],
+     "bytes": {
+      "tmem-columns#0": "512-768"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:1266:1-1266:55",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:736:1-736:55"
+     ],
+     "bytes": {
+      "tmem-columns#0": "512-768"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:1460:1-1460:41",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:733:1-733:55"
+     ],
+     "bytes": {
+      "tmem-columns#0": "512-768,1536-1792"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:1460:1-1460:41",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:736:1-736:55"
+     ],
+     "bytes": {
+      "tmem-columns#0": "512-768,1536-1792"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:1476:1-1476:41",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:733:1-733:55"
+     ],
+     "bytes": {
+      "tmem-columns#0": "1536-1792"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:1476:1-1476:41",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:736:1-736:55"
+     ],
+     "bytes": {
+      "tmem-columns#0": "1536-1792"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:709:1-709:55",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_cp_prefill_sm100.py:717:1-717:55"
+     ],
+     "bytes": {
+      "tmem-columns#0": "0-512"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

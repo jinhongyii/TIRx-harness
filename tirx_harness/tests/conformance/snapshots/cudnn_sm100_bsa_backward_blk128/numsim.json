@@ -1,0 +1,31 @@
+{
+ "case": "cudnn_sm100_bsa_backward_blk128",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "dk": {
+   "dtype": "uint16",
+   "sha256": "f8ada8563e691882ed4247350c2f2b11ef995147eea8387f6ad74a7599f4f32e",
+   "shape": [
+    8192
+   ]
+  },
+  "dq": {
+   "dtype": "uint16",
+   "sha256": "0b12d4bf7c700e13867d26b7fc3abcad880284fd8c0be8cd3b27c03bf9796c6a",
+   "shape": [
+    64
+   ]
+  },
+  "dv": {
+   "dtype": "uint16",
+   "sha256": "272ec5757691ff334e7d36619cf410454fff89366724e11479533e28a25e0355",
+   "shape": [
+    8192
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

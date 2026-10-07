@@ -1,0 +1,38 @@
+{
+ "case": "cudnn_sm100_gemm_proj_rope_mxfp8_bf16in",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out_fp8_col": {
+   "dtype": "uint8",
+   "sha256": "bbd05cf6097ac9b1f89ea29d2542c1b7b67ee46848393895f5a9e43fa1f621e5",
+   "shape": [
+    3145728
+   ]
+  },
+  "out_fp8_row": {
+   "dtype": "uint8",
+   "sha256": "bbd05cf6097ac9b1f89ea29d2542c1b7b67ee46848393895f5a9e43fa1f621e5",
+   "shape": [
+    3145728
+   ]
+  },
+  "out_scales_col": {
+   "dtype": "uint8",
+   "sha256": "3a3ed164e42500a1c5b2d0093f0a813d27dc50d038f330cc100a7e70ece2e6e4",
+   "shape": [
+    98304
+   ]
+  },
+  "out_scales_row": {
+   "dtype": "uint8",
+   "sha256": "3a3ed164e42500a1c5b2d0093f0a813d27dc50d038f330cc100a7e70ece2e6e4",
+   "shape": [
+    98304
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

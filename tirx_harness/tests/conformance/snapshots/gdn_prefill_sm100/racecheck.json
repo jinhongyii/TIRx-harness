@@ -1,0 +1,108 @@
+{
+ "case": "gdn_prefill_sm100",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:310:1-310:33",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:848:1-848:70"
+     ],
+     "bytes": {
+      "tmem-columns#0": "512-768,1536-1792"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:310:1-310:33",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:849:1-849:102"
+     ],
+     "bytes": {
+      "tmem-columns#0": "512-768,1536-1792"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:848:1-848:70",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:853:1-853:70"
+     ],
+     "bytes": {
+      "tmem-columns#0": "512-768"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:849:1-849:102",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:854:1-854:102"
+     ],
+     "bytes": {
+      "tmem-columns#0": "512-768"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:905:1-905:39",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:926:1-926:39"
+     ],
+     "bytes": {
+      "tmem-columns#0": "0-512"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:979:1-979:51",
+      "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:996:1-996:51"
+     ],
+     "bytes": {
+      "tmem-columns#0": "0-512"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

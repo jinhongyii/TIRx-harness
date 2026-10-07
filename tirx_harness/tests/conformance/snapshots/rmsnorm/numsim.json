@@ -1,0 +1,17 @@
+{
+ "case": "rmsnorm",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out_global": {
+   "dtype": "float16",
+   "sha256": "523a164ddfbe3a2ac056db6b7aab1d41faa8127c380ecce25cf87654fd170e6a",
+   "shape": [
+    128
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

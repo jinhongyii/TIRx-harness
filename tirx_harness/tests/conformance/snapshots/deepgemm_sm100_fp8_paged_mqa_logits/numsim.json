@@ -1,0 +1,17 @@
+{
+ "case": "deepgemm_sm100_fp8_paged_mqa_logits",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "logits": {
+   "dtype": "float32",
+   "sha256": "a71487351626275b40ab6ac5f4dae6f538d0bd1346909ba62d86fe38262ecfcf",
+   "shape": [
+    256
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

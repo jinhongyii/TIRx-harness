@@ -1,0 +1,24 @@
+{
+ "case": "radix_topk_single_cta",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out_idx": {
+   "dtype": "int32",
+   "sha256": "cc0763bd98fb84b72230d384e49bfb8a9d3020ef9dfa63e2dcb2de4f689bee61",
+   "shape": [
+    2
+   ]
+  },
+  "out_val": {
+   "dtype": "float32",
+   "sha256": "7fc3a5bc1fb517983d1b38d1a513dafcdaafda35e453a93e9970519c7229c787",
+   "shape": [
+    2
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

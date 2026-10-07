@@ -1,0 +1,11 @@
+{
+ "case": "flash_attention4_fp4",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

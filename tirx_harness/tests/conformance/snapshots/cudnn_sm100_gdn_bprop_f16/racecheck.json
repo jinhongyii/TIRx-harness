@@ -1,0 +1,74 @@
+{
+ "case": "cudnn_sm100_gdn_bprop_f16",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  },
+  {
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:541:1-541:55",
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:932:1-932:27"
+     ],
+     "bytes": {
+      "tmem-columns#0": "512-768,1024-1536"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:541:1-541:55",
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:956:1-956:27"
+     ],
+     "bytes": {
+      "tmem-columns#0": "1024-1536"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:574:1-574:55",
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:581:1-581:55"
+     ],
+     "bytes": {
+      "tmem-columns#0": "1792-1920"
+     },
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "anchors": [],
+     "bytes": {
+      "shared#0": "68608-101376,150528-183296"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 1
+}

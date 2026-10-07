@@ -1,0 +1,11 @@
+{
+ "case": "mxfp4_quantize",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}

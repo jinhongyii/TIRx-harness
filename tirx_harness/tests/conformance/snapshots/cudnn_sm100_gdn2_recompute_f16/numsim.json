@@ -1,0 +1,27 @@
+{
+ "case": "cudnn_sm100_gdn2_recompute_f16",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "checkpoints": {
+   "dtype": "float16",
+   "sha256": "0e8bb545e25e279bf27e681040e3216bde529fcc15372e3fcbc33d5caed1f820",
+   "shape": [
+    1,
+    2,
+    128,
+    128
+   ]
+  },
+  "final_state": {
+   "dtype": "float32",
+   "sha256": "132b22eb74d8ba5213a3f1d5adce6b77c337d8e1c3f1947861e39363d816aa36",
+   "shape": [
+    16384
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

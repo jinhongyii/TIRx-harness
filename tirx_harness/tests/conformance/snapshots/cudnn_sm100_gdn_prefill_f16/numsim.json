@@ -1,0 +1,24 @@
+{
+ "case": "cudnn_sm100_gdn_prefill_f16",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "final_state": {
+   "dtype": "float32",
+   "sha256": "7a8114947245b9aa679f028c8b0c2fe968984cc327a62d66e6b32ce107ecfca3",
+   "shape": [
+    16384
+   ]
+  },
+  "output": {
+   "dtype": "uint16",
+   "sha256": "bb3703bb979eb0118b587ac6d8583fc7079d7706c94f51391c03d366e020e8cb",
+   "shape": [
+    128
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

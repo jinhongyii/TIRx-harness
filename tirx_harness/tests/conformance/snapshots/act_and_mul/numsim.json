@@ -1,0 +1,18 @@
+{
+ "case": "act_and_mul",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out_global": {
+   "dtype": "float16",
+   "sha256": "4eab1b33ec24a02babfe3dabb7766c267c3b9864f520e9e50f6e5a29a2af69c4",
+   "shape": [
+    1,
+    256
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

@@ -1,0 +1,30 @@
+{
+ "case": "deepgemm_sm100_fp8_gemm_1d1d",
+ "diagnostics": [
+  {
+   "anchors": [],
+   "bytes": {
+    "shared#0": "217152-217600",
+    "shared#1": "217152-217600"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "shared",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "D": {
+   "dtype": "uint16",
+   "sha256": "989299f1d3bad5e3d8ff1fbf3fa8eebf5f65b8025592efb928d38398ecaf87b8",
+   "shape": [
+    16,
+    256
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "review"
+}

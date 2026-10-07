@@ -1,0 +1,24 @@
+{
+ "case": "msa_sparse_prepare_flat_schedule_sm100",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "scheduler_metadata": {
+   "dtype": "int32",
+   "sha256": "a90d90bbbac09e655865d42536c19ef1068baad0e2318d06db7772ed130968d0",
+   "shape": [
+    6
+   ]
+  },
+  "work_count": {
+   "dtype": "int32",
+   "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450",
+   "shape": [
+    1
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

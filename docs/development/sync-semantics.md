@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # NumSim synchronization semantics (SyncTable spec)
 
 Status: specification for redesign worker W3 (`numsim-redesign.md` §2.1 SyncTable, §2.6, §4.1).

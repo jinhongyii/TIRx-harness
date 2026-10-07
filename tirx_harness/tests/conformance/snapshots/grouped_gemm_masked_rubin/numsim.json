@@ -1,0 +1,17 @@
+{
+ "case": "grouped_gemm_masked_rubin",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "c": {
+   "dtype": "uint8",
+   "sha256": "c22b83fe7eb579f6b17b74cd3d0fb49a160fc3d35cff1cf7a039b050dfd4ba0d",
+   "shape": [
+    98304
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 1,
+ "verdict": "clean"
+}

@@ -1,0 +1,11 @@
+{
+ "case": "nvfp4_gemm",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 1
+}
