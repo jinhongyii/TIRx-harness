@@ -94,7 +94,7 @@ Each `step` takes one resource state and one already-resolved command:
 | named barrier | `(cta, id 0..15)` | `named::State` | `Arrive(Contribution)`, `Sync(Contribution)`, `Red(Contribution)`, `Resume{gen}` |
 | cluster barrier | `cluster` | `cluster::State` | `Arrive{warp,mask,aligned}`, `Wait{warp,mask,aligned}`, `Exit{warp,lanes}` |
 | async group | `(warp, lane, domain)` | `async_group::State` | `Issue`, `Commit`, `ArriveOn`, `Complete{ordinal,milestone}`, `Wait{n,read}`, `Exit` |
-| tcgen kernel | `kernel` | `tcgen::KernelState` | `use_cta_group(g)` |
+| tcgen kernel | `ResourceId::TcgenKernel` | `tcgen::KernelState` | `SyncCmd::TcgenGroup(g)` (`use_cta_group`). `SyncTable::step`/`step_all` add it implicitly before every lifecycle command, committed atomically with it. Handlers add it explicitly in the same `step_all` batch for mma/cp/shift/commit. |
 | tcgen lifecycle | `cta pair` | `tcgen::State` (`exclusive_max`: 512 or 576) | `Alloc{who,columns,exclusive}` → `Allocated{base}` or `Blocked`, `Dealloc{who,taddr,columns,exclusive}`, `Relinquish{who}` |
 | tcgen work | `(warp, lane)` | `tcgen::WorkState` | `Issue`, `Load`, `Store`, `Commit`, `WaitLd`, `WaitSt` |
 | setmaxnreg | `cta` | `setmaxnreg::State` | `Configure{count}`, `Set{wg,inc,count}`, `WarpgroupSync{wg}`, `Grant{wg}`, `Poll{wg}` |

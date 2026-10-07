@@ -80,6 +80,11 @@ pub enum SyncCmd {
     AsyncGroup(async_group::Cmd),
     Tcgen(tcgen::Cmd),
     TcgenWork(tcgen::WorkCmd),
+    /// Record/check the kernel-wide `.cta_group` (resource `TcgenKernel`).
+    /// `SyncTable` adds it implicitly before every `Tcgen` lifecycle
+    /// command; handlers add it explicitly (same `step_all` batch) before
+    /// mma / cp / shift / commit, whose `WorkCmd` carries no group.
+    TcgenGroup(u8),
     RegPool(setmaxnreg::Cmd),
 }
 
@@ -139,6 +144,7 @@ pub enum Resource {
     AsyncGroup(async_group::State),
     Tcgen(tcgen::State),
     TcgenWork(tcgen::WorkState),
+    TcgenKernel(tcgen::KernelState),
     RegPool(setmaxnreg::State),
 }
 
@@ -211,6 +217,7 @@ impl SyncTable {
             ResourceId::AsyncGroup { domain, .. } => Resource::AsyncGroup(async_group::State::new(domain)),
             ResourceId::TcgenLifecycle { .. } => Resource::Tcgen(tcgen::State::default()),
             ResourceId::TcgenWork { .. } => Resource::TcgenWork(tcgen::WorkState::default()),
+            ResourceId::TcgenKernel => Resource::TcgenKernel(tcgen::KernelState::default()),
             ResourceId::RegPool { .. } => Resource::RegPool(setmaxnreg::State::new(self.init.warps_per_cta)),
             ResourceId::Word { .. } | ResourceId::Grid | ResourceId::WarpSync { .. } => return None,
         })
@@ -232,6 +239,9 @@ impl SyncTable {
             (Resource::TcgenWork(s), SyncCmd::TcgenWork(c)) => {
                 Ok(Outcome::TcgenWork(tcgen::work_step(s, c)))
             }
+            (Resource::TcgenKernel(k), SyncCmd::TcgenGroup(g)) => tcgen::use_cta_group(k, g)
+                .map(|()| Outcome::Tcgen(tcgen::Outcome::Done))
+                .map_err(SyncError::Tcgen),
             (Resource::RegPool(s), SyncCmd::RegPool(c)) => {
                 setmaxnreg::step(s, c).map(Outcome::RegPool).map_err(SyncError::RegPool)
             }
@@ -245,7 +255,16 @@ impl SyncTable {
     /// this command is not kept). A `Blocked` outcome keeps the protocol's
     /// own bookkeeping, e.g. a parked mbarrier wait (`armed`) that consumes
     /// the phase when it completes; the retry is idempotent.
+    ///
+    /// A `Tcgen` lifecycle command first checks the kernel-wide `.cta_group`
+    /// (see [`SyncCmd::TcgenGroup`]); both commit together or not at all.
     pub fn step(&mut self, id: ResourceId, cmd: SyncCmd) -> Result<Step<Outcome>, SyncError> {
+        if let SyncCmd::Tcgen(_) = cmd {
+            return Ok(match self.step_all(&[(id, cmd)])? {
+                Step::Done(mut outs) => Step::Done(outs.pop().expect("one command, one outcome")),
+                Step::Blocked(b) => Step::Blocked(b),
+            });
+        }
         let out = match self.resources.get_mut(&id) {
             Some(res) => Self::apply(res, id, cmd)?,
             None => {
@@ -260,30 +279,44 @@ impl SyncTable {
 
     /// All-or-nothing multi-target step (multicast arrive, lane-varying
     /// batches, 2-CTA ops): applies to clones and commits only if every
-    /// command succeeded and none blocked.
+    /// command succeeded and none blocked. Each `Tcgen` lifecycle command is
+    /// preceded by an implicit `TcgenGroup` check on `TcgenKernel`; only the
+    /// listed commands produce outcomes.
     pub fn step_all(&mut self, cmds: &[(ResourceId, SyncCmd)]) -> Result<Step<Vec<Outcome>>, SyncError> {
-        let mut staged: Vec<(ResourceId, Resource)> = Vec::with_capacity(cmds.len());
+        let mut staged: Vec<(ResourceId, Resource)> = Vec::with_capacity(cmds.len() + 1);
         let mut outs = Vec::with_capacity(cmds.len());
         for &(id, cmd) in cmds {
-            let pos = staged.iter().position(|(r, _)| *r == id);
-            let mut res = match pos {
-                Some(i) => staged.remove(i).1,
-                None => match self.resources.get(&id) {
-                    Some(r) => r.clone(),
-                    None => self.fresh(id).ok_or(SyncError::WrongResource { resource: id })?,
-                },
-            };
-            let out = Self::apply(&mut res, id, cmd)?;
+            if let SyncCmd::Tcgen(c) = cmd {
+                let group = SyncCmd::TcgenGroup(tcgen_cmd_group(c));
+                self.stage(&mut staged, ResourceId::TcgenKernel, group)?;
+            }
+            let out = self.stage(&mut staged, id, cmd)?;
             if out.is_blocked() {
                 return Ok(Step::Blocked(id));
             }
             outs.push(out);
-            staged.push((id, res));
         }
         for (id, r) in staged {
             self.resources.insert(id, r);
         }
         Ok(Step::Done(outs))
+    }
+
+    /// Apply `cmd` to the staged copy of `id` (cloned or created on first
+    /// touch within this batch).
+    fn stage(&self, staged: &mut Vec<(ResourceId, Resource)>, id: ResourceId, cmd: SyncCmd) -> Result<Outcome, SyncError> {
+        let i = match staged.iter().position(|(r, _)| *r == id) {
+            Some(i) => i,
+            None => {
+                let res = match self.resources.get(&id) {
+                    Some(r) => r.clone(),
+                    None => self.fresh(id).ok_or(SyncError::WrongResource { resource: id })?,
+                };
+                staged.push((id, res));
+                staged.len() - 1
+            }
+        };
+        Self::apply(&mut staged[i].1, id, cmd)
     }
 
     /// Is this completion enabled now (W3 spec 1.3 rules: mbarrier action
@@ -364,7 +397,7 @@ impl SyncTable {
                 Resource::Cluster(s) => cluster::quiescent(s).map_err(SyncError::Cluster),
                 Resource::AsyncGroup(s) => async_group::quiescent(s).map_err(SyncError::AsyncGroup),
                 Resource::Tcgen(s) => tcgen::quiescent(s).map_err(SyncError::Tcgen),
-                Resource::TcgenWork(_) => Ok(()),
+                Resource::TcgenWork(_) | Resource::TcgenKernel(_) => Ok(()),
                 Resource::RegPool(s) => setmaxnreg::quiescent(s).map_err(SyncError::RegPool),
             };
             if let Err(e) = e {
@@ -373,5 +406,12 @@ impl SyncTable {
         }
         out.sort_by_cached_key(|(id, _)| format!("{id:?}"));
         out
+    }
+}
+
+/// `.cta_group` a tcgen05 lifecycle command uses.
+fn tcgen_cmd_group(c: tcgen::Cmd) -> u8 {
+    match c {
+        tcgen::Cmd::Alloc { who, .. } | tcgen::Cmd::Dealloc { who, .. } | tcgen::Cmd::Relinquish { who } => who.group(),
     }
 }

@@ -43,6 +43,9 @@ pub enum ResourceId {
     TcgenLifecycle { pair: CtaId },
     /// tcgen05 per-thread work queue (commit / wait::ld / wait::st).
     TcgenWork { warp: WarpId, lane: u8 },
+    /// Kernel-wide tcgen05 `.cta_group` (PTX 9.4 §9.7.18.7.1: every tcgen05
+    /// instruction of a kernel uses the same value).
+    TcgenKernel,
     /// setmaxnreg register pool of a CTA.
     RegPool { cta: CtaId },
     /// A declared synchronization word (`WaitUntil`).

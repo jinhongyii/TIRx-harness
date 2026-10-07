@@ -156,3 +156,24 @@ engine or scheduler fault.
    `libloading = "=0.8.6"`, `sha2 = "=0.10.8"`, dev-dep
    `criterion = "=0.5.1"` (default-features off) and `[[bench]] codegen`
    (harness = false).
+
+## W3-3 done (2026-10-07)
+
+Added `ResourceId::TcgenKernel`, `Resource::TcgenKernel(tcgen::KernelState)`
+and `SyncCmd::TcgenGroup(u8)`. A `TcgenGroup` step returns
+`Outcome::Tcgen(tcgen::Outcome::Done)` or `SyncError::Tcgen(CtaGroupMismatch | InvalidCtaGroup)`.
+
+`SyncTable::step` and `step_all` stage an implicit `TcgenGroup(who.group())`
+before every `SyncCmd::Tcgen` lifecycle command. If the lifecycle command
+errors or blocks, the group is not committed. W2's handlers must add
+`(ResourceId::TcgenKernel, SyncCmd::TcgenGroup(g))` to the same `step_all`
+batch for tcgen05 mma / cp / shift / commit, because `WorkCmd` carries no group.
+
+To keep the build green I added one match arm to each of two W6 files:
+- `synccheck/backend.rs`: `ResourceId::TcgenKernel => return None`, so the
+  explorer does not model the group yet.
+- `synccheck/kinds.rs`: `SyncCmd::TcgenGroup(_) => "tcgen05.cta_group"`.
+
+The differential test `table_tcgen_kernel_group` compares the `SyncTable`
+against the reference composition `use_cta_group`, then `tcgen::step`,
+committed only on a non-blocked success.

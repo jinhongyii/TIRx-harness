@@ -424,5 +424,74 @@ mod table {
                 let _ = table.step(id, cmd);
             }
         }
+
+        /// Kernel-wide `.cta_group` through `SyncTable`: every lifecycle
+        /// command implicitly checks it, `TcgenGroup` checks it explicitly,
+        /// and a failed or blocked lifecycle command commits neither. The
+        /// reference composition: `use_cta_group` then `tcgen::step`, both on
+        /// clones, committed only on a non-blocked success.
+        #[test]
+        fn table_tcgen_kernel_group(ops in prop::collection::vec((
+            0u8..4,
+            0u8..4,
+            prop::sample::select(vec![32u32, 64, 128, 256, 512, 16]),
+            prop::sample::select(vec![0u32, 32, 64, 128, 256]),
+            prop::bool::weighted(0.2),
+        ), 0..MAX_LEN)) {
+            let mut table = SyncTable::new(ResourceInit::default());
+            let life = ResourceId::TcgenLifecycle { pair: CtaId(0) };
+            let mut rk = spec::tcgen::KernelState::default();
+            let mut rs = spec::tcgen::State::default();
+            for (i, &(kind, w, columns, taddr, exclusive)) in ops.iter().enumerate() {
+                let group = if w == 2 { 2 } else { 1 };
+                if kind == 3 {
+                    // Explicit group check, as mma/cp/shift/commit handlers issue it.
+                    let g = w.min(3);
+                    let r = spec::tcgen::use_cta_group(&mut rk, g);
+                    let c = table.step(ResourceId::TcgenKernel, SyncCmd::TcgenGroup(g));
+                    match (&r, &c) {
+                        (Ok(()), Ok(Step::Done(prod::Outcome::Tcgen(prod::tcgen::Outcome::Done)))) => {}
+                        (Err(re), Err(prod::SyncError::Tcgen(ce))) => prop_assert_eq!(dbg(re), dbg(ce)),
+                        _ => prop_assert!(false, "#{} group {:?} vs {:?}", i, r, c),
+                    }
+                } else {
+                    let (rw, cw) = match w {
+                        0 => both!(tcgen, Who::One(0)),
+                        1 => both!(tcgen, Who::One(1)),
+                        2 => both!(tcgen, Who::Pair),
+                        _ => both!(tcgen, Who::One(7)),
+                    };
+                    let (rc, cc) = match kind {
+                        0 => (spec::tcgen::Cmd::Alloc { who: rw, columns, exclusive }, prod::tcgen::Cmd::Alloc { who: cw, columns, exclusive }),
+                        1 => (spec::tcgen::Cmd::Dealloc { who: rw, taddr, columns, exclusive }, prod::tcgen::Cmd::Dealloc { who: cw, taddr, columns, exclusive }),
+                        _ => (spec::tcgen::Cmd::Relinquish { who: rw }, prod::tcgen::Cmd::Relinquish { who: cw }),
+                    };
+                    let mut k2 = rk;
+                    let mut s2 = rs.clone();
+                    let r = spec::tcgen::use_cta_group(&mut k2, group).and_then(|()| spec::tcgen::step(&mut s2, rc));
+                    if matches!(r, Ok(o) if o != spec::tcgen::Outcome::Blocked) {
+                        rk = k2;
+                        rs = s2;
+                    }
+                    let c = table.step(life, SyncCmd::Tcgen(cc));
+                    match (&r, &c) {
+                        (Ok(spec::tcgen::Outcome::Blocked), Ok(Step::Blocked(b))) => prop_assert_eq!(*b, life),
+                        (Ok(ro), Ok(Step::Done(prod::Outcome::Tcgen(co)))) => prop_assert_eq!(dbg(ro), dbg(co)),
+                        (Err(re), Err(prod::SyncError::Tcgen(ce))) => prop_assert_eq!(dbg(re), dbg(ce)),
+                        _ => prop_assert!(false, "#{} lifecycle {:?} vs {:?}", i, r, c),
+                    }
+                }
+                match table.get(ResourceId::TcgenKernel) {
+                    Some(Resource::TcgenKernel(k)) => prop_assert_eq!(dbg(&rk), dbg(k)),
+                    None => prop_assert_eq!(rk.cta_group, None),
+                    other => prop_assert!(false, "{:?}", other),
+                }
+                match table.get(life) {
+                    Some(Resource::Tcgen(s)) => prop_assert_eq!(dbg(&rs), dbg(s)),
+                    None => prop_assert_eq!(dbg(&rs), dbg(&spec::tcgen::State::default())),
+                    other => prop_assert!(false, "{:?}", other),
+                }
+            }
+        }
     }
 }
