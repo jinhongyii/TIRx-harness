@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::cell::{overlap, Cell, Entry, Witness};
+use crate::cell::{effective_heads, overlap, Cell, Entry, Witness};
 use crate::clock::{ActorId, Clock, Epoch, JoinMemo, LaneVec, Stamp};
 use crate::input::*;
-use crate::knowledge::{fence_domains, select_view, Knowledge, Rel, View, NDOM};
+use crate::knowledge::{fence_domains, select_view, Heads, Knowledge, Rel, View, NDOM};
 use crate::shadow::IntervalShadow;
 
 // ---------------------------------------------------------------- report --
@@ -60,10 +60,24 @@ pub enum FindingKind {
     TmemLifetimeReview { class: RaceClass, failure: OrderingFailure },
     /// A release/acquire pair whose scopes do not mutually cover.
     ScopeMismatch { release_scope: Scope, acquire_scope: Scope, release_warp: WarpId, acquire_warp: WarpId },
+    /// Advisory (`review`): not a proven race, an unresolved risk.
+    Advisory { kind: AdvisoryKind },
     /// An allocation ended while an async op with a footprint in it had not
     /// reached any completion milestone.
     AsyncLifetime { op: AsyncId },
     OutOfBounds { size: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AdvisoryKind {
+    /// Two async-proxy accesses issued from different CTAs, ordered only by
+    /// base causality. PTX §8.9.5 preserves same-proxy order only "by the
+    /// same thread block"; which block an async op belongs to is ISA-silent.
+    CrossCtaAsyncOrder,
+    /// A strong load observed an unordered, morally strong write on a word
+    /// that is not a declared `wait_until` word: not a race (§8.7.1), but the
+    /// edge it yields is schedule dependent.
+    UndeclaredProtocolWord,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,7 +264,7 @@ struct Phase {
 }
 
 struct HistEntry {
-    rel: Option<Arc<Rel>>,
+    rel: Option<Heads>,
     is_async: bool,
 }
 
@@ -437,6 +451,40 @@ impl Checker {
         }
     }
 
+    /// Async-proxy pair whose two ops were issued from different CTAs.
+    fn cross_cta_async(&self, prior: &Witness, cur: Cur, cur_proxy: Proxy) -> bool {
+        let nw = self.topo.num_warps();
+        let Cur::Async { a } = cur else { return false };
+        prior.proxy == Proxy::Async
+            && cur_proxy == Proxy::Async
+            && prior.stamp.actor() >= nw
+            && prior.stamp.actor() != self.asyncs[a].actor
+            && self.topo.cta_of(prior.warp) != self.topo.cta_of(self.asyncs[a].warp)
+            && (prior.writes() || cur_proxy == Proxy::Async)
+    }
+
+    fn report_advisory(&mut self, alloc: AllocId, bytes: Range<u64>, prior: &Witness, cw: &Witness, kind: AdvisoryKind) {
+        if !(prior.writes() || cw.writes()) {
+            return;
+        }
+        if self
+            .report
+            .findings
+            .iter()
+            .any(|f| f.kind == FindingKind::Advisory { kind } && f.alloc == alloc && f.current.as_ref().is_some_and(|c| c.site == cw.site))
+        {
+            return;
+        }
+        self.report.findings.push(Finding {
+            kind: FindingKind::Advisory { kind },
+            severity: Severity::Review,
+            alloc,
+            bytes,
+            prior: Some(self.info(prior)),
+            current: Some(self.info(cw)),
+        });
+    }
+
     fn info(&self, w: &Witness) -> WitnessInfo {
         let nw = self.topo.num_warps();
         let (lane, op) = if w.stamp.actor() >= nw {
@@ -547,60 +595,73 @@ impl Checker {
         };
 
         let mut races: Vec<(Range<u64>, Witness)> = Vec::new();
-        let mut acquired: Vec<Arc<Rel>> = Vec::new();
-        let mut word_rel: Option<Option<Arc<Rel>>> = None;
+        let mut advisories: Vec<(Range<u64>, Witness, AdvisoryKind)> = Vec::new();
+        let mut acquired: Vec<Heads> = Vec::new();
+        let mut word_rel: Option<Option<Heads>> = None;
         let word_start = self.words.iter().find(|x| x.alloc == a.alloc && x.range.start < a.range.end && a.range.start < x.range.end).map(|x| x.range.start);
+        let in_word = word_start.is_some();
 
         let mut shadow = std::mem::take(&mut self.allocs.get_mut(&a.alloc).unwrap().shadow);
         {
             let this = &*self;
             shadow.update(a.range.clone(), |seg, cell| {
                 // 1. check
-                for p in cell.writes.as_slice() {
-                    if !this.ordered(cur, &p.w, a.proxy) && !this.morally_strong(&p.w, &w) {
-                        races.push((overlap(p.w.span, &seg), p.w.clone()));
+                let mut check = |p: &Witness| {
+                    let ordered = this.ordered(cur, p, a.proxy);
+                    let ms = this.morally_strong(p, &w);
+                    if !ordered && !ms {
+                        races.push((overlap(p.span, &seg), p.clone()));
+                    } else if ordered && this.cross_cta_async(p, cur, a.proxy) {
+                        advisories.push((overlap(p.span, &seg), p.clone(), AdvisoryKind::CrossCtaAsyncOrder));
+                    } else if !ordered && ms && !writes && !in_word && p.writes() {
+                        advisories.push((overlap(p.span, &seg), p.clone(), AdvisoryKind::UndeclaredProtocolWord));
                     }
+                };
+                for p in cell.writes.as_slice() {
+                    check(&p.w);
                 }
                 if writes {
                     for p in cell.reads.as_slice() {
-                        if !this.ordered(cur, &p.w, a.proxy) && !this.morally_strong(&p.w, &w) {
-                            races.push((overlap(p.w.span, &seg), p.w.clone()));
-                        }
+                        check(&p.w);
                     }
                 }
-                // 2. read-from (strong reads)
-                if !writes || a.kind == AccessKind::Rmw {
-                    if strong {
-                        if let Some(last) = cell.writes.last() {
-                            if let Some(rel) = &last.rel {
-                                if this.morally_strong(&last.w, &w) && !acquired.iter().any(|r| Arc::ptr_eq(r, rel)) {
-                                    acquired.push(rel.clone());
-                                }
-                            }
+                // The write this access reads from: the latest one that is
+                // not a sibling lane of the same instruction.
+                let prev = cell
+                    .writes
+                    .as_slice()
+                    .iter()
+                    .rev()
+                    .find(|e| !(e.w.stamp == w.stamp && e.w.lane != w.lane))
+                    .filter(|e| this.morally_strong(&e.w, &w));
+                let inherited = prev.and_then(|e| effective_heads(&cell.writes, e));
+                // 2. read-from (strong reads and atomics)
+                if strong && (!writes || a.kind == AccessKind::Rmw) {
+                    if let Some(h) = &inherited {
+                        if !acquired.iter().any(|r| Arc::ptr_eq(r, h)) {
+                            acquired.push(h.clone());
                         }
                     }
                 }
                 // 3. record
                 if writes {
-                    let mut rel = own_rel.clone();
-                    if a.kind == AccessKind::Rmw {
-                        // Release sequence: an RMW continues the chain of the
-                        // write it reads from.
-                        if let Some(last) = cell.writes.last() {
-                            if let (Some(prev), true) = (&last.rel, this.morally_strong(&last.w, &w)) {
-                                let mut k = prev.k.clone();
-                                if let Some(own) = &own_rel {
-                                    k.join_propagating(&own.k, &this.memo);
-                                }
-                                let scope = own_rel.as_ref().and_then(|r| r.scope).or(prev.scope);
-                                rel = Some(Arc::new(Rel { k, scope, warp: prev.warp }));
-                            }
+                    // Observation order (PTX §8.9.2): an atomic continues the
+                    // chain of the write it reads from; heads stay separate so
+                    // each is scope-checked against the eventual acquirer.
+                    let base = if a.kind == AccessKind::Rmw { inherited.clone() } else { None };
+                    let rel = match (&base, &own_rel) {
+                        (None, None) => None,
+                        (Some(b), None) => Some(b.clone()),
+                        (b, Some(own)) => {
+                            let mut v: Vec<Arc<Rel>> = b.as_ref().map(|b| b.to_vec()).unwrap_or_default();
+                            v.push(own.clone());
+                            Some(Arc::new(v))
                         }
-                    }
+                    };
                     if word_start.is_some_and(|s| seg.start <= s && s < seg.end) {
                         word_rel = Some(rel.clone());
                     }
-                    let entry = Entry { w: w.clone(), rel };
+                    let entry = Entry { w: w.clone(), rel, base };
                     cell.writes.record(entry, |p| this.ordered(cur, p, a.proxy));
                     if !strong {
                         // A plain write supersedes the readers it is ordered
@@ -609,13 +670,16 @@ impl Checker {
                         cell.reads.retain(|r| !this.ordered(cur, &r.w, a.proxy));
                     }
                 } else {
-                    cell.reads.record(Entry { w: w.clone(), rel: None }, |p| this.ordered(cur, p, a.proxy));
+                    cell.reads.record(Entry { w: w.clone(), rel: None, base: None }, |p| this.ordered(cur, p, a.proxy));
                 }
             });
         }
         self.allocs.get_mut(&a.alloc).unwrap().shadow = shadow;
         for (bytes, prior) in races {
             self.report_race(a.alloc, bytes, cur, &prior, &w);
+        }
+        for (bytes, prior, kind) in advisories {
+            self.report_advisory(a.alloc, bytes, &prior, &w, kind);
         }
         if let Some(rel) = word_rel {
             let ws = word_start.unwrap();
@@ -624,14 +688,16 @@ impl Checker {
             }
         }
         if let Cur::Lane { w: wi, lane, .. } = cur {
-            for rel in acquired {
-                self.warps[wi].tcgen_in.join(&rel.k.tcgen_rel, &self.memo);
-                match a.order {
-                    MemOrder::Acquire | MemOrder::AcqRel => {
-                        self.acquire_rel(wi as u32, LaneMask::lane(lane), a.scope.unwrap(), &rel)
+            for heads in acquired {
+                for rel in heads.iter() {
+                    self.warps[wi].tcgen_in.join(&rel.k.tcgen_rel, &self.memo);
+                    match a.order {
+                        MemOrder::Acquire | MemOrder::AcqRel => {
+                            self.acquire_rel(wi as u32, LaneMask::lane(lane), a.scope.unwrap(), rel)
+                        }
+                        MemOrder::Relaxed | MemOrder::Release => self.warps[wi].pending_acq.push((lane, rel.clone())),
+                        MemOrder::Weak => {}
                     }
-                    MemOrder::Relaxed | MemOrder::Release => self.warps[wi].pending_acq.push((lane, rel)),
-                    MemOrder::Weak => {}
                 }
             }
         }
@@ -1038,10 +1104,12 @@ impl Checker {
                 return;
             }
         }
-        let Some(rel) = self.words[wi].history.get(idx as usize - 1).and_then(|e| e.rel.clone()) else {
-            return; // relaxed / plain publication: no edge, later reads race
+        let Some(heads) = self.words[wi].history.get(idx as usize - 1).and_then(|e| e.rel.clone()) else {
+            return; // plain publication: no edge, later reads race
         };
-        self.acquire_rel(warp, lanes, scope, &rel);
+        for rel in heads.iter() {
+            self.acquire_rel(warp, lanes, scope, rel);
+        }
     }
 }
 
@@ -1073,10 +1141,10 @@ mod tests {
             site: 0,
             warp: 0,
         };
-        f.record(Entry { w: w(1), rel: None }, |_| true);
-        f.record(Entry { w: w(2), rel: None }, |_| true);
+        f.record(Entry { w: w(1), rel: None, base: None }, |_| true);
+        f.record(Entry { w: w(2), rel: None, base: None }, |_| true);
         assert!(matches!(f, Frontier::One(_)));
-        f.record(Entry { w: w(3), rel: None }, |_| false);
+        f.record(Entry { w: w(3), rel: None, base: None }, |_| false);
         assert_eq!(f.as_slice().len(), 2);
     }
 }

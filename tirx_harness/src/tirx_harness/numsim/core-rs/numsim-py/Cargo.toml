@@ -1,0 +1,18 @@
+[package]
+name = "numsim-py"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "numsim_py"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python = ["dep:pyo3"]
+
+[dependencies]
+numsim-core = { path = "../numsim-core" }
+pyo3 = { workspace = true, optional = true }

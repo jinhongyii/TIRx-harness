@@ -38,6 +38,11 @@ pub struct Knowledge {
     pub tcgen_rel: Clock,
 }
 
+/// The release heads a write carries: its own head plus the heads it
+/// inherits through an observation-order chain of morally strong atomics
+/// (PTX §8.9.2). Each head is scope-checked against the acquirer on its own.
+pub type Heads = std::sync::Arc<Vec<std::sync::Arc<Rel>>>;
+
 /// A release payload stored with a write (or a fence-release head).
 #[derive(Clone, Debug)]
 pub struct Rel {
@@ -71,13 +76,16 @@ pub fn select_view(prior: Proxy, cur: Proxy, d: Option<Domain>) -> View {
 /// The bridge slot is the *prior* access's window domain. A
 /// `fence.proxy.async.shared::cta` does not bridge a generic write made
 /// through a `shared::cluster` (mapa) window, even to the same bytes
-/// (test_native_proxy_async_fence.py same_rank_mapa / shared_cta modes).
+/// (test_native_proxy_async_fence.py same_rank_mapa).
 pub fn fence_domains(d: Option<Domain>) -> &'static [usize] {
     match d {
         None => &[0, 1, 2],
         Some(Domain::Global) => &[0],
         Some(Domain::SharedCta) => &[1],
-        Some(Domain::SharedCluster) => &[2],
+        // The shared::cta window lies inside the shared::cluster window
+        // (PTX §5.1.7), so a .shared::cluster fence also covers shared::cta
+        // objects. The converse is ISA-silent: fail closed.
+        Some(Domain::SharedCluster) => &[1, 2],
     }
 }
 

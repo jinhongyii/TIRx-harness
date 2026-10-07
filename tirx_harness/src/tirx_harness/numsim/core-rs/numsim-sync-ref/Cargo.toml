@@ -8,8 +8,6 @@ description = "Executable reference state machines for NumSim synchronization pr
 # Standalone on purpose: this crate is the executable spec that the production
 # SyncTable `step` functions are differentially tested against. It must not
 # share code with them, so it is not a member of the core-rs workspace.
-[workspace]
-
 [dependencies]
 
 [dev-dependencies]

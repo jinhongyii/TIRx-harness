@@ -22,4 +22,3 @@ harness = false
 debug = false
 
 # Standalone until the coordinator adds this crate to the core-rs workspace.
-[workspace]

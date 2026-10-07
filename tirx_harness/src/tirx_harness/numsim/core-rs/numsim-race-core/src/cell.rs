@@ -15,7 +15,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::clock::Stamp;
-use crate::knowledge::Rel;
+use crate::knowledge::Heads;
 use crate::input::{AccessKind, Domain, Proxy, Scope, SiteId};
 
 /// One retained access. 48 bytes; the legacy compact form packs the
@@ -59,23 +59,43 @@ impl Witness {
     }
 }
 
-/// A frontier entry. Writes may carry the release payload a reader that
-/// reads-from them acquires (release head, fence-release head, or the
-/// accumulated release sequence of an RMW chain).
+/// A frontier entry. Writes may carry the release heads a reader that
+/// reads-from them acquires (own release / fence-release head plus the heads
+/// inherited through an RMW observation chain).
+///
+/// `base` is the part inherited from writes that precede the whole
+/// instruction. Sibling lanes of one same-address RMW instruction are
+/// independent threads with unconstrained coherence order (PTX §8.9.1,
+/// §9.7.15.5 silent), so whoever reads from a sibling group may only rely on
+/// `base`, never on another sibling's own head.
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub w: Witness,
-    pub rel: Option<Arc<Rel>>,
+    pub rel: Option<Heads>,
+    pub base: Option<Heads>,
+}
+
+fn heads_eq(a: &Option<Heads>, b: &Option<Heads>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
 }
 
 impl PartialEq for Entry {
     fn eq(&self, o: &Self) -> bool {
-        self.w == o.w
-            && match (&self.rel, &o.rel) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            }
+        self.w == o.w && heads_eq(&self.rel, &o.rel) && heads_eq(&self.base, &o.base)
+    }
+}
+
+/// The heads a reader of `e` may rely on (see [`Entry::base`]).
+pub fn effective_heads(f: &Frontier, e: &Entry) -> Option<Heads> {
+    let siblings = f.as_slice().iter().any(|o| o.w.stamp == e.w.stamp && o.w.lane != e.w.lane);
+    if siblings {
+        e.base.clone()
+    } else {
+        e.rel.clone()
     }
 }
 
