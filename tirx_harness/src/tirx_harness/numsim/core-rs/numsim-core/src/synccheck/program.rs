@@ -14,7 +14,7 @@ pub struct Command {
     pub participants: Vec<usize>,
     pub warp: WarpId,
     pub seq: u32,
-    pub epoch: u32,
+    pub epoch: u64,
     pub site: SiteId,
     pub frames: Vec<LoopFrame>,
     /// Protocol commands on dense resource indices, applied all-or-nothing.
@@ -71,7 +71,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
     struct Raw {
         warp: WarpId,
         seq: u32,
-        epoch: u32,
+        epoch: u64,
         site: SiteId,
         frames: Vec<LoopFrame>,
         cmds: Vec<(usize, SyncCmd)>,

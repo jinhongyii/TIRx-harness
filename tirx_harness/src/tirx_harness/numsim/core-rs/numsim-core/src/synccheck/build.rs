@@ -47,7 +47,7 @@ impl LogBuilder {
         let seq = self.seq.entry(warp).or_insert(0);
         let event = SyncEvent {
             kernel: self.kernel,
-            actor: Actor::Warp { warp: WarpId(warp), epoch: *epoch },
+            actor: Actor::Warp { warp: WarpId(warp), epoch: u64::from(*epoch) },
             seq: *seq,
             site: SiteId(site),
             frames: Vec::new(),
@@ -118,7 +118,8 @@ pub fn reg_pool(cta: u32) -> ResourceId {
     ResourceId::RegPool { cta: CtaId(cta) }
 }
 pub fn tmem(pair: u32) -> ResourceId {
-    ResourceId::TcgenLifecycle { pair: CtaId(pair) }
+    // W3: `pair` is an opaque pair index here (cluster `pair`, pair rank 0).
+    ResourceId::TcgenLifecycle { cluster: pair, pair_rank: 0 }
 }
 pub fn tcgen_work(warp: u32, lane: u8) -> ResourceId {
     ResourceId::TcgenWork { warp: WarpId(warp), lane }
