@@ -362,3 +362,14 @@ from W1's `builtins.py` family table; `""` for rejected ops.
   `args.variant: StrId` (lut_b/ti16) or the target arch; `decode_instr_desc`
   has no `cta_group`. Request a CTA index in the closures and the arch/variant
   string in the payload.
+
+## W5 status (after e2551cf, b3c72f3)
+
+W5-1 through W5-4 are resolved and adopted in `racecheck/`. W5-5 is done:
+numsim-py uses `racecheck::payload::reports`.
+
+Remaining note on item 5 of `contract-review.md`: the racecheck adapter splits
+a multi-lane per-thread async op into one virtual actor per issuing lane. This
+requires either one `AsyncId` per (instruction, lane), or `LaneSpan.lane` set
+to the issuing lane on async spans. `ALL_LANES` spans on a multi-lane op are
+`incomplete` (`async_lane_unknown`), never merged.

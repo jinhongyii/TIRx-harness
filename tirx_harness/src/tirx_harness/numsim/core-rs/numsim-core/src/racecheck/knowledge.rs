@@ -20,12 +20,14 @@
 //!   through *every* thread sync, including relaxed arrives / relaxed waits
 //!   (PTX 9.7.18.6.4.4), and is moved into `tcgen` by `after_thread_sync`.
 //!
-//! * `tmap_rel` / `g2t` — the tensormap proxy (descriptor bytes written
-//!   generically, read by TMA through the tensormap proxy).
-//!   `fence.proxy.tensormap::generic.release` snapshots `hb` into
-//!   `tmap_rel` (propagating like a bridge); the consuming thread's
-//!   `.acquire` moves what reached it into its local `g2t` view, which a
-//!   TMA issued afterwards inherits (PTX §9.7.15.4).
+//! * `tmap_rel[scope]` / `g2t` — the tensormap proxy (descriptor bytes
+//!   written generically, read by TMA through the tensormap proxy).
+//!   `fence.proxy.tensormap::generic.release.<scope>` snapshots `hb` into
+//!   `tmap_rel[scope]` (propagating like a bridge); the consuming thread's
+//!   `.acquire.<scope> [addr], size` keeps, per acquired range, the
+//!   components whose releaser and acquirer scopes mutually include each
+//!   other. A TMA issued afterwards inherits those ranges; `g2t` is the view
+//!   computed for one tensormap-proxy access (PTX §9.7.15.4).
 //!
 //! Shared memory, TMEM and global memory use this one structure; their
 //! differences are which slots are ever consulted (TMEM: `tcgen`; shared and
@@ -43,7 +45,7 @@ pub struct Knowledge {
     pub a2g: [Clock; NDOM],
     pub tcgen: Clock,
     pub tcgen_rel: Clock,
-    pub tmap_rel: Clock,
+    pub tmap_rel: [Clock; 4],
     pub g2t: Clock,
 }
 
@@ -136,7 +138,9 @@ impl Knowledge {
             self.a2g[d].join(&o.a2g[d], memo);
         }
         self.tcgen_rel.join(&o.tcgen_rel, memo);
-        self.tmap_rel.join(&o.tmap_rel, memo);
+        for s in 0..4 {
+            self.tmap_rel[s].join(&o.tmap_rel[s], memo);
+        }
     }
 
     pub fn join_all(&mut self, o: &Knowledge, memo: &JoinMemo) {

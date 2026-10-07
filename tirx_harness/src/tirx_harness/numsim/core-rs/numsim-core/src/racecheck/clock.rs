@@ -388,6 +388,24 @@ impl Clock {
         changed
     }
 
+    /// The components whose actor satisfies `keep` (lane entries included).
+    pub fn filter(&self, mut keep: impl FnMut(ActorId) -> bool) -> Clock {
+        let mut out = Clock::default();
+        for (a, e) in self.epochs.nonzero() {
+            if keep(a) {
+                out.epochs.raise(a, e);
+            }
+        }
+        if let Some(l) = &self.lanes {
+            for (a, v) in l.iter() {
+                if keep(*a) {
+                    out.raise_lanes(*a, v);
+                }
+            }
+        }
+        out
+    }
+
     /// Component-wise minimum (lane entries dropped: a lower bound). Used by
     /// the dominated-frontier GC; O(nonzero components).
     pub fn meet(&self, other: &Clock) -> Clock {

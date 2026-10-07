@@ -11,7 +11,7 @@ use std::ops::Range;
 pub use numsim_core::arena::AllocId;
 use numsim_core::arena::{ByteSpan, Space};
 use numsim_core::observe::{
-    Access as CAccess, AccessSeq, Actor, AsyncClass, CtaId, LaneSpan, Observer, PublishTarget, SyncEvent as CSync,
+    Access as CAccess, AccessSeq, Actor, AsyncClass, CtaId, LaneSpan, LaneVerdict, Observer, PublishTarget, SyncEvent as CSync,
     SyncKind, WarpId as CWarpId, Window, ALL_LANES,
 };
 use numsim_core::program::Sem;
@@ -87,6 +87,14 @@ pub enum Ev {
     Sync(CSync),
 }
 
+pub fn default_scope(obj: &ResourceId) -> Option<Scope> {
+    match obj {
+        ResourceId::Mbarrier { .. } => Some(Scope::Cta),
+        ResourceId::Cluster { .. } => Some(Scope::Cluster),
+        _ => None,
+    }
+}
+
 pub fn mbar(n: u32) -> ResourceId {
     ResourceId::Mbarrier { cta: CtaId(0), alloc: AllocId(99), offset: n }
 }
@@ -124,7 +132,7 @@ impl K {
     }
 
     fn sync_ev(&mut self, actor: Actor, lanes: LaneMask, kind: SyncKind) {
-        self.ev.push(Ev::Sync(CSync { actor, seq: 0, site: SiteId(0), frames: vec![], lanes, kind }));
+        self.ev.push(Ev::Sync(CSync { kernel: 0, actor, seq: 0, site: SiteId(0), frames: vec![], lanes, kind }));
     }
 
     pub fn alloc(&mut self, alloc: AllocId, space: Space, size: u64) {
@@ -224,15 +232,25 @@ impl K {
         *p - 1
     }
 
-    pub fn arrive_r(&mut self, w: WarpId, lanes: u32, obj: ResourceId, phase: u64, release: bool) -> &mut Self {
+    /// Arrive with explicit qualifiers (`None` = lost in lowering) and scope
+    /// (`None` = named barrier).
+    pub fn arrive_q(&mut self, w: WarpId, lanes: u32, obj: ResourceId, phase: u64, release: Option<bool>, scope: Option<Scope>) -> &mut Self {
         let a = self.wactor(w);
-        self.sync_ev(a, LaneMask(lanes), SyncKind::Arrive { obj, phase, release });
+        self.sync_ev(a, LaneMask(lanes), SyncKind::Arrive { obj, phase, release, scope });
         self
     }
-    pub fn wait_r(&mut self, w: WarpId, lanes: u32, obj: ResourceId, phase: u64, acquire: bool) -> &mut Self {
+    pub fn wait_q(&mut self, w: WarpId, lanes: u32, obj: ResourceId, phase: u64, acquire: Option<bool>, scope: Option<Scope>) -> &mut Self {
         let a = self.wactor(w);
-        self.sync_ev(a, LaneMask(lanes), SyncKind::Wait { obj, phase, acquire });
+        self.sync_ev(a, LaneMask(lanes), SyncKind::Wait { obj, phase, acquire, scope });
         self
+    }
+    /// Arrive/wait at the resource's default scope: mbarrier `.cta`,
+    /// cluster barrier `.cluster`, named barrier none.
+    pub fn arrive_r(&mut self, w: WarpId, lanes: u32, obj: ResourceId, phase: u64, release: bool) -> &mut Self {
+        self.arrive_q(w, lanes, obj, phase, Some(release), default_scope(&obj))
+    }
+    pub fn wait_r(&mut self, w: WarpId, lanes: u32, obj: ResourceId, phase: u64, acquire: bool) -> &mut Self {
+        self.wait_q(w, lanes, obj, phase, Some(acquire), default_scope(&obj))
     }
 
     /// Named barrier `bar.sync` over whole warps (participants, no scope).
@@ -286,6 +304,55 @@ impl K {
             SyncKind::AsyncIssue { op, class: kind, proxy, preds: preds.to_vec(), footprint, targets: vec![] },
         );
         op
+    }
+
+    /// One per-thread async op issued by every lane in `mask` (a single
+    /// `AsyncId`; the adapter splits it per lane).
+    pub fn issue_lanes(&mut self, w: WarpId, mask: u32, kind: AsyncKind, proxy: Proxy, footprint: &[(AllocId, Range<u64>)]) -> AsyncId {
+        let op = AsyncId(self.next_op);
+        self.next_op += 1;
+        let a = self.wactor(w);
+        let footprint = footprint.iter().map(|(a, r)| (*a, ByteSpan::new(r.start, r.end - r.start))).collect();
+        self.sync_ev(a, LaneMask(mask), SyncKind::AsyncIssue { op, class: kind, proxy, preds: vec![], footprint, targets: vec![] });
+        op
+    }
+
+    /// Async access whose spans name the issuing lane of each footprint.
+    pub fn aacc_lanes(&mut self, op: AsyncId, side: Milestone, kind: AccessKind, proxy: Proxy, alloc: AllocId, spans: &[(u8, Range<u64>)]) -> &mut Self {
+        let window = self.window(alloc);
+        self.ev.push(Ev::Access {
+            actor: Actor::Async { op, side },
+            site: SiteId(900_000 + op.0 as u32),
+            alloc,
+            space: self.spaces[&alloc],
+            kind,
+            sem: Sem::Weak,
+            scope: Scope::Gpu,
+            atomic: false,
+            returns_value: false,
+            proxy,
+            window,
+            spans: spans.iter().map(|(l, r)| LaneSpan { lane: *l, span: ByteSpan::new(r.start, r.end - r.start) }).collect(),
+        });
+        self
+    }
+
+    /// A wait_until whose lane groups accepted different history entries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wait_until_groups(&mut self, w: WarpId, mask: u32, alloc: AllocId, r: Range<u64>, scope: Scope, groups: &[(u32, u64, u32)]) -> &mut Self {
+        let a = self.wactor(w);
+        self.sync_ev(
+            a,
+            LaneMask(mask),
+            SyncKind::WaitVerdicts {
+                alloc,
+                span: ByteSpan::new(r.start, r.end - r.start),
+                scope,
+                verdicts: groups.iter().map(|(l, acc, obs)| LaneVerdict { lanes: LaneMask(*l), accepted: vec![*acc], observed: *obs }).collect(),
+                pred_reads: vec![],
+            },
+        );
+        self
     }
 
     pub fn aacc(&mut self, op: AsyncId, side: Milestone, kind: AccessKind, proxy: Proxy, alloc: AllocId, r: Range<u64>) -> &mut Self {
@@ -358,8 +425,7 @@ impl K {
                 alloc,
                 span: ByteSpan::new(r.start, r.end - r.start),
                 scope,
-                accepted: vec![accepted],
-                observed,
+                verdicts: vec![LaneVerdict { lanes: LaneMask::lane(lane as usize), accepted: vec![accepted], observed }],
                 pred_reads: pred_reads.iter().map(|(a, r)| (*a, ByteSpan::new(r.start, r.end - r.start))).collect(),
             },
         );

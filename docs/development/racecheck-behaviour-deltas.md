@@ -103,9 +103,12 @@ that a future change is caught.
 | --- | --- | --- | --- | --- |
 | I1 | TensorMap consume without `fence.proxy.tensormap::generic.acquire` | G: hard `Err` (aborts the run) | `missing_proxy_bridge` data race. A release without an acquire, or an acquire without a release, is reported as a race. | §9.7.15.4 |
 | I2 | `red` never acquires | G: `can_acquire` = Atomic class only | Same (confirmed), using `Access::returns_value`. A relaxed `red` + `fence.acquire` gives no edge. | §8.8 |
-| I3 | mbarrier scope not carried by the contract | — | Assumed `.cta`. A cross-CTA arrival that fails the check → `Incomplete::MbarrierScopeUnknown` (temporary; CONTRACT_REQUESTS W5-1) | §9.7.15.16.16 |
+| I3 | mbarrier / cluster arrive-wait qualifiers | No scope. A missing payload is treated as relaxed. | The contract now carries `release`/`acquire: Option<bool>` and `scope`. Edges require mutual scope inclusion. A lost qualifier (`None`) → `SyncQualifierUnknown` incomplete. | §9.7.15.16.16, §9.7.15.3 |
 | I4 | GC of generic witnesses | RS: retired generic history with 64-range coalescing (spurious errors possible). G: proxy-blind floor. | Per-`(actor, lane, kind, window)` summary with a byte hull, checked on the first non-generic access. Fully-dead witnesses are dropped only when every view observes them. | §8.9.5 |
 | I5 | tcgen ordering state | Per warp in RS lane-order layers; per thread in TG | Per lane (PTX thread) | §9.7.18 |
+| I6 | Multi-lane per-thread async ops (cp.async by several lanes in one instruction) | RS: one token, completion merged into the warp clock | The adapter splits the op into one virtual actor per issuing lane. `AsyncComplete{Warp{lanes}}` completes only those lanes' copies. A span that does not name its lane → `AsyncLaneUnknown` incomplete. | §9.7.10.28.1.1 (contract review item 5) |
+| I7 | `wait_until` verdicts | One verdict per wait (G: per lane, conjunctive plan) | Per lane group. Each group's earliest accepted write gives that group's edge. | §8.9.4 (contract review item 6) |
+| I8 | Tensormap acquire | Descriptor-generation frontiers, scope checked | Release snapshots per scope. The acquire keeps only releasers whose scope mutually includes it, and only for the acquired byte range. A TMA's descriptor read is checked per acquired range. | §9.7.15.4 |
 
 ## Known gaps (not deltas yet)
 

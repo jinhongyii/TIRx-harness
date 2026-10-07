@@ -2,15 +2,14 @@
 //! the legacy native payload JSON the Python tests pin
 //! (`race_check_python.rs:184-560`).
 //!
-//! `report::Finding` has no typed slot for race-specific facts, so each
-//! racecheck finding carries one `role = "race"` evidence item whose
-//! `detail` is a compact JSON object (`access_pair`, `ordering_domain`,
-//! `ordering_failure`, `proxy_bridge`, `hint`, `occurrences`, `reason`, ...),
-//! plus `prior` / `current` / `overlap` evidence with site, actor, space,
-//! allocation and bytes. Witness details (lane, access kind, proxy, scope)
-//! are also JSON in `detail`. [`serialize`] reads only the `Report`, so the
-//! payload can be rebuilt from a stored report. (Typed fields are requested
-//! in `CONTRACT_REQUESTS.md`.)
+//! Race-specific facts (`access_pair`, `ordering_domain`, `ordering_failure`,
+//! `proxy_bridge`, `hint`, `occurrences`, incomplete `reason`, and the
+//! per-witness `prior` / `current` objects) live in `Finding::attrs`;
+//! `prior` / `current` / `overlap` evidence carries site, actor, space,
+//! allocation and bytes. [`serialize`] reads only the `Report`, so the
+//! payload can be rebuilt from a stored report.
+
+use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
@@ -107,6 +106,7 @@ fn incomplete_reason(i: &Incomplete) -> (String, Value) {
         Incomplete::WaitPredicateReadsUnstable { warp } => ("wait_predicate_reads_unstable", json!({"warp_id": warp})),
         Incomplete::EventOutsideLaunch { events } => ("event_outside_launch", json!({"events": events})),
         Incomplete::FindingsTruncated { dropped } => ("findings_truncated", json!({"dropped": dropped})),
+        Incomplete::AsyncLaneUnknown { op } => ("async_lane_unknown", json!({"async_op": op.0})),
     };
     (reason.to_string(), extra)
 }
@@ -118,9 +118,8 @@ fn actor_of(w: &WitnessInfo) -> Actor {
     }
 }
 
-fn witness_evidence(role: &str, kernel: u32, w: &WitnessInfo, alloc: AllocId, lr: &LaunchResult) -> Evidence {
-    let (buffer, space) = lr.buffers.get(&alloc).map(|(n, s)| (Some(n.clone()), Some(*s))).unwrap_or((None, None));
-    let detail = json!({
+fn witness_attrs(w: &WitnessInfo) -> Value {
+    json!({
         "lane": w.lane,
         "global_warp_id": w.warp,
         "epoch": w.epoch,
@@ -130,7 +129,19 @@ fn witness_evidence(role: &str, kernel: u32, w: &WitnessInfo, alloc: AllocId, lr
         "domain": domain_name(w.domain),
         "scope": w.scope.map(scope_name),
         "atomic": w.atomic,
-    });
+    })
+}
+
+fn witness_evidence(role: &str, kernel: u32, w: &WitnessInfo, alloc: AllocId, lr: &LaunchResult) -> Evidence {
+    let (buffer, space) = lr.buffers.get(&alloc).map(|(n, s)| (Some(n.clone()), Some(*s))).unwrap_or((None, None));
+    let detail = format!(
+        "{} by warp {} lane {}{} via the {} proxy",
+        kind_name(w.kind),
+        w.warp,
+        w.lane,
+        w.async_op.map(|o| format!(" (async op {})", o.0)).unwrap_or_default(),
+        proxy_name(w.proxy)
+    );
     Evidence {
         role: role.to_string(),
         kernel,
@@ -140,7 +151,7 @@ fn witness_evidence(role: &str, kernel: u32, w: &WitnessInfo, alloc: AllocId, lr
         space,
         alloc: Some(alloc),
         bytes: Some(ByteSpan::new(w.span.start, w.span.end - w.span.start)),
-        detail: Some(detail.to_string()),
+        detail: Some(detail),
     }
 }
 
@@ -168,7 +179,7 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
                 race.insert("hint".into(), json!(SPIN_HINT));
             }
             let kind = if review {
-                FindingKind::Other("tmem_lifetime_review".into())
+                FindingKind::TmemLifetimeReview
             } else {
                 match failure {
                     OrderingFailure::MissingProxyBridge { .. } => FindingKind::ProxyRace,
@@ -204,19 +215,19 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
                 scope_name(*release_scope),
                 scope_name(*acquire_scope)
             );
-            (FindingKind::Other("scope_mismatch".into()), Status::Error, msg)
+            (FindingKind::ScopeMismatch, Status::Error, msg)
         }
         RK::Advisory { kind } => {
-            let name = match kind {
-                AdvisoryKind::CrossCtaAsyncOrder => "cross_cta_async_order",
-                AdvisoryKind::UndeclaredProtocolWord => "undeclared_protocol_word",
+            let (name, ck) = match kind {
+                AdvisoryKind::CrossCtaAsyncOrder => ("cross_cta_async_order", FindingKind::CrossCtaAsyncOrder),
+                AdvisoryKind::UndeclaredProtocolWord => ("undeclared_protocol_word", FindingKind::UndeclaredProtocolWord),
             };
             race.insert("legacy_kind".into(), json!(name));
             let msg = match kind {
                 AdvisoryKind::CrossCtaAsyncOrder => "async-proxy accesses issued from different CTAs are ordered only by base causality; PTX preserves same-proxy order only within one thread block".to_string(),
                 AdvisoryKind::UndeclaredProtocolWord => "a strong load observed an unordered strong write on a word not declared for wait_until; the resulting ordering depends on the schedule".to_string(),
             };
-            (FindingKind::Other(name.into()), Status::Review, msg)
+            (ck, Status::Review, msg)
         }
         RK::AsyncLifetime { op } => {
             race.insert("legacy_kind".into(), json!("data_race"));
@@ -224,7 +235,7 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
             race.insert("ordering_failure".into(), json!("async_lifetime_not_drained"));
             race.insert("async_op".into(), json!(op.0));
             let msg = format!("allocation {} ended while async op {} still had it in its footprint", f.alloc.0, op.0);
-            (FindingKind::AsyncRace, Status::Error, msg)
+            (FindingKind::AsyncLifetime, Status::Error, msg)
         }
         RK::OutOfBounds { size } => {
             race.insert("legacy_kind".into(), json!("oob"));
@@ -240,26 +251,16 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
     let mut sites = Vec::new();
     if let Some(p) = &f.prior {
         ev.push(witness_evidence("prior", kernel, p, f.alloc, lr));
+        race.insert("prior".into(), witness_attrs(p));
         sites.push(p.site);
     }
     if let Some(c) = &f.current {
         ev.push(witness_evidence("current", kernel, c, f.alloc, lr));
+        race.insert("current".into(), witness_attrs(c));
         sites.push(c.site);
     }
-    let has_alloc = f.alloc.0 != u32::MAX;
-    let (buffer, space) = lr.buffers.get(&f.alloc).map(|(n, s)| (Some(n.clone()), Some(*s))).unwrap_or((None, None));
-    ev.push(Evidence {
-        role: "race".into(),
-        kernel,
-        site: sites.first().copied().unwrap_or(SiteId(u32::MAX)),
-        actor: None,
-        buffer: buffer.clone(),
-        space,
-        alloc: has_alloc.then_some(f.alloc),
-        bytes: None,
-        detail: Some(Value::Object(race).to_string()),
-    });
-    if has_alloc {
+    if f.alloc.0 != u32::MAX {
+        let (buffer, space) = lr.buffers.get(&f.alloc).map(|(n, s)| (Some(n.clone()), Some(*s))).unwrap_or((None, None));
         ev.push(Evidence {
             role: "overlap".into(),
             kernel,
@@ -274,7 +275,8 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
     }
     sites.sort();
     sites.dedup();
-    Finding { kind, status, message, sites, evidence: ev }
+    let attrs: BTreeMap<String, Value> = race.into_iter().collect();
+    Finding { kind, status, message, attrs, sites, evidence: ev }
 }
 
 fn convert_incomplete(i: &Incomplete, kernel: u32) -> Finding {
@@ -286,22 +288,14 @@ fn convert_incomplete(i: &Incomplete, kernel: u32) -> Finding {
         d.extend(m);
     }
     let kind = if matches!(i, Incomplete::FindingsTruncated { .. }) { FindingKind::BudgetExhausted } else { FindingKind::Unsupported };
+    let _ = kernel;
     Finding {
         kind,
         status: Status::Incomplete,
         message: format!("racecheck coverage incomplete: {reason}"),
+        attrs: d.into_iter().collect(),
         sites: vec![],
-        evidence: vec![Evidence {
-            role: "race".into(),
-            kernel,
-            site: SiteId(u32::MAX),
-            actor: None,
-            buffer: None,
-            space: None,
-            alloc: None,
-            bytes: None,
-            detail: Some(Value::Object(d).to_string()),
-        }],
+        evidence: vec![],
     }
 }
 
@@ -355,8 +349,7 @@ fn span_json(alloc: Option<AllocId>, b: Option<ByteSpan>) -> Value {
     }
 }
 
-fn witness_json(e: &Evidence) -> Value {
-    let d: Value = e.detail.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+fn witness_json(e: &Evidence, d: &Value) -> Value {
     json!({
         "operation": {"kernel_index": e.kernel, "site": e.site.0, "global_warp_id": d["global_warp_id"], "epoch": d["epoch"], "async_op": d["async_op"]},
         "lane": d["lane"],
@@ -373,11 +366,7 @@ pub fn serialize(r: &Report) -> Value {
     let mut advisories = Vec::new();
     let mut incomplete = Vec::new();
     for f in &r.findings {
-        let race = f.evidence.iter().find(|e| e.role == "race");
-        let d: Map<String, Value> = race
-            .and_then(|e| e.detail.as_deref())
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
+        let d: Map<String, Value> = f.attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         if f.status == Status::Incomplete {
             let mut m = d.clone();
             m.insert("kind".into(), json!("analysis_incomplete"));
@@ -397,15 +386,15 @@ pub fn serialize(r: &Report) -> Value {
         );
         m.insert("kind".into(), json!(legacy));
         for (k, v) in &d {
-            if k != "legacy_kind" {
+            if !matches!(k.as_str(), "legacy_kind" | "prior" | "current") {
                 m.insert(k.clone(), v.clone());
             }
         }
         if let Some(p) = f.evidence.iter().find(|e| e.role == "prior") {
-            m.insert("prior".into(), witness_json(p));
+            m.insert("prior".into(), witness_json(p, d.get("prior").unwrap_or(&Value::Null)));
         }
         if let Some(c) = f.evidence.iter().find(|e| e.role == "current") {
-            m.insert("current".into(), witness_json(c));
+            m.insert("current".into(), witness_json(c, d.get("current").unwrap_or(&Value::Null)));
         }
         if let Some(o) = f.evidence.iter().find(|e| e.role == "overlap") {
             m.insert("overlap".into(), span_json(o.alloc, o.bytes));

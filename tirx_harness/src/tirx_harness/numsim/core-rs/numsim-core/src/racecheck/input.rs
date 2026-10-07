@@ -85,17 +85,17 @@ pub struct Access {
     pub site: SiteId,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FenceKind {
     AcqRel(Scope),
     Sc(Scope),
     ProxyAsync(Option<Domain>),
     TcgenBefore,
     TcgenAfter,
-    /// `fence.proxy.tensormap::generic.release`.
-    TensormapRelease,
-    /// `fence.proxy.tensormap::generic.acquire`.
-    TensormapAcquire,
+    /// `fence.proxy.tensormap::generic.release.<scope>`.
+    TensormapRelease(Scope),
+    /// `fence.proxy.tensormap::generic.acquire.<scope> [addr], size`.
+    TensormapAcquire { scope: Scope, alloc: AllocId, range: std::ops::Range<u64> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,8 +133,9 @@ pub enum SyncEvent {
         alloc: AllocId,
         range: Range<u64>,
         scope: Scope,
-        accepted: Vec<u64>,
-        observed: u32,
+        /// Per lane group `(lanes, accepted bitset, observed index)`; never a
+        /// lane-wise conjunction.
+        verdicts: Vec<(LaneMask, Vec<u64>, u32)>,
         pred_reads: Vec<(AllocId, Range<u64>)>,
         epoch: u32,
     },

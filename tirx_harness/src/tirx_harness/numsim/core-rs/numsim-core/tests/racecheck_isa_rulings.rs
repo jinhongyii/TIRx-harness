@@ -8,22 +8,20 @@ use numsim_core::sync::completion::ResourceId;
 
 const FLAG: std::ops::Range<u64> = 0..4;
 
-/// R4: mbarrier edges need mutual scope inclusion. The contract's Arrive /
-/// Wait do not carry the scope yet (CONTRACT_REQUESTS.md), so the adapter
-/// assumes the PTX default `.cta`: a same-CTA arrival synchronises, and a
-/// remote-CTA arrival (which may be `.cluster`) is `incomplete`, never a
-/// silent pass or an unproven race.
+/// R4: mbarrier edges need mutual scope inclusion. A remote-CTA
+/// `arrive.release.cluster` observed by `try_wait.acquire.cta` gives no edge.
+fn remote_arrive(wait_scope: Scope) -> Report {
+    let mut k = K::new(1, 2, 2);
+    k.st(1, 0, GMEM, 0..4);
+    k.arrive_q(1, 1, mbar(3), 0, Some(true), Some(Scope::Cluster));
+    k.wait_q(0, 1, mbar(3), 0, Some(true), Some(wait_scope)).ld(0, 0, GMEM, 0..4);
+    k.run()
+}
+
 #[test]
 fn r4_mbarrier_scope_mutual_inclusion() {
-    let mut k = K::new(1, 2, 2);
-    k.st(1, 0, GMEM, 0..4).arrive(1, 1, 3, 0, true);
-    k.wait(0, 1, 3, 0, true).ld(0, 0, GMEM, 0..4);
-    let r = k.run();
-    assert!(r.incomplete.iter().any(|i| matches!(i, Incomplete::MbarrierScopeUnknown { .. })), "{r:?}");
-    let mut k = K::new(2, 1, 1);
-    k.st(1, 0, GMEM, 0..4).arrive(1, 1, 3, 0, true);
-    k.wait(0, 1, 3, 0, true).ld(0, 0, GMEM, 0..4);
-    assert!(clean(&k.run()));
+    assert!(has_race(&remote_arrive(Scope::Cta)));
+    assert!(clean(&remote_arrive(Scope::Cluster)));
 }
 
 /// R4: complete-tx is release at cluster scope; a `.cta` wait still sees the
@@ -59,14 +57,19 @@ fn r5_named_barrier_arrive_only_gets_no_acquire() {
     assert!(clean(&k.run()));
 }
 
-/// R5: cluster barrier defaults to release/acquire at cluster scope; a
-/// `.relaxed` arrive gives no generic edge. (A lost qualifier cannot be
-/// expressed by the contract's `release: bool`; see CONTRACT_REQUESTS.md.)
+/// R5: cluster barrier defaults to release/acquire at cluster scope; a lost
+/// qualifier is incomplete, never assumed relaxed; a `.relaxed` arrive gives
+/// no generic edge.
 #[test]
-fn r5_cluster_barrier_defaults_and_relaxed_arrive() {
+fn r5_cluster_barrier_defaults_and_lost_qualifier() {
     let mut k = K::new(1, 2, 2);
     k.st(0, 0, SMEM1, 0..4).cluster_bar(&[0, 1]).ld(1, 0, SMEM1, 0..4);
     assert!(clean(&k.run()));
+    let mut k = K::new(1, 2, 2);
+    k.st(0, 0, SMEM1, 0..4);
+    k.arrive_q(0, u32::MAX, ResourceId::Cluster { cluster: 0 }, 0, None, Some(Scope::Cluster));
+    let r = k.run();
+    assert!(r.incomplete.iter().any(|i| matches!(i, Incomplete::SyncQualifierUnknown { .. })));
     let mut k = K::new(1, 2, 2);
     let c = ResourceId::Cluster { cluster: 0 };
     k.st(0, 0, SMEM1, 0..4);

@@ -7,6 +7,7 @@ use common::*;
 use numsim_core::arena::Space;
 use numsim_core::racecheck::{report, serialize};
 use numsim_core::report::{FindingKind as CK, Status};
+use numsim_core::sync::completion::ResourceId;
 
 /// The cross-proxy pair survives GC: the generic write is observed by every
 /// actor through `hb` but not through the generic→async bridge, so the
@@ -73,11 +74,11 @@ fn tensormap(release: bool, acquire: bool) -> Report {
     let mut k = K::new(2, 1, 1);
     k.st(0, 0, GMEM2, 0..128);
     if release {
-        k.fence(0, 1, FenceKind::TensormapRelease);
+        k.fence(0, 1, FenceKind::TensormapRelease { scope: Scope::Cta });
     }
     k.bar(0, &[0, 1]);
     if acquire {
-        k.fence(1, 1, FenceKind::TensormapAcquire);
+        k.fence(1, 1, FenceKind::TensormapAcquire { scope: Scope::Cta, alloc: GMEM2, span: numsim_core::arena::ByteSpan::new(0, 128) });
     }
     let op = k.issue(1, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16)]);
     k.ar(op, Proxy::TensorMap, GMEM2, 0..128).ar(op, Proxy::Async, GMEM, 0..16).aw(op, Proxy::Async, SMEM, 0..16);
@@ -226,4 +227,105 @@ fn hint_and_review_payloads() {
     assert_eq!(p["findings"][0]["kind"], "tmem_lifetime_review");
     assert_eq!(p["findings"][0]["status"], "review");
     assert_eq!(p["findings"][0]["access_pair"], "read_write");
+}
+
+/// Contract review item 5: a per-thread async op issued by several lanes is
+/// one virtual actor per lane; a lane's wait publishes only its own copy.
+#[test]
+fn per_lane_async_ops_are_not_merged() {
+    let mut k = K::one_warp();
+    let op = k.issue_lanes(0, 0b11, AsyncKind::Copy, Proxy::Generic, &[(SMEM, 0..32)]);
+    k.aacc_lanes(op, Milestone::Read, AccessKind::Read, Proxy::Generic, GMEM, &[(0, 0..16), (1, 16..32)]);
+    k.aacc_lanes(op, Milestone::Write, AccessKind::Write, Proxy::Generic, SMEM, &[(0, 0..16), (1, 16..32)]);
+    k.done_warp(op, Milestone::Write, 0, 0b01);
+    k.ld(0, 0, SMEM, 0..16); // own copy: ordered
+    k.ld(0, 0, SMEM, 16..32); // lane 1's copy: lane 1 has not waited
+    let r = k.run();
+    let f = races(&r);
+    assert_eq!(f.len(), 1, "{r:?}");
+    assert_eq!(f[0].bytes, 16..32);
+    // Spans that do not name the lane of a multi-lane op fail closed.
+    let mut k = K::one_warp();
+    let op = k.issue_lanes(0, 0b11, AsyncKind::Copy, Proxy::Generic, &[(SMEM, 0..32)]);
+    k.aw(op, Proxy::Generic, SMEM, 0..32).done_warp(op, Milestone::Write, 0, 0b11);
+    let r = k.run();
+    assert!(r.incomplete.iter().any(|i| matches!(i, Incomplete::AsyncLaneUnknown { .. })));
+}
+
+/// WaitVerdicts are per lane group: lanes that accepted different writes get
+/// different edges (never a lane-wise conjunction).
+#[test]
+fn wait_verdicts_per_lane_group() {
+    let mut k = K::new(1, 1, 3);
+    k.declare(GMEM2, 0..4);
+    k.st(0, 0, GMEM, 0..4);
+    k.a(2, 0, st(MemOrder::Relaxed, Scope::Gpu), GMEM2, 0..4); // entry 1: no release
+    k.a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, 0..4); // entry 2: release
+    k.wait_until_groups(1, 0b11, GMEM2, 0..4, Scope::Gpu, &[(0b01, 0b110, 1), (0b10, 0b100, 2)]);
+    k.ld(1, 1, GMEM, 0..4);
+    assert!(clean(&k.run()));
+    let mut k = K::new(1, 1, 3);
+    k.declare(GMEM2, 0..4);
+    k.st(0, 0, GMEM, 0..4);
+    k.a(2, 0, st(MemOrder::Relaxed, Scope::Gpu), GMEM2, 0..4);
+    k.a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, 0..4);
+    k.wait_until_groups(1, 0b11, GMEM2, 0..4, Scope::Gpu, &[(0b01, 0b110, 1), (0b10, 0b100, 2)]);
+    k.ld(1, 0, GMEM, 0..4);
+    assert!(has_race(&k.run()));
+}
+
+/// Tensormap acquire is limited to its address range and to releasers whose
+/// scope mutually includes the acquirer.
+#[test]
+fn tensormap_acquire_range_and_scope() {
+    let run = |rel: Scope, acq: Scope, span: (u64, u64), ctas: u32| {
+        let mut k = K::new(1, 1, ctas);
+        let consumer = ctas - 1;
+        k.st(0, 0, GMEM2, 0..128).fence(0, 1, FenceKind::TensormapRelease { scope: rel });
+        let c = ResourceId::Cluster { cluster: 0 };
+        // A cross-CTA handoff through a gpu-scope release/acquire flag.
+        k.a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM, 0..4);
+        k.a(consumer, 0, ld(MemOrder::Acquire, Scope::Gpu), GMEM, 0..4);
+        let _ = c;
+        k.fence(consumer, 1, FenceKind::TensormapAcquire { scope: acq, alloc: GMEM2, span: numsim_core::arena::ByteSpan::new(span.0, span.1) });
+        let op = k.issue(consumer, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16)]);
+        k.ar(op, Proxy::TensorMap, GMEM2, 0..128).aw(op, Proxy::Async, SMEM, 0..16).done_warp(op, Milestone::Write, consumer, 1);
+        k.run()
+    };
+    assert!(errors_free(&run(Scope::Gpu, Scope::Gpu, (0, 128), 2)));
+    assert!(has_race(&run(Scope::Cta, Scope::Gpu, (0, 128), 2)), "release.cta does not reach another CTA");
+    assert!(has_race(&run(Scope::Gpu, Scope::Gpu, (0, 64), 2)), "bytes outside the acquired range");
+    assert!(errors_free(&run(Scope::Cta, Scope::Cta, (0, 128), 1)));
+}
+
+fn errors_free(r: &Report) -> bool {
+    r.errors().next().is_none() && r.incomplete.is_empty()
+}
+
+#[test]
+fn new_kinds_and_attrs() {
+    // scope mismatch → FindingKind::ScopeMismatch with attrs
+    let mut k = K::new(1, 1, 2);
+    k.declare(GMEM2, 0..4);
+    k.st(0, 0, GMEM, 0..4).a(0, 0, st(MemOrder::Release, Scope::Cta), GMEM2, 0..4);
+    k.wait_until(1, 0, GMEM2, 0..4, Scope::Gpu, 0b10, 1).ld(1, 0, GMEM, 0..4);
+    let rep = report(&k.observe());
+    let sm = rep.findings.iter().find(|f| f.kind == CK::ScopeMismatch).expect("scope mismatch");
+    assert_eq!(sm.attrs["release_scope"], "cta");
+    let race = rep.findings.iter().find(|f| f.kind == CK::DataRace).unwrap();
+    assert_eq!(race.attrs["access_pair"], "write_read");
+    assert_eq!(race.attrs["prior"]["access_kind"], "write");
+    // advisory kinds
+    let mut k = K::new(1, 1, 2);
+    k.a(0, 0, st(MemOrder::Relaxed, Scope::Gpu), GMEM, 0..4).a(1, 0, ld(MemOrder::Relaxed, Scope::Gpu), GMEM, 0..4);
+    let rep = report(&k.observe());
+    assert!(rep.findings.iter().any(|f| f.kind == CK::UndeclaredProtocolWord && f.status == Status::Review));
+    let p = serialize(&rep);
+    assert_eq!(p["advisories"][0]["kind"], "undeclared_protocol_word");
+    // async lifetime
+    let mut k = K::one_warp();
+    let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16)]);
+    k.ar(op, Proxy::Async, GMEM, 0..16).alloc_end(SMEM);
+    let rep = report(&k.observe());
+    assert!(rep.findings.iter().any(|f| f.kind == CK::AsyncLifetime));
 }

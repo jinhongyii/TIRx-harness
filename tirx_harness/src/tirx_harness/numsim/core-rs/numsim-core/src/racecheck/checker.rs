@@ -124,6 +124,8 @@ pub enum Incomplete {
     AsyncNeverCompleted { op: AsyncId },
     /// Events delivered outside a launch (no topology to judge them by).
     EventOutsideLaunch { events: u64 },
+    /// A multi-lane per-thread async op's access did not name its lane.
+    AsyncLaneUnknown { op: AsyncId },
     /// `max_findings` reached; later findings were not recorded.
     FindingsTruncated { dropped: u64 },
 }
@@ -158,9 +160,21 @@ pub struct Stats {
 
 // ----------------------------------------------------------------- state --
 
-/// Bridge-row slots: g2a[0..NDOM], a2g[NDOM..2NDOM], tensormap release.
-const NSLOT: usize = 2 * NDOM + 1;
+/// Bridge-row slots: g2a[0..NDOM], a2g[NDOM..2NDOM], tensormap release per
+/// scope [2NDOM..2NDOM+4].
+const NSLOT: usize = 2 * NDOM + 4;
 const TSLOT: usize = 2 * NDOM;
+
+fn scope_index(s: Scope) -> usize {
+    match s {
+        Scope::Cta => 0,
+        Scope::Cluster => 1,
+        Scope::Gpu => 2,
+        Scope::Sys => 3,
+    }
+}
+
+const SCOPES: [Scope; 4] = [Scope::Cta, Scope::Cluster, Scope::Gpu, Scope::Sys];
 
 struct Warp {
     actor: ActorId,
@@ -187,6 +201,9 @@ struct Warp {
     tcgen_issued: Vec<Clock>,
     tcgen_waited: Vec<Clock>,
     tcgen_pub: Vec<Clock>,
+    /// Tensormap ranges each lane acquired (`fence.proxy.tensormap::generic
+    /// .acquire`), with the release knowledge that reached it.
+    g2t_ranges: Vec<Vec<(AllocId, Range<u64>, Clock)>>,
     /// `(epoch, site)` of every instruction that accessed memory, ascending;
     /// pruned below the oldest epoch any witness still references.
     sites: Vec<(Epoch, SiteId)>,
@@ -209,6 +226,7 @@ impl Warp {
             tcgen_issued: vec![Clock::default(); 32],
             tcgen_waited: vec![Clock::default(); 32],
             tcgen_pub: vec![Clock::default(); 32],
+            g2t_ranges: vec![Vec::new(); 32],
             sites: Vec::new(),
         }
     }
@@ -272,7 +290,9 @@ impl Warp {
                 x.g2a[d].join(&k.g2a[d], memo);
                 x.a2g[d].join(&k.a2g[d], memo);
             }
-            x.tmap_rel.join(&k.tmap_rel, memo);
+            for s in 0..4 {
+                x.tmap_rel[s].join(&k.tmap_rel[s], memo);
+            }
         };
         if lanes.is_all() {
             join(&mut self.base);
@@ -287,14 +307,6 @@ impl Warp {
             }
         }
     }
-
-    fn lane_view(&self, lane: u8, v: View, memo: &JoinMemo) -> Clock {
-        let mut c = self.base.view(v).clone();
-        if let Some(x) = &self.extra[lane as usize] {
-            c.join(x.view(v), memo);
-        }
-        c
-    }
 }
 
 fn slot_mut(k: &mut Knowledge, s: usize) -> &mut Clock {
@@ -303,7 +315,7 @@ fn slot_mut(k: &mut Knowledge, s: usize) -> &mut Clock {
     } else if s < 2 * NDOM {
         &mut k.a2g[s - NDOM]
     } else {
-        &mut k.tmap_rel
+        &mut k.tmap_rel[s - 2 * NDOM]
     }
 }
 
@@ -319,6 +331,8 @@ struct AsyncActor {
     site: SiteId,
     kind: AsyncKind,
     k: Knowledge,
+    /// Tensormap ranges the issuing lanes acquired.
+    g2t_ranges: Vec<(AllocId, Range<u64>, Clock)>,
     preds: Vec<usize>,
     footprint: Vec<(AllocId, Range<u64>)>,
     /// Highest milestone reached (0 none, 1 read, 2 write/full).
@@ -329,15 +343,15 @@ struct Alloc {
     size: u64,
     space: Space,
     shadow: IntervalShadow<Cell>,
-    /// Once any non-generic proxy touched the allocation, generic witnesses
-    /// are retired only when every view observes them.
-    sensitive: bool,
-    /// Generic witnesses retired while the allocation was not proxy
-    /// sensitive, summarised per `(actor, lane, write, window)`: the latest
-    /// epoch and the byte hull. A later async/tensormap access is checked
-    /// against them, so GC never hides a cross-proxy race (legacy RS
-    /// `RetiredGenericHistory`; bounded by actors × 32 × 2 × 3).
-    retired: HashMap<(ActorId, u8, bool, u8), RetiredGeneric>,
+    /// Proxies that have accessed the allocation (bit = proxy code).
+    seen: u8,
+    /// Generic witnesses that GC retired while some proxy had not yet
+    /// accessed the allocation, summarised per `(actor, lane, write, window,
+    /// 4 KiB page)`: the latest epoch and the byte hull. Every non-generic
+    /// access is checked against them, so GC never hides a cross-proxy race
+    /// (legacy RS `RetiredGenericHistory`, made view-aware; legacy G's
+    /// proxy-blind floor dropped them).
+    retired: HashMap<(ActorId, u8, bool, u8, u64), RetiredGeneric>,
 }
 
 #[derive(Clone, Debug)]
@@ -349,6 +363,16 @@ struct RetiredGeneric {
     lo: u64,
     hi: u64,
     info: WitnessInfo,
+}
+
+fn proxy_bit(p: Proxy) -> u8 {
+    1 << match p {
+        Proxy::Generic => 0,
+        Proxy::Async => 1,
+        Proxy::TensorMap => 2,
+        Proxy::ReadOnly => 3,
+        Proxy::Tcgen => 4,
+    }
 }
 
 fn domain_code(d: Option<Domain>) -> u8 {
@@ -436,7 +460,8 @@ pub(crate) fn required_scope(t: &Topology, a: WarpId, b: WarpId) -> Scope {
 fn future_proxies(space: Space) -> &'static [Proxy] {
     match space {
         Space::Tmem => &[Proxy::Tcgen],
-        _ => &[Proxy::Generic, Proxy::Async, Proxy::TensorMap],
+        Space::Global => &[Proxy::Generic, Proxy::Async, Proxy::TensorMap],
+        _ => &[Proxy::Generic, Proxy::Async],
     }
 }
 
@@ -483,6 +508,13 @@ impl Checker {
         match e {
             Event::Access(a) => self.access(&a),
             Event::Sync(s) => self.sync(s),
+        }
+    }
+
+    /// Record an incomplete reason once (adapter use).
+    pub fn note_incomplete(&mut self, i: Incomplete) {
+        if !self.report.incomplete.contains(&i) {
+            self.report.incomplete.push(i);
         }
     }
 
@@ -815,6 +847,37 @@ impl Checker {
             self.push_finding(f);
             return;
         }
+        if let (Cur::Async { a: i }, Proxy::TensorMap) = (cur, a.proxy) {
+            // Split at acquired-range boundaries so each piece has one view.
+            let mut cuts: Vec<u64> = self.asyncs[i]
+                .g2t_ranges
+                .iter()
+                .filter(|(al, _, _)| *al == a.alloc)
+                .flat_map(|(_, r, _)| [r.start, r.end])
+                .filter(|x| a.range.start < *x && *x < a.range.end)
+                .collect();
+            if !cuts.is_empty() {
+                cuts.sort_unstable();
+                cuts.dedup();
+                let mut lo = a.range.start;
+                for hi in cuts.into_iter().chain([a.range.end]) {
+                    let mut piece = a.clone();
+                    piece.range = lo..hi;
+                    self.stats.accesses -= 1; // counted once per access
+                    self.access(&piece);
+                    lo = hi;
+                }
+                return;
+            }
+            // The tensormap view for exactly these descriptor bytes.
+            let mut v = Clock::default();
+            for (al, r, k) in &self.asyncs[i].g2t_ranges {
+                if *al == a.alloc && r.start < a.range.end && a.range.start < r.end {
+                    v.join(k, &self.memo);
+                }
+            }
+            self.asyncs[i].k.g2t = v;
+        }
         let w = Witness::pack(stamp, lane, a.proxy, a.domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.wide);
         let writes = w.writes();
         let strong = a.scope.is_some();
@@ -837,6 +900,9 @@ impl Checker {
         };
 
         let mut races: Vec<(Range<u64>, Witness)> = Vec::new();
+        if let Some(al) = self.allocs.get_mut(&a.alloc) {
+            al.seen |= proxy_bit(a.proxy);
+        }
         if a.proxy != Proxy::Generic {
             self.check_retired_generic(a, cur, &w);
         }
@@ -955,10 +1021,9 @@ impl Checker {
     }
 
     /// Check a non-generic access against the generic witnesses GC folded
-    /// into the allocation's summary, then mark the allocation sensitive.
+    /// into the allocation's summary.
     fn check_retired_generic(&mut self, a: &Access, cur: Cur, cw: &Witness) {
         let Some(alloc) = self.allocs.get_mut(&a.alloc) else { return };
-        alloc.sensitive = true;
         if alloc.retired.is_empty() {
             return;
         }
@@ -1009,7 +1074,7 @@ impl Checker {
         self.maybe_gc();
         match s {
             SyncEvent::AllocBegin { alloc, size, space, .. } => {
-                self.allocs.insert(alloc, Alloc { size, space, shadow: IntervalShadow::new(), sensitive: false, retired: HashMap::new() });
+                self.allocs.insert(alloc, Alloc { size, space, shadow: IntervalShadow::new(), seen: proxy_bit(Proxy::Generic), retired: HashMap::new() });
             }
             SyncEvent::AllocEnd { alloc } => {
                 let mut lifetime = Vec::new();
@@ -1169,7 +1234,7 @@ impl Checker {
                     }
                 }
             }
-            SyncEvent::WaitVerdicts { warp, lanes, alloc, range, scope, accepted, observed, pred_reads, epoch } => {
+            SyncEvent::WaitVerdicts { warp, lanes, alloc, range, scope, verdicts, pred_reads, epoch } => {
                 if !self.tick(warp, epoch) {
                     return;
                 }
@@ -1177,7 +1242,11 @@ impl Checker {
                     self.report.incomplete.push(Incomplete::WaitPredicateReadsUnstable { warp });
                     return;
                 }
-                self.wait_verdicts(warp, lanes, alloc, range, scope, &accepted, observed);
+                // Each lane group judged by its own verdicts (never a
+                // lane-wise conjunction).
+                for (glanes, accepted, observed) in verdicts {
+                    self.wait_verdicts(warp, glanes, alloc, range.clone(), scope, &accepted, observed);
+                }
             }
         }
     }
@@ -1218,7 +1287,6 @@ impl Checker {
             if let Some(x) = &w.extra[c as usize] {
                 let j = jx.get_or_insert_with(Default::default);
                 j.join_propagating(x, memo);
-                j.g2t.join(&x.g2t, memo);
             }
         }
         if let Some(jx) = jx {
@@ -1254,9 +1322,10 @@ impl Checker {
         }
         let w = &self.warps[warp as usize];
         let mut k = w.publication(lanes, epoch, &self.memo);
+        let mut g2t_ranges = Vec::new();
         for c in lanes.lanes8() {
             k.tcgen.join(&w.tcgen[c as usize], &self.memo);
-            k.g2t.join(&w.lane_view(c, View::G2t, &self.memo), &self.memo);
+            g2t_ranges.extend(w.g2t_ranges[c as usize].iter().cloned());
         }
         let mut pred_idx = Vec::new();
         for p in preds {
@@ -1290,6 +1359,7 @@ impl Checker {
                     site,
                     kind,
                     k: Knowledge::default(),
+                    g2t_ranges: Vec::new(),
                     preds: Vec::new(),
                     footprint: Vec::new(),
                     done: 0,
@@ -1308,6 +1378,7 @@ impl Checker {
         slot.site = site;
         slot.kind = kind;
         slot.k = k;
+        slot.g2t_ranges = g2t_ranges;
         slot.preds = pred_idx;
         slot.footprint = footprint;
         slot.done = 0;
@@ -1437,28 +1508,45 @@ impl Checker {
                 self.bridge_rows(warp, lanes, &slots, epoch);
                 self.snapshot_hb_into(warp, lanes, &slots);
             }
-            FenceKind::TensormapRelease => {
-                self.bridge_rows(warp, lanes, &[TSLOT], epoch);
-                self.snapshot_hb_into(warp, lanes, &[TSLOT]);
+            FenceKind::TensormapRelease(scope) => {
+                let s = TSLOT + scope_index(scope);
+                self.bridge_rows(warp, lanes, &[s], epoch);
+                self.snapshot_hb_into(warp, lanes, &[s]);
             }
-            FenceKind::TensormapAcquire => {
-                // The acquiring thread's tensormap view: every release that
-                // reached it, including its own warp's released lanes.
-                let memo = &self.memo;
-                let w = &mut self.warps[warp as usize];
-                for c in lanes.lanes8() {
-                    let mut t = w.base.tmap_rel.clone();
-                    if let Some(x) = &w.extra[c as usize] {
-                        t.join(&x.tmap_rel, memo);
-                    }
-                    if let Some(br) = &w.bridge_rows {
-                        let own = br[TSLOT][c as usize];
-                        if own.iter().any(|x| *x != 0) {
-                            t.raise_lanes(w.actor, &own);
+            FenceKind::TensormapAcquire { scope, alloc, range } => {
+                // Per acquiring lane: every release that reached it whose
+                // releaser and this acquire mutually include each other.
+                let nw = self.topo.num_warps();
+                let topo = self.topo;
+                let warp_of = |a: ActorId| if a < nw { a } else { self.asyncs[(a - nw) as usize].warp };
+                let mut acquired = Vec::new();
+                {
+                    let w = &self.warps[warp as usize];
+                    for c in lanes.lanes8() {
+                        let mut t = Clock::default();
+                        for (si, rs) in SCOPES.iter().enumerate() {
+                            let mut r = w.base.tmap_rel[si].clone();
+                            if let Some(x) = &w.extra[c as usize] {
+                                r.join(&x.tmap_rel[si], &self.memo);
+                            }
+                            if let Some(br) = &w.bridge_rows {
+                                let own = br[TSLOT + si][c as usize];
+                                if own.iter().any(|x| *x != 0) {
+                                    r.raise_lanes(w.actor, &own);
+                                }
+                            }
+                            let f = r.filter(|a| {
+                                let aw = warp_of(a);
+                                *rs >= required_scope(&topo, aw, warp) && scope >= required_scope(&topo, warp, aw)
+                            });
+                            t.join(&f, &self.memo);
                         }
+                        acquired.push((c, t));
                     }
-                    let x = w.extra[c as usize].get_or_insert_with(Default::default);
-                    x.g2t.join(&t, memo);
+                }
+                let w = &mut self.warps[warp as usize];
+                for (c, t) in acquired {
+                    w.g2t_ranges[c as usize].push((alloc, range.clone(), t));
                 }
             }
             FenceKind::TcgenBefore => {
@@ -1581,18 +1669,25 @@ impl Checker {
             future_proxies(space).iter().all(|pc| meet.view(select_view(w.proxy(), *pc, w.domain())).observes(w.stamp, w.lane()))
         };
         let same_proxy_dead = |w: &Witness| meet.view(select_view(w.proxy(), w.proxy(), w.domain())).observes(w.stamp, w.lane());
+        let dead_in_seen = |w: &Witness, seen: u8| {
+            [Proxy::Async, Proxy::TensorMap, Proxy::ReadOnly, Proxy::Tcgen]
+                .iter()
+                .filter(|p| seen & proxy_bit(**p) != 0)
+                .all(|pc| meet.view(select_view(w.proxy(), *pc, w.domain())).observes(w.stamp, w.lane()))
+        };
         let mut retired = 0u64;
         let mut live_actors: HashSet<ActorId> = HashSet::new();
         let mut min_epoch: HashMap<ActorId, Epoch> = HashMap::new();
         let mut allocs = std::mem::take(&mut self.allocs);
         for alloc in allocs.values_mut() {
-            let (space, sensitive) = (alloc.space, alloc.sensitive);
+            let (space, seen) = (alloc.space, alloc.seen);
             let mut folded: Vec<Witness> = Vec::new();
             alloc.shadow.retain_mut(|cell| {
                 let last = cell.writes.last().map(|e| e.w);
                 // Decide per witness: drop (dead in every view), fold into the
-                // retired-generic summary (dead in its own proxy, allocation
-                // not proxy sensitive), or keep.
+                // retired-generic summary (dead in every view of a proxy that
+                // already accessed the allocation; the summary answers for the
+                // others), or keep.
                 let mut decide = |w: &Witness, pinned: bool| -> bool {
                     if pinned {
                         return true;
@@ -1605,7 +1700,7 @@ impl Checker {
                     // live actor's hb observes them, any view carrying a
                     // later generation of the slot was snapshotted after
                     // that, so it observes the old stamp as well.
-                    if !sensitive && w.proxy() == Proxy::Generic && space != Space::Tmem && same_proxy_dead(w) {
+                    if w.proxy() == Proxy::Generic && space != Space::Tmem && same_proxy_dead(w) && dead_in_seen(w, seen) {
                         folded.push(*w);
                         retired += 1;
                         return false;
@@ -1626,7 +1721,7 @@ impl Checker {
             for w in folded {
                 let info = self.info(&w);
                 let (lo, hi) = w.span(&self.wide);
-                let key = (w.stamp.actor(), w.lane(), w.writes(), domain_code(w.domain()));
+                let key = (w.stamp.actor(), w.lane(), w.writes(), domain_code(w.domain()), lo >> 12);
                 let e = alloc.retired.entry(key).or_insert_with(|| RetiredGeneric {
                     stamp: w.stamp,
                     lane: w.lane(),
@@ -1658,6 +1753,7 @@ impl Checker {
                 a.in_use = false;
                 a.gen_base += 2; // next generation starts above every old epoch
                 a.k = Knowledge::default();
+                a.g2t_ranges.clear();
                 a.preds.clear();
                 a.footprint.clear();
                 self.free_slots.push(i);

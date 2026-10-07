@@ -22,10 +22,10 @@ use std::collections::HashMap;
 use crate::arena::{AllocId, ByteSpan, Space};
 use crate::observe::{
     Access as CAccess, Actor, CtaId, FenceEvent, LaunchInfo, Observer, PublishTarget, SyncEvent as CSync, SyncKind,
-    WarpEnd, WarpId as CWarpId, ALL_LANES,
+    WarpEnd, WarpId as CWarpId,
 };
 use crate::program::{Proxy, Scope, Sem};
-use crate::sync::completion::ResourceId;
+use crate::sync::completion::AsyncId;
 use crate::value::LaneMask;
 
 use super::checker::{Checker, Incomplete, Report as RaceReport, Stats};
@@ -38,6 +38,9 @@ pub struct RacecheckConfig {
     /// unlimited); the run continues regardless (races never abort).
     pub max_findings: usize,
 }
+
+/// Internal ids of per-lane sub-ops (above any engine-assigned `AsyncId`).
+const SUBOP_BASE: u64 = 1 << 62;
 
 /// Default collector period (events).
 pub const DEFAULT_GC_EVERY: u64 = 1 << 14;
@@ -66,12 +69,17 @@ pub struct RaceObserver {
     buffers: HashMap<AllocId, (String, Space)>,
     /// Events delivered outside `begin_launch`/`end_launch`.
     outside_launch: u64,
+    /// Per-thread async ops issued by several lanes in one instruction are
+    /// split into one virtual actor per issuing lane (PTX async-groups and
+    /// completions are per thread; contract review item 5). Never merged.
+    subops: HashMap<AsyncId, Vec<(u8, AsyncId)>>,
+    next_sub: u64,
     pub launches: Vec<LaunchResult>,
 }
 
 impl RaceObserver {
     pub fn new(config: RacecheckConfig) -> RaceObserver {
-        RaceObserver { config, gc_every: DEFAULT_GC_EVERY, checker: None, kernel: 0, buffers: HashMap::new(), outside_launch: 0, launches: Vec::new() }
+        RaceObserver { config, gc_every: DEFAULT_GC_EVERY, checker: None, kernel: 0, buffers: HashMap::new(), outside_launch: 0, subops: HashMap::new(), next_sub: SUBOP_BASE, launches: Vec::new() }
     }
 
     /// Start a launch from an explicit topology (tests and replay; the
@@ -83,10 +91,6 @@ impl RaceObserver {
         let mut c = Checker::new(topo);
         c.gc_every = self.gc_every;
         c.max_findings = self.config.max_findings;
-        // The contract's Arrive/Wait carry no mbarrier scope (see
-        // CONTRACT_REQUESTS.md): assume the PTX default `.cta` and fail
-        // closed on cross-CTA arrivals.
-        c.mbarrier_scope_assumed = true;
         self.kernel = kernel;
         self.checker = Some(c);
     }
@@ -154,16 +158,6 @@ fn normalize(sem: Sem, scope: Scope, atomic: bool) -> (ri::MemOrder, Option<Scop
     }
 }
 
-/// The scope an arrive/wait on `obj` synchronises at (`None` = named
-/// barrier: participants, no scope).
-fn barrier_scope(obj: &ResourceId) -> Option<Scope> {
-    match obj {
-        ResourceId::Mbarrier { .. } => Some(Scope::Cta),
-        ResourceId::Cluster { .. } => Some(Scope::Cluster),
-        _ => None,
-    }
-}
-
 impl Observer for RaceObserver {
     fn wants_word_history(&self) -> bool {
         true
@@ -227,9 +221,23 @@ impl Observer for RaceObserver {
                 }
             }
             Actor::Async { op, side } => {
+                let subs = self.subops.get(&op);
                 for s in a.spans {
-                    debug_assert!(s.lane == ALL_LANES || s.lane < 32);
-                    let mut x = base(ri::Who::Async { op, side });
+                    let id = match subs {
+                        None => op,
+                        Some(subs) => match subs.iter().find(|(l, _)| *l == s.lane) {
+                            Some((_, id)) => *id,
+                            None => {
+                                // A multi-lane per-thread op whose span does
+                                // not name its lane: attributing it to the
+                                // whole warp would merge lanes (false
+                                // negatives) — fail closed.
+                                c.note_incomplete(Incomplete::AsyncLaneUnknown { op });
+                                continue;
+                            }
+                        },
+                    };
+                    let mut x = base(ri::Who::Async { op: id, side });
                     x.range = span_range(s.span);
                     c.access(&x);
                 }
@@ -259,11 +267,22 @@ impl Observer for RaceObserver {
             SyncKind::DeclareWord { alloc, span } => ri::SyncEvent::DeclareWord { alloc: *alloc, range: span_range(*span) },
             SyncKind::Protocol { .. } => return, // synccheck's input
             SyncKind::AsyncComplete { op, milestone, target } => {
-                let target = match *target {
-                    PublishTarget::Phase { obj, phase } => ri::CompletionTarget::Phase { obj, phase },
-                    PublishTarget::Warp { warp, lanes } => ri::CompletionTarget::Warp { warp: warp.0, lanes },
+                let (t, only) = match *target {
+                    PublishTarget::Phase { obj, phase } => (ri::CompletionTarget::Phase { obj, phase }, LaneMask::ALL),
+                    PublishTarget::Warp { warp, lanes } => (ri::CompletionTarget::Warp { warp: warp.0, lanes }, lanes),
                 };
-                ri::SyncEvent::AsyncComplete { op: *op, milestone: *milestone, target }
+                match self.subops.get(op) {
+                    // Per-thread completion: only the waiting lanes' sub-ops.
+                    Some(subs) => {
+                        for (l, id) in subs.clone() {
+                            if only.contains(l as usize) {
+                                c.sync(ri::SyncEvent::AsyncComplete { op: id, milestone: *milestone, target: t });
+                            }
+                        }
+                        return;
+                    }
+                    None => ri::SyncEvent::AsyncComplete { op: *op, milestone: *milestone, target: t },
+                }
             }
             kind => {
                 let Some((warp, epoch)) = wa else {
@@ -272,24 +291,14 @@ impl Observer for RaceObserver {
                 };
                 match kind {
                     SyncKind::WarpSync { mask } => ri::SyncEvent::WarpSync { warp, mask: *mask, epoch },
-                    SyncKind::Arrive { obj, phase, release } => ri::SyncEvent::Arrive {
-                        warp,
-                        lanes,
-                        obj: *obj,
-                        phase: *phase,
-                        release: Some(*release),
-                        scope: barrier_scope(obj),
-                        epoch,
-                    },
-                    SyncKind::Wait { obj, phase, acquire } => ri::SyncEvent::Wait {
-                        warp,
-                        lanes,
-                        obj: *obj,
-                        phase: *phase,
-                        acquire: Some(*acquire),
-                        scope: barrier_scope(obj),
-                        epoch,
-                    },
+                    // `None` qualifier = lost in lowering → incomplete;
+                    // `scope: None` = named barrier (participants).
+                    SyncKind::Arrive { obj, phase, release, scope } => {
+                        ri::SyncEvent::Arrive { warp, lanes, obj: *obj, phase: *phase, release: *release, scope: *scope, epoch }
+                    }
+                    SyncKind::Wait { obj, phase, acquire, scope } => {
+                        ri::SyncEvent::Wait { warp, lanes, obj: *obj, phase: *phase, acquire: *acquire, scope: *scope, epoch }
+                    }
                     SyncKind::Fence(f) => {
                         let kind = match *f {
                             FenceEvent::AcqRel(s) => ri::FenceKind::AcqRel(s),
@@ -297,8 +306,10 @@ impl Observer for RaceObserver {
                             FenceEvent::ProxyAsync(w) => ri::FenceKind::ProxyAsync(w),
                             FenceEvent::TcgenBefore => ri::FenceKind::TcgenBefore,
                             FenceEvent::TcgenAfter => ri::FenceKind::TcgenAfter,
-                            FenceEvent::TensormapRelease => ri::FenceKind::TensormapRelease,
-                            FenceEvent::TensormapAcquire => ri::FenceKind::TensormapAcquire,
+                            FenceEvent::TensormapRelease { scope } => ri::FenceKind::TensormapRelease(scope),
+                            FenceEvent::TensormapAcquire { scope, alloc, span } => {
+                                ri::FenceKind::TensormapAcquire { scope, alloc, range: span_range(span) }
+                            }
                             // mbarrier init visibility is synccheck's; the
                             // alias proxy orders virtual aliases, and the
                             // shadow is keyed by physical bytes already.
@@ -306,25 +317,55 @@ impl Observer for RaceObserver {
                         };
                         ri::SyncEvent::Fence { warp, lanes, kind, epoch }
                     }
-                    SyncKind::AsyncIssue { op, class, proxy, preds, footprint, .. } => ri::SyncEvent::AsyncIssue {
-                        op: *op,
-                        warp,
-                        lanes,
-                        kind: *class,
-                        proxy: *proxy,
-                        preds: preds.clone(),
-                        footprint: footprint.iter().map(|(a, s)| (*a, span_range(*s))).collect(),
-                        site: e.site,
-                        epoch,
-                    },
-                    SyncKind::WaitVerdicts { alloc, span, scope, accepted, observed, pred_reads } => ri::SyncEvent::WaitVerdicts {
+                    SyncKind::AsyncIssue { op, class, proxy, preds, footprint, .. } => {
+                        let preds: Vec<AsyncId> = preds
+                            .iter()
+                            .flat_map(|p| match self.subops.get(p) {
+                                Some(s) => s.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+                                None => vec![*p],
+                            })
+                            .collect();
+                        let footprint: Vec<_> = footprint.iter().map(|(a, s)| (*a, span_range(*s))).collect();
+                        if *class == crate::observe::AsyncClass::Copy && lanes.count() > 1 {
+                            let mut subs = Vec::new();
+                            for l in lanes.lanes() {
+                                let id = AsyncId(self.next_sub);
+                                self.next_sub += 1;
+                                subs.push((l as u8, id));
+                                c.sync(ri::SyncEvent::AsyncIssue {
+                                    op: id,
+                                    warp,
+                                    lanes: LaneMask::lane(l),
+                                    kind: *class,
+                                    proxy: *proxy,
+                                    preds: preds.clone(),
+                                    footprint: footprint.clone(),
+                                    site: e.site,
+                                    epoch,
+                                });
+                            }
+                            self.subops.insert(*op, subs);
+                            return;
+                        }
+                        ri::SyncEvent::AsyncIssue {
+                            op: *op,
+                            warp,
+                            lanes,
+                            kind: *class,
+                            proxy: *proxy,
+                            preds,
+                            footprint,
+                            site: e.site,
+                            epoch,
+                        }
+                    }
+                    SyncKind::WaitVerdicts { alloc, span, scope, verdicts, pred_reads } => ri::SyncEvent::WaitVerdicts {
                         warp,
                         lanes,
                         alloc: *alloc,
                         range: span_range(*span),
                         scope: *scope,
-                        accepted: accepted.clone(),
-                        observed: *observed,
+                        verdicts: verdicts.iter().map(|v| (v.lanes, v.accepted.clone(), v.observed)).collect(),
                         pred_reads: pred_reads.iter().map(|(a, s)| (*a, span_range(*s))).collect(),
                         epoch,
                     },

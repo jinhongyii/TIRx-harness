@@ -1095,6 +1095,19 @@ merged; `inbox_drain` is only a GC safe point. When CTA parallelism lands:
 - Reclaimed `AsyncId`s are remembered, so a late predecessor reference is not
   reported as unknown.
 
+### Contract update (e2551cf, b3c72f3)
+
+- Arrive/Wait carry qualifiers and scope. There is no adapter-side
+  assumption: `None` → `SyncQualifierUnknown`.
+- `WaitVerdicts` is judged per lane group.
+- `Finding.attrs` carries every structured fact: `access_pair`,
+  `ordering_*`, `proxy_bridge`, `hint`, `occurrences`, `reason`, and
+  `prior`/`current` witness objects.
+- New `FindingKind` variants replace `Other(..)`.
+- Tensormap fences carry a scope, and the acquire carries a byte range.
+- Per-thread async ops issued by several lanes are split per lane by the
+  adapter (contract review item 5).
+
 ### Further ports
 
 - **TensorMap.**
