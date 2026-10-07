@@ -500,3 +500,11 @@ These are outside `program.rs`, `dtype.rs`, `value.rs`, `site.rs` and
   `site.rs`.
 - **W7-1..6, W6-1, W5-1..3, W5-5, W3-*:** these target observe, report,
   sync, sched, oplib or Cargo. None touches the files above; no action.
+
+## W3 (2026-10-07): tcgen pair identity done
+
+`ResourceId::TcgenLifecycle` is now `{ cluster: u32, pair_rank: u8 }`, with
+`pair_rank = ctarank >> 1`. The W2 handler `interp/handlers/tcgen.rs` builds
+it this way; its rendezvous key is a new local `pair_cta(ctx)`, unchanged.
+W6's `synccheck/build.rs::tmem(pair)` maps to `{cluster: pair, pair_rank: 0}`.
+`numsim-sync-ref` does not name the pair, so it needs no change.

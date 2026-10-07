@@ -39,8 +39,11 @@ pub enum ResourceId {
     Cluster { cluster: u32 },
     /// Async-group queue of one thread (`domain` = cp.async or bulk).
     AsyncGroup { warp: WarpId, lane: u8, domain: super::async_group::Domain },
-    /// tcgen05 TMEM lifecycle of a CTA pair (`pair` = global id of the even CTA).
-    TcgenLifecycle { pair: CtaId },
+    /// tcgen05 TMEM lifecycle of a CTA pair: CTAs `2*pair_rank` and
+    /// `2*pair_rank + 1` (by `%cluster_ctarank`) of `cluster`. A CTA's pair
+    /// is `ctarank >> 1` and its peer is `ctarank ^ 1` (PTX 9.4 §9.7.18.5.1,
+    /// *CTA Pair*). `tcgen::Who::One(ctarank & 1)` selects one CTA of it.
+    TcgenLifecycle { cluster: u32, pair_rank: u8 },
     /// tcgen05 per-thread work queue (commit / wait::ld / wait::st).
     TcgenWork { warp: WarpId, lane: u8 },
     /// Kernel-wide tcgen05 `.cta_group` (PTX 9.4 §9.7.18.7.1: every tcgen05
