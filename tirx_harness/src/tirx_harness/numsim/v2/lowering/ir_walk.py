@@ -25,7 +25,8 @@ from . import program_builder as pb
 from .calls import CallsMixin
 from .dtypes import dtype_of, type_key
 from .host_prelude import PreludeMixin
-from .memory import MemoryMixin, MemRef, _Unsupported, escaped_locals, handle
+from .memory import MemoryMixin, MemRef, _Unsupported, escaped_locals, handle, promotable_locals
+from .uninit import maybe_uninit_locals
 
 
 class LoweringUnsupported(Exception):
@@ -103,6 +104,7 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         self.pending_preds: list[tuple[list[pb.Instr], list[int], pb.Reg, pb.Reg, bool]] = []
         self.elect_buffers: set[int] = set()
         self.escaped: set[int] = set()
+        self.uninit_locals: set[int] = set()
         self.tmem_views = False
         self.wide_params: set[int] = set()
 
@@ -187,6 +189,7 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
             self.unsupported(error.node if error.node is not None else self.func.body, error.reason)
             return self.finish()
         self.escaped = escaped_locals(self.func.body)
+        self.uninit_locals = maybe_uninit_locals(statements, promotable_locals(self.func.body, self.escaped))
         self.collect_topology(statements)
         self.read_params()
         for statement in statements:

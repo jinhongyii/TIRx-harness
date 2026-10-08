@@ -24,6 +24,7 @@ and ``ComposeLayout`` (swizzles), lowered as ordinary integer arithmetic.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,7 @@ from . import builtins
 from . import dtypes
 from . import program_builder as pb
 from .dtypes import type_key
+from .uninit import TRACKED_SPACE
 
 if TYPE_CHECKING:
     from .ir_walk import Lowerer
@@ -162,6 +164,34 @@ def escaped_locals(body: Any) -> set[int]:
     return escaped
 
 
+def sum_bases(buffers: list[pb.BufferDecl], index: int) -> int:
+    """Byte offset of ``buffers[index]`` from the start of its view_of chain root."""
+    total = 0
+    while buffers[index].view_of is not None:
+        total += buffers[index].base
+        index = buffers[index].view_of
+    return total
+
+
+def promotable_locals(body: Any, escaped: set[int]) -> dict[int, tuple[int, ...]]:
+    """Local allocations eligible for register promotion: handle -> static shape."""
+    from tvm import tirx
+
+    found: dict[int, tuple[int, ...]] = {}
+
+    def on_alloc(node: Any, visitor: Any) -> None:
+        var = node.buffer
+        info = buffer_shape(var.ty)
+        static = info.static_shape
+        if str(var.ty.storage_scope) == "local" and static is not None and info.layout is None \
+                and not info.strides and handle(var) not in escaped:
+            found[handle(var)] = tuple(static)
+        visitor.default_visit(node)
+
+    structural_visit(body, [(tirx.AllocBuffer, on_alloc)])
+    return found
+
+
 class MemoryMixin:
     """Buffer resolution and access lowering (mixed into ``Lowerer``)."""
 
@@ -175,7 +205,7 @@ class MemoryMixin:
         name = str(var.name)
         elem_ty = self.ty(info.dtype, node)
         if scope == "local" and static is not None and info.layout is None and not info.strides \
-                and handle(var) not in self.escaped:
+                and handle(var) not in self.escaped and handle(var) not in self.uninit_locals:
             count = 1
             for extent in static:
                 count *= extent
@@ -183,6 +213,9 @@ class MemoryMixin:
             self.refs[handle(var)] = RegArray(regs=regs, info=info)
             return
         space = _SPACES.get(scope)
+        if handle(var) in self.uninit_locals:
+            # May be read before written (V2C-19/20): keep it in tracked memory.
+            space = TRACKED_SPACE
         if space not in ("Local", "Shared") or static is None:
             raise _Unsupported(node, f"allocation in scope {scope!r} with shape {[str(s) for s in info.shape]}")
         numel = _numel(static)
@@ -222,11 +255,23 @@ class MemoryMixin:
                 tuple(self.dim_expr(e) for e in info.shape)
             byte_len = pb.DimExpr.const((_numel(static) * dtypes.bits(info.dtype) + 7) // 8) \
                 if static is not None else None
+            # `elem_offset` counts from the backing's *data pointer*, which a view
+            # shares with its own view_of chain root; BufferDecl.base is relative
+            # to view_of, so subtract the parent's offset within that chain.
             base = (int(offset.value) * dtypes.bits(info.dtype)) // 8
+            view_of = backing.buf
+            buffers = self.builder.program.buffers
+            chain = view_of
+            while buffers[chain].view_of is not None:
+                base -= buffers[chain].base
+                chain = buffers[chain].view_of
+            if base < 0:  # starts before the parent: hang it off the chain root
+                base += sum_bases(buffers, view_of)
+                view_of = chain
             buf = self.builder.buffer(
                 pb.BufferDecl(
                     name=name, space=parent.space, dtype=elem_ty, shape=shape,
-                    byte_len=byte_len, align=int(ty.data_alignment), view_of=backing.buf, base=base,
+                    byte_len=byte_len, align=int(ty.data_alignment), view_of=view_of, base=base,
                 )
             )
             self.refs[handle(var)] = MemRef(buf=buf, space=backing.space, info=info)
@@ -315,11 +360,8 @@ class MemoryMixin:
                 size = max(size, ends.get(index, 0), self.dyn_smem_bytes or 0)
             align = max(16, decl.align)
             cursor = (cursor + align - 1) // align * align
-            program.buffers[index] = pb.BufferDecl(
-                name=decl.name, space=decl.space, dtype=decl.dtype, shape=decl.shape,
-                strides=decl.strides, param_slot=decl.param_slot, base=cursor,
-                byte_len=pb.DimExpr.const(size), align=align,
-            )
+            program.buffers[index] = dataclasses.replace(
+                decl, base=cursor, byte_len=pb.DimExpr.const(size), align=align)
             cursor += size
         return cursor
 

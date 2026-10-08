@@ -1513,3 +1513,50 @@ reports) must treat that diagnostic as making the checker verdict
   flash_attention4 returns `O` in the base array's shape (1,256,32,128) while
   legacy returns the tensor-map view (64,256,64); the reference compares the
   latter. sparse_flashmla_decode_head64: missing binding `q_tail_tensormap`.
+
+## W1 (2026-10-08, cont.): W2-16 rulings applied, W4 mqa_logits_fp4
+
+- **Unqualified mbarrier operands (W2-16 ruling): done, with one refinement.**
+  - Scope: `mbarrier.*`, `cp.async.mbarrier.arrive` and the `tcgen05.commit`
+    mbar operand, when written with no state-space qualifier.
+  - A 64-bit operand lowers as `Generic` and a 32-bit operand as
+    `SharedCluster`. Lowering never forces `Shared`.
+  - Refinement: a 64-bit register whose only writers are
+    `Mapa{space: SharedCluster}` lowers as `SharedCluster`.
+    - Reason: `mapa.shared::cluster.u64` returns a shared::cluster window
+      address held in a u64, not a generic pointer.
+    - Without this, nvfp4_gemm:512 failed as Global address 0x37858; with it,
+      nvfp4_gemm runs to completion.
+- **V2C-19/20 (uninitialized register reads): lowering done; one engine
+  binding is needed before the space can become `Reg`.**
+  - New pre-pass in `lowering/uninit.py`. It is a forward "definitely
+    written" dataflow over the TIR, covering:
+    - If-meet: the state after an If keeps only what both branches wrote.
+    - Loops: first-iteration semantics; small constant loops (64 iterations or
+      fewer, no break) are unrolled.
+    - PTX `w` destinations, helper out-parameters and `wait_until`.
+  - A local that may be read before it is written is kept as a memory buffer
+    accessed by `Load`/`Store`. Every other local is still promoted to
+    registers.
+  - The memory space is set by `uninit.TRACKED_SPACE`, currently `Local`. The
+    scheduler binds `Space::Reg` BufferDecls as `Unbound` (sched/mod.rs:567).
+    - Once W2 binds `Reg` like `Local` (per lane, `Init::Uninit`), set
+      `TRACKED_SPACE = "Reg"` and the findings will read `space: register`.
+  - Results:
+    - flashinfer_rmsnorm_quant and gdn_decode_fp32_mtp_warp now report
+      `uninitialized_read` in `local` space.
+    - flashinfer_qk_rmsnorm still reports only the shared footprint, so the
+      register part of V2C-20 is still open.
+    - Corpus: 433 of 2343 kernels have a tracked local (204 before). The new
+      ones are mostly PTX microtests whose source operands really are
+      uninitialized.
+- **W4 mqa_logits_fp4: fixed (lowering).**
+  - Sub-byte sizes were already correct (E2M1: numel × 4 bits).
+  - The real bug: a `DeclBuffer` over another view's data (`data=view.data`)
+    took `elem_offset` as relative to that view. It is relative to the shared
+    data pointer, so the offset was counted twice: `smem_sf_q_2d` landed at
+    188416 + 188416 = 376832.
+  - `BufferDecl.base` now subtracts the parent's chain offset, and falls back
+    to the chain root if the result would be negative.
+  - Also: `finish_shared` now keeps every BufferDecl field when it rewrites
+    root shared buffers. It used to drop `sync_words`.

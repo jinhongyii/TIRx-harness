@@ -129,6 +129,29 @@ class PtxCtx:
             raise _Unsupported(self.node, f"{self.d.op_name}: {name} must be a constant")
         return int(node.value)
 
+    def mbar_addr(self, name: str) -> tuple[pb.Operand, str]:
+        """An mbarrier operand (W2-13 ruling): with no state-space qualifier the
+        PTX form is generic addressing. A 64-bit value stays ``Generic``; a
+        32-bit value (e.g. a ``mapa.shared::cluster`` result) is
+        ``SharedCluster``. Every shared::cta address is also a valid
+        shared::cluster address under rank tagging, so this never forces CTA."""
+        info = self.info(name)
+        token = info.space if info.space else self.mod("space")
+        if token:
+            return self.addr(name)
+        value = self.src(name)
+        if self.lw.operand_ty(value).bits == 64 and not self._cluster_window(value):
+            return value, "Generic"
+        return self.lw.address_in(value, "SharedCluster"), "SharedCluster"
+
+    def _cluster_window(self, value: pb.Operand) -> bool:
+        """Is every writer of ``value`` a ``mapa.shared::cluster`` (a shared::cluster
+        window address held in a 64-bit register, not a generic pointer)?"""
+        if not isinstance(value, pb.Reg):
+            return False
+        writers = [i for i in self.lw.builder.code if value in i.writes()]
+        return bool(writers) and all(i.variant == "Mapa" and i.space == "SharedCluster" for i in writers)
+
     def addr(self, name: str, default_space: str | None = None) -> tuple[pb.Operand, str]:
         info = self.info(name)
         token = info.space if info.space else self.mod("space")
@@ -398,7 +421,7 @@ def lower_async_wait(c: PtxCtx) -> None:
 
 
 def lower_cp_async_mbar_arrive(c: PtxCtx) -> None:
-    mbar, space = c.addr("addr", "Shared")
+    mbar, space = c.mbar_addr("addr")
     c.emit("CpAsyncMbarArrive", mbar=mbar, space=space, noinc=c.flag("noinc"))
 
 
@@ -627,14 +650,14 @@ def lower_mbarrier(c: PtxCtx) -> None:
     name = c.name
     action = c.mod("action")
     if name == "mbarrier_init":
-        mbar, space = c.addr("addr", "Shared")
+        mbar, space = c.mbar_addr("addr")
         c.emit("MbarInit", mbar=mbar, space=space, count=c.src("count"),
                layout_v1=c.mod("layout") == "layout::v1")
     elif name == "mbarrier_inval":
-        mbar, space = c.addr("addr", "Shared")
+        mbar, space = c.mbar_addr("addr")
         c.emit("MbarInval", mbar=mbar, space=space)
     elif action in ("arrive", "arrive_drop"):
-        mbar, space = c.addr("addr", "Shared")
+        mbar, space = c.mbar_addr("addr")
         count = c.opt_src("count") if "count" in c.ops else None
         expect = None
         if c.flag("expect_tx"):
@@ -646,11 +669,11 @@ def lower_mbarrier(c: PtxCtx) -> None:
                no_complete=c.flag("nocomplete"), sem=c.sem("Release"), scope=c.scope("Cta"),
                multicast=_multicast(c), state=state)
     elif action in ("expect_tx", "complete_tx"):
-        mbar, space = c.addr("addr", "Shared")
+        mbar, space = c.mbar_addr("addr")
         c.emit("MbarTx", op="Expect" if action == "expect_tx" else "Complete", mbar=mbar, space=space,
                bytes=c.src("tx_count"), multicast=_multicast(c), scope=c.scope("Cta"))
     elif action in ("test_wait", "try_wait"):
-        mbar, space = c.addr("addr", "Shared")
+        mbar, space = c.mbar_addr("addr")
         if c.flag("parity"):
             phase = pb.phase_parity(c.src("phase"))
         else:
@@ -666,7 +689,7 @@ def lower_mbarrier(c: PtxCtx) -> None:
         state = c.src("state")
         c.emit("MbarQuery", dst=c.dst("count"), op={"PendingCount": {"state": pb.opnd(state)}})
     elif name == "mbarrier_check_layout":
-        mbar, space = c.addr("addr", "Shared")
+        mbar, space = c.mbar_addr("addr")
         c.emit("MbarQuery", dst=c.dst("matches"), op={"CheckLayout": {"mbar": pb.opnd(mbar), "space": space,
                                                                          "layout_v1": c.mod("layout") == "layout::v1"}})
     else:
@@ -771,7 +794,7 @@ def lower_tcgen05(c: PtxCtx) -> None:
     elif name == "tcgen05_relinquish_alloc_permit":
         c.emit("TcgenRelinquish", cta_group=_cta_group(c))
     elif name.startswith("tcgen05_commit"):
-        mbar, space = c.addr("mbar", "SharedCluster")
+        mbar, space = c.mbar_addr("mbar")
         multicast = c.src("mask") if c.has("mask") else (c.src("cta_mask") if c.has("cta_mask") else None)
         token = c.mod("multicast")
         width = int(token.rsplit("::", 1)[1].rstrip("b")) if token.endswith(("::16b", "::32b")) else None

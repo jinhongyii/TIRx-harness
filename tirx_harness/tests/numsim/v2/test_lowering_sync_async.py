@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from tirx_harness.numsim.v2.lowering import program_builder as pb
 
-from ._program import all_of, const, only
+from ._program import all_of, const, definition, only
 
 PIPELINE = '''
 @T.prim_func
@@ -113,3 +113,28 @@ def k(g: T.Buffer((1024,), "float32")):
     assert (bulk.dst_space, bulk.src_space, bulk.completion, bulk.reduce) == ("Global", "Shared", "Group", None)
     barriers = [(i.kind, const(program, i.id), const(program, i.count)) for i in all_of(program, "Barrier")]
     assert barriers == [("Sync", 1, 128), ("Sync", 2, 128)]
+
+
+def test_unqualified_mbarrier_operand_is_generic_or_shared_cluster(lower_source):
+    """W2-13 ruling: no state space -> 64-bit Generic, 32-bit SharedCluster, never Shared."""
+    program = lower_source('''
+@T.prim_func
+def k():
+    T.attr({"tirx.device_entry": T.bool(True), "tirx.dyn_smem_bytes": 64})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    pool = T.alloc_buffer((0,), "uint8", scope="shared.dyn")
+    full = T.decl_buffer((2,), "uint64", data=pool.data, elem_offset=0, scope="shared.dyn", align=8)
+    generic = T.reinterpret(T.handle().ty, T.reinterpret("uint64", T.address_of(full[0])))
+    T.ptx.mbarrier(generic, T.uint32(64), "arrive", "expect_tx", "", "", "", "b64", "")
+    rem = T.alloc_local((1,), "uint64")
+    T.ptx.mapa.shared__cluster.u64(rem[0], full.ptr_to([1]), T.uint32(1))
+    T.ptx.mbarrier.arrive.expect_tx.b64(rem[0], T.uint32(64))
+''')
+    # (TVM rejects an unqualified 32-bit operand at parse time; lowering maps
+    # one, e.g. a raw `mapa` u32 result, to SharedCluster.)
+    wide, remote = all_of(program, "MbarArrive")
+    assert wide.space == "Generic"
+    # A `mapa.shared::cluster` result is a cluster-window address even in a u64.
+    assert remote.space == "SharedCluster"
+    assert definition(program, wide.mbar).variant != "Cvta"  # no forced shared::cta

@@ -170,3 +170,69 @@ def test_dtype_changing_view_is_its_own_logical_buffer(lower_source):
     assert site(loads["wide"]) == "wide"
     assert site(loads["halves"]) == "state"
     assert all(b.name for b in program.buffers)
+
+
+def _uninit_kernel(body: str) -> str:
+    return f'''
+@T.prim_func
+def k(out: T.Buffer((32,), "float32"), idx: T.Buffer((32,), "int32")):
+    T.attr({{"tirx.device_entry": T.bool(True)}})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    a = T.alloc_local((4,), "float32")
+{body}
+'''
+
+
+def _local_buffers(program: pb.Program) -> list[str]:
+    return [b.name for b in program.buffers if b.space == "Local"]
+
+
+def test_possibly_uninitialized_locals_stay_in_tracked_memory(lower_source):
+    """V2C-19/20: a local read before some write lives in Local memory (validity tracked)."""
+    read_first = lower_source(_uninit_kernel("    out[lane] = a[0]"))
+    assert _local_buffers(read_first) == ["a"]
+    conditional = lower_source(_uninit_kernel(
+        "    if lane < 4:\n        a[0] = T.float32(1)\n    out[lane] = a[0]"))
+    assert _local_buffers(conditional) == ["a"]
+    partial = lower_source(_uninit_kernel(
+        "    a[0] = T.float32(1)\n    out[lane] = a[idx[lane]]"))
+    assert _local_buffers(partial) == ["a"]
+
+
+def test_provably_initialized_locals_are_promoted(lower_source):
+    straight = lower_source(_uninit_kernel(
+        "    a[0] = T.float32(1)\n    out[lane] = a[0]"))
+    assert _local_buffers(straight) == []
+    loop_init = lower_source(_uninit_kernel(
+        "    for i in range(4):\n        a[i] = T.float32(0)\n    out[lane] = a[idx[lane]]"))
+    assert _local_buffers(loop_init) == [] and all_of(loop_init, "LoadRegIndexed")
+    both_branches = lower_source(_uninit_kernel(
+        "    if lane < 4:\n        a[0] = T.float32(1)\n    else:\n        a[0] = T.float32(2)\n"
+        "    out[lane] = a[0]"))
+    assert _local_buffers(both_branches) == []
+
+
+def test_sub_byte_view_footprint_and_view_of_view_base(lower_source):
+    """W4 (mqa_logits_fp4): an E2M1 view takes numel/2 bytes, and a view of a view
+    is placed relative to its parent (`elem_offset` counts from the shared data pointer)."""
+    program = lower_source('''
+@T.prim_func
+def k(out: T.Buffer((32,), "uint32")):
+    T.attr({"tirx.device_entry": T.bool(True), "tirx.dyn_smem_bytes": 2048})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    pool = T.alloc_buffer((0,), "uint8", scope="shared.dyn")
+    q = T.decl_buffer((2, 128), "float4_e2m1fn", data=pool.data, elem_offset=0, scope="shared.dyn", align=16)
+    sf = T.decl_buffer((32,), "uint32", data=pool.data, elem_offset=32, scope="shared.dyn", align=16)
+    sf2 = T.decl_buffer((2, 16), "uint32", data=sf.data, elem_offset=32, scope="shared.dyn", align=16)
+    out[lane] = sf[lane] + sf2[lane // 16, lane % 16]
+''')
+    by_name = {b.name: (i, b) for i, b in enumerate(program.buffers)}
+    _, q = by_name["q"]
+    sf_index, sf = by_name["sf"]
+    _, sf2 = by_name["sf2"]
+    assert q.byte_len == pb.DimExpr.const(128)  # 256 x 4 bits
+    assert sf.base == 128 and sf.byte_len == pb.DimExpr.const(128)
+    # sf2 aliases sf exactly: base 0 within sf, not 128 past it.
+    assert (sf2.view_of, sf2.base) == (sf_index, 0)
