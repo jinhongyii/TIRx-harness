@@ -391,6 +391,38 @@ pub trait Observer {
     /// CTA `cta` starts its turn in scheduler round `round` (a natural pause
     /// point, e.g. for checker garbage collection).
     fn round_boundary(&mut self, _cta: CtaId, _round: u64) {}
+    /// Decision 17: a child observer for one scheduling partition's
+    /// replayed events of the current parallel phase, or `None` (default)
+    /// for serial replay into `self`. The scheduler calls `fork` serially in
+    /// replay order at the point it replays today (seq assigned, verdicts
+    /// renumbered), feeds each child its partition's events (possibly on
+    /// another thread), then calls `join` serially in replay order. The
+    /// merged result must not depend on the worker count or on which
+    /// thread ran which child.
+    fn fork(&mut self, _part: &PartitionInfo<'_>) -> Option<Box<dyn ForkedObserver>> {
+        None
+    }
+    /// Take back a child returned by `fork` for the same partition.
+    fn join(&mut self, _part: &PartitionInfo<'_>, _child: Box<dyn ForkedObserver>) {}
+    /// End of one replay batch of round `round`: the parallel phase, the
+    /// serial phase, or the drain (a merge point where every child has
+    /// joined; e.g. for checker garbage collection).
+    fn phase_end(&mut self, _round: u64) {}
+}
+
+/// A scheduling partition as `Observer::fork` sees it (decision 17).
+pub struct PartitionInfo<'a> {
+    /// The partition's first cluster id (`Partition::clusters[0]`): stable
+    /// across rounds, unlike its index in the scheduler's partition list.
+    pub key: u32,
+    /// Its CTAs.
+    pub ctas: &'a [CtaId],
+}
+
+/// A forked child observer (decision 17): sendable to a pool thread and
+/// recoverable as its concrete type by the parent's `join`.
+pub trait ForkedObserver: Observer + Send {
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send>;
 }
 
 /// NumSim's observer.
@@ -491,5 +523,10 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
     fn round_boundary(&mut self, c: CtaId, r: u64) {
         self.0.round_boundary(c, r);
         self.1.round_boundary(c, r);
+    }
+    // `fork` stays `None`: a pair replays serially.
+    fn phase_end(&mut self, r: u64) {
+        self.0.phase_end(r);
+        self.1.phase_end(r);
     }
 }

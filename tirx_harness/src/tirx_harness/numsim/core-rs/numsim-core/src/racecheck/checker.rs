@@ -25,6 +25,8 @@ use super::input::*;
 use super::knowledge::{fence_domains, join_tmap, select_view, Heads, Knowledge, Rel, View, NDOM};
 use super::shadow::IntervalShadow;
 
+mod partition;
+
 // ---------------------------------------------------------------- report --
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -365,6 +367,7 @@ fn slot_mut(k: &mut Knowledge, s: usize) -> &mut Clock {
     }
 }
 
+#[derive(Clone)]
 struct AsyncActor {
     op: AsyncId,
     actor: ActorId,
@@ -381,7 +384,9 @@ struct AsyncActor {
     g2t_ranges: Arc<G2tRanges>,
     /// CTAs that observed this op's completion directly (its mbarrier's
     /// CTA, or the waiting warp's CTA).
-    completed_ctas: Vec<u32>,
+    /// Each with the position it was recorded at (`Checker::last_seq + 1`),
+    /// so a deferred access sees only completions before it.
+    completed_ctas: Vec<(u64, u32)>,
     /// `(slot, generation)` of each predecessor (a reclaimed slot's new
     /// generation is a different op).
     preds: Vec<(usize, Epoch)>,
@@ -393,6 +398,29 @@ struct AsyncActor {
     /// mbarrier-less st.async / red.async `.release` that landed at issue
     /// (T13). Its accesses stay unordered with everything after them.
     drained: bool,
+}
+
+impl AsyncActor {
+    fn placeholder(actor: ActorId) -> Self {
+        AsyncActor {
+            op: AsyncId(u64::MAX),
+            actor,
+            gen_base: 0,
+            in_use: false,
+            warp: 0,
+            lane: 0,
+            issue_epoch: 0,
+            site: SiteId(0),
+            kind: AsyncKind::Copy,
+            k: Knowledge::default(),
+            g2t_ranges: Arc::new(Vec::new()),
+            completed_ctas: Vec::new(),
+            preds: Vec::new(),
+            footprint: Vec::new(),
+            done: 0,
+            drained: false,
+        }
+    }
 }
 
 /// Async slots by global slot index (actor `num_warps + index`). A checker
@@ -715,6 +743,17 @@ pub struct Checker {
     /// stays amortised O(1) per access while memory stays within 2x live.
     gc_period: u64,
     pub stats: Stats,
+    /// A checker partition's context (`None`: the main / serial checker).
+    part: Option<Box<partition::PartCtx>>,
+    /// Main checker: decode evidence of witnesses whose warp / async slot a
+    /// checker partition holds (filled when their deferred accesses run).
+    site_reg: HashMap<(WarpId, Epoch), SiteId>,
+    op_reg: HashMap<(ActorId, Epoch), Arc<AsyncActor>>,
+    /// Seq of the latest access processed.
+    last_seq: u64,
+    /// While a deferred access runs: its seq (completions after it are not
+    /// visible to it).
+    as_of_seq: Option<u64>,
 }
 
 /// Insert `r` into sorted, disjoint, non-adjacent `spans` (bounded: past
@@ -810,7 +849,20 @@ impl Checker {
             since_gc: 0,
             gc_period: 0,
             stats: Stats::default(),
+            part: None,
+            site_reg: HashMap::new(),
+            op_reg: HashMap::new(),
+            last_seq: 0,
+            as_of_seq: None,
         }
+    }
+
+    /// A checker with no warps (a checker partition's shell).
+    fn new_shell(topo: Topology) -> Self {
+        let mut c = Checker::new(Topology { num_ctas: 0, ..topo });
+        c.topo = topo;
+        c.warps = Warps((0..topo.num_warps()).map(|_| None).collect());
+        c
     }
 
     pub fn topology(&self) -> Topology {
@@ -837,6 +889,9 @@ impl Checker {
         match self.incomplete_index.get(&i) {
             Some(&k) => self.report.incomplete_counts[k] += 1,
             None => {
+                if let Some(p) = &mut self.part {
+                    p.incomplete_tags.push(p.tag);
+                }
                 self.incomplete_index.insert(i.clone(), self.report.incomplete.len());
                 self.report.incomplete.push(i);
                 self.report.incomplete_counts.push(1);
@@ -959,11 +1014,26 @@ impl Checker {
             f.tmem = Some(t);
         }
         self.report.findings.push(f);
+        if let Some(p) = &mut self.part {
+            p.finding_tags.push(p.tag);
+            p.finding_keys.push(None);
+        }
         Some(self.report.findings.len() - 1)
+    }
+
+    /// Record a child finding's dedup key (merged by key at absorb).
+    #[inline]
+    fn key_finding(&mut self, i: usize, k: partition::FKey) {
+        if let Some(p) = &mut self.part {
+            p.finding_keys[i] = Some(k);
+        }
     }
 
     /// A natural pause (round boundary): collect if a quarter period elapsed.
     pub fn safe_point(&mut self) {
+        if self.part.is_some() {
+            return; // a checker partition never collects (main does, D7)
+        }
         if self.gc_every != 0 && self.since_gc >= self.gc_every.max(self.gc_period) / 4 {
             self.gc();
         }
@@ -971,12 +1041,29 @@ impl Checker {
 
     fn maybe_gc(&mut self) {
         self.since_gc += 1;
+        if self.part.is_some() {
+            return;
+        }
         if self.gc_every != 0 && self.since_gc >= self.gc_every.max(self.gc_period) {
             self.gc();
         }
     }
 
     // ------------------------------------------------- witness decoding --
+
+    /// The async op a witness names: its live slot, or (main checker) the
+    /// registered snapshot when a checker partition holds the slot.
+    #[inline(always)]
+    fn slot_of_w(&self, w: &Witness) -> Option<&AsyncActor> {
+        let actor = w.stamp.actor();
+        if actor < self.topo.num_warps() {
+            return None;
+        }
+        match self.slot_of(actor) {
+            Some(a) => Some(a),
+            None => self.op_reg.get(&(actor, w.stamp.epoch())).map(|a| &**a),
+        }
+    }
 
     #[inline(always)]
     fn slot_of(&self, actor: ActorId) -> Option<&AsyncActor> {
@@ -990,17 +1077,20 @@ impl Checker {
     /// Performing warp (issuing warp for async actors), for scope tests.
     #[inline(always)]
     fn warp_of(&self, w: &Witness) -> WarpId {
-        match self.slot_of(w.stamp.actor()) {
+        match self.slot_of_w(w) {
             Some(a) => a.warp,
             None => w.stamp.actor(),
         }
     }
 
     fn site_of(&self, w: &Witness) -> SiteId {
-        match self.slot_of(w.stamp.actor()) {
+        match self.slot_of_w(w) {
             Some(a) => a.site,
             None => {
-                let sites = &self.warps[w.stamp.actor() as usize].sites;
+                let Some(warp) = self.warps.get(w.stamp.actor() as usize) else {
+                    return self.site_reg.get(&(w.stamp.actor(), w.stamp.epoch())).copied().unwrap_or(SiteId(u32::MAX));
+                };
+                let sites = &warp.sites;
                 let e = w.stamp.epoch();
                 let i = sites.partition_point(|(x, _)| *x <= e);
                 if i == 0 {
@@ -1079,7 +1169,7 @@ impl Checker {
                 return OrderingFailure::MissingSameWarpLaneOrder;
             }
         }
-        if let Some(a) = self.slot_of(prior.stamp.actor()) {
+        if let Some(a) = self.slot_of_w(prior) {
             let issue = Stamp::new(a.warp, a.issue_epoch);
             let issued_before = match cur {
                 Cur::Lane { w, lane, .. } => {
@@ -1105,12 +1195,13 @@ impl Checker {
         prior.proxy() == Proxy::Async
             && cur_proxy == Proxy::Async
             && prior.stamp.actor() != self.asyncs[a].actor
-            && self.slot_of(prior.stamp.actor()).is_some_and(|p| {
+            && self.slot_of_w(prior).is_some_and(|p| {
                 // Ordered through the prior op's own completion, observed in
                 // the current issuer's CTA (the multicast / 2-CTA consumer
                 // pattern), is not "base causality alone" (review F1).
                 let cur_cta = self.topo.cta_of(self.asyncs[a].warp);
-                self.topo.cta_of(p.warp) != cur_cta && !p.completed_ctas.contains(&cur_cta)
+                self.topo.cta_of(p.warp) != cur_cta
+                    && !p.completed_ctas.iter().any(|(t, c)| *c == cur_cta && self.as_of_seq.is_none_or(|s| *t <= s))
             })
     }
 
@@ -1119,7 +1210,7 @@ impl Checker {
         // depends on slot reuse (GC timing, slot numbering): report the
         // milestone (1 read side, 2 write side), which the event stream
         // alone determines (deltas T22).
-        let (lane, op, epoch) = match self.slot_of(w.stamp.actor()) {
+        let (lane, op, epoch) = match self.slot_of_w(w) {
             Some(a) => (a.lane, Some(a.op), w.stamp.epoch() - a.gen_base),
             None => (w.lane(), None, w.stamp.epoch()),
         };
@@ -1161,6 +1252,7 @@ impl Checker {
             names: None,        };
         if let Some(i) = self.push_finding(f) {
             self.advisory_dedup.insert((kind, alloc, site), i);
+            self.key_finding(i, partition::FKey::Advisory((kind, alloc, site)));
         }
     }
 
@@ -1224,7 +1316,8 @@ impl Checker {
                     names: Some((buf.clone(), seg.buf.clone())),
                 };
                 if let Some(i) = self.push_finding(f) {
-                    self.alias_dedup.insert(key, i);
+                    self.alias_dedup.insert(key.clone(), i);
+                    self.key_finding(i, partition::FKey::Alias(key));
                 }
             }
         }
@@ -1263,7 +1356,7 @@ impl Checker {
             _ => RaceClass::ReadWrite,
         };
         let failure = self.classify(cur, prior, cw);
-        let prior_is_ld = self.slot_of(prior.stamp.actor()).is_some_and(|a| a.kind == AsyncKind::TcgenLd);
+        let prior_is_ld = self.slot_of_w(prior).is_some_and(|a| a.kind == AsyncKind::TcgenLd);
         let review = prior_is_ld && failure == OrderingFailure::AsyncLifetimeNotDrained;
         let prior_site = prior_info.as_ref().map_or_else(|| self.site_of(prior), |i| i.site);
         let key = (alloc, class, prior_site, self.site_of(cw), review);
@@ -1299,6 +1392,7 @@ impl Checker {
             names: None,        };
         if let Some(i) = self.push_finding(f) {
             self.dedup.insert(key, i);
+            self.key_finding(i, partition::FKey::Race(key));
         }
     }
 
@@ -1317,6 +1411,7 @@ impl Checker {
     }
 
     pub fn access(&mut self, a: &Access) {
+        self.last_seq = self.last_seq.max(a.seq);
         if let Who::Lane { warp, .. } = a.who {
             self.flush_polls(warp);
         }
@@ -1417,6 +1512,14 @@ impl Checker {
                 Cur::Lane { .. } => self.lane_g2t = Some(v),
             }
         }
+        self.access_core(a, cur, stamp, lane, domain);
+    }
+
+    /// The shadow part of an access (everything after the actor's prelude:
+    /// tick, site table, tensormap view): pack, check, record, report. A
+    /// checker partition's deferred global access runs only this part, in
+    /// the main checker, with the actor's state as of the access.
+    fn access_core(&mut self, a: &Access, cur: Cur, stamp: Stamp, lane: u8, domain: Option<Domain>) {
         let w = Witness::pack(stamp, lane, a.proxy, domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.allocs.get_mut(&a.alloc).unwrap().wide);
         let writes = w.writes();
         let strong = a.scope.is_some();
@@ -1584,7 +1687,7 @@ impl Checker {
                     // An un-waited tcgen05.ld read is reported once, against
                     // the first write that overwrites it (the review names
                     // the hazard; legacy shadow semantics, deltas T17).
-                    cell.reads.retain(|r| !this.slot_of(r.w.stamp.actor()).is_some_and(|x| x.kind == AsyncKind::TcgenLd));
+                    cell.reads.retain(|r| !this.slot_of_w(&r.w).is_some_and(|x| x.kind == AsyncKind::TcgenLd));
                 } else {
                     cell.reads.record(Entry { w, rel: None, base: None }, wide, |p| this.ordered(cur, p, a.proxy));
                 }
@@ -1731,6 +1834,7 @@ impl Checker {
             names: None,        };
         if let Some(i) = self.push_finding(f) {
             self.scope_dedup.insert(key, i);
+            self.key_finding(i, partition::FKey::Scope(key));
         }
     }
 
@@ -1864,7 +1968,8 @@ impl Checker {
                 match target {
                     CompletionTarget::Phase { obj, phase } => {
                         if let SyncObjId::Mbarrier { cta, .. } = obj {
-                            self.asyncs[i].completed_ctas.push(cta.0);
+                            let t = self.last_seq + 1;
+                            self.asyncs[i].completed_ctas.push((t, cta.0));
                         }
                         self.phase_mut(obj, phase);
                         let ph = self.phases.get_mut(&obj).and_then(|m| m.get_mut(&phase)).unwrap();
@@ -1876,7 +1981,8 @@ impl Checker {
                             return;
                         }
                         let cta = self.topo.cta_of(warp);
-                        self.asyncs[i].completed_ctas.push(cta);
+                        let t = self.last_seq + 1;
+                        self.asyncs[i].completed_ctas.push((t, cta));
                         let memo = &self.memo;
                         let w = &mut self.warps[warp as usize];
                         match kind {
