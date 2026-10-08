@@ -181,7 +181,7 @@ fn rich_log(rng: &mut Rng, warps: u32) -> RecordingObserver {
                     log.cmd(w, 20, m(b), arrive_tx(1, 64));
                     log.event(w, 21, Vec::new(), vec![AsyncTarget { res: m(b), bytes: 64, arrivals: 0 }], None, None, ProtocolStatus::Committed);
                 }
-                0 | 1 | 2 => {
+                0..=2 => {
                     log.cmd(w, 22, m(b), arrive(1));
                 }
                 3 | 4 => {

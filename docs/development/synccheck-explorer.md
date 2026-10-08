@@ -775,3 +775,28 @@ stages × 32 iterations, 1,044 contract events, 100k-state budget:
 | per-resource + strong diamonds | 4,209 | clean |
 | + fingerprint | 1,180 (6 of 9 reused) | clean |
 | + certificates | 9 (all certified, 10 ms) | clean |
+
+### 5.5 Review fixes (2026-10-08, `checker-review.md`)
+
+Each item has a regression test built from contract events.
+
+| Item | Fix | Regression |
+| --- | --- | --- |
+| S1(a): a vacuous parity-1 wait was ignored by the mbarrier certificate | The certificate declines (falls back to the search) unless the wait is HB-before a prerequisite of generation 0's completion | `s1a_vacuous_parity_one_wait_is_not_certified` (deadlock found) |
+| S1(b): a wait of generation g could pass on g−2 | The certificate declines unless every wait of g ≥ 1 is HB-after a consuming wait of g−1 or a mutation of g. "Overtaken" waits also fall back instead of being reported, because the search decides whether they deadlock or pass later | `s1b_wait_that_can_pass_on_an_older_generation_is_not_certified` (never Clean; gated configurations fail closed) |
+| S5: gated DFS projections never checked the reference generations | `Ts` compares every issued command's generations (and captured issue generations) with the reference run. A mismatch is `incomplete`: `fixed_sync_program_model_incomplete`, with source `generation_assignment_differs` | `s5_generation_assignment_is_checked_against_the_reference` (clean, confluent program; the gated search fails closed) |
+| S8: strong diamonds checked one step only | New proof obligation `TransitionSystem::independent_of_future`; the default declines. `Ts` grants it only when, on the transition's single resource, every command that can still run first (un-issued commands not HB-gated behind it, pending completions, retries) is an observer or a contributor, and their arrivals cannot complete the open phase. Contributors that may complete it also require that no mbarrier observer of the last completed parity can still run | explorer unit test `one_step_diamonds_need_the_independence_proof` (discriminating) and `s8_strong_diamond_does_not_hide_a_two_step_lap` (end to end) |
+| F4: `tcgen05.commit` coupled empty[s], tmem_full and the MMA queue | `TcgenWork` commands are dropped from the explored program: they are total, never block, and carry no state the search needs. Each commit is then a single-resource deferred arrival, and its barrier is certified | `f4_umma_ring_is_certified_per_barrier`: 6 stages × 16 k-blocks × 16 tiles, 15 projections all certified, 15 states (was 320k). With certificates off: 3,994 states |
+| TMA events without `Mbarrier(Issue)` were never certified | The certificate reads the projection's commands, including the synthesized `Issue`. `build::issue` no longer injects `Issue` | `tma_event_without_issue_command_is_certified` |
+| `SyncEvent.kernel` (launches merged) | `check` on a mixed log is `incomplete` (`fixed_sync_program_build`). `check_launches` / `split_launches` return one `Report` per launch | `launches_are_checked_separately` |
+| Duplicate cluster waits were overwritten in the certificate | The certificate declines, and the state machine reports `DuplicateWait` | (covered by the state machine) |
+| W2 engine smoke: 32 per-lane cp.async groups were a product (20K states took 16 s; 1M did not finish) | Async-group milestones fire eagerly, in FIFO order, inside the transition that creates the group. Only the issuing thread's `wait_group` observes them. Deferred mbarrier arrivals stay separately schedulable `Complete` transitions gated on the group. Delaying a milestone is indistinguishable from not scheduling the warp | `synccheck_engine.rs`: cp.async scenario Clean in ≤16 states and under 2 s; every interpreter scenario stays within a 20K budget and 5 s |
+
+**Equivalence testing.** The tests now compare against an all-failures exhaustive oracle (`stop_on_first_failure: false`). Each search-based variant must reach the oracle's verdict and report a finding kind the oracle found. The only tolerated difference is a fail-closed `generation_assignment_differs`. There are five generators: random, structured, rich, rich-structured, and lap. The rich generators emit TMA issues without `Issue`, conditional waits, inval/re-init, multi-target waits, tcgen05 alloc/dealloc and commit, cluster barriers, parity-1 first waits and generation-skipping waits.
+
+Mutation checks:
+- Re-opening the S1 holes makes the rich generator fail (Clean against Error).
+- Disabling the S5 check makes the S5 scenario fail.
+- Reverting S8 makes the S8 unit test fail.
+
+**Bench after the fixes.** The sound independence rule keeps the earlier numbers: 16-warp ring 4,209 states with diamonds only, 1,180 with fingerprints, 9 with certificates. The UMMA row has been added (15 states certified).

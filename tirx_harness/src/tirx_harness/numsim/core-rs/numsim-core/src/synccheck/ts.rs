@@ -37,7 +37,6 @@ pub enum PendingKind {
     /// Deferred arrive-on; `after` = async group `(resource, ordinal)` whose
     /// full completion releases it (`cp.async.mbarrier.arrive`).
     Arrive { gen: u64, count: u64, after: Option<(u32, u64)> },
-    Milestone { ordinal: u64, milestone: async_group::Milestone },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -113,8 +112,15 @@ pub struct LocalCmd {
     pub gate: Box<[(u32, u32)]>,
     /// Reference-run generations (gated projections only): the gates are
     /// justified only while the search reproduces them (review S5).
-    pub ref_gens: Option<(Vec<Option<u64>>, Vec<Option<u64>>)>,
+    pub ref_gens: Option<RefGens>,
 }
+
+/// Reference generations of a command: per protocol command, per issued target.
+pub type RefGens = (Vec<Option<u64>>, Vec<Option<u64>>);
+
+/// A candidate transition for the independence proof: its only resource,
+/// its class, and the `(warp, program position)` of its participants.
+type Candidate = (usize, backend::Class, Vec<(usize, usize)>);
 
 pub struct Ts<'p> {
     pub program: &'p Program,
@@ -420,14 +426,24 @@ impl<'p> Ts<'p> {
                 }
             }
         }
-        let mut pending = next.pending.to_vec();
-        let mut ord = 0u16;
+        // Per-thread async groups complete eagerly, in FIFO order. Their
+        // milestones are observed only by the same thread's `wait_group`
+        // and by deferred mbarrier arrivals (which stay separately
+        // schedulable `Complete` transitions, gated on the group). Delaying
+        // a milestone is indistinguishable from not scheduling that warp,
+        // so firing it at once loses no schedule; searching the milestones
+        // of 32 lanes as independent transitions made one cp.async warp a
+        // 2^64-state product (W2 engine smoke).
         for (r, ordinal) in new_groups {
             for milestone in [async_group::Milestone::ReadsDone, async_group::Milestone::FullyDone] {
-                pending.push(Pending { cmd: c as u32, ord, res: r as u32, kind: PendingKind::Milestone { ordinal, milestone } });
-                ord += 1;
+                let cmd = SyncCmd::AsyncGroup(async_group::Cmd::Complete { ordinal, milestone });
+                if let Err(e) = backend::step(&mut next.res[r], self.rid(r), cmd) {
+                    return Tried::Error(self.err(c, e));
+                }
             }
         }
+        let mut pending = next.pending.to_vec();
+        let mut ord = 0u16;
         for (i, &(r, bytes, arrivals)) in lc.issued.iter().enumerate() {
             let gens = issued_gens.entry(r).or_default();
             let mut take = || if gens.is_empty() { None } else { Some(gens.remove(0)) };
@@ -513,7 +529,6 @@ impl<'p> Ts<'p> {
             PendingKind::Arrive { after: Some((g, ordinal)), .. } => {
                 !backend::async_group_pending(&s.res[g as usize], ordinal)
             }
-            PendingKind::Milestone { .. } => matches!(self.try_complete(s, p), Tried::Next(..)),
             _ => true,
         }
     }
@@ -523,9 +538,6 @@ impl<'p> Ts<'p> {
         let cmd = match p.kind {
             PendingKind::Tx { gen, bytes } => SyncCmd::Mbarrier(mbarrier::Cmd::CompleteTx { gen, bytes }),
             PendingKind::Arrive { gen, count, .. } => SyncCmd::Mbarrier(mbarrier::Cmd::DeferredArrive { gen, count }),
-            PendingKind::Milestone { ordinal, milestone } => {
-                SyncCmd::AsyncGroup(async_group::Cmd::Complete { ordinal, milestone })
-            }
         };
         let mut st = s.res[r].clone();
         match backend::step(&mut st, self.rid(r), cmd) {
@@ -534,15 +546,11 @@ impl<'p> Ts<'p> {
                 next.res[r] = st;
                 next.pending = s.pending.iter().filter(|q| (q.cmd, q.ord) != (p.cmd, p.ord)).copied().collect();
                 let mut fx = Effects::default();
-                if let PendingKind::Tx { gen, .. } | PendingKind::Arrive { gen, .. } = p.kind {
-                    fx.release.push((self.resources[r], gen));
-                }
+                let (PendingKind::Tx { gen, .. } | PendingKind::Arrive { gen, .. }) = p.kind;
+                fx.release.push((self.resources[r], gen));
                 Tried::Next(next, fx)
             }
             Err(e) => {
-                if matches!(p.kind, PendingKind::Milestone { .. }) {
-                    return Tried::Disabled;
-                }
                 Tried::Error(self.err(p.cmd as usize, e))
             }
         }
@@ -715,7 +723,7 @@ impl Ts<'_> {
     }
 
     /// The resource, class and `(warp, position)` of a candidate transition.
-    fn candidate(&self, s: &State, t: &Transition) -> Option<(usize, backend::Class, Vec<(usize, usize)>)> {
+    fn candidate(&self, s: &State, t: &Transition) -> Option<Candidate> {
         let class_of = |cmds: &mut dyn Iterator<Item = SyncCmd>| -> backend::Class {
             let mut class = None;
             for c in cmds {
@@ -804,10 +812,7 @@ impl TransitionSystem for Ts<'_> {
         };
         let mut sum = 0u64;
         let mut observers = false;
-        let mut fresh = match self.cmds_named_count(t) {
-            Some(n) => Some(n),
-            None => None,
-        };
+        let mut fresh = self.cmds_named_count(t);
         let mut add = |k: backend::Class, cmd: Option<&SyncCmd>| -> bool {
             match k {
                 backend::Class::Observer => {
@@ -862,7 +867,6 @@ impl TransitionSystem for Ts<'_> {
             let k = match p.kind {
                 PendingKind::Tx { .. } => backend::Class::Contributor(0),
                 PendingKind::Arrive { count, .. } => backend::Class::Contributor(count),
-                PendingKind::Milestone { .. } => backend::Class::Other,
             };
             if !add(k, None) {
                 return false;

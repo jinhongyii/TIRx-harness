@@ -171,7 +171,11 @@ fn cluster_cert(items: &[Item<'_>], participants: u32) -> Option<Result<(), Cert
                 }
             }
             SyncCmd::Cluster(cluster::Cmd::Wait { warp, .. }) => {
-                waits.entry(gen).or_default().insert(warp, i);
+                // A duplicate wait is a protocol error the state machine
+                // reports (`DuplicateWait`); do not overwrite, fall back.
+                if waits.entry(gen).or_default().insert(warp, i).is_some() {
+                    return None;
+                }
             }
             // Exit-aware membership changes need the state machine.
             _ => return None,
