@@ -352,6 +352,31 @@ stay A. I marked them in the CSV (`v2_status` = `pin-internals`,
 `v2-accepts-legacy-rejection` and `error->incomplete` functions should go to
 the owners named above, not to test porting.
 
+### Phase 4: v2 copies of the pinned A tests
+
+`tests/numsim/v2/ports/` holds v2 copies that use the public `v2` API and
+the `requires_v2_engine` marker. Each docstring cites its legacy test. They
+are mapped in `coverage/v2_ports_messages.tsv` (21 rows) and
+`coverage/v2_ports_internals.tsv` (33 rows).
+
+| source | legacy functions | v2 copy | result |
+| --- | ---: | --- | --- |
+| `pin-message` | 14 | `test_error_kinds.py` asserts exception type + v2 error `kind` (+ structured detail such as `MissingWarpgroupSync`), never text | 13 pass. 1 `v2_gap`: v2's binder does not reject a one-byte-per-value float4 array, so this was not a wording difference after all. |
+| `pin-internals` | 33 | `test_internals_<stem>.py`, pins stripped (`stats`, `rust_source`, `semantic_requirements`, op-name sets, `Hint:`); completion now asserted via `result.status` | 28 pass. 5 have xfail cases: predicated `.v2`/`.v4` f32 atomics update predicated-off lanes (6 cases, interp); `sm100_2sm_leader_smem_addr` unsupported; TMEM store outside the warp's sub-partition; zero-step loop is a budget incomplete rather than an error. No function turned out to be a pure pin. |
+| partial E | 7 | `test_partial_tile_forms.py`, `test_single_lane_participation.py`, keeping only TVM-compilable params | 5 pass. 2 have `v2_gap` cases: `tcgen05.wait::ld/st` by one elected lane is clean, because `tcgen_wait` lacks the `full_warp` check; v2 accepts TMA reduce operation/dtype pairs that PTX does not define. |
+
+`tests/numsim/v2/ports` + `tests/numsim/v2/checkers` together: 203 passed,
+51 xfailed, 27 xpassed. Two raw-spelling `wait_until` racecheck halves assert
+the delta-R3 behaviour (`review` `undeclared_protocol_word`), not the
+legacy clean or data-race verdict.
+
+Further legacy expectations v2 does not meet (not xfailed, because the
+legacy assertion admitted the v2 behaviour):
+
+- the divide-by-zero diagnostic names the whole warp mask, not lane 7;
+- a lane-varying but aligned `ldu` address runs to completion, so the
+  uniformity check is missing.
+
 ## Kill order (aligned with redesign §4 step 5)
 
 Each wave lands as one change. Judge it with the clean-baseline diff procedure
@@ -362,9 +387,9 @@ check adds its replacement in the same change.
 | --- | --- | --- | --- |
 | 0 | none (TVM cannot compile these forms) | E rows outside the reviewed maps | none |
 | 1 | `cargo test -p numsim-core --test 'racecheck_*' --test 'synccheck_*'` green, with `*_legacy_ports.rs`; rulings on the 5 ignored ports | B rows with status `covered` or `ported` (227) | the Rust scenario files (already in place) |
-| 2 | `tests/numsim/v2/checkers` green without xfail for a row; `needs_kernel` rows given a v2 test | `v2_kernel_test` and `needs_kernel` rows, and the `other_b` rows marked covered or ported | `tests/numsim/v2/checkers` |
+| 2 | every v2 replacement of the row passes (`retire_tests.py --wave 2` runs them) | B rows with status `v2_kernel_test` | `tests/numsim/v2/checkers`, `tests/numsim/v2/ports/test_single_lane_participation.py` |
 | 3 | conformance green under `NUMSIM_IMPL=v2` (steps 1 to 3) | A `conformance` rows (corpus verdict gates, wiki racecheck, synccheck corpus) | corpus fixtures (F); `tests/conformance` |
-| 4 | v2 facade switch: public-surface A files pass under v2 | none; A files flip to v2 | A public files; internal files ported one at a time |
+| 4 | every v2 copy in `coverage/v2_ports_*.tsv` passes (`retire_tests.py --wave 4` runs them) | public-API A functions with a passing v2 copy; the rest are `flip` (pass unchanged under v2) or `hold` | `tests/numsim/v2/ports`; flipped public files |
 | 5a | D-live outputs recorded once as sha256 or bit goldens (conformance README "Not covered yet") | the `run_paired_primfunc` harness, D rows | recorded goldens + a v2 runner; the `numsim-oplib` cvt goldens stay |
 | 5b | step 5 of the redesign: delete `engine-rs/`, `frontend-rs/` and the legacy Python layer | every C row (`retire_tests.py --wave 5b`), in the same change as the code it pins; A-internal leftovers that were never ported | F, N |
 
@@ -386,6 +411,14 @@ Wave sizes:
 
 - wave 0: 1 file, plus 54 functions in 11 files;
 - wave 1: 26 files (92 tests), plus 135 functions in 26 files;
+- wave 2 (gated; dry run at 4d6b93f plus the working tree): 1 file (2 tests),
+  plus 30 functions in 12 files. 20 rows are held because a replacement is
+  still xfail.
+- wave 4 (gated; same dry run): 5 files (6 tests), plus 42 functions in
+  15 files. These are the 48 functions whose v2 copies pass. 6 ported
+  functions are held behind a `v2_gap`. 219 public functions `flip`
+  (unchanged, already pass under v2). 173 are held: they fail under v2 and
+  have no copy yet.
 - wave 5b: 43 files (192 tests), plus 197 functions in 51 files. Run
   `--wave 5b --markdown` for that list; it is long and changes as A-internal
   tests are ported.

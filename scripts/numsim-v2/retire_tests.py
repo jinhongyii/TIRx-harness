@@ -3,6 +3,7 @@
 Usage (repository root)::
 
     python scripts/numsim-v2/retire_tests.py --wave 0 --dry-run      # print the plan
+    python scripts/numsim-v2/retire_tests.py --wave 4 --dry-run --verbose   # runs the v2 copies first
     python scripts/numsim-v2/retire_tests.py --wave 1 --markdown     # the doc's list
     python scripts/numsim-v2/retire_tests.py --wave 0                # apply (NOT yet: legacy is the oracle)
 
@@ -11,8 +12,20 @@ Waves (rows of ``coverage/test_classification.csv``):
 * ``0``  category E: tile forms TVM's own dispatch rejects.
 * ``1``  category B with status ``covered`` or ``ported``: a Rust scenario
   test built from contract events replaces them.
+* ``2``  category B with status ``v2_kernel_test``: retired once every v2
+  replacement (``tests/numsim/v2/checkers``) passes.
+* ``4``  category A, public-API surface: functions with a v2 copy in
+  ``coverage/v2_ports_*.tsv`` are retired once every copy passes; functions
+  that pass unchanged under ``NUMSIM_IMPL=v2`` (``v2_public_status.tsv``)
+  are listed as ``flip`` (no edit: they become v2 tests when the public names
+  point at v2).
 * ``5b`` category C: implementation pins, deleted together with the legacy
   code at redesign step 5.
+
+Waves 2 and 4 are gated on the replacements passing. The script runs them
+(``pytest --junitxml``) unless ``--v2-results JUNIT.xml`` is given. A
+function counts as passing when every collected item passed, including a
+non-strict XPASS; any failure, error, xfail or skip keeps the legacy test.
 
 A file whose every test function is selected is removed with ``git rm``;
 otherwise the selected functions (with their decorators) are cut out of the
@@ -26,23 +39,89 @@ import argparse
 import ast
 import collections
 import csv
+import os
 import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-CSV = HERE / "coverage" / "test_classification.csv"
+COVERAGE = HERE / "coverage"
+CSV = COVERAGE / "test_classification.csv"
 TESTS_BASE = REPO / "tirx_harness"
 
 
-def selected(row: dict[str, str], wave: str) -> bool:
+def replacements(wave: str, rows: list[dict[str, str]]) -> dict[str, list[str]]:
+    """legacy function id -> v2 replacement node ids (function level)."""
+    out: dict[str, list[str]] = {}
+    if wave == "2":
+        for row in rows:
+            if row["category"] == "B" and row["target"] == "v2_kernel_test":
+                out[row["test_id"]] = [t for t in row["rust_tests"].split(";") if t.startswith("tests/numsim/v2/")]
+    elif wave == "4":
+        for path in sorted(COVERAGE.glob("v2_ports_*.tsv")):
+            with path.open() as handle:
+                for row in csv.DictReader(handle, delimiter="\t"):
+                    tests = [t for t in row["v2_tests"].split(";") if t.strip()]
+                    if tests:
+                        out[row["legacy_test"]] = [t.strip() for t in tests]
+    return out
+
+
+def passing(node_ids: set[str], results: Path | None) -> set[str]:
+    """Function-level node ids whose every item passed."""
+    if not node_ids:
+        return set()
+    if results is None:
+        handle, name = tempfile.mkstemp(suffix=".xml")
+        os.close(handle)
+        results = Path(name)
+        cmd = [sys.executable, "-m", "pytest", "-q", "-n", "16", "-p", "no:cacheprovider", f"--junitxml={results}"]
+        subprocess.run(cmd + sorted(node_ids), cwd=TESTS_BASE, stdout=subprocess.DEVNULL, check=False)
+    outcome: dict[str, bool] = {}
+    for case in ET.parse(results).iter("testcase"):
+        file = case.get("classname", "").replace(".", "/")
+        name = case.get("name", "").split("[")[0]
+        # classname is ``tests.x.y.test_mod`` or ``tests.x.y.test_mod.TestClass``
+        parts = file.split("/")
+        if parts[-1].startswith("Test"):
+            func = f"{'/'.join(parts[:-1])}.py::{parts[-1]}::{name}"
+        else:
+            func = f"{file}.py::{name}"
+        ok = all(case.find(tag) is None for tag in ("failure", "error", "skipped"))
+        outcome[func] = outcome.get(func, True) and ok
+    return {f for f in node_ids if outcome.get(f)}
+
+
+def selection(wave: str, results: Path | None) -> tuple[set[str], dict[str, str]]:
+    """Function ids to retire, plus informational rows (id -> reason)."""
+    rows = list(csv.DictReader(CSV.open()))
+    info: dict[str, str] = {}
     if wave == "0":
-        return row["category"] == "E"
+        return {r["test_id"] for r in rows if r["category"] == "E"}, info
     if wave == "1":
-        return row["category"] == "B" and row["target"] in {"covered", "ported"}
+        return {r["test_id"] for r in rows if r["category"] == "B" and r["target"] in {"covered", "ported"}}, info
     if wave == "5b":
-        return row["category"] == "C"
+        return {r["test_id"] for r in rows if r["category"] == "C"}, info
+    if wave in {"2", "4"}:
+        repl = replacements(wave, rows)
+        ok = passing({t for tests in repl.values() for t in tests}, results)
+        chosen = set()
+        for legacy, tests in repl.items():
+            if tests and all(t in ok for t in tests):
+                chosen.add(legacy)
+            else:
+                info[legacy] = "hold: replacement not passing (" + ", ".join(t for t in tests if t not in ok)[:200] + ")"
+        if wave == "4":
+            for r in rows:
+                if r["category"] == "A" and r["surface"] == "public" and r["test_id"] not in repl:
+                    if r.get("v2_status") == "pass":
+                        info[r["test_id"]] = "flip: passes unchanged under NUMSIM_IMPL=v2"
+                    elif r.get("v2_status"):
+                        info[r["test_id"]] = f"hold: {r['v2_status']} under NUMSIM_IMPL=v2, no v2 copy"
+        return chosen, info
     raise SystemExit(f"wave {wave} has no mechanical selection (see test-migration.md)")
 
 
@@ -65,13 +144,12 @@ def test_functions(path: Path) -> dict[str, tuple[int, int]]:
     return out
 
 
-def plan(wave: str) -> tuple[list[str], dict[str, list[str]], dict[str, list[str]]]:
-    rows = list(csv.DictReader(CSV.open()))
+def plan(wave: str, results: Path | None = None):
+    ids, info = selection(wave, results)
     chosen: dict[str, set[str]] = collections.defaultdict(set)
-    for row in rows:
-        if selected(row, wave):
-            file, _, func = row["test_id"].partition("::")
-            chosen[file].add(func)
+    for test_id in ids:
+        file, _, func = test_id.partition("::")
+        chosen[file].add(func)
     whole: list[str] = []
     partial: dict[str, list[str]] = {}
     missing: dict[str, list[str]] = {}
@@ -89,7 +167,7 @@ def plan(wave: str) -> tuple[list[str], dict[str, list[str]], dict[str, list[str
             whole.append(file)
         elif live:
             partial[file] = sorted(live, key=lambda f: funcs[f][0])
-    return whole, partial, missing
+    return whole, partial, missing, info
 
 
 def cut(path: Path, funcs: list[str]) -> None:
@@ -106,11 +184,13 @@ def cut(path: Path, funcs: list[str]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--wave", required=True, choices=["0", "1", "5b"])
+    parser.add_argument("--wave", required=True, choices=["0", "1", "2", "4", "5b"])
+    parser.add_argument("--v2-results", type=Path, help="junit XML of the v2 replacements (waves 2 and 4)")
+    parser.add_argument("--verbose", action="store_true", help="also print flip / hold rows")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--markdown", action="store_true", help="print the plan as Markdown and exit")
     args = parser.parse_args()
-    whole, partial, missing = plan(args.wave)
+    whole, partial, missing, info = plan(args.wave, args.v2_results)
     n_funcs = sum(len(v) for v in partial.values())
     n_whole = sum(len(test_functions(TESTS_BASE / f)) for f in whole)
 
@@ -131,6 +211,12 @@ def main() -> int:
     for file, funcs in partial.items():
         for func in funcs:
             print(f"cut    tirx_harness/{file}::{func}")
+    kinds = collections.Counter(reason.split(":")[0] for reason in info.values())
+    if args.verbose:
+        for test_id, reason in sorted(info.items()):
+            print(f"# {reason.split(':')[0]:5s} tirx_harness/{test_id}  ({reason.split(':', 1)[1].strip()})")
+    if kinds:
+        print("# " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())), file=sys.stderr)
     for file, funcs in missing.items():
         print(f"warning: not found (stale classification?): {file}: {', '.join(funcs)}", file=sys.stderr)
     print(

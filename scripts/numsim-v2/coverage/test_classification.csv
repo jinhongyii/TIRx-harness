@@ -838,7 +838,7 @@ tests/numsim/integration/test_reported_layout_regressions.py::test_reported_layo
 tests/numsim/integration/test_reported_layout_regressions.py::test_tma_reductions_are_atomic_but_plain_overlapping_stores_still_race,numsim/integration,1,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.copy_async: TIRx schedule dispatch failed: op=tirx.tile.copy_async target=cuda no variant named 'tma' is registered,,public,,runs;checker;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_singleton_outer_gemm_operand_reaches_each_semantic_checker,numsim/integration,2,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.copy_async: TIRx schedule dispatch failed: op=tirx.tile.copy_async target=cuda no variant named 'tma' is registered,,public,,runs;checker;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_warp_gemm_rejects_an_outer_single_lane_election,numsim/integration,2,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.gemm_async: Check failed: (it != id_set.end() && !it->second.is_deferred()) is false: ValueError: cannot infer extent of deferred ScopeIdDef f,,public,,runs;checker;semantic
-tests/numsim/integration/test_reported_layout_regressions.py::test_sync_qualified_warp_operations_reject_single_lane_participation,numsim/integration,8,B,needs_kernel,other_b.tsv,"single elected lane executing a .sync.aligned warp op (tcgen wait::ld/st etc.) must be warp_collective_divergence (v2 kind divergence); interpreter-level participation check, no contract event. 1/4 params hit a TVM-rejected tile form (drop that param). Surfaced in phase 3 when partial-E functions left category E. [partial E: 1/4 kernels hit a TVM-rejected tile form; drop those params by hand]",,public,,runs;checker;semantic
+tests/numsim/integration/test_reported_layout_regressions.py::test_sync_qualified_warp_operations_reject_single_lane_participation,numsim/integration,8,B,v2_kernel_test,other_b.tsv,"single elected lane executing a .sync.aligned warp op (tcgen wait::ld/st etc.) must be warp_collective_divergence (v2 kind divergence); interpreter-level participation check, no contract event. 1/4 params hit a TVM-rejected tile form (drop that param). Surfaced in phase 3 when partial-E functions left category E. Phase 4: v2 copy without the TVM-rejected param; tcgen-wait-{ld,st} params xfail v2_gap (tcgen_wait lacks the full_warp check). [partial E: 1/4 kernels hit a TVM-rejected tile form; drop those params by hand]",tests/numsim/v2/ports/test_single_lane_participation.py::test_sync_qualified_warp_operations_reject_single_lane_participation,public,,runs;checker;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_warpgroup_tile_op_allows_independent_full_warp_participation,numsim/integration,2,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.fill: TIRx schedule dispatch failed: op=tirx.tile.fill target=cuda +----------------+---------------------------------------------------------,,public,,runs;checker;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_warpgroup_tile_op_rejects_partial_warp_participation,numsim/integration,2,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.fill: TIRx schedule dispatch failed: op=tirx.tile.fill target=cuda +----------------+---------------------------------------------------------,,public,,runs;checker;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_numsim_rejects_a_misaligned_tma_shared_component,numsim/integration,1,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.copy_async: TIRx schedule dispatch failed: op=tirx.tile.copy_async target=cuda +--------------------+-----------------------------------------,,public,,runs;semantic
@@ -1865,13 +1865,75 @@ tests/numsim/v2/checkers/test_warp_collectives.py::test_synccheck_accepts_full_w
 tests/numsim/v2/checkers/test_warp_collectives.py::test_synccheck_reports_divergent_collective_inside_while_at_source,numsim/v2,3,N,keep,path,new-layer test,,public,,runs
 tests/numsim/v2/checkers/test_warp_collectives.py::test_synccheck_resolves_boolean_collective_participation_exactly,numsim/v2,4,N,keep,path,new-layer test,,public,,runs
 tests/numsim/v2/checkers/test_warp_collectives.py::test_synccheck_skips_uniformly_false_data_guard,numsim/v2,3,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_error_kinds.py::test_host_tensor_map_integer_expressions_fail_closed_on_unregistered_nodes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_warp_collectives_reject_invalid_participant_contracts,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_if_then_else_mixed_pointer_spaces_fail_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_ldu_rejects_nonuniform_or_misaligned_vector,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_setmaxnreg_requires_explicit_warpgroup_sync_before_a_later_call,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_setmaxnreg_rejects_warp_disagreement_within_one_occurrence,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_direct_one_byte_per_value_float4_array_is_rejected,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_ptx_signed_division_overflow_fails_closed,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_mbarrier_state_token_rejects_a_generation_older_than_the_previous_one,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_integer_trap_predicate_uses_cpp_truth_conversion,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_floating_trap_rejects_signed_zero,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_cuda_pointer_helpers_check_typed_dereference_alignment,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_error_kinds.py::test_a_candidate_index_outside_its_local_table_is_an_execution_error,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_async_group_domain_oracle.py::test_async_group_wait_counts_complete_on_an_empty_queue,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_internals_atomic_domain_oracle.py::test_every_cuda_atomic_add_and_cas_form_executes_with_exact_bits,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_internals_atomic_f32_noftz.py::test_atomic_f32_noftz,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_internals_byte_pointer_view_alias.py::test_byte_pointer_can_form_a_wider_physical_alias,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_deterministic_reexecution.py::test_repeated_full_launch_keeps_outputs_stats_and_poll_order_deterministic,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_internals_device_additional_payload_ops.py::test_payload_runtime,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker;semantic;c:task_count
+tests/numsim/v2/ports/test_internals_float8_address_shuffle.py::test_float8_address_uses_one_byte_physical_pointer,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_float8_address_shuffle.py::test_cuda_four_argument_shfl_sync_uses_implicit_warp_size,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:fn warp_shuffle(
+tests/numsim/v2/ports/test_internals_large_buffer_artifact.py::test_large_register_buffer_table_is_heap_backed_and_executes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_loop_bounds.py::test_uniform_loop_var_preserves_tir_dtype_in_select,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_loop_bounds.py::test_lane_varying_min_extent_and_step_use_masked_native_loop,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:WarpValue
+tests/numsim/v2/ports/test_internals_loop_bounds.py::test_lane_varying_for_rejects_zero_step,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_loop_bounds.py::test_v0_style_nested_triangular_bounds,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_loop_bounds.py::test_static_zero_trip_for_omits_native_loop_scaffolding,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_non_tensor_bulk_forms.py::test_bulk_g2s_cluster_accepts_static_true_predicate_as_unconditional,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_non_tensor_bulk_forms.py::test_raw_bulk_prefetch_preserves_global_memory,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_ordering_calls.py::test_ordering_only_calls_preserve_native_source_order,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_ordering_calls.py::test_griddep_token_crosses_sequential_kernel_phases,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_register_layout_artifact.py::test_wg_local_layout_uses_tid_in_wg_as_owner_and_m_as_register_index,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_internals_register_layout_artifact.py::test_tcgen_atom_layout_uses_warp_and_lane_owners,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_internals_scheduler_polling_artifact.py::test_scheduler_progress_loop_suspends_until_continuation_publish,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_internals_scheduler_polling_artifact.py::test_scheduler_progress_loop_suspends_until_done_publish,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_internals_scheduler_polling_artifact.py::test_scheduler_progress_loop_cas_mismatch_lane_observes_in_body_write_epoch,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_internals_scheduler_polling_artifact.py::test_effectful_scheduler_loop_claims_ready_root_once,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_internals_scheduler_polling_artifact.py::test_time_slice_preserves_lane_divergence_and_native_locals,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_internals_scheduler_polling_artifact.py::test_short_while_does_not_suspend,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_internals_scheduler_polling_artifact.py::test_full_continue_still_reaches_time_slice,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_internals_scheduler_polling_artifact.py::test_initially_false_while_never_executes_body_or_suspends,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_internals_scheduler_polling_artifact.py::test_nested_while_inner_break_does_not_escape_time_sliced_outer_loop,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_internals_wait_until.py::test_rendezvous_matches_raw_spelling,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_internals_wait_until.py::test_rendezvous_raw_spelling_racecheck_is_undeclared_word_review,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker
+tests/numsim/v2/ports/test_internals_wait_until.py::test_packed_wait_matches_raw_spelling,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_internals_wait_until.py::test_packed_wait_raw_spelling_racecheck_is_undeclared_word_review,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker
+tests/numsim/v2/ports/test_internals_wait_until.py::test_a_plain_access_on_a_declared_word_is_reported,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_internals_wait_until.py::test_bit_typed_word_matches_raw_spelling,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_wait_until.py::test_a_backoff_is_the_cuda_loops_business_and_not_the_engines,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic;c:poll
+tests/numsim/v2/ports/test_partial_tile_forms.py::test_ldstmatrix_dispatch_hint_does_not_select_numsim_semantics,numsim/v2,4,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_partial_tile_forms.py::test_ordinary_copy_dispatch_does_not_select_semantics,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_partial_tile_forms.py::test_warpgroup_shared_copy_snapshots_overlap_independent_of_dispatch,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_partial_tile_forms.py::test_typed_tma_reduce_reuses_raw_tensor_map_reduction_abi,numsim/v2,7,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_partial_tile_forms.py::test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs,numsim/v2,4,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_partial_tile_forms.py::test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair,numsim/v2,?,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_single_lane_participation.py::test_sync_qualified_warp_operations_reject_single_lane_participation,numsim/v2,6,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/test_lowering_control.py::test_wait_until_predicate_program,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_control.py::test_wait_until_predicate_that_reads_memory,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_control.py::test_while_break_and_guarded_select,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_control.py::test_bitwise_and_logical_not,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_control.py::test_module_qualifies_per_launch_slots,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/test_lowering_control.py::test_vectorized_loop_lowers_as_serial_loop,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_corpus.py::test_canonical_kernel_lowers_and_validates,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;c:cargo
 tests/numsim/v2/test_lowering_corpus.py::test_wiki_kernel_lowers_and_validates,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;c:cargo
+tests/numsim/v2/test_lowering_fail_closed.py::test_unreviewed_cuda_helper_body_or_signature_fails_closed,numsim/v2,5,N,keep,path,new-layer test,,public,,semantic
+tests/numsim/v2/test_lowering_fail_closed.py::test_scalar_fp8_identity_reinterpret_fails_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic
+tests/numsim/v2/test_lowering_fail_closed.py::test_unknown_tile_config_key_fails_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic
+tests/numsim/v2/test_lowering_fail_closed.py::test_warp_gemm_fragment_layout_off_the_mma_abi_fails_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic
 tests/numsim/v2/test_lowering_memory.py::test_shared_pool_views_and_ptx_buffer_form,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_memory.py::test_raw_address_load_and_vector_unpack,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_memory.py::test_compose_layout_swizzle_becomes_xor_arithmetic,numsim/v2,1,N,keep,path,new-layer test,,public,,
@@ -1882,10 +1944,12 @@ tests/numsim/v2/test_lowering_memory.py::test_dtype_changing_view_is_its_own_log
 tests/numsim/v2/test_lowering_memory.py::test_possibly_uninitialized_locals_stay_in_tracked_memory,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_memory.py::test_provably_initialized_locals_are_promoted,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_memory.py::test_sub_byte_view_footprint_and_view_of_view_base,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/test_lowering_memory.py::test_register_layout_local_indexes_by_register_and_asserts_owner,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_sync_async.py::test_host_prelude_becomes_implicit_tensor_map_slot,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_sync_async.py::test_tma_load_and_mbarrier_protocol,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic
 tests/numsim/v2/test_lowering_sync_async.py::test_bulk_groups_cp_async_and_named_barriers,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_sync_async.py::test_unqualified_mbarrier_operand_is_generic_or_shared_cluster,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/test_lowering_sync_async.py::test_explicit_tensor_map_param_keeps_its_declared_name,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic
 tests/numsim/v2/test_lowering_tcgen05.py::test_tcgen05_lifecycle_and_mma,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic
 tests/numsim/v2/test_lowering_tcgen05.py::test_tmem_view_direct_access,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_vector_add.py::test_vector_add_tables,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic

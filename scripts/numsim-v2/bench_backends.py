@@ -318,6 +318,21 @@ def bench_case(args: argparse.Namespace) -> dict[str, Any]:
     codegen_cache = Path(args.codegen_cache)
     codegen_cache.mkdir(parents=True, exist_ok=True)
     out: dict[str, Any] = {"case": entry.name, "modes": {}, "preflight": [wait_for_quiet(args.max_load)]}
+    args.prebuilt = None
+    if args.prebuild_dir:
+        record = Path(args.prebuild_dir) / f"{entry.name}.json"
+        args.prebuilt = json.loads(record.read_text()) if record.exists() else {"builds": {}}
+        out["codegen_cold"] = {}
+        for variant in ("codegen-O1", "codegen-O3"):
+            build = args.prebuilt.get("builds", {}).get(variant, {})
+            if "build_s" in build:
+                out["codegen_cold"][variant] = {"build_s": build["build_s"], "prebuilt": True,
+                                                "source_bytes": (args.prebuilt.get("source_bytes") or [None])[0]}
+            elif variant in args.variants:
+                # No cached library: a timed run would include a cold build.
+                args.variants = [v for v in args.variants if v != variant]
+                out.setdefault("codegen_dropped", {})[variant] = build.get("error") or args.prebuilt.get(
+                    "error", "no prebuild record")[-500:]
 
     # Static facts and one-off costs (module shared by every v2 mode).
     case = entry.prepare()
@@ -387,11 +402,15 @@ def bench_case(args: argparse.Namespace) -> dict[str, Any]:
             # Eligibility: v2-interp must match the legacy snapshot.
             first = one("interp", workers[0])
             row["eligibility_run"] = first
-            # Cold codegen builds (once per case and opt level; the module is mode independent).
-            # Clear once: O1 and O3 libraries have distinct keys and must
-            # both stay cached for the warm runs below.
+            # Cold codegen builds (once per case and opt level; the module is
+            # mode independent). With a prebuild record (``prebuild``
+            # subcommand) the cold times come from there and the cache is
+            # already warm; otherwise build inline here. Clear once: O1 and O3
+            # libraries have distinct keys and must both stay cached.
             cold_todo = [v for v in ("codegen-O1", "codegen-O3") if v in args.variants and v not in cold_done]
-            if cold_todo:
+            if cold_todo and args.prebuilt is not None:
+                cold_todo = []
+            elif cold_todo:
                 clear_codegen_libs(codegen_cache)
             for variant in cold_todo:
                 rec = one(variant, workers[0])
@@ -434,6 +453,117 @@ class RowAbort(Exception):
         self.norm = norm
 
 
+
+# --------------------------------------------------------------------------
+# Codegen prebuild (cold build times; parallel, before the timed sweep)
+
+
+def build_case(args: argparse.Namespace) -> dict[str, Any]:
+    """Child: build the codegen library of one case at each opt level.
+
+    A ``max_rounds=1`` NumSim run triggers ``backend_for`` (emit + rustc +
+    dlopen) and stops right after; ``timing.build`` is the cold build time
+    (the numsim-core rlib must already be cached). ``NUMSIM_CODEGEN_LOG=1``
+    makes the engine print the cache key, from which the generated source
+    size is read.
+    """
+
+    os.chdir(HARNESS)
+    sys.path.insert(0, str(HARNESS))
+    v2 = import_v2(args.v2_package)
+    from tests.numsim.corpus.canonical_cases import CANONICAL_KERNEL_CASES
+
+    run_mod = sys.modules[v2.Engine.__module__]
+    entry = next(e for e in CANONICAL_KERNEL_CASES if e.name == args.case)
+    case = entry.prepare()
+    module = v2.transpile(case.kernel)
+    bound = run_mod.canonicalize_inputs(module, case.args)
+    out: dict[str, Any] = {"case": entry.name, "builds": {}}
+    for opt in (1, 3):
+        started = time.perf_counter()
+        try:
+            raw = run_mod.native().run(
+                module.handle, {name: b.native for name, b in bound.items()}, mode="numsim",
+                backend="codegen", workers=1, max_rounds=1, opt_level=opt,
+                codegen_cache_dir=str(args.codegen_cache),
+            )
+            out["builds"][f"codegen-O{opt}"] = {"build_s": float(raw["timing"]["build"]) / 1e3,
+                                                 "wall_s": time.perf_counter() - started}
+        except Exception as error:  # noqa: BLE001
+            out["builds"][f"codegen-O{opt}"] = {"error": f"{type(error).__name__}: {str(error)[:1500]}",
+                                                 "wall_s": time.perf_counter() - started}
+    return out
+
+
+def cmd_prebuild(args: argparse.Namespace) -> int:
+    from concurrent.futures import ThreadPoolExecutor
+
+    names = selected_cases(args)
+    target = Path(args.results) / "prebuild"
+    target.mkdir(parents=True, exist_ok=True)
+    cache = Path(args.codegen_cache)
+    if args.clear:
+        print(f"cleared {clear_codegen_libs(cache)} cached libraries", flush=True)
+
+    def one(name: str) -> None:
+        path = target / f"{name}.json"
+        if path.exists() and not args.force:
+            return
+        cmd = [sys.executable, __file__, "case-build", name, "--codegen-cache", args.codegen_cache]
+        if args.v2_package:
+            cmd += ["--v2-package", args.v2_package]
+        env = {**os.environ, "NUMSIM_CODEGEN_LOG": "1"}
+        started = time.perf_counter()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.build_timeout, env=env)
+            stdout, stderr = proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired as error:
+            stdout = ""
+            stderr = (error.stderr.decode() if isinstance(error.stderr, bytes) else (error.stderr or ""))
+            stderr += f"\ntimeout after {args.build_timeout}s"
+        if "@@RESULT@@" in stdout:
+            data = json.loads(stdout.split("@@RESULT@@", 1)[1])
+        else:
+            data = {"case": name, "error": stderr[-3000:], "builds": {}}
+        keys = re.findall(r"key (\w+) emit ([0-9.]+)ms core \S+ rustc (\S+)", stderr)
+        data["keys"] = [k for k, _, _ in keys]
+        sizes = []
+        for key in data["keys"]:
+            src = cache / f"gen-{key}" / "lib.rs"
+            sizes.append(src.stat().st_size if src.exists() else None)
+        data["source_bytes"] = sizes
+        data["prebuild_wall_s"] = time.perf_counter() - started
+        data["preflight"] = preflight(0.2)
+        path.write_text(json.dumps(data, indent=1, sort_keys=True))
+        builds = {k: (round(v["build_s"], 1) if "build_s" in v else "ERR") for k, v in data.get("builds", {}).items()}
+        print(f"[{time.strftime('%H:%M:%S')}] {name}: {builds} src={sizes} {data.get('error', '')[-200:]}", flush=True)
+
+    with ThreadPoolExecutor(args.jobs) as pool:
+        list(pool.map(one, names))
+    return 0
+
+
+def cmd_case_build(args: argparse.Namespace) -> int:
+    data = build_case(args)
+    sys.stdout.write("@@RESULT@@" + json.dumps(data, default=str))
+    sys.stdout.flush()
+    return 0
+
+
+def selected_cases(args: argparse.Namespace) -> list[str]:
+    sys.path.insert(0, str(HARNESS))
+    os.chdir(HARNESS)
+    from tests.numsim.corpus.canonical_cases import CANONICAL_KERNEL_CASES
+
+    pattern = re.compile(args.cases)
+    names = [e.name for e in CANONICAL_KERNEL_CASES if pattern.search(e.name)]
+    if args.status_md:
+        wanted = set(args.modes.split(","))
+        status = parse_status(Path(args.status_md))
+        names = [n for n in names if any(status.get(n, {}).get(m) == "match" for m in wanted)]
+    return names
+
+
 # --------------------------------------------------------------------------
 # Driver
 
@@ -463,6 +593,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         cmd = [sys.executable, __file__, "case", name, "--modes", modes, "--workers", args.workers,
                "--repeats", str(args.repeats), "--max-load", str(args.max_load),
                "--codegen-cache", args.codegen_cache, "--variants", ",".join(args.variants)]
+        prebuild_dir = results / "prebuild"
+        if prebuild_dir.exists() and not args.inline_cold_builds:
+            cmd += ["--prebuild-dir", str(prebuild_dir)]
         if args.v2_package:
             cmd += ["--v2-package", args.v2_package]
         print(f"[{time.strftime('%H:%M:%S')}] {name} ({modes})", flush=True)
@@ -734,9 +867,24 @@ def main() -> int:
                      help="only modes listed as 'match' here ('' = all modes; rows are re-verified anyway)")
     run.add_argument("--case-timeout", type=float, default=3 * 3600)
     run.add_argument("--force", action="store_true")
+    run.add_argument("--inline-cold-builds", action="store_true",
+                     help="measure cold codegen builds inside the sweep even when <results>/prebuild exists")
     case = sub.add_parser("case")
     case.add_argument("case")
+    case.add_argument("--prebuild-dir", default=None)
     common(case)
+    pre = sub.add_parser("prebuild", help="build every case's codegen libraries in parallel (cold build times)")
+    common(pre)
+    pre.add_argument("--cases", default=".")
+    pre.add_argument("--results", default=str(default_cache.parent / "bench-backends"))
+    pre.add_argument("--status-md", default=str(REPO / "docs/development/v2-conformance-status.md"))
+    pre.add_argument("--jobs", type=int, default=12)
+    pre.add_argument("--build-timeout", type=float, default=2 * 3600)
+    pre.add_argument("--clear", action="store_true", help="remove cached gen-* libraries first")
+    pre.add_argument("--force", action="store_true")
+    cb = sub.add_parser("case-build")
+    cb.add_argument("case")
+    common(cb)
     render = sub.add_parser("render")
     render.add_argument("--results", default=str(default_cache.parent / "bench-backends"))
     render.add_argument("--json", default=str(REPO / "docs/development/backend-comparison.json"))
@@ -750,6 +898,10 @@ def main() -> int:
         return cmd_run(args)
     if args.cmd == "case":
         return cmd_case(args)
+    if args.cmd == "prebuild":
+        return cmd_prebuild(args)
+    if args.cmd == "case-build":
+        return cmd_case_build(args)
     return cmd_render(args)
 
 
