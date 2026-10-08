@@ -220,12 +220,17 @@ impl std::error::Error for OpError {}
 
 /// Lift a `numsim-oplib` error (plain message) into the contract error.
 /// Messages naming an unmodeled/unsupported form fail closed as
-/// `Unsupported`; everything else is an operand error (`Invalid`).
+/// `Unsupported`; everything else is an operand error (`Invalid`). Reserved
+/// bits set in an operand are always an operand error, even when the legacy
+/// text says "unsupported" (`raw tcgen05.cp descriptor uses unsupported
+/// reserved/base/LBO-mode bits`: legacy reported it as an error).
 impl From<numsim_oplib::types::OpError> for OpError {
     fn from(error: numsim_oplib::types::OpError) -> OpError {
         let message = error.0;
         let lower = message.to_ascii_lowercase();
-        if lower.contains("unsupported")
+        if lower.contains("reserved") {
+            OpError::invalid(message)
+        } else if lower.contains("unsupported")
             || lower.contains("unmodeled")
             || lower.contains("not modeled")
             || lower.contains("no legacy")

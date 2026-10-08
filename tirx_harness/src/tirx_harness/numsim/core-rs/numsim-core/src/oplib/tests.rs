@@ -113,3 +113,16 @@ fn resolve_ptx_inventory_coverage() {
     assert_eq!(ops, 566);
     assert!(missing_ptx_table.is_empty(), "Ptx-family ops without a resolver: {missing_ptx_table:?}");
 }
+
+#[test]
+fn reserved_operand_bits_are_operand_errors_not_unsupported() {
+    use super::{OpError, OpErrorKind};
+    let lift = |m: &str| OpError::from(numsim_oplib::types::OpError::message(m)).kind;
+    // Legacy text says "unsupported", but legacy reported it as an error.
+    assert_eq!(
+        lift("raw tcgen05.cp descriptor uses unsupported reserved/base/LBO-mode bits"),
+        OpErrorKind::Invalid
+    );
+    assert_eq!(lift("s1z4m11 operand has nonzero reserved bits"), OpErrorKind::Invalid);
+    assert_eq!(lift("ti16_transpose_unmodeled requires an unmodeled analysis contract"), OpErrorKind::Unsupported);
+}

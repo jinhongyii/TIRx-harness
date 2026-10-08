@@ -1743,6 +1743,27 @@ Open, for W1:
 - `smem_desc_make_lo_uniform` is effectful: a `__shfl_sync` of `lo` from
   lane 0 through a pointer. Lowering rejects it today.
 
+## W4-15 (2026-10-08): reserved descriptor bits are errors; `.ws` 64-bit zero-column mask
+
+1. oplib: any lifted `numsim-oplib` error whose text mentions reserved bits
+   is now `Invalid`, checked before the "unsupported" keyword. The case that
+   prompted this is `raw tcgen05.cp descriptor uses unsupported
+   reserved/base/LBO-mode bits`, which was classified `Unsupported`. Legacy
+   reported it as an error. Fixes
+   `test_shared_descriptor_choices_validate_the_consumed_bits[False-*]`.
+2. ti16 `.ws` (W2's `interp/handlers/tcgen.rs`, a call-site patch to review).
+   - Cause: W1 lowers the `.ws` zero-column mask as one 64-bit operand in
+     `disable_output_lane`, but the handler cast it to `u32`. That dropped
+     bits 32..63: the zero-mask form (bit 39), the per-bank spans and the
+     B shift.
+   - Effect: masked B columns were decoded, and the `0x7800` S1Z4M11 filler
+     failed as "nonzero reserved bits".
+   - Fix: a 64-bit operand of a `.ws` MMA is passed as `[low, high]` words,
+     which oplib already accepts. The ti16 decoder itself is unchanged and
+     matches legacy.
+   - Fixes `test_tcgen05_ti16.py::test_ti16_ws_banks_and_column_mask[*]`
+     (6 params).
+
 ## W5-10 (for W2, 2026-10-08): restricted commit and tcgen smem operand proxy
 
 Found with `test_tcgen05_restricted_commit` (a racecheck false negative) and
