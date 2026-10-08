@@ -2866,7 +2866,7 @@ There are 22 modules (175 functions: 120 C, 36 B, 19 A). Every function now has 
 - The remaining A functions have v2 copies. 5 new copies are in `tests/numsim/v2/ports/test_w11_registry.py`.
 - The B functions have Rust or v2-checker replacements (waves 1 and 2).
 
-The mapping is in `scripts/numsim-v2/coverage/deleted_modules_w11.tsv` and `v2_ports_w11.tsv`. Two new v2 gaps, both for W1:
+The mapping is in `scripts/numsim-v2/coverage/v2_ports_w11.tsv` (ports). The category decisions are the classifier's own rows in `test_classification.csv`, so no override is needed; the earlier `deleted_modules_w11.tsv` restated them and was removed. Two new v2 gaps, both for W1:
 
 - **W11-5 [W1 lowering]: the register-owner `Assert` emitted for a dispatched tile op has no site.**
   - Kernel: `Tx.wg.copy` local->local, which TVM dispatches to `copy/fallback`.
@@ -2919,3 +2919,30 @@ Request: default to `AcqRel`.
 `tests/analysis_tools/racecheck/test_native_public_api.py::test_public_checkers_reject_descriptor_storage_for_scalar[racecheck|synccheck]`
 raises `TypeError: only integer scalar arrays can be converted to a scalar index` inside the v2
 input binding, where the test expects a typed rejection.
+
+## W4-swz (W4 patched W1's lowering, 2026-10-08): swizzled shared allocations must start on the swizzle period
+
+- **Symptom.** W9's valid-shape ports: `tcgen05.mma` over SWIZZLE_32B/128B operands filled by `Tx.copy` read the wrong 16-byte K chunk.
+- **Root cause.** The oplib descriptor math was not at fault. `finish_shared` in `v2/lowering/memory.py` packed shared buffers at `max(16, data_alignment)` = 64, so `left_shared` landed at shared offset 64, right after an 8-byte mbarrier.
+  - TIRx swizzles relative to the buffer start.
+  - The matrix descriptor (base-offset field 0), like the hardware, XORs the absolute address bits.
+  - The two agree only when the buffer starts on a multiple of the pattern period.
+  - At offset 64 with SWIZZLE_32B, rows with bit 1 set read K chunk `c ^ 1`.
+- **Patch (in W1's file).** `declare_alloc` now raises a `ComposeLayout`-swizzled allocation's `align` to `2**(per_element + atom_len + swizzle_len)` elements: 256B for 32B, 512B for 64B, 1024B for 128B.
+  - TIRx's own pool allocator uses `align=1024` for the same reason, and `tcgen05_cp.py` notes "descriptor templates use base_offset=0, so the smem buffer base must align to the swizzle period".
+  - The helper is `_swizzle_period_bytes`.
+- **Not done.** Views carved from `shared.dyn` pools keep their kernel-computed offsets: aligning those is the kernel's (pool's) job, as it is on hardware.
+- **Pinned by.**
+  - `numsim-oplib` `smem_desc_tests.rs::matrix_byte_offset_matches_ptx_canonical_layouts_exhaustively`: every swizzle mode × K/MN-major × 1/2/4-byte element against an independent PTX canonical-layout reference.
+  - `unaligned_swizzled_base_differs_from_buffer_relative_swizzle`.
+
+
+## W11-api (2026-10-08, for W8): `ExecutionSubset` has no v2 public counterpart
+
+`docs/api/inputs.md` ("Launch selection") documents `ExecutionSubset` as public: it is imported from `tirx_harness.numsim.api` and passed as `subset=`. The v2 surface does not export it:
+- `tirx_harness.numsim.v2.api.__all__` lists no `ExecutionSubset`.
+- `Engine.run`/`run_*_phase` accept any object with `cluster_ids`/`cta_ids` (`v2/run.py::_subset_extra`).
+
+The legacy class lives in `numsim/api.py`, which is deleted with the legacy layer. That deletion breaks `tests/analysis_tools/{racecheck,synccheck}/corpus/*` (the flashmla task-steal subset runs) and the documented import path.
+
+Request: export a v2 `ExecutionSubset` (`cluster_ids`, `cta_ids`), and the `ExecutionSubsetSelection` alias if it is kept, from `tirx_harness.numsim.v2.api`. Then update `docs/api/inputs.md` to point at it. W11 then switches the two corpus modules' import.
