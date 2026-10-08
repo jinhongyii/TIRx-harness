@@ -37,7 +37,7 @@ pub(crate) struct Deferred {
 
 /// The accessing actor's state as of the access.
 pub(crate) enum Snap {
-    Lane(Box<Warp>),
+    Lane(Arc<Warp>),
     Async(Box<AsyncActor>),
 }
 
@@ -60,6 +60,9 @@ pub(crate) struct PartCtx {
     pub incomplete_tags: Vec<Tag>,
     /// Dedup key of each child finding (`None`: never deduplicated).
     pub finding_keys: Vec<Option<FKey>>,
+    /// Warp snapshots still valid (no event of the warp since, other than
+    /// deferred global accesses): consecutive global accesses share one.
+    pub snaps: HashMap<WarpId, Arc<Warp>>,
 }
 
 /// Dedup key of a finding, as the report functions key them.
@@ -74,8 +77,8 @@ pub(crate) enum FKey {
 impl Warp {
     /// The warp's ordering state without its site table (a deferred
     /// access's HB handle; the site table stays with the live warp).
-    pub(crate) fn snapshot(&self) -> Box<Warp> {
-        Box::new(Warp {
+    pub(crate) fn snapshot(&self) -> Arc<Warp> {
+        Arc::new(Warp {
             actor: self.actor,
             epoch: self.epoch,
             done: self.done,
@@ -164,37 +167,55 @@ impl Checker {
         }
     }
 
-    /// Child entry: process `e` here, or report that it (and everything
+    /// Child entry: process `e` here, or hand it back: it (and everything
     /// after it) belongs to the main checker.
-    pub(crate) fn part_event(&mut self, e: &Event) -> bool {
+    pub(crate) fn part_event(&mut self, e: Event) -> Result<(), Event> {
         let p = self.part.as_mut().expect("child");
         if p.suspended {
-            return false;
+            return Err(e);
         }
-        if let Event::Access(a) = e {
+        if let Event::Access(a) = &e {
             p.tag = (a.seq, 1);
         } else {
             p.tag = (p.tag.0 + p.tag.1 as u64, 0);
         }
-        if self.needs_main(e) {
+        if self.needs_main(&e) {
             self.part.as_mut().unwrap().suspended = true;
-            return false;
+            return Err(e);
         }
         match e {
-            Event::Access(a) if !self.allocs.contains_key(&a.alloc) => self.defer_access(a),
-            Event::Access(a) => self.access(a),
-            Event::Sync(s) => self.sync(s.clone()),
+            Event::Access(a) if !self.allocs.contains_key(&a.alloc) => self.defer_access(&a),
+            Event::Access(a) => {
+                if let Who::Lane { warp, .. } = a.who {
+                    self.part.as_mut().unwrap().snaps.remove(&warp);
+                }
+                self.access(&a)
+            }
+            Event::Sync(s) => {
+                self.part.as_mut().unwrap().snaps.clear();
+                self.sync(s)
+            }
         }
-        true
+        Ok(())
+    }
+
+    /// Is warp `w` held here (a child's own warps; every warp in main).
+    pub(crate) fn holds_warp(&self, w: WarpId) -> bool {
+        self.warp_held(w)
     }
 
     /// The actor-side prelude of a weak global access, then a deferred
     /// record with the actor's state (the HB handle).
     pub(crate) fn defer_access(&mut self, a: &Access) {
+        self.last_seq = self.last_seq.max(a.seq);
         if let Who::Lane { warp, .. } = a.who {
+            if self.poll_stash.contains_key(&warp) {
+                self.part.as_mut().unwrap().snaps.remove(&warp);
+            }
             self.flush_polls(warp);
         }
         self.stats.accesses += 1;
+        self.since_gc += 1; // as `access`'s collector count
         let (cur, stamp, lane) = match a.who {
             Who::Lane { warp, lane, epoch } => {
                 if !self.tick(warp, epoch) {
@@ -252,7 +273,20 @@ impl Checker {
             }
         }
         let snap = match cur {
-            Cur::Lane { w, .. } => Snap::Lane(self.warps[w].snapshot()),
+            Cur::Lane { w, .. } => {
+                // A poll flush at the access's start changed the warp.
+                let p = self.part.as_mut().unwrap();
+                let cached = p.snaps.get(&(w as WarpId)).cloned();
+                let s = match cached {
+                    Some(s) => s,
+                    None => {
+                        let s = self.warps[w].snapshot();
+                        self.part.as_mut().unwrap().snaps.insert(w as WarpId, s.clone());
+                        s
+                    }
+                };
+                Snap::Lane(s)
+            }
             Cur::Async { a: i } => Snap::Async(Box::new(self.asyncs[i].clone())),
         };
         let tag = self.part.as_ref().unwrap().tag;
@@ -272,31 +306,23 @@ impl Checker {
         let Deferred { a, cur, stamp, lane, lane_g2t, snap, .. } = d;
         let domain = a.domain;
         match (cur, snap) {
-            (Cur::Lane { w, epoch, .. }, Snap::Lane(mut s)) => {
-                self.site_reg.insert((w as WarpId, epoch), a.site);
-                let mut live = self.warps.0[w].take().expect("absorbed warp");
-                std::mem::swap(&mut s.sites, &mut live.sites);
-                self.warps.0[w] = Some(s);
+            (Cur::Lane { w, epoch, .. }, Snap::Lane(s)) => {
+                let _ = epoch;
+                self.cur_override = Some((w, s));
                 self.lane_g2t = lane_g2t;
                 self.as_of_seq = Some(a.seq);
                 self.access_core(&a, cur, stamp, lane, domain);
                 self.as_of_seq = None;
-                let mut s = self.warps.0[w].take().unwrap();
-                std::mem::swap(&mut s.sites, &mut live.sites);
-                self.warps.0[w] = Some(live);
+                self.cur_override = None;
             }
             (Cur::Async { a: i }, Snap::Async(s)) => {
-                let reg: Arc<AsyncActor> = Arc::new((*s).clone());
-                for side in 1..=2 {
-                    self.op_reg.insert((s.actor, s.gen_base + side), reg.clone());
-                }
-                let live = self.asyncs.0[i].take().expect("absorbed slot");
-                self.asyncs.0[i] = Some(s);
+                let live = self.asyncs.0.take(i).expect("absorbed slot");
+                self.asyncs.0.put(i, s);
                 self.lane_g2t = None;
                 self.as_of_seq = Some(a.seq);
                 self.access_core(&a, cur, stamp, lane, domain);
                 self.as_of_seq = None;
-                self.asyncs.0[i] = Some(live);
+                self.asyncs.0.put(i, live);
             }
             _ => unreachable!("snapshot kind matches the actor"),
         }
@@ -304,15 +330,22 @@ impl Checker {
 
     /// Split off the child for one partition (`key` = its first cluster id,
     /// `ctas` = its CTAs). The main checker keeps everything else.
-    pub(crate) fn split(&mut self, key: u32, ctas: &[u32], meta: Arc<HashMap<AllocId, AllocMeta>>, reserve: usize) -> Checker {
+    pub(crate) fn split(&mut self, key: u32, ctas: &[u32], meta: Arc<HashMap<AllocId, AllocMeta>>, min_reserve: usize) -> Checker {
         let pool = key + 1;
-        // Deterministic slot reservation for the phase (the main checker
-        // grows the pool; a child that runs out suspends at that issue).
+        // Deterministic slot reservation for the phase: twice the most this
+        // pool ever took in one phase (the main checker grows the pool; a
+        // child that runs out suspends at that issue).
         let nw = self.topo.num_warps();
-        let free = self.pools.get(&pool).map_or(0, |p| p.free.len());
+        let (free, peak) = self.pools.get(&pool).map_or((0, 0), |p| (p.free.len(), p.peak.max(p.taken)));
+        let reserve = (2 * peak).max(min_reserve);
+        if let Some(p) = self.pools.get_mut(&pool) {
+            p.peak = peak;
+            p.taken = 0;
+        }
         for _ in free..reserve {
-            let i = self.asyncs.0.len();
-            self.asyncs.0.push(Some(Box::new(AsyncActor::placeholder(nw + i as u32))));
+            let i = self.next_slot;
+            self.next_slot += 1;
+            self.asyncs.0.put(i, Box::new(AsyncActor::placeholder(nw + i as u32)));
             let p = self.pools.entry(pool).or_default();
             p.slots.push(i);
             p.free.insert(0, i);
@@ -323,7 +356,9 @@ impl Checker {
         let wpc = self.topo.warps_per_cta;
         for &c in ctas {
             for w in c * wpc..(c + 1) * wpc {
-                child.warps.0[w as usize] = self.warps.0[w as usize].take();
+                if let Some(x) = self.warps.0.take(w as usize) {
+                    child.warps.0.put(w as usize, x);
+                }
                 if let Some(v) = self.poll_stash.remove(&w) {
                     child.poll_stash.insert(w, v);
                 }
@@ -331,15 +366,16 @@ impl Checker {
         }
         if let Some(p) = self.pools.remove(&pool) {
             for &i in &p.slots {
-                if child.asyncs.0.len() <= i {
-                    child.asyncs.0.resize_with(i + 1, || None);
+                if let Some(x) = self.asyncs.0.take(i) {
+                    child.asyncs.0.put(i, x);
                 }
-                child.asyncs.0[i] = self.asyncs.0[i].take();
             }
             child.pools.insert(pool, p);
         }
-        let ids: Vec<AllocId> =
-            self.allocs.iter().filter(|(_, a)| matches!(a.space, Space::Shared | Space::Tmem) && clusters.contains(&(a.cta / cpc))).map(|(id, _)| *id).collect();
+        let mut ids: Vec<AllocId> = Vec::new();
+        for cl in &clusters {
+            ids.extend(self.allocs_by_cluster.get(cl).into_iter().flatten().copied());
+        }
         for id in ids {
             child.allocs.insert(id, self.allocs.remove(&id).unwrap());
             if let Some(w) = self.words.remove(&id) {
@@ -363,6 +399,7 @@ impl Checker {
             finding_tags: Vec::new(),
             incomplete_tags: Vec::new(),
             finding_keys: Vec::new(),
+            snaps: HashMap::new(),
         }));
         child
     }
@@ -377,7 +414,6 @@ impl Checker {
         c.gc_every = main.gc_every;
         c.mbarrier_scope_assumed = main.mbarrier_scope_assumed;
         c.max_findings = 0;
-        c.asyncs.0.resize_with(main.asyncs.0.len(), || None);
         c
     }
 
@@ -386,21 +422,16 @@ impl Checker {
     /// global accesses in tag order, then process `stash` here.
     pub(crate) fn absorb(&mut self, mut child: Checker, stash: Vec<Stashed>) {
         let part = *child.part.take().expect("child");
-        for (w, slot) in child.warps.0.iter_mut().enumerate() {
-            if let Some(x) = slot.take() {
-                self.warps.0[w] = Some(x);
-            }
+        for (w, x) in child.warps.0.drain_all() {
+            self.warps.0.put(w, x);
         }
         for (w, v) in child.poll_stash.drain() {
             self.poll_stash.insert(w, v);
         }
         for (k, p) in child.pools.drain() {
             for &i in &p.slots {
-                if self.asyncs.0.len() <= i {
-                    self.asyncs.0.resize_with(i + 1, || None);
-                }
-                if let Some(x) = child.asyncs.0.get_mut(i).and_then(|s| s.take()) {
-                    self.asyncs.0[i] = Some(x);
+                if let Some(x) = child.asyncs.0.take(i) {
+                    self.asyncs.0.put(i, x);
                 }
             }
             self.pools.insert(k, p);
@@ -423,6 +454,7 @@ impl Checker {
         self.since_gc += child.since_gc;
         self.last_seq = self.last_seq.max(child.last_seq);
         self.stats.accesses += child.stats.accesses;
+        self.stats.async_slots += child.stats.async_slots;
         // Report entries and deferred accesses, in replay order.
         enum Item {
             Finding(usize),
@@ -470,6 +502,7 @@ impl Checker {
             match s {
                 Stashed::Event(e) => self.event(e),
                 Stashed::Note(i) => self.note_incomplete(i),
+                Stashed::WarpDone(w) => self.warp_done(w),
             }
         }
     }
@@ -535,6 +568,7 @@ impl Checker {
 pub(crate) enum Stashed {
     Event(Event),
     Note(Incomplete),
+    WarpDone(WarpId),
 }
 
 /// Union of a child finding's TMEM rectangles into the main one (the
@@ -545,5 +579,30 @@ fn merge_tmem(e: &mut TmemRects, t: &TmemRects) {
     }
     for r in &t.1 {
         add_span(&mut e.1, r.clone());
+    }
+}
+
+impl Checker {
+    /// Collect only at `phase_end` from now on (D7).
+    pub fn set_collect_at_phase_end(&mut self, on: bool) {
+        self.collect_at_phase_end = on;
+    }
+
+    /// Fork/join mode: keep decode evidence of global witnesses.
+    pub fn set_fork_join(&mut self, on: bool) {
+        self.register_global = on;
+    }
+
+    /// What a child needs to know of the global allocations it never holds.
+    pub(crate) fn global_meta(&self) -> HashMap<AllocId, AllocMeta> {
+        self.allocs.iter().filter(|(_, a)| a.space == Space::Global).map(|(id, a)| (*id, AllocMeta { space: a.space, size: a.size })).collect()
+    }
+
+    /// End of a replay batch (decision 17 `phase_end`): the collection point
+    /// in both modes (review D7), with every partition joined.
+    pub fn phase_end(&mut self) {
+        if self.gc_every != 0 && self.since_gc >= self.gc_every.max(self.gc_period) / 4 {
+            self.gc();
+        }
     }
 }

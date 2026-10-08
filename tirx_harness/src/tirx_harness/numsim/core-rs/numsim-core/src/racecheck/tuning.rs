@@ -27,6 +27,11 @@ switches! {
     ADAPTIVE_GC: "GC period scaled to twice the live shadow cells.",
 }
 
+/// Decision 17: `RaceObserver`s fork a child checker per scheduling
+/// partition (default for new observers: off until milestone 2 shows the
+/// gain; 1.1x on e24 in milestone 1. Not a pruning switch).
+pub static FORK_JOIN: AtomicBool = AtomicBool::new(false);
+
 #[inline(always)]
 pub fn on(s: &AtomicBool) -> bool {
     s.load(Relaxed)

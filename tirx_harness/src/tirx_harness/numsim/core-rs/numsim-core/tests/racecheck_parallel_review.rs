@@ -22,17 +22,23 @@ const WORKERS: [usize; 3] = [1, 8, 32];
 fn serial_payload(s: &Scenario, workers: usize, rc: &RacecheckConfig) -> (String, String) {
     let cfg = RunConfig { workers, ..s.config.clone() };
     let mut obs = RaceObserver::new(rc.clone());
+    obs.fork_join = false;
+    obs.phase_gc = true;
     let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &cfg).expect("run starts");
     let report: Report = obs.finish();
     (format!("{:?}", o.status), format!("{report:?}"))
 }
 
-/// Fork/join racecheck payload (decision 17). TODO(W5): run the engine with
-/// the fork/join `RaceObserver` and return the same rendering as
-/// [`serial_payload`].
-#[allow(dead_code)]
-fn fork_join_payload(_s: &Scenario, _workers: usize, _rc: &RacecheckConfig) -> (String, String) {
-    unimplemented!("W5: fork/join RaceObserver (racecheck-parallel-design.md §9, decision 17)")
+/// Fork/join racecheck payload (decision 17): the same run with the
+/// observer forking one child checker per scheduling partition.
+fn fork_join_payload(s: &Scenario, workers: usize, rc: &RacecheckConfig) -> (String, String) {
+    let cfg = RunConfig { workers, ..s.config.clone() };
+    let mut obs = RaceObserver::new(rc.clone());
+    obs.fork_join = true;
+    obs.phase_gc = true;
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &cfg).expect("run starts");
+    let report: Report = obs.finish();
+    (format!("{:?}", o.status), format!("{report:?}"))
 }
 
 /// The serial payload is identical at every worker count; returns it.
@@ -337,6 +343,11 @@ const CORPUS: [&str; 8] = [
 ];
 
 fn corpus() -> Vec<Scenario> {
+    // The recorded corpus runs take minutes unoptimised: release builds
+    // only (`cargo test --release --test racecheck_parallel_review`).
+    if cfg!(debug_assertions) {
+        return Vec::new();
+    }
     let dir = fixtures::dir();
     CORPUS
         .iter()
@@ -356,53 +367,45 @@ fn corpus_serial_is_worker_independent() {
 }
 
 // ---------------------------------------------------------------------------
-// Fork/join arm (W5: remove the ignores when the observer lands)
+// Fork/join arm
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "TODO(W5): fork/join observer; §11.2 H1 (strong reads resolved at their own seq)"]
 fn h1_same_round_flag_fork_join_matches_serial() {
     fork_join_matches_serial(&h1(), &RacecheckConfig::default());
 }
 
 #[test]
-#[ignore = "TODO(W5): fork/join observer; §11.2 H2 (pred_reads stability over lower-seq writes only)"]
 fn h2_pred_reads_later_writer_fork_join_matches_serial() {
     fork_join_matches_serial(&h2(), &RacecheckConfig::default());
 }
 
 #[test]
-#[ignore = "TODO(W5): fork/join observer; §11.2 H3 (checker round = engine phase)"]
 fn h3_serial_phase_atom_fork_join_matches_serial() {
     fork_join_matches_serial(&h3(), &RacecheckConfig::default());
 }
 
 #[test]
-#[ignore = "TODO(W5): fork/join observer; §11.2 H4 / W6-P1 (children get renumbered verdicts)"]
 fn w6_p1_same_round_writers_fork_join_matches_serial() {
     fork_join_matches_serial(&same_round_writers(), &RacecheckConfig::default());
 }
 
 #[test]
-#[ignore = "TODO(W5): fork/join observer; §11.1 D3 (partition key = first cluster id)"]
 fn d3_turnover_fork_join_matches_serial() {
     fork_join_matches_serial(&turnover(), &RacecheckConfig::default());
 }
 
 #[test]
-#[ignore = "TODO(W5): fork/join observer; §11.1 D5 (global earliest-N findings cap)"]
 fn d5_findings_cap_fork_join_matches_serial() {
     fork_join_matches_serial(&many_races(), &capped());
 }
 
 #[test]
-#[ignore = "TODO(W5): fork/join observer; §11.2 H6 (stream-cycle fallback order)"]
 fn h6_store_buffering_fork_join_matches_serial() {
     fork_join_matches_serial(&scenarios::cross_cluster_sb(), &RacecheckConfig::default());
 }
 
 #[test]
-#[ignore = "TODO(W5): fork/join observer; §11.1 D1-D7 over every scenario"]
 fn all_scenarios_fork_join_matches_serial() {
     for s in scenarios::all() {
         fork_join_matches_serial(&s, &RacecheckConfig::default());
@@ -410,7 +413,6 @@ fn all_scenarios_fork_join_matches_serial() {
 }
 
 #[test]
-#[ignore = "TODO(W5): fork/join observer; §11 over the recorded corpus"]
 fn corpus_fork_join_matches_serial() {
     for s in corpus() {
         fork_join_matches_serial(&s, &RacecheckConfig::default());

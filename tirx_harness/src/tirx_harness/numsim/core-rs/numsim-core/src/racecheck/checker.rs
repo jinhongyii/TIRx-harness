@@ -26,6 +26,7 @@ use super::knowledge::{fence_domains, join_tmap, select_view, Heads, Knowledge, 
 use super::shadow::IntervalShadow;
 
 mod partition;
+pub(crate) use partition::Stashed;
 
 // ---------------------------------------------------------------- report --
 
@@ -398,6 +399,8 @@ struct AsyncActor {
     /// mbarrier-less st.async / red.async `.release` that landed at issue
     /// (T13). Its accesses stay unordered with everything after them.
     drained: bool,
+    /// Ever issued into (statistics: slots used, not slots reserved).
+    used: bool,
 }
 
 impl AsyncActor {
@@ -419,41 +422,104 @@ impl AsyncActor {
             footprint: Vec::new(),
             done: 0,
             drained: false,
+            used: false,
         }
     }
 }
 
-/// Async slots by global slot index (actor `num_warps + index`). A checker
-/// partition holds only its own pools' slots (`None`: held elsewhere).
-struct Slots(Vec<Option<Box<AsyncActor>>>);
+/// Per-id state, held either densely (the main checker: every id) or
+/// sparsely (a checker partition: only its own ids; iteration is in id
+/// order either way). `None`/absent: held by another partition.
+enum Held<T> {
+    Dense(Vec<Option<Box<T>>>),
+    Sparse(BTreeMap<usize, Box<T>>),
+}
+
+impl<T> Held<T> {
+    #[inline(always)]
+    fn get(&self, i: usize) -> Option<&T> {
+        match self {
+            Held::Dense(v) => v.get(i).and_then(|x| x.as_deref()),
+            Held::Sparse(m) => m.get(&i).map(|x| &**x),
+        }
+    }
+    #[inline(always)]
+    fn get_mut(&mut self, i: usize) -> Option<&mut T> {
+        match self {
+            Held::Dense(v) => v.get_mut(i).and_then(|x| x.as_deref_mut()),
+            Held::Sparse(m) => m.get_mut(&i).map(|x| &mut **x),
+        }
+    }
+    fn take(&mut self, i: usize) -> Option<Box<T>> {
+        match self {
+            Held::Dense(v) => v.get_mut(i).and_then(|x| x.take()),
+            Held::Sparse(m) => m.remove(&i),
+        }
+    }
+    fn put(&mut self, i: usize, x: Box<T>) {
+        match self {
+            Held::Dense(v) => {
+                if v.len() <= i {
+                    v.resize_with(i + 1, || None);
+                }
+                v[i] = Some(x);
+            }
+            Held::Sparse(m) => {
+                m.insert(i, x);
+            }
+        }
+    }
+    fn iter_indexed(&self) -> Box<dyn Iterator<Item = (usize, &T)> + '_> {
+        match self {
+            Held::Dense(v) => Box::new(v.iter().enumerate().filter_map(|(i, x)| x.as_deref().map(|x| (i, x)))),
+            Held::Sparse(m) => Box::new(m.iter().map(|(i, x)| (*i, &**x))),
+        }
+    }
+    fn iter_mut(&mut self) -> Box<dyn Iterator<Item = &mut T> + '_> {
+        match self {
+            Held::Dense(v) => Box::new(v.iter_mut().filter_map(|x| x.as_deref_mut())),
+            Held::Sparse(m) => Box::new(m.values_mut().map(|x| &mut **x)),
+        }
+    }
+    /// Move every held entry out (id order).
+    fn drain_all(&mut self) -> Vec<(usize, Box<T>)> {
+        match self {
+            Held::Dense(v) => v.iter_mut().enumerate().filter_map(|(i, x)| x.take().map(|x| (i, x))).collect(),
+            Held::Sparse(m) => std::mem::take(m).into_iter().collect(),
+        }
+    }
+}
+
+/// Async slots by global slot index (actor `num_warps + index`).
+struct Slots(Held<AsyncActor>);
 
 impl std::ops::Index<usize> for Slots {
     type Output = AsyncActor;
     #[inline(always)]
     fn index(&self, i: usize) -> &AsyncActor {
-        self.0[i].as_deref().expect("async slot held by another checker partition")
+        self.0.get(i).expect("async slot held by another checker partition")
     }
 }
 
 impl std::ops::IndexMut<usize> for Slots {
     #[inline(always)]
     fn index_mut(&mut self, i: usize) -> &mut AsyncActor {
-        self.0[i].as_deref_mut().expect("async slot held by another checker partition")
+        self.0.get_mut(i).expect("async slot held by another checker partition")
     }
 }
 
 impl Slots {
     fn get(&self, i: usize) -> Option<&AsyncActor> {
-        self.0.get(i).and_then(|a| a.as_deref())
+        self.0.get(i)
     }
     fn iter(&self) -> impl Iterator<Item = &AsyncActor> {
-        self.0.iter().filter_map(|a| a.as_deref())
+        self.0.iter_indexed().map(|(_, a)| a)
     }
     fn iter_mut(&mut self) -> impl Iterator<Item = &mut AsyncActor> {
-        self.0.iter_mut().filter_map(|a| a.as_deref_mut())
+        self.0.iter_mut()
     }
     fn iter_indexed(&self) -> impl Iterator<Item = (usize, &AsyncActor)> {
-        self.0.iter().enumerate().filter_map(|(i, a)| a.as_deref().map(|a| (i, a)))
+        self.0.iter_indexed()
     }
 }
 
@@ -464,50 +530,49 @@ struct Pool {
     free: Vec<usize>,
     slots: Vec<usize>,
     index: HashMap<AsyncId, usize>,
+    /// Slots taken from `free` since the last fork; the most ever taken in
+    /// one phase sizes the next reservation (deterministic).
+    taken: usize,
+    peak: usize,
 }
 
 /// Pool of an op: the engine's partition-scoped id range
 /// (`(first cluster + 1) << 40`, D2/D3); per-lane sub-ops (observer) keep
 /// their parent's range in the low 56 bits.
-fn pool_key(op: AsyncId) -> u32 {
+pub(crate) fn pool_key(op: AsyncId) -> u32 {
     ((op.0 & ((1 << 56) - 1)) >> 40) as u32
 }
 
-/// Warps by global id. A checker partition holds only its own warps
-/// (`None`: the warp's state is held by another partition).
-struct Warps(Vec<Option<Box<Warp>>>);
+/// Warps by global id. A checker partition holds only its own warps.
+struct Warps(Held<Warp>);
 
 impl std::ops::Index<usize> for Warps {
     type Output = Warp;
     #[inline(always)]
     fn index(&self, i: usize) -> &Warp {
-        self.0[i].as_deref().expect("warp held by another checker partition")
+        self.0.get(i).expect("warp held by another checker partition")
     }
 }
 
 impl std::ops::IndexMut<usize> for Warps {
     #[inline(always)]
     fn index_mut(&mut self, i: usize) -> &mut Warp {
-        self.0[i].as_deref_mut().expect("warp held by another checker partition")
+        self.0.get_mut(i).expect("warp held by another checker partition")
     }
 }
 
 impl Warps {
     fn get(&self, i: usize) -> Option<&Warp> {
-        self.0.get(i).and_then(|w| w.as_deref())
+        self.0.get(i)
     }
     fn get_mut(&mut self, i: usize) -> Option<&mut Warp> {
-        self.0.get_mut(i).and_then(|w| w.as_deref_mut())
-    }
-    /// Number of warp ids (held or not).
-    fn len(&self) -> usize {
-        self.0.len()
+        self.0.get_mut(i)
     }
     fn iter(&self) -> impl Iterator<Item = &Warp> {
-        self.0.iter().filter_map(|w| w.as_deref())
+        self.0.iter_indexed().map(|(_, w)| w)
     }
     fn iter_mut(&mut self) -> impl Iterator<Item = &mut Warp> {
-        self.0.iter_mut().filter_map(|w| w.as_deref_mut())
+        self.0.iter_mut()
     }
 }
 
@@ -751,6 +816,17 @@ pub struct Checker {
     op_reg: HashMap<(ActorId, Epoch), Arc<AsyncActor>>,
     /// Seq of the latest access processed.
     last_seq: u64,
+    /// Next fresh async slot index (main checker).
+    next_slot: usize,
+    /// Shared / TMEM allocations per cluster (what a fork moves).
+    allocs_by_cluster: HashMap<u32, Vec<AllocId>>,
+    /// Fork/join mode: register the decode evidence of global witnesses.
+    register_global: bool,
+    /// While a deferred lane access runs: its warp's state as of the access.
+    cur_override: Option<(usize, Arc<Warp>)>,
+    /// The scheduler calls `phase_end`: collect only there (D7), never at
+    /// event counts or round boundaries, in serial and fork/join alike.
+    collect_at_phase_end: bool,
     /// While a deferred access runs: its seq (completions after it are not
     /// visible to it).
     as_of_seq: Option<u64>,
@@ -820,8 +896,8 @@ impl Checker {
         Checker {
             topo,
             memo: JoinMemo::default(),
-            warps: Warps((0..n).map(|i| Some(Box::new(Warp::new(i)))).collect()),
-            asyncs: Slots(Vec::new()),
+            warps: Warps(Held::Dense((0..n).map(|i| Some(Box::new(Warp::new(i)))).collect())),
+            asyncs: Slots(Held::Dense(Vec::new())),
             pools: HashMap::new(),
             allocs: HashMap::new(),
             phases: HashMap::new(),
@@ -853,6 +929,11 @@ impl Checker {
             site_reg: HashMap::new(),
             op_reg: HashMap::new(),
             last_seq: 0,
+            next_slot: 0,
+            allocs_by_cluster: HashMap::new(),
+            cur_override: None,
+            register_global: false,
+            collect_at_phase_end: false,
             as_of_seq: None,
         }
     }
@@ -861,7 +942,8 @@ impl Checker {
     fn new_shell(topo: Topology) -> Self {
         let mut c = Checker::new(Topology { num_ctas: 0, ..topo });
         c.topo = topo;
-        c.warps = Warps((0..topo.num_warps()).map(|_| None).collect());
+        c.warps = Warps(Held::Sparse(BTreeMap::new()));
+        c.asyncs = Slots(Held::Sparse(BTreeMap::new()));
         c
     }
 
@@ -1031,7 +1113,7 @@ impl Checker {
 
     /// A natural pause (round boundary): collect if a quarter period elapsed.
     pub fn safe_point(&mut self) {
-        if self.part.is_some() {
+        if self.part.is_some() || self.collect_at_phase_end {
             return; // a checker partition never collects (main does, D7)
         }
         if self.gc_every != 0 && self.since_gc >= self.gc_every.max(self.gc_period) / 4 {
@@ -1041,7 +1123,7 @@ impl Checker {
 
     fn maybe_gc(&mut self) {
         self.since_gc += 1;
-        if self.part.is_some() {
+        if self.part.is_some() || self.collect_at_phase_end {
             return;
         }
         if self.gc_every != 0 && self.since_gc >= self.gc_every.max(self.gc_period) {
@@ -1105,6 +1187,16 @@ impl Checker {
     // ------------------------------------------------------- ordering --
 
     /// Is `prior` ordered before an access by `cur` in proxy `cur_proxy`?
+    /// The current access's warp: live, or (a deferred access in the main
+    /// checker) its state as of the access.
+    #[inline(always)]
+    fn cur_warp(&self, w: usize) -> &Warp {
+        match &self.cur_override {
+            Some((ow, x)) if *ow == w => x,
+            _ => &self.warps[w],
+        }
+    }
+
     #[inline]
     fn ordered(&self, cur: Cur, prior: &Witness, cur_proxy: Proxy) -> bool {
         let mut view = select_view(prior.proxy(), cur_proxy, prior.domain());
@@ -1117,7 +1209,7 @@ impl Checker {
         }
         match cur {
             Cur::Lane { w, lane, epoch } => {
-                let warp = &self.warps[w];
+                let warp = self.cur_warp(w);
                 if prior.stamp.actor() == warp.actor && view == View::Hb {
                     // Program order within a lane; sibling lanes of one
                     // instruction are simultaneous; otherwise the lane-order
@@ -1165,7 +1257,7 @@ impl Checker {
             return OrderingFailure::MissingProxyBridge { prior: pp, current: cp, domain: prior.domain() };
         }
         if let Cur::Lane { w, .. } = cur {
-            if prior.stamp.actor() == self.warps[w].actor {
+            if prior.stamp.actor() == self.cur_warp(w).actor {
                 return OrderingFailure::MissingSameWarpLaneOrder;
             }
         }
@@ -1173,8 +1265,8 @@ impl Checker {
             let issue = Stamp::new(a.warp, a.issue_epoch);
             let issued_before = match cur {
                 Cur::Lane { w, lane, .. } => {
-                    (a.warp == w as u32 && (a.lane == lane || self.warps[w].row[lane as usize][a.lane as usize] >= a.issue_epoch))
-                        || self.warps[w].knows(lane, View::Hb, issue, a.lane)
+                    (a.warp == w as u32 && (a.lane == lane || self.cur_warp(w).row[lane as usize][a.lane as usize] >= a.issue_epoch))
+                        || self.cur_warp(w).knows(lane, View::Hb, issue, a.lane)
                 }
                 Cur::Async { a: x } => self.asyncs[x].k.hb.observes(issue, a.lane),
             };
@@ -1520,6 +1612,24 @@ impl Checker {
     /// checker partition's deferred global access runs only this part, in
     /// the main checker, with the actor's state as of the access.
     fn access_core(&mut self, a: &Access, cur: Cur, stamp: Stamp, lane: u8, domain: Option<Domain>) {
+        if self.register_global && self.allocs.get(&a.alloc).is_some_and(|al| al.space == Space::Global) {
+            // A witness in a global cell may later be judged while its warp /
+            // slot is held by a checker partition: keep its decode evidence.
+            match cur {
+                Cur::Lane { w, epoch, .. } => {
+                    self.site_reg.insert((w as WarpId, epoch), a.site);
+                }
+                Cur::Async { a: i } => {
+                    let s = &self.asyncs[i];
+                    if !self.op_reg.contains_key(&(s.actor, stamp.epoch())) {
+                        let reg = Arc::new(s.clone());
+                        for side in 1..=2 {
+                            self.op_reg.insert((reg.actor, reg.gen_base + side), reg.clone());
+                        }
+                    }
+                }
+            }
+        }
         let w = Witness::pack(stamp, lane, a.proxy, domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.allocs.get_mut(&a.alloc).unwrap().wide);
         let writes = w.writes();
         let strong = a.scope.is_some();
@@ -1859,6 +1969,10 @@ impl Checker {
         }
         match s {
             SyncEvent::AllocBegin { alloc, size, space, cta } => {
+                if matches!(space, Space::Shared | Space::Tmem) {
+                    let cl = cta / self.topo.ctas_per_cluster.max(1);
+                    self.allocs_by_cluster.entry(cl).or_default().push(alloc);
+                }
                 self.allocs.insert(alloc, Alloc {
                         size,
                         space,
@@ -1917,6 +2031,12 @@ impl Checker {
                 }
                 if let Some(al) = self.allocs.remove(&alloc) {
                     self.wide_retired += al.wide.spans.len() as u64;
+                    if matches!(al.space, Space::Shared | Space::Tmem) {
+                        let cl = al.cta / self.topo.ctas_per_cluster.max(1);
+                        if let Some(v) = self.allocs_by_cluster.get_mut(&cl) {
+                            v.retain(|x| *x != alloc);
+                        }
+                    }
                 }
                 self.words.remove(&alloc);
             }
@@ -1976,7 +2096,7 @@ impl Checker {
                         ph.completion.join_propagating(&c, &self.memo);
                     }
                     CompletionTarget::Warp { warp, lanes } => {
-                        if warp as usize >= self.warps.len() {
+                        if warp >= self.topo.num_warps() {
                             self.note_incomplete(Incomplete::CompletionWarpOutOfRange { warp });
                             return;
                         }
@@ -2286,11 +2406,15 @@ impl Checker {
         let lane = lanes.lanes8().next().unwrap_or(0);
         let nw = self.topo.num_warps();
         let key = pool_key(op);
-        let idx = match self.pools.get_mut(&key).and_then(|p| p.free.pop()) {
+        let idx = match self.pools.get_mut(&key).and_then(|p| {
+            p.taken += 1;
+            p.free.pop()
+        }) {
             Some(i) => i,
             None => {
-                let i = self.asyncs.0.len();
-                self.asyncs.0.push(Some(Box::new(AsyncActor {
+                let i = self.next_slot;
+                self.next_slot += 1;
+                self.asyncs.0.put(i, Box::new(AsyncActor {
                     op,
                     actor: nw + i as u32,
                     gen_base: 0,
@@ -2307,13 +2431,17 @@ impl Checker {
                     footprint: Vec::new(),
                     done: 0,
                     drained: false,
-                })));
+                    used: false,
+                }));
                 self.pools.entry(key).or_default().slots.push(i);
-                self.stats.async_slots += 1;
                 i
             }
         };
         let slot = &mut self.asyncs[idx];
+        if !slot.used {
+            slot.used = true;
+            self.stats.async_slots += 1;
+        }
         let actor = slot.actor;
         slot.op = op;
         slot.in_use = true;

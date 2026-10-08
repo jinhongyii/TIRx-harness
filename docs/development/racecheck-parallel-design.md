@@ -298,3 +298,72 @@ Each runs the serial checker and the fork/join checker at 1, 8 and 32 workers, a
 | Validation (bit-identical corpus at 1/16/32 workers, perf) | 2–3 days |
 
 Total: about 3 weeks of focused work, gated by the §10 measurements.
+
+## 13. Milestone 1 status (fork/join, suspend at the first global-dependent event)
+
+Implemented: `RaceObserver::fork`/`join`/`phase_end` (decision 17) on W2's
+`replay_partitions` (98f344c). Checker partitions are in
+`racecheck/checker/partition.rs`; phase-end GC is the default in both modes
+(D7).
+
+**Result: 1.1x on e24 at 16 workers (19.8–20.8 s serial vs 18.3–19.1 s
+fork/join), below the 1.5x bar for a default-on second path.** The path
+lands as infrastructure with `tuning::FORK_JOIN` default **off**; it stays
+off until milestone 2 shows the gain. `phase_gc` stays default on (D7-gated,
+findings unchanged). The review tests run both arms explicitly. Profile at
+16 workers: join/absorb 68% of samples, `wait_verdicts` 52%.
+
+- A child processes its partition's events in seq order. It suspends at the
+  first event that needs state outside its cluster: a strong or atomic global
+  access, `WaitVerdicts`, `AllocBegin`/`AllocEnd`/`DeclareWord`, an SC or
+  tensormap fence, an object outside the cluster, or an exhausted slot
+  reserve. Everything from that event on is stashed for the main checker.
+- Weak global accesses are deferred with an HB handle: a warp snapshot shared
+  by consecutive deferred accesses, or an async-slot clone. `join` applies them
+  in seq order (H1/H2/W3/W4 by construction).
+- Findings, incompletes and stats merge by dedup key in tag order (D4/D5).
+  Decode registries cover witnesses whose warp or slot a not-yet-joined
+  partition holds.
+- Slot pools are keyed by the first cluster id (D3), and the reservation is
+  twice the pool's per-phase peak.
+
+**Validation**
+- All nine `racecheck_parallel_review.rs` fork/join arms pass at 1/8/32
+  workers, including every scenario and the recorded corpus fixtures. The
+  ignores are removed.
+- Payload hashes on fp16_bf16_gemm, deepgemm_1d1d, gdn_decode, kda, stp,
+  radix_topk and mega_moe e24 equal the serial checker's at 1 and 16 workers.
+- Racecheck conformance: 101/101 with fork/join forced on.
+- D7: findings are unchanged under phase-end GC on the same fixtures.
+
+**e24 (t8_h1024_i512_e24_k2_g1), recorded stream, loaded host**
+
+| workers | serial | fork/join |
+| --- | --- | --- |
+| 1 | 21.6–28.9 s | 24.3–26.2 s |
+| 16 | 19.8–20.8 s | 18.3–19.1 s |
+
+The perf gate (`tests/perf/test_corpus_perf.py -k racecheck`) passes; e24
+takes 18.7 s there.
+
+**Why milestone 1 gains little on e24.** At 16 workers, 68% of the samples
+are in `join`, i.e. the main checker processing the stashed remainders, and
+52% are in `wait_verdicts`. mega_moe's warps poll declared global words.
+Each `WaitVerdicts` suspends its partition, and its acquire joins a large
+release clock into the waiting warp, serially. The 70% of events that
+precede the first suspension, measured in §10.1, are cheap events. The
+costly joins come after it.
+
+**Milestone 2 (next).** Resolve `WaitVerdicts` and strong global reads inside
+the child:
+- Word history and release heads come from the round-start state, which is
+  immutable during the parallel replay. That is exact, because the engine lets
+  a partition read only round-start values plus its own writes (I11/I12).
+  A strong own write suspends earlier anyway.
+- Child-side checks fall back to suspension for:
+  - an accepted index at or beyond the round-start history length;
+  - a `pred_reads` range this partition already wrote in the round (H2);
+  - a `consumed` mark, which is applied at join in tag order.
+- Measure first, on e24 and medium: the fraction of `WaitVerdicts` and strong
+  global reads whose witnesses lie entirely in round-start state plus the
+  partition's own history. Report it before building child-side resolution.

@@ -147,3 +147,25 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
       - `tcgen05.ld/st` TMEM and register spans: 0.
       - Reserved range: operand values >= 240 name operands without a
         logical buffer (never an index into `SiteInfo.buffers`).
+17. **Partition replay hooks** (decision 17, racecheck-parallel-design.md).
+    `Observer::fork(&PartitionInfo) -> Option<Box<dyn ForkedObserver>>`,
+    `Observer::join(&PartitionInfo, child)` and `Observer::phase_end(round)`,
+    all with defaults that keep serial replay (`fork` → `None`).
+    - The scheduler offers `fork` serially in replay order at the replay
+      point (after `merge_words` and verdict renumbering, so children see
+      final `seq` values and verdict indices), replays each forked
+      partition's buffer into its child on the pool, then calls `join` (or
+      replays a non-forked partition into the parent) in replay order.
+    - `PartitionInfo.key` is the partition's first cluster id (stable across
+      rounds; the `AsyncId` range uses the same value), `ctas` its CTAs.
+    - `phase_end(round)` fires once per non-empty replay batch: after the
+      parallel phase, the serial phase and the drain.
+    - `ForkedObserver: Observer + Send` adds `into_any` so `join` recovers
+      the concrete child type.
+    - Results must not depend on the worker count or on which thread ran
+      which child. `NoopObserver`, synccheck and the observer pair keep
+      `fork` → `None`; the pair forwards `phase_end`.
+    - `RaceObserver` implements `fork` behind `fork_join` (default
+      `tuning::FORK_JOIN`, **off**: 1.1x on e24 in milestone 1, below the
+      1.5x bar). `phase_gc` (GC only at `phase_end`, D7) defaults on in both
+      modes.

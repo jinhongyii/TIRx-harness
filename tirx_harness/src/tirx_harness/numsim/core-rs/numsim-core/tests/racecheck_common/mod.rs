@@ -506,6 +506,10 @@ impl K {
     pub fn observe(&self) -> RaceObserver {
         let mut obs = RaceObserver::new(RacecheckConfig::default());
         obs.gc_every = self.gc_every;
+        // Contract-event scenarios have no scheduler phases: collect by
+        // event count (the pre-decision-17 policy these GC tests pin).
+        obs.phase_gc = false;
+        obs.fork_join = false;
         obs.start_launch(self.topo, 0);
         if !self.site_buffers.is_empty() {
             obs.set_site_buffers(self.site_buffers.clone());
