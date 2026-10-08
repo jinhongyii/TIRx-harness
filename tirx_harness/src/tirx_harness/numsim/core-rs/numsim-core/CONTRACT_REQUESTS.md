@@ -3040,3 +3040,50 @@ W12 triaged the remaining `v2_gap` marks with `--runxfail`. These need an owner 
 - **Rule.** PTX ISA §9.7.16.6 (tcgen05 memory consistency): the implicit pipeline order between `tcgen05.{mma,cp,shift}`, and what a `tcgen05.commit` tracks, apply only to ops issued by the same thread. Across threads, an op is ordered only by `fence::before_thread_sync`, a thread sync, then `fence::after_thread_sync`.
 - **Fix (W5).** `checker.rs` `async_issue` ignores a pred whose issuing thread (warp, lane) is not the current issuer. Scenarios: `racecheck_tcgen.rs` `cp_to_mma_handoff_needs_both_fences` and `commit_forwards_only_issued_work`, both with and without the cross-thread chain pred.
 - **For W2 (no checker dependency).** The contract documents `preds` as "architected-pipeline predecessors". A cross-thread entry is an execution-order dependency of the engine (a valid schedule), not an architected one. Either emit only the issuing thread's predecessor in `AsyncIssue.preds` and keep the per-CTA chain internal to `Issue.after`, or document that `preds` may include execution-only dependencies. The checker is correct either way.
+
+## W4-w12g (W4 patched W2's `interp/handlers/async_copy.rs`, 2026-10-08): TMA override and bulk-layout operand rules (W12-gaps 2)
+
+- **`tma`: override operand rules.**
+  - `TensorMapDesc::apply_overrides` now takes `(overrides, coords, accessible)`.
+  - The handler computes the lane's coordinates first and passes `&|va, len| arena.resolve_global(va, len).is_ok()`.
+  - oplib enforces two legacy `with_overrides` rules, each `Invalid`:
+    - a `.override::global_address` must have 128 KiB accessible;
+    - a dim/stride override requires all-zero coordinates.
+- **`bulk_copy`: layout operands.**
+  - Every lane first calls `oplib::bulk_copy_layout(size, src, dst, lane, reduce)`: a positive multiple of 16 bytes and 16-byte aligned ends (PTX `cp.async.bulk` / `cp.reduce.async.bulk`). Failures are `Invalid`, with legacy wording.
+  - Previously no bulk copy checked either rule.
+- **Tests.**
+  - numsim-core `oplib::tma::tests::tma_overrides_reject_short_address_window_and_nonzero_coordinates`.
+  - `oplib::tests::bulk_copy_layout_requires_16_byte_sizes_and_alignment`.
+
+## W12-gaps 7–9 (2026-10-08, for W2): engine validations legacy enforced
+
+These are legacy run-time rejections that v2 accepts. Each reproducer is the legacy test, run under `NUMSIM_IMPL=v2` (the v2 copy will be added once fixed). In each case legacy's rejection is the oracle.
+
+7. **`mbarrier.init` through a pointer that is neither warp-uniform nor one-to-one.**
+   - Test: `tests/numsim/integration/test_memory_artifact.py::test_mega_mbarrier_init_rejects_partial_lane_aliasing`. The kernel runs `mbarrier.init.shared.b64(barriers.ptr_to([lane // 2]), 1)`, so two lanes initialize each barrier in one instruction.
+   - v2: completes.
+   - Legacy: "mbarrier.init pointer must be warp-uniform or one-to-one across active lanes".
+   - Concurrent non-atomic initialization of one barrier is undefined. Ask: reject in the `MbarInit` handler (or in sync).
+8. **Cache-hint address and size contracts.**
+   - Test: `tests/numsim/runtime/test_cache_hint_ops.py::test_scalar_cache_hint_runtime_contracts_reach_the_engine`. Four cases:
+     - `applypriority.L2` at a non-128-byte-aligned address;
+     - `cp.async.bulk.prefetch.L2` with a size that is not a multiple of 16;
+     - `applypriority.async.bulk.bulk_group` not 128-byte aligned;
+     - prefetch at an address that is not 16-byte aligned.
+   - v2: all complete.
+   - Legacy: errors "128-byte aligned", "multiple of 16", "16-byte aligned".
+   - Related open rows: P6/P7. Ask: validate the operands in the handlers (and in W4's OpLib if the check lives there).
+9. **A tcgen05 `collector::a::use` after an intervening MMA that discards the collector.**
+   - Test: `tests/numsim/runtime/test_tcgen_collectors.py::test_typed_gemm_discards_a_raw_mma_fill`. The sequence is a raw `collector::a::fill`, then a TVM-dispatched `Tx.gemm_async`, then a raw `collector::a::use`.
+   - v2: completes.
+   - Legacy: "requires a valid previous fill".
+   - The dispatched gemm's MMAs do not keep collector A, so the later `use` reads an invalid collector. Ask: invalidate the collector state on any MMA that does not use `::fill`/`::use` (or `::lastuse`).
+
+## W11-7 [W2/W4] (2026-10-08): runtime `descI` that disagrees with the typed `gemm_async` ABI is accepted
+
+- Legacy test: `tests/numsim/integration/test_block_scaled_gemm_artifact.py::test_block_scaled_desc_i_rejects_static_abi_mismatch_at_runtime`.
+- Reproducer: `tests/numsim/v2/ports/test_w11_l1_block_scaled.py::test_block_scaled_desc_i_rejects_static_abi_mismatch_at_runtime_corrected_kernel` (`v2_gap`). It is the L1/L4-valid version of the legacy kernel: SF through `tcgen05.cp`, N = 16, four-warp read-back.
+- With `corrupt_descriptor=1`, the runtime instruction descriptor of the block-scaled MMA has bit 17 (the N field) flipped. v2 runs to completion and produces different values.
+- Expected, as legacy: an error, because the runtime `descI` does not match the typed TCGEN ABI (the shape declared by the `gemm_async`). This fails open, since an undeclared shape change goes through without an error.
+- The MMA handler (oplib) or the issue path (interp) should check that a runtime `descI` agrees with the statically declared shape and kind.
