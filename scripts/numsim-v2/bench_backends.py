@@ -964,7 +964,7 @@ def main() -> int:
     render.add_argument("--recommendation", default=None, help="markdown appended verbatim")
     reg = sub.add_parser("regressions", help="every (case, mode, workers) row where interp is slower than legacy")
     reg.add_argument("--results", default=str(default_root / "bench-backends"))
-    reg.add_argument("--out", default=str(REPO / "scripts/numsim-v2/coverage/perf_regressions.tsv"))
+    reg.add_argument("--out", default=str(REPO / "docs/development/perf_regressions.tsv"))
     reg.add_argument("--engine", default="", help="engine commit label written into every row")
     mega = sub.add_parser("mega", help="Mega-MoE perf-budget workloads, legacy vs interp")
     mega.add_argument("--configs", default=",".join(MEGA_CONFIGS))

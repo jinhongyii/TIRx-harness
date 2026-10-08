@@ -322,8 +322,8 @@ Follow-up: re-record every v2 baseline on a quiet host
 `scripts/numsim-v2/bench_backends.py` times every canonical case in each mode where v2
 matches legacy (`v2-conformance-status.md`). It runs legacy and v2 interp at
 `max_workers` 1/8/32, 3 interleaved repetitions each, keeping the minimum. Every run's
-normalized result is checked against the legacy conformance snapshot, and a row aborts on
-any difference. Each case runs in its own child process. The 1-minute load average is
+normalized result is checked against the legacy conformance snapshot, or against
+`<mode>.delta.json` for v2 when one exists. A row aborts on any difference. Each case runs in its own child process. The 1-minute load average is
 checked before each (case, mode) and the run waits while it exceeds `--max-load` (default
 40); samples taken above 40 are flagged `(L)`. Results are written per case under
 `$NUMSIM_CACHE_DIR/bench-backends/` and a rerun skips cases already present (`--force` redoes
@@ -335,10 +335,13 @@ $PY ../scripts/numsim-v2/bench_backends.py run --variants legacy,interp
 $PY ../scripts/numsim-v2/bench_backends.py mega            # Mega-MoE perf workloads, 900 s cap per run
 $PY ../scripts/numsim-v2/bench_backends.py render          # docs/development/backend-comparison.{md,json}
 $PY ../scripts/numsim-v2/bench_backends.py regressions --engine "$(git rev-parse --short HEAD)"
-                                              # scripts/numsim-v2/coverage/perf_regressions.tsv
+                                              # docs/development/perf_regressions.tsv
 ```
 
 A full corpus sweep takes about 4-6 h. To time a fixed engine while the tree keeps changing,
-copy `numsim/v2/` (with `numsim/dtype_registry.json` beside it) and `core-rs/`, build the
-extension from the copy, and pass `--v2-package <copy>/numsim_v2_snap`. Narrow a rerun with
-`--cases REGEX`, `--modes` and `--workers`.
+make a private build (`CARGO_TARGET_DIR=<scratch>/target bash
+src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh --out <scratch>/ext`) and pass
+`--v2-package <scratch>/ext/pkg/tirx_harness/numsim/v2`; name that commit with
+`regressions --engine`. Narrow a rerun with `--cases REGEX`, `--modes` and `--workers`.
+`perf_regressions.tsv` lists every (case, mode, workers) row where interp is slower than
+legacy, with an owner guess; `backend-comparison.md` explains the heuristic.
