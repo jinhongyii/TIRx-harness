@@ -1800,6 +1800,37 @@ Open, for W1:
   now stops on `bad_address` at the remote `BULK_S2C` (kernel line 1453),
   which is not oplib.
 
+## W4-17 (2026-10-08): W6 triage oplib gaps (ftz maps, spcompress, interleave prefetch, wide no-offs im2col)
+
+- **`TensorMapDesc.elem_ftz`** (new pub field, default false): `elem` F32/TF32
+  with the FTZ data type (`tensormap.replace .elemtype` 8 / 12,
+  `CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ` / `TFLOAT32_FTZ`). It round-trips
+  through encode, decode and replace, and plans as the non-FTZ type. Struct
+  literals need `..Default::default()` or the new field.
+- **`tcgen05.ld .spcompress`**, modelled end to end:
+  - Lowering (`ptx_lower.py`): the spcompress-only form carries its
+    `rowop` as `red = (op, [])`; `.abs` is in `red_abs`. No schema change:
+    `red` with no registers means "selection op only".
+  - Handler (W2's `interp/handlers/tcgen.rs`): writes
+    `oplib::tcgen_ld_spcompress` (metadata words, then kept values) into
+    `dsts`; the `.red` value is still the fold over the loaded words.
+- **Tensor prefetch** (W2's `interp/handlers/async_copy.rs`): no longer
+  plans. The new `oplib::tma_prefetch_check` only checks the instruction
+  rank against the descriptor rank, as legacy `execute_tma_cache_hint`
+  did. A swizzled 16B-interleave map can therefore be prefetched; an
+  issued transfer still fails with `tma_swizzled_16b_interleave_unmodeled`.
+- **`im2col_no_offs::w`** (lowering): now `TmaMode::Im2colW`, the wide
+  layout. It was `Im2colNoOffs`, which planned as spatial and hit "layout
+  mismatch (wide)".
+- Not oplib:
+  - The synccheck/racecheck `analysis_incomplete` finding for
+    `tma_swizzled_16b_interleave_unmodeled` has an empty message, so
+    `report.format()` lacks the reason. The reason is in
+    `details["reason"]`.
+  - `test_im2col_store_and_reduce[*-*-False]` (and `test_im2col_interleaved`)
+    read `outputs["tmap"]`: the public API's output naming for a
+    TensorMap-bound array.
+
 ## W5-10 (for W2, 2026-10-08): restricted commit and tcgen smem operand proxy
 
 Found with `test_tcgen05_restricted_commit` (a racecheck false negative) and

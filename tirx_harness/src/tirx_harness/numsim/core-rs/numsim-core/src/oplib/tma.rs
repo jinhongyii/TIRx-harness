@@ -52,13 +52,20 @@ pub(crate) const L2_PROMOTION_BYTE: usize = TENSOR_MAP_DESCRIPTOR_BYTES - 1;
 // Field mappings
 // ---------------------------------------------------------------------------
 
-fn elem_to_image(elem: Option<Dtype>, fp4_padded: bool) -> OpResult<(TensorMapElementType, Option<Fp4SharedLayout>)> {
+fn elem_to_image(elem: Option<Dtype>, fp4_padded: bool, ftz: bool) -> OpResult<(TensorMapElementType, Option<Fp4SharedLayout>)> {
     use TensorMapElementType as E;
     let Some(elem) = elem else {
         return Err(OpError::invalid("TensorMap has no element type"));
     };
     if fp4_padded && elem != Dtype::E2M1 {
         return Err(OpError::invalid("TensorMap fp4_padded requires elem E2M1"));
+    }
+    if ftz {
+        return match elem {
+            Dtype::F32 => Ok((E::F32Ftz, None)),
+            Dtype::TF32 => Ok((E::Tf32Ftz, None)),
+            other => Err(OpError::invalid(format!("TensorMap elem_ftz requires elem F32 or TF32, not {other:?}"))),
+        };
     }
     Ok(match elem {
         Dtype::Pred => (E::Bool, None),
@@ -88,9 +95,12 @@ fn elem_to_image(elem: Option<Dtype>, fp4_padded: bool) -> OpResult<(TensorMapEl
     })
 }
 
-fn elem_from_image(elem: TensorMapElementType, fp4: Option<Fp4SharedLayout>) -> OpResult<Dtype> {
+/// `(elem, elem_ftz)` of an image element type.
+fn elem_from_image(elem: TensorMapElementType, fp4: Option<Fp4SharedLayout>) -> OpResult<(Dtype, bool)> {
     use TensorMapElementType as E;
-    Ok(match elem {
+    Ok((match elem {
+        E::F32Ftz => return Ok((Dtype::F32, true)),
+        E::Tf32Ftz => return Ok((Dtype::TF32, true)),
         E::Bool => Dtype::Pred,
         E::U8 => Dtype::U8,
         E::I8 => Dtype::S8,
@@ -114,7 +124,7 @@ fn elem_from_image(elem: TensorMapElementType, fp4: Option<Fp4SharedLayout>) -> 
                 "TensorMap element type {other} (shared layout {fp4:?}) is not representable as a Dtype"
             )))
         }
-    })
+    }, false))
 }
 
 fn swizzle_to_image(code: u8) -> OpResult<(Option<usize>, SwizzleAtomicity)> {
@@ -233,7 +243,7 @@ fn desc_to_image(desc: &TensorMapDesc) -> OpResult<TensorMapImage> {
             "TensorMap rank must be in 1..=5, got {rank}"
         )));
     }
-    let (element_type, fp4_shared_layout) = elem_to_image(desc.elem, desc.fp4_padded)?;
+    let (element_type, fp4_shared_layout) = elem_to_image(desc.elem, desc.fp4_padded, desc.elem_ftz)?;
     let (swizzle_bytes, swizzle_atomicity) = swizzle_of_desc(desc)?;
     let fill_mode = match desc.oob_fill {
         0 => TensorMapFillMode::Zero,
@@ -301,13 +311,12 @@ fn image_to_desc(image: &TensorMapImage, l2_promotion: u8) -> OpResult<TensorMap
     let rank = u8::try_from(image.rank).map_err(|_| OpError::invalid("TensorMap rank overflow"))?;
     let (swizzle, swizzle_atomicity) =
         swizzle_from_image(image.swizzle_bytes, image.swizzle_atomicity)?;
+    let (elem, elem_ftz) = elem_from_image(image.element_type, image.fp4_shared_layout)?;
     let mut desc = TensorMapDesc {
         global_address: image.allocation_id,
         rank,
-        elem: Some(elem_from_image(
-            image.element_type,
-            image.fp4_shared_layout,
-        )?),
+        elem: Some(elem),
+        elem_ftz,
         interleave: interleave_from_image(image.interleave_bytes)?,
         swizzle,
         swizzle_atomicity,

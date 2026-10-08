@@ -497,6 +497,10 @@ pub struct TensorMapDesc {
     /// padded one (`CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B`, one FP4 element
     /// per byte pair slot) instead of the packed `16U4_ALIGN8B` (false).
     pub fp4_padded: bool,
+    /// `elem == F32 / TF32` only: the flush-to-zero data type
+    /// (`CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ` / `TFLOAT32_FTZ`,
+    /// `tensormap.replace .elemtype` 8 / 12). Copies move the same bytes.
+    pub elem_ftz: bool,
 }
 
 impl TensorMapDesc {
@@ -600,6 +604,25 @@ pub fn tma_plan_dir(
     smem_offset: u64,
 ) -> OpResult<TmaPlan> {
     tma::plan(map, dir, mode, coords, im2col_offsets, smem_offset)
+}
+
+/// `cp.async.bulk.prefetch.tensor`: cache residency only, so no plan
+/// (legacy `execute_tma_cache_hint`). Only the instruction's rank must
+/// match the descriptor's (gather4: a rank-2 map, `[col, row0..row3]`). A
+/// shared layout no transfer can use (e.g. a swizzled 16B interleave) is
+/// therefore still prefetchable.
+pub fn tma_prefetch_check(map: &TensorMapDesc, mode: crate::program::TmaMode, coords: &[i64]) -> OpResult {
+    let rank = match mode {
+        crate::program::TmaMode::TileGather4 if coords.len() == 5 => 2,
+        _ => coords.len(),
+    };
+    if usize::from(map.rank) != rank {
+        return Err(OpError::invalid(format!(
+            "cp.async.bulk.prefetch.tensor rank specialization {rank} does not match descriptor rank {}",
+            map.rank
+        )));
+    }
+    Ok(())
 }
 
 /// Legacy entry: [`tma_plan_dir`] with `Load`, except the store-only modes

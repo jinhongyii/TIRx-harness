@@ -707,3 +707,28 @@ fn cached_tiled_plans_equal_direct_plans() {
     }
     assert!(checked > 0);
 }
+
+/// `tensormap.replace .elemtype` 8 / 12 (f32.ftz / tf32.ftz) are
+/// representable (`elem_ftz`), round-trip through the image, and plan like
+/// their non-FTZ types (TF32 maps keep the landing tf32 rounding).
+#[test]
+fn ftz_element_types_are_representable() {
+    let mut desc = desc2d(Dtype::F32, [64, 8], 256, [16, 4], 0);
+    for (code, elem, tf32) in [(8_u64, Dtype::F32, false), (12, Dtype::TF32, true)] {
+        desc.replace(TmapField::ElemType, None, code).unwrap();
+        assert_eq!((desc.elem, desc.elem_ftz), (Some(elem), true), "elemtype {code}");
+        let bytes = desc.try_encode().unwrap();
+        let back = TensorMapDesc::decode(&bytes).unwrap();
+        assert_eq!((back.elem, back.elem_ftz), (Some(elem), true));
+        let plan = tma_plan(&desc, TmaMode::Tile, &[0, 0], &[], 0).unwrap();
+        let mut plain = desc.clone();
+        plain.elem_ftz = false;
+        let reference = tma_plan(&plain, TmaMode::Tile, &[0, 0], &[], 0).unwrap();
+        assert_eq!((plan.global, plan.smem, plan.tf32_round), (reference.global, reference.smem, tf32));
+    }
+    desc.replace(TmapField::ElemType, None, 7).unwrap();
+    assert_eq!((desc.elem, desc.elem_ftz), (Some(Dtype::F32), false));
+    let mut bad = desc2d(Dtype::F16, [64, 8], 128, [16, 4], 0);
+    bad.elem_ftz = true;
+    assert!(bad.try_encode().is_err());
+}
