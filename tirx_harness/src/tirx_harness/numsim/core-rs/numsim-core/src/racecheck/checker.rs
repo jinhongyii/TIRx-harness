@@ -15,7 +15,7 @@
 //!   once no witness of it remains; the slot's next generation starts above
 //!   every epoch of the previous one, so old clocks never observe it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -502,6 +502,49 @@ struct Word {
     own: HashMap<(WarpId, u8), u32>,
 }
 
+/// An allocation's declared words in declaration order, indexed by range
+/// (persistent kernels declare hundreds of thousands: radix_topk_multi_cta),
+/// so lookups are O(log n + hits) instead of a scan per access.
+#[derive(Default)]
+struct Words {
+    list: Vec<Word>,
+    index: BTreeMap<(u64, u64), usize>,
+    max_len: u64,
+}
+
+impl Words {
+    fn declare(&mut self, range: Range<u64>) {
+        if let std::collections::btree_map::Entry::Vacant(v) = self.index.entry((range.start, range.end)) {
+            v.insert(self.list.len());
+            self.max_len = self.max_len.max(range.end - range.start);
+            self.list.push(Word { range, history: Vec::new(), last: None, own: HashMap::new() });
+        }
+    }
+
+    /// Indices of the words overlapping `r`, in declaration order.
+    fn overlapping(&self, r: &Range<u64>) -> Vec<usize> {
+        let lo = r.start.saturating_sub(self.max_len);
+        let mut v: Vec<usize> = self
+            .index
+            .range((lo, 0)..(r.end, 0))
+            .filter(|((s, e), _)| *s < r.end && r.start < *e)
+            .map(|(_, i)| *i)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn exact(&self, r: &Range<u64>) -> Option<usize> {
+        self.index.get(&(r.start, r.end)).copied()
+    }
+
+    /// The first-declared word containing `r`.
+    fn first_within(&self, r: &Range<u64>) -> Option<usize> {
+        let lo = r.start.saturating_sub(self.max_len);
+        self.index.range((lo, 0)..=(r.start, u64::MAX)).filter(|((s, e), _)| *s <= r.start && r.end <= *e).map(|(_, i)| *i).min()
+    }
+}
+
 /// One segment of the alias tracker: `[start, end)` last written through
 /// logical name `buf` by `w` (warp `warp`, site `site`).
 #[derive(Clone)]
@@ -535,7 +578,7 @@ pub struct Checker {
     scope_dedup: HashMap<(SiteId, SiteId, Scope, Scope), usize>,
     /// Latest `fence.sc` per `(warp, lane, scope)`.
     sc: HashMap<(WarpId, u8, Scope), Arc<Knowledge>>,
-    words: HashMap<AllocId, Vec<Word>>,
+    words: HashMap<AllocId, Words>,
     /// Read-froms of possible `wait_until` polls, per warp, held back until
     /// the warp's next event.
     poll_stash: HashMap<WarpId, Vec<PollStash>>,
@@ -1125,7 +1168,7 @@ impl Checker {
         let on_word = self
             .words
             .get(&alloc)
-            .is_some_and(|ws| ws.iter().any(|w| w.range.start < bytes.end && bytes.start < w.range.end));
+            .is_some_and(|ws| !ws.overlapping(&bytes).is_empty());
         let kind = if review {
             FindingKind::TmemLifetimeReview { class, failure }
         } else if on_word && (prior.scope().is_none() || cw.scope().is_none()) {
@@ -1314,10 +1357,12 @@ impl Checker {
             .words
             .get(&a.alloc)
             .map(|ws| {
-                ws.iter()
-                    .enumerate()
-                    .filter(|(_, x)| x.range.start < a.range.end && a.range.start < x.range.end)
-                    .map(|(i, x)| (i, x.range.start.max(a.range.start), x.range == a.range))
+                ws.overlapping(&a.range)
+                    .into_iter()
+                    .map(|i| {
+                        let x = &ws.list[i];
+                        (i, x.range.start.max(a.range.start), x.range == a.range)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -1450,7 +1495,7 @@ impl Checker {
             let is_async = matches!(cur, Cur::Async { .. });
             let ws = self.words.get_mut(&a.alloc).unwrap();
             for (i, rel, mixed_size) in word_rels {
-                let word = &mut ws[i];
+                let word = &mut ws.list[i];
                 if word.last != Some((a.seq, lane)) {
                     word.last = Some((a.seq, lane));
                     word.history.push(HistEntry { rel, is_async, consumed: false, mixed_size });
@@ -1654,10 +1699,7 @@ impl Checker {
                 self.words.remove(&alloc);
             }
             SyncEvent::DeclareWord { alloc, range } => {
-                let ws = self.words.entry(alloc).or_default();
-                if !ws.iter().any(|w| w.range == range) {
-                    ws.push(Word { range, history: Vec::new(), last: None, own: HashMap::new() });
-                }
+                self.words.entry(alloc).or_default().declare(range);
             }
             SyncEvent::WarpSync { warp, mask, epoch } => {
                 if !self.tick(warp, epoch) {
@@ -1944,6 +1986,35 @@ impl Checker {
                 g2t_ranges = w.g2t_ranges[c as usize].clone(); // shared, not copied
             } else if !w.g2t_ranges[c as usize].is_empty() {
                 Arc::make_mut(&mut g2t_ranges).extend(w.g2t_ranges[c as usize].iter().cloned());
+            }
+        }
+        if matches!(kind, AsyncKind::TcgenLd | AsyncKind::TcgenSt) && lanes.count() > 1 {
+            // A warp-collective tcgen05.ld/st is performed by every lane for
+            // its own TMEM rows; `.sync.aligned` converges execution but
+            // orders no memory (like `elect.sync`, deltas T19). Each lane's
+            // part is ordered after an async tcgen05 op only if that lane is,
+            // so the op's tcgen view is the meet over the issuing lanes, not
+            // the union: one elected lane's commit wait does not order the
+            // other lanes' TMEM writes (coordinator ruling on the A-only
+            // restricted commit; legacy row 18 "lane-acquired").
+            let first = lanes.lanes8().next().unwrap_or(0) as usize;
+            let uniform = lanes.lanes8().all(|c| w.extra[c as usize].is_none() && w.tcgen[c as usize].ptr_eq(&w.tcgen[first]));
+            if !uniform {
+                let mut m: Option<Clock> = None;
+                for c in lanes.lanes8() {
+                    let mut t = w.tcgen[c as usize].clone();
+                    t.join(&w.base.hb, &self.memo);
+                    if let Some(x) = &w.extra[c as usize] {
+                        t.join(&x.hb, &self.memo);
+                    }
+                    m = Some(match m {
+                        None => t,
+                        Some(p) => p.meet(&t),
+                    });
+                }
+                if let Some(m) = m {
+                    k.tcgen = m;
+                }
             }
         }
         let mut pred_idx = Vec::new();
@@ -2295,10 +2366,10 @@ impl Checker {
 
     #[allow(clippy::too_many_arguments)]
     fn wait_verdicts(&mut self, warp: WarpId, lanes: LaneMask, alloc: AllocId, range: Range<u64>, scope: Scope, accepted: &[u64], observed: u32, site: SiteId) {
-        let exact = self.words.get(&alloc).and_then(|ws| ws.iter().position(|w| w.range == range));
+        let exact = self.words.get(&alloc).and_then(|ws| ws.exact(&range));
         // A declared region polled element by element (a `sync_words`
         // buffer declared whole): the launch value needs no history.
-        let within = self.words.get(&alloc).and_then(|ws| ws.iter().position(|w| w.range.start <= range.start && range.end <= w.range.end));
+        let within = self.words.get(&alloc).and_then(|ws| ws.first_within(&range));
         let Some(wi) = exact.or(within) else {
             self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
@@ -2314,7 +2385,7 @@ impl Checker {
         // but never coherence-before the waiting lanes' own latest write of
         // the word (CoWR; deltas W7): a grid-sync counter accepts stale
         // values of earlier rounds that the waiter can no longer read.
-        let floor = self.words[&alloc][wi].own.iter().filter(|((w, l), _)| *w == warp && lanes.has(*l)).map(|(_, i)| *i).max().unwrap_or(0);
+        let floor = self.words[&alloc].list[wi].own.iter().filter(|((w, l), _)| *w == warp && lanes.has(*l)).map(|(_, i)| *i).max().unwrap_or(0);
         // If no accepted entry is at or after it (the predicate's history
         // view is coarser than the waiter's own writes), keep the earliest.
         let all = || accepted.iter().enumerate().flat_map(|(i, b)| (0..64u32).filter(move |k| b >> k & 1 != 0).map(move |k| i as u32 * 64 + k));
@@ -2326,7 +2397,7 @@ impl Checker {
         if idx == 0 {
             return; // the launch value satisfied the predicate: no edge owed
         }
-        let word = &self.words[&alloc][wi];
+        let word = &self.words[&alloc].list[wi];
         let Some(e) = word.history.get(idx as usize - 1) else {
             self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
@@ -2344,7 +2415,7 @@ impl Checker {
                 return;
             }
         }
-        let word = &self.words[&alloc][wi];
+        let word = &self.words[&alloc].list[wi];
         let Some(e) = word.history.get(idx as usize - 1) else {
             self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
@@ -2517,7 +2588,7 @@ impl Checker {
         // the index (verdict bitsets index absolute positions).
         if let Some(m) = &global_meet {
             for words in self.words.values_mut() {
-                for word in words.iter_mut() {
+                for word in words.list.iter_mut() {
                     for e in word.history.iter_mut() {
                         let useless = e.rel.as_ref().is_some_and(|h| {
                             h.iter().all(|r| {

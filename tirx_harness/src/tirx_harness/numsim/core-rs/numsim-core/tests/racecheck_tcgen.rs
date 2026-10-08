@@ -287,7 +287,9 @@ fn tcgen_commit_forwards_issuer_publication() {
 /// (preds `[]`), the restricted commit tracks only `ma`, and the mma itself
 /// stays tracked by the next unrestricted commit. Waiting on the restricted
 /// commit orders A's read, never B's (legacy `MmaSharedARead`).
-fn restricted_commit(reuse_b: bool, shape_ok: bool) -> Report {
+/// `reuse`: 0 shared A, 1 shared B, 2 the MMA's TMEM operand (sparse
+/// metadata / LUT / TMEM-A, read by the MMA op itself, W2: operand >= 1).
+fn restricted_commit(reuse: u8, shape_ok: bool) -> Report {
     const A: std::ops::Range<u64> = 512..1024;
     const B: std::ops::Range<u64> = 1024..1536;
     let mut k = K::one_warp();
@@ -304,12 +306,28 @@ fn restricted_commit(reuse_b: bool, shape_ok: bool) -> Report {
         mma
     };
     k.aacc(mma, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, 0..64);
+    // The MMA's TMEM operand read (metadata at a later column).
+    k.aacc(mma, Milestone::Read, AccessKind::Read, Proxy::Tcgen, TMEM, 1024..1088);
     // `AsyncIssue.restricted` (contract 4b9f9c2); the old engine shape
     // (`shape_ok == false`) sent an unmarked commit.
     let c = if shape_ok { k.issue_restricted_commit(0, 0, &[ma]) } else { k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[ma], &[]) };
     k.done_phase(c, Milestone::Write, 1, 0).wait(0, 1, 1, 0, true);
     k.fence(0, 1, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
-    k.st(0, 0, SMEM, if reuse_b { B.start..B.start + 2 } else { A.start..A.start + 2 });
+    match reuse {
+        0 => {
+            k.st(0, 0, SMEM, A.start..A.start + 2);
+        }
+        1 => {
+            k.st(0, 0, SMEM, B.start..B.start + 2);
+        }
+        _ => {
+            // The kernel shape (`_tcgen_kernels.py` early_reuse="lookup"):
+            // only the issuing lane waited; the whole warp then rewrites the
+            // metadata columns with a collective tcgen05.st.
+            let st = k.issue_lanes(0, u32::MAX, AsyncKind::TcgenSt, Proxy::Tcgen, &[]);
+            k.aacc_lane(st, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, 1024..1032, numsim_core::observe::ALL_LANES);
+        }
+    }
     let tracked: Vec<AsyncId> = if shape_ok { vec![mma] } else { vec![] };
     let c = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &tracked, &[]);
     k.done_phase(c, Milestone::Write, 0, 0).wait(0, 1, 0, 0, true);
@@ -318,11 +336,16 @@ fn restricted_commit(reuse_b: bool, shape_ok: bool) -> Report {
 
 #[test]
 fn restricted_commit_publishes_only_shared_a_read() {
-    assert!(clean(&restricted_commit(false, true)));
-    assert!(has_race(&restricted_commit(true, true)));
+    assert!(clean(&restricted_commit(0, true)));
+    assert!(has_race(&restricted_commit(1, true)));
+    // The MMA's TMEM operand reads stay pending after an A-only commit:
+    // reusing the sparse metadata / LUT before a full commit races
+    // (coordinator ruling; PTX §9.7.18.12.1 "does not signal the overall
+    // completion of any prior tcgen05.mma").
+    assert!(has_race(&restricted_commit(2, true)));
     // Today's shape over-publishes: the false negative is in the events,
     // not the checker (W5-10).
-    assert!(!has_race(&restricted_commit(true, false)));
+    assert!(!has_race(&restricted_commit(1, false)));
 }
 
 /// V2C-5: a tcgen05.ld never followed by `tcgen05.wait::ld` (kernels that

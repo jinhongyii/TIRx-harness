@@ -340,5 +340,27 @@ fn frontier_eviction(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction);
+/// Declared-word index (`checker::Words`): radix_topk_multi_cta declares
+/// ~262K protocol words; a linear dedup / overlap scan per DeclareWord and
+/// per access made the checker quadratic (78 s in its first 3 rounds). Rows:
+/// 32K declarations then one access per word; the guard is the absolute
+/// time staying linear (compare `declared_words/8192` and `/32768`).
+fn declared_words(c: &mut Criterion) {
+    let topo = Topology { warps_per_cta: 1, ctas_per_cluster: 1, num_ctas: 1 };
+    let mut g = c.benchmark_group("declared_words");
+    g.sample_size(10);
+    for n in [8192u64, 32768] {
+        let mut ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: n * 8, cta: 0 })];
+        for i in 0..n {
+            ev.push(Event::Sync(SyncEvent::DeclareWord { alloc: AllocId(1), range: i * 8..i * 8 + 4 }));
+        }
+        for i in 0..n {
+            ev.push(acc(0, 0, 1 + i as u32, AccessKind::Read, i * 8..i * 8 + 4, 5));
+        }
+        g.bench_function(BenchmarkId::from_parameter(n), |b| b.iter(|| black_box(Checker::run(topo, ev.iter().cloned()))));
+    }
+    g.finish();
+}
+
+criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words);
 criterion_main!(benches);

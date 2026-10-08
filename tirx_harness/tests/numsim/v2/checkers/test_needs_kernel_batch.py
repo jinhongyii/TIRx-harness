@@ -437,21 +437,16 @@ def test_raw_st_async_mapped_expression_offsets_are_disjoint(checker):
 
 # -- tcgen05 sparse-B16 / LUT-B async read lifetimes -----------------------------
 
-# Only the MMA-enabled params depend on it: the disabled MMA reads nothing.
-_A_ONLY_RESTRICTED_COMMIT = _no_spec_unlisted(
-    "tcgen05.commit .sync_restrict::shared::read::mma::a retiring only the MMA's shared-A reads "
-    "(not in the TcgenCommit contract per lowering-inventory.md; the v2 interpreter treats it as a "
-    "full commit, so the B/metadata/LUT reuse is ordered and racecheck is clean)"
-)
-# Shared-B reuse is reported since W5-13 (8fba7e1); only the TMEM
-# lookup/metadata reuse after the A-only restricted commit is still no_spec.
+# Shared-B reuse is reported since W5-13 (8fba7e1); TMEM lookup/metadata
+# reuse after the A-only restricted commit since the lane-meet rule for
+# collective tcgen05.ld/st (racecheck-semantics row 18).
 _RESOURCE_DISABLED = pytest.mark.parametrize(
     ("resource", "disabled"),
     [
         pytest.param("b", True, id="b-mma_disabled"),
         pytest.param("b", False, id="b-mma_enabled"),
         pytest.param("lookup", True, id="lookup-mma_disabled"),
-        pytest.param("lookup", False, id="lookup-mma_enabled", marks=_A_ONLY_RESTRICTED_COMMIT),
+        pytest.param("lookup", False, id="lookup-mma_enabled"),
     ],
 )
 
@@ -483,7 +478,6 @@ def test_lut_b_async_read_lifetimes(resource, block, disabled):
     unused first 24-byte half and the TMEM write overlaps the lookup table.
     Neither is retired by the A-only restricted commit, so racecheck reports
     ``error``; with the MMA predicated off by ``zero_mask`` it is clean.
-    The MMA-enabled params are ``no_spec`` (unnumbered) as for sparse B16.
     """
 
     kernel, args, _ = lut_b_case(segment=1, block=block, early_reuse=resource)
