@@ -380,3 +380,14 @@ def test_renderer_prints_classification_and_hint():
         "    bytes [0, 4)",
         "    Hint: If this access relies on a hand-written spin wait, consider wait_until.",
     ]
+
+
+def test_incomplete_reason_is_the_message_when_message_is_empty():
+    payload = rep.phase_payload(
+        checker="synccheck", phase_index=0, phase_name="k", records=[],
+        status={"kind": "completed"},
+        diagnostics=[{"kind": "analysis_incomplete", "status": "incomplete",
+                      "reason": "tma_swizzled_16b_interleave_unmodeled", "message": ""}],
+    )
+    text = rep.SyncCheckReport([rep.AnalysisResult("synccheck", payload)]).format()
+    assert "[INCOMPLETE] analysis_incomplete: tma_swizzled_16b_interleave_unmodeled" in text

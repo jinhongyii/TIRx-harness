@@ -444,7 +444,14 @@ def _select_outputs(bound: Mapping[str, BoundInput], outputs: Iterable[str] | Ma
 
     buffers = {name for name, b in bound.items() if b.kind in ("buffer", "view") and not name.startswith("__")}
     if outputs is None:
-        return [(name, name, name) for name in sorted(buffers)]
+        selected = [(name, name, name) for name in sorted(buffers)]
+        # Legacy also exposed a buffer bound through a host tensor map under
+        # the tensor-map parameter's name (as the map's logical tensor).
+        selected += [
+            (b.base, name, name) for name, b in sorted(bound.items())
+            if b.kind == "tensor_map" and b.base is not None and b.base in bound
+        ]
+        return selected
     if isinstance(outputs, str):
         raise TypeError("NumSim outputs must be an iterable of names, not a string")
     pairs = outputs.items() if isinstance(outputs, Mapping) else ((n, n) for n in outputs)
@@ -477,6 +484,10 @@ def _tensor_map_view(image: np.ndarray, base: np.ndarray, data: bytes) -> np.nda
     tensor map in this form)."""
 
     raw = np.ascontiguousarray(image).view(np.uint8).reshape(-1)
+    if (int(raw[63]) & ~0x58 & 0xFF) in (0xA6, 0xA5):
+        # Interleaved maps (16B/32B) have no plain logical-tensor view;
+        # legacy returned the base array.
+        return None
     rank = int(raw[59]) & 7
     if not 1 <= rank <= 5:
         return None
