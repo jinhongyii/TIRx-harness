@@ -51,3 +51,10 @@ harness = false
 [[bench]]
 name = "interp_hot"
 harness = false
+
+# W6: SyncTable::step_all on the per-lane batch shapes of a cp.async GEMM
+# (fp16_bf16_gemm): 32-lane issue / commit / wait batches, plus a wait that
+# blocks on one lane and rolls the batch back.
+[[bench]]
+name = "sync"
+harness = false

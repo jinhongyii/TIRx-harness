@@ -13,7 +13,7 @@
 use crate::arena::{AllocId, Arena, ByteSpan};
 use crate::observe::{AsyncClass, CtaId, WarpId};
 use crate::program::Proxy;
-use crate::sync::{AsyncId, Completion, ResourceId};
+use crate::sync::{AsyncId, Completion, FxBuild, ResourceId};
 use crate::value::WarpMask;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -68,17 +68,17 @@ pub struct BitFrag {
 #[derive(Clone, Debug, Default)]
 pub struct GroupTracker {
     /// Issued but not yet committed ops, per `AsyncGroup` resource.
-    pub open: HashMap<ResourceId, Vec<AsyncId>>,
+    pub open: HashMap<ResourceId, Vec<AsyncId>, FxBuild>,
     /// Ops of each committed group (all, landed or not).
-    pub members: HashMap<(ResourceId, u64), Vec<AsyncId>>,
+    pub members: HashMap<(ResourceId, u64), Vec<AsyncId>, FxBuild>,
     /// Not-yet-landed ops per committed group.
-    pub pending: HashMap<(ResourceId, u64), u32>,
+    pub pending: HashMap<(ResourceId, u64), u32, FxBuild>,
     /// Groups each in-flight op still has to report its landing to.
-    pub op_groups: HashMap<AsyncId, Vec<(ResourceId, u64)>>,
+    pub op_groups: HashMap<AsyncId, Vec<(ResourceId, u64)>, FxBuild>,
     /// Ops that landed while still uncommitted.
-    pub landed_open: HashSet<AsyncId>,
+    pub landed_open: HashSet<AsyncId, FxBuild>,
     /// Deferred mbarrier arrive-ons released by a group's full completion.
-    pub arrivals: HashMap<(ResourceId, u64), Vec<Completion>>,
+    pub arrivals: HashMap<(ResourceId, u64), Vec<Completion>, FxBuild>,
 }
 
 impl GroupTracker {
@@ -605,7 +605,7 @@ pub struct LaunchAux {
     pub cp_async_unpublished: HashMap<(WarpId, u8), Vec<AsyncId>>,
     /// Deferred `cp.async.mbarrier.arrive`s per (group, ordinal): the
     /// (mbarrier, phase, prior cp.async ops) published when it fires.
-    pub cp_arrive_publish: HashMap<(ResourceId, u64), Vec<DeferredPublish>>,
+    pub cp_arrive_publish: HashMap<(ResourceId, u64), Vec<DeferredPublish>, FxBuild>,
     /// Next async op id (partition-scoped: high bits name the partition).
     pub next_async: u64,
     /// Set by a handler that must run as a serial point (a global

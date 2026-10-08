@@ -50,6 +50,7 @@ pub use completion::{AsyncId, AsyncKind, AsyncOp, AsyncSource, Completion, Paylo
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::fmt;
 
 /// Which reading of the ISA a protocol state enforces (reference crate).
@@ -195,11 +196,63 @@ pub struct ResourceInit {
     pub warps_per_cta: u32,
 }
 
+/// Deterministic, fast hasher for `ResourceId` keys (the Fx multiply-rotate
+/// mix). Resource lookups are on the per-instruction hot path (W13 profile:
+/// SipHash was ~5% of a GEMM's engine time). Nothing iterates the map in
+/// hash order: exit checks sort their output.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FxHasher(u64);
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..c.len()].copy_from_slice(c);
+            self.add(u64::from_le_bytes(b));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, x: u8) {
+        self.add(x as u64);
+    }
+    #[inline]
+    fn write_u16(&mut self, x: u16) {
+        self.add(x as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, x: u32) {
+        self.add(x as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, x: u64) {
+        self.add(x);
+    }
+    #[inline]
+    fn write_usize(&mut self, x: usize) {
+        self.add(x as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// `HashMap` / `HashSet` builder for resource keys.
+pub type FxBuild = BuildHasherDefault<FxHasher>;
+
 /// All sync state of one launch.
 #[derive(Clone, Debug, Default)]
 pub struct SyncTable {
     pub init: ResourceInit,
-    pub resources: HashMap<ResourceId, Resource>,
+    pub resources: HashMap<ResourceId, Resource, FxBuild>,
     /// Sync-level completions waiting to be applied.
     pub completions: VecDeque<Completion>,
     /// Data-carrying async ops in flight.
@@ -297,47 +350,86 @@ impl SyncTable {
     }
 
     /// All-or-nothing multi-target step (multicast arrive, lane-varying
-    /// arrive batches, 2-CTA ops): applies to clones and commits only if every
-    /// command succeeded and none blocked. On `Blocked` all staged state is
+    /// arrive batches, 2-CTA ops): commits only if every command succeeded
+    /// and none blocked. On `Blocked` all of the batch's effects are
     /// discarded, including an mbarrier `armed` flag, so blocking waits go
     /// through [`SyncTable::step`]. Each `Tcgen` lifecycle command is
     /// preceded by an implicit `TcgenGroup` check on `TcgenKernel`; only the
     /// listed commands produce outcomes.
+    ///
+    /// Commands apply in place. Each touch saves the resource's prior state
+    /// (or its absence) to an undo log, replayed in reverse on `Err` or
+    /// `Blocked`.
     pub fn step_all(&mut self, cmds: &[(ResourceId, SyncCmd)]) -> Result<Step<Vec<Outcome>>, SyncError> {
-        let mut staged: Vec<(ResourceId, Resource)> = Vec::with_capacity(cmds.len() + 1);
+        // One command whose protocol step is transactional on its own (every
+        // `Err` and `Blocked` leaves the state unchanged): no undo log. The
+        // exceptions are tcgen05 lifecycle commands (two resources) and a
+        // blocking mbarrier wait (a blocked `step` keeps `armed`).
+        if let [(id, cmd)] = cmds {
+            if !matches!(cmd, SyncCmd::Tcgen(_) | SyncCmd::Mbarrier(mbarrier::Cmd::WaitParity { .. })) {
+                return Ok(match self.step(*id, *cmd)? {
+                    Step::Done(out) => Step::Done(vec![out]),
+                    Step::Blocked(b) => Step::Blocked(b),
+                });
+            }
+        }
+        let mut undo: Vec<(ResourceId, Option<Resource>)> = Vec::with_capacity(cmds.len() + 1);
         let mut outs = Vec::with_capacity(cmds.len());
+        let mut blocked = None;
+        let mut result = Ok(());
         for &(id, cmd) in cmds {
             if let SyncCmd::Tcgen(c) = cmd {
                 let group = SyncCmd::TcgenGroup(tcgen_cmd_group(c));
-                self.stage(&mut staged, ResourceId::TcgenKernel, group)?;
+                if let Err(e) = self.apply_logged(&mut undo, ResourceId::TcgenKernel, group) {
+                    result = Err(e);
+                    break;
+                }
             }
-            let out = self.stage(&mut staged, id, cmd)?;
-            if out.is_blocked() {
-                return Ok(Step::Blocked(id));
+            match self.apply_logged(&mut undo, id, cmd) {
+                Ok(out) if out.is_blocked() => {
+                    blocked = Some(id);
+                    break;
+                }
+                Ok(out) => outs.push(out),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
             }
-            outs.push(out);
         }
-        for (id, r) in staged {
-            self.resources.insert(id, r);
+        if result.is_err() || blocked.is_some() {
+            for (id, prior) in undo.into_iter().rev() {
+                match prior {
+                    Some(r) => {
+                        self.resources.insert(id, r);
+                    }
+                    None => {
+                        self.resources.remove(&id);
+                    }
+                }
+            }
         }
-        Ok(Step::Done(outs))
+        result?;
+        Ok(match blocked {
+            Some(b) => Step::Blocked(b),
+            None => Step::Done(outs),
+        })
     }
 
-    /// Apply `cmd` to the staged copy of `id` (cloned or created on first
-    /// touch within this batch).
-    fn stage(&self, staged: &mut Vec<(ResourceId, Resource)>, id: ResourceId, cmd: SyncCmd) -> Result<Outcome, SyncError> {
-        let i = match staged.iter().position(|(r, _)| *r == id) {
-            Some(i) => i,
-            None => {
-                let res = match self.resources.get(&id) {
-                    Some(r) => r.clone(),
-                    None => self.fresh(id).ok_or(SyncError::WrongResource { resource: id })?,
-                };
-                staged.push((id, res));
-                staged.len() - 1
-            }
-        };
-        Self::apply(&mut staged[i].1, id, cmd)
+    /// Apply `cmd` to `id` in place (created on first use), saving the
+    /// resource's prior state (or its absence) to `undo` first. A resource
+    /// touched twice in a batch is saved twice; replaying `undo` in reverse
+    /// restores the earliest state.
+    fn apply_logged(&mut self, undo: &mut Vec<(ResourceId, Option<Resource>)>, id: ResourceId, cmd: SyncCmd) -> Result<Outcome, SyncError> {
+        if let Some(r) = self.resources.get_mut(&id) {
+            undo.push((id, Some(r.clone())));
+            return Self::apply(r, id, cmd);
+        }
+        let mut r = self.fresh(id).ok_or(SyncError::WrongResource { resource: id })?;
+        undo.push((id, None));
+        let out = Self::apply(&mut r, id, cmd)?;
+        self.resources.insert(id, r);
+        Ok(out)
     }
 
     /// Is this completion enabled now (W3 spec 1.3 rules: mbarrier action
