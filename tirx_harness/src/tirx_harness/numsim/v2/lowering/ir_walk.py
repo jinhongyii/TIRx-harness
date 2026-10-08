@@ -116,7 +116,8 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
     def site(self, node: Any, op_name: str | None = None, buffer: int | None = None) -> int:
         spans = _spans(getattr(node, "span", None))
         key = (handle(node), op_name, buffer) if hasattr(node, "__chandle__") else None
-        buffer_name = self.builder.program.buffers[buffer].name if buffer is not None else None
+        # W5-7: the LOGICAL buffer the source names (a view, never the shared.dyn pool).
+        buffer_name = self.builder.program.buffers[buffer].name if buffer is not None else _logical_buffer(node)
         return self.builder.site(
             pb.SiteInfo(kind=type_key(node), spans=spans, op_name=op_name or "",
                         dtype=dtype_of(node) or None, buffer=buffer_name),
@@ -728,6 +729,37 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _logical_buffer(node: Any) -> str | None:
+    """Name of the TIR buffer an access or call addresses first (argument order)."""
+    kind = type_key(node)
+    if kind == "ir.TensorLoad":
+        return str(node.source.name)
+    if kind == "tirx.BufferStore":
+        return str(node.buffer.name)
+    if kind != "ir.Call":
+        return None
+    found: list[str] = []
+
+    def on_call(sub: Any, visitor: Any) -> None:
+        if found:
+            return
+        name = str(getattr(sub.op, "name", ""))
+        if name in ("tirx.address_of", "tirx.buffer_data") and sub.args:
+            target = sub.args[0]
+            if type_key(target) == "ir.TensorLoad":
+                found.append(str(target.source.name))
+            elif type_key(target) == "ir.Var":
+                found.append(str(target.name))
+            return
+        visitor.default_visit(sub)
+
+    for arg in node.args:
+        structural_visit(arg, [(tvm.ir.Call, on_call)])
+        if found:
+            return found[0]
+    return None
 
 
 def _is_int(ty: pb.Ty) -> bool:

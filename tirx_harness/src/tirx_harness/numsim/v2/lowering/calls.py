@@ -716,10 +716,9 @@ class CallsMixin:
             ref = self.refs.get(int(var.__chandle__()))
             buf = getattr(ref, "buf", None)
             if buf is not None:
+                # W5-7: the polled buffer itself (a shared/cluster view or a global
+                # parameter), never its backing pool.
                 decl = self.builder.program.buffers[buf]
-                while decl.view_of is not None:
-                    buf = decl.view_of
-                    decl = self.builder.program.buffers[buf]
                 from dataclasses import replace
 
                 self.builder.program.buffers[buf] = replace(decl, sync_words=True)

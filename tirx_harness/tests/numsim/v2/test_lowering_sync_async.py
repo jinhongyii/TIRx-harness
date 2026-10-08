@@ -61,6 +61,9 @@ def test_tma_load_and_mbarrier_protocol(lower_source):
     assert (tma.dir, tma.mode, tma.cta_group, tma.smem_space) == ("Load", "Tile", 2, "SharedCluster")
     assert len(tma.coords) == 2 and tma.multicast is None
     assert list(tma.completion) == ["Mbarrier"] and tma.completion["Mbarrier"]["space"] == "Shared"
+    # W5-7: sites name the logical buffer (the view), never the shared.dyn pool.
+    site = lambda instr: program.site_of(program.code.index(instr)).buffer  # noqa: E731
+    assert site(tma) == "tile" and site(only(program, "MbarWait")) == "full"
     tmap_addr = next(i for i in all_of(program, "AddrOf") if i.dst == tma.tmap)
     assert program.buffers[tmap_addr.buf].space == "Param"
 
