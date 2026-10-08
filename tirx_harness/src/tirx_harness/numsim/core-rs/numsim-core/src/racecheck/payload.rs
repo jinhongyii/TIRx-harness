@@ -163,6 +163,19 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
     let mut ev = Vec::new();
     let mut race = Map::new();
     let (kind, status, message) = match &f.kind {
+        RK::SignalProtocolError { class, failure } => {
+            let (fname, dom) = failure_name(*failure);
+            race.insert("legacy_kind".into(), json!("signal_protocol_error"));
+            race.insert("access_pair".into(), json!(class_name(*class)));
+            race.insert("ordering_domain".into(), json!(dom));
+            race.insert("ordering_failure".into(), json!(fname));
+            race.insert("hint".into(), json!("Order initialization/reset and other plain accesses before or after the wait using synchronization. Raw scoped publications remain allowed; not every signal access must use wait_until."));
+            let msg = format!(
+                "declared word bytes [{}..{}) of allocation {} are accessed by wait_until and a plain operation without a happens-before relationship",
+                f.bytes.start, f.bytes.end, f.alloc.0
+            );
+            (FindingKind::Other("signal_protocol_error".into()), Status::Error, msg)
+        }
         RK::DataRace { class, failure } | RK::TmemLifetimeReview { class, failure } => {
             let review = matches!(f.kind, RK::TmemLifetimeReview { .. });
             let (fname, dom) = failure_name(*failure);

@@ -52,6 +52,8 @@ pub enum FindingKind {
     AliasStaleRead,
     /// A declared-word wait accepted a write that does not exactly cover the word (W5 delta row W5).
     SignalWriteNotRecorded,
+    /// A race on the bytes of a declared `wait_until` word where at least one side is a weak access (legacy `signal_protocol_error`).
+    SignalProtocolError,
     BarrierMismatch,
     MbarrierMisuse,
     AsyncGroupMisuse,

@@ -1114,6 +1114,22 @@ the event; it never truncates or panics. Async-slot epochs share the same
 
 ### Test-migration rulings (`test-migration.md`)
 
+**Phase 2 rulings** (see `racecheck-behaviour-deltas.md` T1–T6):
+- **tcgen05 work.** Completed work (`tcgen05.wait::ld/st`, or a commit
+  observed through its mbarrier) joins the waiter's hb and is ordered through
+  ordinary thread sync. A tcgen05 op inherits completed work from its issuer's
+  hb. The `before_thread_sync`/`after_thread_sync` pair is required only for
+  uncompleted (pipelined) work. This refines §3 rows 19–23.
+- **`st.async`/`red.async` `.release`** is a generic-proxy strong release
+  whose head holds the issuer's knowledge at issue.
+- **`SignalProtocolError`.** A race on declared-word bytes where one side is
+  weak is reported with this kind.
+- **Poll read-froms.** The read-from of a strong pure read of a declared word
+  is held back until the warp's next event. A `WaitVerdicts` for that lane and
+  word discards it; anything else applies it.
+- **Plain-write wake-ups.** A wait explained only by a plain write is
+  `WaitExitUnproven`.
+
 - **Wide or narrow writes to a declared word.** These are numbered (V3), but a
   wait that accepts one is `SignalWriteNotRecorded`, the legacy
   `signal_write_not_recorded` (delta W5). Mixed-size accesses are outside the

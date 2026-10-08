@@ -1196,3 +1196,18 @@ engine's own error/incomplete precedence and keeps the checker's verdict as
 request a `SynccheckConfig`/input flag (or a `RecordingObserver` marker from
 `warp_done`) saying which warps never ended, so the explorer reports
 `Incomplete { reason: "truncated_log" }` instead of a deadlock.
+
+## W5-8: st.async / red.async proxy and release; `SignalProtocolError`
+
+- **Proxy.** PTX §9.7.10.12 says "st.async is performed in the generic proxy",
+  and §9.7.15.7 says the same for red.async. W2 must emit their `Access`es with
+  `Proxy::Generic` (not `Async`) on `Actor::Async{op, side: Write}`, with
+  `LaneSpan.lane` = the issuing lane.
+- **Release.** The `.release.<scope>` global form (no mbarrier) is a strong
+  release at that scope. Emit it with `sem: Release` and `scope`. Racecheck
+  gives it a release head holding the issuer's knowledge at issue (deltas T2).
+- **Kind.** Please add `FindingKind::SignalProtocolError`. The rule is
+  confirmed: a race on bytes of a declared `wait_until` word where at least
+  one side is a weak (plain) access. It is reported as `status=error`, with
+  the race evidence and the bypass hint (deltas T3). Until the variant exists
+  it uses `Other("signal_protocol_error")`.

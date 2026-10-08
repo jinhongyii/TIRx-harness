@@ -1629,7 +1629,6 @@ fn g6_fp8_tmem_a_requires_published_stores() {
 /// through the fence pair (racecheck-semantics §3 rows 19-23), so both
 /// hand-offs race.
 #[test]
-#[ignore = "undocumented divergence: legacy accepts tcgen05.wait::st + fence::after_thread_sync + cta_sync as publishing TMEM stores to another warp's MMA; the new core requires before_thread_sync/after_thread_sync and reports write_read/write_write async_lifetime_not_drained (no delta row)"]
 fn g6_fp8_tmem_a_legacy_publication_is_clean() {
     for m in [64u32, 128] {
         let r = g6_fp8_tmem_a(m, G6Publish::LegacyAfterFence);
@@ -1705,7 +1704,6 @@ fn g6_async_release_does_not_publish_post_issue_work() {
 /// no edge and the read races, although racecheck-semantics §5 treats async
 /// publications as edge sources (the observed-version fallback).
 #[test]
-#[ignore = "undocumented divergence: st.async/red.async .release (global, no mbarrier) carries no release head in the new core, so a wait_until accepting it gives no edge and the pre-issue payload read races; legacy clean"]
 fn g6_async_release_publishes_pre_issue_work() {
     for (shared, reduction) in [(false, false), (true, false), (false, true)] {
         let r = g6_async_release_publication(false, shared, reduction);
@@ -2395,7 +2393,6 @@ fn g6_wait_has_its_own_hb_event() {
 /// race. The new core has no bypass kind: the plain store races the wait's
 /// strong read as an ordinary `data_race`.
 #[test]
-#[ignore = "undocumented divergence: legacy signal_protocol_error (declared-word bypass) for a plain access concurrent with a wait_until; the new core reports a data_race and has no bypass kind (no delta row)"]
 fn g6_wait_bypass_is_a_signal_protocol_error_not_a_race() {
     for ordering in ["prefix_only", "none"] {
         let r = g6_wait_event(0, false, ordering);
@@ -2449,7 +2446,6 @@ fn g6_wait_for_one_arrival_may_not_read_the_other() {
 /// `second` disappears on this schedule: exactly the run-dependent edge
 /// W1 / §5 ("earliest accepted, schedule independent") rule out.
 #[test]
-#[ignore = "undocumented divergence: the interpreter's acquiring wait_until poll Access gives a read-from edge to the latest write, overriding the earliest-accepted WaitVerdicts edge (W1); legacy reports the race"]
 fn g6_wait_for_one_arrival_with_acquiring_poll_still_races() {
     let r = g6_two_arrivals(1, true);
     assert!(races(&r).iter().any(|f| f.alloc == GMEM && f.bytes == (4..8)), "{r:?}");
@@ -2472,7 +2468,12 @@ fn g6_woken_by_plain_write() -> Report {
 #[test]
 fn g6_wait_woken_by_a_plain_write_is_an_error() {
     let r = g6_woken_by_plain_write();
-    assert!(has_class(&r, RaceClass::WriteRead), "{r:?}");
+    // The plain write races the poll on a declared word: a protocol bypass
+    // (signal_protocol_error, an error with the write_read pair).
+    assert!(
+        r.findings.iter().any(|f| matches!(f.kind, FindingKind::SignalProtocolError { class: RaceClass::WriteRead, .. })),
+        "{r:?}"
+    );
 }
 
 /// runtime/test_wait_until.py::test_a_wait_woken_by_a_plain_write_reports_the_missing_edge
@@ -2481,7 +2482,6 @@ fn g6_wait_woken_by_a_plain_write_is_an_error() {
 /// `WaitExitUnproven` incomplete. The core instead accepts the plain
 /// history entry with no edge and reports no incomplete.
 #[test]
-#[ignore = "undocumented divergence: W2 says an exit explained only by a plain write is WaitExitUnproven incomplete (legacy analysis_incomplete); checker.rs wait_verdicts treats it as a plain publication with no edge and reports no incomplete"]
 fn g6_wait_woken_by_a_plain_write_is_incomplete() {
     let r = g6_woken_by_plain_write();
     assert!(r.incomplete.iter().any(|i| matches!(i, Incomplete::WaitExitUnproven { .. })), "{r:?}");

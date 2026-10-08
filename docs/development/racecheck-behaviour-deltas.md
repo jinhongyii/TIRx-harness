@@ -130,6 +130,17 @@ that a future change is caught.
 | V9 | Events of another kernel | Merged | `KernelMismatch` (incomplete) | contract |
 | V10 | Repeated incompletes (R2) | One entry each | One entry with an occurrence count | — |
 
+## Test-migration phase 2 rulings
+
+| ID | Change | Legacy | New (before → after this change) | Basis |
+| --- | --- | --- | --- | --- |
+| T1 | tcgen05 work across a plain thread sync (`cta_sync`, mbarrier, flag) | Waited `tcgen05.st` + `fence::after_thread_sync` + `cta_sync` publishes the stores to another warp's MMA (clean) | Before: only the fence pair (`before_thread_sync` … `after_thread_sync`) carried any tcgen05 work, so this was a race. After: **completed** work (waited by `tcgen05.wait::ld/st`, or committed and observed through the mbarrier) is ordered like any memory effect the thread observed, through ordinary hb. A tcgen05 op is issued with the completed tcgen05 work in its issuer's hb. The fence pair is required only for **uncompleted** (pipelined, unwaited) work. So the legacy kernel is clean; unwaited stores still race. | §9.7.18 (tcgen05.wait: "all prior tcgen05.st … have completed"); completion observed in program order before the sync |
+| T2 | `st.async` / `red.async` `.release` (global, no mbarrier) | Publication: orders the issuer's pre-issue writes | Before: no release head, so a race. After: a strong release at `.scope` carrying the issuer's knowledge at issue. A waiter that reads from it (or `wait_until`s it) synchronises; post-issue work is not published. These accesses are in the **generic** proxy (CONTRACT_REQUESTS W5-8). | §9.7.10.12, §9.7.15.7 ("strong memory operation with .release semantics at the scope"; "performed in the generic proxy") |
+| T3 | A plain access racing on a declared `wait_until` word | `signal_protocol_error` (declared-word bypass), not `data_race` | Restored as a distinct kind, `SignalProtocolError` (error, same evidence and hint). Rule: a race on declared-word bytes where at least one side is weak. | protocol rule (legacy G:137-176) |
+| T4 | Acquiring `wait_until` poll | Edge from the earliest accepted write | Before: the poll `Access` gave a read-from edge to the latest write, overriding W1. After: the read-from of a strong pure read on a declared word is held back. A `WaitVerdicts` for that lane and word replaces it; any other event of the warp applies it as an ordinary read-from (raw polls keep their edge). | W1, §8.9.4 |
+| T5 | `wait_until` exit explained only by a plain (weak) write | `analysis_incomplete` | `WaitExitUnproven` (incomplete; payload reason `wait_exit_unproven`), together with the `SignalProtocolError` for the plain write. Before: no edge and no incomplete. | W2 |
+| T6 | Finding kind names | `oob` (execution_error), `data_race`, `signal_protocol_error`, `scope_mismatch`, `tmem_lifetime_review`, `alias_stale_read` | Contract `FindingKind`s serialize as `out_of_bounds`, `data_race` / `proxy_race` / `async_race`, `signal_protocol_error`, `scope_mismatch`, `tmem_lifetime_review`, `alias_stale_read`. The racecheck payload keeps the legacy `kind` strings for races (`data_race`, `tmem_lifetime_review`, `signal_protocol_error`, `scope_mismatch`, `alias_stale_read`). `divergence`, `bad_address` and `named_barrier_contract_mismatch` are runtime and synccheck kinds, not racecheck, and belong in those delta lists. | — |
+
 ## Known gaps (not deltas yet)
 
 - **CTA-parallel inbox-drain merge.** The scheduler is single-threaded today,

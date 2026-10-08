@@ -68,6 +68,9 @@ pub struct WitnessInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FindingKind {
     DataRace { class: RaceClass, failure: OrderingFailure },
+    /// A plain (weak) access racing on a declared `wait_until` word: it
+    /// bypasses the signalling protocol (legacy `signal_protocol_error`).
+    SignalProtocolError { class: RaceClass, failure: OrderingFailure },
     /// Same evidence as a data race whose prior is an unwaited tcgen05.ld.
     TmemLifetimeReview { class: RaceClass, failure: OrderingFailure },
     /// A release/acquire pair whose scopes do not mutually cover.
@@ -433,6 +436,16 @@ struct Phase {
     completion: Knowledge,
 }
 
+struct PollStash {
+    lane: u8,
+    alloc: AllocId,
+    range: Range<u64>,
+    heads: Vec<Heads>,
+    order: MemOrder,
+    scope: Scope,
+    site: SiteId,
+}
+
 struct HistEntry {
     rel: Option<Heads>,
     is_async: bool,
@@ -478,6 +491,9 @@ pub struct Checker {
     /// Latest `fence.sc` per `(warp, lane, scope)`.
     sc: HashMap<(WarpId, u8, Scope), Arc<Knowledge>>,
     words: HashMap<AllocId, Vec<Word>>,
+    /// Read-froms of possible `wait_until` polls, per warp, held back until
+    /// the warp's next event.
+    poll_stash: HashMap<WarpId, Vec<PollStash>>,
     advisory_dedup: HashMap<(AdvisoryKind, AllocId, SiteId), usize>,
     /// Logical buffer name per site (`SiteInfo::buffer`), for
     /// `AliasStaleRead`. Empty = advisory off.
@@ -534,6 +550,7 @@ impl Checker {
             scope_dedup: HashMap::new(),
             sc: HashMap::new(),
             words: HashMap::new(),
+            poll_stash: HashMap::new(),
             advisory_dedup: HashMap::new(),
             site_buffer: HashMap::new(),
             wide: WideSpans::default(),
@@ -590,6 +607,10 @@ impl Checker {
 
     /// Finalise: outstanding async work is incomplete.
     pub fn finalize(&mut self) {
+        let warps: Vec<WarpId> = self.poll_stash.keys().copied().collect();
+        for w in warps {
+            self.flush_polls(w);
+        }
         let never: Vec<AsyncId> = self
             .asyncs
             .iter()
@@ -858,8 +879,16 @@ impl Checker {
             f.occurrences += 1;
             return;
         }
+        // A plain access racing on a declared word bypasses the wait_until
+        // protocol: legacy `signal_protocol_error`.
+        let on_word = self
+            .words
+            .get(&alloc)
+            .is_some_and(|ws| ws.iter().any(|w| w.range.start < bytes.end && bytes.start < w.range.end));
         let kind = if review {
             FindingKind::TmemLifetimeReview { class, failure }
+        } else if on_word && (prior.scope().is_none() || cw.scope().is_none()) {
+            FindingKind::SignalProtocolError { class, failure }
         } else {
             FindingKind::DataRace { class, failure }
         };
@@ -879,7 +908,22 @@ impl Checker {
 
     // --------------------------------------------------------- access --
 
+    /// Apply the held-back poll read-froms of `warp` (no WaitVerdicts came).
+    fn flush_polls(&mut self, warp: WarpId) {
+        if self.poll_stash.is_empty() {
+            return;
+        }
+        if let Some(v) = self.poll_stash.remove(&warp) {
+            for p in v {
+                self.apply_read_from(warp as usize, p.lane, AccessKind::Read, false, p.order, Some(p.scope), p.site, p.heads);
+            }
+        }
+    }
+
     pub fn access(&mut self, a: &Access) {
+        if let Who::Lane { warp, .. } = a.who {
+            self.flush_polls(warp);
+        }
         self.stats.accesses += 1;
         self.maybe_gc();
         let Some(size) = self.allocs.get(&a.alloc).map(|x| x.size) else {
@@ -983,6 +1027,13 @@ impl Checker {
                     Some(Arc::new(Rel { k, scope: None, warp: wi as u32, site: a.site }))
                 }
             }
+            // st.async / red.async `.release` (PTX §9.7.10.12, §9.7.15.7: a
+            // strong release at `.scope`, performed in the generic proxy):
+            // releases what the issuing thread knew at issue.
+            (Cur::Async { a: i }, true) if strong && matches!(a.order, MemOrder::Release | MemOrder::AcqRel) => {
+                let act = &self.asyncs[i];
+                Some(Arc::new(Rel { k: act.k.propagating(), scope: a.scope, warp: act.warp, site: act.site }))
+            }
             _ => None,
         };
 
@@ -1062,7 +1113,10 @@ impl Checker {
                     .find(|e| !(e.w.stamp == w.stamp && e.w.lane() != w.lane()))
                     .filter(|e| this.morally_strong(&e.w, &w));
                 let inherited = prev.and_then(|e| effective_heads(&cell.writes, e));
-                // 2. read-from (strong reads and atomics)
+                // 2. read-from (strong reads and atomics). A pure read of a
+                // declared word is a `wait_until` poll: its edge comes only
+                // from the WaitVerdicts earliest accepted write (W1), never
+                // from the run's latest write.
                 if strong && (!writes || a.kind == AccessKind::Rmw) {
                     if let Some(h) = &inherited {
                         if !acquired.iter().any(|r| Arc::ptr_eq(r, h)) {
@@ -1122,16 +1176,42 @@ impl Checker {
             }
         }
         if let Cur::Lane { w: wi, lane, .. } = cur {
+            // A pure strong read of a declared word may be a `wait_until`
+            // poll. Its read-from edge (the run's latest write) is held back:
+            // a following WaitVerdicts for this lane and word replaces it
+            // with the earliest-accepted edge (W1); any other event of the
+            // warp applies it as an ordinary read-from.
+            if in_word && !writes && !acquired.is_empty() {
+                let order = a.order;
+                let scope = a.scope.unwrap();
+                self.poll_stash.entry(wi as u32).or_default().push(PollStash {
+                    lane,
+                    alloc: a.alloc,
+                    range: a.range.clone(),
+                    heads: acquired,
+                    order,
+                    scope,
+                    site: a.site,
+                });
+                return;
+            }
+            self.apply_read_from(wi, lane, a.kind, a.returns_value, a.order, a.scope, a.site, acquired);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_read_from(&mut self, wi: usize, lane: u8, kind: AccessKind, returns_value: bool, order: MemOrder, scope: Option<Scope>, site: SiteId, acquired: Vec<Heads>) {
+        {
             // `red` never forms an acquire pattern (PTX §8.8).
-            let can_acquire = a.kind != AccessKind::Rmw || a.returns_value;
+            let can_acquire = kind != AccessKind::Rmw || returns_value;
             for heads in acquired {
                 for rel in heads.iter() {
                     if !can_acquire {
                         continue; // `red` observes nothing, tcgen included
                     }
                     self.warps[wi].tcgen_in[lane as usize].join(&rel.k.tcgen_rel, &self.memo);
-                    match a.order {
-                        MemOrder::Acquire | MemOrder::AcqRel => self.acquire_rel(wi as u32, one_lane(lane), a.scope.unwrap(), rel, a.site),
+                    match order {
+                        MemOrder::Acquire | MemOrder::AcqRel => self.acquire_rel(wi as u32, one_lane(lane), scope.unwrap(), rel, site),
                         MemOrder::Relaxed | MemOrder::Release => self.warps[wi].push_pending(lane, rel.clone()),
                         MemOrder::Weak => {}
                     }
@@ -1211,6 +1291,21 @@ impl Checker {
 
     pub fn sync(&mut self, s: SyncEvent) {
         self.maybe_gc();
+        match &s {
+            // The verdicts replace the polls of these lanes on this word.
+            SyncEvent::WaitVerdicts { warp, lanes, alloc, range, .. } => {
+                if let Some(v) = self.poll_stash.get_mut(warp) {
+                    v.retain(|p| !(lanes.has(p.lane) && p.alloc == *alloc && p.range.start < range.end && range.start < p.range.end));
+                }
+                self.flush_polls(*warp);
+            }
+            SyncEvent::WarpSync { warp, .. }
+            | SyncEvent::Arrive { warp, .. }
+            | SyncEvent::Wait { warp, .. }
+            | SyncEvent::Fence { warp, .. }
+            | SyncEvent::AsyncIssue { warp, .. } => self.flush_polls(*warp),
+            _ => {}
+        }
         match s {
             SyncEvent::AllocBegin { alloc, size, space, cta } => {
                 self.allocs.insert(alloc, Alloc {
@@ -1315,13 +1410,19 @@ impl Checker {
                         let w = &mut self.warps[warp as usize];
                         match kind {
                             AsyncKind::TcgenLd | AsyncKind::TcgenSt | AsyncKind::TcgenPipelined => {
-                                // tcgen05.wait::{ld,st}: orders the waiting
-                                // thread's own later tcgen05 work; others
-                                // need the fence pair.
+                                // tcgen05.wait::{ld,st}: the work has
+                                // completed for the waiting thread. Completed
+                                // work is ordered like any memory effect the
+                                // thread observed: it travels through ordinary
+                                // thread sync (hb). Only uncompleted
+                                // (pipelined) work needs the fence pair.
                                 for l in lanes.lanes8() {
                                     w.tcgen[l as usize].raise(actor, gen_base + 2);
                                     w.tcgen_waited[l as usize].raise(actor, gen_base + 2);
                                 }
+                                let mut done = Knowledge::default();
+                                done.hb.raise(actor, gen_base + 2);
+                                w.acquire(lanes, &done, memo);
                             }
                             _ => w.acquire(lanes, &c, memo),
                         }
@@ -1520,6 +1621,13 @@ impl Checker {
         let mut g2t_ranges: Arc<Vec<(AllocId, Range<u64>, Clock)>> = Arc::new(Vec::new());
         for (n, c) in lanes.lanes8().enumerate() {
             k.tcgen.join(&w.tcgen[c as usize], &self.memo);
+            if matches!(kind, AsyncKind::TcgenPipelined | AsyncKind::TcgenLd | AsyncKind::TcgenSt) {
+                // Completed tcgen05 work the issuer knows through hb (waited
+                // ld/st, committed and observed MMA) is ordered before this
+                // op without the fence pair.
+                let hb = k.hb.clone();
+                k.tcgen.join(&hb, &self.memo);
+            }
             if n == 0 {
                 g2t_ranges = w.g2t_ranges[c as usize].clone(); // shared, not copied
             } else if !w.g2t_ranges[c as usize].is_empty() {
@@ -1837,8 +1945,17 @@ impl Checker {
             }
         }
         let word = &self.words[&alloc][wi];
-        let Some(heads) = word.history.get(idx as usize - 1).and_then(|e| e.rel.clone()) else {
-            return; // plain publication: no edge, later reads race
+        let Some(e) = word.history.get(idx as usize - 1) else {
+            self.note_incomplete(Incomplete::WaitExitUnproven { warp });
+            return;
+        };
+        let Some(heads) = e.rel.clone() else {
+            if !e.consumed {
+                // Explained only by a plain write: no edge can be proven
+                // (delta W2). The plain write itself still races the poll.
+                self.note_incomplete(Incomplete::WaitExitUnproven { warp });
+            }
+            return;
         };
         for rel in heads.iter() {
             self.acquire_rel(warp, lanes, scope, rel, site);
