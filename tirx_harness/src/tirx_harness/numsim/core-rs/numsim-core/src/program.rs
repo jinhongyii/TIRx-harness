@@ -899,6 +899,10 @@ pub struct TcgenMmaArgs {
     /// `_lut_b` forms (`tcgen05_mma*_lut_b_*`): B through a lookup table.
     /// Orthogonal to `kind` (block-scaled `lut_b` forms exist).
     pub lut_b: bool,
+    /// LUT table address for `lut_b` forms (shared-memory address value);
+    /// must be `Some` iff `lut_b` (checked by `validate`).
+    #[serde(deserialize_with = "required")]
+    pub lut_b_addr: Option<Operand>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2260,6 +2264,11 @@ impl Program {
         }
         // ---- per-instruction references ----
         for (pc, ins) in self.code.iter().enumerate() {
+            if let Instr::TcgenMma(a) = ins {
+                if a.lut_b != a.lut_b_addr.is_some() {
+                    return Err(at(pc, "TcgenMma: lut_b_addr must be set iff lut_b".into()));
+                }
+            }
             let s = self.code_sites[pc];
             if !s.is_none() && s.0 as usize >= self.sites.len() {
                 return Err(at(pc, format!("site {s} out of range")));
@@ -2898,6 +2907,7 @@ impl Instr {
                 opt(&a.scale_input_d, f);
                 opt(&a.sparse_meta, f);
                 a.disable_output_lane.iter().for_each(|o| f(Use(*o)));
+                opt(&a.lut_b_addr, f);
             }
             Tile(t) => {
                 for arg in &t.args {

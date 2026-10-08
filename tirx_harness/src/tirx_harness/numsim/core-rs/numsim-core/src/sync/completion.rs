@@ -101,6 +101,10 @@ pub enum AsyncKind {
     StAsync,
     TcgenMma,
     TcgenCp,
+    /// `tcgen05.commit`: `Payload::None`, `after` = the tracked mma/cp ops,
+    /// `signals` = the deferred mbarrier arrive(s). Observers see it as
+    /// `observe::AsyncClass::TcgenCommit`.
+    TcgenCommit,
     ClcResponse,
 }
 

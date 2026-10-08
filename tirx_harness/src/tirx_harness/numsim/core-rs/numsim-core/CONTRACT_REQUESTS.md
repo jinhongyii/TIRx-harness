@@ -518,6 +518,14 @@ All of these are JSON-visible. `FORMAT_VERSION` is now **2**.
     Anything else fails closed. `AddrOf` / `LoadAddr` / `StoreAddr` on TMEM
     are not allowed.
 
+18. **`TcgenMmaArgs.lut_b_addr: Option<Operand>`** (W2-7). This is the LUT
+    table address for `lut_b` forms. It must be non-null exactly when
+    `lut_b` is true; `validate` enforces this.
+19. **`sync::AsyncKind::TcgenCommit`** (W2-4). This is engine-internal and
+    not in the JSON. A `tcgen05.commit` is an `AsyncOp` with
+    `Payload::None`, `after` = the tracked ops, and `signals` = the deferred
+    arrive(s). It matches `observe::AsyncClass::TcgenCommit`.
+
 **C.3 acks.**
 - **Accepted:** 1 (`numsim.pack`/`unpack`, W4), 2 (`<name>.value`, W4),
   5, 6, 7, 8, 9 and 10.
@@ -743,3 +751,45 @@ Racecheck follows decision 14: one entry per (Access, lane), for every
 overlapping declared word, lanes ascending (`checker-review.md` S4). Please
 reconcile the `observe.rs` comment, and make the engine's history match,
 before W2 emits `WaitVerdicts`.
+
+## W1: half chains lowered in f32 — done (2026-10-08)
+
+Ruling D1 is implemented in `numsim/v2/lowering/ir_walk.py` (`is_half_chain` /
+`wide` / `half_chain`). An f16/bf16 TIR expression tree (`Add Sub Mul Div Min
+Max`, `Select`, the `UNARY_OPS` math calls, `tirx.fma`) computes in
+`Ty{F32, lanes}` registers. Leaves are widened with one `Cast` each; half
+`FloatImm`s become f32 constants of the half-rounded value. Exactly one `Cast`
+to the half type is emitted where the value leaves the chain: a store, an
+explicit `Cast`, a call operand, a `Bind`, or any other non-chain consumer.
+Test: `tests/numsim/v2/test_lowering_vector_add.py::test_half_chain_stays_f32_until_the_store`.
+W4 can drop the bit-16 hack.
+
+## W1 (2026-10-08): phase 3 status and asks
+
+- **W2-2 (rank-tagged shared addresses).** The emitter builds no
+  shared-address constants and never assumes `cvta(...)` is below the window
+  size.
+  - Shared addresses come from `Cvta` / `Mapa` instructions or from the
+    kernel's own integer arithmetic on them.
+  - `BufferDecl.base` stays a window offset (buffer metadata).
+  - The only literal shared operand is `TmaArgs.smem = 0` for
+    `dir: Prefetch`, which has no shared side.
+- **TMEM.** The emitter follows the `BufferDecl` ruling:
+  - `shape = [lane_span, col_span]` of the view's physical rectangle;
+  - `base` = the static `allocated_addr`;
+  - offset = `lane * col_span + col`;
+  - 32-bit elements only;
+  - replicated layouts fail closed on direct access.
+
+  Remaining gap: 12 test kernels have a runtime `allocated_addr` (read from
+  shared memory) and cannot be represented, because `BufferDecl.base` is
+  static. Request: `BufferDecl.base_reg`, or a `Tmem` buffer whose base is a
+  register.
+- **Still unrepresentable (unit tests only):**
+  - `kind::ti16` MMA (25 kernels): `TcMmaKind` has no `Ti16`, and the `ti16`
+    flag alone cannot state the kind the PTX names.
+  - `lut_b` MMA (10): no field for the `b_decompress_metadata` TMEM operand.
+  - `cp.async.bulk(.tensor)` `ignore_bytes_left/right` counts (5) and the
+    `override_global_dim_stride_*` lower/upper stride operands (15).
+  - `tcgen05.ld` `.spcompress` / `.abs` / `.NaN` (5).
+  - `%nwarpid` (2): there is no `SpecialReg`.
