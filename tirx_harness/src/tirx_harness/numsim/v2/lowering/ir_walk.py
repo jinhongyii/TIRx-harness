@@ -116,13 +116,26 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
     def site(self, node: Any, op_name: str | None = None, buffer: int | None = None) -> int:
         spans = _spans(getattr(node, "span", None))
         key = (handle(node), op_name, buffer) if hasattr(node, "__chandle__") else None
-        # W5-7: the LOGICAL buffer the source names (a view, never the shared.dyn pool).
-        buffer_name = self.builder.program.buffers[buffer].name if buffer is not None else _logical_buffer(node)
+        # W5-7 / W9: the LOGICAL buffer identity (root of the view_of chain, stopping
+        # at the shared.dyn pool, which is storage, not a buffer); the view's own
+        # name goes to ``text`` when it differs.
+        if buffer is None:
+            buffer = _logical_buffer(node, self)
+        root, view = self.logical_identity(buffer) if isinstance(buffer, int) else (buffer, None)
         return self.builder.site(
             pb.SiteInfo(kind=type_key(node), spans=spans, op_name=op_name or "",
-                        dtype=dtype_of(node) or None, buffer=buffer_name),
+                        text=f"view {view}" if view and view != root else "",
+                        dtype=dtype_of(node) or None, buffer=root),
             key=key,
         )
+
+    def logical_identity(self, buf: int) -> tuple[str, str]:
+        """(root logical name, own name) of ``Program.buffers[buf]``."""
+        buffers = self.builder.program.buffers
+        own = buffers[buf].name
+        while buffers[buf].view_of is not None and buffers[buf].view_of not in self.dyn_pools:
+            buf = buffers[buf].view_of
+        return buffers[buf].name, own
 
     def ty(self, dtype: str | pb.Ty, node: Any = None) -> pb.Ty:
         if isinstance(dtype, pb.Ty):
@@ -731,16 +744,25 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
 # ---------------------------------------------------------------------------
 
 
-def _logical_buffer(node: Any) -> str | None:
-    """Name of the TIR buffer an access or call addresses first (argument order)."""
+def _logical_buffer(node: Any, lowerer: "Lowerer") -> int | str | None:
+    """The buffer an access or call addresses first (argument order).
+
+    Returns the ``Program.buffers`` index when the TIR buffer has one, else its name.
+    """
+
+    def resolve(var: Any) -> int | str:
+        ref = lowerer.refs.get(handle(var))
+        buf = getattr(ref, "buf", None)
+        return buf if buf is not None else str(var.name)
+
     kind = type_key(node)
     if kind == "ir.TensorLoad":
-        return str(node.source.name)
+        return resolve(node.source)
     if kind == "tirx.BufferStore":
-        return str(node.buffer.name)
+        return resolve(node.buffer)
     if kind != "ir.Call":
         return None
-    found: list[str] = []
+    found: list[Any] = []
 
     def on_call(sub: Any, visitor: Any) -> None:
         if found:
@@ -749,9 +771,9 @@ def _logical_buffer(node: Any) -> str | None:
         if name in ("tirx.address_of", "tirx.buffer_data") and sub.args:
             target = sub.args[0]
             if type_key(target) == "ir.TensorLoad":
-                found.append(str(target.source.name))
+                found.append(resolve(target.source))
             elif type_key(target) == "ir.Var":
-                found.append(str(target.name))
+                found.append(resolve(target))
             return
         visitor.default_visit(sub)
 
