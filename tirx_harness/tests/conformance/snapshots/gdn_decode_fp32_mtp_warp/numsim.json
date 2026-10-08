@@ -2,48 +2,7 @@
  "case": "gdn_decode_fp32_mtp_warp",
  "diagnostics": [
   {
-   "anchors": [
-    "<TensorLoad> buffer[0]"
-   ],
-   "bytes": {
-    "register": "0-4"
-   },
-   "category": "diagnostics",
-   "kind": "uninitialized_read",
-   "space": "register",
-   "status": "review"
-  },
-  {
-   "anchors": [
-    "<TensorLoad> buffer[1]"
-   ],
-   "bytes": {
-    "register": "4-8"
-   },
-   "category": "diagnostics",
-   "kind": "uninitialized_read",
-   "space": "register",
-   "status": "review"
-  },
-  {
-   "anchors": [
-    "<TensorLoad> buffer[2]"
-   ],
-   "bytes": {
-    "register": "8-12"
-   },
-   "category": "diagnostics",
-   "kind": "uninitialized_read",
-   "space": "register",
-   "status": "review"
-  },
-  {
-   "anchors": [
-    "<TensorLoad> buffer[3]"
-   ],
-   "bytes": {
-    "register": "12-16"
-   },
+   "anchors": [],
    "category": "diagnostics",
    "kind": "uninitialized_read",
    "space": "register",
@@ -68,6 +27,6 @@
   }
  },
  "reference_ok": true,
- "schema": 2,
+ "schema": 3,
  "verdict": "review"
 }

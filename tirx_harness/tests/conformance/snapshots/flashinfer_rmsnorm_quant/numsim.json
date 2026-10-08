@@ -2,24 +2,7 @@
  "case": "flashinfer_rmsnorm_quant",
  "diagnostics": [
   {
-   "anchors": [
-    "<TensorLoad> buffer"
-   ],
-   "bytes": {
-    "register": "0-128"
-   },
-   "category": "diagnostics",
-   "kind": "uninitialized_read",
-   "space": "register",
-   "status": "review"
-  },
-  {
-   "anchors": [
-    "tirx_kernels/ported/flashinfer/norm/rmsnorm_quant.py:195:1-195:67"
-   ],
-   "bytes": {
-    "register": "18-20,28-30,38-40,48-50,58-60,68-70,78-80,88-90,98-100,108-110,118-120,128-130,138-140,148-150,158-160,178-180,188-190,198-200,208-210,218-220,228-230,238-240,248-250,258-260,268-270,278-280,288-290,298-300,308-310,318-320"
-   },
+   "anchors": [],
    "category": "diagnostics",
    "kind": "uninitialized_read",
    "space": "register",
@@ -37,6 +20,6 @@
   }
  },
  "reference_ok": true,
- "schema": 2,
+ "schema": 3,
  "verdict": "review"
 }

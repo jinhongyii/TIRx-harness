@@ -35,6 +35,17 @@ grouping (`snapshot._SPACE_ALIASES`); payloads keep `reg`. The byte offsets
 inside the region are still each engine's own layout, so a differing
 footprint there is a layout question, not a missing finding (V2C-20).
 
+## Projection rule: register-space uninitialized reads (schema 3)
+
+Ruling on V2C-20: register-space footprints are not externally meaningful.
+Legacy's per-thread byte numbering was an implementation detail, and the site
+legacy names is often a `<TensorLoad> buffer` pseudo-anchor. An
+`uninitialized_read` in space `register` is therefore projected to its
+(category, kind, status, space) only: no byte offsets and no anchors. A
+difference in whether such reads exist still fails. Legacy payloads carry no
+buffer name, so a per-buffer count cannot be compared. This is a projection
+rule, not a behaviour delta.
+
 ## Delta snapshots
 
 When a behaviour-delta row rules that legacy was wrong, the corrected oracle
@@ -101,6 +112,9 @@ working tree; tirx-kernels 0.1.2.post1; `-n 32 --dist=worksteal`.
 - Cold run (empty `$NUMSIM_CACHE_DIR`, one process per case/mode, 32 at once):
   407 s. Warm `--update-snapshots`: 120 to 174 s. Warm verification:
   158 to 196 s.
+- Schema 3 regeneration (2026-10-08, register-space projection rule):
+  175 s generate, 177 s verify (304 passed); the T12 delta file was bumped to
+  schema 3 by hand (no register content).
 - Schema 2 regeneration (2026-10-08, allocation ids dropped for window
   spaces): 184 s generate, 179-185 s verify. One verify run at load average
   51 had a single failure that did not reproduce in three later runs (two at

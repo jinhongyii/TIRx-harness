@@ -2,12 +2,7 @@
  "case": "selective_state_update_mtp_vertical",
  "diagnostics": [
   {
-   "anchors": [
-    "<TensorLoad> buffer[v, v_1]"
-   ],
-   "bytes": {
-    "register": "0-2048"
-   },
+   "anchors": [],
    "category": "diagnostics",
    "kind": "uninitialized_read",
    "space": "register",
@@ -32,6 +27,6 @@
   }
  },
  "reference_ok": true,
- "schema": 2,
+ "schema": 3,
  "verdict": "review"
 }

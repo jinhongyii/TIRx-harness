@@ -5,12 +5,7 @@
   {
    "diagnostics": [
     {
-     "anchors": [
-      "<TensorLoad> buffer[v, v_1]"
-     ],
-     "bytes": {
-      "register": "0-2048"
-     },
+     "anchors": [],
      "category": "advisories",
      "kind": "uninitialized_read",
      "space": "register",
@@ -20,5 +15,5 @@
    "verdict": "review"
   }
  ],
- "schema": 2
+ "schema": 3
 }

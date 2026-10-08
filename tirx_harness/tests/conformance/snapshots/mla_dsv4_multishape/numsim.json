@@ -2,5 +2,5 @@
  "case": "mla_dsv4_multishape",
  "error": "UnsupportedTIRxError",
  "mode": "numsim",
- "schema": 2
+ "schema": 3
 }

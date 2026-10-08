@@ -38,7 +38,7 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = 2  # 2: no allocation id for per-CTA window spaces
+SCHEMA_VERSION = 3  # 2: no allocation id for window spaces; 3: register reads projected to presence
 MODES = ("numsim", "racecheck", "synccheck")
 SNAPSHOT_ROOT = Path(__file__).resolve().parent / "snapshots"
 IMPL_ENV = "NUMSIM_IMPL"
@@ -305,8 +305,16 @@ def normalize_records(
             if isinstance(value, (str, int, bool)) and not isinstance(value, float):
                 key_fields[field] = value
         key_fields["anchors"] = sorted(collect_anchors(record, resolver))
+        register_read = key_fields["kind"] == "uninitialized_read" and key_fields.get("space") == "register"
+        if register_read:
+            # Projection rule (README, coordinator ruling on V2C-20): register
+            # byte numbering and the reading site are engine details; compare
+            # only that such reads exist, per (category, kind, status).
+            key_fields["anchors"] = []
         key = json.dumps(key_fields, sort_keys=True)
         group = groups.setdefault(key, {**key_fields, "_bytes": {}})
+        if register_read:
+            continue
         columns = record.get("tmem_columns")
         # numsim-core states TMEM footprints as exact column ranges
         # (`tmem_columns = [[lo, hi], ...]` in 4-byte columns; an older single

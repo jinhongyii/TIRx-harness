@@ -2,5 +2,5 @@
  "case": "kda_forward_portfolio_multishape",
  "error": "NumSimExecutionError",
  "mode": "racecheck",
- "schema": 2
+ "schema": 3
 }
