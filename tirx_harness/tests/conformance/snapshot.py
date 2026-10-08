@@ -154,8 +154,20 @@ class SourceResolver:
 
     def __init__(self, module: Any):
         self._sites: dict[tuple[int, int], str] = {}
+        self._v2: set[int] = set()
         spec = getattr(module, "spec", None)
         for kernel_index, kernel in enumerate(getattr(spec, "kernels", ()) or ()):
+            sites = getattr(kernel, "sites", None)
+            if sites and not getattr(kernel, "source_map", ()):
+                # v2: `source_op_id` is a SiteId; its anchor is the site's source
+                # span (the same anchor the record's `source_span` gives). A
+                # site without a span adds no anchor: its text is additive.
+                for site in range(len(sites)):
+                    anchor = format_span(kernel.source_span(site))
+                    if anchor is not None:
+                        self._sites[(kernel_index, site)] = anchor
+                self._v2.add(kernel_index)
+                continue
             for entry in getattr(kernel, "source_map", ()) or ():
                 span = getattr(entry, "span", None)
                 anchor = format_span(span.to_dict()) if span is not None else None
@@ -170,6 +182,8 @@ class SourceResolver:
             return None
         if not isinstance(source_op_id, int) or isinstance(source_op_id, bool):
             return None
+        if kernel_index in self._v2:
+            return self._sites.get((kernel_index, source_op_id))
         return self._sites.get((kernel_index, source_op_id), f"<unmapped op {source_op_id}>")
 
 
