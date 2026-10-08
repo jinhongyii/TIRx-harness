@@ -1088,3 +1088,110 @@ fact.
 - **Q10. Where `may_block` and the "progress" classification live** (needed
   for spin-parking in `LoopEnd`). Is it a property of the contract Instr enum,
   or a table in OpLib?
+
+---
+
+## Part C: Phase 2 status (2026-10-08)
+
+The lowering now emits the committed `numsim_core::program` contract
+(`FORMAT_VERSION` 2, strict serde). Acceptance check:
+`Module::from_json` + `Program::validate()` + postcard round trip, run by
+`scripts/numsim-v2/validate.sh` through `core-rs/tools/validate-program`.
+
+### C.1 Result
+
+| population | kernels | lower with no `Unsupported` | Rust decode + validate |
+| --- | --- | --- | --- |
+| corpus (canonical + wiki + corpus tests) | 195 | **195** | **195 OK** |
+| full captured suite (`strict=False`) | 2343 | 1804 | 2341 OK; the other 2 load only with test-only node types |
+
+`tests/numsim/v2/test_lowering_corpus.py` (marker `slow`) re-lowers every
+`CANONICAL_KERNEL_CASES` and `WIKI_RACECHECK_SPECS` kernel strictly and
+validates each module in Rust: 131 cases.
+
+### C.2 Modules
+
+All modules live in `numsim/v2/lowering/`; each is under 900 lines.
+
+| module | role |
+| --- | --- |
+| `program_builder.py` | contract mirror: `Instr(variant, **fields)` checked against a per-variant `SCHEMA`; the tables; `Module` JSON |
+| `ir_walk.py` | statements, expressions, topology, control flow, `thread_extent`, tile dispatch |
+| `memory.py` | register promotion and escape analysis; shared pool and views; layouts and swizzles; lvalues |
+| `host_prelude.py` | parameters, implicit shape variables, host TensorMap prelude, `DimExpr` |
+| `calls.py` | CUDA helpers, pointer plumbing, `wait_until` predicate programs |
+| `ptx_lower.py` | `tirx.ptx.*` table ops mapped to dedicated variants; pure tail to `Ptx` |
+| `ptx_decode.py` | pure-Python decoder for the TVM PTX table |
+| `builtins.py` | helper operand roles |
+| `dtypes.py` | dtype helpers |
+
+### C.3 Conventions the contract does not spell out
+
+These need a coordinator ack.
+
+1. **Pack and unpack ops for vector lanes.**
+   - `Ptx` ops `numsim.pack` / `numsim.unpack` with mods `ty=<Elem>x<N>` split a
+     vector register into lanes and back. They are used for `ld.v*`/`st.v*`,
+     vector atomics and `prim.Broadcast`/`Shuffle`.
+   - W4 must implement both.
+2. **Value-form `Ptx` op for converters that work through pointers.**
+   - `cuda.float22half2`, `float8tohalf8` and `half8tofloat8` lower to
+     `LoadAddr` + `Ptx <name>.value` + `StoreAddr`.
+   - W4 implements `<name>.value` as the pure conversion.
+3. **`ParamSlot` for implicit shape variables.**
+   - These become `Scalar` slots named `<buffer>.shape<axis>`, with
+     `local_name` set to the TVM variable.
+   - The slot is referenced as `Param` in the buffer slot's `shape`.
+   - The binder (W8) must take its value from the bound array, because
+     `ParamKind` has no shape-variable kind.
+4. **`TensorMapSpec` has no `force_cu_dtype`.**
+   - `11` (TFLOAT32) maps to `dtype: TF32`.
+   - `13` (16U4_ALIGN8B) maps to dense `E2M1`.
+   - `14` (padded) fails closed.
+   - This affects 7 corpus kernels that use `13`.
+5. **`redux.sync.f32 .NaN` (2 corpus kernels).**
+   - Composed as `Redux` + `Unary IsNan` + `Vote Any` + `Select(canonical NaN)`.
+   - `.abs` is lowered as `Unary Abs` before the `Redux`.
+6. **Warp-specialized MMA (`tcgen05.mma.ws`).**
+   - `zero_col_mask` is carried as the single `disable_output_lane` operand.
+   - `collector::bN` is carried in `ws_b_buffer`.
+7. **`tirx.cuda.func_call`.**
+   - TVM's own `tvm_builtin_pointer_offset` is lowered as pointer arithmetic.
+   - Reviewed pure helpers become `Ptx` ops `tirx.cuda.func_call.<name>`, with
+     mods `source_sha256=<16 hex>` (whitespace-normalized source).
+   - Effectful helpers fail closed: the gdn/flashkda tensormap acquire,
+     release and replace helpers (unit tests only).
+8. **`OpKey.mods`** is always `slot=token`.
+   - PTX table ops use their table slot names.
+   - CUDA helpers use `argN=<string literal>`.
+9. **Tile ops (decision 6).**
+   - `tirx.transform.TilePrimitiveDispatch` runs under
+     `Target({"kind": "cuda", "arch": <tirx.cuda_arch>})` only when the
+     function contains `TilePrimitiveCall`.
+   - Its output uses `launch_thread` (`thread_extent`), which the walker now
+     supports.
+   - When dispatch fails, the tile op is left in place and fails closed.
+10. **Topology defaults** follow legacy `topology.rs`.
+    - No CTA-level extent gives one warp.
+    - Warpgroup ids only give one warpgroup.
+    - The grid defaults to one cluster.
+
+### C.4 Residuals in the full suite (`strict=False`)
+
+All residuals are in unit and integration kernels; the corpus has none.
+Ranked by kernel count:
+
+| count | residual | owner / action |
+| --- | --- | --- |
+| 220 (+121 / 109 follow-on loads and stores) | TMEM `DeclBuffer` views and direct `BufferLoad`/`Store` on `tmem` | W1 next: needs a TMEM access lowering (tcgen05 ld/st or a contract `Tmem` buffer form) |
+| 71 | `TilePrimitiveCall` where TVM dispatch rejects the call or the function | W1: inspect the dispatch errors |
+| 17 | unbound variables (`cta_reduce` / `tvm_access_ptr` result vars) | W1 |
+| 14 + 11 | `cuda.warp_reduce` / `cuda.cta_reduce` (multi-instruction helpers) | W1: expand to `Shfl`/`Barrier` sequences |
+| 13 + ~100 | `mbarrier.*_wait.*report*` | contract: `MbarTestWait` has no report destinations |
+| 15 | `st.async.release` / `red.async.release` without mbarrier | contract: `StAsyncArgs` requires an mbarrier |
+| ~30 | bulk-copy `byte_mask` / `ignore_oob` / `report`; TMA overrides | contract: `BulkCopyArgs` lacks the fields; `TmaArgs.overrides` exists but W1 has not wired it yet |
+| 19 | register layouts (`laneid` / `tid_in_wg` axes) on local buffers | tile unit tests; resolved by dispatch once those kernels dispatch |
+| ~15 | `tcgen05.mma` `kind::ti16`, `lut_b`; commit `sync_restrict` / `multicast_width` | contract: not in `TcMmaKind` / `TcgenCommit` |
+| 9 | `ptx_legacy.ldmatrix` / `ptx_legacy.mma` | out of scope (legacy surface) |
+| 6 | `For` kind VECTORIZED | fails closed by design |
+| 1 | `boolx128` parameter | coordinator ruling: lower as a `u8[128]` buffer (not done yet) |

@@ -1,158 +1,155 @@
-"""Builtin call table: TIRx op name -> lowering handler and family.
+"""Non-table builtin facts shared by the escape analysis and call lowering.
 
-The table is the single place where an op name is accepted. Anything not in
-``HANDLERS`` lowers to ``Unsupported`` (fail closed) with its family named so
-coverage reports group gaps by family.
+``HELPERS`` lists every accepted ``tirx.cuda.*`` / ``tirx.*`` helper with its
+operand roles (one letter per argument; a trailing ``*`` repeats the
+previous letter):
 
-Only a handful of pure scalar builtins have handlers in the skeleton; the
-family classification already covers every prefix seen in the corpus
-inventory (``docs/development/lowering-inventory.md``).
+* ``v`` value operand
+* ``o`` out-parameter written through ``address_of(lvalue)``
+* ``x`` in/out parameter through ``address_of(lvalue)``
+* ``s`` string literal (becomes an ``OpKey`` modifier)
+* ``a`` auto: string literal -> modifier, else value
+
+and its lowering ``kind``:
+
+* ``pure`` -> ``Instr::Ptx`` with ``OpKey{name, mods}`` (oplib implements it);
+* ``special`` -> a dedicated lowering in ``calls.py`` (``call_<name>``).
+
+Anything not listed (and not a TVM PTX table op, a ``UNARY_OPS`` math op or a
+structural op) fails closed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
-
-from . import program_builder as pb
-
-if TYPE_CHECKING:
-    from .ir_walk import Lowerer
+from dataclasses import dataclass
 
 
-Handler = Callable[["Lowerer", Any, str], pb.Operand]
-"""``handler(lowerer, call, result_dtype) -> result operand``."""
+@dataclass(frozen=True)
+class Helper:
+    roles: str
+    kind: str = "pure"          # pure | special
 
 
-# Family classification by op-name prefix, most specific first. The family
-# names follow the legacy registry (frontend-rs/src/registry.rs) so coverage
-# can be compared one-to-one during migration.
-_FAMILY_PREFIXES: tuple[tuple[str, str], ...] = (
-    ("tirx.ptx.mbarrier", "sync.mbarrier"),
-    ("tirx.ptx.bar", "sync.named_barrier"),
-    ("tirx.ptx.barrier", "sync.named_barrier"),
-    ("tirx.ptx.fence", "sync.fence"),
-    ("tirx.ptx.cp_async_bulk_tensor", "async.tma"),
-    ("tirx.ptx.cp_reduce_async_bulk_tensor", "async.tma"),
-    ("tirx.ptx.cp_async_bulk", "async.bulk"),
-    ("tirx.ptx.cp_reduce_async_bulk", "async.bulk"),
-    ("tirx.ptx.cp_async", "async.cp_async"),
-    ("tirx.ptx.tcgen05_mma", "tcgen.mma"),
-    ("tirx.ptx.tcgen05_ld", "tcgen.ldst"),
-    ("tirx.ptx.tcgen05_st", "tcgen.ldst"),
-    ("tirx.ptx.tcgen05_cp", "tcgen.copy"),
-    ("tirx.ptx.tcgen05", "tcgen.control"),
-    ("tirx.cuda.tcgen05_encode", "tcgen.descriptor"),
-    ("tirx.ptx.wgmma", "rejected.wgmma"),
-    ("tirx.ptx.multimem", "rejected.multimem"),
-    ("tirx.ptx.fabric", "rejected.fabric"),
-    ("tirx.ptx.mma", "matrix.mma_sync"),
-    ("tirx.ptx.ldmatrix", "matrix.ldmatrix"),
-    ("tirx.ptx.stmatrix", "matrix.stmatrix"),
-    ("tirx.ptx.atom", "memory.atomic"),
-    ("tirx.ptx.red", "memory.atomic"),
-    ("tirx.ptx.ld", "memory.load"),
-    ("tirx.ptx.st", "memory.store"),
-    ("tirx.ptx.tensormap", "tensor_map"),
-    ("tirx.ptx.elect_sync", "warp.elect"),
-    ("tirx.ptx.shfl", "warp.collective"),
-    ("tirx.ptx.vote", "warp.collective"),
-    ("tirx.ptx.redux", "warp.collective"),
-    ("tirx.ptx.match", "warp.collective"),
-    ("tirx.ptx.setmaxnreg", "sync.setmaxnreg"),
-    ("tirx.ptx.griddepcontrol", "sync.grid_dependency"),
-    ("tirx.ptx.clusterlaunchcontrol", "sync.cluster_launch_control"),
-    ("tirx.ptx.cvta", "address"),
-    ("tirx.ptx.mapa", "address"),
-    ("tirx.ptx.getctarank", "address"),
-    ("tirx.ptx.", "register"),
-    ("tirx.cuda.wait_until", "sync.wait_until"),
-    ("tirx.cuda.elect_sync", "warp.elect"),
-    ("tirx.cuda.cta_sync", "sync.named_barrier"),
-    ("tirx.cuda.warp_sync", "sync.named_barrier"),
-    ("tirx.cuda.warpgroup_sync", "sync.named_barrier"),
-    ("tirx.cuda.cluster_sync", "sync.cluster_barrier"),
-    ("tirx.cuda.grid_sync", "sync.grid_barrier"),
-    ("tirx.cuda.func_call", "cuda_helper"),
-    ("tirx.cuda.mbarrier", "sync.mbarrier"),
-    ("tirx.cuda.", "cuda"),
-    ("tirx.tile.", "tile"),
-    ("tirx.", "pure"),
-)
+def _p(roles: str = "a*") -> Helper:
+    return Helper(roles, "pure")
 
 
-def family(op_name: str) -> str:
-    for prefix, name in _FAMILY_PREFIXES:
-        if op_name.startswith(prefix):
-            return name
-    return "unknown"
+def _s(roles: str = "a*") -> Helper:
+    return Helper(roles, "special")
 
 
-# Ops that may return ``Blocked(resource)`` in the engine. The lowering must
-# not hoist or duplicate them (they are scheduling points). Seeded from the
-# legacy ``suspends`` rows; kept as a prefix test until the contract settles.
-_BLOCKING_PREFIXES = (
-    "tirx.ptx.mbarrier_try_wait",
-    "tirx.ptx.mbarrier_test_wait",
-    "tirx.cuda.mbarrier_wait",
-    "tirx.ptx.bar_sync",
-    "tirx.ptx.barrier_sync",
-    "tirx.ptx.barrier_cluster_wait",
-    "tirx.cuda.cta_sync",
-    "tirx.cuda.warpgroup_sync",
-    "tirx.cuda.cluster_sync",
-    "tirx.cuda.grid_sync",
-    "tirx.ptx.cp_async_wait",
-    "tirx.ptx.cp_async_bulk_wait_group",
-    "tirx.ptx.tcgen05_wait",
-    "tirx.cuda.wait_until",
-)
-
-
-def may_block(op_name: str) -> bool:
-    return op_name.startswith(_BLOCKING_PREFIXES)
-
-
-# --------------------------------------------------------------------------
-# Handlers (skeleton subset)
-# --------------------------------------------------------------------------
-
-
-def _unary(op: str) -> Handler:
-    def handler(lowerer: "Lowerer", call: Any, dtype: str) -> pb.Operand:
-        (arg,) = call.args
-        src = lowerer.expr(arg)
-        dst = lowerer.builder.reg(dtype, uniform=lowerer.is_uniform(src))
-        # CONTRACT: math intrinsics may become their own Instr variant
-        # (Instr::Math { op, dtype, ... }) instead of Unary.
-        lowerer.builder.emit(pb.Unary(op=op, dtype=dtype, dst=dst, a=src))
-        return dst
-
-    return handler
-
-
-def _if_then_else(lowerer: "Lowerer", call: Any, dtype: str) -> pb.Operand:
-    # tirx.if_then_else evaluates both arms in SIMT order only for pure arms;
-    # arms containing loads are lowered as Select over both values, which is
-    # what CUDA codegen also emits for pure arms. Arms with side effects are
-    # rejected by the frontend contract (calls with effects are statements).
-    cond, a, b = call.args
-    c, x, y = lowerer.expr(cond), lowerer.expr(a), lowerer.expr(b)
-    dst = lowerer.builder.reg(dtype, uniform=all(lowerer.is_uniform(v) for v in (c, x, y)))
-    lowerer.builder.emit(pb.Select(dtype=dtype, dst=dst, cond=c, a=x, b=y))
-    return dst
-
-
-HANDLERS: dict[str, Handler] = {
-    "tirx.if_then_else": _if_then_else,
-    "tirx.exp": _unary("Exp"),
-    "tirx.exp2": _unary("Exp2"),
-    "tirx.log": _unary("Log"),
-    "tirx.log2": _unary("Log2"),
-    "tirx.sqrt": _unary("Sqrt"),
-    "tirx.rsqrt": _unary("Rsqrt"),
-    "tirx.fabs": _unary("Abs"),
+HELPERS: dict[str, Helper] = {
+    # synchronization (special: dedicated Instr variants)
+    "tirx.cuda.mbarrier_wait": _s("vv"),
+    "tirx.cuda.mbarrier_wait_acquire_cluster": _s("vv"),
+    "tirx.cuda.cta_sync": _s(""),
+    "tirx.cuda.warp_sync": _s("a*"),
+    "tirx.cuda.warpgroup_sync": _s("v"),
+    "tirx.cuda.cluster_sync": _s(""),
+    "tirx.cuda.grid_sync": _s(""),
+    "tirx.cuda.syncthreads_and": _s("v"),
+    "tirx.cuda.syncthreads_or": _s("v"),
+    "tirx.tvm_storage_sync": _s("a*"),
+    "tirx.cuda.thread_fence": _s(""),
+    # warp collectives
+    "tirx.cuda.elect_sync": _s("a*"),
+    "tirx.cuda.__shfl_sync": _s("vvvv"),
+    "tirx.cuda.__shfl_up_sync": _s("vvvv"),
+    "tirx.cuda.__shfl_down_sync": _s("vvvv"),
+    "tirx.cuda.__shfl_xor_sync": _s("vvvv"),
+    "tirx.tvm_warp_shuffle": _s("vvvvv"),
+    "tirx.tvm_warp_shuffle_up": _s("vvvvv"),
+    "tirx.tvm_warp_shuffle_down": _s("vvvvv"),
+    "tirx.tvm_warp_shuffle_xor": _s("vvvvv"),
+    "tirx.cuda.ballot_sync": _s("vv"),
+    "tirx.cuda.any_sync": _s("vv"),
+    "tirx.cuda.__activemask": _s(""),
+    "tirx.tvm_warp_activemask": _s(""),
+    "tirx.cuda.reduce_add_sync_u32": _s("vv"),
+    "tirx.cuda.reduce_min_sync_u32": _s("vv"),
+    # memory / atomics / addresses
+    "tirx.cuda.ldg": _s("va"),
+    "tirx.cuda.atomic_add": _s("vv"),
+    "tirx.cuda.atomic_cas": _s("vvv"),
+    "tirx.cuda.cvta_generic_to_shared": _s("v"),
+    "tirx.cuda.smem_addr_from_uint64": _s("v"),
+    "tirx.cuda.float22half2": _s("vv"),
+    "tirx.cuda.float8tohalf8": _s("vv"),
+    "tirx.cuda.half8tofloat8": _s("vv"),
+    # special registers / control / annotations
+    "tirx.cuda.thread_rank": _s(""),
+    "tirx.cuda.clock64": _s(""),
+    "tirx.cuda.mov_sreg": _s("va"),
+    "tirx.cuda.nano_sleep": _s("v"),
+    "tirx.cuda.printf": _s("a*"),
+    "tirx.cuda.iket_mark": _s("a*"),
+    "tirx.cuda.iket_range_start": _s("a*"),
+    "tirx.cuda.iket_range_end": _s("a*"),
+    "tirx.cuda.iket_range_push": _s("a*"),
+    "tirx.cuda.iket_range_pop": _s(""),
+    "tirx.cuda.iket_sentinel_token": _s("a*"),
+    "tirx.cuda.iket_official_event": _s("a*"),
+    "tirx.cuda.trap_when_assert_failed": _s("v"),
+    "tirx.cuda.wait_until": _s("a*"),
+    "tirx.cuda.func_call": _s("a*"),
+    # pure value helpers -> Instr::Ptx
+    "tirx.cuda.get_tmem_addr": _p("vvv"),
+    "tirx.cuda.sm100_2sm_leader_smem_addr": _p("v"),
+    "tirx.cuda.tcgen05_encode_matrix_descriptor": _p("oa*"),
+    "tirx.cuda.tcgen05_encode_instr_descriptor": _p("oa*"),
+    "tirx.cuda.tcgen05_encode_instr_descriptor_block_scaled": _p("oa*"),
+    "tirx.cuda.runtime_instr_desc": _p("xv"),
+    "tirx.cuda.make_float2": _p("vv"),
+    "tirx.cuda.float2_x": _p("v"),
+    "tirx.cuda.float2_y": _p("v"),
+    "tirx.cuda.uint_as_float": _p("v"),
+    "tirx.cuda.float_as_uint": _p("v"),
+    "tirx.cuda.ffs_u32": _p("v"),
+    "tirx.cuda.float22bfloat162_rn": _p("vv"),
+    "tirx.cuda.float22bfloat162_rn_from_float2": _p("v"),
+    "tirx.cuda.bfloat1622float2": _p("v"),
+    "tirx.cuda.hmin2": _p("vv"),
+    "tirx.cuda.hmax2": _p("vv"),
+    "tirx.cuda.fmul2_rn": _p("vv"),
+    "tirx.cuda.fadd2_rn": _p("vv"),
+    "tirx.cuda.fdividef": _p("vv"),
+    "tirx.cuda.fp8x4_e4m3_from_float4": _p("vvvv"),
+    "tirx.cuda.half2float": _p("v"),
+    "tirx.cuda.bfloat162float": _p("v"),
+    "tirx.log1p": _p("v"),
+    "tirx.sigmoid": _p("v"),
+    "tirx.exp10": _p("v"),
+    "tirx.log10": _p("v"),
+    "tirx.erf": _p("v"),
+    "tirx.nearbyint": _p("v"),
 }
 
+# tirx.* math ops lowered to ``Instr::Unary`` (``UnOp``).
+UNARY_OPS: dict[str, str] = {
+    "tirx.exp": "Exp", "tirx.exp2": "Exp2", "tirx.log": "Log", "tirx.log2": "Log2", "prim.log2": "Log2",
+    "tirx.sqrt": "Sqrt", "tirx.rsqrt": "Rsqrt", "tirx.fabs": "Abs", "tirx.sin": "Sin", "tirx.cos": "Cos",
+    "tirx.tanh": "Tanh", "tirx.popcount": "Popcount", "tirx.clz": "Clz", "tirx.floor": "Floor",
+    "tirx.ceil": "Ceil", "tirx.round": "Round", "tirx.trunc": "Trunc", "tirx.isnan": "IsNan",
+    "tirx.isinf": "IsInf", "tirx.isfinite": "IsFinite",
+}
 
-__all__ = ["HANDLERS", "family", "may_block"]
+# CUDA helpers recognized by name and normalized-source hash (legacy
+# emit/cuda_helper.rs). Pure ones become ``Ptx`` ops; effectful ones must be
+# lowered to primitives (not done yet: they fail closed).
+PURE_FUNC_CALLS = frozenset(
+    {
+        "gdn_lg2_approx_ftz", "flashkda_rsqrtf", "flashkda_tanh_approx", "flashkda_fmaf_rn",
+        "tvm_builtin_fma_scale_sub_f32x2", "combine_int_frac_ex2", "shl_u32_clamp",
+        "smem_desc_add_16B_offset",
+    }
+)
+
+
+def role(roles: str, position: int) -> str:
+    if roles.endswith("*"):
+        fixed = roles[:-2]
+        return fixed[position] if position < len(fixed) else roles[-2]
+    return roles[position] if position < len(roles) else "?"
+
+
+__all__ = ["HELPERS", "Helper", "PURE_FUNC_CALLS", "UNARY_OPS", "role"]

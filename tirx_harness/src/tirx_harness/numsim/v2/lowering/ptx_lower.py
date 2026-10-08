@@ -1,0 +1,883 @@
+"""``tirx.ptx.*`` table ops -> ``numsim_core::Instr`` (decision 1).
+
+Every op is decoded with ``ptx_decode`` (TVM's own table), then:
+
+* families with engine-visible semantics map to their dedicated variant
+  (``LoadAddr``/``Store``, ``Atom``, ``MbarArrive``, ``Tma``, ``TcgenMma``...);
+* the pure-register tail becomes ``Ptx{op, dsts, srcs, pred, keep_dst}`` with
+  ``OpKey{name, mods}`` = op name + non-empty modifier tokens in slot order.
+
+Only ``Ptx`` carries a guard predicate; a predicated dedicated op is wrapped
+in ``If{pred}``. Shared-space address operands given as generic pointers are
+converted with ``Cvta`` (TVM auto-coerces them the same way).
+
+Handlers are looked up by exact table name, then by prefix (``_PREFIX``).
+Unknown non-ALU families and contract gaps raise ``_Unsupported``.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Callable
+
+from . import program_builder as pb
+from . import ptx_decode
+from .dtypes import type_key
+from .memory import _Unsupported
+
+if TYPE_CHECKING:
+    from .ir_walk import Lowerer
+
+
+SPACES = {
+    "": "Generic", "global": "Global", "shared": "Shared", "shared::cta": "Shared",
+    "shared::cluster": "SharedCluster", "local": "Local", "param": "Param", "param::entry": "Param",
+    "const": "Const", "tmem": "Tmem",
+}
+SEMS = {"": "Weak", "weak": "Weak", "relaxed": "Relaxed", "acquire": "Acquire", "release": "Release",
+        "acq_rel": "AcqRel", "sc": "Sc", "volatile": "Volatile", "mmio": "Mmio"}
+SCOPES = {"cta": "Cta", "cluster": "Cluster", "gpu": "Gpu", "sys": "Sys"}
+ATOM_OPS = {"add": "Add", "min": "Min", "max": "Max", "inc": "Inc", "dec": "Dec", "and": "And", "or": "Or",
+            "xor": "Xor", "exch": "Exch", "cas": "Cas"}
+REDUX_OPS = {"add": "Add", "min": "Min", "max": "Max", "and": "And", "or": "Or", "xor": "Xor"}
+CACHE_OPS = {"": "Default", "ca": "Ca", "cg": "Cg", "cs": "Cs", "lu": "Lu", "cv": "Cv", "wb": "Wb", "wt": "Wt"}
+EVICT = {"": "Normal", "L1::evict_normal": "Normal", "L1::evict_first": "First", "L1::evict_last": "Last",
+         "L1::evict_unchanged": "Unchanged", "L1::no_allocate": "NoAllocate"}
+L2_PREFETCH = {"": 0, "L2::64B": 64, "L2::128B": 128, "L2::256B": 256}
+TC_SHAPES = {"32x32b": "S32x32b", "16x64b": "S16x64b", "16x128b": "S16x128b", "16x256b": "S16x256b"}
+MMA_KINDS = {"kind::f16": "F16", "kind::tf32": "Tf32", "kind::f8f6f4": "F8f6f4", "kind::i8": "I8",
+             "kind::mxf8f6f4": "MxF8f6f4", "kind::mxf4": "MxF4", "kind::mxf4nvf4": "MxF4Nvf4"}
+COLLECTOR = {"": "None", "fill": "Fill", "use": "Use", "lastuse": "LastUse", "discard": "Discard"}
+
+
+class PtxCtx:
+    """One decoded call being lowered."""
+
+    def __init__(self, lw: "Lowerer", node: Any, decoded: ptx_decode.DecodedPtx):
+        self.lw = lw
+        self.node = node
+        self.d = decoded
+        self.mods = dict(decoded.modifiers)
+        self.ops = {info.name: (info, values) for info, values in zip(decoded.operands, decoded.values)}
+        self.write_backs: list[Callable[[], None]] = []
+        self.pred = lw.cast_to(lw.expr(decoded.predicate), pb.Ty("Pred")) if decoded.predicate is not None else None
+        self._site: int | None = None
+
+    # -- modifiers --------------------------------------------------------
+    def mod(self, name: str) -> str:
+        return self.mods.get(name, "")
+
+    def flag(self, name: str) -> bool:
+        return bool(self.mods.get(name, ""))
+
+    @property
+    def name(self) -> str:
+        return self.d.table_name
+
+    def sem(self, default: str = "Weak") -> str:
+        token = self.mod("sem")
+        if self.flag("mmio"):
+            return "Mmio"
+        return SEMS[token] if token else default
+
+    def scope(self, default: str = "Gpu") -> str:
+        token = self.mod("scope")
+        return SCOPES[token] if token else default
+
+    def int_mod(self, name: str, prefix: str = "") -> int:
+        token = self.mod(name)
+        return int(token[len(prefix):]) if token else 0
+
+    # -- operands ---------------------------------------------------------
+    def has(self, name: str) -> bool:
+        entry = self.ops.get(name)
+        if entry is None:
+            return False
+        info, values = entry
+        return info.literal is None and len(values) > 0 and any(v is not ptx_decode.SINK for v in values)
+
+    def info(self, name: str) -> ptx_decode.OperandInfo:
+        return self.ops[name][0]
+
+    def nodes(self, name: str) -> tuple[Any, ...]:
+        return self.ops[name][1]
+
+    def src(self, name: str) -> pb.Operand:
+        values = self.nodes(name)
+        if len(values) != 1:
+            raise _Unsupported(self.node, f"{self.d.op_name}: operand {name} has {len(values)} lanes")
+        return self.lw.expr(values[0])
+
+    def opt_src(self, name: str) -> pb.Operand | None:
+        return self.src(name) if self.has(name) else None
+
+    def srcs(self, name: str) -> list[pb.Operand]:
+        return [self.lw.expr(v) for v in self.nodes(name)] if name in self.ops else []
+
+    def uimm(self, name: str, bits: int = 32) -> int:
+        value = self.imm(name)
+        if not 0 <= value < 1 << bits:
+            raise _Unsupported(self.node, f"{self.d.op_name}: immediate {name}={value} out of range")
+        return value
+
+    def imm(self, name: str) -> int:
+        values = self.nodes(name)
+        node = values[0]
+        if isinstance(node, str):
+            return int(node)
+        if type_key(node) != "ir.IntImm":
+            raise _Unsupported(self.node, f"{self.d.op_name}: {name} must be a constant")
+        return int(node.value)
+
+    def addr(self, name: str, default_space: str | None = None) -> tuple[pb.Operand, str]:
+        info = self.info(name)
+        token = info.space if info.space else self.mod("space")
+        space = SPACES.get(token, "Generic")
+        if not token and default_space is not None:
+            space = default_space
+        value = self.src(name)
+        return self.lw.address_in(value, space), space
+
+    def dst(self, name: str) -> pb.Reg | None:
+        values = self.nodes(name)
+        if len(values) != 1:
+            raise _Unsupported(self.node, f"{self.d.op_name}: destination {name} has {len(values)} lanes")
+        return self._bind(values[0], self.info(name))
+
+    def dsts(self, name: str) -> list[pb.Reg | None]:
+        return [self._bind(v, self.info(name)) for v in self.nodes(name)]
+
+    def _bind(self, node: Any, info: ptx_decode.OperandInfo) -> pb.Reg | None:
+        if node is ptx_decode.SINK:
+            return None
+        ty_hint = pb.Ty.from_tvm(info.dtype) if info.dtype else None
+        reg, write_back = self.lw.lvalue_target(node, ty_hint)
+        if self.d.table_name.startswith("elect") and type_key(node) == "ir.TensorLoad":
+            self.lw.elect_buffers.add(int(node.source.__chandle__()))
+        if write_back is not None:
+            self.write_backs.append(write_back)
+        return reg
+
+    def scratch(self, ty: pb.Ty) -> pb.Reg:
+        return self.lw.builder.reg(ty)
+
+    def ptx_ty(self, token_slot: str = "type", lanes: int = 1) -> pb.Ty:
+        return pb.Ty.from_ptx(self.mod(token_slot), lanes)
+
+    # -- emission ---------------------------------------------------------
+    def site(self) -> int:
+        if self._site is None:
+            self._site = self.lw.site(self.node, op_name=self.d.op_name)
+        return self._site
+
+    def emit(self, variant: str, /, **fields: Any) -> None:
+        """Emit one dedicated instruction (predicated via If), then write-backs."""
+        b = self.lw.builder
+        if_pc = None
+        if self.pred is not None:
+            if_pc = b.emit("If", site=self.site(), cond=self.pred, else_pc=0, end_pc=0, elect=False)
+        b.emit(variant, site=self.site(), **fields)
+        self.flush()
+        if if_pc is not None:
+            end = b.emit("EndIf")
+            b.patch(if_pc, "If", cond=self.pred, else_pc=end, end_pc=end, elect=False)
+            self.pred = None
+
+    def flush(self) -> None:
+        for write_back in self.write_backs:
+            write_back()
+        self.write_backs = []
+
+
+# ---------------------------------------------------------------------------
+# Generic Ptx (pure register tail)
+# ---------------------------------------------------------------------------
+
+
+def lower_generic(c: PtxCtx) -> None:
+    lw = c.lw
+    dsts: list[pb.Reg] = []
+    srcs: list[pb.Operand] = []
+    for info, values in zip(c.d.operands, c.d.values):
+        if info.literal is not None:
+            continue
+        if info.kind == "addr":
+            raise _Unsupported(c.node, f"{c.d.op_name}: memory operand in a register op")
+        for value in values:
+            if info.rw == "r":
+                srcs.append(lw.expr(value))
+                continue
+            if value is ptx_decode.SINK:
+                dsts.append(c.scratch(pb.Ty.from_tvm(info.dtype) if info.dtype else pb.Ty("U32")))
+                continue
+            reg = c._bind(value, info)
+            if info.rw == "rw":
+                srcs.append(reg)
+            dsts.append(reg)
+    op = lw.builder.op(pb.OpKey(c.d.op_name, c.d.mod_tokens))
+    lw.builder.emit("Ptx", site=c.site(), op=op, dsts=dsts, srcs=srcs, pred=c.pred,
+                    keep_dst=c.d.preserve_dst)
+    c.flush()
+
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+
+
+def _mods(c: PtxCtx) -> dict:
+    policy = c.opt_src("cache_policy") if "cache_policy" in c.ops else None
+    return pb.mem_mods(cache=CACHE_OPS.get(c.mod("cop"), "Default"), evict=EVICT.get(c.mod("l1ev"), "Normal"),
+                       l2_prefetch=L2_PREFETCH.get(c.mod("prefetch"), 0), policy=policy, nc=c.flag("nc"),
+                       uniform=c.name.startswith("ldu"))
+
+
+def _vec_lanes(c: PtxCtx) -> int:
+    token = c.mod("vec")
+    return int(token[1:]) if token else 1
+
+
+def lower_ld(c: PtxCtx) -> None:
+    lw = c.lw
+    lanes = _vec_lanes(c)
+    ty = c.ptx_ty("type", lanes)
+    addr_node = c.nodes("addr")[0]
+    dsts = c.dsts("d")
+    mods = _mods(c)
+    if c.name == "ld_proxy_readonly":
+        mods["nc"] = True
+    sem, scope = c.sem(), c.scope()
+    value = lw.builder.reg(ty)
+    target = lw.buffer_access(addr_node, c.mod("space"))
+    if target is not None:
+        buf, offset = target
+        fields = dict(ty=ty, dst=value, buf=buf, offset=offset, sem=sem, scope=scope, mods=mods)
+        variant = "Load"
+    else:
+        addr, space = c.addr("addr")
+        fields = dict(ty=ty, dst=value, addr=addr, space=space, sem=sem, scope=scope, mods=mods)
+        variant = "LoadAddr"
+    b = lw.builder
+    if_pc = None
+    if c.pred is not None:
+        if_pc = b.emit("If", site=c.site(), cond=c.pred, else_pc=0, end_pc=0, elect=False)
+    b.emit(variant, site=c.site(), **fields)
+    lanes_out = [value] if lanes == 1 else lw.unpack(value, lanes)
+    for reg, lane in zip(dsts, lanes_out):
+        if reg is not None:
+            lw.assign(reg, lane)
+    c.flush()
+    if if_pc is not None:
+        end = b.emit("EndIf")
+        b.patch(if_pc, "If", cond=c.pred, else_pc=end, end_pc=end, elect=False)
+
+
+def lower_st(c: PtxCtx) -> None:
+    lw = c.lw
+    lanes = _vec_lanes(c)
+    ty = c.ptx_ty("type", lanes)
+    elem = ty.with_lanes(1)
+    values = [lw.convert(v, elem) for v in c.srcs("value")]
+    value = values[0] if lanes == 1 else lw.pack(values, ty)
+    addr_node = c.nodes("addr")[0]
+    mods = _mods(c)
+    sem, scope = c.sem(), c.scope()
+    target = lw.buffer_access(addr_node, c.mod("space"))
+    if target is not None:
+        buf, offset = target
+        c.emit("Store", ty=ty, buf=buf, offset=offset, value=value, sem=sem, scope=scope, mods=mods)
+    else:
+        addr, space = c.addr("addr")
+        c.emit("StoreAddr", ty=ty, addr=addr, space=space, value=value, sem=sem, scope=scope, mods=mods)
+
+
+def lower_discard(c: PtxCtx) -> None:
+    addr, space = c.addr("addr", "Global")
+    c.emit("Discard", addr=addr, space=space, size=128)
+
+
+def lower_atom(c: PtxCtx) -> None:
+    lw = c.lw
+    lanes = _vec_lanes(c)
+    ty = c.ptx_ty("type", lanes)
+    elem = ty.with_lanes(1)
+    values = [lw.convert(v, elem) for v in c.srcs("value")]
+    value = values[0] if lanes == 1 else lw.pack(values, ty)
+    cmp = lw.convert(c.src("compare"), ty) if c.has("compare") else None
+    addr, space = c.addr("addr")
+    dsts = c.dsts("d") if c.has("d") else []
+    result = lw.builder.reg(ty) if dsts else None
+    op = ATOM_OPS[c.mod("op")]
+    sem = c.sem("Relaxed")
+    c.lw.builder.emit("Atom", site=c.site(), op=op, ty=ty, dst=result, addr=addr, space=space, value=value,
+                      cmp=cmp, sem=sem, scope=c.scope(), ftz=not c.flag("noftz") and ty.elem == "F32")
+    if result is not None:
+        outs = [result] if lanes == 1 else lw.unpack(result, lanes)
+        for reg, lane in zip(dsts, outs):
+            if reg is not None:
+                lw.assign(reg, lane)
+    c.flush()
+
+
+def lower_cvta(c: PtxCtx) -> None:
+    space = SPACES.get(c.mod("space"), "Generic")
+    src = c.src("ptr") if "ptr" in c.ops else c.src("a")
+    dst = c.dst("d")
+    to_generic = c.name == "cvta_generic" or c.mod("dir") != "to"
+    c.emit("Cvta", dst=dst, src=src, space=space, to_generic=to_generic if c.name != "cvta" else False)
+
+
+def lower_mapa(c: PtxCtx) -> None:
+    space = "SharedCluster" if c.name in ("mapa_u32", "mapa_u64_shared") or c.mod("space") else "Generic"
+    c.emit("Mapa", dst=c.dst("d"), src=c.src("a"), rank=c.src("b"), space=space)
+
+
+def lower_getctarank(c: PtxCtx) -> None:
+    space = "SharedCluster" if c.name == "getctarank" else "Generic"
+    c.emit("GetCtaRank", dst=c.dst("d"), src=c.src("a"), space=space)
+
+
+def lower_isspacep(c: PtxCtx) -> None:
+    c.emit("Isspacep", dst=c.dst("p"), src=c.src("a"), space=SPACES.get(c.mod("space"), "Generic"))
+
+
+def _matrix_shape(token: str) -> str:
+    return {"m8n8": "M8N8", "m8n16": "M8N16", "m16n8": "M16N8", "m16n16": "M16N16"}[token]
+
+
+def lower_ldmatrix(c: PtxCtx) -> None:
+    addr, space = c.addr("p", "Shared")
+    fmt = "B16"
+    if c.name == "ldmatrix_m16n16_b8":
+        fmt = "B8"
+    elif c.name == "ldmatrix_s8_s4":
+        fmt = "S8S4"
+    elif c.name == "ldmatrix_b8fmt":
+        fmt = {"b6x16_p32": "B6x16P32", "b4x16_p64": "B4x16P64"}[c.mod("src_fmt")]
+    dsts = [d if d is not None else c.scratch(pb.Ty("U32")) for d in c.dsts("r")]
+    c.emit("LdMatrix", dsts=dsts, addr=addr, space=space, shape=_matrix_shape(c.mod("shape")),
+           num=c.int_mod("num", "x"), trans=c.flag("trans"), fmt=fmt)
+
+
+def lower_stmatrix(c: PtxCtx) -> None:
+    addr, space = c.addr("p", "Shared")
+    c.emit("StMatrix", srcs=c.srcs("r"), addr=addr, space=space, shape=_matrix_shape(c.mod("shape")),
+           num=c.int_mod("num", "x"), trans=c.flag("trans"))
+
+
+# ---------------------------------------------------------------------------
+# Async copies / TMA
+# ---------------------------------------------------------------------------
+
+
+def lower_cp_async(c: PtxCtx) -> None:
+    dst, _ = c.addr("dst_mem", "Shared")
+    src, _ = c.addr("src_mem", "Global")
+    mods = pb.mem_mods(cache=CACHE_OPS[c.mod("cop")], l2_prefetch=L2_PREFETCH.get(c.mod("prefetch"), 0),
+                       policy=c.opt_src("cache_policy"))
+    c.emit("CpAsync", dst=dst, src=src, cp_size=c.uimm("cp_size", 8), src_size=c.opt_src("src_size"),
+           ignore_src=c.opt_src("ignore_src"), mods=mods)
+
+
+def lower_async_commit(c: PtxCtx) -> None:
+    c.emit("AsyncCommit", domain="Bulk" if "bulk" in c.name else "CpAsync")
+
+
+def lower_async_wait(c: PtxCtx) -> None:
+    domain = "Bulk" if "bulk" in c.name else "CpAsync"
+    if c.name == "cp_async_wait_all":
+        c.emit("AsyncCommit", domain=domain)
+        c.emit("AsyncWait", domain=domain, n=0, read=False)
+        return
+    group = c.imm("group")
+    if not 0 <= group < 1 << 32:
+        raise _Unsupported(c.node, f"{c.d.op_name}: wait_group count {group} out of range")
+    c.emit("AsyncWait", domain=domain, n=group, read=c.flag("read"))
+
+
+def lower_cp_async_mbar_arrive(c: PtxCtx) -> None:
+    mbar, space = c.addr("addr", "Shared")
+    c.emit("CpAsyncMbarArrive", mbar=mbar, space=space, noinc=c.flag("noinc"))
+
+
+def _completion(c: PtxCtx) -> Any:
+    if "mbar" in c.ops and c.has("mbar"):
+        mbar, space = c.addr("mbar", "Shared")
+        return pb.bulk_completion(mbar, space)
+    return pb.bulk_completion(None)
+
+
+def _multicast(c: PtxCtx) -> pb.Operand | None:
+    for name in ("cta_mask",):
+        if c.has(name):
+            return c.src(name)
+    return None
+
+
+def lower_bulk_copy(c: PtxCtx) -> None:
+    if c.has("byte_mask") or c.has("ignore_bytes_left") or c.flag("report"):
+        raise _Unsupported(c.node, f"{c.d.op_name}: byte masks / ignore_oob / report are not in BulkCopyArgs")
+    dst, dst_space = c.addr("dst_mem")
+    src, src_space = c.addr("src_mem")
+    reduce = None
+    if c.name.startswith("cp_reduce"):
+        reduce = [ATOM_OPS[c.mod("redop")], pb.Ty.from_ptx(c.mod("type")).elem]
+    mods = pb.mem_mods(policy=c.opt_src("cache_policy"))
+    c.emit("BulkCopy", dst=dst, dst_space=dst_space, src=src, src_space=src_space, size=c.src("size"),
+           completion=_completion(c), multicast=_multicast(c), reduce=reduce, mods=mods)
+
+
+def lower_bulk_prefetch(c: PtxCtx) -> None:
+    lower_generic_ordering(c)
+
+
+def lower_tma(c: PtxCtx) -> None:
+    name = c.name
+    if any(part in name for part in ("override", "report")) or c.flag("report"):
+        raise _Unsupported(c.node, f"{c.d.op_name}: TMA overrides/report are not lowered yet")
+    if name.startswith("cp_reduce_async_bulk_tensor"):
+        direction = {"Reduce": ATOM_OPS[c.mod("redop")]}
+    elif "prefetch" in name:
+        direction = "Prefetch"
+    elif "s2g" in name:
+        direction = "Store"
+    else:
+        direction = "Load"
+    mode_token = c.mod("load_mode")
+    mode = {"": "Tile", "tile": "Tile", "tile::gather4": "TileGather4", "tile::scatter4": "TileScatter4",
+            "im2col": "Im2col", "im2col::w": "Im2colW", "im2col::w::128": "Im2colW128",
+            "im2col_no_offs": "Im2colNoOffs"}.get(mode_token)
+    if "no_offs_w" in name:
+        mode = "Im2colNoOffs"
+    if mode is None:
+        raise _Unsupported(c.node, f"{c.d.op_name}: load mode {mode_token!r}")
+    tmap, tmap_space = c.addr("tmap", "Generic")
+    coords = c.srcs("coords")
+    offsets = c.srcs("im2col_info") if c.has("im2col_info") else []
+    if direction in ("Load",):
+        smem, smem_space = c.addr("dst_mem")
+    elif direction == "Prefetch":
+        smem, smem_space = c.lw.const("uint32", 0), "Shared"
+    else:
+        smem, smem_space = c.addr("src_mem")
+    cta_group = c.int_mod("cta_group", "cta_group::")
+    c.emit("Tma", dir=direction, mode=mode, tmap=tmap, tmap_space=tmap_space, coords=coords,
+           im2col_offsets=offsets, smem=smem, smem_space=smem_space, completion=_completion(c),
+           multicast=_multicast(c), cta_group=cta_group, overrides=[],
+           mods=pb.mem_mods(policy=c.opt_src("cache_policy")))
+
+
+def lower_st_async(c: PtxCtx) -> None:
+    if c.name == "st_async_release" or c.name == "red_async_release":
+        raise _Unsupported(c.node, f"{c.d.op_name}: st.async/red.async .release (no mbarrier) is not in StAsyncArgs")
+    lanes = _vec_lanes(c)
+    ty = c.ptx_ty("type", lanes)
+    values = [c.lw.convert(v, ty.with_lanes(1)) for v in c.srcs("b" if "b" in c.ops else "value")]
+    value = values[0] if lanes == 1 else c.lw.pack(values, ty)
+    addr, _ = c.addr("addr", "SharedCluster")
+    mbar, _ = c.addr("mbar", "SharedCluster")
+    red = ATOM_OPS[c.mod("op")] if c.name.startswith("red_async") else None
+    c.emit("StAsync", ty=ty, value=value, addr=addr, mbar=mbar, red=red, sem=c.sem("Weak"),
+           scope=c.scope("Cluster"))
+
+
+def lower_st_bulk(c: PtxCtx) -> None:
+    addr, space = c.addr("addr", "Shared")
+    c.emit("StBulk", addr=addr, space=space, size=c.src("size"))
+
+
+def lower_tensormap_replace(c: PtxCtx) -> None:
+    field = {"global_address": "GlobalAddress", "rank": "Rank", "box_dim": "BoxDim", "global_dim": "GlobalDim",
+             "global_stride": "GlobalStride", "element_stride": "ElementStride", "elemtype": "ElemType",
+             "interleave_layout": "InterleaveLayout", "swizzle_mode": "SwizzleMode",
+             "fill_mode": "FillMode"}[c.mod("field")]
+    addr, space = c.addr("addr", "Global")
+    ordinal = c.uimm("ord", 8) if "ord" in c.ops else None
+    value = c.src("new_val")
+    c.emit("TensorMapReplace", tmap=addr, space=space, field=field, ord=ordinal, value=value)
+
+
+def lower_tensormap_cp_fence(c: PtxCtx) -> None:
+    dst, _ = c.addr("dst_mem", "Global")
+    src, _ = c.addr("src_mem", "Shared")
+    c.emit("TensorMapCopyFence", dst=dst, src=src, size=128, scope=c.scope())
+
+
+def lower_generic_ordering(c: PtxCtx) -> None:
+    """Ordering-only hints (prefetch/applypriority): a ``Ptx`` op with no effects."""
+    lower_generic_any(c)
+
+
+def lower_generic_any(c: PtxCtx) -> None:
+    lw = c.lw
+    srcs: list[pb.Operand] = []
+    for info, values in zip(c.d.operands, c.d.values):
+        if info.literal is not None:
+            continue
+        if info.rw != "r":
+            raise _Unsupported(c.node, f"{c.d.op_name}: unexpected destination")
+        srcs.extend(lw.expr(v) for v in values)
+    op = lw.builder.op(pb.OpKey(c.d.op_name, c.d.mod_tokens))
+    lw.builder.emit("Ptx", site=c.site(), op=op, dsts=[], srcs=srcs, pred=c.pred, keep_dst=False)
+
+
+# ---------------------------------------------------------------------------
+# Synchronization
+# ---------------------------------------------------------------------------
+
+
+def lower_bar(c: PtxCtx) -> None:
+    lw = c.lw
+    aligned = c.flag("aligned") or c.name.startswith("bar_")
+    ident = c.src("a")
+    count = c.opt_src("b")
+    action = c.mod("action")
+    if action == "arrive":
+        kind: Any = "Arrive"
+    elif action == "sync":
+        kind = "Sync"
+    else:
+        op = {"popc": "Popc", "and": "And", "or": "Or"}[c.mod("op")]
+        dst = c.dst("d")
+        kind = {"Red": {"op": op, "pred": pb.opnd(lw.cast_to(c.src("c"), pb.Ty("Pred"))), "dst": dst}}
+    c.emit("Barrier", kind=kind, id=ident, count=count, aligned=aligned)
+
+
+def lower_bar_warp_sync(c: PtxCtx) -> None:
+    c.emit("WarpSync", membermask=c.src("membermask"))
+
+
+def lower_cluster_barrier(c: PtxCtx) -> None:
+    if c.mod("action") == "arrive":
+        c.emit("ClusterArrive", sem=c.sem("Release"), aligned=c.flag("aligned"))
+    else:
+        c.emit("ClusterWait", acquire=True, aligned=c.flag("aligned"))
+
+
+def lower_fence(c: PtxCtx) -> None:
+    name = c.name
+    if name == "fence":
+        c.emit("Fence", kind="Thread", sem=c.sem("Sc"), scope=c.scope())
+    elif name == "fence_mbarrier_init":
+        c.emit("Fence", kind="MbarrierInit", sem="Release", scope="Cluster")
+    elif name == "fence_proxy":
+        if c.mod("proxykind") == "alias":
+            c.emit("Fence", kind="ProxyAlias", sem="Weak", scope="Cta")
+        else:
+            token = c.mod("space")
+            c.emit("Fence", kind={"ProxyAsync": SPACES[token] if token else None}, sem="Weak", scope="Cta")
+    elif name == "fence_proxy_tensormap_release":
+        c.emit("Fence", kind="TensormapRelease", sem="Release", scope=c.scope())
+    elif name == "fence_proxy_tensormap_acquire":
+        addr, space = c.addr("addr", "Generic")
+        c.emit("Fence", kind={"TensormapAcquire": {"addr": pb.opnd(addr), "space": space}}, sem="Acquire",
+               scope=c.scope())
+    else:
+        raise _Unsupported(c.node, f"{c.d.op_name}: fence kind")
+
+
+def lower_mbarrier(c: PtxCtx) -> None:
+    name = c.name
+    action = c.mod("action")
+    if name == "mbarrier_init":
+        mbar, space = c.addr("addr", "Shared")
+        c.emit("MbarInit", mbar=mbar, space=space, count=c.src("count"),
+               layout_v1=c.mod("layout") == "layout::v1")
+    elif name == "mbarrier_inval":
+        mbar, space = c.addr("addr", "Shared")
+        c.emit("MbarInval", mbar=mbar, space=space)
+    elif action in ("arrive", "arrive_drop"):
+        mbar, space = c.addr("addr", "Shared")
+        count = c.opt_src("count") if "count" in c.ops else None
+        expect = None
+        if c.flag("expect_tx"):
+            expect = c.opt_src("tx_count") if "tx_count" in c.ops else count
+            if "tx_count" not in c.ops:
+                count = None
+        state = c.dst("state") if c.has("state") and c.info("state").rw != "r" else None
+        c.emit("MbarArrive", mbar=mbar, space=space, count=count, expect_tx=expect, drop=action == "arrive_drop",
+               no_complete=c.flag("nocomplete"), sem=c.sem("Release"), scope=c.scope("Cta"),
+               multicast=_multicast(c), state=state)
+    elif action in ("expect_tx", "complete_tx"):
+        mbar, space = c.addr("addr", "Shared")
+        c.emit("MbarTx", op="Expect" if action == "expect_tx" else "Complete", mbar=mbar, space=space,
+               bytes=c.src("tx_count"), multicast=_multicast(c), scope=c.scope("Cta"))
+    elif action in ("test_wait", "try_wait"):
+        if "report" in name:
+            raise _Unsupported(c.node, f"{c.d.op_name}: mbarrier wait reports are not in MbarTestWait")
+        if c.mod("phase_type") == "phase_type::conditional":
+            raise _Unsupported(c.node, f"{c.d.op_name}: conditional phase type")
+        mbar, space = c.addr("addr", "Shared")
+        phase = pb.phase_parity(c.src("phase")) if c.flag("parity") else pb.phase_state(c.src("state"))
+        dst = c.dst("wait_complete")
+        c.emit("MbarTestWait", kind="Test" if action == "test_wait" else "Try", mbar=mbar, space=space,
+               phase=phase, sem=c.sem("Acquire"), scope=c.scope("Cta"), dst=dst)
+    elif name == "mbarrier_pending_count":
+        state = c.src("state")
+        c.emit("MbarQuery", dst=c.dst("count"), op={"PendingCount": {"state": pb.opnd(state)}})
+    elif name == "mbarrier_check_layout":
+        mbar, space = c.addr("addr", "Shared")
+        c.emit("MbarQuery", dst=c.dst("matches"), op={"CheckLayout": {"mbar": pb.opnd(mbar), "space": space,
+                                                                         "layout_v1": c.mod("layout") == "layout::v1"}})
+    else:
+        raise _Unsupported(c.node, f"{c.d.op_name}: mbarrier action {action!r}")
+
+
+def lower_setmaxnreg(c: PtxCtx) -> None:
+    c.emit("SetMaxNReg", inc=c.mod("action") == "inc", count=c.uimm("nreg"))
+
+
+def lower_griddepcontrol(c: PtxCtx) -> None:
+    c.lw.builder.program.requirements.grid_dependency = True
+    c.emit("GridDepControl", launch_dependents=c.mod("action") == "launch_dependents")
+
+
+def lower_clc_try_cancel(c: PtxCtx) -> None:
+    resp, _ = c.addr("addr", "Shared")
+    mbar, _ = c.addr("mbar", "Shared")
+    c.emit("ClcTryCancel", resp=resp, mbar=mbar, multicast=c.flag("multicast"))
+
+
+# ---------------------------------------------------------------------------
+# Warp collectives
+# ---------------------------------------------------------------------------
+
+
+def lower_shfl(c: PtxCtx) -> None:
+    mode = {"up": "Up", "down": "Down", "bfly": "Bfly", "idx": "Idx"}[c.mod("mode")]
+    dst = c.dst("d")
+    dst_pred = c.dst("p") if "p" in c.ops else None
+    c.emit("Shfl", mode=mode, ty=c.lw.builder.reg_ty(dst), dst=dst, dst_pred=dst_pred, src=c.src("a"),
+           lane=c.src("b"), clamp=c.src("c"), membermask=c.src("membermask"))
+
+
+def lower_vote(c: PtxCtx) -> None:
+    mode = {"all": "All", "any": "Any", "uni": "Uni", "ballot": "Ballot"}[c.mod("mode")]
+    pred = c.lw.cast_to(c.src("a"), pb.Ty("Pred"))
+    c.emit("Vote", mode=mode, dst=c.dst("d"), pred=pred, membermask=c.src("membermask"))
+
+
+def lower_redux(c: PtxCtx) -> None:
+    ty = c.ptx_ty()
+    src = c.lw.convert(c.src("a"), ty)
+    if c.flag("abs"):
+        # redux.abs reduces |a|: apply Abs before the collective.
+        absolute = c.lw.builder.reg(ty)
+        c.lw.builder.emit("Unary", op="Abs", ty=ty, dst=absolute, a=src)
+        src = absolute
+    dst = c.dst("d")
+    mask = c.src("membermask")
+    if not c.flag("nan"):
+        c.emit("Redux", op=REDUX_OPS[c.mod("op")], ty=ty, dst=dst, src=src, membermask=mask)
+        return
+    # redux.NaN: canonical NaN if any member's input is NaN, else the NaN-ignoring
+    # reduction. Instr::Redux has no NaN flag, so compose it from Redux + Vote.
+    lw, b = c.lw, c.lw.builder
+    reduced = b.reg(ty)
+    is_nan = b.reg(pb.Ty("Pred"))
+    any_nan = b.reg(pb.Ty("Pred"))
+    b.emit("Redux", site=c.site(), op=REDUX_OPS[c.mod("op")], ty=ty, dst=reduced, src=src, membermask=mask)
+    b.emit("Unary", op="IsNan", ty=ty, dst=is_nan, a=src)
+    b.emit("Vote", site=c.site(), mode="Any", dst=any_nan, pred=is_nan, membermask=mask)
+    result = b.reg(ty)
+    b.emit("Select", ty=ty, dst=result, cond=any_nan, a=b.const(ty, 0x7FFF_FFFF), b=reduced)
+    lw.assign(dst, result)
+    c.flush()
+
+
+def lower_elect(c: PtxCtx) -> None:
+    lane = c.dsts("d")[0]
+    pred = c.dst("p")
+    if pred is None:
+        pred = c.scratch(pb.Ty("Pred"))
+    c.emit("Elect", dst_pred=pred, dst_lane=lane, membermask=c.src("membermask"))
+
+
+def lower_activemask(c: PtxCtx) -> None:
+    c.emit("ReadSpecial", dst=c.dst("d"), sreg="ActiveMask")
+
+
+# ---------------------------------------------------------------------------
+# tcgen05
+# ---------------------------------------------------------------------------
+
+
+def _cta_group(c: PtxCtx) -> int:
+    return c.int_mod("cta_group", "cta_group::") or 1
+
+
+def lower_tcgen05(c: PtxCtx) -> None:
+    name = c.name
+    lw = c.lw
+    if name.startswith("tcgen05_alloc"):
+        dst, _ = c.addr("dst", "Shared")
+        c.emit("TcgenAlloc", dst=dst, ncols=c.src("ncols"), cta_group=_cta_group(c), exclusive="exclusive" in name)
+    elif name.startswith("tcgen05_dealloc"):
+        c.emit("TcgenDealloc", taddr=c.src("taddr"), ncols=c.src("ncols"), cta_group=_cta_group(c),
+               exclusive="exclusive" in name)
+    elif name == "tcgen05_relinquish_alloc_permit":
+        c.emit("TcgenRelinquish", cta_group=_cta_group(c))
+    elif name.startswith("tcgen05_commit"):
+        if "sync_restrict" in name or "width" in name:
+            raise _Unsupported(c.node, f"{c.d.op_name}: commit variant not in TcgenCommit")
+        mbar, space = c.addr("mbar", "SharedCluster")
+        multicast = c.src("mask") if c.has("mask") else None
+        c.emit("TcgenCommit", mbar=mbar, space=space, cta_group=_cta_group(c), multicast=multicast)
+    elif name == "tcgen05_wait":
+        c.emit("TcgenWait", st=c.mod("action") == "wait::st")
+    elif name == "tcgen05_fence":
+        kind = "Tcgen05Before" if c.mod("action") == "fence::before_thread_sync" else "Tcgen05After"
+        c.emit("Fence", kind=kind, sem="Weak", scope="Cta")
+    elif name.startswith("tcgen05_ld"):
+        if "spcompress" in name or c.flag("abs") or c.flag("nan"):
+            raise _Unsupported(c.node, f"{c.d.op_name}: spcompress/abs/NaN tcgen05.ld")
+        shape = _tc_shape(c)
+        dsts = [d if d is not None else c.scratch(pb.Ty("U32")) for d in c.dsts("r")]
+        red = None
+        if "redval" in c.ops:
+            red_regs = [d if d is not None else c.scratch(pb.Ty.from_ptx(c.mod("type"))) for d in c.dsts("redval")]
+            red = [REDUX_OPS[c.mod("redop")], red_regs]
+        taddr = c.src("taddr")
+        c.emit("TcgenLd", dsts=dsts, taddr=taddr, shape=shape, num=c.int_mod("num", "x"),
+               pack=c.flag("pack"), red=red, spcompress=False)
+    elif name.startswith("tcgen05_st"):
+        shape = _tc_shape(c)
+        c.emit("TcgenSt", srcs=c.srcs("r"), taddr=c.src("taddr"), shape=shape, num=c.int_mod("num", "x"),
+               unpack=c.flag("unpack"))
+    elif name == "tcgen05_cp":
+        rows, bits = (int(x) for x in c.mod("shape").rstrip("b").split("x"))
+        multicast = {"": 0, "warpx2::02_13": 1, "warpx2::01_23": 2, "warpx4": 3}[c.mod("multicast")]
+        decompress = {"": 0, "b6x16_p32": 6, "b4x16_p64": 4}[c.mod("src_fmt")]
+        c.emit("TcgenCp", taddr=c.src("taddr"), sdesc=c.src("s_desc"), rows=rows, bits=bits, multicast=multicast,
+               decompress_bits=decompress, cta_group=_cta_group(c))
+    elif name.startswith("tcgen05_mma"):
+        lower_tcgen05_mma(c)
+    else:
+        raise _Unsupported(c.node, f"{c.d.op_name}: tcgen05 form")
+    del lw
+
+
+def _tc_shape(c: PtxCtx) -> Any:
+    token = c.mod("shape")
+    if token == "16x32bx2":
+        return {"S16x32bx2": {"split_off": c.uimm("imm_half_splitoff")}}
+    return TC_SHAPES[token]
+
+
+def _collector(token: str) -> tuple[str, int]:
+    if not token:
+        return "None", 0
+    parts = token.split("::")          # collector::a::fill / collector::b0::use
+    which, op = parts[1], parts[2]
+    buffer = int(which[1:]) if len(which) > 1 else 0
+    return COLLECTOR[op], buffer
+
+
+def lower_tcgen05_mma(c: PtxCtx) -> None:
+    name = c.name
+    if "lut_b" in name:
+        raise _Unsupported(c.node, f"{c.d.op_name}: lut_b decompression is not in TcgenMmaArgs")
+    kind = MMA_KINDS.get(c.mod("kind"))
+    if kind is None:
+        raise _Unsupported(c.node, f"{c.d.op_name}: MMA {c.mod('kind')} is not in TcMmaKind")
+    if c.mod("block_size") == "block16" or c.mod("scale_vec") == "scale_vec::4X":
+        block = 16
+    else:
+        block = 32
+    a = {"Smem": pb.opnd(c.src("a_desc"))} if "a_desc" in c.ops else {"Tmem": pb.opnd(c.src("a_tmem"))}
+    block_scale = None
+    if "sfa_tmem" in c.ops:
+        block_scale = [pb.opnd(c.src("sfa_tmem")), pb.opnd(c.src("sfb_tmem")), block]
+    lanes = c.srcs("disable_output_lane") if "disable_output_lane" in c.ops else []
+    if "zero_col_mask" in c.ops and c.has("zero_col_mask"):
+        lanes = [c.src("zero_col_mask")]
+    collector_a, _ = _collector(c.mod("collector_a"))
+    collector_b, b_buffer = _collector(c.mod("collector_b"))
+    c.emit("TcgenMma", kind=kind, cta_group=_cta_group(c), d=c.src("d_tmem"), a=a, b_desc=c.src("b_desc"),
+           idesc=c.src("idesc"), enable_input_d=c.lw.cast_to(c.src("enable_input_d"), pb.Ty("Pred")),
+           ws=c.flag("ws"), ws_b_buffer=b_buffer, block_scale=block_scale, scale_input_d=None,
+           sparse_meta=c.src("sp_meta_tmem") if "sp_meta_tmem" in c.ops else None,
+           disable_output_lane=lanes, collector_a=collector_a, collector_b=collector_b,
+           ashift=c.flag("ashift"), variant=None)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+_EXACT: dict[str, Callable[[PtxCtx], None]] = {
+    "ld": lower_ld, "ld_vec": lower_ld, "ld_vec256": lower_ld, "ldu": lower_ld, "ldu_vec": lower_ld,
+    "ld_proxy_readonly": lower_ld,
+    "st": lower_st, "st_vec": lower_st, "st_vec256": lower_st,
+    "discard": lower_discard,
+    "cvta": lower_cvta, "cvta_generic": lower_cvta, "isspacep": lower_isspacep,
+    "getctarank": lower_getctarank, "getctarank_generic": lower_getctarank,
+    "cp_async_commit_group": lower_async_commit, "cp_async_bulk_commit_group": lower_async_commit,
+    "cp_async_wait_group": lower_async_wait, "cp_async_wait_all": lower_async_wait,
+    "cp_async_bulk_wait_group": lower_async_wait,
+    "cp_async_mbarrier_arrive": lower_cp_async_mbar_arrive,
+    "st_bulk": lower_st_bulk, "tensormap_cp_fenceproxy": lower_tensormap_cp_fence,
+    "bar_warp_sync": lower_bar_warp_sync, "setmaxnreg": lower_setmaxnreg,
+    "griddepcontrol": lower_griddepcontrol, "clusterlaunchcontrol_try_cancel": lower_clc_try_cancel,
+    "elect_sync": lower_elect, "activemask": lower_activemask,
+    "barrier_cluster_arrive": lower_cluster_barrier, "barrier_cluster_wait": lower_cluster_barrier,
+}
+
+_PREFIX: tuple[tuple[str, Callable[[PtxCtx], None]], ...] = (
+    ("atom", lower_atom),
+    ("redux", lower_redux),
+    ("red_async", lower_st_async),
+    ("red", lower_atom),
+    ("mapa", lower_mapa),
+    ("ldmatrix", lower_ldmatrix),
+    ("stmatrix", lower_stmatrix),
+    ("cp_async_bulk_tensor", lower_tma),
+    ("cp_reduce_async_bulk_tensor", lower_tma),
+    ("cp_async_bulk_prefetch", lower_bulk_prefetch),
+    ("cp_async_bulk", lower_bulk_copy),
+    ("cp_reduce_async_bulk", lower_bulk_copy),
+    ("cp_async_c", lower_cp_async),
+    ("st_async", lower_st_async),
+    ("tensormap_replace", lower_tensormap_replace),
+    ("bar_", lower_bar),
+    ("barrier_", lower_bar),
+    ("fence", lower_fence),
+    ("mbarrier", lower_mbarrier),
+    ("shfl", lower_shfl),
+    ("vote", lower_vote),
+    ("redux", lower_redux),
+    ("tcgen05", lower_tcgen05),
+    ("prefetch", lower_generic_ordering),
+    ("applypriority", lower_generic_ordering),
+)
+
+REJECTED = ("wgmma", "multimem", "fabric", "fence_proxy_fabric")
+
+
+def handler_for(table_name: str) -> Callable[[PtxCtx], None]:
+    if table_name.startswith(REJECTED):
+        raise KeyError(table_name)
+    exact = _EXACT.get(table_name)
+    if exact is not None:
+        return exact
+    for prefix, handler in _PREFIX:
+        if table_name.startswith(prefix):
+            return handler
+    return lower_generic
+
+
+def lower_ptx(lw: "Lowerer", node: Any) -> None:
+    try:
+        decoded = ptx_decode.decode(node)
+    except ptx_decode.PtxDecodeError as error:
+        raise _Unsupported(node, str(error)) from error
+    try:
+        handler = handler_for(decoded.table_name)
+    except KeyError:
+        raise _Unsupported(node, f"{decoded.op_name} is rejected (not modeled for the SM100 target)") from None
+    try:
+        handler(PtxCtx(lw, node, decoded))
+    except pb.UnrepresentableType as error:
+        raise _Unsupported(node, f"{decoded.op_name}: {error}") from error
+
+
+__all__ = ["lower_ptx", "handler_for"]

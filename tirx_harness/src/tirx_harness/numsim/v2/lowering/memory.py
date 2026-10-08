@@ -1,0 +1,532 @@
+"""Buffers, addresses and lvalues.
+
+Every TIRx buffer variable resolves to one of three references:
+
+* :class:`RegArray` — a register-promoted ``local`` buffer (one register per
+  element). Promotion requires a static shape, a trivial layout, a
+  representable dtype, and that the buffer's address never escapes
+  (``address_of`` outside a known out-parameter, ``buffer_data``, or a
+  ``DeclBuffer`` view). Constant indices resolve to a register; dynamic
+  indices use ``LoadRegIndexed`` / ``StoreRegIndexed`` (decision 2).
+* :class:`MemRef` — a ``Program.buffers`` entry: parameter buffers, shared
+  allocations and their ``DeclBuffer`` views (static ``elem_offset``), and
+  non-promoted locals (per-lane ``Local`` memory). Accesses are
+  buffer-relative ``Load``/``Store`` with element offsets in the buffer's own
+  dtype; ``address_of`` is ``AddrOf``.
+* :class:`PtrRef` — a view whose data is a pointer *value* (``reinterpret``,
+  a pointer ``Var``, ``handle_add_byte_offset``). Accesses are raw
+  ``LoadAddr``/``StoreAddr`` (generic space) on ``base + offset * itemsize``.
+
+Physical element offsets follow the buffer's layout: row-major (or explicit
+strides) linearization, then ``Layout.apply`` for non-trivial ``TileLayout``
+and ``ComposeLayout`` (swizzles), lowered as ordinary integer arithmetic.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+from tvm_ffi import structural_visit
+
+from . import builtins
+from . import dtypes
+from . import program_builder as pb
+from .dtypes import type_key
+
+if TYPE_CHECKING:
+    from .ir_walk import Lowerer
+
+
+_SPACES = {
+    "global": "Global", "shared": "Shared", "shared.dyn": "Shared", "local": "Local",
+    "tmem": "Tmem", "param": "Param",
+}
+
+_WEAK = {"sem": "Weak", "scope": "Gpu"}
+
+
+def handle(node: Any) -> int:
+    return int(node.__chandle__())
+
+
+class _Unsupported(Exception):
+    def __init__(self, node: Any, reason: str):
+        super().__init__(reason)
+        self.node = node
+        self.reason = reason
+
+
+@dataclass
+class Shape:
+    dtype: str                      # TVM dtype string
+    shape: tuple[Any, ...]          # PrimExpr nodes
+    strides: tuple[Any, ...]        # explicit stride PrimExprs, or ()
+    layout: Any | None              # non-trivial TVM layout, else None
+
+    @property
+    def static_shape(self) -> tuple[int, ...] | None:
+        out = []
+        for extent in self.shape:
+            if type_key(extent) != "ir.IntImm":
+                return None
+            out.append(int(extent.value))
+        return tuple(out)
+
+
+@dataclass
+class RegArray:
+    regs: list[pb.Reg]
+    info: Shape
+
+
+@dataclass
+class MemRef:
+    buf: int
+    space: str                      # AddrSpace of its accesses
+    info: Shape
+
+
+@dataclass
+class PtrRef:
+    base: pb.Operand                # u64 generic address
+    info: Shape
+    elem_offset: Any                # PrimExpr
+
+
+BufferRef = RegArray | MemRef | PtrRef
+
+
+def buffer_shape(ty: Any) -> Shape:
+    layout = getattr(ty, "layout", None)
+    if layout is not None:
+        trivial = getattr(layout, "is_trivial", None)
+        if trivial is not None and trivial():
+            layout = None
+    return Shape(dtype=str(ty.dtype.dtype), shape=tuple(ty.shape),
+                 strides=tuple(getattr(ty, "strides", ()) or ()), layout=layout)
+
+
+def escaped_locals(body: Any) -> set[int]:
+    """Handles of local buffers whose address escapes (they live in memory)."""
+
+    import tvm
+    from tvm import tirx
+
+    escaped: set[int] = set()
+
+    def addressed(node: Any) -> int | None:
+        if type_key(node) == "ir.TensorLoad":
+            return handle(node.source)
+        if type_key(node) == "ir.Var":
+            return handle(node)
+        return None
+
+    def visit_call(call: Any, visitor: Any) -> None:
+        name = str(getattr(call.op, "name", ""))
+        if name in ("tirx.address_of", "tirx.buffer_data"):
+            target = addressed(call.args[0]) if call.args else None
+            if target is not None:
+                escaped.add(target)
+            visitor.default_visit(call)
+            return
+        helper = builtins.HELPERS.get(name)
+        if helper is not None and any(r in "ox" for r in helper.roles.rstrip("*")):
+            for position, arg in enumerate(call.args):
+                role = builtins.role(helper.roles, position)
+                if (
+                    role in "ox"
+                    and type_key(arg) == "ir.Call"
+                    and str(getattr(arg.op, "name", "")) == "tirx.address_of"
+                    and type_key(arg.args[0]) == "ir.TensorLoad"
+                ):
+                    for index in arg.args[0].indices:
+                        visitor.visit(index)
+                    continue
+                visitor.visit(arg)
+            return
+        visitor.default_visit(call)
+
+    def visit_decl(node: Any, visitor: Any) -> None:
+        target = addressed(node.data)
+        if target is None and type_key(node.data) == "ir.Call" and \
+                str(getattr(node.data.op, "name", "")) == "tirx.buffer_data":
+            target = addressed(node.data.args[0])
+        if target is not None:
+            escaped.add(target)
+        visitor.default_visit(node)
+
+    structural_visit(body, [(tvm.ir.Call, visit_call), (tirx.DeclBuffer, visit_decl)])
+    return escaped
+
+
+class MemoryMixin:
+    """Buffer resolution and access lowering (mixed into ``Lowerer``)."""
+
+    # -- declarations ------------------------------------------------------
+    def declare_alloc(self: "Lowerer", node: Any) -> None:
+        var = node.buffer
+        ty = var.ty
+        scope = str(ty.storage_scope)
+        info = buffer_shape(ty)
+        static = info.static_shape
+        name = str(var.name)
+        elem_ty = self.ty(info.dtype, node)
+        if scope == "local" and static is not None and info.layout is None and not info.strides \
+                and handle(var) not in self.escaped:
+            count = 1
+            for extent in static:
+                count *= extent
+            regs = [self.builder.reg(elem_ty, name=name) for _ in range(count)]
+            self.refs[handle(var)] = RegArray(regs=regs, info=info)
+            return
+        space = _SPACES.get(scope)
+        if space not in ("Local", "Shared") or static is None:
+            raise _Unsupported(node, f"allocation in scope {scope!r} with shape {[str(s) for s in info.shape]}")
+        numel = _numel(static)
+        buf = self.builder.buffer(
+            pb.BufferDecl(
+                name=name, space=space, dtype=elem_ty,
+                shape=tuple(pb.DimExpr.const(e) for e in static),
+                byte_len=pb.DimExpr.const((numel * dtypes.bits(info.dtype) + 7) // 8),
+                align=max(16, int(ty.data_alignment)),
+            )
+        )
+        if scope == "shared.dyn":
+            self.dyn_pools.add(buf)
+        self.refs[handle(var)] = MemRef(buf=buf, space=space, info=info)
+
+    def declare_view(self: "Lowerer", node: Any) -> None:
+        var = node.buffer
+        ty = var.ty
+        scope = str(ty.storage_scope)
+        info = buffer_shape(ty)
+        name = str(var.name)
+        data = node.data
+        offset = ty.elem_offset
+        elem_ty = self.ty(info.dtype, node)
+        backing = None
+        if type_key(data) == "ir.Call" and str(data.op.name) == "tirx.buffer_data":
+            backing = self.refs.get(handle(data.args[0]))
+        elif type_key(data) == "ir.Var":
+            backing = self.refs.get(handle(data))
+        if scope == "tmem":
+            raise _Unsupported(node, "TMEM buffer views")
+        if isinstance(backing, MemRef) and type_key(offset) == "ir.IntImm":
+            parent = self.builder.program.buffers[backing.buf]
+            static = info.static_shape
+            shape = tuple(pb.DimExpr.const(e) for e in static) if static is not None else \
+                tuple(self.dim_expr(e) for e in info.shape)
+            byte_len = pb.DimExpr.const((_numel(static) * dtypes.bits(info.dtype) + 7) // 8) \
+                if static is not None else None
+            base = (int(offset.value) * dtypes.bits(info.dtype)) // 8
+            buf = self.builder.buffer(
+                pb.BufferDecl(
+                    name=name, space=parent.space, dtype=elem_ty, shape=shape,
+                    byte_len=byte_len, align=int(ty.data_alignment), view_of=backing.buf, base=base,
+                )
+            )
+            self.refs[handle(var)] = MemRef(buf=buf, space=backing.space, info=info)
+            return
+        if isinstance(backing, RegArray):
+            raise _Unsupported(node, "view of a register-promoted local (escape analysis gap)")
+        if isinstance(backing, PtrRef):
+            extra = self.element_bytes(backing.info.dtype, self.expr(backing.elem_offset))
+            base = self.binary("Add", pb.Ty("U64"), backing.base, extra)
+            self.refs[handle(var)] = PtrRef(base=base, info=info, elem_offset=offset)
+            return
+        base = self.as_address(self.expr(data))
+        self.refs[handle(var)] = PtrRef(base=base, info=info, elem_offset=offset)
+
+    def finish_shared(self: "Lowerer") -> int:
+        """Size dynamic pools from their views, assign CTA shared bases; returns static bytes."""
+        program = self.builder.program
+        ends: dict[int, int] = {}
+        for decl in program.buffers:
+            if decl.view_of is not None and decl.byte_len is not None and decl.byte_len.is_const:
+                end = decl.base + decl.byte_len.value
+                ends[decl.view_of] = max(ends.get(decl.view_of, 0), end)
+        cursor = 0
+        for index, decl in enumerate(program.buffers):
+            if decl.space != "Shared" or decl.view_of is not None:
+                continue
+            size = decl.byte_len.value if decl.byte_len is not None else 0
+            if index in self.dyn_pools:
+                size = max(size, ends.get(index, 0), self.dyn_smem_bytes or 0)
+            align = max(16, decl.align)
+            cursor = (cursor + align - 1) // align * align
+            program.buffers[index] = pb.BufferDecl(
+                name=decl.name, space=decl.space, dtype=decl.dtype, shape=decl.shape,
+                strides=decl.strides, param_slot=decl.param_slot, base=cursor,
+                byte_len=pb.DimExpr.const(size), align=align,
+            )
+            cursor += size
+        return cursor
+
+    # -- offsets -----------------------------------------------------------
+    def index_dtype(self: "Lowerer", indices: Any) -> str:
+        for index in indices:
+            if dtypes.dtype_of(index) in ("int64", "uint64"):
+                return "int64"
+        return "int32"
+
+    def flat_offset(self: "Lowerer", ref: BufferRef, indices: Any) -> tuple[pb.Operand, int]:
+        """Physical element offset of ``indices`` and the access lane count."""
+        info = ref.info
+        lanes = 1
+        idx_dtype = self.index_dtype(indices)
+        lowered = []
+        for index in indices:
+            if type_key(index) == "prim.Ramp":
+                stride = index.stride
+                if type_key(stride) != "ir.IntImm" or int(stride.value) != 1:
+                    raise _Unsupported(index, "non-unit Ramp index")
+                lanes = int(index.lanes)
+                index = index.base
+            lowered.append(self.cast_to(self.expr(index), idx_dtype))
+        if info.strides:
+            terms = [self.mul_extent(v, s, idx_dtype) for v, s in zip(lowered, info.strides)]
+            flat = terms[0] if terms else self.const(idx_dtype, 0)
+            for term in terms[1:]:
+                flat = self.binary("Add", idx_dtype, flat, term)
+        else:
+            flat = None
+            for axis, value in enumerate(lowered):
+                if flat is None:
+                    flat = value
+                else:
+                    flat = self.mul_extent(flat, info.shape[axis], idx_dtype)
+                    flat = self.binary("Add", idx_dtype, flat, value)
+            if flat is None:
+                flat = self.const(idx_dtype, 0)
+        if info.layout is not None:
+            flat = self.apply_layout(info.layout, flat, idx_dtype)
+        return flat, lanes
+
+    def mul_extent(self: "Lowerer", value: pb.Operand, factor: Any, dtype: str) -> pb.Operand:
+        if type_key(factor) == "ir.IntImm":
+            amount = int(factor.value)
+            if amount == 1:
+                return value
+            if isinstance(value, pb.Const):
+                return self.const(dtype, self.const_int(value) * amount)
+            return self.binary("Mul", dtype, value, self.const(dtype, amount))
+        return self.binary("Mul", dtype, value, self.cast_to(self.expr(factor), dtype))
+
+    def apply_layout(self: "Lowerer", layout: Any, flat: pb.Operand, dtype: str) -> pb.Operand:
+        key = handle(layout)
+        cached = self.layout_exprs.get(key)
+        if cached is None:
+            from tvm import tirx
+
+            var = tirx.Var("flat", dtype)
+            mapped = layout.apply(var)
+            axes = {str(k): v for k, v in mapped.items()}
+            if set(axes) != {"m"}:
+                raise _Unsupported(None, f"layout maps to non-memory axes {sorted(axes)}")
+            cached = (var, axes["m"])
+            self.layout_exprs[key] = cached
+        var, expr = cached
+        self.vars[handle(var)] = flat
+        try:
+            return self.cast_to(self.expr(expr), dtype)
+        finally:
+            del self.vars[handle(var)]
+
+    def element_bytes(self: "Lowerer", dtype: str, offset: pb.Operand) -> pb.Operand:
+        """Byte offset (u64) of ``offset`` elements of TVM ``dtype``."""
+        width = dtypes.bits(dtype)
+        wide = self.cast_to(offset, "int64")
+        if width % 8 == 0:
+            scaled = wide if width == 8 else self.binary("Mul", "int64", wide, self.const("int64", width // 8))
+        else:
+            scaled = self.binary("Shr", "int64", self.binary("Mul", "int64", wide, self.const("int64", width)),
+                                 self.const("int64", 3))
+        return self.reinterpret(scaled, pb.Ty("U64"))
+
+    def as_address(self: "Lowerer", value: pb.Operand) -> pb.Operand:
+        """A 64-bit generic address value."""
+        ty = self.operand_ty(value)
+        if ty == pb.Ty("U64"):
+            return value
+        if ty.bits == 64:
+            return self.reinterpret(value, pb.Ty("U64"))
+        return self.cast_to(value, pb.Ty("U64"))
+
+    # -- accesses ----------------------------------------------------------
+    def ref_of(self: "Lowerer", var: Any) -> BufferRef | None:
+        return self.refs.get(handle(var))
+
+    def access_ty(self: "Lowerer", ref: BufferRef, lanes: int, node: Any) -> pb.Ty:
+        ty = self.ty(ref.info.dtype, node)
+        return ty if lanes == 1 else ty.with_lanes(ty.lanes * lanes)
+
+    def load(self: "Lowerer", node: Any) -> pb.Operand:
+        ref = self.ref_of(node.source)
+        if ref is None:
+            raise _Unsupported(node, f"load from unknown buffer {node.source.name}")
+        if isinstance(ref, RegArray):
+            return self.reg_array_read(node, ref, node.indices)
+        offset, lanes = self.flat_offset(ref, node.indices)
+        ty = self.access_ty(ref, lanes, node)
+        dst = self.builder.reg(ty)
+        if isinstance(ref, MemRef):
+            site = self.site(node, buffer=ref.buf)
+            self.builder.emit("Load", site=site, ty=ty, dst=dst, buf=ref.buf, offset=offset,
+                              mods=pb.mem_mods(), **_WEAK)
+        else:
+            addr = self.ptr_address(ref, offset)
+            self.builder.emit("LoadAddr", site=self.site(node), ty=ty, dst=dst, addr=addr, space="Generic",
+                              mods=pb.mem_mods(), **_WEAK)
+        return dst
+
+    def store(self: "Lowerer", node: Any, var: Any, indices: Any, value: pb.Operand) -> None:
+        ref = self.ref_of(var)
+        if ref is None:
+            raise _Unsupported(node, f"store to unknown buffer {var.name}")
+        if isinstance(ref, RegArray):
+            self.reg_array_write(node, ref, indices, value)
+            return
+        offset, lanes = self.flat_offset(ref, indices)
+        ty = self.access_ty(ref, lanes, node)
+        value = self.cast_to(value, ty)
+        if isinstance(ref, MemRef):
+            site = self.site(node, buffer=ref.buf)
+            self.builder.emit("Store", site=site, ty=ty, buf=ref.buf, offset=offset, value=value,
+                              mods=pb.mem_mods(), **_WEAK)
+        else:
+            addr = self.ptr_address(ref, offset)
+            self.builder.emit("StoreAddr", site=self.site(node), ty=ty, addr=addr, space="Generic",
+                              value=value, mods=pb.mem_mods(), **_WEAK)
+
+    def ptr_address(self: "Lowerer", ref: PtrRef, offset: pb.Operand) -> pb.Operand:
+        total = offset
+        if not (type_key(ref.elem_offset) == "ir.IntImm" and int(ref.elem_offset.value) == 0):
+            ty = self.operand_ty(offset)
+            total = self.binary("Add", ty, offset, self.cast_to(self.expr(ref.elem_offset), ty))
+        return self.binary("Add", pb.Ty("U64"), ref.base, self.element_bytes(ref.info.dtype, total))
+
+    def address_of(self: "Lowerer", node: Any) -> pb.Operand:
+        """``address_of(x)``: generic 64-bit address."""
+        target = node.args[0]
+        kind = type_key(target)
+        if kind == "ir.Var":
+            ref = self.refs.get(handle(target))
+            if isinstance(ref, MemRef):
+                return self.addr_of(ref.buf, self.const("int32", 0))
+            raise _Unsupported(node, f"address of variable {target.name}")
+        if kind != "ir.TensorLoad":
+            raise _Unsupported(node, f"address of {kind}")
+        ref = self.ref_of(target.source)
+        if ref is None:
+            raise _Unsupported(node, f"address of unknown buffer {target.source.name}")
+        if isinstance(ref, RegArray):
+            raise _Unsupported(node, "address of a register-promoted local")
+        offset, _ = self.flat_offset(ref, target.indices)
+        if isinstance(ref, MemRef):
+            return self.addr_of(ref.buf, offset)
+        return self.ptr_address(ref, offset)
+
+    def addr_of(self: "Lowerer", buf: int, offset: pb.Operand) -> pb.Reg:
+        dst = self.builder.reg(pb.Ty("U64"))
+        self.builder.emit("AddrOf", dst=dst, buf=buf, offset=offset)
+        return dst
+
+    def buffer_data(self: "Lowerer", node: Any) -> pb.Operand:
+        var = node.args[0]
+        ref = self.refs.get(handle(var))
+        if isinstance(ref, MemRef):
+            return self.addr_of(ref.buf, self.const("int32", 0))
+        if isinstance(ref, PtrRef):
+            return self.ptr_address(ref, self.const("int32", 0))
+        raise _Unsupported(node, f"buffer_data of {var.name}")
+
+    def buffer_target(self: "Lowerer", addr_node: Any) -> tuple[int, pb.Operand] | None:
+        """``(buf, element offset)`` if ``addr_node`` is ``address_of(buf[...])`` of a MemRef."""
+        if type_key(addr_node) != "ir.Call" or str(getattr(addr_node.op, "name", "")) != "tirx.address_of":
+            return None
+        target = addr_node.args[0]
+        if type_key(target) != "ir.TensorLoad":
+            return None
+        ref = self.ref_of(target.source)
+        if not isinstance(ref, MemRef):
+            return None
+        offset, lanes = self.flat_offset(ref, target.indices)
+        return ref.buf, offset
+
+    # -- register arrays ---------------------------------------------------
+    def reg_array_slot(self: "Lowerer", ref: RegArray, indices: Any) -> int | pb.Operand:
+        static = ref.info.static_shape
+        assert static is not None
+        if all(type_key(i) == "ir.IntImm" for i in indices):
+            flat = 0
+            for extent, index in zip(static, indices):
+                flat = flat * extent + int(index.value)
+            if not 0 <= flat < len(ref.regs):
+                raise _Unsupported(None, f"constant index {flat} outside local array of {len(ref.regs)}")
+            return flat
+        offset, lanes = self.flat_offset(ref, indices)
+        if lanes != 1:
+            raise _Unsupported(None, "vector access to a register-promoted local")
+        return offset
+
+    def reg_array_read(self: "Lowerer", node: Any, ref: RegArray, indices: Any) -> pb.Operand:
+        if any(type_key(i) == "prim.Ramp" for i in indices):
+            raise _Unsupported(node, "vector (Ramp) read of a register-promoted local")
+        slot = self.reg_array_slot(ref, indices)
+        if isinstance(slot, int):
+            reg = ref.regs[slot]
+            return self.pred_args.get(reg.index, reg)
+        dst = self.builder.reg(self.builder.reg_ty(ref.regs[0]))
+        self.builder.emit("LoadRegIndexed", site=self.site(node), dst=dst, base=ref.regs[0],
+                          len=len(ref.regs), idx=slot)
+        return dst
+
+    def reg_array_write(self: "Lowerer", node: Any, ref: RegArray, indices: Any, value: pb.Operand) -> None:
+        if any(type_key(i) == "prim.Ramp" for i in indices):
+            raise _Unsupported(node, "vector (Ramp) write of a register-promoted local")
+        elem = self.builder.reg_ty(ref.regs[0])
+        value = self.cast_to(value, elem)
+        slot = self.reg_array_slot(ref, indices)
+        if isinstance(slot, int):
+            reg = ref.regs[slot]
+            self.builder.set_uniform(reg, False)
+            self.builder.emit("Mov", dst=reg, src=value)
+            return
+        self.builder.emit("StoreRegIndexed", site=self.site(node), base=ref.regs[0], len=len(ref.regs),
+                          idx=slot, value=value)
+
+    # -- lvalues (destination operands) -----------------------------------
+    def lvalue_target(self: "Lowerer", node: Any, ty_hint: pb.Ty | None = None) -> tuple[pb.Reg, Any]:
+        """A register to write for lvalue ``node`` and a write-back thunk (or None)."""
+        kind = type_key(node)
+        if kind == "ir.Call" and str(node.op.name) == "tirx.address_of":
+            node = node.args[0]
+            kind = type_key(node)
+        if kind != "ir.TensorLoad":
+            raise _Unsupported(node, f"destination operand is a {kind}")
+        ref = self.ref_of(node.source)
+        if isinstance(ref, RegArray) and not any(type_key(i) == "prim.Ramp" for i in node.indices):
+            slot = self.reg_array_slot(ref, node.indices)
+            if isinstance(slot, int):
+                reg = ref.regs[slot]
+                self.builder.set_uniform(reg, False)
+                return reg, None
+        dtype = dtypes.dtype_of(node)
+        temp = self.builder.reg(self.ty(dtype, node) if dtype else ty_hint)
+        source, indices = node.source, node.indices
+
+        def write_back() -> None:
+            self.store(node, source, indices, temp)
+
+        return temp, write_back
+
+
+def _numel(shape: tuple[int, ...] | None) -> int:
+    total = 1
+    for extent in shape or ():
+        total *= extent
+    return total
+
+
+__all__ = ["BufferRef", "MemRef", "MemoryMixin", "PtrRef", "RegArray", "escaped_locals", "handle"]
