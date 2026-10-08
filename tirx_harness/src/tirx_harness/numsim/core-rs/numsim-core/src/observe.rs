@@ -306,6 +306,11 @@ pub enum SyncKind {
         footprint: Vec<(AllocId, ByteSpan)>,
         /// W6 view of the same issue.
         targets: Vec<AsyncTarget>,
+        /// For `TcgenCommit`: `true` when the commit is `.sync_restrict`
+        /// (tracks only the shared-operand read ops in `preds`, not the MMAs),
+        /// so a checker never implies completion of earlier tcgen05 work
+        /// from a restricted commit (W5 delta T15 caveat). `false` otherwise.
+        restricted: bool,
     },
     AsyncComplete { op: AsyncId, milestone: Side, target: PublishTarget },
     /// A `WaitUntil` succeeded for the lanes in `verdicts` (plan 2.5).
