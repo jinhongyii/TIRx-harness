@@ -18,6 +18,9 @@
 //!   32B atoms, 5 = 128B with 32B atoms + 8B flip, 6 = 128B with 64B atoms
 //!   (the `CUtensorMapSwizzle` numbering), 7 = 96B (sm_103a
 //!   `tensormap.replace.swizzle_mode` 4; NumSim extension).
+//!   `swizzle_atomicity` (0 = implied by `swizzle`, 1 = 32B, 2 = 32B + 8B
+//!   flip, 3 = 64B) names atomicities codes 4..6 cannot (decode emits it only
+//!   then; codes 4..6 plus a different nonzero override are invalid).
 //! * `interleave`: 0 none, 1 = 16B, 2 = 32B (`CUtensorMapInterleave`).
 //! * `oob_fill`: 0 zero, 1 NaN-request-zero-FMA.
 //! * `global_stride[i]` is the byte stride of dimension `i + 1`;
@@ -26,19 +29,19 @@
 //!   `BF16`, `S32`, `U32`, `F32`, `TF32`, `F64`, `S64`, `U64`, `E2M1`
 //!   (packed 16U4_ALIGN8B layout). The image types U6, U32x2, F32_FTZ and
 //!   TF32_FTZ have no `Dtype` and decode as `Unsupported`.
-//!
-//! `TensorMapDesc` carries no im2col pixel-box corners: im2col plans use a
-//! zero bounding box (lower = upper = 0), and images with nonzero corners
-//! decode as `Unsupported`.
+//! * `im2col`: the image's im2col extension (corners, `wide`); `None` =
+//!   tiled. An im2col-mode plan on a map without a box uses a zero
+//!   bounding box (lower = upper = 0, `wide` from the mode).
 
-use super::{OpError, OpResult, TensorMapDesc, TmaPlan};
+use super::{Im2colBox, OpError, OpResult, TensorMapDesc, TmaFill, TmaPlan, TmaPlanDir};
 use crate::arena::ByteSpan;
 use crate::dtype::Dtype;
 use crate::program::{TmaMode, TmapField};
 use numsim_oplib::tma::{
-    plan_gather4_g2s, plan_im2col_g2s, plan_im2col_s2g, plan_tiled_g2s, ByteRun, Fp4SharedLayout,
-    G2sPlan, Im2colMode, S2gPlan, SwizzleAtomicity, TensorMapElementType, TensorMapFillMode,
-    TensorMapIm2col, TensorMapImage, TENSOR_MAP_DESCRIPTOR_BYTES,
+    plan_gather4_g2s, plan_im2col_g2s, plan_im2col_s2g, plan_tiled_g2s, plan_tiled_s2g, ByteRun,
+    Fp4SharedLayout, G2sPlan, Im2colMode, S2gPlan, SwizzleAtomicity, TensorMapElementType,
+    TensorMapFillMode, TensorMapIm2col, TensorMapImage, TensorMapLayout,
+    TENSOR_MAP_DESCRIPTOR_BYTES,
 };
 
 /// Reserved descriptor-tail byte that carries `l2_promotion`.
@@ -125,22 +128,65 @@ fn swizzle_to_image(code: u8) -> OpResult<(Option<usize>, SwizzleAtomicity)> {
     })
 }
 
-fn swizzle_from_image(bytes: Option<usize>, atomicity: SwizzleAtomicity) -> OpResult<u8> {
-    Ok(match (bytes, atomicity) {
-        (None, SwizzleAtomicity::B16) => 0,
-        (Some(32), SwizzleAtomicity::B16) => 1,
-        (Some(64), SwizzleAtomicity::B16) => 2,
-        (Some(128), SwizzleAtomicity::B16) => 3,
-        (Some(128), SwizzleAtomicity::B32) => 4,
-        (Some(128), SwizzleAtomicity::B32Flip8) => 5,
-        (Some(128), SwizzleAtomicity::B64) => 6,
-        (Some(96), SwizzleAtomicity::B16) => 7,
-        (bytes, atomicity) => {
+fn atomicity_from_code(code: u8) -> OpResult<SwizzleAtomicity> {
+    Ok(match code {
+        0 => SwizzleAtomicity::B16,
+        1 => SwizzleAtomicity::B32,
+        2 => SwizzleAtomicity::B32Flip8,
+        3 => SwizzleAtomicity::B64,
+        _ => {
             return Err(OpError::invalid(format!(
-                "TensorMap swizzle {bytes:?}B with {atomicity:?} atomicity has no swizzle code"
+                "TensorMap swizzle atomicity code {code} is invalid"
             )))
         }
     })
+}
+
+fn atomicity_code(atomicity: SwizzleAtomicity) -> u8 {
+    match atomicity {
+        SwizzleAtomicity::B16 => 0,
+        SwizzleAtomicity::B32 => 1,
+        SwizzleAtomicity::B32Flip8 => 2,
+        SwizzleAtomicity::B64 => 3,
+    }
+}
+
+/// `(swizzle, swizzle_atomicity)` contract codes of an image swizzle.
+fn swizzle_from_image(bytes: Option<usize>, atomicity: SwizzleAtomicity) -> OpResult<(u8, u8)> {
+    let width = match bytes {
+        None => 0,
+        Some(32) => 1,
+        Some(64) => 2,
+        Some(128) => 3,
+        Some(96) => 7,
+        Some(other) => {
+            return Err(OpError::invalid(format!(
+                "TensorMap swizzle {other}B has no code"
+            )))
+        }
+    };
+    Ok(match (width, atomicity) {
+        (3, SwizzleAtomicity::B32) => (4, 0),
+        (3, SwizzleAtomicity::B32Flip8) => (5, 0),
+        (3, SwizzleAtomicity::B64) => (6, 0),
+        (width, atomicity) => (width, atomicity_code(atomicity)),
+    })
+}
+
+/// Image swizzle of the contract `(swizzle, swizzle_atomicity)` codes.
+fn swizzle_of_desc(desc: &TensorMapDesc) -> OpResult<(Option<usize>, SwizzleAtomicity)> {
+    let (bytes, implied) = swizzle_to_image(desc.swizzle)?;
+    if desc.swizzle_atomicity == 0 {
+        return Ok((bytes, implied));
+    }
+    let explicit = atomicity_from_code(desc.swizzle_atomicity)?;
+    if (4..=6).contains(&desc.swizzle) && explicit != implied {
+        return Err(OpError::invalid(format!(
+            "TensorMap swizzle code {} conflicts with swizzle_atomicity {}",
+            desc.swizzle, desc.swizzle_atomicity
+        )));
+    }
+    Ok((bytes, explicit))
 }
 
 fn interleave_to_image(code: u8) -> OpResult<Option<usize>> {
@@ -173,10 +219,7 @@ fn to_usize(value: u64, what: &str) -> OpResult<usize> {
 /// Structural conversion (no range validation: `TensorMapImage::encode` and
 /// `materialize` own those). Unused axes (`>= rank`) with a zero
 /// dimension/box/element stride become 1, the image's canonical filler.
-fn desc_to_image(
-    desc: &TensorMapDesc,
-    im2col: Option<TensorMapIm2col>,
-) -> OpResult<TensorMapImage> {
+fn desc_to_image(desc: &TensorMapDesc) -> OpResult<TensorMapImage> {
     let rank = usize::from(desc.rank);
     if !(1..=5).contains(&rank) {
         return Err(OpError::invalid(format!(
@@ -184,7 +227,7 @@ fn desc_to_image(
         )));
     }
     let (element_type, fp4_shared_layout) = elem_to_image(desc.elem)?;
-    let (swizzle_bytes, swizzle_atomicity) = swizzle_to_image(desc.swizzle)?;
+    let (swizzle_bytes, swizzle_atomicity) = swizzle_of_desc(desc)?;
     let fill_mode = match desc.oob_fill {
         0 => TensorMapFillMode::Zero,
         1 => TensorMapFillMode::OobNan,
@@ -234,7 +277,11 @@ fn desc_to_image(
         swizzle_bytes,
         swizzle_atomicity,
         fill_mode,
-        im2col,
+        im2col: desc.im2col.map(|b| TensorMapIm2col {
+            lower: b.lower,
+            upper: b.upper,
+            wide: b.wide,
+        }),
     })
 }
 
@@ -244,20 +291,9 @@ fn image_to_desc(image: &TensorMapImage, l2_promotion: u8) -> OpResult<TensorMap
             "TensorMap image is relocated to an allocation id, not a global virtual address",
         ));
     }
-    if let Some(im2col) = &image.im2col {
-        if im2col
-            .lower
-            .iter()
-            .chain(&im2col.upper)
-            .any(|corner| *corner != 0)
-            || im2col.wide
-        {
-            return Err(OpError::unsupported(
-                "im2col TensorMap bounding-box corners are not representable in TensorMapDesc",
-            ));
-        }
-    }
     let rank = u8::try_from(image.rank).map_err(|_| OpError::invalid("TensorMap rank overflow"))?;
+    let (swizzle, swizzle_atomicity) =
+        swizzle_from_image(image.swizzle_bytes, image.swizzle_atomicity)?;
     let mut desc = TensorMapDesc {
         global_address: image.allocation_id,
         rank,
@@ -266,9 +302,15 @@ fn image_to_desc(image: &TensorMapImage, l2_promotion: u8) -> OpResult<TensorMap
             image.fp4_shared_layout,
         )?),
         interleave: interleave_from_image(image.interleave_bytes)?,
-        swizzle: swizzle_from_image(image.swizzle_bytes, image.swizzle_atomicity)?,
+        swizzle,
+        swizzle_atomicity,
         l2_promotion,
         oob_fill: u8::from(image.fill_mode == TensorMapFillMode::OobNan),
+        im2col: image.im2col.as_ref().map(|b| Im2colBox {
+            lower: b.lower,
+            upper: b.upper,
+            wide: b.wide,
+        }),
         ..TensorMapDesc::default()
     };
     for axis in 0..5 {
@@ -288,17 +330,16 @@ fn image_to_desc(image: &TensorMapImage, l2_promotion: u8) -> OpResult<TensorMap
 // encode / decode / replace
 // ---------------------------------------------------------------------------
 
-fn try_encode(desc: &TensorMapDesc) -> OpResult<[u8; 128]> {
-    let image = desc_to_image(desc, None)?;
+pub(super) fn try_encode(desc: &TensorMapDesc) -> OpResult<[u8; 128]> {
+    let image = desc_to_image(desc)?;
     let mut bytes = [0_u8; 128];
     image.write_descriptor(&mut bytes)?;
     bytes[L2_PROMOTION_BYTE] = desc.l2_promotion;
     Ok(bytes)
 }
 
-/// Encode. The contract signature cannot fail: a descriptor outside the
-/// image's ranges (or with an unmappable field) encodes as all zeros, which
-/// [`decode`] rejects (invalid magic), so every later use fails closed.
+/// Encode; a descriptor outside the image's ranges (or with an unmappable
+/// field) encodes as all zeros, which [`decode`] rejects (invalid magic).
 pub(super) fn encode(desc: &TensorMapDesc) -> [u8; 128] {
     try_encode(desc).unwrap_or([0; 128])
 }
@@ -340,7 +381,7 @@ pub(super) fn replace(
         desc.global_address = value;
         return Ok(());
     }
-    let mut image = desc_to_image(desc, None)?;
+    let mut image = desc_to_image(desc)?;
     let value_usize = to_usize(value, "replacement value")?;
     let name = match field {
         TmapField::SwizzleAtomicity => {
@@ -462,25 +503,32 @@ fn load_plan(
         &plan.source_runs,
         global_address,
     )?;
-    if plan.fill_mode == TensorMapFillMode::OobNan && !smem_oob_fill.is_empty() {
-        return Err(OpError::unsupported(
-            "TMA OOB-NaN fill is not representable in TmaPlan (smem_oob_fill is zero fill)",
-        ));
-    }
-    if matches!(
-        element_type,
-        TensorMapElementType::Tf32 | TensorMapElementType::Tf32Ftz
-    ) && !global.is_empty()
-    {
-        return Err(OpError::unsupported(
-            "TMA load of a TF32 TensorMap rounds f32 to tf32, which a TmaPlan byte copy cannot express",
-        ));
-    }
+    let (fill, fill_pattern) = match plan.fill_mode {
+        TensorMapFillMode::Zero => (TmaFill::Zero, Vec::new()),
+        TensorMapFillMode::OobNan => {
+            // `materialize_g2s_payload`: every 16 bits of a unit read 0x7ff7.
+            if plan.geometry.unit_bytes < 2 || !plan.geometry.unit_bytes.is_multiple_of(2) {
+                return Err(OpError::invalid(
+                    "TensorMap OOB-NaN fill requires an even floating-point element width",
+                ));
+            }
+            (
+                TmaFill::NanRequestZeroFma,
+                numsim_oplib::scalar::PTX_OOB_NAN.to_le_bytes().to_vec(),
+            )
+        }
+    };
     Ok(TmaPlan {
         global,
         smem,
         smem_oob_fill,
         bytes: plan.payload_len as u64,
+        fill,
+        fill_pattern,
+        tf32_round: matches!(
+            element_type,
+            TensorMapElementType::Tf32 | TensorMapElementType::Tf32Ftz
+        ),
     })
 }
 
@@ -499,40 +547,116 @@ fn store_plan(plan: S2gPlan, global_address: u64, smem_offset: u64) -> OpResult<
     Ok(TmaPlan {
         global,
         smem,
-        smem_oob_fill: Vec::new(),
         bytes: plan.payload_len as u64,
+        ..TmaPlan::default()
     })
 }
 
-/// Address generation. The contract has no direction: every mode yields its
-/// load (global -> shared) plan, except `Im2colNoOffs`, which PTX defines
-/// only for stores and yields the store (shared -> global) plan. A tiled
-/// store may reuse a `Tile` plan's matched spans (identical runs) and ignore
-/// `smem_oob_fill`; store-only checks (non-negative coordinates, 8B-flip
-/// swizzle) are not applied here.
+/// `cp.async.bulk.tensor.2d.global.shared::cta.tile::scatter4`: the mirror of
+/// `plan_gather4_g2s` (four rows `[col, row_i]` of a rank-2 map whose box is
+/// one row) with the tiled-store checks. No legacy oracle exists (legacy did
+/// not model scatter4); PTX defines the same four-row box as gather4.
+fn plan_scatter4_s2g(
+    map: &TensorMapLayout,
+    column: i64,
+    rows: &[i64],
+    base: usize,
+) -> OpResult<S2gPlan> {
+    if map.global_shape.len() != 2 || map.box_shape.len() != 2 || map.box_shape[1] != 1 {
+        return Err(OpError::invalid(
+            "TensorMap scatter4 requires a rank-2 map with outer box extent one",
+        ));
+    }
+    if column < 0 || rows.iter().any(|row| *row < 0) {
+        return Err(OpError::invalid(
+            "tiled TMA store requires nonnegative starting coordinates",
+        ));
+    }
+    if matches!(map.transfer_element_bits(), 4 | 6) {
+        return Err(OpError::unsupported(
+            "sub-byte (FP4/U6) TMA scatter4 store fragments are not modeled",
+        ));
+    }
+    map.validate_swizzle_direction(false)?;
+    let geometry = map.geometry()?;
+    let template = &map.transfer_template;
+    let mut source_runs = Vec::new();
+    let mut destination_runs = Vec::new();
+    for (index, &row) in rows.iter().enumerate() {
+        let payload_base = index * template.payload_len;
+        for mut run in template.bind_global(map, &[column, row])? {
+            run.payload_offset += payload_base;
+            destination_runs.push(run);
+        }
+        for unit in 0..geometry.inner_units {
+            let byte_offset = map.shared_byte_offset(
+                index,
+                unit * geometry.unit_stride_bytes,
+                geometry.inner_row_bytes,
+                base,
+            )?;
+            source_runs.push(ByteRun {
+                byte_offset,
+                payload_offset: payload_base + unit * geometry.unit_bytes,
+                byte_len: geometry.unit_bytes,
+            });
+        }
+    }
+    Ok(S2gPlan {
+        source_runs,
+        destination_runs,
+        destination_bits: Vec::new(),
+        unit_bytes: geometry.unit_bytes.min(16),
+        payload_len: template.payload_len * 4,
+    })
+}
+
+/// Address generation for one direction (see `oplib::tma_plan_dir`).
+///
+/// Load: `Tile`, `TileGather4`, `Im2col`, `Im2colW`, `Im2colW128`.
+/// Store (and reduce): `Tile`, `TileScatter4`, `Im2col`/`Im2colNoOffs`
+/// (spatial, no offsets), `Im2colW`. Other combinations are invalid.
 pub(super) fn plan(
     map: &TensorMapDesc,
+    dir: TmaPlanDir,
     mode: TmaMode,
     coords: &[i64],
     im2col_offsets: &[i64],
     smem_offset: u64,
 ) -> OpResult<TmaPlan> {
-    let im2col = match mode {
-        TmaMode::Im2col | TmaMode::Im2colNoOffs => Some(false),
-        TmaMode::Im2colW | TmaMode::Im2colW128 => Some(true),
-        TmaMode::Tile | TmaMode::TileGather4 => None,
-        TmaMode::TileScatter4 => {
-            return Err(OpError::unsupported(
-                "tma_plan TileScatter4 (tile::scatter4) is not modeled",
-            ))
+    let im2col_mode = match (dir, mode) {
+        (_, TmaMode::Tile)
+        | (TmaPlanDir::Load, TmaMode::TileGather4)
+        | (TmaPlanDir::Store, TmaMode::TileScatter4) => None,
+        (TmaPlanDir::Load, TmaMode::Im2col) => Some(Im2colMode::Spatial),
+        (TmaPlanDir::Store, TmaMode::Im2col | TmaMode::Im2colNoOffs) => Some(Im2colMode::Spatial),
+        (_, TmaMode::Im2colW) => Some(Im2colMode::Wide),
+        (TmaPlanDir::Load, TmaMode::Im2colW128) => Some(Im2colMode::Wide128),
+        (dir, mode) => {
+            return Err(OpError::invalid(format!(
+                "TMA {mode:?} is not a valid {dir:?} mode"
+            )))
+        }
+    };
+    let mut image = desc_to_image(map)?;
+    if let Some(im2col_mode) = im2col_mode {
+        let wide = im2col_mode != Im2colMode::Spatial;
+        match &image.im2col {
+            None => {
+                image.im2col = Some(TensorMapIm2col {
+                    lower: [0; 3],
+                    upper: [0; 3],
+                    wide,
+                })
+            }
+            Some(config) if config.wide != wide => {
+                return Err(OpError::invalid(
+                    "im2col instruction/descriptor layout mismatch (wide)",
+                ))
+            }
+            Some(_) => {}
         }
     }
-    .map(|wide| TensorMapIm2col {
-        lower: [0; 3],
-        upper: [0; 3],
-        wide,
-    });
-    let mut image = desc_to_image(map, im2col)?;
     image.host_address = false;
     image.allocation_id = 0;
     let layout = image.materialize(image.rank, usize::MAX, map.global_address)?;
@@ -549,49 +673,39 @@ pub(super) fn plan(
         }
         Ok(())
     };
-    match mode {
-        TmaMode::Tile => {
-            check_rank(layout.rank())?;
-            load_plan(
-                plan_tiled_g2s(&layout, coords, base)?,
-                element_type,
-                address,
-                smem_offset,
-            )
-        }
-        TmaMode::TileGather4 => {
+    match (dir, mode, im2col_mode) {
+        (TmaPlanDir::Load, TmaMode::TileGather4, _) => {
             check_rank(5)?;
-            load_plan(
-                plan_gather4_g2s(&layout, coords[0], &coords[1..], base)?,
-                element_type,
-                address,
-                smem_offset,
-            )
+            let plan = plan_gather4_g2s(&layout, coords[0], &coords[1..], base)?;
+            load_plan(plan, element_type, address, smem_offset)
         }
-        TmaMode::Im2col | TmaMode::Im2colW | TmaMode::Im2colW128 => {
+        (TmaPlanDir::Store, TmaMode::TileScatter4, _) => {
+            check_rank(5)?;
+            let plan = plan_scatter4_s2g(&layout, coords[0], &coords[1..], base)?;
+            store_plan(plan, address, smem_offset)
+        }
+        (TmaPlanDir::Load, _, None) => {
             check_rank(layout.rank())?;
-            let im2col_mode = match mode {
-                TmaMode::Im2col => Im2colMode::Spatial,
-                TmaMode::Im2colW => Im2colMode::Wide,
-                _ => Im2colMode::Wide128,
-            };
+            let plan = plan_tiled_g2s(&layout, coords, base)?;
+            load_plan(plan, element_type, address, smem_offset)
+        }
+        (TmaPlanDir::Store, _, None) => {
+            check_rank(layout.rank())?;
+            store_plan(plan_tiled_s2g(&layout, coords, base)?, address, smem_offset)
+        }
+        (TmaPlanDir::Load, _, Some(im2col_mode)) => {
+            check_rank(layout.rank())?;
             let plan = plan_im2col_g2s(&layout, coords, im2col_mode, im2col_offsets, base)?;
             load_plan(plan, element_type, address, smem_offset)
         }
-        TmaMode::Im2colNoOffs => {
+        (TmaPlanDir::Store, _, Some(im2col_mode)) => {
             check_rank(layout.rank())?;
             if !im2col_offsets.is_empty() {
-                return Err(OpError::invalid("im2col_no_offs takes no im2col offsets"));
+                return Err(OpError::invalid("im2col TMA store takes no im2col offsets"));
             }
-            store_plan(
-                plan_im2col_s2g(&layout, coords, Im2colMode::Spatial, base)?,
-                address,
-                smem_offset,
-            )
+            let plan = plan_im2col_s2g(&layout, coords, im2col_mode, base)?;
+            store_plan(plan, address, smem_offset)
         }
-        TmaMode::TileScatter4 => Err(OpError::unsupported(
-            "tma_plan TileScatter4 (tile::scatter4) is not modeled",
-        )),
     }
 }
 

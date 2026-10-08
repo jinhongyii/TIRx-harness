@@ -194,7 +194,7 @@ fn arithmetic(op: &str, m: &Md, ops: &Operands) -> OpResult<Resolved> {
             let hot_round = rnd_token.is_empty() || rnd_token == "rn";
             let arity = if kind == Arith::Fma { 3 } else { 2 };
             if hot_round && !sat && flat(ops, 1, arity, 32) {
-                let direct: crate::oplib::PtxFn = match (kind, ftz) {
+                let direct: crate::oplib::ptx::DirectFn = match (kind, ftz) {
                     (Arith::Add, false) => add_f32_direct::<false>,
                     (Arith::Add, true) => add_f32_direct::<true>,
                     (Arith::Sub, false) => sub_f32_direct::<false>,
@@ -372,7 +372,7 @@ fn minmax(op: &str, m: &Md, ops: &Operands) -> OpResult<Resolved> {
                 }
             };
         }
-        let direct: crate::oplib::PtxFn = if three { pick!(3) } else { pick!(2) };
+        let direct: crate::oplib::ptx::DirectFn = if three { pick!(3) } else { pick!(2) };
         return Ok(Resolved::Direct(direct));
     }
     if three {

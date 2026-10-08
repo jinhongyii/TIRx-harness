@@ -1,4 +1,7 @@
-use super::super::{tma_plan, OpErrorKind, TensorMapDesc, TmaPlan};
+use super::super::{
+    tma_plan, tma_plan_dir, tma_tf32_round, Im2colBox, OpErrorKind, TensorMapDesc, TmaFill,
+    TmaPlan, TmaPlanDir,
+};
 use super::L2_PROMOTION_BYTE;
 use crate::arena::ByteSpan;
 use crate::dtype::Dtype;
@@ -20,6 +23,7 @@ fn desc2d(elem: Dtype, dims: [u64; 2], stride: u64, boxes: [u32; 2], swizzle: u8
         swizzle,
         l2_promotion: 0,
         oob_fill: 0,
+        ..TensorMapDesc::default()
     }
 }
 
@@ -78,6 +82,7 @@ fn encode_decode_round_trip() {
         swizzle: 0,
         l2_promotion: 4,
         oob_fill: 0,
+        ..TensorMapDesc::default()
     };
     assert_eq!(TensorMapDesc::decode(&desc5.encode()).unwrap(), desc5);
     // Unused axes with zero fillers encode as the canonical 1.
@@ -209,16 +214,21 @@ fn tiled_box_partially_out_of_bounds() {
     let plan = tma_plan(&desc, TmaMode::Tile, &[-16, 0], &[], 0).unwrap();
     assert!(plan.global.is_empty() && plan.smem.is_empty());
     assert_eq!(plan.smem_oob_fill, vec![ByteSpan::new(0, 128)]);
-    // NaN fill cannot be expressed as zero fill.
+    assert_eq!(
+        (plan.fill, plan.fill_pattern.is_empty()),
+        (TmaFill::Zero, true)
+    );
+    // NaN-request-zero-FMA fill: every 16 bits of an OOB element read 0x7ff7.
     let mut nan = desc.clone();
     nan.oob_fill = 1;
+    let plan = tma_plan(&nan, TmaMode::Tile, &[56, 30], &[], 0).unwrap();
+    assert_eq!(plan.fill, TmaFill::NanRequestZeroFma);
+    assert_eq!(plan.fill_pattern, vec![0xf7, 0x7f]);
     assert_eq!(
-        tma_plan(&nan, TmaMode::Tile, &[56, 30], &[], 0)
-            .unwrap_err()
-            .kind,
-        OpErrorKind::Unsupported
+        plan.smem_oob_fill,
+        vec![ByteSpan::new(16, 16), ByteSpan::new(48, 80)]
     );
-    assert!(tma_plan(&nan, TmaMode::Tile, &[0, 0], &[], 0).is_ok());
+    assert!(!plan.tf32_round);
 }
 
 #[test]
@@ -287,26 +297,51 @@ fn im2col_pixels_walk_the_spatial_axis() {
 }
 
 #[test]
-fn unsupported_and_invalid_modes_fail_closed() {
+fn invalid_modes_and_tf32_rounding() {
     let desc = desc2d(Dtype::F16, [64, 32], 128, [16, 4], 0);
+    // scatter4 needs a one-row box; gather4 is load-only, scatter4 store-only.
     assert_eq!(
         tma_plan(&desc, TmaMode::TileScatter4, &[0, 0, 1, 2, 3], &[], 0)
             .unwrap_err()
             .kind,
-        OpErrorKind::Unsupported
+        OpErrorKind::Invalid
     );
+    let row_map = desc2d(Dtype::U8, [64, 32], 64, [32, 1], 0);
+    for (dir, mode) in [
+        (TmaPlanDir::Store, TmaMode::TileGather4),
+        (TmaPlanDir::Load, TmaMode::TileScatter4),
+        (TmaPlanDir::Load, TmaMode::Im2colNoOffs),
+    ] {
+        let error = tma_plan_dir(&row_map, dir, mode, &[0, 0, 1, 2, 3], &[], 0).unwrap_err();
+        assert_eq!(error.kind, OpErrorKind::Invalid, "{dir:?} {mode:?}");
+    }
     assert_eq!(
         tma_plan(&desc, TmaMode::Tile, &[0], &[], 0)
             .unwrap_err()
             .kind,
         OpErrorKind::Invalid
     );
+    // TF32 loads round on landing; stores copy bytes.
     let tf32 = desc2d(Dtype::TF32, [64, 32], 256, [16, 4], 0);
-    assert_eq!(
+    assert!(
         tma_plan(&tf32, TmaMode::Tile, &[0, 0], &[], 0)
-            .unwrap_err()
-            .kind,
-        OpErrorKind::Unsupported
+            .unwrap()
+            .tf32_round
+    );
+    assert!(
+        !tma_plan_dir(&tf32, TmaPlanDir::Store, TmaMode::Tile, &[0, 0], &[], 0)
+            .unwrap()
+            .tf32_round
+    );
+    assert_eq!(
+        tma_tf32_round(0x3f80_1fff),
+        0x3f80_2000,
+        "RNA to 10 mantissa bits"
+    );
+    assert_eq!(
+        tma_tf32_round(0x7fc0_0001),
+        0x7fff_e000,
+        "NaN canonicalizes"
     );
     let mut misaligned = desc.clone();
     misaligned.global_address += 8;
@@ -316,6 +351,172 @@ fn unsupported_and_invalid_modes_fail_closed() {
             .kind,
         OpErrorKind::Invalid
     );
+}
+
+#[test]
+fn tiled_store_skips_oob_and_rejects_negative_coords() {
+    let desc = desc2d(Dtype::F16, [64, 32], 128, [16, 4], 0);
+    let plan = tma_plan_dir(&desc, TmaPlanDir::Store, TmaMode::Tile, &[56, 30], &[], 512).unwrap();
+    assert_eq!(
+        plan.global,
+        vec![
+            ByteSpan::new(VA + 30 * 128 + 112, 16),
+            ByteSpan::new(VA + 31 * 128 + 112, 16)
+        ]
+    );
+    assert_eq!(
+        plan.smem,
+        vec![ByteSpan::new(512, 16), ByteSpan::new(512 + 32, 16)]
+    );
+    assert!(plan.smem_oob_fill.is_empty());
+    assert_eq!(plan.bytes, 128);
+    assert_eq!(
+        tma_plan_dir(&desc, TmaPlanDir::Store, TmaMode::Tile, &[-8, 0], &[], 0)
+            .unwrap_err()
+            .kind,
+        OpErrorKind::Invalid
+    );
+    // 8B-flip atomicity is load-only.
+    let mut flip = desc2d(Dtype::F16, [64, 32], 128, [64, 4], 5);
+    assert!(tma_plan(&flip, TmaMode::Tile, &[0, 0], &[], 0).is_ok());
+    assert!(tma_plan_dir(&flip, TmaPlanDir::Store, TmaMode::Tile, &[0, 0], &[], 0).is_err());
+    flip.swizzle = 3;
+    assert!(tma_plan_dir(&flip, TmaPlanDir::Store, TmaMode::Tile, &[0, 0], &[], 0).is_ok());
+}
+
+#[test]
+fn scatter4_store_mirrors_gather4() {
+    let desc = desc2d(Dtype::U8, [64, 32], 64, [32, 1], 0);
+    let coords = [16, 3, 9, 1, 31];
+    let store = tma_plan_dir(
+        &desc,
+        TmaPlanDir::Store,
+        TmaMode::TileScatter4,
+        &coords,
+        &[],
+        0,
+    )
+    .unwrap();
+    let load = tma_plan(&desc, TmaMode::TileGather4, &coords, &[], 0).unwrap();
+    assert_eq!(
+        (store.global.clone(), store.smem.clone(), store.bytes),
+        (load.global, load.smem, load.bytes)
+    );
+    // The legacy wrapper plans scatter4 as a store.
+    assert_eq!(
+        tma_plan(&desc, TmaMode::TileScatter4, &coords, &[], 0).unwrap(),
+        store
+    );
+    // OOB rows are skipped; negative rows are invalid.
+    let partial = tma_plan_dir(
+        &desc,
+        TmaPlanDir::Store,
+        TmaMode::TileScatter4,
+        &[48, 0, 40, 2, 3],
+        &[],
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        partial.global,
+        vec![
+            ByteSpan::new(VA + 48, 16),
+            ByteSpan::new(VA + 2 * 64 + 48, 16),
+            ByteSpan::new(VA + 3 * 64 + 48, 16)
+        ]
+    );
+    assert_eq!(
+        partial.smem,
+        vec![
+            ByteSpan::new(0, 16),
+            ByteSpan::new(64, 16),
+            ByteSpan::new(96, 16)
+        ]
+    );
+    assert!(tma_plan_dir(
+        &desc,
+        TmaPlanDir::Store,
+        TmaMode::TileScatter4,
+        &[0, -1, 0, 0, 0],
+        &[],
+        0
+    )
+    .is_err());
+}
+
+#[test]
+fn im2col_corners_round_trip_and_bound_the_walk() {
+    // (C=8, W=10, N=2) f16, 8 channels x 4 pixels, W padded by one on each side.
+    let desc = TensorMapDesc {
+        global_address: VA,
+        rank: 3,
+        elem: Some(Dtype::F16),
+        global_dim: [8, 10, 2, 1, 1],
+        global_stride: [16, 160, 0, 0, 0],
+        box_dim: [8, 4, 1, 1, 1],
+        element_stride: [1; 5],
+        im2col: Some(Im2colBox {
+            lower: [-1, 0, 0],
+            upper: [1, 0, 0],
+            wide: false,
+        }),
+        ..TensorMapDesc::default()
+    };
+    let bytes = desc.try_encode().unwrap();
+    assert_eq!(TensorMapDesc::decode(&bytes).unwrap(), desc);
+    // Start at w = -1 (padding: zero fill), then w = 0..2.
+    let plan = tma_plan(&desc, TmaMode::Im2col, &[0, -1, 0], &[0], 0).unwrap();
+    assert_eq!(plan.global, vec![ByteSpan::new(VA, 48)]);
+    assert_eq!(plan.smem, vec![ByteSpan::new(16, 48)]);
+    assert_eq!(plan.smem_oob_fill, vec![ByteSpan::new(0, 16)]);
+    // The walk wraps at w = W + upper = 11 back to lower = -1 of image 1.
+    let plan = tma_plan(&desc, TmaMode::Im2col, &[0, 9, 0], &[0], 0).unwrap();
+    // Pixels: w=9, w=10 (pad), image 1 w=-1 (pad), w=0; (0,9) and (1,0) are
+    // adjacent in global memory.
+    assert_eq!(plan.global, vec![ByteSpan::new(VA + 9 * 16, 32)]);
+    assert_eq!(plan.smem, vec![ByteSpan::new(0, 16), ByteSpan::new(48, 16)]);
+    assert_eq!(plan.smem_oob_fill, vec![ByteSpan::new(16, 32)]);
+    // A wide instruction on a non-wide map is invalid; a tiled one too.
+    assert!(tma_plan(&desc, TmaMode::Im2colW, &[0, 0, 0], &[0, 0], 0).is_err());
+    assert!(tma_plan(&desc, TmaMode::Tile, &[0, 0, 0], &[], 0).is_err());
+    // im2col_no_offs store over the same walk.
+    let mut inside = desc.clone();
+    inside.im2col = Some(Im2colBox::default());
+    let store = tma_plan_dir(
+        &inside,
+        TmaPlanDir::Store,
+        TmaMode::Im2colNoOffs,
+        &[0, 2, 1],
+        &[],
+        0,
+    )
+    .unwrap();
+    assert_eq!(store.global, vec![ByteSpan::new(VA + 160 + 32, 64)]);
+    assert_eq!(store.smem, vec![ByteSpan::new(0, 64)]);
+}
+
+#[test]
+fn swizzle_atomicity_intermediate_states_and_try_encode() {
+    let mut desc = desc2d(Dtype::F16, [64, 32], 128, [64, 8], 4);
+    // 128B/32B atoms -> 64B width keeps 32B atomicity (invalid until fixed).
+    desc.replace(TmapField::SwizzleMode, None, 2).unwrap();
+    assert_eq!((desc.swizzle, desc.swizzle_atomicity), (2, 1));
+    let bytes = desc.encode();
+    assert_eq!(TensorMapDesc::decode(&bytes).unwrap(), desc);
+    assert!(tma_plan(&desc, TmaMode::Tile, &[0, 0], &[], 0).is_err());
+    desc.replace(TmapField::SwizzleAtomicity, None, 0).unwrap();
+    assert_eq!((desc.swizzle, desc.swizzle_atomicity), (2, 0));
+    desc.replace(TmapField::SwizzleMode, None, 3).unwrap();
+    desc.replace(TmapField::SwizzleAtomicity, None, 3).unwrap();
+    assert_eq!((desc.swizzle, desc.swizzle_atomicity), (6, 0));
+    // Conflicting explicit atomicity on a 4..6 code, and range errors.
+    desc.swizzle_atomicity = 1;
+    assert_eq!(desc.try_encode().unwrap_err().kind, OpErrorKind::Invalid);
+    assert_eq!(desc.encode(), [0; 128]);
+    let mut wide = desc2d(Dtype::F16, [64, 32], 129, [64, 8], 3);
+    assert!(wide.try_encode().is_err());
+    wide.global_stride[0] = 128;
+    assert!(wide.try_encode().is_ok());
 }
 
 #[test]

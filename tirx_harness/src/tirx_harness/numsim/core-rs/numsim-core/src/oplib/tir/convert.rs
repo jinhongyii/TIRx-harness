@@ -277,6 +277,13 @@ pub(super) fn cast_elem(from: Dtype, to: Dtype, rnd: Rounding, sat: bool, x: u12
     if rnd == Rounding::Rs {
         return Err(unsupported());
     }
+    // A carried f32 (legacy f32 carrier of a TIR half expression) casts as
+    // the f32 it is; casting back to f16/bf16 rounds it.
+    if matches!(from, Dtype::F16 | Dtype::BF16) {
+        if let Some(v) = super::alu::half_carry(x) {
+            return cast_elem(Dtype::F32, to, rnd, sat, u128::from(v.to_bits()));
+        }
+    }
     if from == to {
         // Same type: the value is already representable.
         return Ok(match to {

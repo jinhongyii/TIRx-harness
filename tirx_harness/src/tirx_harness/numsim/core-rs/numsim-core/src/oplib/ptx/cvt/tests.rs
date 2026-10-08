@@ -180,7 +180,7 @@ fn replay(
             src_tys: &src_tys,
             mask: WarpMask::first_n(count as u32),
         };
-        if let Err(e) = f(&mut io) {
+        if let Err(e) = f.call(&mut io) {
             mismatches.push(format!("{} rows {base}..: execute failed: {e}", spec.name));
             continue;
         }
@@ -273,7 +273,7 @@ fn run1(
         src_tys: &src_tys,
         mask: WarpMask::lane(3),
     };
-    f(&mut io)?;
+    f.call(&mut io)?;
     assert_eq!(dsts[0][0], 0, "inactive lane written");
     Ok(dsts[0][3])
 }

@@ -17,15 +17,15 @@
 //! are sign-extended to the carrier width, then truncated to it).
 //!
 //! # Dispatch
-//! `PtxFn` is a plain `fn` pointer, so parameterized forms are resolved once
-//! into a boxed closure, interned process-wide by (key, tys), and returned as
-//! one of `SLOTS` pre-instantiated trampolines (`tramp::<I>`). Hot
-//! parameterless forms return direct fn items. Exhausting the slots fails
-//! closed (`Unsupported`).
+//! Parameterless hot forms resolve to `PtxFn::new(fn item)`. Parameterized
+//! forms resolve once into a boxed closure capturing the parsed modifiers and
+//! operand layout; it is interned process-wide by (key, tys) and leaked so the
+//! returned `PtxFn` stays `Copy` (bounded by the number of distinct forms).
 
 mod cvt;
 mod helpers;
 mod io;
+mod vector;
 mod warp;
 
 pub(super) mod alu;
@@ -39,49 +39,27 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// A resolved, parameterized op.
-pub(super) type Op = Box<dyn Fn(&mut PtxIo<'_>) -> OpResult + Send + Sync>;
+pub(super) type Op = Box<super::PtxOp>;
 
-/// Distinct parameterized (key, tys) forms per process.
-pub(super) const SLOTS: usize = 2048;
-
-static TABLE: [OnceLock<Op>; SLOTS] = [const { OnceLock::new() }; SLOTS];
-static TRAMPOLINES: [PtxFn; SLOTS] = include!("tramp_table.rs");
-
-fn tramp<const I: usize>(io: &mut PtxIo<'_>) -> OpResult {
-    match TABLE[I].get() {
-        Some(op) => op(io),
-        None => Err(OpError::invalid("unresolved PTX trampoline slot")),
-    }
-}
+/// A plain op fn item (the `Direct` form).
+pub(in crate::oplib) type DirectFn = fn(&mut PtxIo<'_>) -> OpResult;
 
 /// Resolution outcome of a family resolver.
 pub(super) enum Resolved {
     /// A direct fn item (no captured parameters).
-    Direct(PtxFn),
-    /// A parameterized closure; interned behind a trampoline.
+    Direct(DirectFn),
+    /// A parameterized closure; interned and leaked once per distinct form.
     Boxed(Op),
 }
 
 fn intern(identity: String, op: Op) -> OpResult<PtxFn> {
-    static INDEX: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    static INDEX: OnceLock<Mutex<HashMap<String, &'static super::PtxOp>>> = OnceLock::new();
     let mut index = INDEX
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| OpError::invalid("PTX intern table poisoned"))?;
-    if let Some(&slot) = index.get(&identity) {
-        return Ok(TRAMPOLINES[slot]);
-    }
-    let slot = index.len();
-    if slot >= SLOTS {
-        return Err(OpError::unsupported(format!(
-            "more than {SLOTS} distinct parameterized PTX forms in one process"
-        )));
-    }
-    TABLE[slot]
-        .set(op)
-        .map_err(|_| OpError::invalid("PTX trampoline slot reused"))?;
-    index.insert(identity, slot);
-    Ok(TRAMPOLINES[slot])
+    let op: &'static super::PtxOp = *index.entry(identity).or_insert_with(|| Box::leak(op));
+    Ok(PtxFn::from_static(op))
 }
 
 /// Resolve an op for the given operand types.
@@ -89,7 +67,9 @@ pub(super) fn resolve(key: &OpKey, dst_tys: &[Ty], src_tys: &[Ty]) -> OpResult<P
     let mods = Mods::parse(&key.mods);
     let ops = Operands::new(dst_tys, src_tys);
     let name = key.name.as_str();
-    let resolved = if let Some(found) = helpers::resolve(name, &mods, &ops)? {
+    let resolved = if let Some(found) = vector::resolve(name, &mods, &ops)? {
+        found
+    } else if let Some(found) = helpers::resolve(name, &mods, &ops)? {
         found
     } else if let Some(found) = cvt::resolve(name, &mods, &ops)? {
         found
@@ -104,7 +84,7 @@ pub(super) fn resolve(key: &OpKey, dst_tys: &[Ty], src_tys: &[Ty]) -> OpResult<P
         )));
     };
     match resolved {
-        Resolved::Direct(f) => Ok(f),
+        Resolved::Direct(f) => Ok(PtxFn::new(f)),
         Resolved::Boxed(op) => intern(format!("{}|{:?}|{:?}|{:?}", key.name, key.mods, dst_tys, src_tys), op),
     }
 }
@@ -113,6 +93,7 @@ pub(super) fn resolve(key: &OpKey, dst_tys: &[Ty], src_tys: &[Ty]) -> OpResult<P
 /// rejected by modifier/type checks). Used for coverage reports.
 pub(in crate::oplib) fn known_ops() -> Vec<&'static str> {
     let mut names = Vec::new();
+    names.extend_from_slice(vector::NAMES);
     names.extend_from_slice(helpers::NAMES);
     names.extend_from_slice(cvt::NAMES);
     names.extend_from_slice(warp::NAMES);

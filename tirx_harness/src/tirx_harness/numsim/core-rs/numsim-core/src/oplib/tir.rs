@@ -8,6 +8,15 @@
 //! touching lanes, so an unmodeled (op, dtype) is `Unsupported` even under an
 //! empty mask. Outputs are written only for lanes in `mask`.
 //!
+//! f16/bf16 TIR expressions (legacy f32 carrier): legacy evaluated TIR half
+//! arithmetic in f32 and rounded only at a cast to half or a memory store.
+//! A scalar F16/BF16 result that is not exactly representable is therefore
+//! written as its rounded bits (0..16, what stores/PTX ops read) plus the
+//! unrounded f32 in bits 32..64 and `alu::CARRY_FLAG` (bit 16); TIR ops,
+//! compares and casts reading a scalar half honour the carried f32, `Mov`
+//! copies it, stores drop it. Vector halves round per op (no room to carry).
+//! See docs/development/numsim-behaviour-deltas.md (D-1).
+//!
 //! Result types: `Unary` writes a value of `ty`, except `IsNan/IsInf/IsFinite`
 //! which write `Ty{Pred, ty.lanes}` (0/1 per element). `Binary`/`Ternary`
 //! write `ty`. `Compare` takes scalar operands of `ty` and returns the mask.
@@ -36,6 +45,12 @@ fn probe<T>(r: OpResult<T>) -> OpResult {
     }
 }
 
+/// Scalar F16/BF16: values may carry an f32 (see module docs).
+#[inline]
+fn scalar_half(ty: Ty) -> bool {
+    ty.lanes == 1 && matches!(ty.elem, Dtype::F16 | Dtype::BF16)
+}
+
 /// Map `f` over every element of every active lane: inputs of `in_ty`,
 /// output of `out_ty` (same lane count).
 #[inline]
@@ -48,12 +63,19 @@ fn map_elems<const N: usize>(
     mut f: impl FnMut([u128; N]) -> OpResult<u128>,
 ) -> OpResult {
     let (ib, ob) = (in_ty.elem.bits(), out_ty.elem.bits());
+    let (carry_in, carry_out) = (scalar_half(in_ty), scalar_half(out_ty));
     for lane in mask.lanes() {
         let vals: [Packed; N] = std::array::from_fn(|k| load(ins[k], in_ty, lane));
         let mut r: Packed = [0; 4];
         for e in 0..in_ty.lanes as usize {
-            let x: [u128; N] = std::array::from_fn(|k| get(&vals[k], e, ib));
-            put(&mut r, e, ob, f(x)?);
+            let x: [u128; N] =
+                std::array::from_fn(|k| if carry_in { u128::from(vals[k][0]) } else { get(&vals[k], e, ib) });
+            let y = f(x)?;
+            if carry_out {
+                r[0] = y as u64;
+            } else {
+                put(&mut r, e, ob, y);
+            }
         }
         store(out, out_ty, lane, &r);
     }
@@ -110,8 +132,11 @@ pub(super) fn compare(op: CmpOp, ty: Ty, a: &[WarpValue<u64>], b: &[WarpValue<u6
     let bits = ty.elem.bits();
     let mut result = 0u32;
     for lane in mask.lanes() {
-        let x = get(&load(a, ty, lane), 0, bits);
-        let y = get(&load(b, ty, lane), 0, bits);
+        let (x, y) = if scalar_half(ty) {
+            (u128::from(a[0][lane]), u128::from(b[0][lane]))
+        } else {
+            (get(&load(a, ty, lane), 0, bits), get(&load(b, ty, lane), 0, bits))
+        };
         if alu::compare(op, ty.elem, x, y)? {
             result |= 1 << lane;
         }

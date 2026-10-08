@@ -49,6 +49,12 @@ fn shfl_and_redux_follow_legacy_lane_rules() {
     assert_eq!(down[31], 131); // out of range: own value, predicate false
     assert!(!valid.contains(31) && valid.contains(30));
     let (bfly, _) = shfl(ShflMode::Bfly, &src, &[1u64; 32], &c, WarpMask::ALL);
+    let full = [u64::from(u32::MAX); 32];
+    let (checked, ok) = shfl_sync(ShflMode::Down, &src, &b, &c, &full, WarpMask::ALL).unwrap();
+    assert_eq!((checked, ok), (down, valid));
+    // Lane 1 reads lane 2, which is not active: legacy error.
+    let err = shfl_sync(ShflMode::Down, &src, &b, &c, &full, WarpMask(0b11)).unwrap_err();
+    assert_eq!(err.kind, OpErrorKind::Invalid);
     assert_eq!((bfly[0], bfly[1]), (101, 100));
 
     let values: WarpValue<u64> = std::array::from_fn(|l| l as u64);

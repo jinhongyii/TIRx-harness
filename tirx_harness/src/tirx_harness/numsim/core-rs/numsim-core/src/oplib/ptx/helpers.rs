@@ -488,7 +488,7 @@ pub(in crate::oplib) fn resolve(
 ) -> OpResult<Option<Resolved>> {
     use Resolved::Direct;
     let direct =
-        |f: crate::oplib::PtxFn, dsts: &[u32], srcs: &[u32]| -> OpResult<Option<Resolved>> {
+        |f: crate::oplib::ptx::DirectFn, dsts: &[u32], srcs: &[u32]| -> OpResult<Option<Resolved>> {
             no_mods(mods, name)?;
             widths(ops, dsts, srcs, name)?;
             Ok(Some(Direct(f)))
@@ -506,7 +506,7 @@ pub(in crate::oplib) fn resolve(
             // Legacy lowers both on `uint32` operands as bf16x2; a `float16x2`
             // carrier selects the f16x2 form.
             let f16 = ops.src_tys.iter().all(|t| t.elem == Dtype::F16) && !ops.src_tys.is_empty();
-            let f: crate::oplib::PtxFn = match (name == "tirx.cuda.hmin2", f16) {
+            let f: crate::oplib::ptx::DirectFn = match (name == "tirx.cuda.hmin2", f16) {
                 (true, false) => hmin2_bf16,
                 (true, true) => hmin2_f16,
                 (false, false) => hmax2_bf16,

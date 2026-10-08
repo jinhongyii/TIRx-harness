@@ -321,8 +321,70 @@ pub struct PtxIo<'a> {
     pub mask: WarpMask,
 }
 
-/// A resolved generic op.
-pub type PtxFn = fn(&mut PtxIo<'_>) -> OpResult;
+/// A resolved generic op, resolved once at program load: either a plain fn
+/// item (parameterless hot forms) or a closure that carries the parsed
+/// modifiers/operand layout. `Copy` and cheap to call; invoke with
+/// [`PtxFn::call`].
+#[derive(Clone, Copy)]
+pub struct PtxFn {
+    imp: PtxImpl,
+}
+
+/// A parameterized op body (interned and leaked once per distinct
+/// `(OpKey, tys)` per process, so `PtxFn` stays `Copy`).
+pub type PtxOp = dyn Fn(&mut PtxIo<'_>) -> OpResult + Send + Sync;
+
+#[derive(Clone, Copy)]
+enum PtxImpl {
+    Direct(fn(&mut PtxIo<'_>) -> OpResult),
+    Data(&'static PtxOp),
+}
+
+impl PtxFn {
+    /// Wrap a plain function (no captured data).
+    pub const fn new(f: fn(&mut PtxIo<'_>) -> OpResult) -> PtxFn {
+        PtxFn { imp: PtxImpl::Direct(f) }
+    }
+    /// Wrap a `'static` closure.
+    pub const fn from_static(op: &'static PtxOp) -> PtxFn {
+        PtxFn { imp: PtxImpl::Data(op) }
+    }
+    /// Run the op over `io`.
+    #[inline]
+    pub fn call(&self, io: &mut PtxIo<'_>) -> OpResult {
+        match self.imp {
+            PtxImpl::Direct(f) => f(io),
+            PtxImpl::Data(op) => op(io),
+        }
+    }
+    /// Whether this is a plain fn item (no captured data).
+    pub fn is_direct(&self) -> bool {
+        matches!(self.imp, PtxImpl::Direct(_))
+    }
+    /// Identity (same fn item or same interned closure).
+    pub fn same(&self, other: &PtxFn) -> bool {
+        match (self.imp, other.imp) {
+            (PtxImpl::Direct(a), PtxImpl::Direct(b)) => a as usize == b as usize,
+            (PtxImpl::Data(a), PtxImpl::Data(b)) => std::ptr::addr_eq(a as *const PtxOp, b as *const PtxOp),
+            _ => false,
+        }
+    }
+}
+
+impl From<fn(&mut PtxIo<'_>) -> OpResult> for PtxFn {
+    fn from(f: fn(&mut PtxIo<'_>) -> OpResult) -> PtxFn {
+        PtxFn::new(f)
+    }
+}
+
+impl fmt::Debug for PtxFn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.imp {
+            PtxImpl::Direct(p) => write!(f, "PtxFn::Direct({:#x})", p as usize),
+            PtxImpl::Data(op) => write!(f, "PtxFn::Data({:p})", op as *const PtxOp),
+        }
+    }
+}
 
 /// Resolve an interned `OpKey` (op name + canonical modifiers) for the given
 /// operand types, once at program load. Unknown ops/modifiers are
@@ -332,11 +394,38 @@ pub fn resolve_ptx(key: &OpKey, dst_tys: &[Ty], src_tys: &[Ty]) -> OpResult<PtxF
     ptx::resolve(key, dst_tys, src_tys)
 }
 
+/// Every op name `resolve_ptx` recognises (sorted). Individual modifier/type
+/// forms of a listed name may still be rejected; use it for coverage reports
+/// and lowering acceptance checks.
+pub fn ptx_op_names() -> Vec<&'static str> {
+    ptx::known_ops()
+}
+
 // ---------------------------------------------------------------------------
 // Warp collectives
 // ---------------------------------------------------------------------------
 
+/// `shfl.sync` with legacy validation: `active` executes, each lane's
+/// `membermask` names the participants. Returns (values written for `active`
+/// lanes, lanes whose source was in range). A source lane that is not an
+/// active participant is `Invalid` ("warp shuffle reads a non-participant
+/// lane"), as is a lane missing from its own membermask.
+#[inline]
+pub fn shfl_sync(
+    mode: ShflMode,
+    src: &WarpValue<u64>,
+    lane: &WarpValue<u64>,
+    clamp: &WarpValue<u64>,
+    membermask: &WarpValue<u64>,
+    active: WarpMask,
+) -> OpResult<(WarpValue<u64>, WarpMask)> {
+    warp::shfl_sync(mode, src, lane, clamp, membermask, active)
+}
+
 /// `shfl.sync` (32-bit payload slots): (values, lanes whose source was in range).
+/// Infallible compatibility form of [`shfl_sync`] (`members` = active =
+/// participants); a non-member source reads its value with predicate false.
+/// Prefer `shfl_sync`.
 #[inline]
 pub fn shfl(
     mode: ShflMode,
@@ -358,6 +447,16 @@ pub fn redux(op: ReduxOp, ty: Ty, src: &WarpValue<u64>, members: WarpMask) -> Op
 // Tensor maps, descriptors, address generation
 // ---------------------------------------------------------------------------
 
+/// Im2col pixel bounding box of a tensor map (`cuTensorMapEncodeIm2col`
+/// corners; `wide` = `CU_TENSOR_MAP_IM2COL_WIDE` maps for `im2col::w`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Im2colBox {
+    /// Lower corner per spatial dim (D, H, W order as in the image: dims 1..).
+    pub lower: [i16; 3],
+    pub upper: [i16; 3],
+    pub wide: bool,
+}
+
 /// Decoded CUtensorMap. The 128-byte in-memory encoding is NumSim's own
 /// (hardware's is opaque); host ABI and `tensormap.replace` both go through
 /// [`TensorMapDesc::encode`]/[`TensorMapDesc::decode`].
@@ -368,20 +467,37 @@ pub struct TensorMapDesc {
     pub elem: Option<Dtype>,
     /// Elements per dimension (innermost first).
     pub global_dim: [u64; 5],
-    /// Byte strides of dims 1.. (dim 0 is contiguous).
+    /// Byte strides of dims 1.. (`global_stride[i]` = dim `i + 1`; [4] = 0).
     pub global_stride: [u64; 5],
     pub box_dim: [u32; 5],
     pub element_stride: [u32; 5],
+    /// 0 none, 1 = 16B, 2 = 32B.
     pub interleave: u8,
-    /// 0 none, 1 = 32B, 2 = 64B, 3 = 128B, 4+ = 128B atom variants.
+    /// 0 none, 1 = 32B, 2 = 64B, 3 = 128B, 4 = 128B/32B atoms,
+    /// 5 = 128B/32B atoms + 8B flip, 6 = 128B/64B atoms, 7 = 96B.
     pub swizzle: u8,
     pub l2_promotion: u8,
     /// 0 = zero fill, 1 = NaN request-zero FMA fill.
     pub oob_fill: u8,
+    /// Swizzle atomicity override (`tensormap.replace.swizzle_atomicity`
+    /// numbering: 0 = 16B/default, 1 = 32B, 2 = 32B + 8B flip, 3 = 64B).
+    /// 0 keeps the atomicity implied by `swizzle`; decode only sets it for
+    /// combinations `swizzle` codes 4..6 cannot name (e.g. 64B width with 32B
+    /// atoms, an intermediate `tensormap.replace` state).
+    pub swizzle_atomicity: u8,
+    /// Im2col bounding box; `None` = tiled map.
+    pub im2col: Option<Im2colBox>,
 }
 
 impl TensorMapDesc {
     pub const BYTES: usize = 128;
+    /// Encode; an unencodable map (field out of descriptor range, no element
+    /// type, ...) is an error.
+    pub fn try_encode(&self) -> OpResult<[u8; 128]> {
+        tma::try_encode(self)
+    }
+    /// [`Self::try_encode`], with unencodable maps encoded as all zeros (which
+    /// [`Self::decode`] rejects, so every use fails closed).
     pub fn encode(&self) -> [u8; 128] {
         tma::encode(self)
     }
@@ -394,19 +510,63 @@ impl TensorMapDesc {
     }
 }
 
+/// Fill of OOB box elements in a TMA load.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TmaFill {
+    #[default]
+    Zero,
+    /// `CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA`: every 16 bits of an
+    /// OOB element read as the PTX OOB NaN `0x7ff7`.
+    NanRequestZeroFma,
+}
+
 /// Byte-level plan of one TMA transfer: matched element runs between the
 /// global tensor and the (swizzled) shared box, plus OOB-filled smem runs.
 /// Global spans are *virtual addresses*; smem spans are window offsets.
+/// `global` and `smem` have equal totals and pair byte-for-byte in
+/// concatenation order (load: global -> smem; store/reduce: smem -> global).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TmaPlan {
     pub global: Vec<crate::arena::ByteSpan>,
     pub smem: Vec<crate::arena::ByteSpan>,
+    /// Load only: smem bytes of OOB elements, filled per `fill`.
     pub smem_oob_fill: Vec<crate::arena::ByteSpan>,
+    /// Transaction bytes (`complete_tx`; the full box for loads).
     pub bytes: u64,
+    pub fill: TmaFill,
+    /// Byte pattern written repeatedly over each `smem_oob_fill` span from its
+    /// first byte (spans start on element boundaries). Empty = zeros.
+    pub fill_pattern: Vec<u8>,
+    /// Load of a TF32 map: each copied 4-byte element (not the OOB fill) is
+    /// rounded f32 -> tf32 on landing (NaN -> `0x7fffe000`); see
+    /// [`tma_tf32_round`].
+    pub tf32_round: bool,
 }
 
-/// Address generation for `cp.async.bulk.tensor` (tile / im2col modes,
-/// swizzle, OOB). `coords` innermost first.
+/// Direction of a TMA plan (`cp.reduce.async.bulk.tensor` plans as `Store`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TmaPlanDir {
+    #[default]
+    Load,
+    Store,
+}
+
+/// Address generation for `cp.async.bulk.tensor` (tile / gather4 / scatter4
+/// / im2col modes, swizzle, OOB), with the direction's checks. `coords`
+/// innermost first (gather4/scatter4: `[col, row0..row3]`).
+pub fn tma_plan_dir(
+    map: &TensorMapDesc,
+    dir: TmaPlanDir,
+    mode: crate::program::TmaMode,
+    coords: &[i64],
+    im2col_offsets: &[i64],
+    smem_offset: u64,
+) -> OpResult<TmaPlan> {
+    tma::plan(map, dir, mode, coords, im2col_offsets, smem_offset)
+}
+
+/// Legacy entry: [`tma_plan_dir`] with `Load`, except the store-only modes
+/// `Im2colNoOffs` / `TileScatter4`, which plan as `Store`.
 pub fn tma_plan(
     map: &TensorMapDesc,
     mode: crate::program::TmaMode,
@@ -414,7 +574,18 @@ pub fn tma_plan(
     im2col_offsets: &[i64],
     smem_offset: u64,
 ) -> OpResult<TmaPlan> {
-    tma::plan(map, mode, coords, im2col_offsets, smem_offset)
+    use crate::program::TmaMode;
+    let dir = match mode {
+        TmaMode::Im2colNoOffs | TmaMode::TileScatter4 => TmaPlanDir::Store,
+        _ => TmaPlanDir::Load,
+    };
+    tma::plan(map, dir, mode, coords, im2col_offsets, smem_offset)
+}
+
+/// TMA's f32 -> tf32 landing conversion for `TmaPlan::tf32_round` (one
+/// little-endian 4-byte element).
+pub fn tma_tf32_round(bits: u32) -> u32 {
+    numsim_oplib::tma::tma_f32_to_tf32(f32::from_bits(bits)).to_bits()
 }
 
 /// Decoded tcgen05/wgmma shared-memory matrix descriptor.
@@ -450,12 +621,84 @@ pub struct InstrDesc {
     pub scale_type: Option<Dtype>,
 }
 
+/// Decode an idesc valid for `cta_group::1` or `::2` (SM100).
 pub fn decode_instr_desc(idesc: u32, kind: crate::program::TcMmaKind) -> OpResult<InstrDesc> {
     tc::decode_instr_desc(idesc, kind)
 }
 
-/// tcgen05.mma numerics: reads A/B (and scales) through the closures, reads
-/// and writes the D tile in tensor memory through `tmem`. No engine state.
+/// Decode an idesc for one CTA group (1 or 2; SM100; `.ws` shapes accepted
+/// for `cta_group::1`).
+pub fn decode_instr_desc_for(idesc: u32, kind: crate::program::TcMmaKind, cta_group: u8) -> OpResult<InstrDesc> {
+    tc::decode_instr_desc_for(idesc, kind, cta_group)
+}
+
+/// Target architecture of a tcgen05 instruction (descriptor field widths,
+/// f8f6f4 K=64, LUT-B, SFA layouts, scale formats).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TcArch {
+    #[default]
+    Sm100,
+    Sm103,
+    Sm107,
+}
+
+/// Instruction facts of a `tcgen05.mma` that `TcgenMmaPayload` does not carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TcMmaOptions {
+    pub arch: TcArch,
+    /// `kind::i8` with the `.ti16` (s1z4m11) operand spelling.
+    pub ti16: bool,
+    /// `.lut_b`: TMEM address of the lookup table (f8f6f4 / mxf8f6f4).
+    pub lut_b: Option<u32>,
+    /// `.ws` zero-column-mask descriptor. `None` falls back to the payload's
+    /// `disable_output_lane` words (`[lo]` or `[lo, hi]`, as lowering passes
+    /// the mask operand there), else 0.
+    pub zero_col_mask: Option<u64>,
+    /// Block-scale `.block16/.block32` spelling (fixed vectors) rather than
+    /// `.scale_vec::NX` (only differs for SM103/SM107 K=96/128).
+    pub fixed_vectors: bool,
+}
+
+impl TcMmaOptions {
+    /// Parse a `TcgenMmaArgs::variant` string: tokens separated by `.`, `,`,
+    /// `;` or spaces among `ti16`, `fixed_vectors`/`block16`/`block32`,
+    /// `sm_100[a]`, `sm_103[a]`, `sm_107[a]` (`lut_b` needs its address and
+    /// `zero_col_mask` its value, so they are set as fields).
+    pub fn parse_variant(variant: &str) -> OpResult<TcMmaOptions> {
+        tc::parse_variant(variant)
+    }
+}
+
+/// `smem(cta, addr, buf)` of [`tc_mma_ctas`].
+pub type TcSmemRead<'a> = &'a dyn Fn(u32, u32, &mut [u8]) -> OpResult;
+/// `tmem_read(cta, lane, col, buf)` of [`tc_mma_ctas`].
+pub type TcTmemRead<'a> = &'a dyn Fn(u32, u32, u32, &mut [u8]) -> OpResult;
+/// `tmem_write(cta, lane, col, bytes)` of [`tc_mma_ctas`].
+pub type TcTmemWrite<'a> = &'a mut dyn FnMut(u32, u32, u32, &[u8]) -> OpResult;
+
+/// tcgen05.mma numerics: reads A/B (and scales, metadata, LUT) through the
+/// closures, reads and writes the D tile in tensor memory. No engine state.
+///
+/// `cta` is the CTA index within the issuing group: 0 for `cta_group::1`
+/// (the issuing CTA), 0/1 = even/odd CTA of the pair for `cta_group::2`.
+/// `smem(cta, addr, buf)` reads that CTA's shared window at a window byte
+/// address; `tmem_read(cta, lane, col, buf)` / `tmem_write(cta, lane, col,
+/// bytes)` access one 32-bit TMEM cell (taddr `lane << 16 | col`).
+/// `.ashift` shifts A's TMEM rows after the product (writes through
+/// `tmem_write`). Collector qualifiers do not change numerics; the engine
+/// tracks their state with [`tc_collector_transition`].
+pub fn tc_mma_ctas(
+    payload: &crate::sync::completion::TcgenMmaPayload,
+    options: &TcMmaOptions,
+    smem: TcSmemRead<'_>,
+    tmem_read: TcTmemRead<'_>,
+    tmem_write: TcTmemWrite<'_>,
+) -> OpResult {
+    tc::tc_mma_ctas(payload, options, smem, tmem_read, tmem_write)
+}
+
+/// Single-CTA wrapper of [`tc_mma_ctas`] (default options; `cta_group::2`
+/// is an error because the closures reach one CTA).
 pub fn tc_mma(
     payload: &crate::sync::completion::TcgenMmaPayload,
     smem: &dyn Fn(u32, &mut [u8]) -> OpResult,
@@ -463,6 +706,18 @@ pub fn tc_mma(
     tmem_write: &mut dyn FnMut(u32, u32, &[u8]) -> OpResult,
 ) -> OpResult {
     tc::tc_mma(payload, smem, tmem_read, tmem_write)
+}
+
+/// Per-issuing-lane collector buffer state transition (bit 0 = A, bits 1..5
+/// = B0..B3; `fill` sets, `use` requires, `lastuse` requires + clears,
+/// `discard` clears). `use`/`lastuse` of an unfilled slot is an error.
+pub fn tc_collector_transition(
+    state: u8,
+    collector_a: crate::program::CollectorOp,
+    collector_b: crate::program::CollectorOp,
+    b_buffer: u8,
+) -> OpResult<u8> {
+    tc::collector_transition(state, collector_a, collector_b, b_buffer)
 }
 
 // ---------------------------------------------------------------------------

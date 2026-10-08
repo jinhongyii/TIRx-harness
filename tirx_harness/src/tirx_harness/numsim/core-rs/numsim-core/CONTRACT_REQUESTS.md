@@ -671,3 +671,63 @@ interpreter ~10x faster on ALU-bound kernels.
 - `wait_until` captures: registers cannot change while the warp waits, so
   the register file is the snapshot; verdict caches reset per lane when
   the capture values change.
+
+## W4-6 (2026-10-08): phase 3 signature changes — W2 call sites
+
+All approved by the coordinator on 2026-10-07. Old forms are kept as thin
+wrappers where noted, so existing call sites keep compiling; please migrate.
+
+- **`PtxFn` is a data-carrying `Copy` struct** (no more trampoline table):
+  `oplib::PtxFn { .. }` with `PtxFn::new(fn(&mut PtxIo) -> OpResult)`,
+  `PtxFn::from_static(&'static PtxOp)`, `f.call(&mut io) -> OpResult`,
+  `is_direct()`, `same(&other)`. Parameterized forms are resolved once into a
+  closure (interned per distinct (key, tys), leaked so `PtxFn` stays `Copy`).
+  W4 applied the two mechanical call-site edits in W2's files to keep the tree
+  building: `interp/mod.rs` `ops.push(PtxFn::new(support::unresolved_ptx))`
+  and `interp/handlers/alu.rs` `f.call(&mut io)`.
+- **`oplib::shfl_sync(mode, src, lane, clamp, membermask: &WarpValue<u64>,
+  active) -> OpResult<(WarpValue<u64>, WarpMask)>`** with legacy validation
+  (non-participant source / lane missing from its membermask = `Invalid`).
+  `oplib::shfl` kept (infallible compatibility form). Migrate
+  `interp/handlers/warp.rs`.
+- **TMA**: `tma_plan_dir(map, TmaPlanDir::{Load,Store}, mode, coords,
+  im2col_offsets, smem_offset)`; `TmaPlan` gained `fill: TmaFill`,
+  `fill_pattern: Vec<u8>` (repeat over each `smem_oob_fill` span; empty =
+  zeros; NaN fill = `[0xf7, 0x7f]`) and `tf32_round: bool` (round the copied
+  4-byte elements with `oplib::tma_tf32_round` on landing). Reductions plan as
+  `Store`. `tma_plan` kept (Load, except store-only `Im2colNoOffs` /
+  `TileScatter4`). Named `TmaPlanDir` because `program::TmaDir` exists.
+  `TensorMapDesc` gained `swizzle_atomicity: u8` and `im2col:
+  Option<Im2colBox{lower, upper, wide}>` (Default-compatible);
+  `try_encode() -> OpResult<[u8;128]>` (`encode()` kept, zeros on failure).
+- **tcgen05**: `tc_mma_ctas(payload, &TcMmaOptions, smem: Fn(cta, addr, buf),
+  tmem_read: Fn(cta, lane, col, buf), tmem_write: FnMut(cta, lane, col,
+  bytes))` — `cta` is the index within the group (0 = issuer for
+  cta_group::1; 0/1 = even/odd CTA of the pair). `TcMmaOptions{arch: TcArch,
+  ti16, lut_b: Option<u32>, zero_col_mask: Option<u64>, fixed_vectors}` with
+  `TcMmaOptions::parse_variant(&str)` for the resolved `args.variant` string.
+  `.ws` zero-column masks above bit 31 need `zero_col_mask` or both
+  `disable_output_lane` words; `.lut_b` needs the table taddr in `lut_b`
+  (not in `TcgenMmaArgs`). `tc_collector_transition(state, a, b, b_buffer)`
+  is the legacy collector state machine (engine keeps the per-lane state).
+  `decode_instr_desc_for(idesc, kind, cta_group)` added. `tc_mma` kept
+  (cta 0, default options; cta_group::2 -> Unsupported "needs tc_mma_ctas").
+  Migrate `sched::run_mma`.
+- **Register-encoding exception (behaviour delta D1, ruled "match legacy")**:
+  a scalar F16/BF16 value produced by TIR `Unary/Binary/Ternary` that is not
+  exactly representable keeps its rounded bits in 0..16 plus the unrounded f32
+  in bits 32..64 and flag bit 16 (legacy f32 carrier). Stores must write only
+  `ty.mem_bytes()` low bytes (drops the carrier = legacy round-at-store); `Mov`
+  / `Select` / `LoadRegIndexed` copy slots unchanged (keep it). Anything that
+  compares whole slot values of f16/bf16 registers must mask to `ty.bits()`.
+  See docs/development/numsim-behaviour-deltas.md (D1). Alternative if the
+  contract worker prefers a clean encoding: W1 lowers half expression trees in
+  f32 (Cast at leaves, Cast back at stores), and this carrier can be removed.
+- **W1 §C.3 ops implemented**: `numsim.pack` / `numsim.unpack` (mod
+  `ty=<Dtype debug name>x<N>`; pieces' bit widths must tile the vector, pure
+  bit moves incl. sub-byte) and `tirx.cuda.{float22half2,float8tohalf8,
+  half8tofloat8}.value` (legacy `cuda_f32_to_fp16_bits` /
+  `cuda_fp16_bits_to_f32` element conversions) in `oplib/ptx/vector.rs`.
+- `TcgenMmaArgs::{ti16, lut_b}` (contract) are honoured by `tc_mma_ctas`;
+  `lut_b` still needs the table taddr in `TcMmaOptions::lut_b` (fails closed
+  without it) because the args carry only the flag.

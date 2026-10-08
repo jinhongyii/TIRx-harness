@@ -67,8 +67,9 @@ fn half_arith_and_vectors() {
     let a = 0x4000_3c00u64;
     let b = 0x3c00_3c00u64;
     assert_eq!(bin(BinOp::Add, Ty::F16X2, a, b).unwrap(), 0x4200_4000);
-    assert_eq!(bin(BinOp::Add, Ty::F16, 0x3c00, 0x1000).unwrap(), 0x3c00);
-    assert_eq!(bin(BinOp::Add, Ty::F16, 0x3c00, 0x1001).unwrap(), 0x3c01);
+    // Scalar halves keep the legacy f32 carrier; the stored (low) bits round.
+    assert_eq!(bin(BinOp::Add, Ty::F16, 0x3c00, 0x1000).unwrap() & 0xffff, 0x3c00);
+    assert_eq!(bin(BinOp::Add, Ty::F16, 0x3c00, 0x1001).unwrap() & 0xffff, 0x3c01);
     // bf16x2 multiply: 1.5 * 2 = 3, -1 * 0.5 = -0.5.
     assert_eq!(bin(BinOp::Mul, Ty::BF16X2, 0xbf80_3fc0, 0x3f00_4000).unwrap(), 0xbf00_4040);
     assert_eq!(un(UnOp::Neg, Ty::F16, 0x3c00).unwrap(), 0xbc00);
@@ -366,4 +367,25 @@ fn convert_bits_single_values() {
     assert_eq!(convert_bits(Ty::B128, Ty::B128, D, false, u128::MAX).unwrap(), u128::MAX);
     assert_eq!(kind(convert_bits(Ty::vector(Dtype::F32, 8), Ty::vector(Dtype::F32, 8), D, false, 0)), OpErrorKind::Unsupported);
     assert_eq!(kind(convert_bits(Ty::F16X2, Ty::F32, D, false, 0)), OpErrorKind::Invalid);
+}
+
+#[test]
+fn half_chains_keep_the_legacy_f32_carrier_until_store() {
+    // 1 + 2^-11 is not an f16: legacy kept it in f32 across the chain.
+    let one = 0x3c00u64;
+    let tiny = 0x1000u64; // 2^-11
+    let sum = bin(BinOp::Add, Ty::F16, one, tiny).unwrap();
+    assert_eq!(sum & 0xffff, 0x3c00, "stores/PTX see the rounded value");
+    assert_ne!(sum & (1 << 16), 0, "inexact result carries its f32");
+    // (1 + 2^-11) + 2^-11 = 1 + 2^-10: exact in f16 only through the carrier
+    // (per-op rounding would give 1.0 twice).
+    let chained = bin(BinOp::Add, Ty::F16, sum, tiny).unwrap();
+    assert_eq!(chained, 0x3c01);
+    // Casting the carried value to f32 is exact; to f16 rounds it.
+    assert_eq!(cv(Ty::F16, Ty::F32, Rounding::Default, false, sum).unwrap(), f(1.0 + 2f32.powi(-11)));
+    assert_eq!(cv(Ty::F16, Ty::F16, Rounding::Default, false, sum).unwrap(), 0x3c00);
+    // Compare sees the carried value.
+    assert!(cmp(CmpOp::Gt, Ty::F16, sum, one));
+    // Exact results stay zero-extended.
+    assert_eq!(bin(BinOp::Add, Ty::F16, one, one).unwrap(), 0x4000);
 }

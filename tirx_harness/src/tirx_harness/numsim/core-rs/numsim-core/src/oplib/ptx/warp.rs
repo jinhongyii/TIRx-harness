@@ -559,7 +559,7 @@ mod tests {
         let f = resolve_ptx(key, dst_tys, src_tys).unwrap();
         let mut dsts = vec![[0u64; 32]; dst_tys.iter().map(|t| t.slots() as usize).sum()];
         let mut io = PtxIo { dsts: &mut dsts, dst_tys, srcs, src_tys, mask };
-        f(&mut io).unwrap();
+        f.call(&mut io).unwrap();
         dsts
     }
 

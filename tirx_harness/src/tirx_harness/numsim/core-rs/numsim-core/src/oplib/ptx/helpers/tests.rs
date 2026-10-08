@@ -32,7 +32,7 @@ fn run(name: &str, mods: &[&str], dsts: &[Ty], srcs: &[(Ty, u128)]) -> Result<Ve
         src_tys: &src_tys,
         mask: WarpMask::lane(LANE),
     };
-    f(&mut io)?;
+    f.call(&mut io)?;
     assert!(
         out.iter().all(|s| s[LANE + 1] == 0x5555_5555_5555_5555),
         "inactive lane written"

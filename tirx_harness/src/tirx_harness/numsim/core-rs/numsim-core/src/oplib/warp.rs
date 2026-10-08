@@ -52,6 +52,34 @@ pub(super) fn shfl(
     (values, valid)
 }
 
+/// Legacy-validated `shfl.sync` (see `oplib::shfl_sync`).
+pub(super) fn shfl_sync(
+    mode: ShflMode,
+    src: &WarpValue<u64>,
+    lane: &WarpValue<u64>,
+    clamp: &WarpValue<u64>,
+    membermask: &WarpValue<u64>,
+    active: WarpMask,
+) -> OpResult<(WarpValue<u64>, WarpMask)> {
+    let mode = match mode {
+        ShflMode::Idx => lib::ShuffleMode::Index,
+        ShflMode::Up => lib::ShuffleMode::Up,
+        ShflMode::Down => lib::ShuffleMode::Down,
+        ShflMode::Bfly => lib::ShuffleMode::Xor,
+    };
+    let selectors: WarpValue<u32> = std::array::from_fn(|l| lane[l] as u32);
+    let controls: WarpValue<u32> = std::array::from_fn(|l| clamp[l] as u32);
+    let participants: WarpValue<u32> = std::array::from_fn(|l| membermask[l] as u32);
+    let (values, in_range) = lib::shfl_sync(active, &participants, src, &selectors, &controls, mode)?;
+    let mut valid = WarpMask::NONE;
+    for l in active.lanes() {
+        if in_range[l] {
+            valid = valid.or(WarpMask::lane(l));
+        }
+    }
+    Ok((values, valid))
+}
+
 /// `redux.sync` over `members`: fold from the lowest member in ascending
 /// lane order (legacy order); `ty` selects u32 / s32 / f32 (min/max, NaN
 /// canonicalized). `.NaN` variants are not expressible through `ReduxOp`.
