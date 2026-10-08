@@ -633,6 +633,9 @@ fn enum_variants(src: &str, name: &str) -> Vec<String> {
     out
 }
 
+/// `(protocol, reference source, [(coverage kind, enum name)])`.
+type ProtocolEnums = (&'static str, &'static str, &'static [(&'static str, &'static str)]);
+
 /// Minimum hits per variant across one run of every property.
 const MIN_HITS: u64 = 3;
 
@@ -652,7 +655,7 @@ fn coverage_reaches_every_variant() {
     tcgen_kernel_and_work_match_reference();
     setmaxnreg_matches_reference();
     query_matches_reference();
-    let sources: [(&str, &str, &[(&str, &str)]); 7] = [
+    let sources: [ProtocolEnums; 7] = [
         ("query", include_str!("../../numsim-sync-ref/src/query.rs"), &[("err", "TokenError")]),
         ("mbarrier", include_str!("../../numsim-sync-ref/src/mbarrier.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error")]),
         ("named", include_str!("../../numsim-sync-ref/src/named.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error"), ("lint", "Lint"), ("gather_cmd", "GatherCmd"), ("gather_ok", "GatherOutcome")]),

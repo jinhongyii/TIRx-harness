@@ -8,7 +8,7 @@ Plan: `docs/development/numsim-redesign.md`. Worker inputs:
 
 Workspace members: `numsim-core` (everything below) and `numsim-py`
 (pyo3 bindings, feature `python`). The standalone crates
-`numsim-sync-ref`, `numsim-sync-explore`, `numsim-race-core`, `numsim-oplib`
+`numsim-sync-ref`, `numsim-race-core`, `numsim-oplib`
 have their own `[workspace]` tables; the coordinator merges them.
 
 ```

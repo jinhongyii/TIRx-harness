@@ -1009,3 +1009,79 @@ Eight seeded mutations of the production code were each caught.
 Side queries are pinned in `sync/query.rs`: the state-token layout, `pending_count`, and `check_layout`.
 
 Error mapping: `SyncError::finding_kind` maps each error to a report kind. `RuntimeError` marks infrastructure faults. Exit lints go through `SyncTable::exit_lints` and are reported as Review.
+
+## 10. Rule map: step rule → production fn → reference fn → ISA answer
+
+**Paths.**
+- **Production:** `numsim-core/src/sync/<protocol>.rs`. All rules are reached through `step` unless another function is named.
+- **Reference:** `numsim-sync-ref/src/<protocol>.rs`. `step` delegates to `apply`, which calls the helpers listed.
+- **ISA answers:** "Q*n*" is the entry in `sync-isa-answers.md`. "Limits: …" names a subsection of its "Additional limits and forms" section. "PTX §…" means no Q-entry exists, and the section in this document cites the ISA directly.
+
+**Differential checks.** The two implementations are compared after every command by `numsim-core/tests/sync_differential.rs`. Its `coverage_reaches_every_variant` test requires every `Cmd`, `Outcome` and `Error` variant below to be reached at least 3 times. The two exceptions are `mbarrier::FutureNotBufferable` and `named::ArrivalOverflow`, which are defensive and unreachable through valid step sequences.
+
+### mbarrier (§2)
+
+| Rule | Production | Reference | ISA |
+| --- | --- | --- | --- |
+| `Init`: count range (`InvalidCount`, 511 with `.layout::v1`), re-init rules (`ReinitActive`, `ReinitWithoutInval`, `ReinitBeforeConsumption`) | `step` | `apply` → `init` | Q2; Limits: expected-arrival ranges |
+| `Inval`: `InvalWithOutstanding` | `step` | `apply` | Q2 |
+| `Arrive` / `arrive_drop` / `.noComplete`: `Uninitialized`, `ArrivalOverflow`, `DropUnderflow`, `NoCompleteWouldComplete`, `ReuseBeforeConsumption` | `step` | `apply` → `arrive`, `add_arrivals`, `maybe_complete` | Limits: `.noComplete`; PTX §9.7.15.16.16-17 |
+| `ExpectTx` / `arrive.expect_tx` tx range: `TxCountOutOfRange` | `step` → `range_check` | `apply` → `check_tx` | Limits: `expect_tx` txCount width; tx-count ranges |
+| `IncPending`: `PendingOverflow` | `step` | `apply` | PTX §9.7.15.16.18 |
+| `Issue` / `CompleteTx` / `DeferredArrive`: token and landing (`UnknownToken`, `StaleCompletion`, `CompletionAfterComplete`, `FutureNotBufferable`, `TxOverDelivery`) | `step` → `take_token`, `landing_target`, `complete_if_ready` | `apply` → `take_token`, `target`, `maybe_complete` | Q7 (deferred arrive-on); Limits: tx-count ranges |
+| `TestParity` / `WaitParity` / `TestState`: `InvalidPhase`, `InvalidStateToken`, `Blocked` | `step` → `parity_query` | `apply` → `query_parity` | Limits: `try_wait` vs `test_wait`, and parity |
+| Exit: `IncompleteAtExit` (outstanding tokens, buffered completions, or an unsettled tx-count) | `quiescent` | `quiescent` | PTX §9.7.14.7 |
+| Multicast `ctaMask` outside the cluster (`bad_address`, raised before any target is touched) | `interp::handlers::async_copy::ranks_of` | — (engine addressing) | Q9 |
+| State token, `pending_count` (`NotNoComplete`), `check_layout` | `query.rs`: `encode`, `pending_count`, `check_layout` | `query.rs`: same names | PTX §9.7.15.16.20 |
+
+### Named barriers (§3)
+
+| Rule | Production | Reference | ISA |
+| --- | --- | --- | --- |
+| `b` multiple of 32 (`InvalidCount`); same `b` per generation (`ContractMismatch`) | `step` | `apply` → `contribute` | Q3 |
+| A whole-warp contribution (`PartialWarp` for `.aligned` or an empty mask) | `step` | `contribute` | Q3, Q5 |
+| Non-aligned partial warps: gather to one arrival; `PartialWarp` when the missing lanes exit or reach another id | `gather` | `gather` | Q3, Q5 (ruling, §3.6) |
+| `Duplicate`, `RedMixed`, `ArrivalOverflow` (defensive) | `step` | `contribute` | Q3 |
+| `Resume`: `ResumeFuture` | `step` | `apply` | — (model invariant) |
+| Exit: dangling generation (`DanglingAtExit` lint); exit-aware membership | `exit_lint`; engine `interp::handlers::control::release_named_on_exit` | `exit_lint` | Q3, Q4 (delta B7) |
+
+### Cluster barrier (§4)
+
+| Rule | Production | Reference | ISA |
+| --- | --- | --- | --- |
+| Participation: `UnexpectedParticipant`, `PartialWarp` | `step` → `participation`, `live_lanes` | `apply` → `check_lanes` | Q4 |
+| `Arrive`: `EarlyArrival`; generation roll | `step` → `roll_if_complete`, `complete` | `apply` | Q4 |
+| `Wait`: `WaitBeforeArrival`, `DuplicateWait` | `step` | `apply` | Q4 |
+| `Exit`: exited threads leave the expected set | `step` | `apply` | Q4 |
+
+### Async groups (§5)
+
+| Rule | Production | Reference | ISA |
+| --- | --- | --- | --- |
+| `Issue` / `Commit` / `ArriveOn` (closes the open group): `InvalidForm` | `step` → `close` | `apply` → `push` | Q7 |
+| `Complete { milestone }` in FIFO order: `NotEnabled` | `step` → `enabled_index`; `milestone_enabled` | `apply` | Q7 |
+| `Wait { n, read }` | `step`, `wait_prefix_len` | `apply`, `wait_prefix_len` | Q7 |
+| `Exit`: bulk groups are committed implicitly; uncommitted `cp.async` gives the `UncommittedAtExit` lint; `PendingAtExit` | `step`, `exit_lint`, `quiescent` | `apply`, `exit_lint`, `quiescent` | Q7; deltas A3 and B5 |
+
+### tcgen05 (§6)
+
+| Rule | Production | Reference | ISA |
+| --- | --- | --- | --- |
+| `Alloc` column rule (`InvalidColumns`; `.exclusive` limit from the arch) | `step` → `valid_columns` | `apply` → `valid_columns` | Q6 (Table 58) |
+| `Alloc` blocks until free | `step` → `free_base` | `apply` → `first_fit` | Q1 |
+| `AllocAfterRelinquish`, `AllocationSizeIncrease`, `AllocWhileExclusive` | `step` | `apply` | Q6 |
+| `Dealloc`: `DeallocationMismatch` (exclusivity must match); any warp of the CTA | `step` | `apply` | Q6, Q8 |
+| TMEM access outside every live allocation (`bad_address`) | engine (`interp::handlers::tcgen`) | — | Q8 (delta T9) |
+| `cta_group` uniformity: `InvalidCtaGroup`, `CtaGroupMismatch` | `use_cta_group`, `participants` | `use_cta_group`, `Who::indices` | PTX §9.7.18 |
+| Work tokens and `commit` (`WorkCmd`) | `work_step` | `work_step` | PTX §9.7.18.6 |
+| Exit: `LiveAllocationsAtExit` | `quiescent` | `quiescent` | Q6 |
+
+### setmaxnreg (§7)
+
+| Rule | Production | Reference | ISA |
+| --- | --- | --- | --- |
+| `Configure`: `InvalidCount`, `ConfigureConflict` | `step` → `valid_count`, `default_count` | `apply` → `valid_count`, `default_count` | PTX §9.7.21.5 (§7.4) |
+| `Set`: `IncompleteWarpgroup`, `WarpgroupPending`, `MissingWarpgroupSync`, `InvalidDirection`; an increase stays pending | `step` → `warpgroup` | `apply` → `check_wg` | §7.4 (trailing partial warpgroup: V2C-14 ruling) |
+| `WarpgroupSync`: no-op for a trailing partial warpgroup | `step` | `apply` | §7.4 |
+| `Grant` / `Poll`: `GrantNotEnabled`, `Blocked` | `step`, `enabled_grants` | `apply`, `enabled_grants` | §7.4 |
+| Exit: `PendingAtExit` | `quiescent` | `quiescent` | §7.4 |

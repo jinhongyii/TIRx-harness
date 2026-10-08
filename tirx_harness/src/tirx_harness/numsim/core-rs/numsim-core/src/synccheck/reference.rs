@@ -121,7 +121,7 @@ fn run_component(
     let mut rr = 0usize;
     loop {
         *steps += 1;
-        if *steps % 1024 == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if steps.is_multiple_of(1024) && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return Err(RunError::WallTime);
         }
         let local_warps = ts.warps.len().max(1);

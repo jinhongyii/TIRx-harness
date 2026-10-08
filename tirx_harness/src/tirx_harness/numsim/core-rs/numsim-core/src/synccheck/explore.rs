@@ -229,7 +229,7 @@ pub fn explore<M: TransitionSystem>(
     let mut popped = 0u64;
     'search: while let Some(id) = stack.pop() {
         popped += 1;
-        if popped % 256 == 0 && limits.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if popped.is_multiple_of(256) && limits.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             result.termination = Termination::WallTime;
             break;
         }

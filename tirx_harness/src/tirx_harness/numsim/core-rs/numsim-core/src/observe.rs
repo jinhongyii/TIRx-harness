@@ -8,7 +8,7 @@
 //!   declared words, wait verdicts).
 //!
 //! Consumers: Racecheck (W5, `numsim-race-core/src/input.rs`) and the
-//! Synccheck explorer (W6, `numsim-sync-explore/src/event.rs`). Both map
+//! Synccheck explorer (W6, ). Both map
 //! onto these types with a thin adapter; name mappings are noted inline.
 //!
 //! # Delivery order (one total order per run)

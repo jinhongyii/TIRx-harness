@@ -190,7 +190,7 @@ pub struct Program {
 - `sync-behaviour-deltas.md`：相对旧行为的变更清单，供快照 diff 审查。
 - `racecheck-semantics.md`：33 条 HB 边、冲突规则、时钟表示技巧与操作数论证、22 条旧有不合理行为。原型在 `core-rs/numsim-race-core/`。
 - `racecheck-isa-answers.md`：release sequence、moral strength、proxy 规则等的 ISA 裁定。
-- `synccheck-explorer.md`：两阶段算法、投影、证书、指纹、DFS 剪枝表与测量。原型在 `core-rs/numsim-sync-explore/`。
+- `synccheck-explorer.md`：两阶段算法、投影、证书、指纹、DFS 剪枝表与测量。实现在 `numsim-core/src/synccheck/`，剪枝基准在 `numsim-core/benches/synccheck.rs`。
 - `lowering-inventory.md`：194 个 corpus PrimFunc 的 IR 节点、builtin、dtype、layout、控制流统计；lowering 设计与三个 worked example。
 
 ## 8. 环境备忘

@@ -4,9 +4,11 @@ orphan: true
 
 # Synccheck explorer: spec of today's algorithm and the plan for the rewrite
 
-Status: draft, 2026-10-07, branch `refactor/clean-core`, worker W6.
+Status: implemented, 2026-10-08, branch `refactor/clean-core`, worker W6.
 Contract: [`numsim-redesign.md`](numsim-redesign.md) §2.1 (Synccheck row), §2.6, §3, §6.
-Prototype: `tirx_harness/src/tirx_harness/numsim/core-rs/numsim-sync-explore/`.
+Implementation: `tirx_harness/src/tirx_harness/numsim/core-rs/numsim-core/src/synccheck/`.
+Reduction benchmarks: `numsim-core/benches/synccheck.rs` (§5.9).
+Sections 1-4 specify the legacy algorithm that the rewrite preserves; §5 describes the rewrite.
 
 This document pins down how today's Synccheck works so the rewrite keeps the
 semantics and the pruning, and says what the new explorer needs from the
@@ -204,9 +206,10 @@ projections:**
 4. Commands that change several resources atomically are never split across
    projections: wait batches, multi-CTA TCGEN, and collectives.
 
-The prototype tests this argument directly. On 3000 random and structured
-logs, the gated per-resource verdict equals the ungated whole-program verdict
-(`numsim-sync-explore/tests/equivalence.rs`).
+The equivalence tests check this argument directly. On random, structured,
+rich, lap, register-pool and TMA-issuer logs, the gated per-resource verdict
+equals the ungated whole-program verdict
+(`numsim-core/tests/synccheck_equivalence.rs`).
 
 **Projections that can only be certified.** For named and cluster projections,
 and for plain mbarrier projections (no transactions, completions, expect_tx,
@@ -624,11 +627,11 @@ Vec<SyncEvent> ──► Program (per-warp sequences, collectives joined)
                ──► projections (per resource + atomic joins; HB gates from reference clocks)
                ──► certificate? ── yes ──► visited 1
                ──► fingerprint seen clean? ── yes ──► reused
-               ──► DFS (state hash, sleep sets, strong diamonds, persistent hook)
+               ──► DFS (state hash, sleep sets, strong diamonds, persistent singletons §5.10)
                ──► findings | incomplete (state/transition limit, model) | clean
 ```
 
-What changes compared with today:
+### 5.2 What changes compared with legacy
 
 * **No clocks or generations in the log.** The prototype recomputes them from
   one complete schedule of the whole program (`program::reference_run`). Any
@@ -646,102 +649,32 @@ What changes compared with today:
   still need a blocked flag, because their contribution and their release are
   separate.
 * **The explorer owns the strong-diamond and commutation checks.** They only
-  need `step` and `enabled`, so the model implements only the state machine
-  and the optional `persistent_transition` hook.
+  need `step` and `enabled`, so the model implements only the state machine,
+  the `independent_of_future` proof obligation and the `singleton_persistent`
+  hook (§5.10).
 * **Fingerprint for every single-resource projection**, not only mbarrier. The
   full encoding is the map key, so no second equivalence pass is needed.
 
-### 5.2 Prototype status (`core-rs/numsim-sync-explore/`)
+### 5.3 Contract inputs
 
-* `src/event.rs` defines the local `SyncEvent`. `src/protocol.rs` has
-  stand-in mbarrier/named/cluster machines. It is a PLACEHOLDER, to be
-  swapped for the W3 `step` functions (`numsim-sync-ref` did not exist when
-  this was written).
-* `src/ts.rs` is the transition system. `src/explore.rs` is the DFS, a port of
-  `po`. `src/projection.rs`, `src/certificate.rs`, `src/fingerprint.rs`, and
-  `src/check.rs` are the driver and the reasons.
-* `tests/scenarios.rs` has 19 scenarios translated from the Python tests:
-  * use-before-init, both in program order and across warps without
-    publication;
-  * `cta_sync` publication;
-  * under-arrival deadlock (trailing ninth warp) and arrival overflow;
-  * producer lap;
-  * the depth-two pipeline and a K-stage ring with and without TMA, both
-    clean;
-  * wrong parity;
-  * the cross-protocol cycle;
-  * repeated `cta_sync`;
-  * named arrive reuse;
-  * cluster exit, which is incomplete;
-  * transaction over-delivery;
-  * TMA with many waiters;
-  * budget exhaustion, which is incomplete;
-  * fingerprint reuse;
-  * a malformed log.
+The `SyncEvent` fields the explorer relies on are now part of the contract
+(`numsim-core/src/observe.rs`). They are:
+- per-actor `seq` over committed commands;
+- explicit counts;
+- physical resource ids;
+- async targets bound to the issuing command;
+- multi-resource atomic events;
+- collective ids;
+- sites and loop frames;
+- the observed parity of conditional successes.
 
-  Each scenario runs under four configurations, which must agree on the
-  verdict.
-* `tests/equivalence.rs` runs 3000 random logs. Every reduced or projected
-  configuration gives the same verdict as the unreduced whole-program search.
-* `benches/pipeline.rs` prints the tables in §3 and runs the criterion
-  timings.
-
-Not yet ported:
-
-* setmaxnreg pools, TCGEN lifecycle, async groups;
-* wait batches, inval/re-init, `.noinc` pending raises;
-* conditional waits (`try_wait` returning true);
-* named-barrier lane masks and aligned-site checks;
-* the payload serializer.
-
-The prototype's `IncompleteReason` and `Finding` variants already map 1:1 to
-the reason and kind strings in §2.8 and §4.
-
-### 5.3 What the explorer needs from the contract `SyncEvent`
-
-Compared with today's draft in `numsim-core/src/observe.rs` (`SyncEvent {actor,
-seq, site, resource, lanes, cmd, outcome}`):
-
-1. **Per-actor `seq` over committed commands only.** Synccheck uses `seq` as
-   the cursor. A `Blocked` attempt that is retried must not create a second
-   program position. One option is to log only `Done`/`Failed` attempts.
-   Another is to guarantee that exactly one `Done` follows a run of `Blocked`
-   attempts with the same `seq`.
-2. **Counts in `cmd`, not derived from `lanes`.** Arrival count, `expect_tx`
-   bytes, named `expected`/`count` in threads, and cluster participants. The
-   explorer must never re-derive participation from a mask.
-3. **A resource identity that is the physical object.** Remote (cluster-mapped)
-   mbarrier arrivals must carry the *target* CTA's barrier id. Today this is
-   `PhysicalBarrierId.target_global_cta_id`. The draft's
-   `ResourceId::Mbarrier{alloc, offset}` is enough only if `alloc` is
-   per-CTA.
-4. **Async completions bound to an issuing command.** The issuer's
-   `(warp, seq)`, the target resource or resources, the bytes per target, and
-   the `arrive` flag (`cp.async.mbarrier.arrive`, `tcgen05.commit`). The
-   explorer turns each target into one pending `Complete` transition whose
-   generation is captured at issue. `AsyncIssue.targets` in the draft has
-   this. It also needs the issuer's `seq`.
-5. **Multi-resource atomic commands**, either as one event with several
-   resources, or with an id that groups them. Cases: lane-varying waits on
-   several barriers (today's `MbarrierWaitBatch`), multi-barrier `init`/`inval`,
-   2-CTA TCGEN ops.
-6. **Collective identity** for setmaxnreg and TCGEN alloc/dealloc/relinquish:
-   one id shared by the participating warps' records, plus the participant set.
-   The explorer joins the records into one command with several participants.
-7. **Static site and loop frames** (`site`) for reporting and for the
-   aligned named-barrier "same static instruction" rule.
-8. **Conditional successes**: a `Test`/`try_wait` that returned true must
-   record which phase it observed. Today these are `conditional_mbarrier_completions`.
-   Without them, conditional control is not fixed by the run.
-9. **Not needed:** vector clocks, observed generations, outcomes of successful
-   steps. The explorer recomputes them. Observed generations are still useful
-   as a debug cross-check.
+The requests and their resolution are recorded in `numsim-core/CONTRACT_REQUESTS.md` (W6-1 to W6-5).
 
 ### 5.4 Integration status (phase 2)
 
 The explorer now lives in `numsim-core/src/synccheck/` and runs on the
 production `crate::sync::*::step` functions (`backend.rs` is the only file
-that names them). `numsim-sync-explore/` only hosts the pipeline bench.
+that names them).
 
 * Entry points: `synccheck::check(&RecordingObserver, &SynccheckConfig) -> report::Report`
   and `synccheck::serialize(&Report) -> serde_json::Value` (today's payload
@@ -761,20 +694,15 @@ that names them). `numsim-sync-explore/` only hosts the pipeline bench.
 * Contract gaps: `numsim-core/CONTRACT_REQUESTS.md` W6-1 (non-confluence
   kind, structured payload, `.aligned`, kernel index, `TestState` success
   flag).
-* Tests: `numsim-core/tests/synccheck_scenarios.rs` (40),
-  `synccheck_equivalence.rs` (1,500 random logs), `synccheck_payload.rs` (3),
-  plus the explorer unit tests in `synccheck/explore.rs` (3).
+* Tests (2026-10-08):
+  * `numsim-core/tests/synccheck_scenarios.rs`: 67 tests.
+  * `synccheck_legacy_ports.rs`: 60 tests.
+  * `synccheck_equivalence.rs`: 7 generators (random, structured, rich, rich-structured, lap, register-pool, TMA-issuer) against the exhaustive oracle.
+  * `synccheck_payload.rs`: 3 tests.
+  * `synccheck_engine.rs`: 4 interpreter scenarios.
+  * The explorer unit tests in `synccheck/explore.rs`.
 
-Bench (`cargo bench -p numsim-sync-explore --bench pipeline`), 16 warps × 4
-stages × 32 iterations, 1,044 contract events, 100k-state budget:
-
-| config | states | verdict |
-| --- | --- | --- |
-| whole program, any reductions | >100k | incomplete |
-| per-resource, plain or sleep sets only | >100k | incomplete |
-| per-resource + strong diamonds | 4,209 | clean |
-| + fingerprint | 1,180 (6 of 9 reused) | clean |
-| + certificates | 9 (all certified, 10 ms) | clean |
+Benchmarks: §5.9.
 
 ### 5.5 Review fixes (2026-10-08, `checker-review.md`)
 
@@ -947,3 +875,28 @@ On the other shapes they cost 0.8-0.9x. Their guard row is "sleep sets (in combi
   - Scenarios: `per_thread_tma_issuers_stay_small` (72 states; it fails with the rule off) and `inval_racing_a_tma_landing_is_an_error`.
   - Neither the generator nor the inval scenario catches a mutation that treats every command as harmless: the racing mutations here reach an error in both orders. Soundness rests on the conservative conditions above. Every non-observer command on the barrier blocks the rule, including the synthesized `Issue`.
 - **Bench note:** the fingerprint row's time ratio was noisy in this run (0.4x, 218 vs 1,569 states). Its state ratio (7x) is the guard.
+
+### 5.10 Persistent singleton rules
+
+`TransitionSystem::singleton_persistent` (`synccheck/ts.rs`) returns one enabled transition that forms a persistent set on its own: every transition that can run before it commutes with it and cannot disable it. Only that transition is explored from the state. The rule combines with sleep sets (Godefroid: explore persistent \ sleep). Each rule has a switch in `explore::Rules`, a guard row in `benches/synccheck.rs` (§5.9) and equivalence-oracle coverage. The guard is states with the rule on versus off.
+
+1. **Private async-group issue/commit** (`private_issue`). Bench: per_lane_arrivals(4,1,1,4), 546 vs 10,898 states.
+   The command has one participant and no async targets, and touches only groups that no other warp's command touches. Nothing else can conflict with it or disable it, and HB gates only open.
+   A later issue lands in a newer group than any deferred arrival already attached, because ArriveOn closes its group. Milestones are eager.
+2. **Ready mbarrier observer** (`ready_observer`). Bench: per_lane_arrivals(1,8,2,1), 118 vs 7,171 states.
+   The candidate is a wait or test (`Issue` or `Resume`) that is ready now. Everything that can still run first on its barrier is another observer: other warps' commands not HB-gated behind it, their retries, and no pending completion.
+   A wait is not invisible, because it consumes the completed phase. That is why no arrive may precede it; the S8 proof alone was refuted by the lap oracle.
+3. **Deferred completion, S8-independent** (`deferred_completion`). Bench: per_lane_arrivals(4,2,2,1), 2,805 vs the 200k budget.
+   The candidate is a pending mbarrier completion for which `independent_of_future` holds: the other contributions cannot complete the phase without it, and no observer it could disable exists.
+   It stays enabled once enabled, because async-group completion and FIFO order are monotone. Unlike waits, completions consume no phase.
+4. **Setmaxnreg warpgroup-sync credit** (`regpool_sync`). Bench: regpool_credits(3,2), 104 vs the 200k budget.
+   `WarpgroupSync { wg }` only clears `needs_sync[wg]`; it never blocks and never fails. It conflicts only with a `Set` of the same warpgroup, and no such `Set` can run first.
+   Under the contract, credits come from a warp of their own warpgroup, so a conflicting `Set` is a collective that includes the crediting warp.
+5. **Setmaxnreg `Poll` resume** (`regpool_sync`). Same bench row as rule 4.
+   A granted increase's `Poll` retry reads `pending[wg]` and mutates nothing. Only a `Set` of the same warpgroup could re-arm it, and that `Set` is a collective that includes the resuming warp.
+6. **Sole landing** (`sole_landing`). Bench: per_thread_tma(32, pair), 72 vs the 200k budget.
+   The candidate is a pending mbarrier completion that is the only possible mutation of its barrier. The only other pending completions allowed are transaction landings for the same phase: bytes add up in any order, and over-delivery fails in every order.
+   Every command or retry that can run first on the barrier is a parity observer the completion cannot disable. This also covers completions that finish the phase, which rule 3 declines.
+
+**Symmetry, not a singleton: twin landings** (`twin_landings`). Bench: per_lane_arrivals(1,2,2,1) with rule 3 off, 2,168 vs the 200k budget.
+Enabled pendings that differ only in issuing command and ordinal (same resource, FIFO, generation and count/bytes, and named by no landing gate) are interchangeable. Only the lowest is offered.

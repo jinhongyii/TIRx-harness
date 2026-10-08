@@ -69,8 +69,8 @@ the numerical-change rule in `CLAUDE.md`.
 
 Two crates are test oracles and benchmarks, not production code:
 `numsim-sync-ref` (one small, obviously correct reference state machine per
-protocol) and `numsim-race-core` / `numsim-sync-explore` (criterion benchmarks
-for the checkers' pruning techniques).
+protocol) and `numsim-race-core` (criterion benchmarks for racecheck's
+pruning techniques; synccheck's are `numsim-core/benches/synccheck.rs`).
 
 ## Data flow
 
@@ -247,7 +247,7 @@ fields, or absolute times.
 | Differential and property | Interpreter vs. codegen bit equality; reference state machine vs. `step`; reduced vs. exhaustive Synccheck search on random logs | `numsim-core/tests/{codegen_equivalence,sync_differential,synccheck_equivalence}.rs` |
 | Pure core | Hand-written `Program`s and contract events fed to the engine and checkers, without Python | `numsim-core/tests/` |
 | Lowering | The contents of the lowered `Program`, not any generated text | `tests/numsim/v2/` |
-| Performance | Criterion microbenchmarks and end-to-end checks relative to a per-host baseline; opt-in `performance` marker | `numsim-core/benches/`, `numsim-race-core`, `numsim-sync-explore`, `tests/perf/` |
+| Performance | Criterion microbenchmarks and end-to-end checks relative to a per-host baseline; opt-in `performance` marker | `numsim-core/benches/` (synccheck reduction guards: `benches/synccheck.rs`), `numsim-race-core`, `tests/perf/` |
 
 CI runs the Rust workspace tests and the Python suite without the GPU and
 performance markers, so snapshot drift fails CI (pending: CI does not build

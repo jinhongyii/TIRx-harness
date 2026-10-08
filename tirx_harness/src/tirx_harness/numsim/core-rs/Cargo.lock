@@ -340,7 +340,6 @@ dependencies = [
  "criterion",
  "libm",
  "numsim-types",
- "pyo3",
 ]
 
 [[package]]
@@ -359,14 +358,6 @@ dependencies = [
  "criterion",
  "numsim-core",
  "serde_json",
-]
-
-[[package]]
-name = "numsim-sync-explore"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "numsim-core",
 ]
 
 [[package]]
