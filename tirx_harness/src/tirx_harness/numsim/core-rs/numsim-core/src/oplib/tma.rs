@@ -692,6 +692,18 @@ pub(super) fn plan(
     im2col_offsets: &[i64],
     smem_offset: u64,
 ) -> OpResult<TmaPlan> {
+    cache::plan(map, dir, mode, coords, im2col_offsets, smem_offset)
+}
+
+/// [`plan`] without the translation cache.
+fn plan_uncached(
+    map: &TensorMapDesc,
+    dir: TmaPlanDir,
+    mode: TmaMode,
+    coords: &[i64],
+    im2col_offsets: &[i64],
+    smem_offset: u64,
+) -> OpResult<TmaPlan> {
     let im2col_mode = match (dir, mode) {
         (_, TmaMode::Tile)
         | (TmaPlanDir::Load, TmaMode::TileGather4)
@@ -776,6 +788,8 @@ pub(super) fn plan(
         }
     }
 }
+
+mod cache;
 
 #[cfg(test)]
 mod tests;

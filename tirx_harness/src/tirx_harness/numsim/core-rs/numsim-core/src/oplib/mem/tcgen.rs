@@ -64,7 +64,17 @@ pub struct TcgenLdstMap {
     /// 1, or 2 for `.pack::16b` / `.unpack::16b` (two 16-bit halves in the
     /// low halves of two consecutive columns).
     pub pieces_per_register: usize,
-    pieces: Vec<TcgenLdstPiece>,
+    pieces: std::rc::Rc<[TcgenLdstPiece]>,
+    runs: std::rc::Rc<[TcgenCellRun]>,
+}
+
+/// A run of consecutive TMEM cells of one lane that a `tcgen05.ld`/`st`
+/// touches (`cells` cells from `column`); see [`TcgenLdstMap::cell_runs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TcgenCellRun {
+    pub tmem_lane: u32,
+    pub column: u32,
+    pub cells: u32,
 }
 
 impl TcgenLdstMap {
@@ -78,6 +88,13 @@ impl TcgenLdstMap {
     pub fn all(&self) -> &[TcgenLdstPiece] {
         &self.pieces
     }
+
+    /// The TMEM cells the pieces touch, as maximal runs of consecutive
+    /// columns per lane, sorted by (lane, column); each cell appears once.
+    /// Lets the engine move whole runs instead of one piece at a time.
+    pub fn cell_runs(&self) -> &[TcgenCellRun] {
+        &self.runs
+    }
 }
 
 /// Legacy `raw_tcgen05_ldst_location` for every register and lane of a
@@ -87,6 +104,49 @@ impl TcgenLdstMap {
 /// `.unpack::16b` (st). The `.16x32bx2` half-split offset rides in
 /// `TcShape::S16x32bx2 { split_off }`.
 pub fn tcgen_ldst_map(
+    shape: TcShape,
+    num: u16,
+    pack16: bool,
+    warp_in_cta: u32,
+    taddr: u32,
+) -> OpResult<TcgenLdstMap> {
+    // Maps are pure in their inputs and shared (`Rc`) once built; kernels
+    // issue the same few forms every iteration (perf, W2-21).
+    type Key = (TcShape, u16, bool, u32, u32);
+    thread_local! {
+        static MAPS: std::cell::RefCell<std::collections::HashMap<Key, TcgenLdstMap>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key: Key = (shape, num, pack16, warp_in_cta, taddr);
+    if let Some(map) = MAPS.with(|maps| maps.borrow().get(&key).cloned()) {
+        return Ok(map);
+    }
+    let map = build_ldst_map(shape, num, pack16, warp_in_cta, taddr)?;
+    MAPS.with(|maps| {
+        let mut maps = maps.borrow_mut();
+        if maps.len() >= 1024 {
+            maps.clear();
+        }
+        maps.insert(key, map.clone());
+    });
+    Ok(map)
+}
+
+fn cell_runs(pieces: &[TcgenLdstPiece]) -> Vec<TcgenCellRun> {
+    let mut cells: Vec<(u32, u32)> = pieces.iter().map(|p| (p.tmem_lane, p.column)).collect();
+    cells.sort_unstable();
+    cells.dedup();
+    let mut runs: Vec<TcgenCellRun> = Vec::new();
+    for (lane, column) in cells {
+        match runs.last_mut() {
+            Some(run) if run.tmem_lane == lane && run.column + run.cells == column => run.cells += 1,
+            _ => runs.push(TcgenCellRun { tmem_lane: lane, column, cells: 1 }),
+        }
+    }
+    runs
+}
+
+fn build_ldst_map(
     shape: TcShape,
     num: u16,
     pack16: bool,
@@ -137,10 +197,12 @@ pub fn tcgen_ldst_map(
             }
         }
     }
+    let runs = cell_runs(&pieces);
     Ok(TcgenLdstMap {
         registers,
         pieces_per_register: per,
-        pieces,
+        pieces: pieces.into(),
+        runs: runs.into(),
     })
 }
 
@@ -389,4 +451,37 @@ pub fn tcgen_cp_decode(src: &[u8], decompress_bits: u8) -> OpResult<[u8; 4]> {
     let mut packed = [0_u8; 4];
     packed[..src.len()].copy_from_slice(src);
     Ok(cp_decode_word(&packed, src.len(), decompress)?)
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    /// `cell_runs` covers exactly the cells of the pieces, merged per lane;
+    /// the cached map equals a freshly built one.
+    #[test]
+    fn ldst_cell_runs_cover_the_pieces_once() {
+        for (shape, num, pack16) in [
+            (TcShape::S32x32b, 8_u16, false),
+            (TcShape::S32x32b, 4, true),
+            (TcShape::S16x64b, 4, false),
+            (TcShape::S16x256b, 2, false),
+        ] {
+            let map = tcgen_ldst_map(shape, num, pack16, 1, 0x20_0010).unwrap();
+            assert_eq!(map, build_ldst_map(shape, num, pack16, 1, 0x20_0010).unwrap());
+            let mut from_runs: Vec<(u32, u32)> = map
+                .cell_runs()
+                .iter()
+                .flat_map(|r| (r.column..r.column + r.cells).map(move |c| (r.tmem_lane, c)))
+                .collect();
+            let mut from_pieces: Vec<(u32, u32)> = map.all().iter().map(|p| (p.tmem_lane, p.column)).collect();
+            from_pieces.sort_unstable();
+            from_pieces.dedup();
+            let n = from_runs.len();
+            from_runs.dedup();
+            assert_eq!(from_runs.len(), n, "{shape:?}: a cell in two runs");
+            assert_eq!(from_runs, from_pieces, "{shape:?}");
+            assert!(map.cell_runs().len() <= 32, "{shape:?}: one run per lane expected");
+        }
+    }
 }

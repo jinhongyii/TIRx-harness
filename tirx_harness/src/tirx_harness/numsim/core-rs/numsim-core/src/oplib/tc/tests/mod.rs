@@ -105,18 +105,23 @@ impl Machine {
                 buf.copy_from_slice(bytes);
                 Ok(())
             };
+            // Batched reads span several cells of one lane.
             let read_tmem = |cta: u32, lane: u32, col: u32, buf: &mut [u8]| -> OpResult {
-                let cell = tmem
-                    .borrow()
-                    .get(&(cta, lane, col))
-                    .copied()
-                    .unwrap_or([0; 4]);
-                buf.copy_from_slice(&cell[..buf.len()]);
+                for (i, chunk) in buf.chunks_mut(4).enumerate() {
+                    let cell = tmem
+                        .borrow()
+                        .get(&(cta, lane, col + i as u32))
+                        .copied()
+                        .unwrap_or([0; 4]);
+                    chunk.copy_from_slice(&cell[..chunk.len()]);
+                }
                 Ok(())
             };
             let mut write_tmem = |cta: u32, lane: u32, col: u32, bytes: &[u8]| -> OpResult {
-                tmem.borrow_mut()
-                    .insert((cta, lane, col), bytes.try_into().unwrap());
+                for (i, chunk) in bytes.chunks(4).enumerate() {
+                    tmem.borrow_mut()
+                        .insert((cta, lane, col + i as u32), chunk.try_into().unwrap());
+                }
                 Ok(())
             };
             tc_mma_ctas(payload, options, &read_smem, &read_tmem, &mut write_tmem)
@@ -135,18 +140,23 @@ impl Machine {
                 buf.copy_from_slice(&smem[start..start + buf.len()]);
                 Ok(())
             };
+            // Batched reads span several cells of one lane.
             let read_tmem = |lane: u32, col: u32, buf: &mut [u8]| -> OpResult {
-                let cell = tmem
-                    .borrow()
-                    .get(&(0, lane, col))
-                    .copied()
-                    .unwrap_or([0; 4]);
-                buf.copy_from_slice(&cell[..buf.len()]);
+                for (i, chunk) in buf.chunks_mut(4).enumerate() {
+                    let cell = tmem
+                        .borrow()
+                        .get(&(0, lane, col + i as u32))
+                        .copied()
+                        .unwrap_or([0; 4]);
+                    chunk.copy_from_slice(&cell[..chunk.len()]);
+                }
                 Ok(())
             };
             let mut write_tmem = |lane: u32, col: u32, bytes: &[u8]| -> OpResult {
-                tmem.borrow_mut()
-                    .insert((0, lane, col), bytes.try_into().unwrap());
+                for (i, chunk) in bytes.chunks(4).enumerate() {
+                    tmem.borrow_mut()
+                        .insert((0, lane, col + i as u32), chunk.try_into().unwrap());
+                }
                 Ok(())
             };
             tc_mma(payload, &read_smem, &read_tmem, &mut write_tmem)

@@ -746,7 +746,9 @@ pub type TcTmemWrite<'a> = &'a mut dyn FnMut(u32, u32, u32, &[u8]) -> OpResult;
 /// (the issuing CTA), 0/1 = even/odd CTA of the pair for `cta_group::2`.
 /// `smem(cta, addr, buf)` reads that CTA's shared window at a window byte
 /// address; `tmem_read(cta, lane, col, buf)` / `tmem_write(cta, lane, col,
-/// bytes)` access one 32-bit TMEM cell (taddr `lane << 16 | col`).
+/// bytes)` access TMEM from cell (taddr `lane << 16 | col`): a buffer of
+/// more than 4 bytes covers the following cells of the same lane (cell
+/// `col + i` = bytes `4 * i ..`; a run never crosses a lane, W4-16).
 /// `.ashift` shifts A's TMEM rows after the product (writes through
 /// `tmem_write`). Collector qualifiers do not change numerics; the engine
 /// tracks their state with [`tc_collector_transition`].
@@ -793,7 +795,7 @@ pub use mem::{
     ldmatrix_fragments, ldmatrix_plan, stmatrix_plan, stmatrix_writes, tcgen_cp_decode,
     tcgen_cp_plan, tcgen_ld_dst_count, tcgen_ld_reduce, tcgen_ld_spcompress, tcgen_ldst_map,
     tcgen_ldst_registers, LdMatrixPlan, MatrixAccess, StMatrixPlan, TcgenCpPlan, TcgenCpWord,
-    TcgenLdRed, TcgenLdstMap, TcgenLdstPiece,
+    TcgenCellRun, TcgenLdRed, TcgenLdstMap, TcgenLdstPiece,
 };
 
 // ---------------------------------------------------------------------------

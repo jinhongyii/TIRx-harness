@@ -31,7 +31,7 @@ use numsim_oplib::mma::mma_f32_abt_increasing_k;
 use numsim_oplib::tcgen05::gather::{
     cta2_window_cells, gather_b16_rows_with, gather_f8_rows, gather_lut_b_rows, gather_mxf4_rows,
     gather_packed_tmem_a, gather_scaled_tmem_a_cta, gather_sparse_mxf4_e8m0_rows, gather_tf32_rows,
-    merge_cta2_packed_a, read_dense_window, scaled_tmem_a_geometry, scatter_dense_window,
+    merge_cta2_packed_a, scaled_tmem_a_geometry,
     sparse_mxf4_metadata_code, validate_f8_gather,
 };
 use numsim_oplib::tcgen05::instr_desc::{
@@ -43,7 +43,7 @@ use numsim_oplib::tcgen05::integer::{
     gather_integer_rows, integer_mma_accumulate, integer_shape, IntegerKind,
 };
 use numsim_oplib::tcgen05::layouts::{
-    cta1_dense_tmem_layout, metadata_nibble, mxf8_scale_layout, sparse_metadata_location,
+    cta1_dense_tmem_layout, lane_disabled, metadata_nibble, tmem_address, mxf8_scale_layout, sparse_metadata_location,
     validate_sparse_metadata_address, DenseTmemLayout, ScaleLayout, SparseMetadataLayout,
     CTA1_PACKED_A_COLUMNS,
 };
@@ -58,7 +58,8 @@ use numsim_oplib::tcgen05::scale::{
 };
 use numsim_oplib::tcgen05::smem_desc::{
     decode_matrix_descriptor, decode_matrix_descriptor_for_layout, decode_packed_matrix_descriptor,
-    f8_b_descriptor, ColumnMask, MatrixDescriptor, MatrixDescriptorLayout, SharedWindow,
+    b16_matrix_byte_offset, f8_b_descriptor, masked_row, ColumnMask, MatrixDescriptor,
+    MatrixDescriptorLayout, SharedWindow,
 };
 use numsim_oplib::types::{OpError as LibError, OpResult as LibResult};
 
@@ -222,6 +223,218 @@ impl Io<'_> {
     }
 }
 
+/// One call per run of consecutive columns of one TMEM lane (perf,
+/// W2-21): `cells` are `(cta, lane, column, index)` in walk order; runs are
+/// maximal stretches of that order with the same CTA and lane and columns
+/// increasing by one. The closures see exactly the cells of the walk.
+fn cell_runs(cells: &[(usize, usize, usize, usize)]) -> impl Iterator<Item = &[(usize, usize, usize, usize)]> {
+    let mut rest = cells;
+    std::iter::from_fn(move || {
+        let (&first, _) = rest.split_first()?;
+        let mut len = 1;
+        while let Some(&(cta, lane, column, _)) = rest.get(len) {
+            if cta != first.0 || lane != first.1 || column != first.2 + len {
+                break;
+            }
+            len += 1;
+        }
+        let (run, tail) = rest.split_at(len);
+        rest = tail;
+        Some(run)
+    })
+}
+
+fn check_cell(io: &Io<'_>, lane: usize, column: usize) -> LibResult<(u32, u32)> {
+    let lane = io.index(lane, "TMEM lane")?;
+    let column = io.index(column, "TMEM column")?;
+    if lane >= crate::arena::addr::TMEM_LANES || column >= crate::arena::addr::TMEM_COLS {
+        return Err(io.fail(OpError::invalid(format!("tmem cell ({lane}, {column}) out of range"))));
+    }
+    Ok((lane, column))
+}
+
+/// Read one run of cells (`indices` = value slots of `column..`).
+fn read_run<T>(
+    io: &Io<'_>,
+    buf: &mut Vec<u8>,
+    (cta, lane, column): (usize, usize, usize),
+    indices: &[usize],
+    values: &mut [T],
+    decode: &impl Fn([u8; 4]) -> T,
+) -> LibResult<()> {
+    check_cell(io, lane, column + indices.len() - 1)?;
+    let (lane, column) = check_cell(io, lane, column)?;
+    buf.clear();
+    buf.resize(indices.len() * 4, 0);
+    (io.tmem_read)(cta as u32, lane, column, buf).map_err(|error| io.fail(error))?;
+    for (&index, bytes) in indices.iter().zip(buf.chunks_exact(4)) {
+        values[index] = decode([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
+    Ok(())
+}
+
+/// Write one run of cells.
+fn write_run<T: Copy>(
+    io: &Io<'_>,
+    tmem_write: &mut dyn FnMut(u32, u32, u32, &[u8]) -> OpResult,
+    buf: &mut Vec<u8>,
+    (cta, lane, column): (usize, usize, usize),
+    indices: &[usize],
+    values: &[T],
+    encode: &impl Fn(T) -> [u8; 4],
+) -> LibResult<()> {
+    check_cell(io, lane, column + indices.len() - 1)?;
+    let (lane, column) = check_cell(io, lane, column)?;
+    buf.clear();
+    for &index in indices {
+        buf.extend_from_slice(&encode(values[index]));
+    }
+    tmem_write(cta as u32, lane, column, buf).map_err(|error| io.fail(error))
+}
+
+/// Runs of a `(cta, lane, column, index)` cell list (CTA pairs).
+fn list_runs(
+    cells: &[(usize, usize, usize, usize)],
+    mut run: impl FnMut((usize, usize, usize), &[usize]) -> LibResult<()>,
+) -> LibResult<()> {
+    let mut indices = Vec::new();
+    for chunk in cell_runs(cells) {
+        indices.clear();
+        indices.extend(chunk.iter().map(|cell| cell.3));
+        run((chunk[0].0, chunk[0].1, chunk[0].2), &indices)?;
+    }
+    Ok(())
+}
+
+/// The CTA1 dense window walk of `dense_tmem_cells` (same order, same
+/// checks and messages), streamed as runs of consecutive columns of one
+/// lane: `run(lane, column, indices)` with `indices[i] = row * n + col` of
+/// the cell at `column + i`. No per-cell vectors (perf, W2-21).
+fn cta1_runs(
+    taddr: u32,
+    m: usize,
+    n: usize,
+    layout: DenseTmemLayout,
+    mask: Option<[u32; 4]>,
+    mut run: impl FnMut(usize, usize, &[usize]) -> LibResult<()>,
+) -> LibResult<()> {
+    let (base_lane, base_column) = tmem_address(taddr, 0, 0)?;
+    m.checked_mul(n)
+        .ok_or_else(|| LibError::message("raw TCGEN destination shape overflow"))?;
+    let mut indices: Vec<usize> = Vec::with_capacity(n);
+    if layout == DenseTmemLayout::D && n > 0 {
+        // Layout D: row `r` is lane `base + r`, columns `base..base + n`.
+        layout.location(m - 1, n - 1, m, n)?;
+        for row in 0..m {
+            let lane = base_lane
+                .checked_add(row)
+                .ok_or_else(|| LibError::message("raw TCGEN destination lane overflow"))?;
+            if lane >= 128 {
+                return Err(LibError::message(format!(
+                    "raw TCGEN destination lane {lane} is outside 128 lanes"
+                )));
+            }
+            if mask.is_some_and(|mask| lane_disabled(&mask, lane)) {
+                continue;
+            }
+            base_column
+                .checked_add(n - 1)
+                .ok_or_else(|| LibError::message("raw TCGEN destination column overflow"))?;
+            indices.clear();
+            indices.extend(row * n..row * n + n);
+            run(lane, base_column, &indices)?;
+        }
+        return Ok(());
+    }
+    let mut current: Option<(usize, usize)> = None;
+    for row in 0..m {
+        for col in 0..n {
+            let (lane_delta, column_delta) = layout.location(row, col, m, n)?;
+            let lane = base_lane
+                .checked_add(lane_delta)
+                .ok_or_else(|| LibError::message("raw TCGEN destination lane overflow"))?;
+            if lane >= 128 {
+                return Err(LibError::message(format!(
+                    "raw TCGEN destination lane {lane} is outside 128 lanes"
+                )));
+            }
+            if mask.is_some_and(|mask| lane_disabled(&mask, lane)) {
+                continue;
+            }
+            let column = base_column
+                .checked_add(column_delta)
+                .ok_or_else(|| LibError::message("raw TCGEN destination column overflow"))?;
+            match current {
+                Some((l, c)) if l == lane && c + indices.len() == column => {}
+                _ => {
+                    if let Some((l, c)) = current {
+                        run(l, c, &indices)?;
+                    }
+                    indices.clear();
+                    current = Some((lane, column));
+                }
+            }
+            indices.push(row * n + col);
+        }
+    }
+    if let Some((l, c)) = current {
+        run(l, c, &indices)?;
+    }
+    Ok(())
+}
+
+/// `gather_b16_rows_with` with K-major rows read 16 bytes (8 elements) at
+/// a time where the descriptor layout keeps them contiguous, which every
+/// canonical K-major layout does within a 16-byte core-matrix row (perf,
+/// W2-21). Same values, same bytes read, in the same row order; any other
+/// shape takes the per-element path.
+#[allow(clippy::too_many_arguments)]
+fn gather_b16_chunked<Scalar: Default + Copy>(
+    read_shared: &mut impl FnMut(usize, &mut [u8]) -> LibResult<()>,
+    descriptor: MatrixDescriptor,
+    rows: usize,
+    columns: usize,
+    transpose: bool,
+    mask: Option<ColumnMask>,
+    decode: impl Fn(u16) -> LibResult<Scalar>,
+) -> LibResult<Vec<Scalar>> {
+    if transpose || columns % 8 != 0 {
+        return gather_b16_rows_with(read_shared, WINDOW, descriptor, rows, columns, transpose, mask, decode);
+    }
+    let mut values = Vec::with_capacity(
+        rows.checked_mul(columns)
+            .ok_or_else(|| LibError::message("raw sparse b16 gather shape overflow"))?,
+    );
+    let mut chunk = [0_u8; 16];
+    for row in 0..rows {
+        let Some(row) = masked_row(mask, row) else {
+            values.extend(std::iter::repeat_with(Scalar::default).take(columns));
+            continue;
+        };
+        for first in (0..columns).step_by(8) {
+            // A 16-byte-aligned start whose 8th element sits 14 bytes on is
+            // one core-matrix row: swizzling permutes whole 16-byte units.
+            let start = b16_matrix_byte_offset(WINDOW, descriptor, row, first, false)?;
+            let contiguous = start % 16 == 0
+                && b16_matrix_byte_offset(WINDOW, descriptor, row, first + 7, false)? == start + 14;
+            if contiguous {
+                read_shared(start, &mut chunk)?;
+                for pair in chunk.chunks_exact(2) {
+                    values.push(decode(u16::from_le_bytes([pair[0], pair[1]]))?);
+                }
+            } else {
+                for column in first..first + 8 {
+                    let offset = b16_matrix_byte_offset(WINDOW, descriptor, row, column, false)?;
+                    let mut bytes = [0_u8; 2];
+                    read_shared(offset, &mut bytes)?;
+                    values.push(decode(u16::from_le_bytes(bytes))?);
+                }
+            }
+        }
+    }
+    Ok(values)
+}
+
 fn write_cell(
     io: &Io<'_>,
     tmem_write: TcTmemWrite<'_>,
@@ -262,29 +475,18 @@ impl Window {
         decode: impl Fn([u8; 4]) -> T,
         disabled: T,
     ) -> OpResult<Vec<T>> {
-        if self.cta_group == 1 {
-            return io.lib(read_dense_window(
-                &mut |_, _| Ok(true),
-                &mut |lane, column| io.cell(0, lane, column),
-                self.taddr,
-                self.m,
-                self.n,
-                self.layout,
-                decode,
-                disabled,
-                self.mask4(),
-            ));
-        }
-        let cells = io.lib(cta2_window_cells(
-            self.taddr,
-            self.m,
-            self.n,
-            self.layout,
-            None,
-        ))?;
+        // Legacy `read_dense_window` with an always-valid cell reads every
+        // cell, disabled lanes included (`disabled` is never used).
+        let _ = disabled;
         let mut values = vec![disabled; self.m * self.n];
-        for (cta, lane, column, index) in cells {
-            values[index] = decode(io.lib(io.cell(cta, lane, column))?);
+        let mut buf = Vec::new();
+        if self.cta_group == 1 {
+            io.lib(cta1_runs(self.taddr, self.m, self.n, self.layout, None, |lane, column, indices| {
+                read_run(io, &mut buf, (0, lane, column), indices, &mut values, &decode)
+            }))?;
+        } else {
+            let cells = io.lib(cta2_window_cells(self.taddr, self.m, self.n, self.layout, None))?;
+            io.lib(list_runs(&cells, |at, indices| read_run(io, &mut buf, at, indices, &mut values, &decode)))?;
         }
         Ok(values)
     }
@@ -296,33 +498,15 @@ impl Window {
         encode: impl Fn(T) -> [u8; 4],
         values: &[T],
     ) -> OpResult {
+        let mut buf = Vec::new();
         if self.cta_group == 1 {
-            let result = scatter_dense_window(
-                &mut |lane, column, bytes: [u8; 4]| {
-                    write_cell(io, tmem_write, 0, lane, column, &bytes)
-                },
-                self.taddr,
-                self.m,
-                self.n,
-                self.layout,
-                encode,
-                self.mask4(),
-                values,
-            );
-            return io.lib(result);
+            io.lib(cta1_runs(self.taddr, self.m, self.n, self.layout, Some(self.mask4()), |lane, column, indices| {
+                write_run(io, tmem_write, &mut buf, (0, lane, column), indices, values, &encode)
+            }))
+        } else {
+            let cells = io.lib(cta2_window_cells(self.taddr, self.m, self.n, self.layout, Some(self.mask)))?;
+            io.lib(list_runs(&cells, |at, indices| write_run(io, tmem_write, &mut buf, at, indices, values, &encode)))
         }
-        let cells = io.lib(cta2_window_cells(
-            self.taddr,
-            self.m,
-            self.n,
-            self.layout,
-            Some(self.mask),
-        ))?;
-        for (cta, lane, column, index) in cells {
-            let bytes = encode(values[index]);
-            io.lib(write_cell(io, tmem_write, cta, lane, column, &bytes))?;
-        }
-        Ok(())
     }
 }
 
@@ -527,5 +711,45 @@ pub(super) fn run(
         TcMmaKind::I8 | TcMmaKind::Ti16 => integer_mma(&io, payload, options, &form, tmem_write),
         TcMmaKind::MxF4 | TcMmaKind::MxF4Nvf4 => mxf4_mma(&io, payload, options, &form, tmem_write),
         TcMmaKind::MxF8f6f4 => mxf8f6f4_mma(&io, payload, options, &form, tmem_write),
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+    use numsim_oplib::tcgen05::encode::encode_matrix_descriptor;
+
+    /// The chunked K-major b16 gather returns the per-element gather's
+    /// values and reads exactly the same bytes, for every swizzle mode.
+    #[test]
+    fn chunked_b16_gather_matches_the_per_element_gather() {
+        let smem: Vec<u8> = (0..1 << 16).map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        for swizzle in 0..=6_i64 {
+            for (rows, columns) in [(64, 16), (128, 64), (8, 8), (16, 24)] {
+                for transpose in [false, true] {
+                    let Ok(descriptor) = decode_matrix_descriptor(encode_matrix_descriptor(0x2000, 8, 64, swizzle)) else {
+                        continue;
+                    };
+                    let run = |chunked: bool| {
+                        let mut read: Vec<usize> = Vec::new();
+                        let mut fetch = |offset: usize, buf: &mut [u8]| -> LibResult<()> {
+                            buf.copy_from_slice(&smem[offset..offset + buf.len()]);
+                            read.extend(offset..offset + buf.len());
+                            Ok(())
+                        };
+                        let decode = |bits: u16| Ok(u32::from(bits));
+                        let values = if chunked {
+                            gather_b16_chunked(&mut fetch, descriptor, rows, columns, transpose, None, decode)
+                        } else {
+                            gather_b16_rows_with(&mut fetch, WINDOW, descriptor, rows, columns, transpose, None, decode)
+                        };
+                        read.sort_unstable();
+                        read.dedup();
+                        (values.map_err(|e| e.to_string()), read)
+                    };
+                    assert_eq!(run(true), run(false), "swizzle {swizzle} {rows}x{columns} transpose {transpose}");
+                }
+            }
+        }
     }
 }

@@ -655,3 +655,55 @@ fn tma_reduce_validation_matches_the_legacy_ptx_table() {
         assert!(super::super::tma_reduce_valid(op, Dtype::U32).is_err());
     }
 }
+
+/// The translation cache returns the direct planner's plan for interior and
+/// OOB boxes alike (loads and stores, every swizzle, ranks 1..3).
+#[test]
+fn cached_tiled_plans_equal_direct_plans() {
+    use super::super::{TmaPlanDir, TensorMapDesc};
+    let mut seed = 0x9e37_79b9_u64;
+    let mut next = move |bound: u64| {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % bound
+    };
+    let mut checked = 0;
+    for (elem, bytes) in [(Dtype::U8, 1_u64), (Dtype::BF16, 2), (Dtype::F32, 4), (Dtype::F64, 8)] {
+        for swizzle in 0..=3_u8 {
+            for rank in 1..=3_u8 {
+                let inner_box = (if swizzle == 0 { 64 } else { 16 << swizzle }) / bytes;
+                let mut map = TensorMapDesc {
+                    global_address: 0x1_0000_0000 + 0x100 * next(16),
+                    rank,
+                    elem: Some(elem),
+                    global_dim: [512, 64, 8, 1, 1],
+                    global_stride: [512 * bytes + 256, (512 * bytes + 256) * 64, 0, 0, 0],
+                    box_dim: [inner_box as u32, 8, 2, 1, 1],
+                    element_stride: [1, 1, 1, 1, 1],
+                    swizzle,
+                    ..Default::default()
+                };
+                for i in usize::from(rank)..5 {
+                    map.global_dim[i] = 1;
+                    map.box_dim[i] = 1;
+                }
+                for dir in [TmaPlanDir::Load, TmaPlanDir::Store] {
+                    for _ in 0..12 {
+                        let coords: Vec<i64> = (0..usize::from(rank))
+                            .map(|i| next(map.global_dim[i] + 8) as i64 - 4)
+                            .collect();
+                        let smem = 0x400 * next(4);
+                        let direct = super::plan_uncached(&map, dir, TmaMode::Tile, &coords, &[], smem);
+                        let cached = super::plan(&map, dir, TmaMode::Tile, &coords, &[], smem);
+                        assert_eq!(
+                            cached.map_err(|e| e.to_string()),
+                            direct.map_err(|e| e.to_string()),
+                            "{elem:?} swizzle {swizzle} rank {rank} {dir:?} {coords:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 0);
+}

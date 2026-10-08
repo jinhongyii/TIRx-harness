@@ -392,12 +392,47 @@ fn encode_instr_descriptor(
     }
     integer_sources(ops, name)?;
     let ops = ops.clone();
+    let form = format!("{block_scaled}:{}", dtypes.join(","));
     Ok(Resolved::Boxed(Box::new(move |io: &mut PtxIo<'_>| {
+        // Operands are usually warp-uniform: encode once per distinct tuple
+        // (the string dtype arguments make one encode ~80 ns; perf, W2-21).
+        let mut last: Option<([i64; 11], u32)> = None;
+        let mut previous: Option<(usize, u32)> = None;
         for lane in 0..WARP_SIZE {
             if !io.mask.contains(lane) {
                 continue;
             }
+            if let Some((prev, encoded)) = previous {
+                if (0..n_values).all(|i| ops.src(io, i, lane) == ops.src(io, i, prev)) {
+                    ops.put(io, 0, lane, u64::from(encoded), 32, false);
+                    continue;
+                }
+            }
             let v = |i: usize| int_value(ops.src_tys[i], ops.src(io, i, lane));
+            let mut inputs = [0_i64; 11];
+            for (i, slot) in inputs.iter_mut().enumerate().take(n_values) {
+                *slot = v(i);
+            }
+            if let Some((seen, encoded)) = last {
+                if seen == inputs {
+                    previous = Some((lane, encoded));
+                    ops.put(io, 0, lane, encoded as u64, 32, false);
+                    continue;
+                }
+            }
+            // Across calls: the same few descriptors are encoded every
+            // iteration; remember them per thread.
+            thread_local! {
+                static ENCODED: std::cell::RefCell<std::collections::HashMap<String, std::collections::HashMap<[i64; 11], u32>>> =
+                    std::cell::RefCell::new(std::collections::HashMap::new());
+            }
+            let cached = ENCODED.with(|cache| cache.borrow().get(form.as_str()).and_then(|m| m.get(&inputs)).copied());
+            if let Some(encoded) = cached {
+                last = Some((inputs, encoded));
+                previous = Some((lane, encoded));
+                ops.put(io, 0, lane, u64::from(encoded), 32, false);
+                continue;
+            }
             let encoded = if block_scaled {
                 // srcs: sfa_tmem_addr, sfb_tmem_addr (unused: a/b_sf_id = 0),
                 // M, N, K, trans_a, trans_b, n_cta_groups, neg_a, neg_b, is_sparse.
@@ -435,6 +470,16 @@ fn encode_instr_descriptor(
                     v(9) != 0,
                 )?
             };
+            last = Some((inputs, encoded as u32));
+            previous = Some((lane, encoded as u32));
+            ENCODED.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                let forms = cache.entry(form.clone()).or_default();
+                if forms.len() >= 4096 {
+                    forms.clear();
+                }
+                forms.insert(inputs, encoded as u32);
+            });
             ops.put(io, 0, lane, encoded as u64, 32, false);
         }
         Ok(())

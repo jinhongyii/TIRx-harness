@@ -1764,6 +1764,42 @@ Open, for W1:
    - Fixes `test_tcgen05_ti16.py::test_ti16_ws_banks_and_column_mask[*]`
      (6 params).
 
+## W4-16 (2026-10-08): W2-21 perf hot spots (oplib side) and W2-20 prefetch
+
+- **Contract widening (W2: `sched/partition.rs::run_mma` already
+  conforms).** The `tc_mma_ctas` `tmem_read` / `tmem_write` buffers may now
+  cover several consecutive cells of one lane: cell `col + i` is bytes
+  `4i..4i+4`, and a run never crosses a lane. oplib now reads and writes the
+  D window, and packed TMEM A, as one call per lane run instead of one per
+  cell. K-major B16 smem operands are read 16 bytes (8 elements) at a time
+  where the layout keeps them contiguous. Both read exactly the same bytes
+  as before, so footprints are unchanged. Values are bit-exact; a test
+  compares the chunked and per-element gathers for every swizzle mode.
+- **TMA plans:** an interior tile-mode box (no OOB element, byte-multiple
+  element type, no interleave) reuses a cached plan of the same map at
+  coordinates 0, shifted by `sum c_i * stride_i`. The cache is
+  thread-local, keyed by (map, direction, smem offset). A test compares the
+  cached and direct planners on interior and OOB boxes.
+- **`tcgen_ldst_map`:** maps are cached per (shape, num, pack, warp,
+  taddr) and shared through `Rc`. New `TcgenLdstMap::cell_runs()` lists the
+  touched cells as per-lane runs of consecutive columns. W2: read and write
+  each run with one TMEM access instead of one per piece. That is the
+  remaining 167 us/op (#4).
+- **Generic Ptx (#5):** `PtxFn`s are already resolved once per op at load
+  (`interp/mod.rs`, `Loaded::ops`); nothing re-resolves.
+  - The slow oplib ops in `fp16_bf16_gemm` were `numsim.pack` (bit-by-bit
+    insert) and `tcgen05_encode_instr_descriptor` (string dtype parsing per
+    lane). `pack` now uses word shifts. The encoder now reuses its result
+    for repeated operand tuples, within a call and across calls on the same
+    thread.
+  - The rest of the 2.6 us/op is handler-side (scratch marshalling,
+    timers).
+- **W2-20 `cp_async_bulk_prefetch`:** both table spellings already resolve
+  (`ptx/hints.rs`), and lowering emits `cp.async.bulk.prefetch` as an
+  ordering-only instruction, not a `Ptx` op. `alphamoe_fp8_blockscale_qwen3next`
+  now stops on `bad_address` at the remote `BULK_S2C` (kernel line 1453),
+  which is not oplib.
+
 ## W5-10 (for W2, 2026-10-08): restricted commit and tcgen smem operand proxy
 
 Found with `test_tcgen05_restricted_commit` (a racecheck false negative) and

@@ -56,24 +56,41 @@ fn mask(v: &mut Bits, bits: u32) {
     }
 }
 
+/// `v >> n` over the 256-bit value.
+fn shr(v: &Bits, n: u32) -> Bits {
+    let (words, bits) = ((n / 64) as usize, n % 64);
+    std::array::from_fn(|i| {
+        let lo = v.get(i + words).copied().unwrap_or(0);
+        let hi = v.get(i + words + 1).copied().unwrap_or(0);
+        if bits == 0 { lo } else { (lo >> bits) | (hi << (64 - bits)) }
+    })
+}
+
+/// `v << n` over the 256-bit value.
+fn shl(v: &Bits, n: u32) -> Bits {
+    let (words, bits) = ((n / 64) as usize, n % 64);
+    std::array::from_fn(|i| {
+        let lo = if i >= words { v[i - words] } else { 0 };
+        let below = if i > words { v[i - words - 1] } else { 0 };
+        if bits == 0 { lo } else { (lo << bits) | (below >> (64 - bits)) }
+    })
+}
+
 /// `width` bits of `v` starting at bit `at`.
 fn extract(v: &Bits, at: u32, width: u32) -> Bits {
-    let mut out = [0u64; 4];
-    for bit in 0..width {
-        let src = at + bit;
-        if (v[(src / 64) as usize] >> (src % 64)) & 1 == 1 {
-            out[(bit / 64) as usize] |= 1 << (bit % 64);
-        }
-    }
+    let mut out = if at >= 256 { [0; 4] } else { shr(v, at) };
+    mask(&mut out, width);
     out
 }
 
 fn insert(v: &mut Bits, at: u32, width: u32, piece: &Bits) {
-    for bit in 0..width {
-        if (piece[(bit / 64) as usize] >> (bit % 64)) & 1 == 1 {
-            let dst = at + bit;
-            v[(dst / 64) as usize] |= 1 << (dst % 64);
-        }
+    if at >= 256 {
+        return;
+    }
+    let mut piece = *piece;
+    mask(&mut piece, width);
+    for (w, p) in v.iter_mut().zip(shl(&piece, at)) {
+        *w |= p;
     }
 }
 
@@ -127,7 +144,49 @@ pub(in crate::oplib) fn resolve(name: &str, mods: &Mods, ops: &Operands) -> OpRe
                 return Err(OpError::unsupported(format!("{name}: pieces {pieces:?} do not tile {vector}")));
             }
             let widths: Vec<u32> = pieces.iter().map(|t| t.bits()).collect();
-            if pack {
+            // Pieces that sit inside one 64-bit word (every <=64-bit element
+            // tiling): one shift/mask per piece instead of the 256-bit path.
+            let mut placement: Vec<(usize, u32, u64)> = Vec::with_capacity(widths.len());
+            let mut at = 0;
+            for &w in &widths {
+                if w == 0 || w > 64 || at % 64 + w > 64 || pieces.iter().any(|t| t.slots() != 1) {
+                    placement.clear();
+                    break;
+                }
+                let mask = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+                placement.push(((at / 64) as usize, at % 64, mask));
+                at += w;
+            }
+            let whole_off = if pack { ops.dst_off[0] } else { ops.src_off[0] };
+            let piece_offs: Vec<usize> = if pack { ops.src_off.clone() } else { ops.dst_off.clone() };
+            let whole_slots = whole[0].slots() as usize;
+            if !placement.is_empty() && pack {
+                Resolved::Boxed(Box::new(move |io| {
+                    for lane in io.mask.lanes() {
+                        let mut v = [0u64; 4];
+                        for (&(word, shift, mask), &off) in placement.iter().zip(&piece_offs) {
+                            v[word] |= (io.srcs[off][lane] & mask) << shift;
+                        }
+                        for (k, w) in v.iter().enumerate().take(whole_slots) {
+                            io.dsts[whole_off + k][lane] = *w;
+                        }
+                    }
+                    Ok(())
+                }))
+            } else if !placement.is_empty() {
+                Resolved::Boxed(Box::new(move |io| {
+                    for lane in io.mask.lanes() {
+                        let mut v = [0u64; 4];
+                        for (k, w) in v.iter_mut().enumerate().take(whole_slots) {
+                            *w = io.srcs[whole_off + k][lane];
+                        }
+                        for (&(word, shift, mask), &off) in placement.iter().zip(&piece_offs) {
+                            io.dsts[off][lane] = (v[word] >> shift) & mask;
+                        }
+                    }
+                    Ok(())
+                }))
+            } else if pack {
                 Resolved::Boxed(Box::new(move |io| {
                     for lane in io.mask.lanes() {
                         let mut v = [0u64; 4];
@@ -212,6 +271,37 @@ mod tests {
         let mut io = PtxIo { dsts: &mut dsts, dst_tys, srcs, src_tys, mask: WarpMask(0b101) };
         f.call(&mut io).unwrap();
         dsts
+    }
+
+    /// Word-level `extract` / `insert` equal the bit-by-bit definitions.
+    #[test]
+    fn extract_and_insert_match_the_bitwise_definition() {
+        let bit = |v: &super::Bits, i: u32| (v[(i / 64) as usize] >> (i % 64)) & 1;
+        let mut seed = 0x1234_5678_9abc_def0_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2000 {
+            let v: super::Bits = [next(), next(), next(), next()];
+            let width = (next() % 129) as u32;
+            let at = (next() % (257 - u64::from(width))) as u32;
+            let got = super::extract(&v, at, width);
+            for i in 0..256 {
+                let want = if i < width { bit(&v, at + i) } else { 0 };
+                assert_eq!(bit(&got, i), want, "extract at {at} width {width} bit {i}");
+            }
+            let mut dst: super::Bits = [next(), 0, next(), 0];
+            let before = dst;
+            super::insert(&mut dst, at, width, &v);
+            for i in 0..256 {
+                let inside = i >= at && i < at + width;
+                let want = bit(&before, i) | if inside { bit(&v, i - at) } else { 0 };
+                assert_eq!(bit(&dst, i), want, "insert at {at} width {width} bit {i}");
+            }
+        }
     }
 
     #[test]

@@ -101,9 +101,8 @@ pub(super) fn float_mma(
                 // Legacy CTA2 B16 gathers take no column mask (.ws is CTA1).
                 let mask = if cg == 1 { mask } else { None };
                 io.per_cta(cg, |cta| {
-                    gather_b16_rows_with(
+                    gather_b16_chunked(
                         &mut io.shared(cta),
-                        WINDOW,
                         descriptor,
                         rows,
                         columns,
