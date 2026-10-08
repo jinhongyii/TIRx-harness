@@ -227,13 +227,15 @@ fn tma_store_cross_warp_race_after_wait() {
     assert!(has_failure(&r, |f| f == OrderingFailure::MissingInterActorSync));
 }
 
-/// Memory reuse under an unfinished async op, and out-of-bounds.
+/// Memory reuse under an unfinished async op, and out-of-bounds. (A shared
+/// allocation ends only at CTA exit, which drains bulk copies — ruling S7 —
+/// so the lifetime case uses a non-shared allocation.)
 #[test]
 fn reuse_and_oob() {
     let mut k = K::one_warp();
-    let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16)]);
+    let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(GMEM2, 0..16)]);
     k.ar(op, Proxy::Async, GMEM, 0..16);
-    k.alloc_end(SMEM);
+    k.alloc_end(GMEM2);
     k.st(0, 0, GMEM, 4090..4100);
     let r = k.run();
     assert!(r.findings.iter().any(|f| matches!(f.kind, FindingKind::AsyncLifetime { .. })));
@@ -273,4 +275,26 @@ fn async_group_wait_is_per_lane() {
         k.ld(0, 1, SMEM, 0..4);
         assert_eq!(has_race(&k.run()), !sync);
     }
+}
+
+/// Ruling S7: a TMA store still in flight when its CTA exits (no final
+/// `cp.async.bulk.wait_group`) is drained by the hardware: neither
+/// `AsyncLifetime` nor `AsyncNeverCompleted`. Its global write stays
+/// unordered with a later access by a still-running CTA.
+#[test]
+fn bulk_store_in_flight_at_cta_exit_is_drained() {
+    let run = |later_cta_write: bool| {
+        let mut k = K::new(1, 1, 2);
+        k.st(0, 0, SMEM, 0..16).fence(0, 1, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+        let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16), (GMEM, 0..16)]);
+        k.ar(op, Proxy::Async, SMEM, 0..16).aw(op, Proxy::Async, GMEM, 0..16);
+        k.alloc_end(SMEM);
+        if later_cta_write {
+            k.st(1, 0, GMEM, 0..4);
+        }
+        k.run()
+    };
+    let r = run(false);
+    assert!(r.findings.is_empty() && r.incomplete.is_empty(), "{r:?}");
+    assert!(has_race(&run(true)));
 }

@@ -119,7 +119,9 @@ pub struct Finding {
     /// For TMEM: the union of overlapped `(lanes, columns)` over all
     /// occurrences (the byte hull spans rows, so it cannot be projected to
     /// columns; TMEM byte = (lane * 512 + column) * 4).
-    pub tmem: Option<(Range<u32>, Range<u32>)>,
+    /// `(lanes, columns)`: sorted, disjoint, merged only when overlapping or
+    /// adjacent, over every occurrence's exact overlap.
+    pub tmem: Option<(Vec<Range<u64>>, Vec<Range<u64>>)>,
     /// `AliasStaleRead` only: the merged byte spans of every occurrence
     /// (legacy `overlaps`); empty for other kinds.
     pub spans: Vec<Range<u64>>,
@@ -372,6 +374,10 @@ struct AsyncActor {
     footprint: Vec<(AllocId, Range<u64>)>,
     /// Highest milestone reached (0 none, 1 read, 2 write/full).
     done: u8,
+    /// A bulk copy still in flight when its CTA's shared memory ended
+    /// (implicit CTA exit): drained by the hardware (deltas S7). Its
+    /// accesses stay unordered with everything after them.
+    drained: bool,
 }
 
 struct Alloc {
@@ -546,21 +552,20 @@ fn add_span(spans: &mut Vec<Range<u64>>, r: Range<u64>) {
     }
 }
 
-/// `(lanes, columns)` of a TMEM byte range.
-fn tmem_rect(r: &Range<u64>) -> (Range<u32>, Range<u32>) {
+/// Fold the TMEM byte range `r` into `(lanes, columns)` (exact per-lane
+/// column segments of the taddr-encoded range).
+fn add_tmem(t: &mut (Vec<Range<u64>>, Vec<Range<u64>>), r: &Range<u64>) {
     let row = 512 * 4;
-    let (l0, l1) = ((r.start / row) as u32, ((r.end - 1) / row) as u32 + 1);
-    if l1 == l0 + 1 {
-        (l0..l1, ((r.start % row) / 4) as u32..(((r.end - 1) % row) / 4) as u32 + 1)
+    let (l0, l1) = (r.start / row, (r.end - 1) / row);
+    add_span(&mut t.0, l0..l1 + 1);
+    let (c0, c1) = ((r.start % row) / 4, ((r.end - 1) % row) / 4 + 1);
+    if l0 == l1 {
+        add_span(&mut t.1, c0..c1);
+    } else if l1 > l0 + 1 || c0 <= c1 {
+        add_span(&mut t.1, 0..512);
     } else {
-        (l0..l1, 0..512)
-    }
-}
-
-fn union_rect(a: Option<(Range<u32>, Range<u32>)>, b: (Range<u32>, Range<u32>)) -> (Range<u32>, Range<u32>) {
-    match a {
-        None => b,
-        Some((l, c)) => (l.start.min(b.0.start)..l.end.max(b.0.end), c.start.min(b.1.start)..c.end.max(b.1.end)),
+        add_span(&mut t.1, c0..512);
+        add_span(&mut t.1, 0..c1);
     }
 }
 
@@ -668,7 +673,7 @@ impl Checker {
             // leaves no unobserved effect. Its accesses stay unordered with
             // everything after them (races / TmemLifetimeReview still fire);
             // the destination-register side belongs to Space::Reg.
-            .filter(|a| a.in_use && a.done == 0 && !matches!(a.kind, AsyncKind::TcgenCommit | AsyncKind::TcgenLd | AsyncKind::TcgenSt))
+            .filter(|a| a.in_use && a.done == 0 && !a.drained && !matches!(a.kind, AsyncKind::TcgenCommit | AsyncKind::TcgenLd | AsyncKind::TcgenSt))
             .map(|a| a.op)
             .collect();
         for op in never {
@@ -731,7 +736,7 @@ impl Checker {
         let f = &mut self.report.findings[i];
         f.occurrences += 1;
         if tmem && !bytes.is_empty() {
-            f.tmem = Some(union_rect(f.tmem.take(), tmem_rect(bytes)));
+            add_tmem(f.tmem.get_or_insert_with(Default::default), bytes);
         }
         if matches!(f.kind, FindingKind::Advisory { kind: AdvisoryKind::AliasStaleRead }) {
             add_span(&mut f.spans, bytes.clone());
@@ -747,7 +752,9 @@ impl Checker {
             f.spans.push(f.bytes.clone());
         }
         if f.tmem.is_none() && !f.bytes.is_empty() && self.is_tmem(f.alloc) {
-            f.tmem = Some(tmem_rect(&f.bytes));
+            let mut t = Default::default();
+            add_tmem(&mut t, &f.bytes);
+            f.tmem = Some(t);
         }
         self.report.findings.push(f);
         Some(self.report.findings.len() - 1)
@@ -1411,11 +1418,19 @@ impl Checker {
                     });
             }
             SyncEvent::AllocEnd { alloc } => {
+                // Shared memory ends only at CTA exit, and the hardware keeps
+                // it until the CTA's outstanding bulk copies are done (ruling
+                // S7: no final `cp.async.bulk.wait_group` is not an error).
+                let shared = self.allocs.get(&alloc).is_some_and(|al| al.space == Space::Shared);
                 let mut lifetime = Vec::new();
-                for a in &self.asyncs {
+                for a in self.asyncs.iter_mut() {
                     if a.in_use && a.done == 0 {
                         if let Some((_, r)) = a.footprint.iter().find(|(al, _)| *al == alloc) {
-                            lifetime.push((a.op, r.clone()));
+                            if shared && a.kind == AsyncKind::Copy {
+                                a.drained = true;
+                            } else if !a.drained {
+                                lifetime.push((a.op, r.clone()));
+                            }
                         }
                     }
                 }
@@ -1762,6 +1777,7 @@ impl Checker {
                     preds: Vec::new(),
                     footprint: Vec::new(),
                     done: 0,
+                    drained: false,
                 });
                 self.stats.async_slots += 1;
                 self.asyncs.len() - 1
@@ -1782,6 +1798,7 @@ impl Checker {
         slot.preds = pred_idx;
         slot.footprint = footprint;
         slot.done = 0;
+        slot.drained = false;
         let gen_base = slot.gen_base;
         if kind == AsyncKind::TcgenPipelined {
             for c in lanes.lanes8() {

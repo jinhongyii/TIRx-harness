@@ -324,8 +324,9 @@ fn new_kinds_and_attrs() {
     assert_eq!(p["advisories"][0]["kind"], "undeclared_protocol_word");
     // async lifetime
     let mut k = K::one_warp();
-    let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16)]);
-    k.ar(op, Proxy::Async, GMEM, 0..16).alloc_end(SMEM);
+    // (non-shared: CTA exit drains bulk copies from shared, ruling S7)
+    let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(GMEM2, 0..16)]);
+    k.ar(op, Proxy::Async, GMEM, 0..16).alloc_end(GMEM2);
     let rep = report(&k.observe());
     assert!(rep.findings.iter().any(|f| f.kind == CK::AsyncLifetime));
 }

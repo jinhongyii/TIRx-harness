@@ -383,7 +383,8 @@ fn alias_stale_read_ignores_unnamed_buffers() {
 }
 
 /// V2C-34: TMEM findings carry explicit `tmem_lanes` / `tmem_columns`
-/// (`[lo, hi)`, union over occurrences); `Evidence.bytes` stays the
+/// (lists of `[lo, hi)`, exact per-occurrence overlaps merged only when
+/// overlapping or adjacent); `Evidence.bytes` stays the
 /// taddr-encoded span (byte = (lane * 512 + column) * 4), whose hull spans
 /// whole rows and cannot be projected to columns.
 #[test]
@@ -396,8 +397,17 @@ fn v2c34_tmem_lane_column_attrs() {
     }
     let rep = report(&k.observe());
     let race = rep.findings.iter().find(|f| f.kind == CK::DataRace).expect("tmem race");
-    assert_eq!(race.attrs["tmem_lanes"], serde_json::json!([3, 6]));
-    assert_eq!(race.attrs["tmem_columns"], serde_json::json!([10, 12]));
+    assert_eq!(race.attrs["tmem_lanes"], serde_json::json!([[3, 4], [5, 6]]));
+    assert_eq!(race.attrs["tmem_columns"], serde_json::json!([[10, 12]]));
+    // Disjoint column overlaps stay separate (legacy exact overlaps).
+    let mut k = K::new(2, 1, 1);
+    for w in 0..2 {
+        k.inst(w, &[0], PLAIN_ST, |l| (TMEM, col(u64::from(l), 64)..col(u64::from(l), 80)));
+        k.inst(w, &[0], PLAIN_ST, |l| (TMEM, col(u64::from(l), 96)..col(u64::from(l), 112)));
+    }
+    let rep = report(&k.observe());
+    let cols: Vec<_> = rep.findings.iter().filter(|f| f.kind == CK::DataRace).map(|f| f.attrs["tmem_columns"].clone()).collect();
+    assert!(cols.iter().all(|c| c == &serde_json::json!([[64, 80]]) || c == &serde_json::json!([[96, 112]])), "{cols:?}");
     // Non-TMEM findings carry no tmem keys.
     let mut k = K::new(2, 1, 1);
     k.st(0, 0, SMEM, 0..4).st(1, 0, SMEM, 0..4);

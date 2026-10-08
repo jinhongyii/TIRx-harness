@@ -296,8 +296,9 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
     // V2C-34: TMEM evidence as explicit [lo, hi) lane / column ranges
     // (Evidence.bytes stays the taddr-encoded span).
     if let Some((l, c)) = &f.tmem {
-        race.insert("tmem_lanes".into(), json!([l.start, l.end]));
-        race.insert("tmem_columns".into(), json!([c.start, c.end]));
+        let list = |v: &Vec<std::ops::Range<u64>>| json!(v.iter().map(|r| [r.start, r.end]).collect::<Vec<_>>());
+        race.insert("tmem_lanes".into(), list(l));
+        race.insert("tmem_columns".into(), list(c));
     }
     if f.severity == Severity::Review {
         debug_assert_eq!(status, Status::Review);
