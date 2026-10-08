@@ -2798,3 +2798,16 @@ The 25 public-API functions with class `other-assertion` in `scripts/numsim-v2/c
 - **Found while testing:** the replace `rank` field holds rank - 1. My earlier guard (accepting 1..=5) was off by one; it is now `<= 4`.
 
 `cargo test --workspace`: 1032 passed, 1 failed. The failure is `synccheck_scenarios::four_producers_per_lane_arrivals_on_two_barriers_stay_small`, a pure-synccheck log test, against W6's uncommitted explorer edits. Codegen equivalence passes 4/4.
+
+### W11 follow-up (2026-10-08): W11-1 and W11-3 fixed (lowering, by W11 with W1's OK); W11-2 fixed (W2); W11-4 new
+
+- **W11-1 fixed** (`ptx_decode.py`, `ptx_lower.py`). `DecodedPtx.pred_lanes` marks every lane whose operand type is `.pred` or that carries a `p<i>` marker.
+  - `.pred` sources are read as `carrier != 0`, as 0/1 in the carrier's type (`PtxCtx.read`).
+  - A guarded op's `.pred` register or local destinations are bridged just before its `If`. With `preserve_dst` they become `dst := (dst != 0)`, which is TVM's `_pred_keep`. Without it they become `dst := 0`, which is TVM's `_pred_undef` choice and does not read the carrier. The op itself stays wholly inside the guard (W6 rule).
+  - Program tests are in `tests/numsim/v2/test_lowering_pred_bridge_and_dyn_pool.py`.
+  - Now passing: legacy `test_maintenance_predicates_and_carriers`, `test_ptx_bitops` (the W9 `.pred` item) and `test_compare_instruction_predicates[True]`. `[False]` differs only by delta P8 and is ported as `ports/test_w11_compare_predicates.py`.
+- **W11-3 fixed** (`memory.py::finish_shared`). A kernel with one `shared.dyn` pool and a committed `tirx.dyn_smem_bytes` sizes the pool to the committed value, so a strided view that overruns it is bounds-checked. Other pools are unchanged, and so are static shared buffers. The legacy test now raises `out_of_bounds` ("out-of-bounds access [32768, 32772) to alloc1 of 2048 bytes"). It still fails only on its message regex, and the port is `test_w11_reproducers.py::test_w11_3_...`.
+- **W11-2 fixed by W2** (Rust scenario `ptx_op_per_signature`).
+- **W11-4 [W4 oplib], new; the W11-2 fix uncovered it.** A narrow `cvt` into a 128-bit carrier now stops with `incomplete`: `cvt.s8.s8 ... destination carrier Ty { elem: B128 } cannot hold a 8-bit result`. Legacy sign- or zero-extends into `int128`/`uint128` carriers, and `test_cvt_carriers_*` uses them for every type. Before the W11-2 fix this was masked, because the first use's types were used for every use.
+  - Reproducer: `ports/test_w11_reproducers.py::test_w11_4_narrow_cvt_extends_into_a_128_bit_carrier` (`v2_gap`). `cvt.s8.s8` of -1 into an `int128` local should give both u64 halves `0xFFFFFFFFFFFFFFFF`.
+  - Port blocked on it: `ports/test_w11_cvt_carriers.py` (`v2_gap`).

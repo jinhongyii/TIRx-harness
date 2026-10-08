@@ -6,8 +6,11 @@ The four W9-public-API bugs re-checked by this triage (``discard`` alignment,
 fixed by W2 while it ran; their legacy tests pass unchanged and need no copy here.
 
 Each test asserts the correct (PTX ISA / device-validated / legacy-agreeing)
-behaviour and is marked ``v2_gap`` until its owner fixes v2; an XPASS means the
-gap is closed and the marker (and the legacy test's blocked status) can go.
+behaviour. All three are fixed and pass: W11-1 (``.pred`` bridge) and W11-3
+(committed dynamic shared size) in lowering, W11-2 (per-signature PTX op
+resolution) in the interpreter (W2 Rust scenario ``ptx_op_per_signature``).
+W11-4 (128-bit destination carrier of a narrow ``cvt``), uncovered by the W11-2
+fix, stays ``v2_gap``.
 """
 
 from __future__ import annotations
@@ -42,10 +45,6 @@ def guarded_pred_destination(output: T.Buffer((4, 32), "uint32")):
         output[i, lane] = d[i]
 
 
-@v2_gap(
-    "W11-1: a guarded op's .pred destination carried in a uint32 is kept raw (91), not as (old != 0); "
-    "same root cause as CONTRACT_REQUESTS W9-public-API phase 6 [W1] .pred bridge (ptx_decode drops p<i>)"
-)
 def test_w11_1_guarded_pred_destination_is_a_boolean_carrier():
     result = v2.Engine().run(v2.transpile(guarded_pred_destination), {"output": np.zeros((4, 32), np.uint32)})
     out = result.outputs["output"]
@@ -80,7 +79,6 @@ def signed_cvt_into_several_carriers(output: T.Buffer((3,), "int64")):
         output[2] = q[0]
 
 
-@v2_gap("W11-2: Loaded::new resolves each Ptx op with the operand types of its first use only")
 def test_w11_2_ptx_op_resolves_per_use_carrier_types():
     result = v2.Engine().run(
         v2.transpile(signed_cvt_into_several_carriers), {"output": np.zeros(3, np.int64)}
@@ -104,9 +102,33 @@ def explicit_shared_strides_oob():
         scratch[1, 0, 0] = T.float32(1)
 
 
-@v2_gap("W11-3: a shared.dyn pool is sized from its views' strided extents, not tirx.dyn_smem_bytes")
 def test_w11_3_pool_access_beyond_committed_dyn_smem_is_out_of_bounds():
     # The pool commits prod(shape) * 4 = 2048 bytes; scratch[1, 0, 0] is byte 32768.
     with pytest.raises(v2.ExecutionError) as info:
         v2.Engine().run(v2.transpile(explicit_shared_strides_oob), {})
     assert "out_of_bounds" in str(info.value) or "out-of-bounds" in str(info.value)
+
+
+# -- W11-4 [W4 oplib]: a narrow cvt into a 128-bit carrier --------------------
+
+
+@T.prim_func
+def narrow_cvt_into_b128_carrier(output: T.Buffer((2,), "uint64")):
+    T.device_entry()
+    _warp = T.warp_id([1])
+    lane = T.lane_id([32])
+    src = T.alloc_local((1,), "int8")
+    src[0] = T.int8(-1)
+    wide = T.alloc_local((1,), "int128")
+    T.ptx["cvt.s8.s8"](wide[0], src[0])
+    if lane == 0:
+        bytes_ = wide.view("uint64")
+        output[0] = bytes_[0]
+        output[1] = bytes_[1]
+
+
+@v2_gap("W11-4: cvt.s8.s8 into an int128 carrier stops 'destination carrier B128 cannot hold a 8-bit result'")
+def test_w11_4_narrow_cvt_extends_into_a_128_bit_carrier():
+    result = v2.Engine().run(v2.transpile(narrow_cvt_into_b128_carrier), {"output": np.zeros(2, np.uint64)})
+    # Sign extension to the full register width, as legacy computes for int128/uint128 carriers.
+    np.testing.assert_array_equal(result.outputs["output"], [0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF])

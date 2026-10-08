@@ -427,6 +427,11 @@ replacements first):
 - wave 0: 1 file, plus 60 functions in 14 files. This includes the six W1
   out-of-scope tests (001a09f): the three `tcgen_cp_*` replicated-TMEM-view
   tests, `mxfp4_uses_ue8m0`, `legacy_m16n8k32_int8` and `legacy_ldmatrix_x1`.
+  Correction (W11): v2 lowers and runs the three `tcgen_cp_*` tests
+  (`expands_tlane_replicas`, `supports_rank3_multi_instruction_layout`,
+  `cta_group2_supports_float16_payloads`); they differ only by numsim delta
+  T20 and have copies in `ports/test_w11_tcgen_transfer_artifact.py`, so they
+  should retire in wave 4 rather than wave 0. The L1 rejections are other tests.
 - wave 1: 26 files (92 tests), plus 135 functions in 26 files.
 - wave 2: 1 file (2 tests), plus 36 functions in 14 files. 14 rows are held.
 - wave 4: 9 files (11 tests), plus 71 functions in 31 files, i.e. 82 retired
@@ -608,7 +613,11 @@ There are 26 `(pending: ...)` markers:
   - numsim/CLAUDE:5 and AGENTS:5
 - **10 need a decision made as part of step 5**, and are listed by the
   script:
-  - the snapshot policy: architecture:164 and 191, CLAUDE:43 and AGENTS:43;
+  - the snapshot policy: architecture:164 and 191, CLAUDE:43 and AGENTS:43
+    (decided 2026-10-08 and written in: v2 becomes the oracle, every changed
+    case is justified by a delta row id in the commit message, CI check
+    `check_snapshot_deltas.py`; delta files are folded by
+    `fold_snapshot_deltas.py` in the deletion commit);
   - the `NUMSIM_V2_` prefix (api/numsim:134);
   - the `NumSimBuildError` type (api/numsim:163);
   - the report exception class (api/checkers:67);

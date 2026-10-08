@@ -398,7 +398,13 @@ class MemoryMixin:
                 continue
             size = decl.byte_len.value if decl.byte_len is not None else 0
             if index in self.dyn_pools:
-                size = max(size, ends.get(index, 0), self.dyn_smem_bytes or 0)
+                if self.dyn_smem_bytes is not None and len(self.dyn_pools) == 1:
+                    # The committed `tirx.dyn_smem_bytes` is the CTA's dynamic shared
+                    # memory: a view whose (strided) extent overruns it does not grow
+                    # it, and its out-of-range accesses fail as out_of_bounds.
+                    size = max(size, self.dyn_smem_bytes)
+                else:
+                    size = max(size, ends.get(index, 0), self.dyn_smem_bytes or 0)
             align = max(16, decl.align)
             cursor = (cursor + align - 1) // align * align
             program.buffers[index] = dataclasses.replace(

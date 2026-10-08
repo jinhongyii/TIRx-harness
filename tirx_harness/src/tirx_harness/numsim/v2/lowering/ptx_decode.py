@@ -60,6 +60,10 @@ class DecodedPtx:
     predicate: Any | None
     preserve_dst: bool
     orders_memory: bool
+    # Per operand, per lane: the lane is a ``.pred``-class register (``.pred``
+    # operand type or ``pN`` marker). TVM binds it through a uint32 carrier and bridges it with
+    # ``setp.ne.b32 p, %N, 0`` on input and ``selp.b32 %N, 1, 0, p`` on output.
+    pred_lanes: tuple[tuple[bool, ...], ...] = ()
 
     def modifier(self, name: str) -> str:
         return dict(self.modifiers).get(name, "")
@@ -132,7 +136,7 @@ def decode(call: Any) -> DecodedPtx:
         error = entry.check(mod_map)
         if error:
             raise PtxDecodeError(f"{op_name}: illegal modifier combination: {error}")
-    predicated, preserve, _preds, sinks = _marker(op_name, marker)
+    predicated, preserve, preds, sinks = _marker(op_name, marker)
 
     layout = operand_layout(entry, mod_map)
     lane_total = sum(lanes for _, _, lanes in layout)
@@ -145,6 +149,7 @@ def decode(call: Any) -> DecodedPtx:
 
     infos: list[OperandInfo] = []
     values: list[tuple[Any, ...]] = []
+    pred_lanes: list[tuple[bool, ...]] = []
     rows = {id(slot): (first, lanes) for slot, first, lanes in layout}
     for slot in entry.operands:
         ptx_type = dtype = ""
@@ -158,11 +163,16 @@ def decode(call: Any) -> DecodedPtx:
         if slot.kind == "imm" and slot.literal is not None:
             infos.append(OperandInfo(slot.name, "imm", slot.rw, 1, ptx_type, dtype, space, str(slot.literal)))
             values.append((slot.literal,))
+            pred_lanes.append((False,))
             continue
         first, lanes = rows[id(slot)]
         infos.append(OperandInfo(slot.name, slot.kind, slot.rw, lanes_of(slot, mod_map),
                                  ptx_type, dtype, space, None))
         values.append(tuple(SINK if first + lane in sinks else next(present) for lane in range(lanes)))
+        # A ``.pred``-typed register always goes through TVM's ``BRIDGE["pred"]``.
+        is_pred = slot.kind == "reg" and ptx_type == "pred"
+        pred_lanes.append(tuple((is_pred or first + lane in preds) and first + lane not in sinks
+                                for lane in range(lanes)))
     return DecodedPtx(
         op_name=op_name,
         table_name=entry.name,
@@ -172,6 +182,7 @@ def decode(call: Any) -> DecodedPtx:
         predicate=predicate,
         preserve_dst=preserve,
         orders_memory=bool(entry.orders_memory),
+        pred_lanes=tuple(pred_lanes),
     )
 
 

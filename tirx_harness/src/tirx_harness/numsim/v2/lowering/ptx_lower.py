@@ -59,6 +59,7 @@ class PtxCtx:
         self.d = decoded
         self.mods = dict(decoded.modifiers)
         self.ops = {info.name: (info, values) for info, values in zip(decoded.operands, decoded.values)}
+        self.pred_lanes = {info.name: flags for info, flags in zip(decoded.operands, decoded.pred_lanes)}
         self.write_backs: list[Callable[[], None]] = []
         self.pred = lw.cast_to(lw.expr(decoded.predicate), pb.Ty("Pred")) if decoded.predicate is not None else None
         self._site: int | None = None
@@ -106,13 +107,24 @@ class PtxCtx:
         values = self.nodes(name)
         if len(values) != 1:
             raise _Unsupported(self.node, f"{self.d.op_name}: operand {name} has {len(values)} lanes")
-        return self.lw.expr(values[0])
+        return self.read(name, 0, values[0])
+
+    def is_pred_lane(self, name: str, lane: int) -> bool:
+        flags = self.pred_lanes.get(name, ())
+        return lane < len(flags) and flags[lane]
+
+    def read(self, name: str, lane: int, node: Any) -> pb.Operand:
+        """Source lane ``lane`` of operand ``name``. A ``.pred``-class lane is
+        bridged as TVM's helper does (``setp.ne.b32 p, %N, 0``): the op sees
+        ``carrier != 0`` as 0/1 in the carrier's type, never its raw bits."""
+        value = self.lw.expr(node)
+        return bool_carrier(self.lw, value) if self.is_pred_lane(name, lane) else value
 
     def opt_src(self, name: str) -> pb.Operand | None:
         return self.src(name) if self.has(name) else None
 
     def srcs(self, name: str) -> list[pb.Operand]:
-        return [self.lw.expr(v) for v in self.nodes(name)] if name in self.ops else []
+        return [self.read(name, i, v) for i, v in enumerate(self.nodes(name))] if name in self.ops else []
 
     def uimm(self, name: str, bits: int = 32) -> int:
         value = self.imm(name)
@@ -212,6 +224,57 @@ class PtxCtx:
         self.write_backs = []
 
 
+def bool_carrier(lw: "Lowerer", value: pb.Operand) -> pb.Operand:
+    """``value != 0`` as 0/1 in ``value``'s own type (TVM's ``.pred`` bridge)."""
+    ty = lw.operand_ty(value)
+    if ty.elem == "Pred":
+        return value
+    return lw.cast_to(lw.cast_to(value, pb.Ty("Pred")), ty)
+
+
+def _register_lvalue(lw: "Lowerer", node: Any) -> bool:
+    """Is ``node`` a register-array element or a ``local`` buffer element?"""
+    from .memory import MemRef, RegArray
+
+    if type_key(node) == "ir.Call" and str(node.op.name) == "tirx.address_of":
+        node = node.args[0]
+    if type_key(node) != "ir.TensorLoad":
+        return False
+    ref = lw.ref_of(node.source)
+    return isinstance(ref, RegArray) or (isinstance(ref, MemRef) and ref.space == "Local")
+
+
+def bridge_guarded_pred_destinations(ctx: PtxCtx) -> None:
+    """Off-lane value of a guarded op's ``.pred``-class destinations.
+
+    TVM's ``_pred_keep`` helper reads the carrier on every lane
+    (``setp.ne.b32 pd, %0, 0``) and writes ``selp.b32 %0, 1, 0, pd`` after the
+    guarded instruction, so an off lane ends with ``old != 0``. ``_pred_undef``
+    selects from an unwritten predicate: 0 or 1, modeled as 0 without reading
+    the carrier. Only register/local destinations are bridged here (the
+    carrier is a C lvalue the helper binds by reference); the op itself still
+    runs entirely inside the guard."""
+    lw = ctx.lw
+    for info, values in zip(ctx.d.operands, ctx.d.values):
+        if info.rw not in ("w", "rw") or info.literal is not None:
+            continue
+        for lane, node in enumerate(values):
+            if node is ptx_decode.SINK or not ctx.is_pred_lane(info.name, lane):
+                continue
+            if not _register_lvalue(lw, node):
+                continue
+            ty_hint = pb.Ty.from_tvm(info.dtype) if info.dtype else None
+            reg, write_back = lw.lvalue_target(node, ty_hint)
+            ty = lw.operand_ty(reg)
+            if ctx.d.preserve_dst:
+                value = bool_carrier(lw, lw.expr(node))
+            else:
+                value = lw.const(ty, 0)
+            lw.builder.emit("Mov", dst=reg, src=lw.cast_to(value, ty))
+            if write_back is not None:
+                write_back()
+
+
 # ---------------------------------------------------------------------------
 # Generic Ptx (pure register tail)
 # ---------------------------------------------------------------------------
@@ -224,13 +287,13 @@ def lower_generic(c: PtxCtx) -> None:
     for info, values in zip(c.d.operands, c.d.values):
         if info.literal is not None:
             continue
-        for value in values:
+        for lane, value in enumerate(values):
             if info.kind == "addr":
                 # A register op that names an address only uses its value (e.g. createpolicy.range).
                 srcs.append(lw.as_address(lw.expr(value)))
                 continue
             if info.rw == "r":
-                srcs.append(lw.expr(value))
+                srcs.append(c.read(info.name, lane, value))
                 continue
             if value is ptx_decode.SINK:
                 dsts.append(c.scratch(pb.Ty.from_tvm(info.dtype) if info.dtype else pb.Ty("U32")))
@@ -651,7 +714,9 @@ def lower_tensormap_replace(c: PtxCtx) -> None:
              "global_stride": "GlobalStride", "element_stride": "ElementStride", "elemtype": "ElemType",
              "interleave_layout": "InterleaveLayout", "swizzle_mode": "SwizzleMode",
              "fill_mode": "FillMode"}[c.mod("field")]
-    addr, space = c.addr("addr", "Global")
+    # No state-space qualifier = generic addressing (PTX); a descriptor image
+    # in shared memory then resolves through the generic shared window.
+    addr, space = c.addr("addr")
     ordinal = c.uimm("ord", 8) if "ord" in c.ops else None
     value = c.src("new_val")
     c.emit("TensorMapReplace", tmap=addr, space=space, field=field, ord=ordinal, value=value)
@@ -1055,6 +1120,7 @@ def lower_ptx(lw: "Lowerer", node: Any) -> None:
     b = lw.builder
     if_pc = None
     if ctx.pred is not None:
+        bridge_guarded_pred_destinations(ctx)
         # The guard covers the whole instruction, operands included: a
         # predicated-off lane evaluates no memory operand (legacy; e.g.
         # `@p ld [A + Select(p, i, size)]` must not read A[size]). Inside the

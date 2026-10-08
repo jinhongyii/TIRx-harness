@@ -5,7 +5,7 @@
 - ``test_tcgen_cp_supports_rank3_multi_instruction_layout``
 - ``test_tcgen_cp_cta_group2_supports_float16_payloads``
 
-**Delta (numsim-behaviour-deltas T5): the legacy kernels read TMEM before the
+**Delta (numsim-behaviour-deltas T20): the legacy kernels read TMEM before the
 ``tcgen05.cp`` completes.** Each legacy kernel issues ``Tx.copy_async(tmem, smem)``
 (TVM dispatches it to ``tcgen05.cp``; the replicated TMEM view ``R[4 : 32 @ TLane]``
 becomes ``.warpx4`` multicast) and then reads the destination through a physical
