@@ -16,6 +16,25 @@ pub fn tf32_payload_to_f32(bits: u32) -> f32 {
     f32::from_bits(bits & 0xffff_e000)
 }
 
+/// `f32` bits of [`NarrowFormat::decode_value_direct`] for every 8-bit code of
+/// each format (index = `NarrowFormat as usize`), built once.
+fn narrow_decode_table() -> &'static [[u32; 256]; 5] {
+    static TABLE: std::sync::OnceLock<[[u32; 256]; 5]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let formats = [
+            NarrowFormat::E4M3,
+            NarrowFormat::E5M2,
+            NarrowFormat::E2M3,
+            NarrowFormat::E3M2,
+            NarrowFormat::E2M1,
+        ];
+        std::array::from_fn(|f| {
+            debug_assert_eq!(formats[f] as usize, f);
+            std::array::from_fn(|code| formats[f].decode_value_direct(code as u8).to_bits())
+        })
+    })
+}
+
 /// `kind::f8f6f4` / `mxf8f6f4` narrow operand formats (legacy `RawTcgenNarrowFormat`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NarrowFormat {
@@ -69,6 +88,16 @@ impl NarrowFormat {
     /// Exact decode of one narrow code (low `width` bits, sign included) to f32; subnormals
     /// and E5M2 infinities exact. Any NaN code gives `f32::NAN` (`0x7fc0_0000`, sign dropped).
     pub fn decode_value(self, bits: u8) -> f32 {
+        // Table lookup (perf, W4 profile: the per-element decode was ~7% of
+        // `deepgemm_sm100_fp8_gemm_1d1d`): the table holds exactly the bits
+        // of the direct decode for every code, so results are identical. Codes
+        // wider than the format index the table modulo 256 like the direct
+        // decode's masked fields; callers pass `width`-bit codes.
+        f32::from_bits(narrow_decode_table()[self as usize][usize::from(bits)])
+    }
+
+    /// The direct (table-free) decode [`decode_value`](Self::decode_value) is built from.
+    pub fn decode_value_direct(self, bits: u8) -> f32 {
         narrow_float_bits_to_f32_checked(bits, self.format()).unwrap_or(f32::NAN)
     }
 
@@ -213,6 +242,27 @@ pub fn decode_e2m1_word(word: u32) -> [f32; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decode table is bit-identical to the direct decode for every
+    /// format and all 256 codes (NaN codes included).
+    #[test]
+    fn decode_table_matches_the_direct_decode_exhaustively() {
+        for format in [
+            NarrowFormat::E4M3,
+            NarrowFormat::E5M2,
+            NarrowFormat::E2M3,
+            NarrowFormat::E3M2,
+            NarrowFormat::E2M1,
+        ] {
+            for code in 0..=255_u8 {
+                assert_eq!(
+                    format.decode_value(code).to_bits(),
+                    format.decode_value_direct(code).to_bits(),
+                    "{format:?} {code:#04x}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_f16_destination_codec_uses_the_low_half_and_zeroes_the_upper_half() {

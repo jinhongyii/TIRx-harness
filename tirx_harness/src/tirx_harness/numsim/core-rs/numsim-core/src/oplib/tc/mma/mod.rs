@@ -383,6 +383,53 @@ fn cta1_runs(
     Ok(())
 }
 
+/// The CTA-pair window walk of `cta2_window_cells` (same order, same checks
+/// and messages), streamed as runs: Layout D (every canonical accumulator)
+/// is one run per (CTA, row) without building the `m * n` cell list (perf,
+/// W4 profile: the list walk was ~12% of `fp16_bf16_gemm`). Other layouts
+/// take the cell list.
+fn cta2_runs(
+    taddr: u32,
+    m: usize,
+    n: usize,
+    layout: DenseTmemLayout,
+    mask: Option<[u32; 8]>,
+    mut run: impl FnMut((usize, usize, usize), &[usize]) -> LibResult<()>,
+) -> LibResult<()> {
+    if layout != DenseTmemLayout::D || n == 0 || !(m == 128 || m == 256) {
+        let cells = cta2_window_cells(taddr, m, n, layout, mask)?;
+        return list_runs(&cells, run);
+    }
+    let (base_lane, base_column) = tmem_address(taddr, 0, 0)?;
+    let rows_per_cta = m / 2;
+    layout.physical_columns(n)?;
+    layout.location(rows_per_cta - 1, n - 1, rows_per_cta, n)?;
+    let mut indices: Vec<usize> = Vec::with_capacity(n);
+    for target in 0..2 {
+        for row in 0..rows_per_cta {
+            let lane = base_lane
+                .checked_add(row)
+                .ok_or_else(|| LibError::message("raw cta_group=2 destination lane overflow"))?;
+            if lane >= 128 {
+                return Err(LibError::message(format!(
+                    "raw cta_group=2 destination lane {lane} is outside 128 lanes"
+                )));
+            }
+            if mask.is_some_and(|mask| ((mask[target * 4 + lane / 32] >> (lane % 32)) & 1) != 0) {
+                continue;
+            }
+            base_column
+                .checked_add(n - 1)
+                .ok_or_else(|| LibError::message("raw cta_group=2 destination column overflow"))?;
+            let first = (target * rows_per_cta + row) * n;
+            indices.clear();
+            indices.extend(first..first + n);
+            run((target, lane, base_column), &indices)?;
+        }
+    }
+    Ok(())
+}
+
 /// `gather_b16_rows_with` with K-major rows read 16 bytes (8 elements) at
 /// a time where the descriptor layout keeps them contiguous, which every
 /// canonical K-major layout does within a 16-byte core-matrix row (perf,
@@ -485,8 +532,9 @@ impl Window {
                 read_run(io, &mut buf, (0, lane, column), indices, &mut values, &decode)
             }))?;
         } else {
-            let cells = io.lib(cta2_window_cells(self.taddr, self.m, self.n, self.layout, None))?;
-            io.lib(list_runs(&cells, |at, indices| read_run(io, &mut buf, at, indices, &mut values, &decode)))?;
+            io.lib(cta2_runs(self.taddr, self.m, self.n, self.layout, None, |at, indices| {
+                read_run(io, &mut buf, at, indices, &mut values, &decode)
+            }))?;
         }
         Ok(values)
     }
@@ -504,8 +552,9 @@ impl Window {
                 write_run(io, tmem_write, &mut buf, (0, lane, column), indices, values, &encode)
             }))
         } else {
-            let cells = io.lib(cta2_window_cells(self.taddr, self.m, self.n, self.layout, Some(self.mask)))?;
-            io.lib(list_runs(&cells, |at, indices| write_run(io, tmem_write, &mut buf, at, indices, values, &encode)))
+            io.lib(cta2_runs(self.taddr, self.m, self.n, self.layout, Some(self.mask), |at, indices| {
+                write_run(io, tmem_write, &mut buf, at, indices, values, &encode)
+            }))
         }
     }
 }
@@ -748,6 +797,39 @@ mod chunk_tests {
                         (values.map_err(|e| e.to_string()), read)
                     };
                     assert_eq!(run(true), run(false), "swizzle {swizzle} {rows}x{columns} transpose {transpose}");
+                }
+            }
+        }
+    }
+
+    /// The streamed CTA-pair walk emits exactly the runs of the cell-list walk
+    /// (same order, CTA, lane, column and indices) and the same errors.
+    #[test]
+    fn cta2_runs_match_the_cell_list_walk() {
+        type Runs = Vec<((usize, usize, usize), Vec<usize>)>;
+        type Sink<'a> = &'a mut dyn FnMut((usize, usize, usize), &[usize]) -> LibResult<()>;
+        type Walk<'a> = &'a dyn Fn(Sink<'_>) -> LibResult<()>;
+        let collect = |f: Walk<'_>| -> Result<Runs, String> {
+            let mut out = Vec::new();
+            f(&mut |at, idx| {
+                out.push((at, idx.to_vec()));
+                Ok(())
+            })
+            .map_err(|e| format!("{e:?}"))?;
+            Ok(out)
+        };
+        let masks = [None, Some([0; 8]), Some([0x8000_0001, 0, 0xffff_ffff, 0, 0, 0x10, 0, 0x8000_0000])];
+        for taddr in [0_u32, 16, 0x0040_0020, 0x0050_0000] {
+            for m in [128_usize, 256, 64] {
+                for n in [8_usize, 32, 256] {
+                    for mask in masks {
+                        let streamed = collect(&|run| cta2_runs(taddr, m, n, DenseTmemLayout::D, mask, run));
+                        let listed = collect(&|run| {
+                            let cells = cta2_window_cells(taddr, m, n, DenseTmemLayout::D, mask)?;
+                            list_runs(&cells, run)
+                        });
+                        assert_eq!(streamed, listed, "taddr={taddr:#x} m={m} n={n} mask={mask:?}");
+                    }
                 }
             }
         }

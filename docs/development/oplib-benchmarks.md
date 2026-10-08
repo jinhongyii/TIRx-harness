@@ -31,6 +31,7 @@ One MMA through `tc_mma_ctas` with engine-like closures (`numsim-core` bench `op
 | `tc_mma/i8_ss_m128_n256_k32` | 700.76 µs |
 | `tc_mma/mxf8f6f4_e4m3_ss_m128_n256_k32` | 478.74 µs |
 | `tc_mma/mxf4_e2m1_ss_m128_n256_k64` | 539.26 µs |
+| `tc_mma/bf16_ss_cta2_m256_n256_k16_accumulate` | 672 µs |
 
 ## MMA: increasing-K chain
 
@@ -155,6 +156,12 @@ Dispatched tile reductions run on `shfl.sync` and `redux`; `warp_reduce` covers 
 | Word-level `numsim.pack` (W4-16) | `ptx_32_lanes/pack_u32x4` | 3.20 µs | 0.17-0.19 µs |
 | Warp-uniform and cached instruction-descriptor encode (W4-16) | `ptx_32_lanes/encode_instr_descriptor` | 2.64 µs | 0.44-0.50 µs |
 | Arithmetic E4M3 encoder (W4-19; the old nearest-code search is the test oracle) | `cvt_x1024/f32_to_e4m3_satfinite` | 693 µs | 4.8 µs |
+| Streamed CTA-pair Layout-D accumulator walk (`cta2_runs`; no `m*n` cell list) (W4-perf) | `tc_mma/bf16_ss_cta2_m256_n256_k16_accumulate` | 1.43 ms | 0.67 ms |
+| Table decode of tcgen05 narrow operands (fp8/fp6/fp4; bit-identical, tested exhaustively) (W4-perf) | `tcgen05_narrow_decode_x1024_atoms/E4M3_table` (old path: `..._direct`) | 136 µs | 20.4 µs |
+
+End to end (1 worker, interpreter, min of 3 interleaved runs on a loaded host), these
+two changes took `fp16_bf16_gemm` from 96 to 76 ms per run and
+`deepgemm_sm100_fp8_gemm_1d1d` from 11.5 to 10.0 ms per run.
 
 The NaN re-pin of the MMA chain (delta D8) costs nothing on finite outputs.
 When many outputs are NaN, it recomputes each of their chains with the scalar

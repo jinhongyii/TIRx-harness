@@ -120,6 +120,8 @@ struct MmaCase {
     /// Block-scaled: (scale dtype, block size).
     scaled: Option<(&'static str, u8)>,
     accumulate: bool,
+    /// `cta_group` (2: the CTA-pair accumulator window, `cta2_runs`).
+    cta_group: u8,
 }
 
 /// The tcgen05.mma kinds and shapes the canonical corpus issues (dense
@@ -133,13 +135,14 @@ fn tc(c: &mut Criterion) {
         encode_block_scaled_instr_descriptor_fields, encode_dense_instr_descriptor_fields, encode_matrix_descriptor,
     };
     let cases = [
-        MmaCase { name: "f16_ss_m128_n256_k16_accumulate", kind: K::F16, types: ("float32", "bfloat16", "bfloat16"), shape: (128, 256, 16), bits: 16, scaled: None, accumulate: true },
-        MmaCase { name: "bf16_ss_m64_n256_k16_layout_f", kind: K::F16, types: ("float32", "bfloat16", "bfloat16"), shape: (64, 256, 16), bits: 16, scaled: None, accumulate: false },
-        MmaCase { name: "tf32_ss_m128_n256_k8", kind: K::Tf32, types: ("float32", "tf32", "tf32"), shape: (128, 256, 8), bits: 32, scaled: None, accumulate: true },
-        MmaCase { name: "f8f6f4_e4m3_ss_m128_n256_k32", kind: K::F8f6f4, types: ("float32", "float8_e4m3fn", "float8_e4m3fn"), shape: (128, 256, 32), bits: 8, scaled: None, accumulate: true },
-        MmaCase { name: "i8_ss_m128_n256_k32", kind: K::I8, types: ("int32", "int8", "int8"), shape: (128, 256, 32), bits: 8, scaled: None, accumulate: true },
-        MmaCase { name: "mxf8f6f4_e4m3_ss_m128_n256_k32", kind: K::MxF8f6f4, types: ("float32", "float8_e4m3fn", "float8_e4m3fn"), shape: (128, 256, 32), bits: 8, scaled: Some(("float8_e8m0fnu", 32)), accumulate: true },
-        MmaCase { name: "mxf4_e2m1_ss_m128_n256_k64", kind: K::MxF4, types: ("float32", "float4_e2m1fn", "float4_e2m1fn"), shape: (128, 256, 64), bits: 4, scaled: Some(("float8_e8m0fnu", 32)), accumulate: true },
+        MmaCase { name: "f16_ss_m128_n256_k16_accumulate", kind: K::F16, types: ("float32", "bfloat16", "bfloat16"), shape: (128, 256, 16), bits: 16, scaled: None, accumulate: true, cta_group: 1 },
+        MmaCase { name: "bf16_ss_m64_n256_k16_layout_f", kind: K::F16, types: ("float32", "bfloat16", "bfloat16"), shape: (64, 256, 16), bits: 16, scaled: None, accumulate: false, cta_group: 1 },
+        MmaCase { name: "tf32_ss_m128_n256_k8", kind: K::Tf32, types: ("float32", "tf32", "tf32"), shape: (128, 256, 8), bits: 32, scaled: None, accumulate: true, cta_group: 1 },
+        MmaCase { name: "f8f6f4_e4m3_ss_m128_n256_k32", kind: K::F8f6f4, types: ("float32", "float8_e4m3fn", "float8_e4m3fn"), shape: (128, 256, 32), bits: 8, scaled: None, accumulate: true, cta_group: 1 },
+        MmaCase { name: "i8_ss_m128_n256_k32", kind: K::I8, types: ("int32", "int8", "int8"), shape: (128, 256, 32), bits: 8, scaled: None, accumulate: true, cta_group: 1 },
+        MmaCase { name: "mxf8f6f4_e4m3_ss_m128_n256_k32", kind: K::MxF8f6f4, types: ("float32", "float8_e4m3fn", "float8_e4m3fn"), shape: (128, 256, 32), bits: 8, scaled: Some(("float8_e8m0fnu", 32)), accumulate: true, cta_group: 1 },
+        MmaCase { name: "mxf4_e2m1_ss_m128_n256_k64", kind: K::MxF4, types: ("float32", "float4_e2m1fn", "float4_e2m1fn"), shape: (128, 256, 64), bits: 4, scaled: Some(("float8_e8m0fnu", 32)), accumulate: true, cta_group: 1 },
+        MmaCase { name: "bf16_ss_cta2_m256_n256_k16_accumulate", kind: K::F16, types: ("float32", "bfloat16", "bfloat16"), shape: (256, 256, 16), bits: 16, scaled: None, accumulate: true, cta_group: 2 },
     ];
     let mut g = c.benchmark_group("tc_mma");
     for case in cases {
@@ -162,14 +165,14 @@ fn tc(c: &mut Criterion) {
         let b_desc = place(0x9000, n);
         let (d, a, b) = case.types;
         let idesc = match case.scaled {
-            None => encode_dense_instr_descriptor_fields(d, a, b, m as i64, n as i64, k as i64, false, false, 1, false, false, false, false),
+            None => encode_dense_instr_descriptor_fields(d, a, b, m as i64, n as i64, k as i64, false, false, i64::from(case.cta_group), false, false, false, false),
             Some((s, _)) => encode_block_scaled_instr_descriptor_fields(d, a, b, s, s, m as i64, n as i64, k as i64, false, false, 1, false, false, false),
         }
         .unwrap() as u32;
         let op = Operand::Const(ConstId(0));
         let payload = TcgenMmaPayload {
             args: TcgenMmaArgs {
-                kind: case.kind, cta_group: 1, d: op, a: TcA::Smem(op), b_desc: op, idesc: op, enable_input_d: op,
+                kind: case.kind, cta_group: case.cta_group, d: op, a: TcA::Smem(op), b_desc: op, idesc: op, enable_input_d: op,
                 ws: false, ws_b_buffer: 0, block_scale: case.scaled.map(|(_, block)| (op, op, block)), scale_input_d: None, sparse_meta: None,
                 disable_output_lane: Vec::new(), collector_a: CollectorOp::None, collector_b: CollectorOp::None,
                 ashift: false, lut_b: false, lut_b_addr: None, declared: None,
@@ -177,7 +180,7 @@ fn tc(c: &mut Criterion) {
             d_taddr: 0, a: a_desc, b_desc, idesc, enable_input_d: case.accumulate,
             // Scale tables after the 256 D columns (all-zero UE8M0 = 2^-127).
             scale_taddrs: case.scaled.map(|_| (320, 352)), scale_input_d: None, sparse_meta: None, disable_output_lane: Vec::new(),
-            smem: vec![AllocId(0)], tmem: vec![AllocId(1)],
+            smem: vec![AllocId(0); usize::from(case.cta_group)], tmem: vec![AllocId(1); usize::from(case.cta_group)],
         };
         let tmem_bytes = 128 * 512 * 4;
         let mem = Mem { smem, tmem: std::cell::RefCell::new(vec![0u8; tmem_bytes]), valid: vec![true; tmem_bytes], log: Default::default() };

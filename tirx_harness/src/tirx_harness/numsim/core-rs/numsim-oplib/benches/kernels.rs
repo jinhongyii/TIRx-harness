@@ -4,7 +4,7 @@
 //! baselines in `docs/development/oplib-benchmarks.md`.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use numsim_oplib::{cvt, fpenv, mma, scalar, warp};
+use numsim_oplib::{cvt, fpenv, mma, scalar, tcgen05, warp};
 use numsim_types::{WarpMask, WarpValue};
 
 const N: usize = 1024;
@@ -194,8 +194,48 @@ fn math(c: &mut Criterion) {
     g.finish();
 }
 
+/// tcgen05 narrow-operand decode: 1024 16-byte shared atoms (16 Ki values) per
+/// iteration through the decode table (`decode_shared_atom`) and the direct
+/// per-value decode it replaced (W4 profile).
+fn narrow_decode(c: &mut Criterion) {
+    use tcgen05::narrow::NarrowFormat;
+    let atoms: Vec<[u8; 16]> = (0..1024_u32)
+        .map(|i| std::array::from_fn(|j| (i.wrapping_mul(31) as u8).wrapping_add(j as u8 * 17)))
+        .collect();
+    let mut g = c.benchmark_group("tcgen05_narrow_decode_x1024_atoms");
+    for format in [NarrowFormat::E4M3, NarrowFormat::E2M3] {
+        g.bench_function(format!("{format:?}_table"), |b| {
+            b.iter(|| {
+                black_box(&atoms)
+                    .iter()
+                    .map(|&a| format.decode_shared_atom(a)[7])
+                    .sum::<f32>()
+            })
+        });
+        g.bench_function(format!("{format:?}_direct"), |b| {
+            b.iter(|| {
+                black_box(&atoms)
+                    .iter()
+                    .map(|a| {
+                        let width = format.format().width_bits;
+                        let packed = u128::from_le_bytes(*a);
+                        let mask = (1_u128 << width) - 1;
+                        let v: [f32; 16] = std::array::from_fn(|i| {
+                            format
+                                .decode_value_direct(((packed >> (i as u32 * width)) & mask) as u8)
+                        });
+                        v[7]
+                    })
+                    .sum::<f32>()
+            })
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
+    narrow_decode,
     conversions,
     host_nan_rule,
     mma_chain,

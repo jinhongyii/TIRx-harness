@@ -34,7 +34,7 @@ from tvm.tirx.layout import ComposeLayout, S, TileLayout, tmem_datapath_layout
 from tvm.backend.cuda.tile_primitive.gemm_async.tcgen05 import sf_smem_layout, sf_tmem_layout
 from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 from tirx_harness.numsim.errors import UnsupportedTIRxError
 
@@ -887,7 +887,6 @@ def test_block_scaled_desc_i_rejects_static_abi_mismatch_at_runtime():
 
 
 
-@v2_gap("W11-7: a runtime descI that disagrees with the typed gemm_async ABI (N bit flipped) runs to completion instead of being rejected")
 def test_block_scaled_desc_i_rejects_static_abi_mismatch_at_runtime_corrected_kernel():
     """Corrected kernel, legacy assertion: flipping the runtime ``descI`` N bit
     (``corrupt_descriptor=1``) must stop the run (legacy: "does not match the
