@@ -137,6 +137,12 @@ impl<'c> Builder<'c> {
         self.incomplete(FindingKind::Unsupported, message, Vec::new(), json!({"reason": "fixed_sync_program_build", "source": detail}));
     }
 
+    /// The recording stopped before the launch completed (V2C-23).
+    pub fn truncated(&mut self, detail: String) {
+        let message = format!("the launch did not run to completion ({detail}); synchronization was not checked");
+        self.incomplete(FindingKind::Unsupported, message, Vec::new(), json!({"reason": "truncated_launch", "source": detail}));
+    }
+
     pub fn wall_time_limit(&mut self, started: Instant) {
         let usage = started.elapsed().as_millis() as u64;
         let limit = self.config.limits.max_wall_time_ms;

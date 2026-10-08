@@ -787,3 +787,34 @@ fn cluster_exit_after_last_wait_is_certified() {
     let r = run_all(&log.build(), init, Verdict::Clean);
     assert_eq!(stat(&r[0].1, "certified_program_count"), 1, "{:?}", r[0].1.coverage);
 }
+
+
+/// V2C-23: a launch that stopped early (budget) is `incomplete`
+/// (`truncated_launch`), not a deadlock from the blocked warp's missing
+/// partner; a `Deadlocked` end of a completed launch stays a deadlock.
+#[test]
+fn truncated_launch_is_incomplete_not_deadlock() {
+    use numsim_core::observe::{Observer, WarpEnd, WarpId};
+    let build = |end1: WarpEnd, ended: bool| {
+        let mut log = LogBuilder::new();
+        log.cmd(0, 1, mbar(0, 0), init(1));
+        cta_sync(&mut log, 0, &[0, 1], 2);
+        log.blocked_at_exit(0, 2, mbar(0, 0), wait(0));
+        let mut rec = log.build();
+        rec.launches.push((0, numsim_core::program::LaunchShape { grid: [1, 1, 1], cluster: [1, 1, 1], block: [64, 1, 1], smem_bytes: 0 }));
+        rec.warp_done(WarpId(0), WarpEnd::Deadlocked);
+        rec.warp_done(WarpId(1), end1);
+        if ended {
+            rec.launches_ended = 1;
+        }
+        rec
+    };
+    for (end1, ended) in [(WarpEnd::Budget, true), (WarpEnd::Exited, false), (WarpEnd::Error, true)] {
+        let r = check(&build(end1, ended), &SynccheckConfig::default());
+        assert_eq!(r.verdict, Verdict::Incomplete, "{end1:?} {ended}: {:#}", serialize(&r));
+        assert_eq!(payload(&r, Status::Incomplete)["reason"], "truncated_launch");
+    }
+    let r = check(&build(WarpEnd::Exited, true), &SynccheckConfig::default());
+    assert_eq!(r.verdict, Verdict::Error);
+    assert_eq!(serialize(&r)["execution_error"]["kind"], "deadlock");
+}

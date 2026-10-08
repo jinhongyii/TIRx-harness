@@ -117,13 +117,49 @@ pub fn split_launches(log: &RecordingObserver) -> Vec<(u32, RecordingObserver)> 
         let event = if warp == u32::MAX { &log.other[index as usize] } else { &log.per_warp[warp as usize][index as usize] };
         crate::observe::Observer::sync(out.entry(event.kernel).or_default(), event);
     }
-    for (kernel, shape) in &log.launches {
+    // Launches run in order and the engine stops after a failing one, so
+    // the first `launches_ended` launches ended and only the last started
+    // launch can carry abnormal warp ends.
+    let last = log.launches.last().map(|(k, _)| *k);
+    for (i, (kernel, shape)) in log.launches.iter().enumerate() {
         let rec = out.entry(*kernel).or_default();
         if !rec.launches.iter().any(|(k, _)| k == kernel) {
             rec.launches.push((*kernel, *shape));
+            rec.launches_ended += u32::from((i as u32) < log.launches_ended);
+        }
+        if Some(*kernel) == last && log.launches.len() > 1 {
+            rec.warp_ends = log.warp_ends.clone();
+        }
+    }
+    if log.launches.len() <= 1 {
+        if let Some(rec) = out.values_mut().next() {
+            rec.warp_ends = log.warp_ends.clone();
         }
     }
     out.into_iter().collect()
+}
+
+/// A recording of a launch that did not run to completion (review V2C-23):
+/// `None` when the log is complete or carries no launch facts (hand-built
+/// logs). Deadlocked ends are not truncation: they are the finding.
+fn truncation(log: &RecordingObserver) -> Option<String> {
+    use crate::observe::WarpEnd;
+    if log.launches.is_empty() {
+        return None;
+    }
+    if (log.launches_ended as usize) < log.launches.len() {
+        return Some(format!("{} of {} launches reached end_launch", log.launches_ended, log.launches.len()));
+    }
+    if let Some((w, end)) = log.warp_ends.iter().find(|(_, e)| matches!(e, WarpEnd::Budget | WarpEnd::Error | WarpEnd::Trapped)) {
+        return Some(format!("warp {} ended with {end:?}", w.0));
+    }
+    if !log.warp_ends.is_empty() {
+        let ended = log.warp_ends.iter().map(|(w, _)| w.0).collect::<std::collections::BTreeSet<_>>();
+        if let Some(w) = (0..log.per_warp.len() as u32).find(|w| !log.per_warp[*w as usize].is_empty() && !ended.contains(w)) {
+            return Some(format!("warp {w} has events but no end"));
+        }
+    }
+    None
 }
 
 /// One [`Report`] per launch in the log (never merged).
@@ -156,6 +192,18 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
             return out.finish(started);
         }
     };
+    // Protocol errors the engine hit are findings even if they stopped the
+    // launch; otherwise a truncated recording is incomplete, never a
+    // deadlock from missing events.
+    let protocol_errors = failures.iter().filter(|f| f.error.is_some()).cloned().collect::<Vec<_>>();
+    if !protocol_errors.is_empty() {
+        out.phase_a(&protocol_errors);
+        return out.finish(started);
+    }
+    if let Some(detail) = truncation(log) {
+        out.truncated(detail);
+        return out.finish(started);
+    }
     if !failures.is_empty() {
         out.phase_a(&failures);
         return out.finish(started);
