@@ -1,6 +1,6 @@
 {
  "case": "msa_prefill_multishape",
- "delta": "synccheck-explorer.md rule S5 (section 5.5) and section 5.8 (V2C-28): genuine kernel race (parity aliasing; a softmax warpgroup can overwrite o_smem during an in-flight TMA store); legacy reported clean, v2 fails closed with fixed_sync_program_model_incomplete / generation_assignment_differs",
+ "delta": "sync-behaviour-deltas S1: genuine parity-aliasing kernel race (synccheck-explorer.md section 5.8); legacy reported clean, v2 fails closed with fixed_sync_program_model_incomplete / generation_assignment_differs",
  "mode": "synccheck",
  "phases": [
   {

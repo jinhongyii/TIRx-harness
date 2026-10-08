@@ -4,7 +4,7 @@ orphan: true
 
 # v2 conformance status
 
-Generated 2026-10-08 at f6e9fa7 (fourth sweep; sparse_flashmla_decode_head64 and msa_prefill_multishape/synccheck re-run after 72c7908; public-API run at f6e9fa7) by the W8 sweep: every canonical case
+Generated 2026-10-08 at f6e9fa7 sweep; rows re-run at 9b1869e: sparse_flashmla_decode_head64, msa_prefill_multishape/synccheck, deepgemm_sm100_tf32_hc_prenorm_gemm, flash_attention_backward_sm100/racecheck by the W8 sweep: every canonical case
 (`tests/numsim/corpus/canonical_cases.py`) x {numsim, racecheck, synccheck} run under
 `NUMSIM_IMPL=v2` and compared with the legacy snapshots in `tirx_harness/tests/conformance/`
 (v2 may add source anchors to diagnostics legacy recorded without one; see
@@ -21,17 +21,16 @@ fail-closed reason); **crash** (engine runtime error or binder exception); **no 
 
 | mode | match | differs | incomplete | crash | no oracle |
 | --- | --- | --- | --- | --- | --- |
-| numsim | 97 | 1 | 0 | 0 | 3 |
-| racecheck | 88 | 10 | 0 | 0 | 3 |
-| synccheck | 97 | 1 | 0 | 0 | 3 |
+| numsim | 98 | 0 | 0 | 0 | 3 |
+| racecheck | 90 | 8 | 0 | 0 | 3 |
+| synccheck | 98 | 0 | 0 | 0 | 3 |
 
 ## Issues by root cause
 
 | issue | owner | cause | cases (modes) |
 | --- | --- | --- | --- |
-| V2C-36 | racecheck | new `scope_mismatch` + `data_race` (+ `cross_cta_async_order`) findings on cluster kernels legacy found clean or review-only; likely racecheck-behaviour-deltas R4/B1/B7 scope rules -- W5 to confirm and add delta snapshots | 4: `flash_attention_backward_sm100` (r), `sm100_fp8_fp4_mega_moe` (r), `sparse_flashmla_prefill_head128_phase1` (r), `sparse_flashmla_prefill_head128_small_topk_phase1` (r) |
+| V2C-36 | racecheck | new `scope_mismatch` + `data_race` (+ `cross_cta_async_order`) findings on cluster kernels legacy found clean or review-only; likely racecheck-behaviour-deltas R4/B1/B7 scope rules -- W5 to confirm and add delta snapshots | 3: `sm100_fp8_fp4_mega_moe` (r), `sparse_flashmla_prefill_head128_phase1` (r), `sparse_flashmla_prefill_head128_small_topk_phase1` (r) |
 | V2C-38 | racecheck | same finding kinds, different source anchors (witness site pair) and/or footprint | 2: `gdn_cp_prefill_sm100` (r), `gdn_prefill_sm100` (r) |
-| V2C-22 | interp / oplib | new `uninitialized_read` advisories: reads of bytes the engine never wrote (same cases fail the numeric reference, V2C-22) | 1: `deepgemm_sm100_tf32_hc_prenorm_gemm` (n/r/s) |
 
 ## Public-API legacy tests under v2
 
@@ -310,14 +309,14 @@ rest are v2 bugs for the named owner unless a delta row is added.
 | `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | match | match | match |
 | `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | match | match | match |
 | `deepgemm_sm100_m_grouped_fp8_gemm_masked` | match | match | match |
-| `deepgemm_sm100_tf32_hc_prenorm_gemm` | differs [V2C-22] | differs [V2C-22] | differs [V2C-22] |
+| `deepgemm_sm100_tf32_hc_prenorm_gemm` | match | match | match |
 | `dense_blockscaled_gemm_sm107` | match | match | match |
 | `fast_topk_clusters` | match | match | match |
 | `fastcu_nvfp4_gemm_gb300` | match | match | match |
 | `filtered_topk` | match | match | match |
 | `flash_attention4` | match | match | match |
 | `flash_attention4_fp4` | match | match | match |
-| `flash_attention_backward_sm100` | match | differs [V2C-36] | match |
+| `flash_attention_backward_sm100` | match | match | match |
 | `flash_mla_sparse_fwd` | match | match | match |
 | `flashinfer_add_rmsnorm_fp4quant` | match | match | match |
 | `flashinfer_fused_add_rmsnorm` | match | match | match |

@@ -1,0 +1,25 @@
+{
+ "case": "deepgemm_sm100_tf32_hc_prenorm_gemm",
+ "delta": "CONTRACT_REQUESTS W2-20, register-space uninit reports (V2C-19/20): v2 reports the uninitialized TMEM read (columns 128-160) where data moves into registers, legacy at the later register use -- a documented reporting-point delta",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/tf32_hc_prenorm_gemm.py:630:1-630:66"
+     ],
+     "bytes": {
+      "tmem-columns": "512-640"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "tmem",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

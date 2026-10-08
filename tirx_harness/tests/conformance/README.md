@@ -69,7 +69,9 @@ legacy engine is deleted.
 | --- | --- | --- |
 | `bmm_fp8_rubin`, `cudnn_sm100_dense_blockscaled_gemm_persistent_{dsrelu,srelu}_quant`, `fastcu_nvfp4_gemm_gb300`, `nvfp4_gemm` / racecheck | racecheck-behaviour-deltas B7 | `scope_mismatch` errors: a qualifier-less remote `mbarrier.arrive` is `.release.cta` (ISA R4), so the cross-CTA arrive/wait edge is dropped |
 | `deepgemm_sm100_fp8_gemm_1d1d` / racecheck | racecheck-behaviour-deltas B7 | as above, plus the `data_race`s that follow from the dropped edge |
-| `msa_prefill_multishape` / synccheck | synccheck-explorer.md rule S5 (§5.5) and §5.8 | `incomplete` (`fixed_sync_program_model_incomplete`, `generation_assignment_differs`): a genuine parity-aliasing race in the kernel; legacy reported clean |
+| `msa_prefill_multishape` / synccheck | sync-behaviour-deltas S1 (synccheck-explorer.md §5.8) | `incomplete` (`fixed_sync_program_model_incomplete`, `generation_assignment_differs`): a genuine parity-aliasing race in the kernel; legacy reported clean |
+| `deepgemm_sm100_tf32_hc_prenorm_gemm` / numsim, racecheck, synccheck | CONTRACT_REQUESTS W2-20 (V2C-19/20 reporting point) | an `uninitialized_read` review on TMEM columns 128-160 at the memory read (legacy reported at the later register use); outputs and reference check unchanged |
+| `flash_attention_backward_sm100` / racecheck | racecheck-behaviour-deltas B7 (+ X4) | `scope_mismatch` on default-`.cta` remote arrives, the data races that follow from the dropped edge, and a `cross_cta_async_order` advisory |
 | (removed) `msa_sparse_atten_fwd_nvfp4_kv_sm100` / racecheck | racecheck-behaviour-deltas T12 | subsumed by the schema-4 projection rule below (`tmem_lifetime_review` compared by kind + anchors) |
 
 ## What a snapshot contains (`snapshot.py`)
