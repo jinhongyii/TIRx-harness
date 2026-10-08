@@ -73,8 +73,32 @@ impl Default for Limits {
 pub struct Options {
     pub sleep_sets: bool,
     pub strong_diamonds: bool,
+    /// Master switch for every persistent-set rule (see [`Rules`]).
     pub persistent: bool,
     pub stop_on_first_failure: bool,
+    /// Individual reductions of the transition system, for the criterion
+    /// benches that guard each one (`benches/synccheck.rs`).
+    pub rules: Rules,
+}
+
+/// Switches for the model-level reductions of `ts::Ts`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rules {
+    /// Terminal transaction-completion persistent rule (`persistent_transition`).
+    pub tx_terminal: bool,
+    /// Singleton: warp-private async-group issue/commit.
+    pub private_issue: bool,
+    /// Singleton: ready mbarrier wait/test with only observers before it.
+    pub ready_observer: bool,
+    /// Singleton: deferred mbarrier completion proven independent (S8).
+    pub deferred_completion: bool,
+    /// Symmetry: only the lowest of interchangeable enabled pendings.
+    pub twin_landings: bool,
+}
+
+impl Rules {
+    pub const ALL: Self = Self { tx_terminal: true, private_issue: true, ready_observer: true, deferred_completion: true, twin_landings: true };
+    pub const NONE: Self = Self { tx_terminal: false, private_issue: false, ready_observer: false, deferred_completion: false, twin_landings: false };
 }
 
 impl Options {
@@ -83,12 +107,14 @@ impl Options {
         strong_diamonds: false,
         persistent: false,
         stop_on_first_failure: true,
+        rules: Rules::NONE,
     };
     pub const ALL: Self = Self {
         sleep_sets: true,
         strong_diamonds: true,
         persistent: true,
         stop_on_first_failure: true,
+        rules: Rules::ALL,
     };
 }
 

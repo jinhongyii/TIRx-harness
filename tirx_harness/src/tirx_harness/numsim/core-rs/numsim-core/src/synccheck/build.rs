@@ -316,3 +316,49 @@ pub fn umma_ring(stages: u32, kblocks: u32, tiles: u32) -> RecordingObserver {
     }
     log.build()
 }
+
+/// `producers` warps each attach 32 per-lane `cp.async.mbarrier.arrive.noinc`
+/// arrivals (one cp.async group per lane, `issues` issues per lane before
+/// each arrive) to each of `barriers` mbarriers (count `32 * producers`);
+/// `waiters` other warps wait on every barrier in turn. Warps 0..producers
+/// produce; the next `waiters` warps wait. Shape of `bsa_backward`,
+/// `mla_dsv4_multishape`, `blockscaled_..._rubin` (V2C-31).
+pub fn per_lane_arrivals(producers: u32, waiters: u32, barriers: u32, issues: u32) -> RecordingObserver {
+    let warps = producers + waiters;
+    let bar = |b: u32| mbar(0, 8 * b);
+    let mut log = LogBuilder::new();
+    for b in 0..barriers {
+        log.cmd(0, 1, bar(b), init(32 * u64::from(producers)));
+    }
+    cta_sync(&mut log, 0, &(0..warps).collect::<Vec<_>>(), warps);
+    for p in 0..producers {
+        let groups = (0..32u8).map(|l| async_group_res(p, l, async_group::Domain::CpAsync)).collect::<Vec<_>>();
+        for b in 0..barriers {
+            for _ in 0..issues {
+                log.cmds(p, 2 + 2 * b, groups.iter().map(|&g| (g, group(async_group::Cmd::Issue))).collect());
+            }
+            let targets = (0..32).map(|_| AsyncTarget { res: bar(b), bytes: 0, arrivals: 1 }).collect();
+            log.event(p, 3 + 2 * b, groups.iter().map(|&g| (g, group(async_group::Cmd::ArriveOn))).collect(), targets, None, None, ProtocolStatus::Committed);
+        }
+    }
+    for w in producers..warps {
+        for b in 0..barriers {
+            log.cmd(w, 100 + b, bar(b), wait(0));
+        }
+    }
+    log.build()
+}
+
+/// One TMA-filled mbarrier (`arrive.expect_tx` + one transaction), waited
+/// on by `warps` warps: the terminal transaction-completion rule.
+pub fn tma_many_waiters(warps: u32) -> RecordingObserver {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1));
+    cta_sync(&mut log, 0, &(0..warps).collect::<Vec<_>>(), warps);
+    log.cmd(0, 2, mbar(0, 0), arrive_tx(1, 1024));
+    log.issue(0, 3, mbar(0, 0), 1024, 0, Vec::new());
+    for w in 0..warps {
+        log.cmd(w, 4, mbar(0, 0), wait(0));
+    }
+    log.build()
+}

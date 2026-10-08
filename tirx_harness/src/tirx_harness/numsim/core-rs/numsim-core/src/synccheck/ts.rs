@@ -156,6 +156,8 @@ pub struct Ts<'p> {
     /// targets, only `AsyncGroup` issue/commit on groups no other warp's
     /// command touches (persistent singletons).
     private: Vec<bool>,
+    /// Which model-level reductions are on (bench switches; default all).
+    pub rules: super::explore::Rules,
 }
 
 enum Tried {
@@ -293,7 +295,7 @@ impl<'p> Ts<'p> {
                     })
             })
             .collect();
-        let mut ts = Ts { program, key: spec.key, warps, programs, resources, cmds, initial_res, resource_cmds, global_local, landing_gated, private };
+        let mut ts = Ts { program, key: spec.key, warps, programs, resources, cmds, initial_res, resource_cmds, global_local, landing_gated, private, rules: super::explore::Rules::ALL };
         if let Some(reference) = reference {
             for c in &mut ts.cmds {
                 let g = c.global;
@@ -778,7 +780,7 @@ impl<'p> Ts<'p> {
             }
         }
         for p in s.pending.iter() {
-            if self.pending_enabled(s, p) && !self.has_enabled_twin_below(s, p) {
+            if self.pending_enabled(s, p) && !(self.rules.twin_landings && self.has_enabled_twin_below(s, p)) {
                 out.push(Transition::Complete(p.cmd, p.ord));
             }
         }
@@ -1082,7 +1084,7 @@ impl TransitionSystem for Ts<'_> {
         // newer group than any deferred arrival already attached (ArriveOn
         // closes its group), and milestones are eager. Its warp cannot do
         // anything else first, so it is a persistent singleton.
-        if let Some(t) = enabled.iter().copied().find(|t| matches!(*t, Transition::Issue(c) if self.private[c as usize])) {
+        if let Some(t) = enabled.iter().copied().find(|t| self.rules.private_issue && matches!(*t, Transition::Issue(c) if self.private[c as usize])) {
             if self.step(s, &t).is_ok() {
                 return Some(t);
             }
@@ -1095,7 +1097,7 @@ impl TransitionSystem for Ts<'_> {
         // arrival, pending completion or other mutation that can still run
         // first rules it out (the S8 proof alone is not enough here).
         if let Some(t) = enabled.iter().copied().find(|t| {
-            matches!(*t, Transition::Issue(_) | Transition::Resume(_)) && self.only_observers_before(s, t)
+            self.rules.ready_observer && matches!(*t, Transition::Issue(_) | Transition::Resume(_)) && self.only_observers_before(s, t)
         }) {
             if self.step(s, &t).is_ok() {
                 return Some(t);
@@ -1109,7 +1111,8 @@ impl TransitionSystem for Ts<'_> {
         // is a persistent singleton (no-oracle `mla_dsv4_multishape`: 4
         // producer warps x 32 per-lane arrivals on each of two barriers).
         if let Some(t) = enabled.iter().copied().find(|t| {
-            matches!(*t, Transition::Complete(..))
+            self.rules.deferred_completion
+                && matches!(*t, Transition::Complete(..))
                 && matches!(self.candidate(s, t), Some((r, backend::Class::Contributor(_), _)) if matches!(s.res[r], Res::Mbarrier(_)))
                 && self.independent_of_future(s, t)
         }) {
@@ -1126,6 +1129,9 @@ impl TransitionSystem for Ts<'_> {
     /// not-yet-issued command of the projection can observe the barrier
     /// except parity waits/tests that this completion makes ready.
     fn persistent_transition(&self, s: &State, enabled: &[Transition]) -> Option<Transition> {
+        if !self.rules.tx_terminal {
+            return None;
+        }
         enabled.iter().copied().find(|t| {
             let Transition::Complete(c, o) = *t else { return false };
             let Some(p) = s.pending.iter().find(|p| (p.cmd, p.ord) == (c, o)) else { return false };

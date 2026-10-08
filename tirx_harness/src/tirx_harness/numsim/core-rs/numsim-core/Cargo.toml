@@ -40,3 +40,8 @@ harness = false
 [[bench]]
 name = "oplib"
 harness = false
+
+# W6: synccheck reduction guards (one row per pruning technique).
+[[bench]]
+name = "synccheck"
+harness = false

@@ -87,6 +87,9 @@ pub struct SynccheckConfig {
     /// elsewhere). `None`: derived from the recording (see
     /// `Program::tcgen_exclusive_max`).
     pub tcgen_exclusive_max: Option<u32>,
+    /// Happens-before gates on per-resource projections (bench switch;
+    /// off over-approximates the interleavings and may fail closed).
+    pub hb_gates: bool,
 }
 
 impl Default for SynccheckConfig {
@@ -101,6 +104,7 @@ impl Default for SynccheckConfig {
             explore: explore::Options::ALL,
             limits: EchoLimits::default(),
             tcgen_exclusive_max: None,
+            hb_gates: true,
         }
     }
 }
@@ -300,13 +304,15 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
             out.wall_time_limit(started);
             break;
         }
-        let ts = match ts::Ts::new(&program, &spec, &init, Some(&reference)) {
+        let spec = if config.hb_gates { spec } else { projection::ProjectionSpec { gated: false, ..spec } };
+        let mut ts = match ts::Ts::new(&program, &spec, &init, Some(&reference)) {
             Ok(ts) => ts,
             Err(detail) => {
                 out.program_build(detail);
                 break;
             }
         };
+        ts.rules = config.explore.rules;
         out.stats.programs += 1;
         if config.certificates {
             if let Some(result) = certificate::certify(&ts, &reference, init.cluster_warps) {

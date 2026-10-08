@@ -865,3 +865,41 @@ Mutation checks:
   - Make each epilogue wait on a generation that cannot alias: a turn barrier between the two warpgroups' epilogues (like `xu_turn`), so warpgroup 1 waits only after warpgroup 0 has consumed generation `seq_x - 2`.
   - Or give each warpgroup its own `o_smem` tile and `o_smem_free` barrier, waiting on parity `it_x & 1`.
 - **Report.** It stays `incomplete` (`fixed_sync_program_model_incomplete` / `generation_assignment_differs`), with the operation (warp 4, op 4310, loop iteration 1) and the witness schedule. A proof that it is an error would need the race checker on the `o_smem` bytes; racecheck reports a new `data_race` on this case (V2C-37), and whether that is this race is unverified.
+
+### 5.9 Benchmarks: one guard per reduction (2026-10-08)
+
+The CLAUDE.md rule is to keep pruning techniques guarded by their criterion benchmarks.
+
+**Bench.** `cargo bench -p numsim-core --bench synccheck` (`numsim-core/benches/synccheck.rs`).
+- It prints the table below, then times the "on" configuration of every row with criterion. `SYNCCHECK_TABLE_ONLY=1` prints only the table.
+- Each row runs one scenario generator from `synccheck::build` (`pipeline`, `umma_ring`, `tma_many_waiters`, `per_lane_arrivals`) twice: everything on, then the same configuration with that one technique off. "Off" runs are capped at 200k states.
+- The bench asserts that every "on" run is Clean. A reduction that breaks therefore fails the bench, and one that stops pruning shows as a criterion regression of the "off" ratio.
+
+**Switches.** Individual techniques are switched by `explore::Options::rules` (`Rules { tx_terminal, private_issue, ready_observer, deferred_completion, twin_landings }`, default all on) and `SynccheckConfig::hb_gates` (default on).
+
+Release build, one run:
+
+| Technique | Scenario | States on / off | Transitions on / off | Time on / off | Time ratio | Verdict on / off |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| per-resource projection (off = whole program) | pipeline(6,2,8) | 153 / 79,038 | 163 / 179,445 | 1.5 ms / 2.4 s | 1574x | Clean / Clean |
+| HB gates | pipeline(6,2,8) | 153 / 2 | 163 / 2 | — | (soundness) | Clean / **Error** (false alarm) |
+| sleep sets (alone vs none) | tma_many_waiters(16) | 196,616 / 196,616 | 262,149 / 1,572,876 | 5.2 s / 2.9 s | **0.5x** | Clean / Clean |
+| strong diamonds (with sleep, persistent off) | tma_many_waiters(16) | 75 / 196,616 | 75 / 262,149 | 5.2 ms / 4.9 s | 942x | Clean / Clean |
+| fingerprint dedup | pipeline(8,8,64,1024) | 218 / 1,569 | 230 / 1,665 | 8.7 ms / 19.3 ms | 2.2x | Clean / Clean |
+| causal certificates | umma_ring(6,16,16) | 15 / 3,860 | 1,453 / 4,376 | 18.9 ms / 33.3 ms | 1.8x (257x states) | Clean / Clean |
+| tx terminal persistent | pipeline(4,2,8,1024) | 143 / 147 | 151 / 157 | 1.0 ms / 1.1 ms | **1.1x** | Clean / Clean |
+| twin landings (deferred-completion singleton off) | per_lane_arrivals(1,2,2,1) | 2,334 / 200,000 (budget) | 2,368 / 200,032 | 121 ms / 21.6 s | 178x | Clean / Incomplete |
+| singleton: private async-group issue | per_lane_arrivals(4,1,1,4) | 546 / 10,898 | 545 / 10,897 | 92 ms / 1.7 s | 18.5x | Clean / Clean |
+| singleton: ready observer | per_lane_arrivals(1,8,2,1) | 118 / 7,171 | 117 / 7,170 | 9.1 ms / 525 ms | 57x | Clean / Clean |
+| singleton: deferred completion | per_lane_arrivals(4,2,2,1) | 2,805 / 200,000 (budget) | 2,804 / 200,511 | 763 ms / 59.3 s | 78x | Clean / Incomplete |
+
+**Findings.**
+- **HB gates** are not a performance technique. They make per-resource projection sound against false alarms, so their guard is the Clean assertion.
+- **Twin landings** are subsumed by the deferred-completion singleton when both are on, so their row switches that singleton off. The same holds for `tx terminal persistent`: the observer and deferred-completion singletons cover it, and alone it fires only in shapes where it saves a few states.
+- **Two techniques have no ≥2x guard:**
+  - *Sleep sets* cut explored transitions 6x but are slower (0.5x). Cloning a sleep set per node costs more than the transitions save, and in every shape tried (whole and per-resource pipelines, many waiters) they never cut states.
+  - *tx terminal persistent* saves at most 3% of states.
+
+  Both are candidates for removal, or for sleep sets an optimization (shared or bitset sleep sets). The decision is the coordinator's; the switches make it a one-line change.
+- **`sync/` memoization:** there is none (no caches in `numsim-core/src/sync/`), so there is nothing to guard.
+- **Budget paths** have scenario tests: `budget_exhaustion_is_incomplete` (states → `fixed_sync_states`), `transition_budget_is_incomplete` (`fixed_sync_transitions`) and `wall_time_limit_is_incomplete` (`wall_time`).
