@@ -11,7 +11,7 @@
       "tirx_kernels/ported/msa/sparse_atten_fwd_nvfp4_kv.py:2960:1-2960:43"
      ],
      "bytes": {
-      "tmem-columns#0": "256-320,384-448"
+      "tmem-columns": "256-320,384-448"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -24,5 +24,5 @@
    "verdict": "review"
   }
  ],
- "schema": 1
+ "schema": 2
 }

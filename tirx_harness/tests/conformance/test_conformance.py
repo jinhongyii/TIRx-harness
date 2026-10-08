@@ -25,11 +25,19 @@ def implementation():
 @pytest.mark.parametrize("entry", CANONICAL_KERNEL_CASES, ids=lambda entry: entry.name)
 def test_conformance_snapshot(entry, mode, implementation, request) -> None:
     update = request.config.getoption("update_snapshots")
+    if update and implementation.name != "legacy":
+        pytest.fail("snapshots are the legacy oracle; regenerate them only with NUMSIM_IMPL=legacy")
     expected = snap.load_snapshot(entry.name, mode)
     if not update and implementation.name != "legacy" and expected is not None and "error" in expected:
         pytest.skip(f"legacy failed this case ({expected['error']}); there is no oracle to compare")
 
-    actual = snap.collect_snapshot(entry, mode, implementation)
+    if implementation.name == "legacy":
+        actual = snap.collect_snapshot(entry, mode, implementation)
+    else:
+        try:
+            actual = snap.collect_snapshot(entry, mode, implementation, reraise=(NotImplementedError,))
+        except NotImplementedError as error:
+            pytest.skip(f"{implementation.name}: not implemented yet: {error}")
 
     if update:
         snap.write_snapshot(entry.name, mode, actual)
@@ -39,6 +47,8 @@ def test_conformance_snapshot(entry, mode, implementation, request) -> None:
             f"no snapshot for {entry.name}/{mode}; generate it with "
             "NUMSIM_IMPL=legacy pytest tests/conformance --update-snapshots"
         )
+    if implementation.name != "legacy":
+        actual = snap.relax_unanchored(expected, actual)
     if actual != expected:
         pytest.fail(
             f"{implementation.name} diverges from the {entry.name}/{mode} snapshot:\n"

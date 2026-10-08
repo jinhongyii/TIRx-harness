@@ -16,3 +16,28 @@ def pytest_addoption(parser) -> None:
         default=False,
         help="rewrite tests/conformance/snapshots from the selected NUMSIM_IMPL instead of comparing",
     )
+
+
+# ---------------------------------------------------------------------------
+# NUMSIM_IMPL=v2: run public-API NumSim tests against the v2 engine.
+#
+# Rebinds the public names of ``tirx_harness.numsim`` (and the top-level
+# ``tirx_harness.racecheck`` / ``synccheck``) to ``tirx_harness.numsim.v2``
+# before any test module is imported, so ``from tirx_harness.numsim import
+# Engine`` / ``numsim.transpile`` resolve to v2. Internal modules
+# (``tirx_harness.numsim.api`` etc.) are untouched; tests importing them keep
+# exercising legacy. Data classes shared by both (NumSimCase, TensorMap,
+# ComparisonSpec, errors) stay the legacy objects. See dev-loop.md.
+if os.environ.get("NUMSIM_IMPL", "").strip() == "v2":
+    import tirx_harness as _harness
+    import tirx_harness.numsim as _numsim
+    from tirx_harness.numsim import v2 as _v2
+
+    for _name in (
+        "transpile", "Engine", "compare", "run_case", "CoverageBounds", "ResourceLimits",
+        "CompiledModule", "NumSimResult",
+    ):
+        setattr(_numsim, _name, getattr(_v2, _name))
+    _numsim.NativeAnalysisResult = _v2.AnalysisResult
+    _harness.racecheck = _v2.racecheck
+    _harness.synccheck = _v2.synccheck

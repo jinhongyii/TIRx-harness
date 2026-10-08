@@ -7,7 +7,7 @@
     {
      "anchors": [],
      "bytes": {
-      "shared#0": "128-2048,2176-4096"
+      "shared": "128-2048,2176-4096"
      },
      "category": "advisories",
      "kind": "uninitialized_read",
@@ -18,5 +18,5 @@
    "verdict": "review"
   }
  ],
- "schema": 1
+ "schema": 2
 }

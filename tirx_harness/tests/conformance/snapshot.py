@@ -38,7 +38,7 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: no allocation id for per-CTA window spaces
 MODES = ("numsim", "racecheck", "synccheck")
 SNAPSHOT_ROOT = Path(__file__).resolve().parent / "snapshots"
 IMPL_ENV = "NUMSIM_IMPL"
@@ -220,9 +220,18 @@ def record_space(value: Mapping[str, Any]) -> str | None:
     return "+".join(sorted(spaces)) if spaces else None
 
 
+# Spaces with one window per CTA: the allocation id is an engine-internal
+# numbering (legacy counts per space, numsim-core counts globally), so only
+# the space is kept. Global allocations keep their id (host parameter order
+# in both engines).
+_WINDOW_SPACES = frozenset({"shared", "tmem", "local", "register", "param"})
+
+
 def _region(space: Any, alloc: Any) -> str:
     region = str(space) if space is not None else "?"
-    return region if alloc is None else f"{region}#{alloc}"
+    if alloc is None or region.split("+")[0] in _WINDOW_SPACES:
+        return region
+    return f"{region}#{alloc}"
 
 
 def merge_intervals(items: Iterable[tuple[int, int]]) -> str:
@@ -341,6 +350,62 @@ def normalize_numsim(
         "outputs": {name: hash_array(outputs[name]) for name in sorted(outputs)},
         "diagnostics": normalize_records((("diagnostics", item) for item in diagnostics), resolver),
     }
+
+
+def _regroup(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        key_fields = {k: v for k, v in group.items() if k != "bytes"}
+        key = json.dumps(key_fields, sort_keys=True)
+        target = merged.setdefault(key, {**key_fields, "_bytes": {}})
+        for region, text in (group.get("bytes") or {}).items():
+            for part in filter(None, text.split(",")):
+                start, end = part.split("-")
+                target["_bytes"].setdefault(region, []).append((int(start), int(end)))
+    out = []
+    for key in sorted(merged):
+        group = merged[key]
+        footprint = {r: merge_intervals(items) for r, items in sorted(group.pop("_bytes").items())}
+        if footprint:
+            group["bytes"] = footprint
+        out.append(group)
+    return out
+
+
+def relax_unanchored(expected: dict[str, Any], actual: dict[str, Any]) -> dict[str, Any]:
+    """Drop source anchors the legacy oracle could not record.
+
+    Legacy NumSim/Racecheck emitted some diagnostics (notably
+    ``uninitialized_read`` without a source op) with no source evidence, so
+    their snapshot groups have ``anchors == []``. A new implementation that
+    attaches the real source site is not wrong. For every
+    (category, kind, status, space) whose expected groups are all
+    unanchored, the actual groups lose their anchors and are re-merged;
+    everything else (kinds, statuses, byte footprints) is still compared.
+    Used only for non-legacy implementations.
+    """
+
+    def unanchored_keys(groups: list[dict[str, Any]]) -> set[tuple]:
+        keys: dict[tuple, bool] = {}
+        for g in groups:
+            key = (g.get("category"), g.get("kind"), g.get("status"), g.get("space"))
+            keys[key] = keys.get(key, True) and not g.get("anchors")
+        return {k for k, unanchored in keys.items() if unanchored}
+
+    def relax(exp_groups: list[dict[str, Any]], act_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        keys = unanchored_keys(exp_groups)
+        changed = [
+            {**g, "anchors": []} if (g.get("category"), g.get("kind"), g.get("status"), g.get("space")) in keys else g
+            for g in act_groups
+        ]
+        return _regroup(changed)
+
+    actual = copy.deepcopy(actual)
+    if "diagnostics" in expected and "diagnostics" in actual:
+        actual["diagnostics"] = relax(expected["diagnostics"], actual["diagnostics"])
+    for exp_phase, act_phase in zip(expected.get("phases") or (), actual.get("phases") or ()):
+        act_phase["diagnostics"] = relax(exp_phase["diagnostics"], act_phase["diagnostics"])
+    return actual
 
 
 # --------------------------------------------------------------------------
@@ -487,8 +552,19 @@ def _run_analysis_case(numsim: Any, entry: Any, mode: str) -> dict[str, Any]:
     return {"phases": phases}
 
 
-def collect_snapshot(entry: Any, mode: str, impl: Implementation) -> dict[str, Any]:
-    """Run one canonical case in one mode and return its normalized snapshot."""
+def collect_snapshot(
+    entry: Any,
+    mode: str,
+    impl: Implementation,
+    *,
+    reraise: tuple[type[BaseException], ...] = (),
+) -> dict[str, Any]:
+    """Run one canonical case in one mode and return its normalized snapshot.
+
+    Exceptions are recorded as ``{"error": type}`` except those in
+    ``reraise`` (v2 re-raises ``NotImplementedError`` so unfinished engine
+    bodies skip instead of failing).
+    """
 
     header = {"schema": SCHEMA_VERSION, "case": entry.name, "mode": mode}
     try:
@@ -498,6 +574,8 @@ def collect_snapshot(entry: Any, mode: str, impl: Implementation) -> dict[str, A
             body = _run_analysis_case(impl.numsim, entry, mode)
         else:
             raise ValueError(f"unknown conformance mode {mode!r}")
+    except reraise:
+        raise
     except Exception as error:  # noqa: BLE001 - recorded as part of the oracle
         body = {"error": type(error).__name__}
     return {**header, **body}
@@ -515,6 +593,7 @@ __all__ = [
     "load_snapshot",
     "normalize_analysis_phase",
     "normalize_numsim",
+    "relax_unanchored",
     "selected_impl_name",
     "write_snapshot",
 ]

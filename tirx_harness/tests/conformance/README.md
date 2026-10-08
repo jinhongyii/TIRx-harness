@@ -24,7 +24,8 @@ any invocation. Only regenerate from `legacy`, and review the diff.
 while that module is missing or does not yet expose `transpile`, `Engine`
 (`run`, `run_racecheck_phase`, `run_synccheck_phase`), `compare`,
 `CoverageBounds` and `ResourceLimits` with the legacy signatures. Cases whose
-legacy snapshot is an exception are skipped under v2 (no oracle).
+legacy snapshot is an exception are skipped under v2 (no oracle), and so is
+any v2 run that raises `NotImplementedError` (unfinished numsim-core bodies).
 
 ## What a snapshot contains (`snapshot.py`)
 
@@ -41,7 +42,11 @@ legacy snapshot is an exception are skipped under v2 (no oracle).
   anchors** (`file:line:col-end_line:end_col`, resolved from legacy
   `(kernel_index, source_op_id)` through the module source map, or taken from an
   embedded serialized `source_span`). Byte overlaps of all members of a group
-  are merged into `bytes: {"<space>#<allocation>": "a-b,c-d"}` (half-open).
+  are merged into `bytes: {"<region>": "a-b,c-d"}` (half-open). The region is
+  `global#<allocation>` for global memory (host parameter order in both
+  engines) and just the space for per-CTA windows (`shared`, `tmem`, `local`,
+  `register`, `param`), whose allocation numbering is engine-internal
+  (snapshot schema 2).
   TMEM ranges are projected to column bytes (`tmem-columns#N`) because the lane
   quadrant of the witnessing warp depends on the schedule.
 - **exception**: `{"error": "<ExceptionType>"}` when the implementation raises
@@ -50,6 +55,10 @@ legacy snapshot is an exception are skipped under v2 (no oracle).
 Dropped on purpose: messages, hints, timings, stats, poll/transition counts,
 occurrence and finding counts, warp ids, per-warp sequence numbers, loop
 iteration ordinals, internal op ids, anonymous buffer names.
+
+For non-legacy implementations, groups legacy recorded with no source anchor
+at all are compared without anchors (`relax_unanchored`): legacy could not
+name a source for some diagnostics, and v2 naming one is not a regression.
 
 Caveat for v2: racecheck `findings` are witness-based (one prior/current pair
 per site pair). The legacy witness is stable across runs, but a different
@@ -66,6 +75,11 @@ working tree; tirx-kernels 0.1.2.post1; `-n 32 --dist=worksteal`.
 - Cold run (empty `$NUMSIM_CACHE_DIR`, one process per case/mode, 32 at once):
   407 s. Warm `--update-snapshots`: 120 to 174 s. Warm verification:
   158 to 196 s.
+- Schema 2 regeneration (2026-10-08, allocation ids dropped for window
+  spaces): 184 s generate, 179-185 s verify. One verify run at load average
+  51 had a single failure that did not reproduce in three later runs (two at
+  `-n 64`); the failing case id was not captured. Treat a lone failure under
+  heavy load as a rerun-first signal.
 - Stability: after the final normalization, the snapshots were regenerated and
   then verified four times at `-n 16`, `-n 64`, `-n 96` and `-n 32`; all 303
   matched every time. (Before TMEM column projection, `gdn_cp_prefill_sm100`

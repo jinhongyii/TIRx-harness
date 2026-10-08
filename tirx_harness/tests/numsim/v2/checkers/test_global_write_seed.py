@@ -42,7 +42,6 @@ from ._runnable import (
 
 pytestmark = requires_v2_engine
 
-_HOST_ALIAS = no_spec(2, "host-input aliasing; v2 fails closed (NotImplementedError, CONTRACT_REQUESTS W8-6)")
 _HOST_POINTER = no_spec(
     2,
     "host-input aliasing; the legacy kernel is fed HOST addresses (ndarray.ctypes.data) as pointer "
@@ -57,7 +56,9 @@ def _assert_alias_race(report) -> None:
 
 
 def _alias(flag: bool):
-    return pytest.param(flag, id="aliased" if flag else "distinct", marks=_HOST_ALIAS if flag else ())
+    # Host-input aliasing is implemented (W8-6: overlapping host arrays are
+    # views of one engine allocation); no mark.
+    return pytest.param(flag, id="aliased" if flag else "distinct")
 
 
 # -- kernels (copied from the legacy test) ---------------------------------------
@@ -270,8 +271,8 @@ def test_register_result_writes_preserve_host_alias_races(alias_inputs):
     "alias",
     [
         pytest.param("none"),
-        pytest.param("selected", marks=_HOST_ALIAS),
-        pytest.param("unselected", marks=_HOST_ALIAS),
+        pytest.param("selected"),
+        pytest.param("unselected"),
     ],
 )
 def test_loop_carried_selected_pointer_preserves_compact_alias_races(select_b, alias):
@@ -320,8 +321,8 @@ def test_unknown_register_overwrite_keeps_read_before_write_race(func):
     "replace",
     [
         pytest.param(False, id="initial-base", marks=v2_gap(
-            "TMA store through a TensorMap bound over a host array (tensor_map_of): "
-            "bad_address 'Global address ... is not mapped'")),
+            "distinct inputs: racecheck reports an alias_stale_read review on the TMA store "
+            "(W5; the V2C-25 bad_address is fixed)")),
         pytest.param(True, id="replaced-base", marks=v2_gap(
             "tensormap.replace + fence.proxy.tensormap::generic release/acquire still reports a "
             "missing_proxy_bridge data_race on the descriptor bytes")),

@@ -4,7 +4,7 @@
   {
    "anchors": [],
    "bytes": {
-    "shared#0": "256-2048,2304-4096"
+    "shared": "256-2048,2304-4096"
    },
    "category": "diagnostics",
    "kind": "uninitialized_read",
@@ -30,6 +30,6 @@
   }
  },
  "reference_ok": true,
- "schema": 1,
+ "schema": 2,
  "verdict": "review"
 }

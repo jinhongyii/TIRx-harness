@@ -10,7 +10,7 @@
       "tirx_kernels/ported/flashmla/sparse_prefill_head64_phase1.py:714:1-714:39"
      ],
      "bytes": {
-      "shared#0": "229376-229380"
+      "shared": "229376-229380"
      },
      "category": "advisories",
      "kind": "alias_stale_read",
@@ -21,5 +21,5 @@
    "verdict": "review"
   }
  ],
- "schema": 1
+ "schema": 2
 }

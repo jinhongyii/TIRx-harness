@@ -11,7 +11,7 @@
       "tirx_kernels/ported/flashattention/flash_attention4.py:476:1-476:85"
      ],
      "bytes": {
-      "tmem-columns#0": "256-320,384-448"
+      "tmem-columns": "256-320,384-448"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -27,7 +27,7 @@
       "tirx_kernels/ported/flashattention/flash_attention4.py:851:1-851:50"
      ],
      "bytes": {
-      "tmem-columns#0": "0-256,512-768"
+      "tmem-columns": "0-256,512-768"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -40,5 +40,5 @@
    "verdict": "review"
   }
  ],
- "schema": 1
+ "schema": 2
 }

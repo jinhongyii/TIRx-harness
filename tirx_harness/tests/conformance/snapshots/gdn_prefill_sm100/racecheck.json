@@ -11,7 +11,7 @@
       "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:848:1-848:70"
      ],
      "bytes": {
-      "tmem-columns#0": "512-768,1536-1792"
+      "tmem-columns": "512-768,1536-1792"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -27,7 +27,7 @@
       "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:849:1-849:102"
      ],
      "bytes": {
-      "tmem-columns#0": "512-768,1536-1792"
+      "tmem-columns": "512-768,1536-1792"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -43,7 +43,7 @@
       "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:853:1-853:70"
      ],
      "bytes": {
-      "tmem-columns#0": "512-768"
+      "tmem-columns": "512-768"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -59,7 +59,7 @@
       "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:854:1-854:102"
      ],
      "bytes": {
-      "tmem-columns#0": "512-768"
+      "tmem-columns": "512-768"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -75,7 +75,7 @@
       "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:926:1-926:39"
      ],
      "bytes": {
-      "tmem-columns#0": "0-512"
+      "tmem-columns": "0-512"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -91,7 +91,7 @@
       "tirx_kernels/ported/flashinfer/gdn_prefill/gdn_prefill_sm100.py:996:1-996:51"
      ],
      "bytes": {
-      "tmem-columns#0": "0-512"
+      "tmem-columns": "0-512"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -104,5 +104,5 @@
    "verdict": "review"
   }
  ],
- "schema": 1
+ "schema": 2
 }

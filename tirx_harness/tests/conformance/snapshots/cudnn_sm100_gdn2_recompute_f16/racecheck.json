@@ -15,7 +15,7 @@
       "tirx_kernels/ported/cudnn/linear_attention/gdn2_recompute_f16.py:631:1-631:55"
      ],
      "bytes": {
-      "tmem-columns#0": "768-832"
+      "tmem-columns": "768-832"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -31,7 +31,7 @@
       "tirx_kernels/ported/cudnn/linear_attention/gdn2_recompute_f16.py:631:1-631:55"
      ],
      "bytes": {
-      "tmem-columns#0": "768-832"
+      "tmem-columns": "768-832"
      },
      "category": "findings",
      "kind": "tmem_lifetime_review",
@@ -44,5 +44,5 @@
    "verdict": "review"
   }
  ],
- "schema": 1
+ "schema": 2
 }

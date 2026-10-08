@@ -1560,3 +1560,63 @@ reports) must treat that diagnostic as making the checker verdict
     to the chain root if the result would be negative.
   - Also: `finish_shared` now keeps every BufferDecl field when it rewrites
     root shared buffers. It used to drop `sync_words`.
+
+## v2 conformance, sweep 2 (W8, 2026-10-08, at 62c4226)
+
+Status of the earlier rows: V2C-1 (prefetch), V2C-3 (BitNot), V2C-6, V2C-8,
+V2C-9/V2C-25 (TMA through host tensor maps), V2C-10, V2C-11, V2C-13 and the
+W8-6 aliasing rows no longer reproduce; V2C-23 is fixed in synccheck
+(b6c4254). numsim-py now forwards every observer callback to the per-launch
+recorder (launch shapes, warp ends), binds overlapping host arrays as
+`ArgValue::View`s of one region, and voids a checker verdict computed from a
+truncated log. Current table: `docs/development/v2-conformance-status.md`
+(numsim 81 match / racecheck 34 / synccheck 63 of 101). New rows:
+
+### V2C-4 [synccheck]: synccheck could not build the fixed sync program
+
+- Cases (6): `bmm_fp8_rubin` (synccheck), `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` (synccheck), `deepgemm_sm100_fp8_gemm_1d1d` (synccheck), `fastcu_nvfp4_gemm_gb300` (synccheck), `nvfp4_gemm` (synccheck), `sparse_flashmla_prefill_head128_phase1` (synccheck)
+- Minimal reproduction: `nvfp4_gemm` / synccheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "nvfp4_gemm-synccheck"`
+- Observed: expected diagnostics [{"diagnostics": [], "verdict": "clean"}] / actual [{"verdict": "incomplete", "diagnostics": [{"category": "incomplete", "kind": "analysis_incomplete", "status": "incomplete", "reason": "fixed_sync_program_build", "anchors": []}]}]
+
+### V2C-5 [racecheck]: racecheck-behaviour-deltas P6 (`AsyncNeverCompleted` incomplete at launch end) -- verify
+
+- Cases (35): `bmm_fp8_rubin` (racecheck), `cudnn_sm100_bsa_backward_blk128` (racecheck), `cudnn_sm100_bsa_backward_blk64` (racecheck), `cudnn_sm100_bsa_forward_blk128` (racecheck), `cudnn_sm100_bsa_forward_blk64` (racecheck), `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` (racecheck), `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` (racecheck), `cudnn_sm100_dense_gemm_persistent_swiglu` (racecheck), `cudnn_sm100_dsa_sparse_attention_backward` (racecheck), `cudnn_sm100_gdn2_recompute_f16` (racecheck), `cudnn_sm100_gdn_bprop_f16` (racecheck), `cudnn_sm100_gdn_prefill_f16` (racecheck), `cudnn_sm100_gdn_recompute_f16` (racecheck), `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` (racecheck), `cudnn_sm100_moe_grouped_gemm_dglu_dbias` (racecheck), `cudnn_sm103_flex_attention_forward` (racecheck), `deepgemm_sm100_fp4_mqa_logits` (racecheck), `deepgemm_sm100_fp8_bmm` (racecheck), `deepgemm_sm100_fp8_gemm_1d1d` (racecheck), `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` (racecheck), `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` (racecheck), `deepgemm_sm100_m_grouped_fp8_gemm_masked` (racecheck), `deepgemm_sm100_tf32_hc_prenorm_gemm` (racecheck), `dense_blockscaled_gemm_sm107` (racecheck), `fastcu_nvfp4_gemm_gb300` (racecheck), `flash_attention4` (racecheck), `flash_attention4_fp4` (racecheck), `flash_mla_sparse_fwd` (racecheck), `gdn_cp_prefill_sm100` (racecheck), `gdn_prefill_sm100` (racecheck), `grouped_gemm_masked_rubin` (racecheck), `msa_sparse_atten_fwd_sm100` (racecheck), `nvfp4_gemm` (racecheck), `sparse_flashmla_prefill_head128_phase1` (racecheck), `sparse_flashmla_prefill_head64_phase1` (racecheck)
+- Minimal reproduction: `nvfp4_gemm` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "nvfp4_gemm-racecheck"`
+- Observed: release .cta (warp 196) and acquire .cluster (warp 204) do not mutually cover each other's thread; allocation 7 ended while async op 1099511627784 still had it in its footprint
+
+### V2C-28 [synccheck]: synccheck: fixed sync program model incomplete
+
+- Cases (3): `deepgemm_sm100_fp4_mqa_logits` (synccheck), `deepgemm_sm100_fp8_mqa_logits` (synccheck), `msa_prefill_multishape` (synccheck)
+- Minimal reproduction: `msa_prefill_multishape` / synccheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "msa_prefill_multishape-synccheck"`
+- Observed: expected diagnostics [{"diagnostics": [], "verdict": "clean"}] / actual [{"verdict": "incomplete", "diagnostics": [{"category": "incomplete", "kind": "analysis_incomplete", "status": "incomplete", "reason": "fixed_sync_program_model_incomplete", "anchors": ["<unmapped op 4310>"]}]}]
+
+### V2C-30 [interp (arena::addr) / lowering]: shared::cta address names another CTA rank
+
+- Cases (2): `alphamoe_fp8_blockscale_qwen3next` (numsim/racecheck/synccheck), `flash_attention_backward_sm100` (numsim/racecheck/synccheck)
+- Minimal reproduction: `flash_attention_backward_sm100` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "flash_attention_backward_sm100-numsim"`
+- Observed: ExecutionError: NumSim execution error: bad_address: shared::cta address 0x1000058 names CTA rank 1, not the executing CTA (rank 0) at /localhome/local-hongyij/TIRx-harness/.venv/lib/python3.12/site-packages/tirx_kernels/ported/flashattention/flash_attention_backward.py:1277
+
+### V2C-31 [synccheck]: no result within the sweep timeout (explorer ignores the wall-time limit inside one projection)
+
+- Cases (10): `cudnn_sm100_bsa_backward_blk64` (synccheck), `cudnn_sm100_dsa_sparse_attention_backward` (synccheck), `cudnn_sm100_gdn_bprop_f16` (synccheck), `cudnn_sm100_gdn_prefill_f16` (synccheck), `cudnn_sm100_gdn_recompute_f16` (synccheck), `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in` (racecheck/synccheck), `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` (racecheck/synccheck), `fp16_bf16_gemm` (numsim/racecheck/synccheck), `gdn_prefill_sm100` (synccheck), `sparse_flashmla_prefill_head128_small_topk_phase1` (numsim/racecheck/synccheck)
+- Minimal reproduction: `fp16_bf16_gemm` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "fp16_bf16_gemm-numsim"`
+- Observed: no result within the 900 s sweep timeout
+
+### V2C-32 [oplib]: sub-byte (FP4/U4) TMA store fragments not representable in TmaPlan
+
+- Cases (1): `blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin` (numsim/racecheck/synccheck)
+- Minimal reproduction: `blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin-numsim"`
+- Observed: ExecutionError: NumSim execution incomplete: analysis_incomplete: Op(Unsupported): sub-byte (FP4/U6) TMA store fragments are not representable in TmaPlan at /localhome/local-hongyij/TIRx-harness/.venv/lib/python3.12/site-packages/tirx_kernels/ported/flashinfer/fused_moe/blockscaled_contiguous_gather
+
+### V2C-33 [lowering]: lowering rejects `wait_until` whose destination is not a promoted local
+
+- Cases (2): `radix_topk_multi_cta` (numsim/racecheck), `sm100_fp8_fp4_mega_moe` (numsim/racecheck/synccheck)
+- Minimal reproduction: `radix_topk_multi_cta` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "radix_topk_multi_cta-numsim"`
+- Observed: UnsupportedTIRxError: radix_topk_multi_cta: unsupported TIRx: site#16 ir.Call: wait_until destination must be a promoted local scalar; site#44 ir.Call: wait_until destination must be a promoted local scalar; site#103 ir.Call: wait_until destination must be a promoted local scalar
+
+### V2C-34 [racecheck (contract: TMEM span convention)]: TMEM byte spans use a different addressing than legacy (lane * 2048 + col * 4); the snapshot's column projection cannot compare them
+
+- Cases (1): `msa_sparse_atten_fwd_nvfp4_kv_sm100` (racecheck)
+- Minimal reproduction: `msa_sparse_atten_fwd_nvfp4_kv_sm100` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "msa_sparse_atten_fwd_nvfp4_kv_sm100-racecheck"`
+- Observed: TMEM lifetime conflict requires review: the earlier tcgen05.ld may not have completed before the conflicting reuse (read_write conflict on bytes [256..260416) of allocation 17: async_lifetime_not_drai; TMEM lifetime conflict requires review: the earlier tcgen05.ld may not have completed before the conflicting reuse (read_write conflict on bytes [320..260480) of allocation 17: async_lifetime_not_drai
+

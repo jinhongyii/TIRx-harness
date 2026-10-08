@@ -86,6 +86,9 @@ pub struct RunRequest {
     /// Synccheck state / transition budgets per projection.
     pub state_budget: Option<u64>,
     pub transition_budget: Option<u64>,
+    /// Synccheck `EchoLimits` (`max_schedules`, `max_events_per_run`,
+    /// `max_total_events`, `max_wall_time_ms`, `max_diagnostic_bytes`).
+    pub synccheck_limits: BTreeMap<String, u64>,
     /// Racecheck: stop recording after this many findings (0 = unlimited).
     pub max_findings: usize,
     /// Accepted for API stability; the scheduler is single-threaded today.
@@ -104,6 +107,7 @@ impl RunRequest {
             config: RunConfig::default(),
             state_budget: None,
             transition_budget: None,
+            synccheck_limits: BTreeMap::new(),
             max_findings: 0,
             workers: 1,
             opt_level: 1,
@@ -214,6 +218,9 @@ fn exec_error_kind(e: &ExecError) -> (String, &'static str) {
         K::Uninit => "uninitialized_read".to_string(),
         K::Misaligned => "misaligned".to_string(),
         K::BadAddress => "bad_address".to_string(),
+        // Legacy kind strings are kept (W9 review): a named-barrier protocol
+        // violation was `named_barrier_contract_mismatch`.
+        K::Protocol(numsim_core::sync::SyncError::Named(_)) => "named_barrier_contract_mismatch".to_string(),
         K::Protocol(_) => "sync_protocol_error".to_string(),
         K::Op(OpErrorKind::Unsupported) => "unsupported".to_string(),
         K::Op(OpErrorKind::Invalid) => "invalid_operand".to_string(),
@@ -234,6 +241,7 @@ fn exec_error_json(kernel_index: Option<usize>, e: &ExecError) -> Value {
         "message": e.message,
         "detail": format!("{:?}", e.kind),
         "kernel_index": kernel_index.map(|k| k as u32).unwrap_or(e.kernel),
+        "source": "run_status",
         "site": if e.site.is_none() { Value::Null } else { json!(e.site.0) },
         "warp": e.warp.0,
         "pc": e.pc.0,
@@ -269,6 +277,9 @@ fn runtime_finding_json(f: &numsim_core::report::Finding) -> Value {
     m.insert("kind".into(), kind);
     m.insert("status".into(), json!(status.unwrap_or_else(|| "error".into())));
     m.insert("message".into(), json!(f.message));
+    for (key, value) in &f.attrs {
+        m.entry(key.clone()).or_insert_with(|| value.clone());
+    }
     if let Some(e) = f.evidence.iter().find(|e| e.bytes.is_some()).or_else(|| f.evidence.first()) {
         m.insert("kernel_index".into(), json!(e.kernel));
         if !e.site.is_none() {
@@ -300,6 +311,7 @@ fn diagnostics_of(outcome: &RunOutcome) -> Vec<Value> {
             "kind": "deadlock",
             "status": "error",
             "message": "no warp can make progress",
+            "source": "run_status",
             "kernel_index": kernel,
             "blocked": blocked.len(),
         })),
@@ -307,6 +319,7 @@ fn diagnostics_of(outcome: &RunOutcome) -> Vec<Value> {
             "kind": "analysis_incomplete",
             "status": "incomplete",
             "reason": reason,
+            "source": "run_status",
             "kernel_index": kernel,
             "site": site.filter(|s| !s.is_none()).map(|s| s.0),
         })),
@@ -373,11 +386,21 @@ struct PerLaunchRecorder {
 }
 
 impl Observer for PerLaunchRecorder {
+    // Every callback is forwarded so the per-launch recorder keeps whatever
+    // `RecordingObserver` records (launch shapes included).
+    fn enabled(&self) -> bool {
+        self.current.enabled()
+    }
+    fn wants_word_history(&self) -> bool {
+        self.current.wants_word_history()
+    }
     fn begin_launch(&mut self, info: &LaunchInfo<'_>) {
         self.current = RecordingObserver::new();
         self.kernel = info.kernel_index;
+        self.current.begin_launch(info);
     }
-    fn end_launch(&mut self, _info: &LaunchInfo<'_>) {
+    fn end_launch(&mut self, info: &LaunchInfo<'_>) {
+        self.current.end_launch(info);
         let log = std::mem::take(&mut self.current);
         self.launches.push((self.kernel, log));
     }
@@ -427,6 +450,17 @@ pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result
                     }
                     if let Some(budget) = request.transition_budget {
                         sc.transition_budget = budget;
+                    }
+                    for (key, value) in &request.synccheck_limits {
+                        let v = *value;
+                        match key.as_str() {
+                            "max_schedules" => sc.limits.max_schedules = v,
+                            "max_events_per_run" => sc.limits.max_events_per_run = v,
+                            "max_total_events" => sc.limits.max_total_events = v,
+                            "max_wall_time_ms" => sc.limits.max_wall_time_ms = v,
+                            "max_diagnostic_bytes" => sc.limits.max_diagnostic_bytes = v,
+                            _ => {}
+                        }
                     }
                     reports.push(synccheck::check(log, &sc));
                 }
@@ -554,6 +588,7 @@ mod py {
 
     /// Accepted values: `("buffer", data, valid_mask_or_None)`, `("scalar", int)`,
     /// `("tensor_map", data)`, `("tensor_map_of", base_arg, byte_offset, image)`,
+    /// `("view", target_buffer_arg, byte_offset, byte_len)`,
     /// `("pointer", target, offset)`, a bytes-like /
     /// numpy array (buffer, all valid), or an int (scalar bits).
     fn arg_value(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<ArgValue> {
@@ -590,6 +625,11 @@ mod py {
                     Ok(ArgValue::TensorMapOf { base, offset, desc })
                 }
                 ("pointer", 3) => Ok(ArgValue::Pointer { target: t.get_item(1)?.extract()?, offset: t.get_item(2)?.extract()? }),
+                ("view", 4) => Ok(ArgValue::View {
+                    target: t.get_item(1)?.extract()?,
+                    offset: t.get_item(2)?.extract()?,
+                    len: t.get_item(3)?.extract()?,
+                }),
                 _ => Err(PyValueError::new_err(format!("{name}: unknown argument form {tag:?}/{}", t.len()))),
             };
         }
@@ -613,7 +653,7 @@ mod py {
     #[pyo3(signature = (module, inputs, *, mode="numsim", backend="interp", workers=1, seed=0,
                         loop_budget=None, quantum=None, max_rounds=None, opt_level=1,
                         validity=None, state_budget=None, transition_budget=None, max_findings=0,
-                        codegen_cache_dir=None, subset=None))]
+                        codegen_cache_dir=None, subset=None, synccheck_limits=None))]
     fn run<'py>(
         py: Python<'py>,
         module: &PyModuleHandle,
@@ -632,6 +672,7 @@ mod py {
         max_findings: usize,
         codegen_cache_dir: Option<std::path::PathBuf>,
         subset: Option<Vec<u32>>,
+        synccheck_limits: Option<BTreeMap<String, u64>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let mode = Mode::parse(mode).ok_or_else(|| PyValueError::new_err(format!("unknown mode {mode:?}")))?;
         let backend = BackendKind::parse(backend).ok_or_else(|| PyValueError::new_err(format!("unknown backend {backend:?}")))?;
@@ -652,6 +693,14 @@ mod py {
         request.codegen_cache_dir = codegen_cache_dir;
         request.config.seed = seed;
         request.config.subset = subset;
+        if let Some(limits) = synccheck_limits {
+            for key in limits.keys() {
+                if !["max_schedules", "max_events_per_run", "max_total_events", "max_wall_time_ms", "max_diagnostic_bytes"].contains(&key.as_str()) {
+                    return Err(PyValueError::new_err(format!("unknown synccheck limit {key:?}")));
+                }
+            }
+            request.synccheck_limits = limits;
+        }
         request.config.validity = validity_policy(validity, mode)
             .ok_or_else(|| PyValueError::new_err(format!("unknown validity policy {validity:?}")))?;
         if let Some(v) = loop_budget {

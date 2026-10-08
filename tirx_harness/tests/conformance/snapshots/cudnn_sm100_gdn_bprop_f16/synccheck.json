@@ -11,7 +11,7 @@
     {
      "anchors": [],
      "bytes": {
-      "shared#0": "68608-101376,150528-183296"
+      "shared": "68608-101376,150528-183296"
      },
      "category": "advisories",
      "kind": "uninitialized_read",
@@ -22,5 +22,5 @@
    "verdict": "review"
   }
  ],
- "schema": 1
+ "schema": 2
 }

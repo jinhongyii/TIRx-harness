@@ -10,7 +10,7 @@
       "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:720:1-720:39"
      ],
      "bytes": {
-      "shared#0": "180224-180228"
+      "shared": "180224-180228"
      },
      "category": "advisories",
      "kind": "alias_stale_read",
@@ -23,7 +23,7 @@
       "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:724:1-724:39"
      ],
      "bytes": {
-      "shared#0": "180228-180232"
+      "shared": "180228-180232"
      },
      "category": "advisories",
      "kind": "alias_stale_read",
@@ -34,5 +34,5 @@
    "verdict": "review"
   }
  ],
- "schema": 1
+ "schema": 2
 }
