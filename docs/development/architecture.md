@@ -141,6 +141,9 @@ on the observer; tests check both (numsim-redesign.md §2.3).
 
 ## Common changes
 
+Build and test with a private extension (`build_dev.sh --out`, never the shared
+`.so`) when others may be running; see [dev-loop.md](dev-loop.md) "NumSim v2".
+
 ### Add an instruction
 
 1. **Lower it.** Map the TIRx builtin or PTX form in `v2/lowering/`. A form
@@ -157,6 +160,9 @@ on the observer; tests check both (numsim-redesign.md §2.3).
 4. **Test it** with a hand-built `Program` (`testutil::ProgramBuilder`) in
    `numsim-core/tests/`, a lowering test under `tests/numsim/v2/`, and, when
    the hardware behavior is uncertain, a paired NumSim/GPU microtest.
+5. **Regenerate the support table.** `numsim-oplib/SUPPORTED_OPS.md` is
+   generated (`cargo run -p numsim-core --example supported_ops`); the
+   `supported_ops_md_is_current` test fails while it is stale.
 
 ### Add a checker rule
 
@@ -170,7 +176,9 @@ on the observer; tests check both (numsim-redesign.md §2.3).
 3. Add a scenario test built from contract events (`numsim-core/tests/
    racecheck_*.rs`, `synccheck_*.rs`). For a protocol change, update the
    reference state machine in `numsim-sync-ref` too; the differential test
-   compares the two.
+   compares the two. A Synccheck explorer reduction follows
+   `synccheck/README.md` "Adding a rule (reduction)" (switch, oracle,
+   scenario, bench row).
 4. Add a row to the matching behavior-delta file for every change a user can
    observe. A changed snapshot with no delta row is a regression.
 
@@ -212,7 +220,7 @@ Source text is the TVMScript statement as written (`shared[0] = warp + 1`).
 Legacy printed a normalized form, so tests that pinned legacy source text
 must use the v2 form.
 
-## Conformance snapshots and delta files
+## Conformance snapshots
 
 `tests/conformance/` replays every canonical corpus case in the three modes
 and compares a normalized projection with
@@ -226,11 +234,10 @@ Every intended behavior change is documented in one of three delta files:
 [NumSim numerics](numsim-behaviour-deltas.md),
 [synchronization](sync-behaviour-deltas.md), and
 [Racecheck](racecheck-behaviour-deltas.md). Each row states the legacy and the
-new behavior and the PTX ISA basis or ruling. While both engines were in the
-tree, a row that ruled legacy wrong for a corpus case stored the corrected
-oracle beside the legacy snapshot as `<mode>.delta.json`; `79f04eb` folded those
-17 files into the base snapshots (`scripts/numsim-v2/fold_snapshot_deltas.py`),
-so each snapshot is now the single oracle for its case and mode.
+new behavior and the PTX ISA basis or ruling. There are no per-case delta
+files: the 17 `<mode>.delta.json` files kept while both engines were in the
+tree were folded into the base snapshots in `79f04eb`, so each snapshot is the
+single oracle for its case and mode.
 
 Snapshot policy:
 
@@ -240,8 +247,6 @@ Snapshot policy:
   snapshot must cite the justifying delta row id in its message (CI:
   `scripts/numsim-v2/check_snapshot_deltas.py`). Never regenerate a snapshot
   just to make a failing case pass.
-- `--update-snapshots` never writes delta files; they are edited by hand with
-  their delta row.
 
 The per-case state of the migration is tracked in
 [v2 conformance status](v2-conformance-status.md).
