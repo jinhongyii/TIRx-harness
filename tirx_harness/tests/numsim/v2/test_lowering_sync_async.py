@@ -209,3 +209,23 @@ def k(out: T.Buffer((32,), "uint32")):
 ''')
     ptx = [i for i in all_of(program, "Ptx") if i.pred is not None]
     assert ptx and all(i.keep_dst for i in ptx)
+
+
+def test_ptx_call_sites_carry_their_source_text():
+    """Sweep 3: every site has text; a PTX call site shows its source statement."""
+    from tests.numsim.runtime.test_atomic_f32_noftz import atomic_kernel
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(atomic_kernel("atom", 1, "global"))
+    assert all(site.text for site in program.sites)
+    ptx_sites = [s for s in program.sites if s.op_name.startswith("tirx.ptx.")]
+    assert ptx_sites and all(s.text for s in ptx_sites)
+
+
+def test_site_text_reads_the_source_line_when_the_span_has_a_file():
+    from tests.analysis_tools.synccheck.test_reported_tool_regressions import packed_bf16_vector_reduction
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(packed_bf16_vector_reduction.func)
+    site = next(s for s in program.sites if s.op_name.startswith("tirx.ptx.") and s.spans)
+    assert "red.global.v2.bf16x2.add.noftz" in site.text

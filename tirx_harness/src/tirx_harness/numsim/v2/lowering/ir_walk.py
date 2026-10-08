@@ -125,10 +125,13 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         if buffer is None:
             buffer = _logical_buffer(node, self)
         root, view = self.logical_identity(buffer) if isinstance(buffer, int) else (buffer, None)
+        text = _source_text(spans) or op_name or (str(getattr(getattr(node, "op", None), "name", "")) or
+                                                  type_key(node))
+        if view and view != root:
+            text = f"{text} [view {view}]"
         return self.builder.site(
             pb.SiteInfo(kind=type_key(node), spans=spans, op_name=op_name or "",
-                        text=f"view {view}" if view and view != root else "",
-                        dtype=dtype_of(node) or None, buffer=root),
+                        text=text[:200], dtype=dtype_of(node) or None, buffer=root),
             key=key,
         )
 
@@ -823,6 +826,22 @@ def _mul(a: pb.DimExpr, b: pb.DimExpr) -> pb.DimExpr:
     if b.is_const and b.value == 1:
         return a
     return pb.DimExpr("Mul", args=(a, b))
+
+
+def _source_text(spans: tuple[pb.SourceSpan, ...]) -> str:
+    """The statement's source text (innermost span), as legacy's source map
+    showed it: the spanned lines, whitespace-collapsed; "" when unreadable."""
+    import linecache
+
+    for span in spans:
+        if not span.file or span.line <= 0:
+            continue
+        last = max(span.line, span.end_line)
+        lines = [linecache.getline(span.file, n) for n in range(span.line, min(last, span.line + 8) + 1)]
+        text = " ".join(" ".join(lines).split())
+        if text:
+            return text
+    return ""
 
 
 def _spans(span: Any) -> tuple[pb.SourceSpan, ...]:

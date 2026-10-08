@@ -2194,3 +2194,14 @@ needs a decision before more rows can be judged. New rows:
 - Minimal reproduction: `flash_mla_sparse_fwd` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "flash_mla_sparse_fwd-racecheck"`
 - Observed: expected diagnostics [{"diagnostics": [{"anchors": ["tirx_kernels/ported/flashmla/sparse_prefill_head64_phase1.py:1383:1-1383:42", "tirx_kernels/ported/flashmla/sparse_prefill_head64_phase1.py:714:1-714:39"], "bytes": {"shared": "229376-229380"}, "category": "advisories" / actual [{"verdict": "review", "diagnostics": [{"category": "advisories", "kind": "alias_stale_read", "status": "review", "space": "shared", "anchors": ["<unmapped op 164>", "tirx_kernels/ported/flashmla/sparse_prefill_head64_phase1.py:1383:1-1383:42", "tirx
 
+
+## W1 (2026-10-08): sweep 3, `SiteInfo.text` — done
+
+- Every site's `text` is now the statement's source text: the lines of its
+  innermost span with a readable file, whitespace-collapsed, at most 200
+  characters (legacy source_map). Without a readable span, it is the op name,
+  or the node kind for non-call statements.
+- A view whose name differs from its logical buffer appends
+  ` [view <name>]` (W9).
+- Corpus sweep: 217,222 sites, 0 with empty text. The `tma_atomicity` `T.ptx.cp`
+  sites carry their source line.
