@@ -139,3 +139,25 @@ fn q7_wait_group_read_publishes_only_the_source_read() {
     assert!(races(&src).is_empty(), "source reuse after .read is ordered: {src:?}");
     assert!(!races(&run(false)).is_empty(), ".read does not publish the destination");
 }
+
+/// C3/Q11 engine shape: the engine's cluster gather must emit exactly one
+/// `Arrive` for the warp, naming every gathered lane (the shape
+/// `c3_gathered_cluster_arrive_releases_every_lane` assumes).
+#[test]
+fn engine_cluster_gather_emits_one_arrive_naming_every_lane() {
+    use numsim_core::observe::{RecordingObserver, SyncKind};
+    use numsim_core::sched::{self, RunStatus};
+    use numsim_core::testutil::scenarios;
+    let s = scenarios::cluster_partial_arrive(false);
+    let mut rec = RecordingObserver::default();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut rec, &s.config).expect("run starts");
+    assert_eq!(o.status, RunStatus::Completed, "{:?}", o.status);
+    let arrives: Vec<_> = rec
+        .per_warp
+        .iter()
+        .flatten()
+        .filter(|e| matches!(e.kind, SyncKind::Arrive { obj: ResourceId::Cluster { .. }, .. }))
+        .collect();
+    assert_eq!(arrives.len(), 1, "{arrives:?}");
+    assert_eq!(arrives[0].lanes.0, u32::MAX, "{arrives:?}");
+}
