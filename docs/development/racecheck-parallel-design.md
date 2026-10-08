@@ -201,6 +201,40 @@ During:
   2x of NumSim's engine scaling;
 - the criterion guards in `benches/racecheck.rs` unchanged.
 
+### 10.1 Gating measurements (taken; counters on a private build, reverted)
+
+Counting observer (word history on, as for racecheck) over the recorded
+streams; partitions counted in `Scheduler::parallel_phase`.
+
+| case | workers | rounds | partitions / round | accesses | global accesses | strong global (atomic or non-weak) | acquire-capable global | warp HB handles (total; per round mean / max) | async ops with global accesses per round (mean / max) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| mega_moe e24 (t8_h1024_i512_e24_k2_g1) | 16 | 174 | 74 (all rounds) | 152,933 | 10,933 (7.1%) | 4,329 (39.6% of global) | 4,049 (37.0%) | 4,369; 25.1 / 424 | 27.5 / 420 |
+| mega_moe medium (t64_h2048_i1536_e96_k4_g1) | 16 | 2,391 | 74 (all rounds) | 3,038,486 | 236,208 (7.8%) | 35,529 (15.0%) | 31,593 (13.4%) | 48,988; 20.5 / 1,266 | 70.7 / 487 |
+| fp16_bf16_gemm | 16 | 38 | 8 | 3,240 | 96 | 0 | 0 | 0 | 2.5 / 15 |
+| gdn_decode_bf16_wide_vec_mtp | 1 | 10 | 128 | 56,576 | 18,432 | 0 | 0 | 1,024; 102.4 / 512 | 0 |
+
+Reading against the 2.7 s target (e24):
+1. **Partitions.** e24 and medium already run as 74 partitions every round
+   under the partitioned-words scheduler (one per 2-CTA cluster). The §6 risk
+   does not materialise for them, and checker work is divisible across
+   partitions.
+2. **Serial share.** Global accesses are 7–8% of accesses. The strong ones
+   that need the serial global-sync step number 4.3K on e24 (35K on medium).
+   That is about 0.1 s of acquire joins at today's ~20 µs per join.
+   Everything else (shared/TMEM accesses, mbarrier and tcgen sync, which
+   carry the clock joins that cost about 12 s) is partition-local.
+3. **Handles.** HB handles are cheap: 4.4K warp-knowledge versions over the
+   whole e24 run (at most 424 in a round), plus at most 420 async ops per
+   round. Each handle is a few Arc clones.
+4. **Projection.** Checker about 17 s split across min(16 workers, 74
+   partitions), so ≈ 1.1 s, plus the serial global step and merge
+   (≈ 0.1–0.5 s), plus the engine and replay (≈ 0.5–1 s) ≈ **1.7–2.6 s**.
+
+**Verdict: go**, with the 2.7 s cap within reach but with little margin; load
+imbalance across partitions is the unmeasured term. The first prototype
+milestone should be the partition-parallel `sync()`/`access()` pass alone
+(serial global pass), measured on e24 before the stripe shards are built.
+
 ## 11. Effort estimate
 
 | Part | Estimate |
