@@ -249,7 +249,7 @@ pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Op
                         a.valid.set_range(offs[l], n, true);
                     }
                 }
-                if ctx.aux.wants_history && !ctx.aux.words.is_empty() {
+                if !ctx.aux.words.is_empty() {
                     for l in active.lanes() {
                         let span = crate::arena::ByteSpan::new(offs[l], n);
                         ctx.aux.words.log_lane(alloc, span, &lane(l)[..n as usize]);
@@ -633,7 +633,7 @@ pub fn st_bulk(ctx: &mut ExecCtx<'_>, a: Operand, space: AddrSpace, size: Operan
         if let Err(e) = ctx.arena.fill(view, &[loc.span(n)], 0) {
             return Err(support::arena_err(ctx, e, WarpMask::lane(l)));
         }
-        if ctx.aux.wants_history {
+        if !ctx.aux.words.is_empty() {
             ctx.aux.words.log_from_arena(ctx.arena, loc.alloc, loc.span(n));
         }
         if ctx.observing {
@@ -665,7 +665,7 @@ pub fn discard(ctx: &mut ExecCtx<'_>, a: Operand, space: AddrSpace, size: u32) -
         if let Err(e) = ctx.arena.invalidate(view, &[loc.span(size as u64)]) {
             return Err(support::arena_err(ctx, e, WarpMask::lane(l)));
         }
-        if ctx.aux.wants_history {
+        if !ctx.aux.words.is_empty() {
             ctx.aux.words.log_from_arena(ctx.arena, loc.alloc, loc.span(size as u64));
         }
         if ctx.observing {

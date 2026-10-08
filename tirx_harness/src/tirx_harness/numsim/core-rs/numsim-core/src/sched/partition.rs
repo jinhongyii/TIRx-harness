@@ -632,7 +632,10 @@ impl Partition {
                 rmw = true;
             }
             Payload::TcgenMma(p) => {
-                let (r, w, u) = run_mma(arena, p, tc_arch(env.program.arch.as_deref()), meta.as_ref().and_then(|m| m.lut_b))
+                // Read spans feed only access events and the ZeroAndReport
+                // uninit reports.
+                let track_reads = env.observing || arena.policy() == crate::arena::ValidityPolicy::ZeroAndReport;
+                let (r, w, u) = run_mma(arena, p, tc_arch(env.program.arch.as_deref()), meta.as_ref().and_then(|m| m.lut_b), track_reads)
                     .map_err(|e| sched_error(ExecErrorKind::Op(e.kind), kernel, op.source.warp, op.source.site, e.message))?;
                 reads.extend(r);
                 read_time_uninit = u;
@@ -690,6 +693,34 @@ impl Partition {
             for &(a, s) in &read_time_uninit {
                 self.report_read_time_uninit(env, arena, op.id, op.source.site, lane, a, s);
             }
+        }
+        // Declared-word writes are counted (and, under a history observer,
+        // logged with images) in every mode, in the order the write accesses
+        // are reported below (W13-1).
+        if !self.aux.words.is_empty() {
+            let window = |arena: &Arena, a: AllocId| match arena.get(a).space {
+                Space::Global => Some(Window::Global),
+                Space::Shared => Some(Window::SharedCta),
+                _ => None,
+            };
+            let elem = match &op.payload {
+                Payload::Reduce { dtype, .. } | Payload::ReduceData { dtype, .. } => Some(dtype.mem_bytes() as u64),
+                _ => None,
+            };
+            let mut items: Vec<(AllocId, Option<Window>, LaneSpan)> = match elem {
+                Some(eb) => writes
+                    .iter()
+                    .flat_map(|&(a, s)| {
+                        let w = window(arena, a);
+                        (0..s.len / eb.max(1)).map(move |k| (a, w, LaneSpan { lane, span: ByteSpan::new(s.start + k * eb, eb) }))
+                    })
+                    .collect(),
+                None => writes.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect(),
+            };
+            support::log_async_writes(&mut self.aux, arena, &mut items);
+            let mut items: Vec<(AllocId, Option<Window>, LaneSpan)> =
+                frag_writes.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
+            support::log_async_writes(&mut self.aux, arena, &mut items);
         }
         if env.observing {
             let site = op.source.site;
@@ -874,29 +905,136 @@ impl Partition {
 
 /// `spans` minus every byte of `minus` (per allocation).
 fn subtract_spans(spans: &[(AllocId, ByteSpan)], minus: &[(AllocId, ByteSpan)]) -> Vec<(AllocId, ByteSpan)> {
-    let mut out = Vec::new();
-    for &(a, s) in spans {
-        let mut pieces = vec![s];
-        for &(ma, m) in minus.iter().filter(|(ma, _)| *ma == a) {
-            let _ = ma;
-            let mut next = Vec::new();
-            for p in pieces {
-                if !p.overlaps(m) {
-                    next.push(p);
-                    continue;
-                }
-                if p.start < m.start {
-                    next.push(ByteSpan::new(p.start, m.start - p.start));
-                }
-                if m.end() < p.end() {
-                    next.push(ByteSpan::new(m.end(), p.end() - m.end()));
-                }
+    // W13: each span minus the `minus` spans of its allocation, as
+    // ascending pieces, in input order, without re-splitting every span
+    // against every `minus` span (quadratic; 62% of an observed Mega MoE
+    // run). Per allocation: the union of the non-empty `minus` spans
+    // (sorted, overlapping/touching merged), the raw non-empty spans, and
+    // the empty ones, which only cut a piece they fall strictly inside
+    // (`ByteSpan::overlaps` of the previous piecewise loop).
+    struct Minus {
+        alloc: AllocId,
+        union: Vec<ByteSpan>,
+        raw: Vec<ByteSpan>,
+        cuts: Vec<u64>,
+    }
+    let mut per: Vec<Minus> = Vec::new();
+    {
+        let mut m: Vec<(AllocId, ByteSpan)> = minus.to_vec();
+        m.sort_unstable();
+        for (a, s) in m {
+            if per.last().is_none_or(|x| x.alloc != a) {
+                per.push(Minus { alloc: a, union: Vec::new(), raw: Vec::new(), cuts: Vec::new() });
             }
-            pieces = next;
+            let x = per.last_mut().expect("entry");
+            if s.len == 0 {
+                x.cuts.push(s.start);
+                continue;
+            }
+            x.raw.push(s);
+            match x.union.last_mut() {
+                Some(l) if s.start <= l.end() => {
+                    let end = l.end().max(s.end());
+                    l.len = end - l.start;
+                }
+                _ => x.union.push(s),
+            }
         }
-        out.extend(pieces.into_iter().map(|p| (a, p)));
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    for &(a, s) in spans {
+        let Ok(k) = per.binary_search_by_key(&a, |x| x.alloc) else {
+            out.push((a, s));
+            continue;
+        };
+        let m = &per[k];
+        if s.len == 0 {
+            // An empty span goes when a non-empty one strictly contains it.
+            if !m.raw.iter().any(|r| s.overlaps(*r)) {
+                out.push((a, s));
+            }
+            continue;
+        }
+        let emit = |lo: u64, hi: u64, out: &mut Vec<(AllocId, ByteSpan)>| {
+            // Cuts strictly inside [lo, hi) split the piece.
+            let mut at = lo;
+            let mut c = m.cuts.partition_point(|&x| x <= lo);
+            while c < m.cuts.len() && m.cuts[c] < hi {
+                if m.cuts[c] > at {
+                    out.push((a, ByteSpan::new(at, m.cuts[c] - at)));
+                    at = m.cuts[c];
+                }
+                c += 1;
+            }
+            out.push((a, ByteSpan::new(at, hi - at)));
+        };
+        let mut k = m.union.partition_point(|u| u.end() <= s.start);
+        let mut at = s.start;
+        while k < m.union.len() && m.union[k].start < s.end() {
+            if m.union[k].start > at {
+                emit(at, m.union[k].start, &mut out);
+            }
+            at = at.max(m.union[k].end());
+            k += 1;
+        }
+        if at < s.end() {
+            emit(at, s.end(), &mut out);
+        }
     }
     out
+}
+
+#[cfg(test)]
+mod subtract_tests {
+    use super::*;
+
+    /// The previous (quadratic) implementation: the reference.
+    fn subtract_spans_reference(spans: &[(AllocId, ByteSpan)], minus: &[(AllocId, ByteSpan)]) -> Vec<(AllocId, ByteSpan)> {
+        let mut out = Vec::new();
+        for &(a, s) in spans {
+            let mut pieces = vec![s];
+            for &(_, m) in minus.iter().filter(|(ma, _)| *ma == a) {
+                let mut next = Vec::new();
+                for p in pieces {
+                    if !p.overlaps(m) {
+                        next.push(p);
+                        continue;
+                    }
+                    if p.start < m.start {
+                        next.push(ByteSpan::new(p.start, m.start - p.start));
+                    }
+                    if m.end() < p.end() {
+                        next.push(ByteSpan::new(m.end(), p.end() - m.end()));
+                    }
+                }
+                pieces = next;
+            }
+            out.extend(pieces.into_iter().map(|p| (a, p)));
+        }
+        out
+    }
+
+    #[test]
+    fn matches_reference() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for case in 0..3000 {
+            let width = 8 + rnd(300);
+            let maxlen = 1 + rnd(if case % 2 == 0 { 8 } else { 80 });
+            let gen = |rnd: &mut dyn FnMut(u64) -> u64| -> Vec<(AllocId, ByteSpan)> {
+                let n = rnd(40);
+                (0..n).map(|_| (AllocId(rnd(3) as u32), ByteSpan::new(rnd(width), rnd(maxlen + 1)))).collect()
+            };
+            let spans = gen(&mut rnd);
+            let minus = gen(&mut rnd);
+            assert_eq!(subtract_spans(&spans, &minus), subtract_spans_reference(&spans, &minus), "case {case}: {spans:?} - {minus:?}");
+        }
+    }
 }
 
 /// `.per_16bytes` copy report (W2-8): in each 16-byte chunk of the source
@@ -1115,7 +1253,13 @@ fn split_tmem_reads(reads: &[(AllocId, ByteSpan)], bases: &[(u8, u32, u32)]) -> 
     out
 }
 
-fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch: crate::oplib::TcArch, lut_b: Option<u32>) -> crate::oplib::OpResult<(Spans, Spans, Spans)> {
+fn run_mma(
+    arena: &mut Arena,
+    p: &crate::sync::completion::TcgenMmaPayload,
+    arch: crate::oplib::TcArch,
+    lut_b: Option<u32>,
+    track_reads: bool,
+) -> crate::oplib::OpResult<(Spans, Spans, Spans)> {
     use crate::oplib::OpError;
     use std::cell::RefCell;
     let cell = RefCell::new(arena);
@@ -1124,8 +1268,9 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
     let mut writes: Spans = Vec::new();
     let options = crate::oplib::TcMmaOptions { arch, ti16: p.args.kind == crate::program::TcMmaKind::Ti16, lut_b, ..Default::default() };
     // oplib reads/writes one small piece at a time: record them merged with
-    // the previous piece when contiguous (most are), and read/write private
-    // (non-overlaid) allocations directly when every byte is valid.
+    // the previous piece when contiguous (most are; only when a consumer
+    // needs the read spans), and read/write private (non-overlaid)
+    // allocations directly when every byte is valid.
     fn note(v: &mut Spans, al: AllocId, span: ByteSpan) {
         if let Some((la, ls)) = v.last_mut() {
             if *la == al && ls.end() == span.start {
@@ -1154,7 +1299,9 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
         if !fast_read(&ar, al, span, out) {
             ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
         }
-        note(&mut reads.borrow_mut(), al, span);
+        if track_reads {
+            note(&mut reads.borrow_mut(), al, span);
+        }
         Ok(())
     };
     // A buffer may span several consecutive cells of one lane (W4-16);
@@ -1176,7 +1323,9 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
             }
             ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
         }
-        note(&mut reads.borrow_mut(), al, span);
+        if track_reads {
+            note(&mut reads.borrow_mut(), al, span);
+        }
         Ok(())
     };
     let mut tmem_write = |cta: u32, lane: u32, col: u32, data: &[u8]| -> crate::oplib::OpResult {
@@ -1194,7 +1343,7 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
         note(&mut writes, al, span);
         Ok(())
     };
-    crate::oplib::tc_mma_ctas(p, &options, &smem, &tmem_read, &mut tmem_write)?;
+    crate::oplib::tc_mma_ctas(p, &options, &smem, &tmem_read, &mut tmem_write, None)?;
     let mut r = reads.into_inner();
     coalesce(&mut r);
     coalesce(&mut writes);

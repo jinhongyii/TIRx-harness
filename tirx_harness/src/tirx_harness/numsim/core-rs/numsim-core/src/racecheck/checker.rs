@@ -395,6 +395,94 @@ struct AsyncActor {
     drained: bool,
 }
 
+/// Async slots by global slot index (actor `num_warps + index`). A checker
+/// partition holds only its own pools' slots (`None`: held elsewhere).
+struct Slots(Vec<Option<Box<AsyncActor>>>);
+
+impl std::ops::Index<usize> for Slots {
+    type Output = AsyncActor;
+    #[inline(always)]
+    fn index(&self, i: usize) -> &AsyncActor {
+        self.0[i].as_deref().expect("async slot held by another checker partition")
+    }
+}
+
+impl std::ops::IndexMut<usize> for Slots {
+    #[inline(always)]
+    fn index_mut(&mut self, i: usize) -> &mut AsyncActor {
+        self.0[i].as_deref_mut().expect("async slot held by another checker partition")
+    }
+}
+
+impl Slots {
+    fn get(&self, i: usize) -> Option<&AsyncActor> {
+        self.0.get(i).and_then(|a| a.as_deref())
+    }
+    fn iter(&self) -> impl Iterator<Item = &AsyncActor> {
+        self.0.iter().filter_map(|a| a.as_deref())
+    }
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut AsyncActor> {
+        self.0.iter_mut().filter_map(|a| a.as_deref_mut())
+    }
+    fn iter_indexed(&self) -> impl Iterator<Item = (usize, &AsyncActor)> {
+        self.0.iter().enumerate().filter_map(|(i, a)| a.as_deref().map(|a| (i, a)))
+    }
+}
+
+/// One partition key's async slots: its free list, every slot it owns,
+/// and its live ops.
+#[derive(Default)]
+struct Pool {
+    free: Vec<usize>,
+    slots: Vec<usize>,
+    index: HashMap<AsyncId, usize>,
+}
+
+/// Pool of an op: the engine's partition-scoped id range
+/// (`(first cluster + 1) << 40`, D2/D3); per-lane sub-ops (observer) keep
+/// their parent's range in the low 56 bits.
+fn pool_key(op: AsyncId) -> u32 {
+    ((op.0 & ((1 << 56) - 1)) >> 40) as u32
+}
+
+/// Warps by global id. A checker partition holds only its own warps
+/// (`None`: the warp's state is held by another partition).
+struct Warps(Vec<Option<Box<Warp>>>);
+
+impl std::ops::Index<usize> for Warps {
+    type Output = Warp;
+    #[inline(always)]
+    fn index(&self, i: usize) -> &Warp {
+        self.0[i].as_deref().expect("warp held by another checker partition")
+    }
+}
+
+impl std::ops::IndexMut<usize> for Warps {
+    #[inline(always)]
+    fn index_mut(&mut self, i: usize) -> &mut Warp {
+        self.0[i].as_deref_mut().expect("warp held by another checker partition")
+    }
+}
+
+impl Warps {
+    fn get(&self, i: usize) -> Option<&Warp> {
+        self.0.get(i).and_then(|w| w.as_deref())
+    }
+    fn get_mut(&mut self, i: usize) -> Option<&mut Warp> {
+        self.0.get_mut(i).and_then(|w| w.as_deref_mut())
+    }
+    /// Number of warp ids (held or not).
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn iter(&self) -> impl Iterator<Item = &Warp> {
+        self.0.iter().filter_map(|w| w.as_deref())
+    }
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Warp> {
+        self.0.iter_mut().filter_map(|w| w.as_deref_mut())
+    }
+}
+
 struct Alloc {
     size: u64,
     space: Space,
@@ -414,6 +502,9 @@ struct Alloc {
     retired: std::collections::BTreeMap<(u64, ActorId, u8, bool, u8), RetiredGeneric>,
     /// Widest retired hull, in pages (bounds the backward page scan).
     retired_span_pages: u64,
+    /// Wide-span side table of this allocation's witnesses (per allocation,
+    /// so an allocation's state can move between checker partitions).
+    wide: WideSpans,
 }
 
 #[derive(Clone, Debug)]
@@ -566,10 +657,12 @@ enum Cur {
 pub struct Checker {
     topo: Topology,
     pub memo: JoinMemo,
-    warps: Vec<Warp>,
-    asyncs: Vec<AsyncActor>,
-    free_slots: Vec<usize>,
-    async_index: HashMap<AsyncId, usize>,
+    warps: Warps,
+    asyncs: Slots,
+    /// Async slot pools, one per partition key (`pool_key`): the free
+    /// slots and the live ops of the ops a partition issues, so a checker
+    /// partition can own them (D3: keyed by the partition's first cluster).
+    pools: HashMap<u32, Pool>,
     allocs: HashMap<AllocId, Alloc>,
     /// Per sync object, its most recent phases (older ones can no longer be
     /// waited on: mbarrier parity / barrier generations).
@@ -601,7 +694,9 @@ pub struct Checker {
     pub site_buffer_space: HashMap<SiteId, Space>,
     /// Sites of `wait_until` polls (lowering's `tirx.cuda.wait_until`).
     pub poll_sites: HashSet<SiteId>,
-    wide: WideSpans,
+    /// Wide spans of allocations already ended (statistics).
+    wide_retired: u64,
+    empty_wide: WideSpans,
     report: Report,
     dedup: HashMap<(AllocId, RaceClass, SiteId, SiteId, bool), usize>,
     /// Run the collectors every this many events (0 = never).
@@ -686,10 +781,9 @@ impl Checker {
         Checker {
             topo,
             memo: JoinMemo::default(),
-            warps: (0..n).map(Warp::new).collect(),
-            asyncs: Vec::new(),
-            free_slots: Vec::new(),
-            async_index: HashMap::new(),
+            warps: Warps((0..n).map(|i| Some(Box::new(Warp::new(i)))).collect()),
+            asyncs: Slots(Vec::new()),
+            pools: HashMap::new(),
             allocs: HashMap::new(),
             phases: HashMap::new(),
             incomplete_index: HashMap::new(),
@@ -705,7 +799,8 @@ impl Checker {
             poll_sites: HashSet::new(),
             site_buffer_space: HashMap::new(),
             operand_buffer: HashMap::new(),
-            wide: WideSpans::default(),
+            wide_retired: 0,
+            empty_wide: WideSpans::default(),
             report: Report::default(),
             dedup: HashMap::new(),
             gc_every: 1 << 14,
@@ -750,7 +845,11 @@ impl Checker {
     }
 
     pub fn wide_span_count(&self) -> u64 {
-        self.wide.spans.len() as u64
+        self.wide_retired + self.allocs.values().map(|a| a.wide.spans.len() as u64).sum::<u64>()
+    }
+
+    fn wide_of(&self, alloc: AllocId) -> &WideSpans {
+        self.allocs.get(&alloc).map_or(&self.empty_wide, |a| &a.wide)
     }
 
     /// Findings so far (the run is not finalised).
@@ -786,7 +885,7 @@ impl Checker {
 
     pub fn finish(mut self) -> Report {
         self.finalize();
-        self.stats.wide_spans = self.wide.spans.len() as u64;
+        self.stats.wide_spans = self.wide_span_count();
         self.report
     }
 
@@ -817,8 +916,12 @@ impl Checker {
         true
     }
 
+    fn op_slot(&self, op: AsyncId) -> Option<usize> {
+        self.pools.get(&pool_key(op)).and_then(|p| p.index.get(&op).copied())
+    }
+
     fn async_idx(&mut self, op: AsyncId) -> Option<usize> {
-        let r = self.async_index.get(&op).copied();
+        let r = self.op_slot(op);
         if r.is_none() {
             self.note_incomplete(Incomplete::UnknownAsyncOp { op });
         }
@@ -878,7 +981,10 @@ impl Checker {
     #[inline(always)]
     fn slot_of(&self, actor: ActorId) -> Option<&AsyncActor> {
         let nw = self.topo.num_warps();
-        (actor >= nw).then(|| &self.asyncs[(actor - nw) as usize])
+        if actor < nw {
+            return None;
+        }
+        self.asyncs.get((actor - nw) as usize)
     }
 
     /// Performing warp (issuing warp for async actors), for scope tests.
@@ -953,11 +1059,11 @@ impl Checker {
         }
     }
 
-    fn morally_strong(&self, p: &Witness, c: &Witness) -> bool {
+    fn morally_strong(&self, p: &Witness, c: &Witness, wide: &WideSpans) -> bool {
         match (p.scope(), c.scope()) {
             (Some(ps), Some(cs)) => {
                 let (pw, cw) = (self.warp_of(p), self.warp_of(c));
-                p.proxy() == c.proxy() && p.same_span(c, &self.wide) && self.covers(ps, pw, cw) && self.covers(cs, cw, pw)
+                p.proxy() == c.proxy() && p.same_span(c, wide) && self.covers(ps, pw, cw) && self.covers(cs, cw, pw)
             }
             _ => false,
         }
@@ -1008,7 +1114,7 @@ impl Checker {
             })
     }
 
-    fn info(&self, w: &Witness) -> WitnessInfo {
+    fn info(&self, w: &Witness, wide: &WideSpans) -> WitnessInfo {
         // An async op's stamp epoch is `gen_base + milestone`, and `gen_base`
         // depends on slot reuse (GC timing, slot numbering): report the
         // milestone (1 read side, 2 write side), which the event stream
@@ -1017,7 +1123,7 @@ impl Checker {
             Some(a) => (a.lane, Some(a.op), w.stamp.epoch() - a.gen_base),
             None => (w.lane(), None, w.stamp.epoch()),
         };
-        let (s, e) = w.span(&self.wide);
+        let (s, e) = w.span(wide);
         WitnessInfo {
             warp: self.warp_of(w),
             lane,
@@ -1047,8 +1153,8 @@ impl Checker {
             severity: Severity::Review,
             alloc,
             bytes,
-            prior: Some(self.info(prior)),
-            current: Some(self.info(cw)),
+            prior: Some(self.info(prior, self.wide_of(alloc))),
+            current: Some(self.info(cw, self.wide_of(alloc))),
             occurrences: 1,
             tmem: None,
             spans: Vec::new(),
@@ -1103,7 +1209,7 @@ impl Checker {
                     self.bump(i, &o);
                     continue;
                 }
-                let mut prior = self.info(&seg.w);
+                let mut prior = self.info(&seg.w, self.wide_of(alloc));
                 prior.site = seg.site;
                 let f = Finding {
                     kind: FindingKind::Advisory { kind: AdvisoryKind::AliasStaleRead },
@@ -1111,7 +1217,7 @@ impl Checker {
                     alloc,
                     bytes: o,
                     prior: Some(prior),
-                    current: Some(self.info(cw)),
+                    current: Some(self.info(cw, self.wide_of(alloc))),
                     occurrences: 1,
                     tmem: None,
                     spans: Vec::new(),
@@ -1185,8 +1291,8 @@ impl Checker {
             severity: if review { Severity::Review } else { Severity::Error },
             alloc,
             bytes,
-            prior: Some(prior_info.unwrap_or_else(|| self.info(prior))),
-            current: Some(self.info(cw)),
+            prior: Some(prior_info.unwrap_or_else(|| self.info(prior, self.wide_of(alloc)))),
+            current: Some(self.info(cw, self.wide_of(alloc))),
             occurrences: 1,
             tmem: None,
             spans: Vec::new(),
@@ -1253,8 +1359,8 @@ impl Checker {
         };
         if a.range.end > size || a.range.start > a.range.end {
             let current = matches!(cur, Cur::Lane { .. }).then(|| {
-                let w = Witness::pack(stamp, lane, a.proxy, domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.wide);
-                self.info(&w)
+                let w = Witness::pack(stamp, lane, a.proxy, domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.allocs.get_mut(&a.alloc).unwrap().wide);
+                self.info(&w, self.wide_of(a.alloc))
             });
             let f = Finding {
                 kind: FindingKind::OutOfBounds { size },
@@ -1311,7 +1417,7 @@ impl Checker {
                 Cur::Lane { .. } => self.lane_g2t = Some(v),
             }
         }
-        let w = Witness::pack(stamp, lane, a.proxy, domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.wide);
+        let w = Witness::pack(stamp, lane, a.proxy, domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.allocs.get_mut(&a.alloc).unwrap().wide);
         let writes = w.writes();
         let strong = a.scope.is_some();
 
@@ -1376,9 +1482,10 @@ impl Checker {
         let mut word_rels: Vec<(usize, Option<Heads>, bool)> = Vec::new();
 
         let mut shadow = std::mem::take(&mut self.allocs.get_mut(&a.alloc).unwrap().shadow);
+        let wide_tbl = std::mem::take(&mut self.allocs.get_mut(&a.alloc).unwrap().wide);
         {
             let this = &*self;
-            let wide = &self.wide;
+            let wide = &wide_tbl;
             // `ordered` of each prior this segment's check computed, reused
             // by the record step's eviction (it asks the same question).
             let mut judged: Vec<(Witness, bool)> = Vec::new();
@@ -1396,7 +1503,7 @@ impl Checker {
                     }
                     let ordered = this.ordered(cur, p, a.proxy);
                     judged.push((*p, ordered));
-                    let ms = this.morally_strong(p, &w);
+                    let ms = this.morally_strong(p, &w, wide);
                     if !ordered && !ms {
                         races.push((overlap(p.span(wide), &seg), *p));
                     } else if ordered && this.cross_cta_async(p, cur, a.proxy) {
@@ -1429,7 +1536,7 @@ impl Checker {
                     .iter()
                     .rev()
                     .find(|e| !(e.w.stamp == w.stamp && e.w.lane() != w.lane()))
-                    .filter(|e| this.morally_strong(&e.w, &w));
+                    .filter(|e| this.morally_strong(&e.w, &w, wide));
                 let inherited = prev.and_then(|e| effective_heads(&cell.writes, e));
                 // 2. read-from (strong reads and atomics). A pure read of a
                 // declared word is a `wait_until` poll: its edge comes only
@@ -1483,7 +1590,11 @@ impl Checker {
                 }
             });
         }
-        self.allocs.get_mut(&a.alloc).unwrap().shadow = shadow;
+        {
+            let al = self.allocs.get_mut(&a.alloc).unwrap();
+            al.shadow = shadow;
+            al.wide = wide_tbl;
+        }
         for (bytes, prior) in races {
             self.report_race(a.alloc, bytes, cur, &prior, &w);
         }
@@ -1652,6 +1763,7 @@ impl Checker {
                         seen: proxy_bit(Proxy::Generic),
                         retired: Default::default(),
                         retired_span_pages: 0,
+                        wide: WideSpans::default(),
                     });
             }
             SyncEvent::AllocEnd { alloc } => {
@@ -1699,7 +1811,9 @@ impl Checker {
             names: None,                    };
                     self.push_finding(f);
                 }
-                self.allocs.remove(&alloc);
+                if let Some(al) = self.allocs.remove(&alloc) {
+                    self.wide_retired += al.wide.spans.len() as u64;
+                }
                 self.words.remove(&alloc);
             }
             SyncEvent::DeclareWord { alloc, range } => {
@@ -2023,7 +2137,7 @@ impl Checker {
         }
         let mut pred_idx = Vec::new();
         for p in preds {
-            let Some(pi) = self.async_index.get(&p).copied() else {
+            let Some(pi) = self.op_slot(p) else {
                 // Not live: completed and reclaimed (no witness left), or
                 // unknown. Either way adding no ordering is conservative.
                 continue;
@@ -2052,7 +2166,7 @@ impl Checker {
             // whose arrival is not yet delivered, is omitted), so every
             // earlier pipelined op of the thread the checker still holds
             // is tracked here too (deltas T15).
-            for (si, sa) in self.asyncs.iter().enumerate() {
+            for (si, sa) in self.asyncs.iter_indexed() {
                 if sa.in_use
                     && sa.kind == AsyncKind::TcgenPipelined
                     && sa.warp == warp
@@ -2065,12 +2179,14 @@ impl Checker {
         }
         let lane = lanes.lanes8().next().unwrap_or(0);
         let nw = self.topo.num_warps();
-        let idx = match self.free_slots.pop() {
+        let key = pool_key(op);
+        let idx = match self.pools.get_mut(&key).and_then(|p| p.free.pop()) {
             Some(i) => i,
             None => {
-                self.asyncs.push(AsyncActor {
+                let i = self.asyncs.0.len();
+                self.asyncs.0.push(Some(Box::new(AsyncActor {
                     op,
-                    actor: nw + self.asyncs.len() as u32,
+                    actor: nw + i as u32,
                     gen_base: 0,
                     in_use: false,
                     warp,
@@ -2085,9 +2201,10 @@ impl Checker {
                     footprint: Vec::new(),
                     done: 0,
                     drained: false,
-                });
+                })));
+                self.pools.entry(key).or_default().slots.push(i);
                 self.stats.async_slots += 1;
-                self.asyncs.len() - 1
+                i
             }
         };
         let slot = &mut self.asyncs[idx];
@@ -2125,7 +2242,7 @@ impl Checker {
                 self.warps[warp as usize].tcgen_issued[c as usize].raise(actor, gen_base + 2);
             }
         }
-        self.async_index.insert(op, idx);
+        self.pools.entry(key).or_default().index.insert(op, idx);
     }
 
     /// The tcgen05 ops a commit's completion covers: its tracked ops and,
@@ -2563,8 +2680,8 @@ impl Checker {
                 !cell.is_empty()
             });
             for w in folded {
-                let info = self.info(&w);
-                let (lo, hi) = w.span(&self.wide);
+                let info = self.info(&w, &alloc.wide);
+                let (lo, hi) = w.span(&alloc.wide);
                 let page = lo >> 12;
                 alloc.retired_span_pages = alloc.retired_span_pages.max((hi.saturating_sub(1) >> 12) - page);
                 let key = (page, w.stamp.actor(), w.lane(), w.writes(), domain_code(w.domain()));
@@ -2579,7 +2696,7 @@ impl Checker {
                     alloc.retired_span_pages = alloc.retired_span_pages.max((e.hi.saturating_sub(1) >> 12) - page);
                 }
                 let kind = if e.w.writes() { AccessKind::Write } else { AccessKind::Read };
-                e.w = Witness::pack(e.w.stamp, e.w.lane(), Proxy::Generic, e.w.domain(), kind, None, false, (e.lo, e.hi), &mut self.wide);
+                e.w = Witness::pack(e.w.stamp, e.w.lane(), Proxy::Generic, e.w.domain(), kind, None, false, (e.lo, e.hi), &mut alloc.wide);
                 e.info.span = e.lo..e.hi;
             }
         }
@@ -2611,11 +2728,14 @@ impl Checker {
             }
         }
         // Async-slot reclaim: completed ops with no witness left.
-        for i in 0..self.asyncs.len() {
+        let held: Vec<usize> = self.asyncs.iter_indexed().map(|(i, _)| i).collect();
+        for i in held {
             let a = &self.asyncs[i];
             if a.in_use && a.done >= 2 && !live_actors.contains(&a.actor) {
                 let op = a.op;
-                self.async_index.remove(&op);
+                let pool = self.pools.get_mut(&pool_key(op)).expect("op's pool");
+                pool.index.remove(&op);
+                pool.free.push(i);
                 let a = &mut self.asyncs[i];
                 a.in_use = false;
                 a.gen_base += 2; // next generation starts above every old epoch
@@ -2624,12 +2744,11 @@ impl Checker {
                 a.completed_ctas.clear();
                 a.preds.clear();
                 a.footprint.clear();
-                self.free_slots.push(i);
                 self.stats.async_slots_reclaimed += 1;
             }
         }
         // Site tables: keep only epochs a witness may still name.
-        for w in &mut self.warps {
+        for w in self.warps.iter_mut() {
             let keep_from = min_epoch.get(&w.actor).copied().unwrap_or(w.epoch);
             let i = w.sites.partition_point(|(e, _)| *e <= keep_from);
             if i > 1 {

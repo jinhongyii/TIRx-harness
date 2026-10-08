@@ -1039,8 +1039,10 @@ pub fn wait_until(
     for l in todo.lanes() {
         let loc = support::resolve(ctx, space, lane_val(ctx, a, l), l, n)?;
         super::mem::check_align(ctx, loc, n, l)?;
-        if ctx.aux.wants_history && ctx.aux.words.region(loc.alloc, loc.span(n)).is_none() {
-            // Undeclared word: declared at first use (history starts now).
+        ctx.aux.words.materialize(loc.alloc, loc.span(n));
+        if ctx.aux.words.region(loc.alloc, loc.span(n)).is_none() {
+            // Undeclared word: declared at first use (history and the write
+            // count start now), in every mode (W13-1).
             ctx.aux.words.declare(ctx.arena, loc.alloc, loc.span(n));
             support::sync_event(ctx, WarpMask::lane(l), SyncKind::DeclareWord { alloc: loc.alloc, span: loc.span(n) });
         }
@@ -1068,6 +1070,20 @@ pub fn wait_until(
         }
         let sp = support::spec(ctx, AccessKind::Read, sem, scope, Proxy::Generic);
         support::emit(ctx, sp, &mut acc);
+        // A word written more than MAX_WORD_HISTORY times has no complete
+        // history: an accepting wait on it is `incomplete` in every mode
+        // (counts are kept without an observer too; W13-1).
+        for &(l, loc) in &locs {
+            if accepted.contains(l) && ctx.aux.words.overflowed(loc.alloc, loc.span(n)) {
+                return Err(ctx.error(
+                    ExecErrorKind::Unsupported,
+                    format!(
+                        "declared-word history exceeded {} writes; wait_until verdicts over it would be computed on a truncated history",
+                        crate::interp::aux::MAX_WORD_HISTORY
+                    ),
+                ));
+            }
+        }
         if ctx.aux.wants_history && ctx.observing {
             let locs: Vec<(usize, support::Loc)> = locs.iter().copied().filter(|(l, _)| accepted.contains(*l)).collect();
             emit_verdicts(ctx, pred, scope, captures, &locs, n, pred_reads)?;
@@ -1137,9 +1153,13 @@ fn emit_verdicts(
             cache.bits[l].resize(hist.len().div_ceil(64).max(1), 0);
         }
         let start = lanes.lanes().map(|l| cache.evaluated[l]).min().unwrap_or(0);
+        // The predicate on historical values is hypothetical (it never ran
+        // on hardware): a fault there means "not accepted" for that entry
+        // and never stops the run, and its side effects (diagnostics) are
+        // discarded (W13-2). Only the real evaluation can fault.
         let saved_obs = ctx.observing;
+        let saved_diags = ctx.aux.diagnostics.len();
         ctx.observing = false;
-        let mut res = Ok(());
         for (i, &v) in hist.iter().enumerate().skip(start) {
             let mut need = 0u32;
             for l in lanes.lanes() {
@@ -1147,20 +1167,14 @@ fn emit_verdicts(
                     need |= 1 << l;
                 }
             }
-            match eval_pred(ctx, pred, &[v; 32], WarpMask(need)) {
-                Ok(ok) => {
-                    for l in ok.lanes() {
-                        cache.bits[l][i / 64] |= 1 << (i % 64);
-                    }
-                }
-                Err(e) => {
-                    res = Err(e);
-                    break;
+            if let Ok(ok) = eval_pred(ctx, pred, &[v; 32], WarpMask(need)) {
+                for l in ok.lanes() {
+                    cache.bits[l][i / 64] |= 1 << (i % 64);
                 }
             }
         }
+        ctx.aux.diagnostics.truncate(saved_diags);
         ctx.observing = saved_obs;
-        res?;
         for l in lanes.lanes() {
             cache.evaluated[l] = hist.len();
         }

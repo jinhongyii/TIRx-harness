@@ -818,15 +818,22 @@ impl<'p> Scheduler<'p> {
                 }
                 warps.push(ws);
             }
-            // Declared words in the shared window.
-            if self.wants_history {
+            // Declared words in the shared window: validated and declared
+            // in every mode (counts and overflow are observer-independent;
+            // W13-1/3).
+            {
                 for (i, b) in self.program.buffers.iter().enumerate() {
                     if let (true, BufBinding::SharedWindow { offset, len }) = (b.sync_words, self.bindings[i]) {
-                        let spans = sync_word_spans(b, offset as u64, len)
+                        let (base, w, n) = sync_word_array(b, offset as u64, len)
                             .map_err(|m| sched_error(ExecErrorKind::Unsupported, self.kernel_index, WarpId(u32::MAX), SiteId::NONE, m))?;
-                        for span in spans {
-                            self.partitions[pi].aux.words.declare(arena, ctx.smem, span);
-                            self.host_event(observer, SyncKind::DeclareWord { alloc: ctx.smem, span });
+                        if self.observing || self.wants_history {
+                            let spans: Vec<ByteSpan> = (0..n).map(|k| ByteSpan::new(base + k * w, w)).collect();
+                            self.partitions[pi].aux.words.declare_words(arena, ctx.smem, &spans);
+                            for span in spans {
+                                self.host_event(observer, SyncKind::DeclareWord { alloc: ctx.smem, span });
+                            }
+                        } else {
+                            self.partitions[pi].aux.words.declare_array(ctx.smem, base, w, n);
                         }
                     }
                 }
@@ -974,16 +981,22 @@ impl<'p> Scheduler<'p> {
                 self.host_event(observer, SyncKind::AllocBegin { alloc: a, space, size, cta: CtaId(u32::MAX) });
             }
         }
-        if self.wants_history {
+        self.launch_words.images = self.wants_history;
+        {
             for (i, b) in self.program.buffers.iter().enumerate() {
                 if let (true, BufBinding::View(v)) = (b.sync_words, self.bindings[i]) {
-                    let spans = match sync_word_spans(b, v.offset, v.len) {
-                        Ok(s) => s,
+                    let (base, w, n) = match sync_word_array(b, v.offset, v.len) {
+                        Ok(a) => a,
                         Err(m) => return classify(sched_error(ExecErrorKind::Unsupported, self.kernel_index, WarpId(u32::MAX), SiteId::NONE, m)),
                     };
-                    for span in spans {
-                        self.launch_words.declare(arena, v.alloc, span);
-                        self.host_event(observer, SyncKind::DeclareWord { alloc: v.alloc, span });
+                    if self.observing || self.wants_history {
+                        let spans: Vec<ByteSpan> = (0..n).map(|k| ByteSpan::new(base + k * w, w)).collect();
+                        self.launch_words.declare_words(arena, v.alloc, &spans);
+                        for span in spans {
+                            self.host_event(observer, SyncKind::DeclareWord { alloc: v.alloc, span });
+                        }
+                    } else {
+                        self.launch_words.declare_array(v.alloc, base, w, n);
                     }
                 }
             }
@@ -1252,9 +1265,10 @@ impl<'p> Scheduler<'p> {
     /// program-visible depends on it.
     fn merge_words(&mut self, order: &[usize]) {
         use crate::interp::aux::{WordRegion, MAX_WORD_HISTORY};
-        if !self.wants_history {
-            return;
-        }
+        // Write counts (and overflow) are merged in every mode (W13-1);
+        // post-images, positions and verdict renumbering only when a
+        // history-consuming observer is attached (`images`).
+        let images = self.wants_history;
         // Launch-wide log length of each region before this merge, recorded
         // when the merge first touches it (`None`: created by this merge).
         // Every partition's log of a region agrees with the launch-wide log
@@ -1280,10 +1294,10 @@ impl<'p> Scheduler<'p> {
                 {
                     let start = match touched_ix.get(&(*alloc, r.span.start)) {
                         Some(&t) => touched[t].1,
-                        None => global.exact(*alloc, r.span).map(|t| t.log.len()),
+                        None => global.exact(*alloc, r.span).map(|t| t.count),
                     };
-                    let mut m: Vec<Option<usize>> = (0..start.unwrap_or(0).min(r.log.len())).map(Some).collect();
-                    if start == Some(r.log.len()) && !r.overflow {
+                    let mut m: Vec<Option<usize>> = if images { (0..start.unwrap_or(0).min(r.log.len())).map(Some).collect() } else { Vec::new() };
+                    if start == Some(r.count) && !r.overflow {
                         map.insert((*alloc, r.span.start), m);
                         continue;
                     }
@@ -1292,15 +1306,25 @@ impl<'p> Scheduler<'p> {
                         touched.len() - 1
                     });
                     if global.position(*alloc, r.span).is_none() {
-                        global.insert(*alloc, WordRegion { span: r.span, init: r.init.clone(), log: Vec::new(), overflow: false });
+                        global.insert(*alloc, WordRegion { span: r.span, init: r.init.clone(), log: Vec::new(), count: 0, overflow: false });
                     }
                     let t = global.exact_mut(*alloc, r.span).expect("region just inserted");
-                    for (spans, img) in r.log.iter().skip(start.unwrap_or(0)) {
-                        if t.log.len() >= MAX_WORD_HISTORY {
+                    if !images {
+                        let add = r.count.saturating_sub(start.unwrap_or(0));
+                        if t.count + add > MAX_WORD_HISTORY {
+                            t.count = MAX_WORD_HISTORY;
+                            t.overflow = true;
+                        } else {
+                            t.count += add;
+                        }
+                    }
+                    for (spans, img) in r.log.iter().skip(start.unwrap_or(0)).take(if images { usize::MAX } else { 0 }) {
+                        if t.count >= MAX_WORD_HISTORY {
                             t.overflow = true;
                             break;
                         }
                         m.push(Some(t.log.len()));
+                        t.count += 1;
                         let mut merged = t.log.last().map(|e| e.1.clone()).unwrap_or_else(|| t.init.clone());
                         for sp in spans {
                             let lo = sp.start.max(r.span.start);
@@ -1322,6 +1346,26 @@ impl<'p> Scheduler<'p> {
             self.partitions[k].aux.words.clear_dirty();
         }
         if touched.is_empty() {
+            return;
+        }
+        if !images {
+            // Counts only: every partition's copy of a touched region takes
+            // the launch-wide count and overflow.
+            let global = &self.launch_words;
+            for p in &mut self.partitions {
+                for &((alloc, span), _) in &touched {
+                    let Some(g) = global.exact(alloc, span) else { continue };
+                    match p.aux.words.exact_mut(alloc, span) {
+                        Some(l) => {
+                            l.count = g.count;
+                            l.overflow = g.overflow;
+                        }
+                        None => {
+                            p.aux.words.insert(alloc, g.clone());
+                        }
+                    }
+                }
+            }
             return;
         }
         // Renumber each partition's buffered verdicts and rebase its verdict
@@ -1395,6 +1439,7 @@ impl<'p> Scheduler<'p> {
                         }
                         l.log.truncate(keep);
                         l.log.extend_from_slice(&g.log[keep..]);
+                        l.count = g.count;
                         l.overflow = g.overflow;
                     }
                     None => {
@@ -1639,7 +1684,10 @@ fn blocked_cmd(r: ResourceId) -> SyncCmd {
 /// A dtype that is not a whole number of bytes, or a buffer that is not a
 /// whole number of words, has no well-defined word: fail closed
 /// (`incomplete`, coordinator ruling on W5-14).
-fn sync_word_spans(b: &crate::program::BufferDecl, offset: u64, len: u64) -> Result<Vec<ByteSpan>, String> {
+/// A `sync_words` buffer's words as `(base, width, n)`; validated in every
+/// mode (W13-3: a malformed span is `incomplete` with or without an
+/// observer).
+fn sync_word_array(b: &crate::program::BufferDecl, offset: u64, len: u64) -> Result<(u64, u64, u64), String> {
     let bits = b.dtype.bits() as u64;
     if bits == 0 || !bits.is_multiple_of(8) || !len.is_multiple_of(bits / 8) {
         return Err(format!(
@@ -1648,7 +1696,7 @@ fn sync_word_spans(b: &crate::program::BufferDecl, offset: u64, len: u64) -> Res
         ));
     }
     let w = bits / 8;
-    Ok((0..len / w).map(|k| ByteSpan::new(offset + k * w, w)).collect())
+    Ok((offset, w, len / w))
 }
 
 fn write_param(arena: &mut Arena, params: AllocId, off: u64, bytes: &[u8]) {

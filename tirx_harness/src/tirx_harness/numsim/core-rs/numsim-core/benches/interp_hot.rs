@@ -20,6 +20,11 @@
 //!   `alu::load_reg_indexed` / `store_reg_indexed`.
 //! * `store_v4` — 16-byte vector stores into shared memory (a GEMM
 //!   epilogue's staging): `mem::store`.
+//! * `observed_overhead` — the cost of being observed: whole corpus runs
+//!   with no observer and with a counting observer (events built and
+//!   delivered, no word history, no checker), from the recorded fixtures
+//!   (`fp16_bf16_gemm` at 1 worker, `mega_moe_t8_h1024_i512_e24_k2_g1` at its
+//!   recorded 16 workers); skipped when missing.
 //! * `corpus_numsim` — whole corpus kernels (NumSim mode, 1 worker) from the
 //!   recorded fixtures: `examples/record_race_fixtures.py OUT rmsnorm
 //!   deepgemm_sm100_fp8_gemm_1d1d fp16_bf16_gemm` into `$RACE_FIXTURES` or
@@ -364,6 +369,46 @@ fn bench(c: &mut Criterion) {
     group(c, "store_v4", "iters2048", &store_v4(2048));
 }
 
+/// Events on, history off, no checker: only the cost of building and
+/// delivering the event stream.
+#[derive(Default)]
+struct Counting {
+    events: u64,
+}
+impl numsim_core::observe::Observer for Counting {
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        self.events += 1 + a.spans.len() as u64;
+    }
+    fn sync(&mut self, _e: &numsim_core::observe::SyncEvent) {
+        self.events += 1;
+    }
+}
+
+fn observed_overhead(c: &mut Criterion) {
+    let dir = fixtures::dir();
+    for (case, workers) in [("fp16_bf16_gemm", Some(1)), ("mega_moe_t8_h1024_i512_e24_k2_g1", None)] {
+        if !fixtures::exists(&dir, case) {
+            eprintln!("observed_overhead: fixture {dir}/{case}.* missing, skipped");
+            continue;
+        }
+        let (module, inputs, mut config) = fixtures::load(&dir, case);
+        if let Some(w) = workers {
+            config.workers = w;
+        }
+        let mut g = c.benchmark_group("observed_overhead");
+        g.sample_size(10);
+        g.bench_function(format!("{case}/noop"), |b| b.iter(|| sched::run_with_config(&module, &inputs, &mut NoopObserver, &config).unwrap()));
+        g.bench_function(format!("{case}/counting"), |b| {
+            b.iter(|| {
+                let mut o = Counting::default();
+                sched::run_with_config(&module, &inputs, &mut o, &config).unwrap();
+                o.events
+            })
+        });
+        g.finish();
+    }
+}
+
 fn corpus(c: &mut Criterion) {
     let dir = fixtures::dir();
     for case in ["rmsnorm", "deepgemm_sm100_fp8_gemm_1d1d", "fp16_bf16_gemm"] {
@@ -378,5 +423,5 @@ fn corpus(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench, corpus);
+criterion_group!(benches, bench, corpus, observed_overhead);
 criterion_main!(benches);

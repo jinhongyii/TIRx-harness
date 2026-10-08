@@ -706,19 +706,20 @@ fn wait_until_predicate_reads_are_captured() {
     assert!(found, "no WaitVerdicts with pred_reads");
 }
 
-/// M11: a declared-word history past MAX_WORD_HISTORY makes the verdict
-/// incomplete (history observers only); NumSim alone completes.
+/// M11: a declared word written past MAX_WORD_HISTORY makes an accepting
+/// wait on it incomplete, with or without an observer: the write count is
+/// kept in every mode (W13-1 ruling).
 #[test]
 fn word_history_overflow_is_incomplete() {
     let s = scenarios::word_history_overflow(scenarios::MAX_HISTORY_PROBE);
     let mut t = Trace(Vec::new(), true);
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut t, &s.config).unwrap();
-    match &o.status {
+    let watched = sched::run_with_config(&s.module, &s.inputs, &mut t, &s.config).unwrap();
+    match &watched.status {
         RunStatus::Incomplete { reason, .. } => assert!(reason.contains("history"), "{reason}"),
         other => panic!("expected incomplete, got {other:?}"),
     }
-    let o = run(&s);
-    completed(&o);
+    let plain = run(&s);
+    assert_eq!(plain.status, watched.status);
     // Below the limit the verdict is computed.
     let s = scenarios::word_history_overflow(100);
     let mut t = Trace(Vec::new(), true);

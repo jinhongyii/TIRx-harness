@@ -23,7 +23,8 @@ mod dense;
 
 use std::cell::RefCell;
 
-use super::super::{OpError, OpResult, TcArch, TcMmaOptions, TcSmemRead, TcTmemRead, TcTmemWrite};
+use super::super::{OpError, OpResult, TcArch, TcMmaOptions, TcSmemRead, TcSpace, TcTmemRead, TcTmemWrite, TcViews};
+use crate::arena::{addr, ValidityPolicy};
 use super::mxf4_spellings;
 use crate::program::{TcA, TcMmaKind};
 use crate::sync::completion::TcgenMmaPayload;
@@ -90,9 +91,19 @@ struct Io<'a> {
     smem: TcSmemRead<'a>,
     tmem_read: TcTmemRead<'a>,
     stash: RefCell<Option<OpError>>,
+    /// Whole-allocation views (`None` = callbacks only).
+    views: Option<RefCell<TcViews<'a>>>,
 }
 
-impl Io<'_> {
+/// TMEM cell range check of the callbacks (`tmem_of` in the engine): a
+/// piece starting at `(lane, col)` of `len` bytes must stay in its lane.
+fn tmem_piece_in_range(lane: u32, col: u32, len: usize) -> bool {
+    lane < addr::TMEM_LANES
+        && col < addr::TMEM_COLS
+        && u64::from(col) * 4 + len as u64 <= u64::from(addr::TMEM_COLS) * 4
+}
+
+impl<'a> Io<'a> {
     fn fail(&self, error: OpError) -> LibError {
         let message = error.message.clone();
         self.stash.borrow_mut().get_or_insert(error);
@@ -119,30 +130,122 @@ impl Io<'_> {
         })
     }
 
-    fn shared(&self, cta: usize) -> impl FnMut(usize, &mut [u8]) -> LibResult<()> + '_ {
+    fn shared<'s>(&'s self, cta: usize) -> impl FnMut(usize, &mut [u8]) -> LibResult<()> + use<'s, 'a> {
         move |offset, buf| {
             let address = self.index(offset, "shared address")?;
+            if self.view_smem(cta as u32, address, buf) {
+                return Ok(());
+            }
             (self.smem)(cta as u32, address, buf).map_err(|error| self.fail(error))
         }
     }
 
+    /// Serve a shared piece from the CTA's window view when it is in bounds
+    /// and every byte is valid; `false` = use the callback for this piece.
+    fn view_smem(&self, cta: u32, address: u32, buf: &mut [u8]) -> bool {
+        let Some(views) = &self.views else { return false };
+        let mut views = views.borrow_mut();
+        let views = &mut *views;
+        let Some(Some(window)) = views.smem.get(cta as usize) else { return false };
+        let start = u64::from(addr::decode_shared(address).1);
+        let len = buf.len() as u64;
+        let end = start + len;
+        if end > window.bytes.len() as u64 || window.valid.first_clear(start, len).is_some() {
+            return false;
+        }
+        buf.copy_from_slice(&window.bytes[start as usize..end as usize]);
+        if let Some(reads) = views.reads.as_deref_mut() {
+            reads.push((TcSpace::Shared, cta, start, len));
+        }
+        true
+    }
+
+    /// Read `buf.len()` bytes of TMEM from cell `(lane, column)`: from the
+    /// CTA's view when in range and valid, else through the callback.
+    fn read_tmem(&self, cta: u32, lane: u32, column: u32, buf: &mut [u8]) -> LibResult<()> {
+        if let Some(views) = &self.views {
+            let mut views = views.borrow_mut();
+            let views = &mut *views;
+            if let Some(Some(tmem)) = views.tmem.get(cta as usize) {
+                if tmem_piece_in_range(lane, column, buf.len()) {
+                    let start = addr::tmem_byte_offset(lane, column);
+                    let len = buf.len() as u64;
+                    let end = start + len;
+                    if end <= tmem.bytes.len() as u64 {
+                        // The view owns these bytes for the call: invalid
+                        // bytes follow the policy here, as `Arena::read`.
+                        buf.copy_from_slice(&tmem.bytes[start as usize..end as usize]);
+                        if let Some(first) = tmem.valid.first_clear(start, len) {
+                            views.uninit.push((cta, start, len));
+                            match views.policy {
+                                ValidityPolicy::Error => {
+                                    let error = crate::arena::ArenaError::Uninit { alloc: tmem.alloc, offset: first };
+                                    return Err(self.fail(OpError::invalid(error.to_string())));
+                                }
+                                ValidityPolicy::Allow => {}
+                                ValidityPolicy::ZeroAndReport => {
+                                    let mut at = first;
+                                    while let Some(x) = tmem.valid.first_clear(at, end - at) {
+                                        buf[(x - start) as usize] = 0;
+                                        at = x + 1;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(reads) = views.reads.as_deref_mut() {
+                            reads.push((TcSpace::Tmem, cta, start, len));
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        (self.tmem_read)(cta, lane, column, buf).map_err(|error| self.fail(error))
+    }
+
+    /// Write a TMEM run: into the CTA's view when in range (marking it valid
+    /// and recording it), else through the callback.
+    fn write_tmem(
+        &self,
+        tmem_write: TcTmemWrite<'_>,
+        cta: u32,
+        lane: u32,
+        column: u32,
+        bytes: &[u8],
+    ) -> LibResult<()> {
+        if let Some(views) = &self.views {
+            let mut views = views.borrow_mut();
+            let views = &mut *views;
+            if let Some(Some(tmem)) = views.tmem.get_mut(cta as usize) {
+                if tmem_piece_in_range(lane, column, bytes.len()) {
+                    let start = addr::tmem_byte_offset(lane, column);
+                    let len = bytes.len() as u64;
+                    let end = start + len;
+                    if end <= tmem.bytes.len() as u64 {
+                        tmem.bytes[start as usize..end as usize].copy_from_slice(bytes);
+                        tmem.valid.set_range(start, len, true);
+                        views.writes.push((cta, start, len));
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        tmem_write(cta, lane, column, bytes).map_err(|error| self.fail(error))
+    }
+
     fn cell(&self, cta: usize, lane: usize, column: usize) -> LibResult<[u8; 4]> {
         let mut bytes = [0_u8; 4];
-        (self.tmem_read)(
-            cta as u32,
-            self.index(lane, "TMEM lane")?,
-            self.index(column, "TMEM column")?,
-            &mut bytes,
-        )
-        .map_err(|error| self.fail(error))?;
+        let lane = self.index(lane, "TMEM lane")?;
+        let column = self.index(column, "TMEM column")?;
+        self.read_tmem(cta as u32, lane, column, &mut bytes)?;
         Ok(bytes)
     }
 
-    fn words(&self, cta: usize) -> impl FnMut(usize, usize) -> LibResult<u32> + '_ {
+    fn words<'s>(&'s self, cta: usize) -> impl FnMut(usize, usize) -> LibResult<u32> + use<'s, 'a> {
         move |lane, column| Ok(u32::from_le_bytes(self.cell(cta, lane, column)?))
     }
 
-    fn bytes(&self, cta: usize) -> impl FnMut(usize, usize, usize) -> LibResult<u8> + '_ {
+    fn bytes<'s>(&'s self, cta: usize) -> impl FnMut(usize, usize, usize) -> LibResult<u8> + use<'s, 'a> {
         move |lane, column, byte| {
             let cell = self.cell(cta, lane, column)?;
             cell.get(byte)
@@ -273,7 +376,7 @@ fn read_run<T>(
     let (lane, column) = check_cell(io, lane, column)?;
     buf.clear();
     buf.resize(indices.len() * 4, 0);
-    (io.tmem_read)(cta as u32, lane, column, buf).map_err(|error| io.fail(error))?;
+    io.read_tmem(cta as u32, lane, column, buf)?;
     let cells = buf.as_chunks::<4>().0;
     if let Some(slots) = contiguous(indices).and_then(|r| values.get_mut(r)) {
         // Every streamed run is a contiguous index range: no per-cell indirection.
@@ -312,7 +415,7 @@ fn write_run<T: Copy>(
             *cell = encode(values[index]);
         }
     }
-    tmem_write(cta as u32, lane, column, buf).map_err(|error| io.fail(error))
+    io.write_tmem(tmem_write, cta as u32, lane, column, buf)
 }
 
 /// Runs of a `(cta, lane, column, index)` cell list (CTA pairs).
@@ -515,7 +618,7 @@ fn write_cell(
 ) -> LibResult<()> {
     let lane = io.index(lane, "TMEM lane")?;
     let column = io.index(column, "TMEM column")?;
-    tmem_write(cta as u32, lane, column, bytes).map_err(|error| io.fail(error))
+    io.write_tmem(tmem_write, cta as u32, lane, column, bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -764,12 +867,14 @@ pub(super) fn run(
     smem: TcSmemRead<'_>,
     tmem_read: TcTmemRead<'_>,
     tmem_write: TcTmemWrite<'_>,
+    views: Option<TcViews<'_>>,
 ) -> OpResult {
     let form = check_form(payload, options)?;
     let io = Io {
         smem,
         tmem_read,
         stash: RefCell::new(None),
+        views: views.map(RefCell::new),
     };
     match payload.args.kind {
         TcMmaKind::F16 | TcMmaKind::Tf32 => float_mma(&io, payload, options, &form, tmem_write),

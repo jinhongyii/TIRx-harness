@@ -135,6 +135,7 @@ impl BitSet {
     pub fn get(&self, i: u64) -> bool {
         (self.words[(i / 64) as usize] >> (i % 64)) & 1 == 1
     }
+    #[inline]
     pub fn set_range(&mut self, start: u64, len: u64, value: bool) {
         let mut i = start;
         let end = start + len;
@@ -210,6 +211,7 @@ impl BitSet {
     }
 
     /// First index in `[start, start+len)` whose bit is clear.
+    #[inline]
     pub fn first_clear(&self, start: u64, len: u64) -> Option<u64> {
         let mut i = start;
         let end = start + len;
@@ -1272,6 +1274,7 @@ pub mod addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     /// W6 S-a: a shard that reads back bytes it wrote itself this round did
     /// not read the round-start value; it must not be ordered before

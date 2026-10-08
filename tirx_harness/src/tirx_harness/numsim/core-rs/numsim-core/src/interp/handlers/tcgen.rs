@@ -809,7 +809,7 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
     // back once (validity is unchanged: already valid); other pieces take
     // the per-piece path. The images are flushed before any error returns.
     let mut runs = RunImages::load(ctx, tmem, map.cell_runs(), true)?;
-    let log = ctx.aux.wants_history && !ctx.aux.words.is_empty();
+    let log = !ctx.aux.words.is_empty();
     let mut bytes = Vec::with_capacity(nregs * 4);
     let res = (|| -> Result<(), crate::interp::ExecError> {
         for t in active.lanes() {
@@ -1122,24 +1122,40 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
 /// that moved are A's, the others B's. Cached per descriptor set.
 fn mma_a_footprint(ctx: &mut ExecCtx<'_>, p: &TcgenMmaPayload) -> Result<Vec<(u32, u32, u32)>, ExecError> {
     // The A footprint depends on A's descriptor (layout, LBO/SBO, swizzle),
-    // the instruction descriptor and the group, and moves with A's start
-    // address; swizzling sees the start only modulo 1024 bytes. Cache it
-    // relative to the start, keyed by everything else, so a pipeline
-    // walking its stages reuses one probe.
+    // the instruction descriptor and its kind, the group and the target, and
+    // moves with A's start address; swizzling sees the start only modulo
+    // 1024 bytes. Cache it relative to the start, keyed by everything else,
+    // so a pipeline walking its stages reuses one probe. The value is a pure
+    // function of the key, so one process-wide cache serves every partition,
+    // worker thread and run (W13: the probe runs two whole MMAs).
+    type Key = (u64, u64, u32, u8, TcMmaKind, oplib::TcArch, bool);
+    type Footprints = std::sync::Mutex<std::collections::HashMap<Key, std::sync::Arc<[(u32, u32, u32)]>>>;
+    static FOOTPRINTS: std::sync::OnceLock<Footprints> = std::sync::OnceLock::new();
     let start = ((p.a & 0x3fff) << 4) as u32;
-    let key = (p.a & !0x3fff, (start % 1024) as u64, p.idesc, p.args.cta_group);
-    if let Some(v) = ctx.aux.mma_a_footprints.get(&key) {
-        return Ok(v.iter().map(|&(c, rel, n)| (c, rel.wrapping_add(start), n)).collect());
-    }
     let arch = match ctx.program.arch.as_deref() {
         Some(a) if a.starts_with("sm_103") => oplib::TcArch::Sm103,
         Some(a) if a.starts_with("sm_107") => oplib::TcArch::Sm107,
         _ => oplib::TcArch::Sm100,
     };
-    let options = oplib::TcMmaOptions { arch, ti16: p.args.kind == TcMmaKind::Ti16, ..Default::default() };
-    let out = mma_a_footprint_probe(p, &options);
-    ctx.aux.mma_a_footprints.insert(key, out.iter().map(|&(c, a, n)| (c, a.wrapping_sub(start), n)).collect());
-    Ok(out)
+    let ti16 = p.args.kind == TcMmaKind::Ti16;
+    let key: Key = (p.a & !0x3fff, (start % 1024) as u64, p.idesc, p.args.cta_group, p.args.kind, arch, ti16);
+    let cache = FOOTPRINTS.get_or_init(Default::default);
+    let hit = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+    let rel = match hit {
+        Some(v) => v,
+        None => {
+            let options = oplib::TcMmaOptions { arch, ti16, ..Default::default() };
+            let out = mma_a_footprint_probe(p, &options);
+            let rel: std::sync::Arc<[(u32, u32, u32)]> = out.iter().map(|&(c, a, n)| (c, a.wrapping_sub(start), n)).collect();
+            let mut m = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if m.len() >= 4096 {
+                m.clear();
+            }
+            m.insert(key, rel.clone());
+            rel
+        }
+    };
+    Ok(rel.iter().map(|&(c, r, n)| (c, r.wrapping_add(start), n)).collect())
 }
 
 /// The MMA's shared-A read as its own async op (legacy `MmaSharedARead`,

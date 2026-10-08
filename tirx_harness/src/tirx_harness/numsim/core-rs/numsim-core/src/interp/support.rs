@@ -731,7 +731,7 @@ pub fn mem_write(ctx: &mut ExecCtx<'_>, loc: Loc, lane: usize, src: &[u8]) -> Re
     if let Err(e) = ctx.arena.write(v, &[span], src) {
         return Err(arena_err(ctx, e, WarpMask::lane(lane)));
     }
-    if ctx.aux.wants_history && !ctx.aux.words.is_empty() {
+    if !ctx.aux.words.is_empty() {
         ctx.aux.words.log_lane(loc.alloc, span, src);
     }
     Ok(())
@@ -829,7 +829,6 @@ pub fn emit_accesses(
             spans.push(acc.items[j].2);
             j += 1;
         }
-        let writes = matches!(spec.kind, AccessKind::Write | AccessKind::Rmw);
         let declared = aux.wants_history && !aux.words.is_empty() && {
             let raw: Vec<ByteSpan> = spans.iter().map(|s| s.span).collect();
             aux.words.overlaps(alloc, &raw)
@@ -852,16 +851,24 @@ pub fn emit_accesses(
             operand: spec.operand,
         };
         observer.access(&a);
-        // Warp writes are logged per lane at `mem_write` (with the lane's
-        // own bytes); other writers (async landings, fills) here, per span.
-        if declared && writes && !matches!(spec.actor, Actor::Warp { .. }) {
-            for s in spans.iter() {
-                aux.words.log_from_arena(arena, alloc, s.span);
-            }
-        }
         i = j;
     }
     acc.items.clear();
+}
+
+/// Declared-word logging of an async landing's writes (async landings,
+/// fills): one entry per span, in the order `emit_accesses` reports them
+/// (sorted by allocation, window, lane span). Runs in every mode, so
+/// declared-word counts and overflow never depend on the observer (W13-1);
+/// warp writes are logged per lane at `mem_write`.
+pub fn log_async_writes(aux: &mut LaunchAux, arena: &Arena, items: &mut [(AllocId, Option<Window>, LaneSpan)]) {
+    if aux.words.is_empty() {
+        return;
+    }
+    items.sort_by_key(|a| (a.0, window_key(a.1), a.2));
+    for &(alloc, _, ls) in items.iter() {
+        aux.words.log_from_arena(arena, alloc, ls.span);
+    }
 }
 
 fn window_key(w: Option<Window>) -> u8 {

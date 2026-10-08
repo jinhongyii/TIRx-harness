@@ -405,7 +405,6 @@ fn observer_independent(s: &Scenario) {
 /// clusters, MAX/2 + 4 each). Today only a history observer stops the run
 /// (`Unsupported`, history overflow).
 #[test]
-#[ignore = "xfail: W13 audit item 1 (W2) -- word-history overflow stops only observed runs"]
 fn word_history_overflow_is_observer_independent() {
     let each = MAX / 2 + 4;
     observer_independent(&overflow_writers([each - 1, each - 1], [0, 0], [SENTINEL, SENTINEL]));
@@ -484,7 +483,6 @@ fn pred_faults_on_history_completes_unobserved() {
 /// under a history observer, so a fault on an old value (0) stops only
 /// observed runs.
 #[test]
-#[ignore = "xfail: W13 audit item 2 (W2) -- predicate re-evaluation on history faults only when observed"]
 fn predicate_fault_on_history_is_observer_independent() {
     observer_independent(&pred_faults_on_history());
 }
@@ -493,7 +491,6 @@ fn predicate_fault_on_history_is_observer_independent() {
 /// (E2M1) has no well-defined word. Today that is `Unsupported` only when
 /// the observer wants word history.
 #[test]
-#[ignore = "xfail: W13 audit item 3 (W2) -- malformed sync_words span is Unsupported only under history"]
 fn malformed_sync_words_is_observer_independent() {
     let mut s = scenarios::wait_until_flag();
     let flag = s.module.kernels[0].buffers.iter().position(|b| b.name == "flag").unwrap();

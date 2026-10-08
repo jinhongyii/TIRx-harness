@@ -159,8 +159,12 @@ pub struct WordRegion {
     /// Post-image of the region after each write `Access` overlapping it,
     /// with the allocation-relative spans that access wrote.
     pub log: Vec<(Vec<ByteSpan>, Vec<u8>)>,
+    /// Writes counted so far (always kept, with or without an observer;
+    /// equals `log.len()` when the table keeps images).
+    pub count: usize,
     /// More than [`MAX_WORD_HISTORY`] writes arrived: later ones were not
-    /// logged, so verdicts over this region are `incomplete`.
+    /// counted, so `wait_until` over this region is `incomplete` (with or
+    /// without an observer, W13-1).
     pub overflow: bool,
 }
 
@@ -181,11 +185,78 @@ pub struct WordTable {
     /// (the scheduler merges only these), with a dedupe set.
     dirty: Vec<(AllocId, ByteSpan)>,
     dirty_set: HashSet<(AllocId, u64, u64)>,
+    /// Keep post-images (a history-consuming observer is attached);
+    /// otherwise only counts and overflow are kept.
+    pub images: bool,
+    /// Declared words not yet materialized (count-only mode): per
+    /// allocation, `(base, width, n)` arrays of `n` words of `width` bytes.
+    /// A word's region is created (count 0) on its first write or wait, so
+    /// a kernel declaring 10^5+ words pays only for the words it touches.
+    arrays: HashMap<AllocId, Vec<(u64, u64, u64)>>,
 }
 
 impl WordTable {
     pub fn is_empty(&self) -> bool {
-        self.regions.is_empty()
+        self.regions.is_empty() && self.arrays.is_empty()
+    }
+
+    /// Declare `spans` of `alloc` (a buffer's sync words). With images the
+    /// regions are created now (index 0 = current bytes); without, a run of
+    /// equal-width adjacent words is recorded as one lazy array.
+    pub fn declare_words(&mut self, arena: &Arena, alloc: AllocId, spans: &[ByteSpan]) {
+        if self.images {
+            for &s in spans {
+                self.declare(arena, alloc, s);
+            }
+            return;
+        }
+        let mut i = 0;
+        while i < spans.len() {
+            let (base, w) = (spans[i].start, spans[i].len);
+            let mut j = i + 1;
+            while j < spans.len() && spans[j].len == w && spans[j].start == base + (j - i) as u64 * w {
+                j += 1;
+            }
+            if w > 0 {
+                self.arrays.entry(alloc).or_default().push((base, w, (j - i) as u64));
+            }
+            i = j;
+        }
+    }
+
+    /// Declare `n` words of `w` bytes at `base` of `alloc` lazily
+    /// (count-only mode; no image is ever needed).
+    pub fn declare_array(&mut self, alloc: AllocId, base: u64, w: u64, n: u64) {
+        debug_assert!(!self.images, "lazy words have no declaration image");
+        if w > 0 && n > 0 {
+            self.arrays.entry(alloc).or_default().push((base, w, n));
+        }
+    }
+
+    /// Create the regions of lazily declared words of `alloc` overlapping
+    /// `span` (count 0, no image: count-only mode).
+    pub fn materialize(&mut self, alloc: AllocId, span: ByteSpan) {
+        let Some(arrays) = self.arrays.get(&alloc) else { return };
+        let mut new: Vec<ByteSpan> = Vec::new();
+        for &(base, w, n) in arrays {
+            let end = base + w * n;
+            let (lo, hi) = (span.start.max(base), span.end().max(span.start + 1).min(end));
+            if lo >= hi {
+                continue;
+            }
+            for k in (lo - base) / w..(hi - base).div_ceil(w) {
+                new.push(ByteSpan::new(base + k * w, w));
+            }
+        }
+        for s in new {
+            if self.position(alloc, s).is_none() {
+                self.insert(alloc, WordRegion { span: s, init: Vec::new(), log: Vec::new(), count: 0, overflow: false });
+            }
+        }
+    }
+
+    fn arrays_overlap(&self, alloc: AllocId, span: ByteSpan) -> bool {
+        self.arrays.get(&alloc).is_some_and(|v| v.iter().any(|&(base, w, n)| span.start < base + w * n && base < span.end()))
     }
 
     fn mark(&mut self, alloc: AllocId, span: ByteSpan) {
@@ -210,7 +281,7 @@ impl WordTable {
     /// Does `alloc` hold any declared region? (Writes to other allocations
     /// log nothing, so they may take paths that skip the history.)
     pub fn has(&self, alloc: AllocId) -> bool {
-        self.regions.get(&alloc).is_some_and(|rs| !rs.is_empty())
+        self.regions.get(&alloc).is_some_and(|rs| !rs.is_empty()) || self.arrays.contains_key(&alloc)
     }
 
     /// Index range of `alloc`'s regions that may overlap `span` (each one
@@ -258,6 +329,9 @@ impl WordTable {
 
     /// Does any span overlap a declared region of `alloc`?
     pub fn overlaps(&self, alloc: AllocId, spans: &[ByteSpan]) -> bool {
+        if spans.iter().any(|s| self.arrays_overlap(alloc, *s)) {
+            return true;
+        }
         let Some(rs) = self.regions.get(&alloc) else { return false };
         spans.iter().any(|s| rs[self.window(alloc, *s)].iter().any(|r| s.overlaps(r.span)))
     }
@@ -281,7 +355,7 @@ impl WordTable {
             return;
         }
         let init = snapshot(arena, alloc, span);
-        self.insert(alloc, WordRegion { span, init, log: Vec::new(), overflow: false });
+        self.insert(alloc, WordRegion { span, init, log: Vec::new(), count: 0, overflow: false });
         self.mark(alloc, span);
     }
 
@@ -290,6 +364,10 @@ impl WordTable {
     /// image with this lane's bytes merged in (README decision 14: entries
     /// are (write Access, lane) pairs in delivery order, lanes ascending).
     pub fn log_lane(&mut self, alloc: AllocId, span: ByteSpan, bytes: &[u8]) {
+        if self.arrays.contains_key(&alloc) {
+            self.materialize(alloc, span);
+        }
+        let images = self.images;
         let w = self.window(alloc, span);
         let Some(rs) = self.regions.get_mut(&alloc) else { return };
         let mut touched: Vec<ByteSpan> = Vec::new();
@@ -298,8 +376,12 @@ impl WordTable {
                 continue;
             }
             touched.push(r.span);
-            if r.log.len() >= MAX_WORD_HISTORY {
+            if r.count >= MAX_WORD_HISTORY {
                 r.overflow = true;
+                continue;
+            }
+            r.count += 1;
+            if !images {
                 continue;
             }
             let mut img = r.log.last().map(|e| e.1.clone()).unwrap_or_else(|| r.init.clone());
@@ -444,9 +526,6 @@ pub struct GridBarrier {
 
 /// A latched `mbarrier` wait: (target, command, lanes, observed generation).
 pub type LatchedWait = (ResourceId, crate::sync::SyncCmd, WarpMask, Option<u64>);
-/// Shared-A footprint cache key: (A descriptor without start, start mod
-/// 1024, instruction descriptor, cta_group).
-pub type MmaFootprintKey = (u64, u64, u32, u8);
 /// A deferred `cp.async.mbarrier.arrive` publication: (mbarrier, phase,
 /// prior cp.async ops).
 pub type DeferredPublish = (ResourceId, u64, Vec<AsyncId>);
@@ -597,9 +676,6 @@ pub struct LaunchAux {
     /// of the thread that may still be in flight (pruned when they land).
     pub tcgen_inflight: HashMap<(WarpId, u8), Vec<AsyncId>>,
     pub tcgen_inflight_shared: HashMap<(WarpId, u8), Vec<AsyncId>>,
-    /// Cache of shared-A footprints per (A descriptor, B descriptor, idesc,
-    /// cta_group): window (cta, address, len) reads.
-    pub mma_a_footprints: HashMap<MmaFootprintKey, Vec<(u32, u32, u32)>>,
     /// cp.async ops per issuing thread not yet covered by a
     /// `cp.async.mbarrier.arrive` (W5-11).
     pub cp_async_unpublished: HashMap<(WarpId, u8), Vec<AsyncId>>,

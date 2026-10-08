@@ -76,14 +76,13 @@ pub struct RaceObserver {
     /// split into one virtual actor per issuing lane (PTX async-groups and
     /// completions are per thread; contract review item 5). Never merged.
     subops: HashMap<AsyncId, Vec<(u8, AsyncId)>>,
-    next_sub: u64,
     pub launches: Vec<LaunchResult>,
     buffer_of_site: HashMap<crate::site::SiteId, String>,
 }
 
 impl RaceObserver {
     pub fn new(config: RacecheckConfig) -> RaceObserver {
-        RaceObserver { config, gc_every: DEFAULT_GC_EVERY, checker: None, kernel: 0, buffers: HashMap::new(), outside_launch: 0, subops: HashMap::new(), next_sub: SUBOP_BASE, launches: Vec::new(), buffer_of_site: HashMap::new() }
+        RaceObserver { config, gc_every: DEFAULT_GC_EVERY, checker: None, kernel: 0, buffers: HashMap::new(), outside_launch: 0, subops: HashMap::new(), launches: Vec::new(), buffer_of_site: HashMap::new() }
     }
 
     /// Start a launch from an explicit topology (tests and replay; the
@@ -446,8 +445,10 @@ impl Observer for RaceObserver {
                         if *class == crate::observe::AsyncClass::Copy && lanes.count() > 1 {
                             let mut subs = Vec::new();
                             for l in lanes.lanes() {
-                                let id = AsyncId(self.next_sub);
-                                self.next_sub += 1;
+                                // Derived from the parent id: deterministic
+                                // in any partition, and in the parent's
+                                // slot pool (`checker::pool_key`).
+                                let id = AsyncId(SUBOP_BASE | ((l as u64) << 56) | op.0);
                                 subs.push((l as u8, id));
                                 c.sync(ri::SyncEvent::AsyncIssue {
                                     op: id,
