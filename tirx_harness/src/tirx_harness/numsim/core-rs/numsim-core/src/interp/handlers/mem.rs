@@ -115,7 +115,7 @@ fn fast_offset(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, n: u64, len: u64, abs_base
 pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, sem: Sem, scope: Scope, mods: MemMods) -> HResult {
     active_or_next!(ctx);
     let n = ty.mem_bytes() as u64;
-    if n <= 8 && ty.slots() == 1 && !mods.uniform {
+    if n <= 8 && ty.slots() == 1 && !mods.uniform && !(mods.nc && ctx.arena.readonly_tracking()) {
         if let Some((alloc, base, len, window)) = fast_target(ctx, buf) {
             let active = ctx.warp.active;
             let mut vals = [0u64; 32];
@@ -170,6 +170,9 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
         let loc = support::resolve_buf(ctx, buf, idx, l, n)?;
         check_align(ctx, loc, n, l)?;
         support::mem_read(ctx, loc, l, &mut bytes[..n as usize])?;
+        if mods.nc {
+            support::readonly_read(ctx, loc.alloc, loc.span(n), l)?;
+        }
         write_lane_bytes(ctx, dst, l, &bytes[..n as usize]);
         check_uniform(ctx, &mods, *first.get_or_insert(loc), loc, l)?;
         if ctx.observing {
@@ -190,7 +193,7 @@ pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Op
     active_or_next!(ctx);
     let _ = mods;
     let n = ty.mem_bytes() as u64;
-    if n <= 8 && ty.slots() == 1 && !(ctx.aux.wants_history && !ctx.aux.words.is_empty()) {
+    if n <= 8 && ty.slots() == 1 && !(ctx.aux.wants_history && !ctx.aux.words.is_empty()) && !ctx.arena.readonly_tracking() {
         if let Some((alloc, base, len, window)) = fast_target(ctx, buf) {
             let active = ctx.warp.active;
             let mut offs = [0u64; 32];
@@ -258,6 +261,9 @@ pub fn load_addr(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, a: Operand, space: Add
         let loc = support::resolve(ctx, space, v, l, n)?;
         check_align(ctx, loc, n, l)?;
         support::mem_read(ctx, loc, l, &mut bytes[..n as usize])?;
+        if mods.nc {
+            support::readonly_read(ctx, loc.alloc, loc.span(n), l)?;
+        }
         write_lane_bytes(ctx, dst, l, &bytes[..n as usize]);
         check_uniform(ctx, &mods, *first.get_or_insert(loc), loc, l)?;
         if ctx.observing {
@@ -480,6 +486,7 @@ pub fn st_bulk(ctx: &mut ExecCtx<'_>, a: Operand, space: AddrSpace, size: Operan
         let v = lane_val(ctx, a, l);
         let n = lane_val(ctx, size, l);
         let loc = support::resolve(ctx, space, v, l, n)?;
+        support::readonly_write(ctx, loc.alloc, loc.span(n), l)?;
         let view = support::whole(ctx.arena, loc.alloc);
         if let Err(e) = ctx.arena.fill(view, &[loc.span(n)], 0) {
             return Err(support::arena_err(ctx, e, WarpMask::lane(l)));

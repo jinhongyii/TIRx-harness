@@ -470,6 +470,7 @@ fn op_effect(ctx: &mut ExecCtx<'_>, effect: crate::interp::OpEffect, srcs: &[Ope
                         report: None,
                         lut_b: None,
                         strong: None,
+                        restricted: false,
                     },
                 );
                 ctx.aux.groups.issue(gres, op);

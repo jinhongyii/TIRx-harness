@@ -360,6 +360,7 @@ pub fn tcgen_commit(
                 report: None,
                 lut_b: None,
                 strong: None,
+                restricted,
             },
         );
     }
@@ -428,6 +429,7 @@ fn ldst_op(ctx: &mut ExecCtx<'_>, class: AsyncClass) -> AsyncId {
             report: None,
             lut_b: None,
             strong: None,
+            restricted: false,
         },
     )
 }
@@ -450,6 +452,73 @@ fn check_piece_live(ctx: &ExecCtx<'_>, p: &oplib::TcgenLdstPiece, t: usize, what
 #[inline]
 fn piece_offset(p: &oplib::TcgenLdstPiece) -> u64 {
     addr::tmem_byte_offset(p.tmem_lane, p.column) + p.cell_byte as u64
+}
+
+/// Byte images of the live, fully valid cell runs of a `tcgen05.ld/st`
+/// map (W4-16), read once per op. `locate` maps a piece to its image byte.
+struct RunImages<'m> {
+    runs: &'m [oplib::TcgenCellRun],
+    /// Image start per run (`None`: that run takes the per-piece path).
+    at: Vec<Option<usize>>,
+    image: Vec<u8>,
+}
+
+impl<'m> RunImages<'m> {
+    fn load(ctx: &mut ExecCtx<'_>, tmem: crate::arena::AllocId, runs: &'m [oplib::TcgenCellRun], enabled: bool) -> Result<Self, crate::interp::ExecError> {
+        let mut at = Vec::with_capacity(runs.len());
+        let mut image = Vec::new();
+        let size = ctx.arena.get(tmem).size;
+        for r in runs {
+            let span = ByteSpan::new(addr::tmem_byte_offset(r.tmem_lane, r.column), r.cells as u64 * 4);
+            let ok = enabled
+                && r.column as u64 + r.cells as u64 <= addr::TMEM_COLS as u64
+                && span.end() <= size
+                && support::tmem_live(ctx, r.column, r.cells)
+                && ctx.arena.first_invalid(support::whole(ctx.arena, tmem), span).is_none();
+            if ok {
+                let k = image.len();
+                image.resize(k + span.len as usize, 0);
+                ctx.arena
+                    .read(support::whole(ctx.arena, tmem), &[span], &mut image[k..])
+                    .map_err(|e| support::arena_err(ctx, e, WarpMask::ALL))?;
+                at.push(Some(k));
+            } else {
+                at.push(None);
+            }
+        }
+        Ok(RunImages { runs, at, image })
+    }
+
+    /// Image byte of piece `p` when its run is fast. `hint`: last run index.
+    #[inline]
+    fn locate(&self, p: &oplib::TcgenLdstPiece, hint: &mut usize) -> Option<usize> {
+        let inside = |r: &oplib::TcgenCellRun| r.tmem_lane == p.tmem_lane && p.column >= r.column && p.column < r.column + r.cells;
+        let i = if self.runs.get(*hint).is_some_and(inside) {
+            *hint
+        } else {
+            let i = self.runs.partition_point(|r| (r.tmem_lane, r.column) <= (p.tmem_lane, p.column)).checked_sub(1)?;
+            if !inside(&self.runs[i]) {
+                return None;
+            }
+            *hint = i;
+            i
+        };
+        self.at[i].map(|k| k + (p.column - self.runs[i].column) as usize * 4 + p.cell_byte as usize)
+    }
+
+    /// Write every fast run's image back (one write per run).
+    fn store(&self, ctx: &mut ExecCtx<'_>, tmem: crate::arena::AllocId) -> Result<(), crate::interp::ExecError> {
+        for (r, k) in self.runs.iter().zip(&self.at) {
+            if let Some(k) = *k {
+                let span = ByteSpan::new(addr::tmem_byte_offset(r.tmem_lane, r.column), r.cells as u64 * 4);
+                let v = support::whole(ctx.arena, tmem);
+                ctx.arena
+                    .write(v, &[span], &self.image[k..k + span.len as usize])
+                    .map_err(|e| support::arena_err(ctx, e, WarpMask::ALL))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[inline]
@@ -477,52 +546,27 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
     let mut tspans = Vec::with_capacity(if ctx.observing { active.count() as usize * nregs } else { 0 });
     // One register image buffer for every lane (no per-lane allocation).
     let mut bytes = vec![0u8; nregs * 4];
-    // Pieces of one lane, in order, as (piece, register byte).
-    let mut lane_pieces: Vec<(oplib::TcgenLdstPiece, usize)> = Vec::with_capacity(nregs * 2);
+    // W4-16: each live, fully valid cell run is read once into `image`;
+    // pieces of other runs take the per-piece path (same errors / findings).
+    let runs = RunImages::load(ctx, tmem, map.cell_runs(), ctx.aux.capture_reads.is_none())?;
     for t in active.lanes() {
         bytes.fill(0);
-        lane_pieces.clear();
+        let mut hint = 0usize;
         for r in 0..nregs {
-            lane_pieces.extend(map.pieces(r, t).iter().map(|p| (*p, 4 * r + p.reg_byte as usize)));
-        }
-        // Contiguous runs (TMEM bytes and register bytes both consecutive)
-        // are read at once when every column is live and every byte valid;
-        // otherwise the run is read piece by piece (same errors / findings).
-        let mut i = 0;
-        while i < lane_pieces.len() {
-            let (p0, at0) = lane_pieces[i];
-            let off0 = piece_offset(&p0);
-            let (mut len, mut last_col, mut j) = (p0.len as u64, p0.column, i + 1);
-            while let Some(&(p, at)) = lane_pieces.get(j) {
-                if piece_offset(&p) != off0 + len || at as u64 != at0 as u64 + len || p.column < last_col || p.column > last_col + 1 {
-                    break;
+            for p in map.pieces(r, t) {
+                let at = 4 * r + p.reg_byte as usize;
+                let n = p.len as usize;
+                if let Some(k) = runs.locate(p, &mut hint) {
+                    bytes[at..at + n].copy_from_slice(&runs.image[k..k + n]);
+                } else {
+                    check_piece_live(ctx, p, t, "tcgen05.ld")?;
+                    let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
+                    support::mem_read(ctx, loc, t, &mut bytes[at..at + n])?;
                 }
-                len += p.len as u64;
-                last_col = p.column;
-                j += 1;
-            }
-            let span = ByteSpan::new(off0, len);
-            let batched = j - i > 1
-                && ctx.aux.capture_reads.is_none()
-                && support::tmem_live(ctx, p0.column, last_col - p0.column + 1)
-                && ctx.arena.first_invalid(support::whole(ctx.arena, tmem), span).is_none();
-            if batched {
-                let loc = support::Loc { alloc: tmem, offset: off0, window: None, remote: None };
-                support::mem_read(ctx, loc, t, &mut bytes[at0..at0 + len as usize])?;
                 if ctx.observing {
-                    tspans.extend(lane_pieces[i..j].iter().map(|(p, _)| LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) }));
-                }
-            } else {
-                for &(p, at) in &lane_pieces[i..j] {
-                    check_piece_live(ctx, &p, t, "tcgen05.ld")?;
-                    let loc = support::Loc { alloc: tmem, offset: piece_offset(&p), window: None, remote: None };
-                    support::mem_read(ctx, loc, t, &mut bytes[at..at + p.len as usize])?;
-                    if ctx.observing {
-                        tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(loc.offset, p.len as u64) });
-                    }
+                    tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
                 }
             }
-            i = j;
         }
         let mut pos = 0usize;
         for &d in &args.dsts {
@@ -568,26 +612,45 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
     let nregs = map.registers;
     let op = ldst_op(ctx, AsyncClass::TcgenSt);
     let tmem = ctx.cta.tmem;
-    let mut tspans = Vec::new();
-    for t in active.lanes() {
-        let mut bytes = Vec::with_capacity(nregs * 4);
-        for &s in &args.srcs {
-            let ty = support::operand_ty(ctx, s);
-            let mut tmp = [0u8; 32];
-            support::lane_bytes(ctx, s, ty, t, &mut tmp);
-            bytes.extend_from_slice(&tmp[..ty.mem_bytes() as usize]);
-        }
-        bytes.resize(nregs * 4, 0);
-        for r in 0..nregs {
-            for p in map.pieces(r, t) {
-                check_piece_live(ctx, p, t, "tcgen05.st")?;
-                let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
-                let at = 4 * r + p.reg_byte as usize;
-                support::mem_write(ctx, loc, t, &bytes[at..at + p.len as usize])?;
-                tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(loc.offset, p.len as u64) });
+    let mut tspans = Vec::with_capacity(if ctx.observing { active.count() as usize * nregs } else { 0 });
+    // W4-16: live, fully valid cell runs are patched in `image` and written
+    // back once (validity is unchanged: already valid); other pieces take
+    // the per-piece path. The images are flushed before any error returns.
+    let fast = !(ctx.aux.wants_history && !ctx.aux.words.is_empty());
+    let mut runs = RunImages::load(ctx, tmem, map.cell_runs(), fast)?;
+    let mut bytes = Vec::with_capacity(nregs * 4);
+    let res = (|| -> Result<(), crate::interp::ExecError> {
+        for t in active.lanes() {
+            bytes.clear();
+            for &s in &args.srcs {
+                let ty = support::operand_ty(ctx, s);
+                let mut tmp = [0u8; 32];
+                support::lane_bytes(ctx, s, ty, t, &mut tmp);
+                bytes.extend_from_slice(&tmp[..ty.mem_bytes() as usize]);
+            }
+            bytes.resize(nregs * 4, 0);
+            let mut hint = 0usize;
+            for r in 0..nregs {
+                for p in map.pieces(r, t) {
+                    let at = 4 * r + p.reg_byte as usize;
+                    let n = p.len as usize;
+                    if let Some(k) = runs.locate(p, &mut hint) {
+                        runs.image[k..k + n].copy_from_slice(&bytes[at..at + n]);
+                    } else {
+                        check_piece_live(ctx, p, t, "tcgen05.st")?;
+                        let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
+                        support::mem_write(ctx, loc, t, &bytes[at..at + n])?;
+                    }
+                    if ctx.observing {
+                        tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
+                    }
+                }
             }
         }
-    }
+        Ok(())
+    })();
+    runs.store(ctx, tmem)?;
+    res?;
     let regs: Vec<Reg> = args.srcs.iter().filter_map(|s| if let Operand::Reg(r) = s { Some(*r) } else { None }).collect();
     let rs = if ctx.observing { reg_spans(ctx, &regs, active) } else { Vec::new() };
     if let Some(&ra) = ctx.aux.reg_allocs.get(ctx.warp.id.0 as usize) {
@@ -691,6 +754,7 @@ pub fn tcgen_cp(ctx: &mut ExecCtx<'_>, args: TcgenCpArgs) -> HResult {
                 report: None,
                 lut_b: None,
                 strong: None,
+                restricted: false,
             },
         );
         ctx.aux.tcgen_last.insert(ctx.cta.id, op);
@@ -788,6 +852,7 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
                 report: None,
                 lut_b,
                 strong: None,
+                restricted: false,
             },
         );
         ctx.aux.tcgen_last.insert(ctx.cta.id, op);
@@ -867,6 +932,7 @@ fn shared_a_read(ctx: &mut ExecCtx<'_>, l: usize, mma: AsyncId, p: &TcgenMmaPayl
             report: None,
             lut_b: None,
             strong: None,
+            restricted: false,
         },
     );
     // Lands after the MMA (whose landing performs the read).

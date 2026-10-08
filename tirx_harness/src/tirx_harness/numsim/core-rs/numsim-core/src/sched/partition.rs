@@ -629,6 +629,19 @@ impl Partition {
                 rmw = true;
             }
         }
+        // Readonly-proxy contract: no global byte the kernel read through
+        // `ld.global.nc` may be written (any write path).
+        if arena.readonly_tracking() {
+            let dead = meta.as_ref().map(|m| m.dead.as_slice()).unwrap_or(&[]);
+            let frags = meta.as_ref().map(|m| m.bit_frags.as_slice()).unwrap_or(&[]);
+            let all = writes.iter().copied().chain(dead.iter().copied()).chain(frags.iter().map(|f| (f.global.0, ByteSpan::new(f.global.1, 1))));
+            for (a, sp) in all {
+                if let Err(b) = arena.note_global_write(a, sp) {
+                    let m = support::readonly_conflict_message(&arena.get(a).name, a, b);
+                    return Err(sched_error(ExecErrorKind::BadAddress, kernel, op.source.warp, op.source.site, m));
+                }
+            }
+        }
         // `.ignore_oob` dead bytes: zero, then invalid (legacy validity
         // `false`); they are part of the copy's write footprint.
         if let Some(m) = meta.as_ref().filter(|m| !m.dead.is_empty()) {
@@ -991,15 +1004,17 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
         note(&mut reads.borrow_mut(), al, span);
         Ok(())
     };
-    let tmem_of = |cta: u32, lane: u32, col: u32| -> crate::oplib::OpResult<(AllocId, u64)> {
+    // A buffer may span several consecutive cells of one lane (W4-16);
+    // it must not run past the lane's last column.
+    let tmem_of = |cta: u32, lane: u32, col: u32, len: usize| -> crate::oplib::OpResult<(AllocId, u64)> {
         let al = *p.tmem.get(cta as usize).ok_or_else(|| OpError::invalid("mma tmem operand of a CTA outside the group"))?;
-        if lane >= addr::TMEM_LANES || col >= addr::TMEM_COLS {
-            return Err(OpError::invalid(format!("tmem cell ({lane}, {col}) out of range")));
+        if lane >= addr::TMEM_LANES || col >= addr::TMEM_COLS || col as u64 * 4 + len as u64 > addr::TMEM_COLS as u64 * 4 {
+            return Err(OpError::invalid(format!("tmem cells ({lane}, {col}) + {len} bytes out of range")));
         }
         Ok((al, addr::tmem_byte_offset(lane, col)))
     };
     let tmem_read = |cta: u32, lane: u32, col: u32, out: &mut [u8]| -> crate::oplib::OpResult {
-        let (al, off) = tmem_of(cta, lane, col)?;
+        let (al, off) = tmem_of(cta, lane, col, out.len())?;
         let ar = cell.borrow();
         let span = ByteSpan::new(off, out.len() as u64);
         if !fast_read(&ar, al, span, out) {
@@ -1009,7 +1024,7 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
         Ok(())
     };
     let mut tmem_write = |cta: u32, lane: u32, col: u32, data: &[u8]| -> crate::oplib::OpResult {
-        let (al, off) = tmem_of(cta, lane, col)?;
+        let (al, off) = tmem_of(cta, lane, col, data.len())?;
         let mut ar = cell.borrow_mut();
         let span = ByteSpan::new(off, data.len() as u64);
         if !ar.is_overlaid(al) && !ar.get(al).metadata_only && span.end() <= ar.get(al).size {

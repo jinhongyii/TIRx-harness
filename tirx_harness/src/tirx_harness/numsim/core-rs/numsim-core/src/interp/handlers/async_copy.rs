@@ -55,6 +55,9 @@ pub struct Issue {
     /// `st.async` / `red.async`: the landing is a strong release write in
     /// the generic proxy at this scope (W5-8).
     pub strong: Option<Scope>,
+    /// `tcgen05.commit .sync_restrict`: `after` holds only the shared-operand
+    /// read ops (`SyncKind::AsyncIssue::restricted`).
+    pub restricted: bool,
 }
 
 /// Issue an async op: allocate its id, emit `AsyncIssue`, queue it.
@@ -80,6 +83,7 @@ pub fn issue_async(ctx: &mut ExecCtx<'_>, lanes: WarpMask, is: Issue) -> AsyncId
                 preds: is.after.clone(),
                 footprint: fp,
                 targets: is.targets.clone(),
+                restricted: is.restricted,
             },
         );
     }
@@ -246,6 +250,7 @@ pub fn cp_async(
                 report: None,
                 lut_b: None,
                 strong: None,
+                restricted: false,
             },
         );
         ctx.aux.groups.issue(group_res(ctx, l, Domain::CpAsync), op);
@@ -530,6 +535,7 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
                 report: args.report,
                 lut_b: None,
                 strong: None,
+                restricted: false,
             },
         );
         if !dead.is_empty() {
@@ -773,6 +779,7 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
                 report: args.report,
                 lut_b: None,
                 strong: None,
+                restricted: false,
             },
         );
         if !bit_frags.is_empty() {
@@ -842,6 +849,7 @@ pub fn st_async(ctx: &mut ExecCtx<'_>, args: StAsyncArgs) -> HResult {
                 report: None,
                 lut_b: None,
                 strong: Some(args.scope),
+                restricted: false,
             },
         );
     }

@@ -351,6 +351,8 @@ struct Shard {
     /// Bytes of shared allocations this shard read, per stripe (only when
     /// read tracking is on; see [`Arena::shard_replay_order`]).
     reads: Option<std::cell::RefCell<HashMap<(AllocId, u64), BitSet>>>,
+    /// The base arena's readonly tracking (read-only while shards exist).
+    ro_base: *const Option<Box<ReadonlyTrack>>,
 }
 
 // SAFETY: the scheduler keeps the base arena alive and does not touch it
@@ -398,11 +400,56 @@ pub struct Arena {
     /// Global allocations sorted by base (bases are monotonically assigned).
     global_index: Vec<(u64, u64, AllocId)>,
     shard: Option<Box<Shard>>,
+    /// Readonly-proxy tracking (kernel lifetime; see
+    /// [`Arena::set_readonly_tracking`]). In a shard: this round's deltas.
+    ro: Option<Box<ReadonlyTrack>>,
+}
+
+/// Global bytes read through the readonly proxy (`ld.global.nc`) and global
+/// bytes written, per allocation, over one kernel launch. PTX requires
+/// readonly-proxy bytes to stay unwritten for the whole kernel, so a byte
+/// in both sets (in either order) is a kernel error.
+#[derive(Clone, Debug, Default)]
+struct ReadonlyTrack {
+    read: HashMap<AllocId, BitSet>,
+    written: HashMap<AllocId, BitSet>,
+}
+
+impl ReadonlyTrack {
+    fn first_in(set: &HashMap<AllocId, BitSet>, id: AllocId, span: ByteSpan) -> Option<u64> {
+        let b = set.get(&id)?;
+        let end = span.end().min(b.len());
+        if span.start >= end {
+            return None;
+        }
+        b.first_set(span.start, end - span.start)
+    }
+
+    fn mark(set: &mut HashMap<AllocId, BitSet>, id: AllocId, size: u64, span: ByteSpan) {
+        let end = span.end().min(size);
+        if span.start < end {
+            set.entry(id).or_insert_with(|| BitSet::new(size, false)).set_range(span.start, end - span.start, true);
+        }
+    }
+
+    /// First byte set in both `a` and `b` (same allocation).
+    fn conflict(a: &HashMap<AllocId, BitSet>, b: &HashMap<AllocId, BitSet>) -> Option<(AllocId, u64)> {
+        let mut keys: Vec<&AllocId> = a.keys().filter(|k| b.contains_key(k)).collect();
+        keys.sort();
+        for k in keys {
+            let (x, y) = (&a[k], &b[k]);
+            if let Some(i) = x.words.iter().zip(&y.words).position(|(p, q)| p & q != 0) {
+                let w = x.words[i] & y.words[i];
+                return Some((*k, i as u64 * 64 + w.trailing_zeros() as u64));
+            }
+        }
+        None
+    }
 }
 
 impl Arena {
     pub fn new(policy: ValidityPolicy) -> Arena {
-        Arena { allocs: Vec::new(), policy, next_global_va: addr::GLOBAL_VA_BASE, global_index: Vec::new(), shard: None }
+        Arena { allocs: Vec::new(), policy, next_global_va: addr::GLOBAL_VA_BASE, global_index: Vec::new(), shard: None, ro: None }
     }
 
     pub fn policy(&self) -> ValidityPolicy {
@@ -429,32 +476,6 @@ impl Arena {
     /// see [`Arena::alloc_register_buffer`] for byte-backed ones.
     pub fn alloc(&mut self, space: Space, owner: Owner, name: &str, size: u64, init: Init) -> AllocId {
         self.alloc_inner(space, owner, name, size, init, space == Space::Reg)
-    }
-
-    /// A global allocation whose base keeps `low` as its low 8 bits:
-    /// `base = aligned synthetic base | low` (host-pointer low bits ruling);
-    /// the guard gap before the next allocation is unchanged.
-    pub fn alloc_global_low_bits(&mut self, owner: Owner, name: &str, size: u64, init: Init, low: u8) -> AllocId {
-        let id = self.alloc_inner(Space::Global, owner, name, size + low as u64, init_shifted(init, low, size), false);
-        let a = &mut self.allocs[id.0 as usize];
-        if low != 0 {
-            // Re-express the allocation as starting `low` bytes in.
-            a.base += low as u64;
-            a.size = size;
-            a.bytes.drain(..low as usize);
-            let mut v = BitSet::new(size, false);
-            for i in 0..size {
-                if a.valid.get(i + low as u64) {
-                    v.set_range(i, 1, true);
-                }
-            }
-            a.valid = v;
-            if let Some(e) = self.global_index.last_mut() {
-                e.0 = a.base;
-                e.1 = a.base + size;
-            }
-        }
-        id
     }
 
     /// A byte-backed `Space::Reg` allocation: register-space buffers kept in
@@ -910,8 +931,74 @@ impl Arena {
                 global_index: &self.global_index as *const _,
                 overlay: HashMap::new(),
                 reads: None,
+                ro_base: &self.ro as *const _,
             })),
+            ro: self.ro.as_ref().map(|_| Box::default()),
         }
+    }
+
+    /// Start (`true`, clearing any previous state) or stop readonly-proxy
+    /// tracking for a kernel launch (plain arena only).
+    pub fn set_readonly_tracking(&mut self, on: bool) {
+        assert!(self.shard.is_none(), "readonly tracking is set on the base arena");
+        self.ro = on.then(Box::default);
+    }
+
+    pub fn readonly_tracking(&self) -> bool {
+        self.ro.is_some()
+    }
+
+    /// The base arena's tracking state, as of the shard's creation.
+    fn ro_base(&self) -> Option<&ReadonlyTrack> {
+        match &self.shard {
+            // SAFETY: the base arena is not modified while shards exist.
+            Some(sh) => unsafe { (*sh.ro_base).as_deref() },
+            None => None,
+        }
+    }
+
+    /// Record a readonly-proxy read of global `span` of `id`. `Err(byte)`:
+    /// the kernel already wrote that byte.
+    pub fn note_readonly_read(&mut self, id: AllocId, span: ByteSpan) -> Result<(), u64> {
+        if self.ro.is_none() || self.get(id).space != Space::Global {
+            return Ok(());
+        }
+        let size = self.get(id).size;
+        if let Some(b) = self.ro_base().and_then(|t| ReadonlyTrack::first_in(&t.written, id, span)) {
+            return Err(b);
+        }
+        let t = self.ro.as_mut().expect("tracking");
+        if let Some(b) = ReadonlyTrack::first_in(&t.written, id, span) {
+            return Err(b);
+        }
+        ReadonlyTrack::mark(&mut t.read, id, size, span);
+        Ok(())
+    }
+
+    /// Record a write of global `span` of `id`. `Err(byte)`: the kernel
+    /// read that byte through the readonly proxy.
+    pub fn note_global_write(&mut self, id: AllocId, span: ByteSpan) -> Result<(), u64> {
+        if self.ro.is_none() || self.get(id).space != Space::Global {
+            return Ok(());
+        }
+        let size = self.get(id).size;
+        if let Some(b) = self.ro_base().and_then(|t| ReadonlyTrack::first_in(&t.read, id, span)) {
+            return Err(b);
+        }
+        let t = self.ro.as_mut().expect("tracking");
+        if let Some(b) = ReadonlyTrack::first_in(&t.read, id, span) {
+            return Err(b);
+        }
+        ReadonlyTrack::mark(&mut t.written, id, size, span);
+        Ok(())
+    }
+
+    /// A byte that `shard` read through the readonly proxy and this (base)
+    /// arena's tracking has as written, or the reverse: a conflict between
+    /// partitions within one round (checked before merging the shard).
+    pub fn readonly_merge_conflict(&self, shard: &Arena) -> Option<(AllocId, u64)> {
+        let (Some(base), Some(d)) = (self.ro.as_deref(), shard.ro.as_deref()) else { return None };
+        ReadonlyTrack::conflict(&d.read, &base.written).or_else(|| ReadonlyTrack::conflict(&d.written, &base.read))
     }
 
     /// Record which shared-allocation bytes this shard reads (for
@@ -1000,7 +1087,19 @@ impl Arena {
 
     /// Apply a shard's writes to shared allocations. Shards merged later
     /// overwrite bytes written by shards merged earlier (byte granularity).
-    pub fn merge_shard(&mut self, shard: Arena) {
+    pub fn merge_shard(&mut self, mut shard: Arena) {
+        if let (Some(base), Some(d)) = (self.ro.as_mut(), shard.ro.take()) {
+            for (dst, src) in [(&mut base.read, d.read), (&mut base.written, d.written)] {
+                for (id, bits) in src {
+                    match dst.get_mut(&id) {
+                        Some(b) => b.words.iter_mut().zip(&bits.words).for_each(|(x, y)| *x |= *y),
+                        None => {
+                            dst.insert(id, bits);
+                        }
+                    }
+                }
+            }
+        }
         let sh = *shard.shard.expect("not a shard");
         let mut stripes: Vec<((AllocId, u64), Stripe)> = sh.overlay.into_iter().collect();
         stripes.sort_by_key(|(k, _)| *k);
@@ -1021,33 +1120,6 @@ impl Arena {
                     }
                 }
             }
-        }
-    }
-}
-
-/// `init` for an allocation of `low + size` bytes whose first `low` bytes
-/// are dropped afterwards.
-fn init_shifted(init: Init, low: u8, size: u64) -> Init {
-    if low == 0 {
-        return init;
-    }
-    let pad = low as usize;
-    match init {
-        Init::Uninit => Init::Uninit,
-        Init::Zeroed => Init::Zeroed,
-        Init::Bytes(b) => {
-            let mut v = vec![0u8; pad];
-            v.extend(b);
-            Init::Bytes(v)
-        }
-        Init::BytesWithValidity(b, valid) => {
-            let mut v = vec![0u8; pad];
-            v.extend(b);
-            let mut bits = BitSet::new(size + low as u64, true);
-            for i in 0..size {
-                bits.set_range(i + low as u64, 1, valid.get(i));
-            }
-            Init::BytesWithValidity(v, bits)
         }
     }
 }

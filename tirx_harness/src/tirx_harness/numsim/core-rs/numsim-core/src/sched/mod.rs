@@ -211,10 +211,10 @@ pub enum ArgValue {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inputs {
     pub args: BTreeMap<String, ArgValue>,
-    /// Host address of `Buffer` arguments (when the host array has one):
-    /// a buffer's synthetic global address keeps the host pointer's low 8
-    /// bits (`arena::addr` ruling), so kernel alignment arithmetic matches
-    /// the host's.
+    /// Host address of `Buffer` arguments (when the host array has one).
+    /// Not used for placement (V2C-35 ruling): every top-level buffer gets
+    /// a fresh synthetic base aligned like `cudaMalloc` (at least 256
+    /// bytes); only `View` arguments sit at an offset inside their region.
     pub host_addrs: BTreeMap<String, u64>,
 }
 
@@ -1176,8 +1176,16 @@ impl<'p> Scheduler<'p> {
         } else {
             (0..kept).collect()
         };
+        let mut ro_err = None;
         for (k, shard) in shards.into_iter().enumerate() {
             if k < kept {
+                // Readonly-proxy conflicts between partitions of one round.
+                if ro_err.is_none() {
+                    if let Some((a, b)) = arena.readonly_merge_conflict(&shard) {
+                        let m = support::readonly_conflict_message(&arena.get(a).name, a, b);
+                        ro_err = Some(sched_error(ExecErrorKind::BadAddress, self.kernel_index, WarpId(u32::MAX), SiteId::NONE, m));
+                    }
+                }
                 arena.merge_shard(shard);
             } else {
                 arena.discard_shard(shard);
@@ -1195,7 +1203,7 @@ impl<'p> Scheduler<'p> {
                 Err(e) => first_err = Some(e),
             }
         }
-        match first_err {
+        match first_err.or(ro_err) {
             Some(e) => Err(e),
             None => Ok(progress),
         }
@@ -1605,8 +1613,10 @@ fn host_buffer(
                 }
                 None => Init::Bytes(bytes.clone()),
             };
-            let low = inputs.host_addrs.get(name).map_or(0, |p| (*p & 0xff) as u8);
-            let a = arena.alloc_global_low_bits(Owner::Launch, name, size, init, low);
+            // V2C-35 ruling: a top-level buffer is a fresh device
+            // allocation (aligned like cudaMalloc); the host pointer's bits
+            // are not copied. Sub-views keep their offset in the region.
+            let a = arena.alloc(Space::Global, Owner::Launch, name, size, init);
             globals.insert(name.to_string(), a);
             Ok(a)
         }
@@ -1658,6 +1668,20 @@ fn allocate_host(
                 }
                 _ => {}
             }
+        }
+    }
+    // W8-8: every buffer argument is placed, also those no parameter
+    // references (e.g. the base array a descriptor image bound to a plain
+    // buffer parameter points at), after the referenced ones (name order).
+    for (name, arg) in &inputs.args {
+        match arg {
+            ArgValue::Buffer { .. } => {
+                host_buffer(arena, globals, inputs, name)?;
+            }
+            ArgValue::View { .. } => {
+                host_region(arena, globals, inputs, name)?;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -1862,7 +1886,11 @@ pub fn run_with_config(
         }
         let view_lens: BTreeMap<String, u64> = views.iter().map(|(k, v)| (k.clone(), v.1)).collect();
         let mut sched = Scheduler::with_params(program, k as u32, shape, &mut arena, &globals, &view_lens, params, loaded, config.clone())?;
+        // Readonly-proxy contract, for kernels with `ld.global.nc` loads.
+        let nc_loads = program.code.iter().any(|i| matches!(i, Instr::Load { mods, .. } | Instr::LoadAddr { mods, .. } if mods.nc));
+        arena.set_readonly_tracking(program.requirements.readonly_proxy || nc_loads);
         let status = sched.run(&mut arena, observer, backend);
+        arena.set_readonly_tracking(false);
         outcome.stats.instrs += sched.stats.instrs;
         outcome.stats.rounds += sched.stats.rounds;
         outcome.stats.completions += sched.stats.completions;
@@ -1915,12 +1943,7 @@ pub fn run_with_config(
                 if let Some(&a) = globals.get(target) {
                     let al = arena.get(a);
                     let (lo, hi) = (*offset as usize, (*offset + *len) as usize);
-                    let mut valid = BitSet::new(*len, false);
-                    for i in 0..*len {
-                        if al.valid.get(*offset + i) {
-                            valid.set_range(i, 1, true);
-                        }
-                    }
+                    let valid = al.valid.slice(*offset, *len);
                     outcome.outputs.buffers.insert(name.clone(), (al.bytes[lo..hi].to_vec(), valid));
                 }
             }

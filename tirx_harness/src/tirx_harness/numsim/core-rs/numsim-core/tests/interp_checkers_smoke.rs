@@ -73,6 +73,8 @@ fn checkers_on_special_scenarios() {
             // reports a same-lane write/read conflict (W2-19, W5 to rule).
             "implicit_tmem" => assert_eq!(o.status, RunStatus::Completed),
             // M11: history overflow under a history-consuming observer.
+            // Readonly-proxy contract violations: execution errors.
+            "readonly_proxy" => assert!(matches!(o.status, RunStatus::Error(_)), "{:?}", o.status),
             "word_history_overflow" => assert!(matches!(o.status, RunStatus::Incomplete { .. }), "{:?}", o.status),
             _ => {}
         }

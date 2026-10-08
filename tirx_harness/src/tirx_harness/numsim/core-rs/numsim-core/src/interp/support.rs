@@ -627,6 +627,7 @@ pub fn mem_write(ctx: &mut ExecCtx<'_>, loc: Loc, lane: usize, src: &[u8]) -> Re
             format!("store to byte {} of the kernel parameter space, which is read-only", loc.offset),
         ));
     }
+    readonly_write(ctx, loc.alloc, span, lane)?;
     let v = whole(ctx.arena, loc.alloc);
     if let Err(e) = ctx.arena.write(v, &[span], src) {
         return Err(arena_err(ctx, e, WarpMask::lane(lane)));
@@ -635,6 +636,44 @@ pub fn mem_write(ctx: &mut ExecCtx<'_>, loc: Loc, lane: usize, src: &[u8]) -> Re
         ctx.aux.words.log_lane(loc.alloc, span, src);
     }
     Ok(())
+}
+
+/// Message of a readonly-proxy conflict (legacy wording).
+pub fn readonly_conflict_message(name: &str, alloc: AllocId, byte: u64) -> String {
+    format!("write overlaps readonly bytes (readonly-proxy load): global allocation {} ({name}), byte offset {byte}", alloc.0)
+}
+
+/// A global write of `span` of `alloc` by `lane`: an error when the kernel
+/// read any of those bytes through the readonly proxy (PTX: such bytes stay
+/// read-only for the whole kernel; legacy `ReadonlyProxyWriteConflict`).
+#[inline]
+pub fn readonly_write(ctx: &mut ExecCtx<'_>, alloc: AllocId, span: ByteSpan, lane: usize) -> Result<(), ExecError> {
+    if !ctx.arena.readonly_tracking() {
+        return Ok(());
+    }
+    match ctx.arena.note_global_write(alloc, span) {
+        Ok(()) => Ok(()),
+        Err(b) => {
+            let m = readonly_conflict_message(&ctx.arena.get(alloc).name, alloc, b);
+            Err(err(ctx, ExecErrorKind::BadAddress, WarpMask::lane(lane), m))
+        }
+    }
+}
+
+/// A readonly-proxy (`ld.global.nc`) read of `span` of `alloc` by `lane`:
+/// an error when the kernel already wrote any of those bytes.
+#[inline]
+pub fn readonly_read(ctx: &mut ExecCtx<'_>, alloc: AllocId, span: ByteSpan, lane: usize) -> Result<(), ExecError> {
+    if !ctx.arena.readonly_tracking() {
+        return Ok(());
+    }
+    match ctx.arena.note_readonly_read(alloc, span) {
+        Ok(()) => Ok(()),
+        Err(b) => {
+            let m = readonly_conflict_message(&ctx.arena.get(alloc).name, alloc, b);
+            Err(err(ctx, ExecErrorKind::BadAddress, WarpMask::lane(lane), m))
+        }
+    }
 }
 
 /// What an access looks like apart from its spans.

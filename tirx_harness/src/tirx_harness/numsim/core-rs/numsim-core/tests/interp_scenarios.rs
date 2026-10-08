@@ -1010,21 +1010,42 @@ fn fp4_tma_store_applies_bit_fragments() {
     assert_ne!(want, vec![0xeeu8; 64]);
 }
 
-/// Ruling: a buffer's synthetic global address keeps the host pointer's
-/// low 8 bits (and the run uses that address).
+/// V2C-35 ruling: a top-level buffer's synthetic base is aligned like
+/// `cudaMalloc` whatever its host pointer; a view keeps its byte offset
+/// inside its region (misaligned sub-views stay visible).
 #[test]
-fn global_addresses_keep_host_pointer_low_bits() {
+fn global_bases_are_aligned_and_views_keep_offsets() {
     let mut s = scenarios::aliased_views();
     s.inputs.host_addrs.insert("mem".into(), 0x7f00_1234_5678_9a44);
     s.inputs.host_addrs.insert("out".into(), 0x7f00_0000_0000_0010);
     let plan = sched::plan_global_addresses(&s.module, &s.inputs).unwrap();
-    assert_eq!(plan["mem"] & 0xff, 0x44);
+    assert_eq!(plan["mem"] % 256, 0);
+    assert_eq!(plan["out"] % 256, 0);
     assert_eq!(plan["x"], plan["mem"]);
-    assert_eq!(plan["out"] & 0xff, 0x10);
+    assert_eq!(plan["z"], plan["mem"] + 8);
     let o = run(&s);
     completed(&o);
     assert_eq!(u32s(&o, "out"), vec![12, 13, 104, 105]);
     assert_eq!(u32s(&o, "mem"), vec![10, 11, 12, 13, 104, 105]);
+}
+
+/// W8-8: a buffer argument no parameter references is still placed (its
+/// address is planned, it is returned unchanged) and does not move the
+/// referenced buffers.
+#[test]
+fn unreferenced_buffer_arguments_are_allocated() {
+    let mut s = scenarios::aliased_views();
+    let before = sched::plan_global_addresses(&s.module, &s.inputs).unwrap();
+    s.inputs.args.insert("zz_extra".into(), sched::ArgValue::Buffer { bytes: vec![7, 8, 9], valid: None });
+    let plan = sched::plan_global_addresses(&s.module, &s.inputs).unwrap();
+    assert!(plan.contains_key("zz_extra"));
+    assert_eq!(plan["zz_extra"] % 256, 0);
+    for (k, v) in &before {
+        assert_eq!(plan[k], *v, "{k} moved");
+    }
+    let o = run(&s);
+    completed(&o);
+    assert_eq!(o.outputs.buffers["zz_extra"].0, vec![7, 8, 9]);
 }
 
 /// Ruling: physical special registers read 0.
@@ -1165,4 +1186,71 @@ fn param_dependent_tensor_map_box() {
     completed(&a);
     completed(&b);
     assert_eq!(a.outputs.buffers["out"], b.outputs.buffers["out"]);
+}
+
+/// TMEM access footprints of a run, in delivery order: (kind, {(lane, byte)}).
+#[derive(Default)]
+struct TmemAccesses(Vec<(numsim_core::observe::AccessKind, std::collections::BTreeSet<(u8, u64)>)>);
+
+impl Observer for TmemAccesses {
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        if a.space == numsim_core::arena::Space::Tmem {
+            let set = a.spans.iter().flat_map(|s| (s.span.start..s.span.end()).map(move |b| (s.lane, b))).collect();
+            self.0.push((a.kind, set));
+        }
+    }
+}
+
+/// W5 (c06149c): `tcgen05.ld/st` observer spans cover exactly the cells
+/// each lane's pieces touch, identically on the run (fast) path and the
+/// per-piece (fallback) path.
+#[test]
+fn tcgen_ldst_spans_are_exact_on_both_paths() {
+    use numsim_core::arena::addr::tmem_byte_offset;
+    use numsim_core::observe::AccessKind;
+    let exact: std::collections::BTreeSet<(u8, u64)> =
+        (0..32u32).flat_map(|l| (0..16u64).map(move |b| (l as u8, tmem_byte_offset(l, 0) + b))).collect();
+    let go = |store: bool| {
+        let s = scenarios::tcgen_ld_wide(store);
+        let mut obs = TmemAccesses::default();
+        let cfg = RunConfig { validity: ValidityPolicy::ZeroAndReport, ..s.config.clone() };
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &cfg).expect("run starts");
+        completed(&o);
+        obs.0
+    };
+    // st (fallback: fresh TMEM), st (run path), ld (run path).
+    let fast = go(true);
+    let kinds: Vec<AccessKind> = fast.iter().map(|x| x.0).collect();
+    assert_eq!(kinds, vec![AccessKind::Write, AccessKind::Write, AccessKind::Read], "{kinds:?}");
+    for (k, set) in &fast {
+        assert_eq!(set, &exact, "{k:?}");
+    }
+    // ld of never-written cells (fallback path).
+    let slow = go(false);
+    assert_eq!(slow.len(), 1);
+    assert_eq!(slow[0], fast[2]);
+}
+
+/// Readonly-proxy contract (W5, c06149c; legacy `test_readonly_proxy`): a
+/// global write overlapping bytes read through `ld.global.nc`, in either
+/// order or from another partition, is an execution error; disjoint writes
+/// are fine.
+#[test]
+fn readonly_proxy_writes_are_rejected() {
+    for v in ["clean", "disjoint"] {
+        let o = run(&scenarios::readonly_proxy(v));
+        completed(&o);
+        assert_eq!(u32s(&o, "out"), (0..32).collect::<Vec<u32>>(), "{v}");
+    }
+    for v in ["after", "before", "cross_cta"] {
+        for workers in [1usize, 2] {
+            let s = scenarios::readonly_proxy(v);
+            let cfg = RunConfig { workers, ..s.config.clone() };
+            let o = run_cfg(&s, &cfg);
+            match &o.status {
+                RunStatus::Error(e) => assert!(e.message.contains("write overlaps readonly bytes"), "{v}: {e:?}"),
+                other => panic!("{v}: expected the readonly error, got {other:?}"),
+            }
+        }
+    }
 }

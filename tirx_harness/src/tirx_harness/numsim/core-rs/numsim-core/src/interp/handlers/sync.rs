@@ -972,6 +972,7 @@ pub fn clc_try_cancel(ctx: &mut ExecCtx<'_>, resp: Operand, mbar: Operand, multi
                 report: None,
                 lut_b: None,
                 strong: None,
+                restricted: false,
             },
         );
     }

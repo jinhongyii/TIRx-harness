@@ -776,6 +776,122 @@ pub fn tcgen_ld_st() -> Scenario {
     scenario("tcgen_ld_st", b.build_module(), inputs(vec![("out", u32_buf([0; 128]))]))
 }
 
+/// One warp, `tcgen05.st/ld.32x32b.x4` (4 consecutive cells per lane):
+/// with `store`, two stores (the first onto fresh, invalid TMEM: per-piece
+/// path; the second onto valid cells: run path) then a load (run path);
+/// without, only the load, of never-written cells (per-piece path; run
+/// with `ZeroAndReport`). Sites: st 2 and 5, ld 3. Observer spans must not
+/// depend on the path (W5, c06149c).
+pub fn tcgen_ld_wide(store: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("tcgen_ld_wide", 32);
+    let out = b.global("out", Dtype::U32);
+    let slot = b.shared("taddr", Dtype::U32, 1);
+    let tid = b.reg(Ty::U32);
+    let sa = b.reg(Ty::U32);
+    let t = b.reg(Ty::U32);
+    let v: Vec<Reg> = (0..4).map(|_| b.reg(Ty::U32)).collect();
+    b.thread_rank(tid);
+    let k0 = b.k_u32(0);
+    let k32 = b.k_u32(32);
+    b.smem_addr(sa, slot, k0);
+    b.push(Instr::TcgenAlloc { dst: sa.into(), ncols: k32, cta_group: 1, exclusive: false });
+    b.bar_sync(0);
+    b.ld_u32(t, slot, k0);
+    if store {
+        for site in [2, 5] {
+            b.site("tcgen_st", site);
+            b.push(Instr::TcgenSt(Box::new(TcgenStArgs {
+                srcs: vec![tid.into(), tid.into(), tid.into(), tid.into()],
+                taddr: t.into(),
+                row: k0,
+                col: k0,
+                shape: TcShape::S32x32b,
+                num: 4,
+                unpack: false,
+            })));
+            b.push(Instr::TcgenWait { st: true });
+        }
+    }
+    b.site("tcgen_ld", 3);
+    b.push(Instr::TcgenLd(Box::new(TcgenLdArgs {
+        dsts: v.clone(),
+        taddr: t.into(),
+        row: k0,
+        col: k0,
+        shape: TcShape::S32x32b,
+        num: 4,
+        pack: false,
+        red: None,
+        red_abs: false,
+        red_nan: false,
+        spcompress: false,
+    })));
+    b.push(Instr::TcgenWait { st: false });
+    b.no_site();
+    b.st_u32(out, tid, v[3]);
+    b.push(Instr::TcgenDealloc { taddr: t.into(), ncols: k32, cta_group: 1, exclusive: false });
+    b.push(Instr::TcgenRelinquish { cta_group: 1 });
+    b.exit();
+    scenario("tcgen_ld_wide", b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
+}
+
+/// Readonly-proxy contract (legacy `test_readonly_proxy`): lanes read
+/// `data[lane]` with `ld.global.nc` into `out`. `variant`:
+/// `"clean"` (no write), `"after"` / `"before"` (write `data[lane]` after /
+/// before the read: an error either way), `"disjoint"` (write
+/// `data[lane + 32]` before and after: clean), `"cross_cta"` (two CTAs in
+/// different partitions: CTA 0 reads, CTA 1 writes `data[lane]`: an error).
+pub fn readonly_proxy(variant: &str) -> Scenario {
+    let mut b = ProgramBuilder::new("readonly_proxy", 32);
+    let cross = variant == "cross_cta";
+    if cross {
+        b.grid(2, 1, 1);
+    }
+    let data = b.global("data", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let hi = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    b.lane_id(lane);
+    let k32 = b.k_u32(32);
+    b.add(Ty::U32, hi, lane, k32);
+    let write = |b: &mut ProgramBuilder, at: Reg| b.st_u32(data, at, lane);
+    let read = |b: &mut ProgramBuilder| {
+        b.push(Instr::Load { ty: Ty::U32, dst: v, buf: data, offset: lane.into(), sem: Sem::Weak, scope: Scope::Cta, mods: MemMods { nc: true, ..Default::default() } });
+        b.st_u32(out, lane, v);
+    };
+    match variant {
+        "after" => {
+            read(&mut b);
+            write(&mut b, lane);
+        }
+        "before" => {
+            write(&mut b, lane);
+            read(&mut b);
+        }
+        "disjoint" => {
+            write(&mut b, hi);
+            read(&mut b);
+            write(&mut b, hi);
+        }
+        "cross_cta" => {
+            b.read_special(cta, SpecialReg::CtaLinear);
+            let k0 = b.k_u32(0);
+            b.compare(CmpOp::Eq, Ty::U32, p, cta, k0);
+            b.if_(p);
+            read(&mut b);
+            b.else_();
+            write(&mut b, lane);
+            b.end_if();
+        }
+        _ => read(&mut b),
+    }
+    b.exit();
+    scenario("readonly_proxy", b.build_module(), inputs(vec![("data", u32_buf(0..64)), ("out", u32_buf([0; 32]))]))
+}
+
 /// Rows x cols of the TMA scenario's f32 tensor, and its box.
 pub const TMA_ROWS: u32 = 8;
 pub const TMA_COLS: u32 = 16;
@@ -3087,7 +3203,7 @@ pub fn tma_load_param_box() -> Scenario {
 /// Scenarios that are deliberately racy or only meaningful with a specific
 /// configuration (each test states its expectation): not in [`all`].
 pub fn special() -> Vec<Scenario> {
-    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), tmem_subword(), tmem_f16_rows(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE)]
+    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), tmem_subword(), tmem_f16_rows(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE), readonly_proxy("after"), readonly_proxy("cross_cta"), tcgen_ld_wide(false)]
 }
 
 /// Writes in [`word_history_overflow`] past `MAX_WORD_HISTORY`.
@@ -3097,6 +3213,9 @@ pub const MAX_HISTORY_PROBE: u32 = (crate::interp::aux::MAX_WORD_HISTORY as u32)
 pub fn all() -> Vec<Scenario> {
     vec![
         vector_add(),
+        tcgen_ld_wide(true),
+        readonly_proxy("clean"),
+        readonly_proxy("disjoint"),
         divergent_if_else(),
         nested_loops(),
         mbarrier_producer_consumer(),
