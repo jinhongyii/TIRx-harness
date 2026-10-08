@@ -23,7 +23,9 @@ from tvm_ffi import structural_map, structural_walk
 from tirx_harness import numsim
 from tirx_harness.numsim import v2
 
-from ._runnable import assert_clean, no_spec, race_access_pairs, requires_v2_engine
+from tests.numsim.v2.ports._racedeltas import assert_b7_scope_mismatch
+
+from ._runnable import assert_clean, race_access_pairs, requires_v2_engine
 from ._tcgen_kernels import SPARSE_B16_CASES, lut_b_case, sparse_float_case
 
 pytestmark = requires_v2_engine
@@ -45,13 +47,19 @@ def _no_spec_unlisted(what: str):
     )
 
 
-# test-migration.md no-spec item 11: CTA 0's qualifier-less
-# ``mbarrier.arrive.expect_tx.shared::cluster`` on CTA 1's barrier defaults to
-# ``.release.cta``; the new racecheck reports ``scope_mismatch`` against CTA 1's
-# ``.cta`` acquire where legacy was clean.
-_REMOTE_ARRIVE_DEFAULT_CTA_SCOPE = no_spec(
-    11, "default .cta scope of a qualifier-less remote mbarrier arrive (racecheck scope_mismatch)"
-)
+def _assert_clean_or_b7(checker, report):
+    """Synccheck: clean. Racecheck: racecheck delta B7 (formerly test-migration.md
+    no-spec item 11). CTA 0's qualifier-less
+    ``mbarrier.arrive.expect_tx.shared::cluster`` on CTA 1's barrier defaults to
+    ``.release.cta`` and does not include CTA 1's ``.cta`` ``mbarrier_wait``:
+    exactly one ``scope_mismatch`` (release warp 0 -> acquire warp 1), where
+    legacy was clean. The ``st.async`` bytes reach CTA 1 through their own
+    complete-tx (delta B3), so there is no follow-on race."""
+
+    if checker == "racecheck":
+        assert_b7_scope_mismatch(report, acquire_warps={1}, count=1)
+    else:
+        assert_clean(report)
 
 
 # -- griddepcontrol.wait --------------------------------------------------------
@@ -398,10 +406,7 @@ _ST_ASYNC_EXPECTED = np.array(
 )
 
 
-@pytest.mark.parametrize(
-    "checker",
-    ["synccheck", pytest.param("racecheck", marks=_REMOTE_ARRIVE_DEFAULT_CTA_SCOPE)],
-)
+@pytest.mark.parametrize("checker", CHECKERS)
 @pytest.mark.parametrize(
     "offset_form", ["instruction", "constant", "dynamic", "reversed", "subtracted", "wrapped"]
 )
@@ -411,31 +416,29 @@ def test_raw_st_async_preserves_mapped_remote_cta_ownership(offset_form, checker
     CTA 0 ``st.async``-es two disjoint 16-byte halves into CTA 1 through a
     ``mapa``-ed u32 address, the second half offset by an ``add.u32`` or by
     one of five equivalent u32 expressions. Both resolve to CTA 1's
-    ``destination``: the checker is clean, and NumSim reads back both halves.
-    The racecheck param is ``no_spec`` item 11 (see
-    ``_REMOTE_ARRIVE_DEFAULT_CTA_SCOPE``).
+    ``destination``: Synccheck is clean, and NumSim reads back both halves.
+    Racecheck is racecheck delta B7 (one ``scope_mismatch``; see
+    ``_assert_clean_or_b7``).
     """
 
     kernel = mapped_st_async_case(offset_form)
-    _check(checker, kernel, {"output": np.zeros(8, dtype=np.uint32)}).require_clean()
+    _assert_clean_or_b7(checker, _check(checker, kernel, {"output": np.zeros(8, dtype=np.uint32)}))
     result = v2.Engine().run(v2.transpile(kernel), {"output": np.zeros(8, dtype=np.uint32)})
     np.testing.assert_array_equal(result.outputs["output"], _ST_ASYNC_EXPECTED)
 
 
-@pytest.mark.parametrize(
-    "checker",
-    ["synccheck", pytest.param("racecheck", marks=_REMOTE_ARRIVE_DEFAULT_CTA_SCOPE)],
-)
+@pytest.mark.parametrize("checker", CHECKERS)
 def test_raw_st_async_mapped_expression_offsets_are_disjoint(checker):
     """Replaces ``tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_st_async_mapped_expression_offsets_are_disjoint[checker]``.
 
     The second remote ``st.async`` addresses ``remote_destination[0] + 16``
-    inline: its footprint is disjoint from the first, so the checker is clean
-    with no findings. The racecheck param is ``no_spec`` item 11.
+    inline: its footprint is disjoint from the first, so there is no race:
+    Synccheck is clean with no findings and Racecheck reports only racecheck
+    delta B7 (one ``scope_mismatch``; see ``_assert_clean_or_b7``).
     """
 
     report = _check(checker, raw_st_async_uses_mapped_u32_expression_offset, {"output": np.zeros(8, dtype=np.uint32)})
-    assert_clean(report)
+    _assert_clean_or_b7(checker, report)
 
 
 # -- tcgen05 sparse-B16 / LUT-B async read lifetimes -----------------------------

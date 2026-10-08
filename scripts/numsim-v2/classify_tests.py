@@ -79,6 +79,19 @@ OVERRIDES: dict[str, tuple[str, str, str]] = {
     # with no semantic assert left once the pin is stripped.
     "tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_g2s_cluster_dynamic_predicate_transpiles": (
         "C", "delete", "only asserts the legacy resolved PTX op-name set"),
+    # W1 public-API triage (001a09f): out of scope for v2, deleted.
+    "tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_supports_float16_payloads": (
+        "E", "delete", "W1 001a09f: replicated TMEM view (contract item 29 fail-closed)"),
+    "tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_expands_tlane_replicas": (
+        "E", "delete", "W1 001a09f: replicated TMEM view (contract item 29 fail-closed)"),
+    "tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_supports_rank3_multi_instruction_layout": (
+        "E", "delete", "W1 001a09f: replicated TMEM view (contract item 29 fail-closed)"),
+    "tests/numsim/runtime/test_tile_general_semantics.py::test_mxfp4_uses_ue8m0_scales_over_32_element_vectors": (
+        "E", "delete", "W1 001a09f: replicated TMEM view (contract item 29 fail-closed)"),
+    "tests/numsim/runtime/test_dense_mma_forms.py::test_legacy_m16n8k32_int8_reuses_dense_form_and_engine": (
+        "E", "delete", "W1 001a09f: ptx_legacy surface, out of scope"),
+    "tests/numsim/runtime/test_matrix_memory_domain_oracle.py::test_legacy_ldmatrix_x1_domain_matches_independent_fragment_mapping": (
+        "E", "delete", "W1 001a09f: ptx_legacy surface, out of scope"),
     "tests/test_dump_kernel.py": ("F", "keep", "dump_kernel tool"),
     "tests/test_packaging.py": ("F", "keep", "packaging"),
     "tests/test_skills.py": ("F", "keep", "skills CLI"),

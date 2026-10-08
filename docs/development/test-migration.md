@@ -77,7 +77,7 @@ module-local `_run_*` helpers. Using such an API only as the way to run the
 kernel does not make a test C; the test is classified by what it asserts. A
 test is C only when it asserts about the private API itself.
 
-## Counts (2026-10-08, after phase 3)
+## Counts (2026-10-08, phase 5, 2a5895a)
 
 | directory | A | B | C | D | E | F | N | total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -89,36 +89,33 @@ test is C only when it asserts about the private API itself.
 | conformance |  |  |  |  |  |  | 2 | 2 |
 | numsim/abi |  |  | 3 |  |  |  |  | 3 |
 | numsim/corpus | 29 |  |  |  |  | 23 |  | 52 |
-| numsim/integration | 325 | 3 | 140 |  | 39 | 3 |  | 510 |
+| numsim/integration | 322 | 3 | 140 |  | 42 | 3 |  | 510 |
 | numsim/microtests |  |  | 1 | 55 |  |  |  | 56 |
 | numsim/registry | 17 |  | 81 |  | 1 |  |  | 99 |
-| numsim/runtime | 608 | 33 | 67 |  | 15 | 5 |  | 728 |
-| numsim/v2 |  |  |  |  |  |  | 98 | 98 |
-| **total** | **1004** | **279** | **389** | **55** | **55** | **44** | **100** | **1926** |
+| numsim/runtime | 605 | 33 | 67 |  | 18 | 5 |  | 728 |
+| numsim/v2 |  |  |  |  |  |  | 214 | 214 |
+| **total** | **998** | **279** | **389** | **55** | **61** | **44** | **216** | **2042** |
 
 | A target | public facade only | imports legacy internals |
 | --- | ---: | ---: |
 | conformance | 19 | 22 |
 | v2-api | 0 | 23 |
-| v2-kernel-case | 439 | 501 |
+| v2-kernel-case | 433 | 501 |
 
 | category | target / status | tests |
 | --- | --- | ---: |
 | A | conformance | 41 |
 | A | v2-api | 23 |
-| A | v2-kernel-case | 940 |
+| A | v2-kernel-case | 934 |
 | B | covered | 88 |
-| B | needs_kernel | 1 |
 | B | ported | 139 |
-| B | v2_kernel_test | 51 |
+| B | v2_kernel_test | 52 |
 | C | delete | 389 |
 | D | D-live | 48 |
 | D | D-recorded | 7 |
-| E | delete | 55 |
+| E | delete | 61 |
 | F | keep | 44 |
-| N | keep | 100 |
-
-cvt goldens: 133 recorded forms in Python, 133 generated numsim-oplib tests
+| N | keep | 216 |
 
 **E (tile forms TVM rejects).** The list was regenerated from scratch rather
 than copied from W1:
@@ -424,28 +421,24 @@ files still parse, and exactly the selected functions disappear. **Do not run
 it without `--dry-run` yet**: legacy remains the oracle until conformance is
 complete.
 
-Wave sizes:
+Wave sizes (dry run at 2a5895a plus the working tree; waves 2 and 4 run the
+replacements first):
 
-- wave 0: 1 file, plus 54 functions in 11 files;
-- wave 1: 26 files (92 tests), plus 135 functions in 26 files;
-- wave 2 (gated; dry run at 4d6b93f plus the working tree): 1 file (2 tests),
-  plus 30 functions in 12 files. 20 rows are held because a replacement is
-  still xfail.
-- wave 4 (gated; dry run at 23b4364 plus the working tree): 5 files
-  (6 tests), plus 47 functions in 19 files. These are the 52 functions whose
-  v2 copies pass. 269 public functions `flip` (they already pass unchanged
-  under v2). 124 are held. `v2_public_status.tsv` was refreshed from the
-  23b4364 run: 449 of 762 items pass. Its pin and stats ports are mapped in
-  `v2_ports_{messages,internals,reductions,stats}.tsv`.
+- wave 0: 1 file, plus 60 functions in 14 files. This includes the six W1
+  out-of-scope tests (001a09f): the three `tcgen_cp_*` replicated-TMEM-view
+  tests, `mxfp4_uses_ue8m0`, `legacy_m16n8k32_int8` and `legacy_ldmatrix_x1`.
+- wave 1: 26 files (92 tests), plus 135 functions in 26 files.
+- wave 2: 1 file (2 tests), plus 36 functions in 14 files. 14 rows are held.
+- wave 4: 9 files (11 tests), plus 71 functions in 31 files, i.e. 82 retired
+  functions. 310 public functions flip. 48 are held.
 - wave 5b: 43 files (192 tests), plus 197 functions in 51 files. Run
-  `--wave 5b --markdown` for that list; it is long and changes as A-internal
-  tests are ported.
+  `--wave 5b --markdown` for the list.
 
-Paths are relative to `tirx_harness/`.
+Port maps used by wave 4: `coverage/v2_ports_{messages,internals,reductions,stats,triage,deltas,racedeltas,w1triage}.tsv`.
 
 ### Wave 0 (E: tile forms TVM's dispatch rejects)
 
-Wave 0: 1 whole files (1 tests), 54 functions cut from 11 files.
+Wave 0: 1 whole files (1 tests), 60 functions cut from 14 files.
 
 ```bash
 cd tirx_harness
@@ -456,9 +449,12 @@ git rm tests/numsim/registry/test_tile_dispatch_invariance.py
 - `tests/numsim/integration/test_gemm_async_artifact.py`: `test_dense_gemm_async_gathers_physical_operands_and_accumulates_tmem`, `test_dense_fp8_gemm_async_matches_numpy`, `test_dense_gemm_async_no_swizzle_descriptor_matches_numpy`, `test_thread_scope_gemm_async_requires_one_runtime_issuer`, `test_dense_gemm_async_rejects_wrong_tmem_a_layout`, `test_dense_gemm_async_rejects_declared_geometry_that_disagrees_with_operands`, `test_tile_tf32_gemm_async_fails_closed`, `test_cta_group2_m64_tcgen_mma_uses_layout_b_independently_of_declared_layout`, `test_cta_group2_routes_each_pair_within_a_four_cta_cluster`, `test_dense_gemm_async_handles_repeated_dynamic_index_loads`, `test_dense_gemm_async_runs_numpy_backend_on_two_cluster_workers`, `test_cta_group2_gathers_both_shared_shards_and_scatters_tmem`, `test_cta_group2_gathers_both_tmem_a_shards`, `test_all_inactive_gemm_async_is_a_noop`
 - `tests/numsim/integration/test_permute_layout_artifact.py`: `test_shared_permute_layout_copies_logical_values_between_physical_layouts`, `test_explicit_permute_layout_dispatch_uses_canonical_semantics`, `test_global_permute_layout_writes_destination_physical_order`, `test_shared_permute_layout_zero_fills_only_uninitialized_padding`, `test_shared_permute_layout_zero_fills_fp16_padding`, `test_shared_permute_layout_zero_fills_bf16_padding`, `test_shared_permute_layout_zero_fills_fp8_padding`
 - `tests/numsim/integration/test_reported_layout_regressions.py`: `test_tma_reductions_are_atomic_but_plain_overlapping_stores_still_race`, `test_singleton_outer_gemm_operand_reaches_each_semantic_checker`, `test_warp_gemm_rejects_an_outer_single_lane_election`, `test_warpgroup_tile_op_allows_independent_full_warp_participation`, `test_warpgroup_tile_op_rejects_partial_warp_participation`, `test_numsim_rejects_a_misaligned_tma_shared_component`, `test_checkers_reject_a_misaligned_tma_shared_component`, `test_checkers_accept_an_aligned_tma_tensor_issue`
-- `tests/numsim/integration/test_tcgen_transfer_artifact.py`: `test_tcgen_ldst_rejects_tmem_layout_outside_fixed_instruction_abi`, `test_tcgen_cp_rejects_destination_lane_permutation`, `test_tcgen_cp_rejects_declared_shape_that_disagrees_with_layout`
+- `tests/numsim/integration/test_tcgen_transfer_artifact.py`: `test_tcgen_cp_expands_tlane_replicas`, `test_tcgen_cp_supports_rank3_multi_instruction_layout`, `test_tcgen_cp_cta_group2_supports_float16_payloads`, `test_tcgen_ldst_rejects_tmem_layout_outside_fixed_instruction_abi`, `test_tcgen_cp_rejects_destination_lane_permutation`, `test_tcgen_cp_rejects_declared_shape_that_disagrees_with_layout`
+- `tests/numsim/runtime/test_dense_mma_forms.py`: `test_legacy_m16n8k32_int8_reuses_dense_form_and_engine`
+- `tests/numsim/runtime/test_matrix_memory_domain_oracle.py`: `test_legacy_ldmatrix_x1_domain_matches_independent_fragment_mapping`
 - `tests/numsim/runtime/test_runtime_form_domain_oracles.py`: `test_snapshot_copy_variable_min_runtime_domain_has_exact_oracle`
 - `tests/numsim/runtime/test_tile_codegen.py`: `test_fp8_register_to_shared_owner_copy_runs_in_numsim`, `test_forced_elementwise_dispatch_does_not_change_local_semantics`, `test_typed_tma_reduce_rejects_non_store_direction`, `test_typed_tma_rejects_unknown_cache_hint`, `test_cta_copy_uses_canonical_semantics_independent_of_dispatch`
+- `tests/numsim/runtime/test_tile_general_semantics.py`: `test_mxfp4_uses_ue8m0_scales_over_32_element_vectors`
 - `tests/numsim/runtime/test_tile_owner_transport.py`: `test_pointwise_transports_unique_owners_across_warps`, `test_cast_unary_and_binary_share_owner_transport`
 - `tests/numsim/runtime/test_tile_reduction_variants.py`: `test_shared_cta_reductions_support_float16_and_scope_completion`, `test_shared_cta_accum_reduction_writes_each_output_once`, `test_shared_reduction_uses_lexicographic_order`, `test_empty_reduction_axes_follow_identity_reduction_semantics`
 - `tests/numsim/runtime/test_tile_unary_codegen.py`: `test_fill_accepts_untyped_python_literals`, `test_fill_accepts_an_integer_literal_wider_than_int32`
@@ -524,6 +520,169 @@ git rm tests/numsim/runtime/test_tensormap_publication.py
 - `tests/numsim/runtime/test_tma_im2col_multiissuer.py`: `test_im2col_multiissuer_requires_completion_wait`
 - `tests/numsim/runtime/test_tma_multiissuer.py`: `test_tma_multiissuer_requires_wait_and_disjoint_destinations`
 - `tests/numsim/runtime/test_wait_until.py`: `test_wait_has_its_own_hb_event`, `test_a_wait_that_waits_for_both_arrivals_may_read_both`, `test_a_wait_that_waits_for_one_arrival_may_not_read_the_other`, `test_a_wait_woken_by_a_plain_write_reports_the_missing_edge`, `test_a_wait_on_a_word_that_carries_its_own_payload_is_clean`
+
+## Step 5: final deletion plan (dry run, 2a5895a + working tree)
+
+`scripts/numsim-v2/retire_legacy.py --dry-run [--list]` prints the whole
+step. `--apply` performs it, and refuses while the blockers below remain
+unless given `--force`. It has not been run.
+
+### What goes
+
+- **Legacy code (240 tracked files).** Removed with `git rm`:
+  - `numsim/engine-rs/` (126 files)
+  - `tirx_harness/frontend-rs/` (90 files)
+  - `numsim/transpiler/` (14 files)
+  - `api.py`, `bindings.py`, `checker_runner.py`, `checkers.py`,
+    `checker_report.py`, `checker_render.py`, `abi.py`, `host_abi.py`,
+    `value_analysis.py`
+  - the `thirdparty/tvm-rust-ext` submodule and its `.gitmodules` entry
+  - the untracked `_tvm_rust_ext.abi3.so`, `.identity` and
+    `_thirdparty_licenses/`
+- **Legacy tests.** The union of waves 0, 1, 2, 4 and 5b removes 92 test
+  files (420 tests) and cuts 375 functions from 85 files. 4 support modules
+  are left with no importer: `racecheck/_native_race_trace.py`,
+  `support/paths.py`, `support/runtime_cases.py` and
+  `support/tirx_device_surface.py`. Wave 3 (corpus gates) is added once
+  conformance matches.
+- **Migration tooling that needs a legacy capture:** `capture_plugin.py`,
+  `tile_rejections.py` and `lower_sweep.py`.
+
+### What stays or moves (v2 imports it)
+
+- **Kept:**
+  - `numsim/errors.py`;
+  - `numsim/cases.py` (public `TensorMap` / `Im2col` / `NumSimCase` /
+    `ComparisonSpec`; v2 `run.py` decodes `cases.TensorMap` images);
+  - `dtype_abi.py` + `dtype_registry.json` (used by `cases`);
+  - `report.py` (`Mismatch`, `NumSimReport`).
+- **Moved:**
+  - The `compare` closure of `api.py` (169 lines: `NumSimResult`,
+    `_comparison_*`, `compare`) moves to `v2/compare.py`, extracted from the
+    AST. `v2/report.py` imports it from there.
+  - `engine-rs/SUPPORTED_OPS.md` moves to `numsim-oplib/`, because
+    `gen_registry.py` reads it.
+
+### What is rewritten
+
+The script generates these files:
+
+- `tirx_harness/__init__.py`: `racecheck` and `synccheck` call `numsim.v2`.
+- `numsim/__init__.py`: re-exports v2 plus `cases` and `errors`.
+- `setup.py`: builds `numsim_core_py` (`cargo build -p numsim-py --features
+  extension-module`) instead of the tvm-rust-ext frontend; the sdist
+  submodule copy is dropped.
+- `MANIFEST.in`
+- `gen_registry.py`
+
+These are checklist items in the plan, edited by hand:
+
+- `tests/conftest.py`: drop the `NUMSIM_IMPL` shim.
+- `tests/conformance/{snapshot.py,test_conformance.py,README.md}`: v2 is
+  the implementation, the snapshots are the oracle, and a regeneration only
+  writes `<mode>.delta.json` naming a delta row.
+- `tests.yml`: the submodule step becomes a `build_dev.sh` step, plus
+  `cargo test --workspace`.
+- `build_wheels.yml`
+- `scripts/smoke_wheel.py`
+- `numsim/{CLAUDE,AGENTS}.md`
+- `support/paths.py`
+- optionally, `NUMSIM_V2_*` becomes `NUMSIM_*` in `v2/options.py`.
+
+### Docs
+
+The submodule line is removed from `docs/optimization-runs.md`,
+`docs/installation.md`, `tests/CLAUDE.md` and `tests.yml`.
+
+There are 26 `(pending: ...)` markers:
+
+- **13 resolve on deletion** and are removed:
+  - README:47
+  - api/checkers:29
+  - api/index:19
+  - api/inputs:102
+  - api/numsim:10
+  - components/tools:39
+  - architecture:16 and 215
+  - installation:22, 54 and 71
+  - numsim/CLAUDE:5 and AGENTS:5
+- **10 need a decision made as part of step 5**, and are listed by the
+  script:
+  - the snapshot policy: architecture:164 and 191, CLAUDE:43 and AGENTS:43;
+  - the `NUMSIM_V2_` prefix (api/numsim:134);
+  - the `NumSimBuildError` type (api/numsim:163);
+  - the report exception class (api/checkers:67);
+  - the operation-table move (tools:162);
+  - single-launch entry points (tools:431);
+  - `InputError` versus `incomplete` (tools:440).
+- **3 stay:** the `"auto"` worker count and the backend decision (2).
+
+Installation:22 needs a reread when it is removed. A Cargo toolchain is still
+needed to build `numsim_core_py`, and also for the codegen backend if that
+backend survives.
+
+### Blockers (what must be green under v2 before deletion)
+
+I ran fresh `NUMSIM_IMPL=v2` runs at 2a5895a:
+
+- public-API A: 544 of 755 items pass;
+- internal-surface A: 518 of 793 items pass.
+
+The internal-surface tests run under the same shim, because their legacy
+imports still resolve today. `coverage/step5_a_status.tsv` places every A
+function:
+
+| step-5 bucket | public | internal | what happens |
+| --- | ---: | ---: | --- |
+| flip (passes unchanged under v2) | 310 | 275 | Kept. Internal files only lose their module-level legacy import. |
+| retired: a passing v2 copy exists (wave 4) | 75 | 5 | Deleted. |
+| gpu-only (skipped without a GPU) | 4 | 0 | Decided with the microtests. |
+| **needs-port** (fails only on pins) | 6 | 56 | W9: a v2 copy or a kind assertion. |
+| **uses-legacy-internals** (the test calls `analyze` ×67, `verify` ×15, `_descriptor_storage` ×10, `prepare_bindings` ×8, `emit_rust_module` ×8, …) | 0 | 96 | Port to `v2.transpile` / `Program` assertions, or delete if the assertion is the pin. |
+| **blocked-v2** (v2 behaviour differs, no ruling) | 38 | 92 | Owner work. |
+
+The `blocked-v2` functions break down by class:
+
+- **Public:** engine-stops 20, other-assertion 5, the 4 bugs filed under
+  `CONTRACT_REQUESTS.md` "W9-public-API", synccheck-verdict 4,
+  lowering-rejects 3, racecheck-verdict 2, v2 accepts a legacy rejection 1.
+- **Internal:** other-assertion 40 (not triaged yet), engine-stops 24,
+  lowering-rejects 16, v2 accepts a legacy rejection 12.
+
+The other blockers:
+
+- **Conformance itself.** `tests/numsim/corpus/kernels/state_update.py`
+  imports the legacy `host_abi` and `transpiler.frontend` at module level.
+  `attention.py` and `native_multishape.py` import `bindings` helpers. These
+  modules are reached through `canonical_cases`, so deleting the legacy
+  modules breaks `tests/conformance` at import. Port these three fixture
+  modules first; this is the hard blocker.
+- **Surviving modules that import deleted code.** 85 surviving test or
+  support modules import a deleted legacy module (`--list` shows them).
+  Besides the corpus fixtures, these include:
+  - `microtests/harness.py` (`bindings.prepare_bindings`), which affects
+    every D test: switch it to the v2 binder, then run the microtests once
+    on a GPU under v2;
+  - `support/three_way.py` (`bindings`, `host_abi`, `analyze`), which
+    affects the corpus GPU three-way tests;
+  - `support/manifest.py`;
+  - the A-internal files above.
+- **Held replacements.** 14 wave-2 rows and the wave-4 holds have a v2
+  replacement that is still xfail (`v2_gap` or `no_spec`).
+- **Wave 3 (corpus gates).** It retires once the remaining racecheck
+  conformance cases match (90 of 98 with oracle at 43b3e2f).
+
+In short, step 5 can run when:
+
+1. the corpus fixture modules and the microtest harness are ported to v2;
+2. the 62 `needs-port` and 96 `uses-legacy-internals` A functions are ported
+   or deleted;
+3. the 130 `blocked-v2` functions are fixed, ruled with a delta row, or
+   accepted as failures to delete;
+4. the held replacements pass.
+
+The rest (585 flips, 80 retired copies, waves 0, 1 and 5b) is mechanical.
+
 
 ## Semantics in legacy tests that no new spec mentions
 

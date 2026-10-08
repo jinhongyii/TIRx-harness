@@ -126,7 +126,7 @@ def test_warp_collectives_reject_invalid_participant_contracts():
                 "output": output,
             },
         )
-    _assert_stop(excinfo, {"divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
 
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(
@@ -137,7 +137,7 @@ def test_warp_collectives_reject_invalid_participant_contracts():
                 "output": output,
             },
         )
-    _assert_stop(excinfo, {"divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
 
     inconsistent = np.full(32, np.uint32(0xFFFFFFFF), dtype=np.uint32)
     inconsistent[7] = np.uint32(0xFFFFFFFE)
@@ -146,7 +146,7 @@ def test_warp_collectives_reject_invalid_participant_contracts():
             module,
             {"participant_masks": inconsistent, "active_count": active_count, "output": output},
         )
-    _assert_stop(excinfo, {"divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
 
     active_count[0] = np.int32(16)
     with pytest.raises(NumSimExecutionError) as excinfo:
@@ -158,7 +158,7 @@ def test_warp_collectives_reject_invalid_participant_contracts():
                 "output": output,
             },
         )
-    _assert_stop(excinfo, {"divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
 
 
 # -- tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py ----------
@@ -225,7 +225,7 @@ def invalid(source: T.Buffer((64,), "uint32")):
     )
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(v2.transpile(kernel), {"source": np.zeros(64, np.uint32)})
-    _assert_stop(excinfo, {"divergence", "misaligned"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence", "misaligned"})
 
 
 # -- tests/numsim/runtime/test_ordering_calls.py -----------------------------
@@ -270,7 +270,7 @@ def test_setmaxnreg_rejects_warp_disagreement_within_one_occurrence():
     module = v2.transpile(setmaxnreg_warp_disagreement)
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(module, {"output": np.zeros(1, dtype=np.int32)})
-    _assert_stop(excinfo, {"divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
 
 
 # -- tests/numsim/runtime/test_packed_float4_global_views.py -----------------

@@ -680,6 +680,15 @@ def _core(row: dict, variant: str, w: str) -> float | None:
     return run["min"]["run"] + run["min"]["check"]
 
 
+def _ns_per_instr(row: dict, w: str) -> float | None:
+    """Interp native run time per executed warp instruction (``stats.instrs``)."""
+
+    run = row.get("runs", {}).get("interp", {}).get(w)
+    if not run or not run.get("stats", {}).get("instrs"):
+        return None
+    return 1e9 * run["min"]["run"] / run["stats"]["instrs"]
+
+
 def cmd_render(args: argparse.Namespace) -> int:
     results = Path(args.results)
     cases = [json.loads(p.read_text()) for p in sorted(results.glob("*.json"))]
@@ -780,9 +789,10 @@ def cmd_render(args: argparse.Namespace) -> int:
         "dispatch overhead is what codegen removes. Rows bucketed by heavy share, codegen O1 vs interp "
         "core-time geomean at the largest worker count measured:\n")
     w = workers[-1] if workers else None
-    add("| mode | bucket | rows | O1 vs interp (core) | O3 vs interp (core) | interp vs legacy (engine) |")
-    add("| --- | --- | --- | --- | --- | --- |")
-    buckets = (("scalar-heavy (heavy < 2%)", 0, 2), ("mixed (2-8%)", 2, 8), ("tile/TMA/MMA-heavy (>= 8%)", 8, 101))
+    add("| mode | bucket | rows | interp ns per warp instr (median) | O1 vs interp (core) | O3 vs interp (core) | interp vs legacy (engine) |")
+    add("| --- | --- | --- | --- | --- | --- | --- |")
+    buckets = (("pure scalar (no heavy instrs)", 0, 1e-9), ("scalar-dominated (heavy < 1.5%)", 1e-9, 1.5),
+               ("tile/TMA/MMA-rich (heavy >= 1.5%)", 1.5, 101))
     for mode in MODES:
         for label, lo, hi in buckets:
             rows = [c["modes"][mode] for c in cases if c.get("modes", {}).get(mode, {}).get("status") == "ok"
@@ -793,7 +803,10 @@ def cmd_render(args: argparse.Namespace) -> int:
             o1 = geomean([_core(r, "interp", w) / _core(r, "codegen-O1", w) for r in rows])
             o3 = geomean([_core(r, "interp", w) / _core(r, "codegen-O3", w) for r in rows if _core(r, "codegen-O3", w)])
             il = geomean([_engine(r, "legacy", w) / _engine(r, "interp", w) for r in rows if _engine(r, "legacy", w)])
-            add(f"| {mode} | {label} | {len(rows)} | {fmt_x(o1)} | {fmt_x(o3)} | {fmt_x(il)} |")
+            nspi = [_ns_per_instr(r, w) for r in rows]
+            nspi = [x for x in nspi if x]
+            add(f"| {mode} | {label} | {len(rows)} | {statistics.median(nspi):.0f} | {fmt_x(o1)} | {fmt_x(o3)} | {fmt_x(il)} |"
+                if nspi else f"| {mode} | {label} | {len(rows)} | - | {fmt_x(o1)} | {fmt_x(o3)} | {fmt_x(il)} |")
     add("")
 
     # Per-case tables.
@@ -804,14 +817,15 @@ def cmd_render(args: argparse.Namespace) -> int:
             if not rows:
                 continue
             add(f"## {mode}, max_workers={w}\n")
-            add("| case | heavy% | dyn instrs | legacy | interp | O1 | O1 cold build | O3 | O3 cold build | interp/legacy | O1/legacy | O3/legacy | core interp | core O1 | core O3 | cg/int core |")
-            add("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+            add("| case | heavy% | dyn instrs | ns/instr | legacy | interp | O1 | O1 cold build | O3 | O3 cold build | interp/legacy | O1/legacy | O3/legacy | core interp | core O1 | core O3 | cg/int core |")
+            add("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
             for c, r in sorted(rows, key=lambda cr: cr[0]["case"]):
                 leg, it, o1, o3 = (_engine(r, v, str(w)) for v in VARIANTS)
                 cold_ = c.get("codegen_cold", {})
                 instrs = r["runs"]["interp"][str(w)].get("stats", {}).get("instrs")
                 ci, c1, c3 = (_core(r, v, str(w)) for v in ("interp", "codegen-O1", "codegen-O3"))
                 add(f"| `{c['case']}` | {c.get('instr_mix', {}).get('heavy_pct', 0):.1f} | {instrs if instrs is not None else '-'} | "
+                    f"{(f'{_ns_per_instr(r, str(w)):.0f}' if _ns_per_instr(r, str(w)) else '-')} | "
                     f"{fmt_s(leg)} | {fmt_s(it)} | {fmt_s(o1)} | {fmt_s(cold_.get('codegen-O1', {}).get('build_s'))} | "
                     f"{fmt_s(o3)} | {fmt_s(cold_.get('codegen-O3', {}).get('build_s'))} | "
                     f"{fmt_x(leg / it if leg and it else None)} | {fmt_x(leg / o1 if leg and o1 else None)} | "

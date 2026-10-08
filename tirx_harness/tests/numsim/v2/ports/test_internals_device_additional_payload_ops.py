@@ -1529,18 +1529,20 @@ _GAPS = {
         "tirx.cuda.sm100_2sm_leader_smem_addr ... has no faithful pure-value model' "
         "(numsim's shared::cluster address encoding differs from the hardware bit 24)"
     ),
-    "raw_tcgen_mma_tf32_ts_predicated": v2_gap(
-        "synccheck verdict incomplete: analysis_incomplete 'Unsupported: not modeled: "
-        "tmem[4352]: tmem lane 32 is outside warp 0's sub-partition' (direct TMEM "
-        "buffer store from warp 0 to lanes 32..63; legacy accepted it)"
-    ),
 }
+
+
+# Covered by test_triage_device_additional_payload_ops.py, which asserts the
+# delta behaviour (bad_address: a TMEM buffer store outside the issuing warp's
+# sub-partition fails closed; CONTRACT_REQUESTS.md batch 2 item 17).
+_ELSEWHERE = {"raw_tcgen_mma_tf32_ts_predicated"}
 
 
 def _params():
     return [
         pytest.param(name, marks=(_GAPS[name],) if name in _GAPS else (), id=name)
         for name in _BY_NAME
+        if name not in _ELSEWHERE
     ]
 
 
