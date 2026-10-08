@@ -120,7 +120,12 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
             });
             let kept = cmds
                 .iter()
-                .filter(|pc| keep(&pc.cmd, pc.observed_parity) && !matches!(pc.cmd, SyncCmd::TcgenGroup(_)))
+                // `TcgenGroup` is checked statically; `TcgenWork` commands are
+                // total and never block, so they carry no protocol state the
+                // search needs (and would couple every commit's barriers).
+                .filter(|pc| {
+                    keep(&pc.cmd, pc.observed_parity) && !matches!(pc.cmd, SyncCmd::TcgenGroup(_) | SyncCmd::TcgenWork(_))
+                })
                 .map(|pc| (intern(pc.res), pc.cmd))
                 .collect::<Vec<_>>();
             let issued = issued

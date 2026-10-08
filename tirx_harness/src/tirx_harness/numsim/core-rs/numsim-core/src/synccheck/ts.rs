@@ -111,6 +111,9 @@ pub struct LocalCmd {
     /// HB gate: `(local warp, count)` - that warp must have returned from its
     /// first `count` projection commands.
     pub gate: Box<[(u32, u32)]>,
+    /// Reference-run generations (gated projections only): the gates are
+    /// justified only while the search reproduces them (review S5).
+    pub ref_gens: Option<(Vec<Option<u64>>, Vec<Option<u64>>)>,
 }
 
 pub struct Ts<'p> {
@@ -199,6 +202,7 @@ impl<'p> Ts<'p> {
                 issued,
                 conditional: c.conditional,
                 gate: Box::new([]),
+                ref_gens: None,
             });
         }
         let programs = warps
@@ -262,6 +266,8 @@ impl<'p> Ts<'p> {
                 }
             }
             self.cmds[c].gate = gate.into_boxed_slice();
+            let g = self.cmds[c].global;
+            self.cmds[c].ref_gens = Some((reference.gens[g].clone(), reference.issued_gens[g].clone()));
         }
     }
 
@@ -440,6 +446,20 @@ impl<'p> Ts<'p> {
         }
         pending.sort_by_key(|p| (p.cmd, p.ord));
         next.pending = pending.into_boxed_slice();
+        if let Some((gens, issued)) = &lc.ref_gens {
+            if *gens != fx.gens || *issued != fx.issued_gens {
+                return Tried::Error(TsError {
+                    cmd: Some(lc.global),
+                    kind: ErrKind::Incomplete {
+                        reason: "generation_assignment_differs",
+                        detail: format!(
+                            "this schedule assigns generations {:?}/{:?}, the reference run {gens:?}/{issued:?}; the happens-before gates of this projection do not hold",
+                            fx.gens, fx.issued_gens
+                        ),
+                    },
+                });
+            }
+        }
         match retry {
             Some(rc) => {
                 for &w in &lc.participants {
@@ -684,6 +704,58 @@ impl<'p> Ts<'p> {
     }
 }
 
+impl Ts<'_> {
+    /// Thread count of a named-barrier contribution `t` makes, if any.
+    fn cmds_named_count(&self, t: &Transition) -> Option<u64> {
+        let Transition::Issue(c) = *t else { return None };
+        self.cmds[c as usize].cmds.iter().find_map(|(_, cmd)| match cmd {
+            SyncCmd::Named(named::Cmd::Arrive(k) | named::Cmd::Sync(k) | named::Cmd::Red(k)) => Some(k.count),
+            _ => None,
+        })
+    }
+
+    /// The resource, class and `(warp, position)` of a candidate transition.
+    fn candidate(&self, s: &State, t: &Transition) -> Option<(usize, backend::Class, Vec<(usize, usize)>)> {
+        let class_of = |cmds: &mut dyn Iterator<Item = SyncCmd>| -> backend::Class {
+            let mut class = None;
+            for c in cmds {
+                class = Some(match (class, backend::classify(&c)) {
+                    (None, k) => k,
+                    (Some(backend::Class::Observer), backend::Class::Observer) => backend::Class::Observer,
+                    (Some(backend::Class::Contributor(a)), backend::Class::Contributor(b)) => backend::Class::Contributor(a + b),
+                    _ => backend::Class::Other,
+                });
+            }
+            class.unwrap_or(backend::Class::Other)
+        };
+        match *t {
+            Transition::Issue(c) => {
+                let lc = &self.cmds[c as usize];
+                let mut rs = lc.cmds.iter().map(|(r, _)| *r).chain(lc.issued.iter().map(|(r, _, _)| *r)).collect::<Vec<_>>();
+                rs.sort_unstable();
+                rs.dedup();
+                let [r] = rs[..] else { return None };
+                let class = class_of(&mut lc.cmds.iter().map(|(_, c)| *c));
+                Some((r, class, lc.participants.iter().copied().zip(lc.positions.iter().copied()).collect()))
+            }
+            Transition::Resume(w) => {
+                let (r, cmd) = s.retry[w as usize]?;
+                Some((r as usize, backend::classify(&cmd), vec![(w as usize, s.cursors[w as usize] as usize)]))
+            }
+            Transition::Complete(c, o) => {
+                let p = s.pending.iter().find(|p| (p.cmd, p.ord) == (c, o))?;
+                let class = match p.kind {
+                    PendingKind::Tx { .. } => backend::Class::Contributor(0),
+                    PendingKind::Arrive { count, after: None, .. } => backend::Class::Contributor(count),
+                    _ => backend::Class::Other,
+                };
+                Some((p.res as usize, class, Vec::new()))
+            }
+            _ => None,
+        }
+    }
+}
+
 impl TransitionSystem for Ts<'_> {
     type State = State;
     type Transition = Transition;
@@ -704,6 +776,106 @@ impl TransitionSystem for Ts<'_> {
     }
     fn describe_deadlock(&self, s: &State) -> Deadlock {
         Ts::describe_deadlock(self, s)
+    }
+
+    /// Strong-diamond proof obligation beyond one step (review S8). `t` is
+    /// independent of everything that can run before it when, on its only
+    /// resource `r`, every command that may still run first (every
+    /// un-issued command of another warp that is not HB-gated behind `t`,
+    /// every pending completion, every registered retry) is an observer or a
+    /// contributor, and their arrivals together cannot complete `r`'s open
+    /// phase. Then no such sequence can complete a phase, so contributions
+    /// commute (counters), observers keep their verdicts, and `t` stays
+    /// enabled with the same effect. If `t` is itself a contributor and could
+    /// complete the phase together with them, mbarrier observers must be
+    /// absent (completion would disable them).
+    fn independent_of_future(&self, s: &State, t: &Transition) -> bool {
+        let Some((r, class, at)) = self.candidate(s, t) else { return false };
+        if class == backend::Class::Other {
+            return false;
+        }
+        let res = &s.res[r];
+        let stable = backend::observers_stable(res);
+        if class == backend::Class::Observer && stable {
+            return true;
+        }
+        let behind_t = |lc: &LocalCmd| {
+            lc.gate.iter().any(|&(w, n)| at.iter().any(|&(tw, pos)| tw == w as usize && n as usize > pos))
+        };
+        let mut sum = 0u64;
+        let mut observers = false;
+        let mut fresh = match self.cmds_named_count(t) {
+            Some(n) => Some(n),
+            None => None,
+        };
+        let mut add = |k: backend::Class, cmd: Option<&SyncCmd>| -> bool {
+            match k {
+                backend::Class::Observer => {
+                    if cmd.is_none_or(|c| backend::observer_disabled_by_completion(res, c)) {
+                        observers = true
+                    }
+                }
+                backend::Class::Contributor(n) => sum += n,
+                backend::Class::Other => return false,
+            }
+            true
+        };
+        for w in 0..self.warps.len() {
+            if at.iter().any(|&(tw, _)| tw == w) {
+                continue;
+            }
+            if let Some((rr, cmd)) = s.retry[w] {
+                if rr as usize == r && !add(backend::classify(&cmd), Some(&cmd)) {
+                    return false;
+                }
+            }
+            let start = s.cursors[w] as usize + usize::from(s.retry[w].is_some());
+            for &c in self.programs[w].iter().skip(start) {
+                let lc = &self.cmds[c];
+                if behind_t(lc) {
+                    break;
+                }
+                if Transition::Issue(c as u32) == *t {
+                    continue;
+                }
+                for &(cr, ref cmd) in &lc.cmds {
+                    if cr == r {
+                        if let SyncCmd::Named(crate::sync::named::Cmd::Arrive(k) | crate::sync::named::Cmd::Sync(k) | crate::sync::named::Cmd::Red(k)) = cmd {
+                            fresh = Some(fresh.map_or(k.count, |f: u64| f.min(k.count)));
+                        }
+                        if !add(backend::classify(cmd), Some(cmd)) {
+                            return false;
+                        }
+                    }
+                }
+                for &(ir, _, arrivals) in &lc.issued {
+                    if ir == r && !add(backend::Class::Contributor(arrivals), None) {
+                        return false;
+                    }
+                }
+            }
+        }
+        for p in s.pending.iter() {
+            if p.res as usize != r || Transition::Complete(p.cmd, p.ord) == *t {
+                continue;
+            }
+            let k = match p.kind {
+                PendingKind::Tx { .. } => backend::Class::Contributor(0),
+                PendingKind::Arrive { count, .. } => backend::Class::Contributor(count),
+                PendingKind::Milestone { .. } => backend::Class::Other,
+            };
+            if !add(k, None) {
+                return false;
+            }
+        }
+        let Some(remaining) = backend::remaining(res, fresh) else { return false };
+        if sum >= remaining {
+            return false;
+        }
+        match class {
+            backend::Class::Contributor(a) => stable || !observers || sum + a < remaining,
+            _ => true,
+        }
     }
 
     /// Today's terminal-completion rule (`sync_fixed_unified.rs:5304-5380`):

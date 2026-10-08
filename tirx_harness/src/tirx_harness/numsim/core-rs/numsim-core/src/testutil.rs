@@ -16,6 +16,8 @@
 //! assert!(p.validate().is_ok());
 //! ```
 
+pub mod scenarios;
+
 use crate::arena::Space;
 use crate::dtype::{Dtype, Ty};
 use crate::program::*;

@@ -31,6 +31,15 @@ pub trait TransitionSystem {
     ) -> Option<Self::Transition> {
         None
     }
+    /// Proof obligation of the strong-diamond reduction beyond one step:
+    /// no transition that can occur before `transition` (enabled now, or
+    /// enabled later by any sequence of other transitions) conflicts with it
+    /// or can disable it. The one-step diamond test alone misses a
+    /// transition exposed only after two pruned siblings (review S8). The
+    /// default declines, which keeps the search exhaustive.
+    fn independent_of_future(&self, _state: &Self::State, _transition: &Self::Transition) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,7 +245,11 @@ pub fn explore<M: TransitionSystem>(
         let canonical = (options.strong_diamonds && persistent.is_none() && active > 1)
             .then(|| all_strong_diamonds(model, &enabled, &successors))
             .filter(|all| *all)
-            .and_then(|_| enabled.iter().position(|t| !sleep.contains(t)));
+            .and_then(|_| {
+                enabled
+                    .iter()
+                    .position(|t| !sleep.contains(t) && model.independent_of_future(&state, t))
+            });
         if canonical.is_some() {
             result.strong_diamond_pruned += active - 1;
         }
@@ -342,8 +355,10 @@ fn commutes<M: TransitionSystem>(
 
 /// Every pair of enabled transitions is a *strong* diamond: both orders reach
 /// the same state and neither first step changes the other enabled
-/// transitions (no newly exposed or disabled successor). Exploring one
-/// canonical transition is then sufficient (`sync_fixed_unified.rs:5382-5423`).
+/// transitions (no newly exposed or disabled successor). Together with
+/// [`TransitionSystem::independent_of_future`] for the chosen transition this
+/// makes `{canonical}` a persistent set; the one-step test alone (today's
+/// `sync_fixed_unified.rs:5382-5423`) is not sufficient.
 fn all_strong_diamonds<M: TransitionSystem>(
     model: &M,
     enabled: &[M::Transition],
@@ -413,6 +428,10 @@ mod tests {
             state.0.iter().all(|done| *done)
         }
         fn describe_deadlock(&self, _: &Self::State) {}
+        // Increments commute and never disable each other.
+        fn independent_of_future(&self, _: &Self::State, _: &usize) -> bool {
+            !self.overwrite
+        }
     }
 
     #[test]
@@ -452,5 +471,55 @@ mod tests {
         assert_eq!(result.termination, Termination::StateLimit(100));
         let result = explore(&model, Limits { max_states: usize::MAX, max_transitions: 50 }, Options::NONE);
         assert_eq!(result.termination, Termination::TransitionLimit(50));
+    }
+
+    /// Review S8: `t`, `s1`, `s2` are pairwise one-step strong diamonds, but
+    /// `u` becomes enabled only after both `s1` and `s2` and fails if `t` has
+    /// not run. Choosing `t` as the canonical transition on the one-step test
+    /// alone hides the failure; the independence hook must veto it.
+    struct TwoStep {
+        claims_independence: bool,
+    }
+
+    impl TransitionSystem for TwoStep {
+        // (t, s1, s2, u) done flags.
+        type State = [bool; 4];
+        type Transition = u8;
+        type Error = &'static str;
+        type Deadlock = ();
+
+        fn initial_state(&self) -> Self::State {
+            [false; 4]
+        }
+        fn enabled(&self, s: &Self::State) -> Vec<u8> {
+            let mut out = (0..3).filter(|&i| !s[i as usize]).collect::<Vec<_>>();
+            if s[1] && s[2] && !s[3] {
+                out.push(3);
+            }
+            out
+        }
+        fn step(&self, s: &Self::State, t: &u8) -> Result<Self::State, &'static str> {
+            if *t == 3 && !s[0] {
+                return Err("u ran before t");
+            }
+            let mut n = *s;
+            n[*t as usize] = true;
+            Ok(n)
+        }
+        fn is_complete(&self, s: &Self::State) -> bool {
+            s.iter().all(|d| *d)
+        }
+        fn describe_deadlock(&self, _: &Self::State) {}
+        fn independent_of_future(&self, _: &Self::State, _: &u8) -> bool {
+            self.claims_independence
+        }
+    }
+
+    #[test]
+    fn one_step_diamonds_need_the_independence_proof() {
+        let unsound = explore(&TwoStep { claims_independence: true }, Limits::default(), Options::ALL);
+        assert!(unsound.failures.is_empty(), "the one-step test alone misses the failure");
+        let sound = explore(&TwoStep { claims_independence: false }, Limits::default(), Options::ALL);
+        assert!(!sound.failures.is_empty());
     }
 }

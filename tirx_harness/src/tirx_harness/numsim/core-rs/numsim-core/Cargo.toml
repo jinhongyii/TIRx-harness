@@ -30,3 +30,8 @@ criterion = { version = "=0.5.1", default-features = false }
 [[bench]]
 name = "codegen"
 harness = false
+
+# W2: interpreter dispatch / memory microbenches.
+[[bench]]
+name = "interp"
+harness = false

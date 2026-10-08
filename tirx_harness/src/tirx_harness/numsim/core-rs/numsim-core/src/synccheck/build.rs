@@ -75,9 +75,11 @@ impl LogBuilder {
     }
 
     /// An async op (TMA, commit, cp.async.mbarrier.arrive) promising `bytes`
-    /// and/or `arrivals` to mbarrier `res`; extra `cmds` precede the `Issue`.
-    pub fn issue(&mut self, warp: u32, site: u32, res: ResourceId, bytes: u64, arrivals: u64, mut cmds: Vec<(ResourceId, SyncCmd)>) -> &mut Self {
-        cmds.push((res, SyncCmd::Mbarrier(mbarrier::Cmd::Issue)));
+    /// and/or `arrivals` to mbarrier `res`, as the contract delivers it: the
+    /// event lists the `issued` target and only the commands the instruction
+    /// itself executes (`cmds`, e.g. `TcgenWork(Commit)` or `ArriveOn`); no
+    /// `Mbarrier(Issue)` is injected (the explorer derives the token).
+    pub fn issue(&mut self, warp: u32, site: u32, res: ResourceId, bytes: u64, arrivals: u64, cmds: Vec<(ResourceId, SyncCmd)>) -> &mut Self {
         self.event(warp, site, cmds, vec![AsyncTarget { res, bytes, arrivals }], None, None, ProtocolStatus::Committed)
     }
 
@@ -98,6 +100,13 @@ impl LogBuilder {
 
     pub fn blocked_at_exit(&mut self, warp: u32, site: u32, res: ResourceId, cmd: SyncCmd) -> &mut Self {
         self.event(warp, site, vec![(res, cmd)], Vec::new(), None, None, ProtocolStatus::BlockedAtExit)
+    }
+
+    /// Start a new launch: per-warp sequences and epochs restart.
+    pub fn restart_seq(&mut self) -> &mut Self {
+        self.seq.clear();
+        self.epoch.clear();
+        self
     }
 
     pub fn build(&self) -> RecordingObserver {
@@ -225,6 +234,57 @@ pub fn pipeline(warps: u32, stages: u32, iterations: u32, tma_bytes: u64) -> Rec
             let (s, round) = (i % stages, i / stages);
             log.cmd(w, 20, full(s), wait(u64::from(round & 1)));
             log.cmd(w, 21, empty(s), arrive(1));
+        }
+    }
+    log.build()
+}
+
+/// SM100 UMMA ring: warp 0 = TMA producer (`arrive.expect_tx` + TMA into
+/// full[s]), warp 1 = MMA warp (waits full[s], `tcgen05.commit` arrives on
+/// empty[s]; per tile waits tmem_empty and commits tmem_full), warps 2..6 =
+/// epilogue (wait tmem_full, arrive tmem_empty). `kblocks` k-blocks per tile,
+/// `tiles` tiles (persistent kernel), `stages`-deep smem ring.
+pub fn umma_ring(stages: u32, kblocks: u32, tiles: u32) -> RecordingObserver {
+    let full = |s: u32| mbar(0, 8 * s);
+    let empty = |s: u32| mbar(0, 8 * (stages + s));
+    let tmem_full = mbar(0, 8 * (2 * stages));
+    let tmem_empty = mbar(0, 8 * (2 * stages + 1));
+    let epilogue = [2u32, 3, 4, 5];
+    let mut log = LogBuilder::new();
+    for s in 0..stages {
+        log.cmd(0, 1, full(s), init(1)).cmd(0, 1, empty(s), init(1));
+    }
+    log.cmd(0, 2, tmem_full, init(1)).cmd(0, 2, tmem_empty, init(epilogue.len() as u64));
+    cta_sync(&mut log, 0, &(0..6).collect::<Vec<_>>(), 6);
+    let bytes = 32 * 1024;
+    for t in 0..tiles {
+        for k in 0..kblocks {
+            let i = t * kblocks + k;
+            let (s, round) = (i % stages, i / stages);
+            if round >= 1 {
+                log.cmd(0, 10, empty(s), wait(u64::from((round - 1) & 1)));
+            }
+            log.cmd(0, 11, full(s), arrive_tx(1, bytes));
+            log.issue(0, 12, full(s), bytes, 0, Vec::new());
+        }
+    }
+    for t in 0..tiles {
+        if t >= 1 {
+            log.cmd(1, 20, tmem_empty, wait(u64::from((t - 1) & 1)));
+        }
+        for k in 0..kblocks {
+            let i = t * kblocks + k;
+            let (s, round) = (i % stages, i / stages);
+            log.cmd(1, 21, full(s), wait(u64::from(round & 1)));
+            log.cmd(1, 22, tcgen_work(1, 0), work(tcgen::WorkCmd::Issue));
+            log.issue(1, 23, empty(s), 0, 1, vec![(tcgen_work(1, 0), work(tcgen::WorkCmd::Commit))]);
+        }
+        log.issue(1, 24, tmem_full, 0, 1, vec![(tcgen_work(1, 0), work(tcgen::WorkCmd::Commit))]);
+    }
+    for &w in &epilogue {
+        for t in 0..tiles {
+            log.cmd(w, 30, tmem_full, wait(u64::from(t & 1)));
+            log.cmd(w, 31, tmem_empty, arrive(1));
         }
     }
     log.build()

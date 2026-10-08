@@ -43,11 +43,14 @@ fn items<'a>(ts: &Ts<'_>, reference: &'a ReferenceRun) -> Option<Vec<Item<'a>>> 
         return None;
     }
     let mut out = Vec::new();
+    // Uses the projection's commands as the contract delivers them, with
+    // the explorer's synthesized `Issue` for an event that only lists
+    // `issued` targets (a TMA event carries no explicit `Issue`).
     for lc in &ts.cmds {
-        let g = &ts.program.commands[lc.global];
-        if g.participants.len() != 1 || g.cmds.len() != 1 {
+        if lc.participants.len() != 1 || lc.cmds.len() != 1 {
             return None;
         }
+        let g = &ts.program.commands[lc.global];
         let issued = g
             .issued
             .iter()
@@ -56,8 +59,8 @@ fn items<'a>(ts: &Ts<'_>, reference: &'a ReferenceRun) -> Option<Vec<Item<'a>>> 
             .collect();
         out.push(Item {
             global: lc.global,
-            cmd: g.cmds[0].1,
-            gen: reference.gens[lc.global][0],
+            cmd: lc.cmds[0].1,
+            gen: lc.origin[0].and_then(|o| reference.gens[lc.global][o]),
             issued,
             warp: lc.participants[0],
             position: lc.positions[0],
@@ -226,6 +229,7 @@ fn mbarrier_cert(items: &[Item<'_>]) -> Option<Result<(), CertError>> {
         tx_issues: Vec<usize>,
     }
     let mut gens = BTreeMap::<u64, Gen>::new();
+    let mut vacuous = Vec::<usize>::new();
     for (i, it) in items.iter().enumerate() {
         if it.global == init.global {
             continue;
@@ -270,11 +274,11 @@ fn mbarrier_cert(items: &[Item<'_>]) -> Option<Result<(), CertError>> {
                     e.tx_issues.push(i);
                 }
             }
-            mbarrier::Cmd::WaitParity { .. } | mbarrier::Cmd::TestParity { .. } => {
-                if let Some(gen) = it.gen {
-                    gens.entry(gen).or_default().waits.push(i);
-                }
-            }
+            mbarrier::Cmd::WaitParity { .. } | mbarrier::Cmd::TestParity { .. } => match it.gen {
+                Some(gen) => gens.entry(gen).or_default().waits.push(i),
+                // Vacuous parity-1 success before generation 0 completed.
+                None => vacuous.push(i),
+            },
             _ => return None,
         }
     }
@@ -319,17 +323,39 @@ fn mbarrier_cert(items: &[Item<'_>]) -> Option<Result<(), CertError>> {
                 }
             }
         }
+        // Review S1(b): a wait observed generation `gen` in the reference;
+        // unless it is ordered after generation `gen - 1` completed (after a
+        // consuming wait of `gen - 1` or a mutation of `gen`), another
+        // schedule lets it pass on an older generation of the same parity.
+        // Fall back to the exhaustive search for such shapes.
+        if gen > 0 {
+            let prior = &gens[&(gen - 1)];
+            for &w in &st.waits {
+                let after_prior = prior.waits.iter().any(|&p| items[p].final_.hb(items[w].initial))
+                    || st.mutations.iter().any(|&(m, _)| items[m].initial.hb(items[w].initial));
+                if !after_prior {
+                    return None;
+                }
+            }
+        }
         if let Some(next) = gens.get(&(gen + 1)).filter(|n| n.arrivals == expected && n.tx_completed == n.tx_expected) {
+            // An overtaken wait either blocks forever or passes on a later
+            // generation of the same parity; which one is a property of the
+            // whole schedule space, so let the search decide (review S1).
             for &w in &st.waits {
                 if !next.mutations.iter().any(|&(m, _)| items[w].initial.hb(items[m].initial)) {
-                    return err(
-                        "mbarrier_wait_overtaken",
-                        P,
-                        items[w].global,
-                        next.mutations.first().map(|&(m, _)| items[m].global).into_iter().collect(),
-                        format!("wait for generation {gen} can be overtaken by generation {} completion", gen + 1),
-                    );
+                    return None;
                 }
+            }
+        }
+    }
+    // Review S1(a): a vacuous parity-1 success must be ordered before some
+    // prerequisite of generation 0's completion; otherwise generation 0 can
+    // complete first and the wait blocks until generation 1. Fall back.
+    if let Some(first) = gens.get(&0).filter(|g| g.arrivals == expected && g.tx_completed == g.tx_expected) {
+        for &w in &vacuous {
+            if !first.mutations.iter().any(|&(m, _)| items[w].initial.hb(items[m].initial)) {
+                return None;
             }
         }
     }

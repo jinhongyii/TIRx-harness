@@ -567,13 +567,20 @@ fn align_up(x: u64, a: u64) -> u64 {
 ///
 /// * Global: synthetic VA starting at [`addr::GLOBAL_VA_BASE`]; allocation bases
 ///   are [`addr::GLOBAL_ALIGN`]-aligned, separated by [`addr::GLOBAL_GUARD`].
-/// * Shared (`.shared::cta`): 32-bit offset in the executing CTA's window.
-/// * Shared cluster (`.shared::cluster`): 32-bit; bits `[0, 24)` = window
-///   offset, bits `[24, 32)` = `rank + 1` of the target CTA, or 0 meaning
-///   "the executing CTA". So every `.shared::cta` address is also a valid
-///   `.shared::cluster` address naming the executing CTA (PTX property).
-/// * Generic: global VAs as is; shared at [`addr::GENERIC_SHARED_BASE`] + window
-///   offset (executing CTA); local at [`addr::GENERIC_LOCAL_BASE`] + offset.
+/// * Shared (`.shared::cta` and `.shared::cluster`, one encoding, as on
+///   hardware): 32-bit `rank << 24 | offset`, where `rank` is the owning
+///   CTA's rank in its cluster and `offset < 2^24` the byte offset in its
+///   window. `cvta.to.shared` of the executing CTA's window yields its own
+///   rank tag, so `mapa(p, own_rank) == p` and the CUTLASS pair-leader idiom
+///   `p & 0xFEFF_FFFF` names the even CTA of the pair. `.shared::cta`
+///   accesses require `rank == own rank` (else a bad-address error);
+///   `.shared::cluster` accesses route by rank. In a cluster-less launch
+///   every rank tag is 0.
+/// * Generic: global VAs as is; distributed shared memory at
+///   [`addr::GENERIC_SHARED_BASE`] + shared address (so 64-bit `mapa` results
+///   and generic ld/st to a peer's window resolve); local at
+///   [`addr::GENERIC_LOCAL_BASE`] + offset; kernel parameters at
+///   [`addr::GENERIC_PARAM_BASE`] + offset.
 /// * Tensor memory: `lane << 16 | column` (PTX taddr).
 pub mod addr {
     /// First global VA.
@@ -582,14 +589,20 @@ pub mod addr {
     pub const GLOBAL_ALIGN: u64 = 1 << 12;
     /// Unmapped gap after every global allocation.
     pub const GLOBAL_GUARD: u64 = 1 << 16;
-    /// Generic aperture of the executing CTA's shared window.
+    /// Generic aperture of the cluster's distributed shared memory.
     pub const GENERIC_SHARED_BASE: u64 = 0x0000_7f00_0000_0000;
     /// Generic aperture of the executing thread's local memory.
     pub const GENERIC_LOCAL_BASE: u64 = 0x0000_7e00_0000_0000;
+    /// Generic aperture of the launch's kernel-parameter block
+    /// (`__grid_constant__` tensor maps); param-space addresses are offsets
+    /// in the block.
+    pub const GENERIC_PARAM_BASE: u64 = 0x0000_7d00_0000_0000;
     /// Size of each generic aperture.
     pub const APERTURE: u64 = 1 << 32;
-    /// Bits of window offset in a shared::cluster address.
-    pub const CLUSTER_OFFSET_BITS: u32 = 24;
+    /// Bits of window offset in a shared address.
+    pub const SHARED_OFFSET_BITS: u32 = 24;
+    /// Largest shared window offset + 1.
+    pub const SHARED_WINDOW_MAX: u32 = 1 << SHARED_OFFSET_BITS;
     pub const TMEM_LANES: u32 = 128;
     pub const TMEM_COLS: u32 = 512;
 
@@ -597,8 +610,11 @@ pub mod addr {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Generic {
         Global(u64),
+        /// A shared address (`rank << 24 | offset`).
         Shared(u32),
         Local(u32),
+        /// Offset in the kernel-parameter block.
+        Param(u32),
         Unmapped(u64),
     }
 
@@ -607,6 +623,8 @@ pub mod addr {
             Generic::Shared((va - GENERIC_SHARED_BASE) as u32)
         } else if (GENERIC_LOCAL_BASE..GENERIC_LOCAL_BASE + APERTURE).contains(&va) {
             Generic::Local((va - GENERIC_LOCAL_BASE) as u32)
+        } else if (GENERIC_PARAM_BASE..GENERIC_PARAM_BASE + APERTURE).contains(&va) {
+            Generic::Param((va - GENERIC_PARAM_BASE) as u32)
         } else if va >= GLOBAL_VA_BASE && va < GENERIC_LOCAL_BASE {
             Generic::Global(va)
         } else {
@@ -614,32 +632,27 @@ pub mod addr {
         }
     }
 
-    pub const fn generic_from_shared(offset: u32) -> u64 {
-        GENERIC_SHARED_BASE + offset as u64
+    /// Generic address of a shared address (`rank << 24 | offset`).
+    pub const fn generic_from_shared(shared: u32) -> u64 {
+        GENERIC_SHARED_BASE + shared as u64
     }
 
     pub const fn generic_from_local(offset: u32) -> u64 {
         GENERIC_LOCAL_BASE + offset as u64
     }
 
-    /// Encode a shared::cluster address. `rank = None` = executing CTA.
-    pub const fn shared_cluster(rank: Option<u32>, offset: u32) -> u32 {
-        let r = match rank {
-            Some(r) => r + 1,
-            None => 0,
-        };
-        (r << CLUSTER_OFFSET_BITS) | (offset & ((1 << CLUSTER_OFFSET_BITS) - 1))
+    /// Encode a shared address; `None` if `offset >= 2^24` or `rank > 255`.
+    pub const fn shared_addr(rank: u32, offset: u32) -> Option<u32> {
+        if offset >= SHARED_WINDOW_MAX || rank > 0xff {
+            None
+        } else {
+            Some((rank << SHARED_OFFSET_BITS) | offset)
+        }
     }
 
-    /// Decode a shared::cluster address into (rank or self, window offset).
-    pub const fn decode_shared_cluster(a: u32) -> (Option<u32>, u32) {
-        let r = a >> CLUSTER_OFFSET_BITS;
-        let off = a & ((1 << CLUSTER_OFFSET_BITS) - 1);
-        if r == 0 {
-            (None, off)
-        } else {
-            (Some(r - 1), off)
-        }
+    /// Decode a shared address into `(rank, window offset)`.
+    pub const fn decode_shared(a: u32) -> (u32, u32) {
+        (a >> SHARED_OFFSET_BITS, a & (SHARED_WINDOW_MAX - 1))
     }
 
     pub const fn tmem_addr(lane: u32, col: u32) -> u32 {
@@ -702,11 +715,14 @@ mod tests {
     }
 
     #[test]
-    fn cluster_addr_roundtrip() {
-        let a = addr::shared_cluster(Some(3), 0x1230);
-        assert_eq!(addr::decode_shared_cluster(a), (Some(3), 0x1230));
-        assert_eq!(addr::decode_shared_cluster(0x40), (None, 0x40));
-        assert!(matches!(addr::classify_generic(addr::generic_from_shared(16)), addr::Generic::Shared(16)));
+    fn shared_addr_roundtrip() {
+        let a = addr::shared_addr(3, 0x1230).unwrap();
+        assert_eq!(a, 3 << 24 | 0x1230);
+        assert_eq!(addr::decode_shared(a), (3, 0x1230));
+        // CUTLASS pair-leader idiom: clearing bit 24 names the even CTA.
+        assert_eq!(addr::decode_shared(addr::shared_addr(1, 64).unwrap() & 0xFEFF_FFFF), (0, 64));
+        assert_eq!(addr::shared_addr(0, 1 << 24), None);
+        assert!(matches!(addr::classify_generic(addr::generic_from_shared(a)), addr::Generic::Shared(x) if x == a));
     }
 
     #[test]

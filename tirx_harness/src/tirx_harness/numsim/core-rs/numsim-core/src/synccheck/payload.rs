@@ -366,11 +366,16 @@ impl<'c> Builder<'c> {
 
     /// Returns true when the result is terminal (stop checking projections).
     pub fn search_result(&mut self, program: &Program, ts: &Ts<'_>, search: &SearchResult<Transition, TsError, Deadlock>) -> bool {
-        if let Some(failure) = search.failures.first() {
+        // With `stop_on_first_failure` off every distinct failure is reported
+        // (used by the exhaustive oracle in the equivalence tests).
+        let take = if self.config.explore.stop_on_first_failure { 1 } else { usize::MAX };
+        for failure in search.failures.iter().take(take) {
             match failure {
                 Failure::Error { transition, error, witness } => self.protocol_error(ts, error, Some(*transition), witness),
                 Failure::Deadlock { deadlock, witness } => self.deadlock(ts, deadlock, witness),
             }
+        }
+        if !search.failures.is_empty() {
             return true;
         }
         let first_op = ts.cmds.first().map(|c| op_json(program, c.global));

@@ -125,3 +125,79 @@ pub fn exit_lint(res: &Res) -> Option<(crate::report::FindingKind, String)> {
         _ => None,
     }
 }
+
+/// How a command interacts with a barrier's phase, for the strong-diamond
+/// independence proof (`Ts::independent_of_future`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// Reads the completed phase (parity waits/tests, named `Resume`,
+    /// cluster wait); never completes a phase.
+    Observer,
+    /// Adds `n` arrivals (or only counters/tx with `n == 0`) to the open phase.
+    Contributor(u64),
+    /// Anything else (init, inval, pending increments, drops, state tokens,
+    /// other protocols): no reduction.
+    Other,
+}
+
+pub fn classify(cmd: &SyncCmd) -> Class {
+    use crate::sync::{cluster, mbarrier, named};
+    match cmd {
+        SyncCmd::Mbarrier(c) => match *c {
+            mbarrier::Cmd::WaitParity { .. } | mbarrier::Cmd::TestParity { .. } => Class::Observer,
+            mbarrier::Cmd::Arrive { count, drop: false, no_complete: false, .. } => Class::Contributor(count),
+            mbarrier::Cmd::ExpectTx { .. } | mbarrier::Cmd::Issue | mbarrier::Cmd::CompleteTx { .. } => {
+                Class::Contributor(0)
+            }
+            mbarrier::Cmd::DeferredArrive { count, .. } => Class::Contributor(count),
+            _ => Class::Other,
+        },
+        SyncCmd::Named(named::Cmd::Resume { .. }) => Class::Observer,
+        SyncCmd::Named(named::Cmd::Arrive(_) | named::Cmd::Sync(_) | named::Cmd::Red(_)) => {
+            Class::Contributor(p::named::WARP_SIZE)
+        }
+        SyncCmd::Cluster(cluster::Cmd::Wait { .. }) => Class::Observer,
+        SyncCmd::Cluster(cluster::Cmd::Arrive { .. }) => Class::Contributor(1),
+        _ => Class::Other,
+    }
+}
+
+/// Arrivals still needed before the open phase can complete, in the units of
+/// [`Class::Contributor`]. `fresh` is the thread count a named barrier's next
+/// generation will expect. `None` = unknown (no reduction).
+pub fn remaining(res: &Res, fresh: Option<u64>) -> Option<u64> {
+    match res {
+        Res::Mbarrier(s) if s.live => Some(if s.complete { s.expected } else { s.required() - s.arrived }),
+        Res::Named(s) => match s.expected {
+            Some(e) if !s.complete => Some(e - s.arrived),
+            _ => fresh,
+        },
+        Res::Cluster(s) => {
+            let members = s.live.iter().filter(|&&m| m != 0).count() as u64;
+            Some(members.saturating_sub(s.arrived.len() as u64))
+        }
+        _ => None,
+    }
+}
+
+/// Observers of this resource are never disabled once enabled (named
+/// `Resume{gen}` and cluster waits stay ready); mbarrier parity observers
+/// are disabled by the next phase completion.
+pub fn observers_stable(res: &Res) -> bool {
+    matches!(res, Res::Named(_) | Res::Cluster(_))
+}
+
+/// An mbarrier parity observer that a completion of the open phase would
+/// flip from ready to blocked (it observes the last completed parity).
+/// Observers waiting for the open phase are only enabled by its completion.
+pub fn observer_disabled_by_completion(res: &Res, cmd: &SyncCmd) -> bool {
+    use crate::sync::mbarrier;
+    match (res, cmd) {
+        (
+            Res::Mbarrier(s),
+            SyncCmd::Mbarrier(mbarrier::Cmd::WaitParity { parity } | mbarrier::Cmd::TestParity { parity }),
+        ) => !s.live || *parity == s.completed_parity(),
+        (Res::Mbarrier(_), _) => true,
+        _ => false,
+    }
+}

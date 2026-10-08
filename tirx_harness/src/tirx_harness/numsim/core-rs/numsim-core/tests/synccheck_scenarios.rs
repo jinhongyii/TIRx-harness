@@ -143,8 +143,11 @@ fn producer_lap_without_back_pressure_is_an_error() {
     cta_sync(&mut log, 0, &[0, 1], 2);
     log.cmd(0, 2, mbar(0, 0), arrive(1)).cmd(0, 2, mbar(0, 0), arrive(1));
     log.cmd(1, 3, mbar(0, 0), wait(0)).cmd(1, 3, mbar(0, 0), wait(1));
-    let r = run_all(&log.build(), cta(2), Verdict::Error);
-    assert_eq!(kind(&r[0].1), "mbarrier_wait_overtaken");
+    // The certificate no longer reports `mbarrier_wait_overtaken`: an
+    // overtaken wait is decided by the search.
+    for (name, r) in run_all(&log.build(), cta(2), Verdict::Error) {
+        assert_ne!(kind(&r), "mbarrier_wait_overtaken", "{name}");
+    }
 }
 
 /// `native_mbarrier_depth_two_pipeline`.
@@ -596,4 +599,165 @@ fn kernel_index_and_attrs_flow_into_the_report() {
     assert_eq!(serialize(&r)["findings"][0]["operation"]["kernel_index"], 3);
     assert_eq!(r.meta["algorithm"], "fixed_sync_state");
     assert_eq!(r.meta["termination"]["kind"], "finding");
+}
+
+
+// ---- regressions for docs/development/checker-review.md ----
+
+/// S1(a): a parity-1 wait that may pass before generation 0 completes.
+/// With the waiter as warp 0 the reference run lets it pass vacuously; the
+/// certificate must decline, and the search finds the deadlock where the
+/// arrive comes first.
+#[test]
+fn s1a_vacuous_parity_one_wait_is_not_certified() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1));
+    cta_sync(&mut log, 0, &[0, 1], 2);
+    log.cmd(0, 2, mbar(0, 0), wait(1));
+    log.cmd(1, 3, mbar(0, 0), arrive(1));
+    for (name, r) in run_all(&log.build(), cta(2), Verdict::Error) {
+        assert_eq!(kind(&r), "deadlock", "{name}");
+    }
+}
+
+/// S1(b): the reviewer's sequence. W's `wait M(0)` is meant for generation 2
+/// but can pass on generation 0, so the reference clocks gate other
+/// projections on an edge that a legal schedule does not have.
+#[test]
+fn s1b_wait_that_can_pass_on_an_older_generation_is_not_certified() {
+    let (m, y, e, z) = (mbar(0, 0), mbar(0, 8), mbar(0, 16), mbar(0, 24));
+    let (p, c, w) = (0, 1, 2);
+    let mut log = LogBuilder::new();
+    for b in [m, y, e, z] {
+        log.cmd(p, 1, b, init(1));
+    }
+    cta_sync(&mut log, 0, &[p, c, w], 3);
+    log.cmd(p, 2, y, arrive(1)).cmd(p, 3, m, arrive(1)).cmd(p, 4, e, wait(0));
+    log.cmd(p, 5, m, arrive(1)).cmd(p, 6, e, wait(1)).cmd(p, 7, m, arrive(1));
+    log.cmd(c, 8, y, wait(0)).cmd(c, 9, m, wait(0)).cmd(c, 10, e, arrive(1));
+    log.cmd(c, 11, m, wait(1)).cmd(c, 12, e, arrive(1));
+    for i in 0..12u32 {
+        let parity = u64::from(i & 1);
+        log.cmd(w, 13, z, arrive(1)).cmd(w, 14, z, wait(parity));
+    }
+    log.cmd(w, 15, m, wait(0)).cmd(w, 16, y, arrive(1));
+    let log = log.build();
+    // The certificate declines; the gated search then leaves the reference
+    // generation assignment and fails closed (it used to certify Clean).
+    for (name, cfg) in configs(cta(3)) {
+        let r = check(&log, &cfg);
+        match name {
+            "whole-plain" | "components" => {
+                assert_eq!(r.verdict, Verdict::Error, "{name}");
+                assert_eq!(kind(&r), "mbarrier_arrive_before_consumption", "{name}");
+            }
+            _ => {
+                assert_ne!(r.verdict, Verdict::Clean, "{name}");
+                if r.verdict == Verdict::Incomplete {
+                    let p = payload(&r, Status::Incomplete);
+                    assert!(p["source"].as_str().unwrap().starts_with("generation_assignment_differs"), "{name}: {p:#}");
+                }
+            }
+        }
+    }
+}
+
+/// S5: a wait that may observe generation 0 or 2 (same parity) in a
+/// program that is otherwise clean and confluent. The gated projection must
+/// not trust gates built from the reference assignment: it fails closed.
+#[test]
+fn s5_generation_assignment_is_checked_against_the_reference() {
+    let (m, e) = (mbar(0, 0), mbar(0, 8));
+    let (p, c, w) = (0, 1, 2);
+    let mut log = LogBuilder::new();
+    log.cmd(p, 1, m, init(1)).cmd(p, 1, e, init(1));
+    cta_sync(&mut log, 0, &[p, c, w], 3);
+    log.cmd(p, 2, m, arrive(1)).cmd(p, 3, e, wait(0)).cmd(p, 2, m, arrive(1)).cmd(p, 3, e, wait(1)).cmd(p, 2, m, arrive(1));
+    log.cmd(c, 4, m, wait(0)).cmd(c, 5, e, arrive(1)).cmd(c, 4, m, wait(1)).cmd(c, 5, e, arrive(1)).cmd(c, 4, m, wait(0));
+    log.cmd(w, 6, m, wait(0));
+    let log = log.build();
+    let exhaustive = check(&log, &SynccheckConfig { mode: ProjectionMode::Whole, certificates: false, explore: Options::NONE, ..config(cta(3)) });
+    assert_eq!(exhaustive.verdict, Verdict::Clean, "{:#}", serialize(&exhaustive));
+    for certificates in [false, true] {
+        let r = check(&log, &SynccheckConfig { certificates, ..config(cta(3)) });
+        assert_eq!(r.verdict, Verdict::Incomplete, "{:#}", serialize(&r));
+        assert!(payload(&r, Status::Incomplete)["source"].as_str().unwrap().starts_with("generation_assignment_differs"));
+    }
+}
+
+/// S8 end to end (the discriminating regression is the explorer unit test
+/// `one_step_diamonds_need_the_independence_proof`). After generation 0
+/// completes, the lapped waiter's `wait(0)` (warp 0, lowest command ids)
+/// commutes in one step with each of the two generation-1 arrivals, which
+/// are HB-ordered after the early waiter's consumption. Together the two
+/// arrivals complete generation 1 and disable `wait(0)` forever.
+#[test]
+fn s8_strong_diamond_does_not_hide_a_two_step_lap() {
+    let m = mbar(0, 0);
+    let mut log = LogBuilder::new();
+    // Warp 0 initializes, publishes with a non-blocking `bar.arrive` and
+    // immediately waits: it cannot lag before its wait.
+    log.cmd(0, 1, m, init(2)).cmd(0, 7, named_bar(0, 0), bar_arrive(0, 192)).cmd(0, 2, m, wait(0));
+    for w in 1..6 {
+        log.cmd(w, 8, named_bar(0, 0), bar_sync(w, 192));
+    }
+    log.cmd(1, 3, m, wait(0)).cmd(1, 4, named_bar(0, 1), bar_sync(1, 96)); // consumes, then releases the next producers
+    log.cmd(2, 5, m, arrive(1));
+    log.cmd(3, 5, m, arrive(1));
+    log.cmd(4, 4, named_bar(0, 1), bar_sync(4, 96)).cmd(4, 6, m, arrive(1));
+    log.cmd(5, 4, named_bar(0, 1), bar_sync(5, 96)).cmd(5, 6, m, arrive(1));
+    let log = log.build();
+    let init = cta(6);
+    let exhaustive = check(&log, &SynccheckConfig { mode: ProjectionMode::Whole, certificates: false, explore: Options::NONE, ..config(init) });
+    assert_eq!(exhaustive.verdict, Verdict::Error, "{:#}", serialize(&exhaustive));
+    for mode in [ProjectionMode::Whole, ProjectionMode::Components, ProjectionMode::PerResource] {
+        for certificates in [false, true] {
+            let reduced = check(&log, &SynccheckConfig { mode, certificates, ..config(init) });
+            assert_ne!(reduced.verdict, Verdict::Clean, "{mode:?} certificates={certificates}: {:#}", serialize(&reduced));
+        }
+    }
+}
+
+/// F4: tcgen05.commit no longer couples its barriers and the MMA work queue
+/// into one uncertifiable projection. A UMMA ring (TMA producer -> MMA warp
+/// committing to empty[s] and tmem_full -> epilogue) is certified.
+#[test]
+fn f4_umma_ring_is_certified_per_barrier() {
+    let r = check(&umma_ring(6, 16, 16), &config(cta(6)));
+    assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+    assert_eq!(stat(&r, "certified_program_count"), stat(&r, "program_count"));
+    assert!(stat(&r, "visited_state_count") < 1_000, "{:?}", r.coverage);
+}
+
+/// A TMA event as the contract delivers it (only an issued target, no
+/// `Mbarrier(Issue)` command) is certified.
+#[test]
+fn tma_event_without_issue_command_is_certified() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1));
+    cta_sync(&mut log, 0, &[0, 1], 2);
+    log.cmd(0, 2, mbar(0, 0), arrive_tx(1, 64));
+    log.event(0, 3, Vec::new(), vec![AsyncTarget { res: mbar(0, 0), bytes: 64, arrivals: 0 }], None, None, numsim_core::observe::ProtocolStatus::Committed);
+    log.cmd(1, 4, mbar(0, 0), wait(0));
+    let r = check(&log.build(), &config(cta(2)));
+    assert_eq!(r.verdict, Verdict::Clean);
+    assert_eq!(stat(&r, "certified_program_count"), stat(&r, "program_count"));
+}
+
+/// Contract: one Report per launch; launches are never merged.
+#[test]
+fn launches_are_checked_separately() {
+    let mut log = LogBuilder::new();
+    log.kernel = 0;
+    log.cmd(0, 1, mbar(0, 0), init(1)).cmd(0, 2, mbar(0, 0), arrive(1)).cmd(0, 3, mbar(0, 0), wait(0));
+    log.kernel = 1;
+    log.restart_seq();
+    log.cmd(0, 1, mbar(0, 0), wait(0)).cmd(0, 2, mbar(0, 0), init(1));
+    let all = log.build();
+    let reports = numsim_core::synccheck::check_launches(&all, &config(one()));
+    assert_eq!(reports.iter().map(|r| (r.launch, r.verdict)).collect::<Vec<_>>(), [(0, Verdict::Clean), (1, Verdict::Error)]);
+    // `check` on a mixed log fails closed instead of merging.
+    let mixed = check(&all, &config(one()));
+    assert_eq!(mixed.verdict, Verdict::Incomplete);
+    assert_eq!(payload(&mixed, Status::Incomplete)["reason"], "fixed_sync_program_build");
 }

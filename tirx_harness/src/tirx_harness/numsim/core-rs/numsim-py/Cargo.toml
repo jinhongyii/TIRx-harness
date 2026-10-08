@@ -4,15 +4,20 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# The Python extension module is `numsim_core_py` (PyInit_numsim_core_py).
+# Dev install: see build_dev.sh in this directory.
 [lib]
-name = "numsim_py"
+name = "numsim_core_py"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
 python = ["dep:pyo3"]
+# Link mode for a loadable extension (no libpython link); only for the cdylib.
+extension-module = ["python", "pyo3/extension-module", "pyo3/abi3-py312"]
 
 [dependencies]
 numsim-core = { path = "../numsim-core" }
+serde_json.workspace = true
 pyo3 = { workspace = true, optional = true }

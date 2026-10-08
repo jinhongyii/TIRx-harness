@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use criterion::{black_box, BenchmarkId, Criterion};
 use numsim_core::observe::RecordingObserver;
 use numsim_core::sync::ResourceInit;
-use numsim_sync_explore::build::pipeline;
+use numsim_sync_explore::build::{pipeline, umma_ring};
 use numsim_sync_explore::explore::Options;
 use numsim_sync_explore::{check, ProjectionMode, SynccheckConfig};
 
@@ -70,6 +70,8 @@ fn main() {
     table("4 warps x 2 stages x 8 iterations", 4, &pipeline(4, 2, 8, 0));
     table("16 warps x 4 stages x 32 iterations", 16, &plain);
     table("same, TMA producer (arrive.expect_tx + async completion)", 16, &tma);
+    // Review F4: 6 stages, 16 k-blocks, 16 tiles, tcgen05.commit arrivals.
+    table("UMMA ring 6 stages x 16 k-blocks x 16 tiles", 6, &umma_ring(6, 16, 16));
 
     let mut criterion = Criterion::default()
         .sample_size(10)

@@ -99,11 +99,39 @@ impl Default for SynccheckConfig {
     }
 }
 
-/// Explore all interleavings of the logged protocol and report deadlocks,
-/// protocol violations and non-confluence reachable under some schedule.
+/// Split a log by `SyncEvent::kernel` (one launch per kernel index).
+pub fn split_launches(log: &RecordingObserver) -> Vec<(u32, RecordingObserver)> {
+    let mut out = std::collections::BTreeMap::<u32, RecordingObserver>::new();
+    for &(warp, index) in &log.order {
+        let event = if warp == u32::MAX { &log.other[index as usize] } else { &log.per_warp[warp as usize][index as usize] };
+        crate::observe::Observer::sync(out.entry(event.kernel).or_default(), event);
+    }
+    out.into_iter().collect()
+}
+
+/// One [`Report`] per launch in the log (never merged).
+pub fn check_launches(log: &RecordingObserver, config: &SynccheckConfig) -> Vec<Report> {
+    split_launches(log).into_iter().map(|(_, l)| check(&l, config)).collect()
+}
+
+/// Explore all interleavings of one launch's logged protocol and report
+/// deadlocks, protocol violations and non-confluence reachable under some
+/// schedule. A log that mixes launches is incomplete (use [`check_launches`]).
 pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
     let started = Instant::now();
     let mut out = payload::Builder::new(config);
+    let kernels = log
+        .per_warp
+        .iter()
+        .flatten()
+        .chain(&log.other)
+        .map(|e| e.kernel)
+        .collect::<std::collections::BTreeSet<_>>();
+    if kernels.len() > 1 {
+        out.kernel = *kernels.first().expect("non-empty");
+        out.program_build(format!("the log mixes launches {kernels:?}; check each launch separately (check_launches)"));
+        return out.finish(started);
+    }
     let (program, failures) = match program::build(log) {
         Ok(x) => x,
         Err(detail) => {
@@ -132,7 +160,11 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
     };
     if !reference.is_complete() {
         out.reference_failure(&program, &config.init, &reference);
-        return out.finish(started);
+        // Without gates (whole / components) the search does not need the
+        // reference clocks; in all-failures mode keep exploring.
+        if config.explore.stop_on_first_failure || config.mode == ProjectionMode::PerResource || config.certificates {
+            return out.finish(started);
+        }
     }
     let limits = explore::Limits {
         max_states: usize::try_from(config.state_budget).unwrap_or(usize::MAX),

@@ -445,7 +445,7 @@ mod table {
             prop::bool::weighted(0.2),
         ), 0..MAX_LEN)) {
             let mut table = SyncTable::new(ResourceInit::default());
-            let life = ResourceId::TcgenLifecycle { pair: CtaId(0) };
+            let life = ResourceId::TcgenLifecycle { cluster: 0, pair_rank: 0 };
             let mut rk = spec::tcgen::KernelState::default();
             let mut rs = spec::tcgen::State::default();
             for (i, &(kind, w, columns, taddr, exclusive)) in ops.iter().enumerate() {
@@ -517,7 +517,7 @@ mod table {
         assert_eq!(batch.step_all(&[(id, wait)]).unwrap(), Step::Blocked(id));
         assert!(!armed(&batch));
         // A blocked command on a fresh resource leaves no resource behind.
-        let pair = ResourceId::TcgenLifecycle { pair: CtaId(0) };
+        let pair = ResourceId::TcgenLifecycle { cluster: 0, pair_rank: 0 };
         let mut t = SyncTable::new(ResourceInit::default());
         let alloc = |columns| SyncCmd::Tcgen(prod::tcgen::Cmd::Alloc { who: prod::tcgen::Who::One(0), columns, exclusive: false });
         assert!(matches!(t.step(pair, alloc(512)).unwrap(), Step::Done(_)));
