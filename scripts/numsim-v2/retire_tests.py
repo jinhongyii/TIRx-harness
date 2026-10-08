@@ -77,6 +77,24 @@ def replacements(wave: str, rows: list[dict[str, str]]) -> dict[str, list[str]]:
     return out
 
 
+def gpu_marked(func_id: str) -> bool:
+    """True when the replacement function carries ``@pytest.mark.numsim_gpu``.
+
+    Coordinator ruling (after e192f28): GPU-oracle copies form the gpu-only
+    bucket. They skip off a GPU host and run on one, so a skip does not hold
+    the legacy cut."""
+    path = TESTS_BASE / func_id.split("::", 1)[0]
+    name = func_id.split("::")[-1]
+    try:
+        tree = ast.parse(path.read_text())
+    except (OSError, SyntaxError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return any("numsim_gpu" in ast.unparse(d) for d in node.decorator_list)
+    return False
+
+
 def passing(node_ids: set[str], results: Path | None) -> set[str]:
     """Function-level node ids whose every item passed."""
     if not node_ids:
@@ -108,6 +126,8 @@ def passing(node_ids: set[str], results: Path | None) -> set[str]:
         # delta T18) is the accepted contract, so it counts as passing.
         documented = skipped is not None and "documented limitation" in (skipped.get("message") or "")
         ok = all(case.find(tag) is None for tag in ("failure", "error")) and (skipped is None or documented)
+        if not ok and skipped is not None and all(case.find(t) is None for t in ("failure", "error")):
+            ok = gpu_marked(func)
         outcome[func] = outcome.get(func, True) and ok
     return {f for f in node_ids if outcome.get(f)}
 

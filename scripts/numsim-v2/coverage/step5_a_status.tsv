@@ -30,7 +30,7 @@ tests/numsim/integration/test_api.py::test_comparison_rejects_odd_bfloat16_byte_
 tests/numsim/integration/test_api.py::test_comparison_spec_rejects_permissive_field_values	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_api.py::test_engine_native_loop_policy_is_explicit_and_validated	internal	other-assertion	retired-wave4	
 tests/numsim/integration/test_api.py::test_engine_worker_configuration_is_explicit_and_validated	internal	pass	retired-wave4	
-tests/numsim/integration/test_api.py::test_execution_subset_uses_subset_api_name	internal	pass	uses-legacy-internals	ExecutionSubset
+tests/numsim/integration/test_api.py::test_execution_subset_uses_subset_api_name	internal	pass	retired-wave4	ExecutionSubset
 tests/numsim/integration/test_api.py::test_integer_comparison_is_exact_by_default	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_api.py::test_multi_kernel_subsets_are_phase_indexed_and_never_broadcast	internal	pass	retired-wave4	ExecutionSubset,numsim_api
 tests/numsim/integration/test_api.py::test_phase_subset_indices_and_ids_fail_closed	internal	pass	retired-wave4	ExecutionSubset,numsim_api
@@ -186,7 +186,7 @@ tests/numsim/integration/test_memory_artifact.py::test_mega_atomic_and_reduction
 tests/numsim/integration/test_memory_artifact.py::test_mega_cluster_arrive_wait_rendezvous_exposes_peer_global_writes	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_memory_artifact.py::test_mega_cluster_wait_does_not_require_every_arriving_warp_to_wait	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_memory_artifact.py::test_mega_lane_private_mbarrier_init_initializes_one_barrier_per_lane	internal	pass	flip-after-import-fix	
-tests/numsim/integration/test_memory_artifact.py::test_mega_mbarrier_init_rejects_partial_lane_aliasing	internal	v2-accepts-legacy-rejection	blocked-v2	
+tests/numsim/integration/test_memory_artifact.py::test_mega_mbarrier_init_rejects_partial_lane_aliasing	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_memory_artifact.py::test_mega_one_dimensional_bulk_copy_roundtrips_bytes	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_memory_artifact.py::test_mega_st_bulk_zeroes_the_exact_shared_byte_range	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_memory_artifact.py::test_native_loop_with_extra_body_effect_uses_engine_budget	internal	pin-message(error->incomplete)	retired-wave4	
@@ -384,7 +384,7 @@ tests/numsim/runtime/test_byte_copy_vector_store.py::test_vector_store_registry_
 tests/numsim/runtime/test_byte_pointer_view_alias.py::test_byte_pointer_can_form_a_wider_physical_alias	public	pin-internals	retired-wave4	
 tests/numsim/runtime/test_cache_hint_ops.py::test_async_applypriority_bulk_groups_are_visible_to_checkers	internal	pass	retired-wave4	_run_racecheck,_run_synccheck
 tests/numsim/runtime/test_cache_hint_ops.py::test_cache_hint_family_validates_operands_without_changing_memory	internal	other-assertion	retired-wave4	call_op_names
-tests/numsim/runtime/test_cache_hint_ops.py::test_scalar_cache_hint_runtime_contracts_reach_the_engine	internal	v2-accepts-legacy-rejection	blocked-v2	
+tests/numsim/runtime/test_cache_hint_ops.py::test_scalar_cache_hint_runtime_contracts_reach_the_engine	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_cache_hint_ops.py::test_tensor_map_selector_accepts_independent_lane_hint_descriptors	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_cache_hint_ops.py::test_valid_address_prefetch_checks_only_predicate_selected_lanes	internal	pass	retired-wave4	
 tests/numsim/runtime/test_compare_predicates.py::test_compare_instruction_predicates	public	other-assertion	retired-wave4	
@@ -855,7 +855,7 @@ tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_fence_forms_are_numerical
 tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_single_cta_lifecycle_writes_canonical_base	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_two_cta_lifecycle_rendezvous	internal	pin-internals	retired-wave4	
 tests/numsim/runtime/test_tcgen_codegen.py::test_tmem_pool_non_power_of_two_columns_fail_at_engine	internal	pin-message	retired-wave4	
-tests/numsim/runtime/test_tcgen_collectors.py::test_typed_gemm_discards_a_raw_mma_fill	internal	v2-accepts-legacy-rejection	blocked-v2	
+tests/numsim/runtime/test_tcgen_collectors.py::test_typed_gemm_discards_a_raw_mma_fill	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_tcgen_commit_predicates.py::test_tcgen_commit_predicates_gate_all_operands	public	pass	flip	
 tests/numsim/runtime/test_tcgen_lut_b.py::test_block_lut_b_scales_and_packed_tmem	public	pass	flip	
 tests/numsim/runtime/test_tcgen_lut_b.py::test_dense_lut_b_segments_and_cta_partition	public	pass	flip	
