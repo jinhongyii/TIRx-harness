@@ -11,8 +11,9 @@ Day-to-day commands for the NumSim / Racecheck / Synccheck redesign
 
 Interactive shells on the development hosts export `PYTHONPATH`, `TVM_HOME`,
 `TVM_LIBRARY_PATH` and `LD_LIBRARY_PATH` pointing at a local TVM 0.26 tree.
-That TVM shadows the pinned `apache-tvm` wheel and the frontend panics with
-`sym.Analyzer is not registered`. Always start with:
+That TVM shadows the TIRx-enabled `tvm` installed in the project venv, so
+`import tvm` loads the wrong build and TIRx kernels fail to parse or lower.
+Always start with:
 
 ```bash
 source scripts/dev-env.sh   # repo root; clears the TVM variables, sets $PY
@@ -302,30 +303,13 @@ once it lands.
 Follow-up: re-record every v2 baseline on a quiet host
 (`perf_gate.py --run -n 1 --record`, without `--force`) and then review each limit.
 
-### Legacy vs v2 corpus comparison
+### Legacy vs v2 corpus comparison (history)
 
-`scripts/numsim-v2/bench_backends.py` times every canonical case in each mode where v2
-matches legacy (`v2-conformance-status.md`). It runs legacy and v2 interp at
-`max_workers` 1/8/32, 3 interleaved repetitions each, keeping the minimum. Every run's
-Each case runs in its own child process. The 1-minute load average is
-checked before each (case, mode) and the run waits while it exceeds `--max-load` (default
-40); samples taken above 40 are flagged `(L)`. Results are written per case under
-`$NUMSIM_CACHE_DIR/bench-backends/` and a rerun skips cases already present (`--force` redoes
-them). On a near-idle host, from `tirx_harness/`:
-
-```bash
-nproc; uptime; vmstat 1 3                     # preflight (tests/CLAUDE.md)
-$PY ../scripts/numsim-v2/bench_backends.py run --variants legacy,interp
-$PY ../scripts/numsim-v2/bench_backends.py mega            # Mega-MoE perf workloads, 900 s cap per run
-$PY ../scripts/numsim-v2/bench_backends.py render          # docs/development/backend-comparison.{md,json}
-$PY ../scripts/numsim-v2/bench_backends.py regressions --engine "$(git rev-parse --short HEAD)"
-                                              # docs/development/perf_regressions.tsv
-```
-
-A full corpus sweep takes about 4-6 h. To time a fixed engine while the tree keeps changing,
-make a private build (`CARGO_TARGET_DIR=<scratch>/target bash
-src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh --out <scratch>/ext`) and pass
-`--v2-package <scratch>/ext/pkg/tirx_harness/numsim/v2`; name that commit with
-`regressions --engine`. Narrow a rerun with `--cases REGEX`, `--modes` and `--workers`.
-`perf_regressions.tsv` lists every (case, mode, workers) row where interp is slower than
-legacy, with an owner guess; `backend-comparison.md` explains the heuristic.
+Before the legacy engine was deleted (79f04eb), `scripts/numsim-v2/bench_backends.py`
+timed every canonical case in each mode against legacy (max_workers 1/8/32, min of 3
+interleaved runs) and measured the deleted codegen backend. The results are in
+[backend-comparison.md](backend-comparison.md) (and, once written, `perf_regressions.tsv`:
+the rows where interp was slower than legacy). The script's last version is
+`git show 7c7d049:scripts/numsim-v2/bench_backends.py`. Ongoing performance tracking is
+the v2 performance gate above (`scripts/numsim-v2/perf_gate.py`, `tests/perf`) plus the
+criterion benches in `core-rs/numsim-core/benches/`.
