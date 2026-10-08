@@ -590,3 +590,81 @@ fn dense_shapes_match_the_ptx_isa_table() {
 fn f8f6f4_descriptor(d_format: u32, a_format: u32, b_format: u32, m: u32, n: u32) -> u32 {
     (d_format << 4) | (a_format << 7) | (b_format << 10) | ((n >> 3) << 17) | ((m >> 4) << 24)
 }
+
+/// W11-7: the shape a runtime descriptor encodes is compared with the declared
+/// MMA shape; the reproducer's flipped N bit (bit 17) turns N=16 into N=24.
+#[test]
+fn runtime_descriptor_shape_must_match_the_declared_mma() {
+    // kind::mxf8f6f4 M=128 N=16 K=32: M field 8 at bits 24.., N field 2 at 17.., UE8M0 bit 23.
+    let mx = (8_u32 << 24) | (2 << 17) | (1 << 23);
+    let declared = MmaShape {
+        m: 128,
+        n: 16,
+        k: 32,
+    };
+    assert_eq!(idesc_shape(mx, IdescFamily::Mxf8f6f4), declared);
+    check_declared_shape(mx, IdescFamily::Mxf8f6f4, declared).unwrap();
+    let flipped = mx ^ (1 << 17);
+    assert_eq!(idesc_shape(flipped, IdescFamily::Mxf8f6f4).n, 24);
+    let err = check_declared_shape(flipped, IdescFamily::Mxf8f6f4, declared)
+        .unwrap_err()
+        .0;
+    assert!(
+        err.contains("M=128 N=24 K=32") && err.contains("M=128 N=16 K=32"),
+        "{err}"
+    );
+    // Bit 26 is not part of the mxf8f6f4 M field; bit 31 selects K=64; sparse doubles K.
+    assert_eq!(idesc_shape(mx | (1 << 26), IdescFamily::Mxf8f6f4), declared);
+    assert_eq!(idesc_shape(mx | (1 << 31), IdescFamily::Mxf8f6f4).k, 64);
+    assert_eq!(idesc_shape(mx | 4, IdescFamily::Mxf8f6f4).k, 64);
+    // Dense kinds: f16 K=16, tf32 K=8, f8f6f4 K=32 (64 with bit 29); M/N errors either way.
+    let dense = (4_u32 << 24) | (8 << 17);
+    assert_eq!(
+        idesc_shape(dense, IdescFamily::Dense { k: 16 }),
+        MmaShape {
+            m: 64,
+            n: 64,
+            k: 16
+        }
+    );
+    assert_eq!(
+        idesc_shape(dense | (1 << 29), IdescFamily::Dense { k: 32 }).k,
+        64
+    );
+    assert_eq!(
+        idesc_shape(dense | (1 << 29), IdescFamily::Dense { k: 16 }).k,
+        16
+    );
+    assert!(check_declared_shape(
+        dense,
+        IdescFamily::Dense { k: 8 },
+        MmaShape {
+            m: 128,
+            n: 64,
+            k: 8
+        }
+    )
+    .is_err());
+    // kind::mxf4: M = bits 27..29 x 128, K 64 / 96 (bit 31) / 128 (bit 3).
+    let mxf4 = (1_u32 << 27) | (32 << 17);
+    assert_eq!(
+        idesc_shape(mxf4, IdescFamily::Mxf4),
+        MmaShape {
+            m: 128,
+            n: 256,
+            k: 64
+        }
+    );
+    assert_eq!(idesc_shape(mxf4 | (1 << 31), IdescFamily::Mxf4).k, 96);
+    assert_eq!(idesc_shape(mxf4 | (1 << 3), IdescFamily::Mxf4).k, 128);
+    assert!(check_declared_shape(
+        mxf4,
+        IdescFamily::Mxf4,
+        MmaShape {
+            m: 256,
+            n: 256,
+            k: 64
+        }
+    )
+    .is_err());
+}

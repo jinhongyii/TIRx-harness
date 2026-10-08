@@ -44,8 +44,7 @@ legacy Python modules).
 | --- | --- | --- |
 | Lowering (Python) | `numsim/v2/lowering/` ([README](../../tirx_harness/src/tirx_harness/numsim/v2/lowering/README.md)) | TIRx PrimFunc → `Module` (one `Program` per launch) |
 | Contract | `core-rs/numsim-core/src/{program,dtype,value,site,observe,report}.rs`, `numsim-types` | `Program`, `Instr`, `Dtype`, `SiteInfo`, the `Observer` trait, `Finding` |
-| Interpreter backend | `numsim-core/src/interp/` | `WarpState`, the mask stack, one handler per instruction family |
-| Codegen backend | `numsim-core/src/codegen/` | A printer from `Program` to Rust that calls the same handlers; one `rustc` per module |
+| Interpreter | `numsim-core/src/interp/` | `WarpState`, the mask stack, one handler per instruction family |
 | Scheduler | `numsim-core/src/sched/` | Rounds, seeded warp rotation, async landing, deadlock and budget detection, cluster partitions |
 | Arena | `numsim-core/src/arena.rs` | Allocations, views, validity bits, address encodings |
 | SyncTable | `numsim-core/src/sync/` | Protocol states, `step` functions, the completion queue |
@@ -79,9 +78,9 @@ TIRx PrimFunc
   │  lowering (Python): TVM tile dispatch + tile_forms, ir_walk, calls, ptx_lower
   ▼
 Module = [Program]                 cached as JSON under $NUMSIM_CACHE_DIR/v2-modules
-  │  numsim_core_py.run(module, inputs, mode, backend, seed, workers)
+  │  numsim_core_py.run(module, inputs, mode, seed, workers)
   ▼
-Scheduler ── Interpreter or codegen step function ── handlers
+Scheduler ── Interpreter step function ──────── handlers
   │             │                    │                  │
   │           Arena               SyncTable           OpLib
   ▼
@@ -142,8 +141,8 @@ partition. Results and observer streams never depend on the worker count.
    Request an `Instr` variant through `CONTRACT_REQUESTS.md`, then write its
    handler in `interp/handlers/`. The handler reads and writes the arena,
    steps the `SyncTable` for protocol effects, and emits the `Access` and
-   `SyncEvent` records the checkers need. The codegen backend prints a call to
-   the same handler, so semantics never appear in generated code.
+   `SyncEvent` records the checkers need. The handler is the instruction's
+   only semantics; nothing else executes it.
 4. **Test it** with a hand-built `Program` (`testutil::ProgramBuilder`) in
    `numsim-core/tests/`, a lowering test under `tests/numsim/v2/`, and, when
    the hardware behavior is uncertain, a paired NumSim/GPU microtest.
@@ -245,7 +244,7 @@ fields, or absolute times.
 | Layer | What it checks | Where |
 | --- | --- | --- |
 | Semantic conformance | Corpus verdicts, findings, and outputs against snapshots | `tests/conformance/` |
-| Differential and property | Interpreter vs. codegen bit equality; reference state machine vs. `step`; reduced vs. exhaustive Synccheck search on random logs | `numsim-core/tests/{codegen_equivalence,sync_differential,synccheck_equivalence}.rs` |
+| Differential and property | Reference state machine vs. `step`; reduced vs. exhaustive Synccheck search on random logs | `numsim-core/tests/{sync_differential,synccheck_equivalence}.rs` |
 | Pure core | Hand-written `Program`s and contract events fed to the engine and checkers, without Python | `numsim-core/tests/` |
 | Lowering | The contents of the lowered `Program`, not any generated text | `tests/numsim/v2/test_lowering_*.py` |
 | Kernel-level checks | Racecheck/Synccheck facts that contract events cannot express | `tests/numsim/v2/checkers/` |
@@ -269,4 +268,4 @@ conformance run skip there).
 | [Synccheck explorer](synccheck-explorer.md) | Projection, certificates, fingerprints, DFS, budgets |
 | [Lowering inventory](lowering-inventory.md) | IR nodes, builtins, and layouts the corpus uses |
 | [Test migration](test-migration.md) | How the legacy test suite is retired |
-| [Backend comparison](backend-comparison.md) | Interpreter vs. codegen measurements and the backend decision |
+| [Backend comparison](backend-comparison.md) | Interpreter vs. codegen measurements behind the decision to keep only the interpreter |

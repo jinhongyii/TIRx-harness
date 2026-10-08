@@ -23,7 +23,8 @@ fn tir(c: &mut Criterion) {
     let (af, bf, cf) = (f32s(1.5), f32s(-2.25), f32s(0.5));
     let ah = lanes(|l| 0x3c00 + l as u64);
     let mut out = vec![[0u64; 32]];
-    let ops: Vec<(&str, Box<dyn Fn(&mut Vec<WarpValue<u64>>)>)> = vec![
+    type Case<'a> = (&'a str, Box<dyn Fn(&mut Vec<WarpValue<u64>>) + 'a>);
+    let ops: Vec<Case> = vec![
         ("binary_add_u32", Box::new(|o| oplib::binary(BinOp::Add, Ty::U32, &au, &bu, o, mask).unwrap())),
         ("binary_add_f32", Box::new(|o| oplib::binary(BinOp::Add, Ty::F32, &af, &bf, o, mask).unwrap())),
         ("binary_mul_f32", Box::new(|o| oplib::binary(BinOp::Mul, Ty::F32, &af, &bf, o, mask).unwrap())),
@@ -52,7 +53,9 @@ fn ptx(c: &mut Criterion) {
     let mask = WarpMask::ALL;
     let key = |name: &str, mods: &[&str]| OpKey { name: name.into(), mods: mods.iter().map(|m| m.to_string()).collect() };
     let f = |seed: f32| -> WarpValue<u64> { std::array::from_fn(|l| u64::from((seed + l as f32 * 0.37).to_bits())) };
-    let cases: Vec<(&str, OpKey, Vec<Ty>, Vec<Ty>, Vec<WarpValue<u64>>)> = vec![
+    // (name, op, destination types, source types, source values)
+    type Case = (&'static str, OpKey, Vec<Ty>, Vec<Ty>, Vec<WarpValue<u64>>);
+    let cases: Vec<Case> = vec![
         ("mov_pack_b32x2", key("tirx.ptx.mov_pack_b32x2", &["b64"]), vec![Ty::U64], vec![Ty::U32, Ty::U32], vec![f(1.0), f(2.0)]),
         ("mov_unpack_b32x2", key("tirx.ptx.mov_unpack_b32x2", &["b64"]), vec![Ty::U32, Ty::U32], vec![Ty::U64], vec![f(1.0)]),
         ("fma_rn_f32", key("tirx.ptx.fma", &["rn", "f32"]), vec![Ty::F32], vec![Ty::F32; 3], vec![f(1.0), f(2.0), f(3.0)]),
@@ -169,7 +172,7 @@ fn tc(c: &mut Criterion) {
                 kind: case.kind, cta_group: 1, d: op, a: TcA::Smem(op), b_desc: op, idesc: op, enable_input_d: op,
                 ws: false, ws_b_buffer: 0, block_scale: case.scaled.map(|(_, block)| (op, op, block)), scale_input_d: None, sparse_meta: None,
                 disable_output_lane: Vec::new(), collector_a: CollectorOp::None, collector_b: CollectorOp::None,
-                ashift: false, lut_b: false, lut_b_addr: None,
+                ashift: false, lut_b: false, lut_b_addr: None, declared: None,
             },
             d_taddr: 0, a: a_desc, b_desc, idesc, enable_input_d: case.accumulate,
             // Scale tables after the 256 D columns (all-zero UE8M0 = 2^-127).

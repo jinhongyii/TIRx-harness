@@ -16,15 +16,9 @@ pub(super) fn entries() -> &'static [OpEntry] {
             .map(|info| OpEntry {
                 name: info.name,
                 family: info.family,
-                fidelity: match info.fidelity {
-                    lib::Fidelity::Modeled => Fidelity::Modeled,
-                    lib::Fidelity::DeterministicRepresentative => Fidelity::DeterministicRepresentative,
-                    lib::Fidelity::OrderingOnly => Fidelity::OrderingOnly,
-                    lib::Fidelity::ExactProtocol => Fidelity::ExactProtocol,
-                    lib::Fidelity::Rejected => Fidelity::Rejected,
-                },
+                fidelity: info.fidelity,
                 notes: info.notes,
-                instr: if info.fidelity == lib::Fidelity::Rejected { "" } else { instr_family(info.name) },
+                instr: if info.fidelity == Fidelity::Rejected { "" } else { instr_family(info.name) },
             })
             .collect()
     })
@@ -162,7 +156,7 @@ the required hardware is available.\n\n",
             "| {} | {} | {} | {} |\n",
             cell(&format!("`{}`", e.name)),
             cell(e.family),
-            e.fidelity.name(),
+            e.fidelity.as_str(),
             cell(e.notes)
         ));
     }
@@ -172,7 +166,7 @@ participation in its declared execution scope, including register-only lowerings
 | Operation | Fidelity | Notes |\n| --- | --- | --- |\n",
     );
     for e in tiles {
-        s.push_str(&format!("| {} | {} | {} |\n", cell(&format!("`{}`", e.name)), e.fidelity.name(), cell(e.notes)));
+        s.push_str(&format!("| {} | {} | {} |\n", cell(&format!("`{}`", e.name)), e.fidelity.as_str(), cell(e.notes)));
     }
     s
 }

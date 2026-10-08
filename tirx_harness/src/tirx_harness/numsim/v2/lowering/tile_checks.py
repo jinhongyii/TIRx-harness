@@ -8,19 +8,46 @@ behaviour (reasons as legacy frontend-rs ``analyze/tile_forms``).
 
 from __future__ import annotations
 
+import itertools
 from typing import Any
 
 from .dtypes import type_key
 
 # Tile config keys any legacy tile form accepted (frontend-rs analyze/tile_forms
 # `unknown_keys` lists, union over ops).
-TILE_CONFIG_KEYS = frozenset({
-    "cache", "cache_hint", "cta_group", "cta_mask", "descI", "gather4", "is_AB_tf32", "l1_evict",
-    "l2_evict", "l2_promotion", "mbar", "mbarrier_addr", "mma_m", "mma_n", "multicast", "oob", "pred",
-    "prefetch_size", "prefetch_tensormap", "remote_cta_id", "rounding_mode", "shape", "smem_desc",
-    "tensormap_l2_promotion", "thread_reduce", "tma_dtype", "use_tma_reduce", "vec_len",
-    "weight_stationary",
-})
+TILE_CONFIG_KEYS = frozenset(
+    {
+        "cache",
+        "cache_hint",
+        "cta_group",
+        "cta_mask",
+        "descI",
+        "gather4",
+        "is_AB_tf32",
+        "l1_evict",
+        "l2_evict",
+        "l2_promotion",
+        "mbar",
+        "mbarrier_addr",
+        "mma_m",
+        "mma_n",
+        "multicast",
+        "oob",
+        "pred",
+        "prefetch_size",
+        "prefetch_tensormap",
+        "remote_cta_id",
+        "rounding_mode",
+        "shape",
+        "smem_desc",
+        "tensormap_l2_promotion",
+        "thread_reduce",
+        "tma_dtype",
+        "use_tma_reduce",
+        "vec_len",
+        "weight_stationary",
+    }
+)
 
 
 def tile_rejection(node: Any) -> str | None:
@@ -50,11 +77,22 @@ def _touches_float64(node: Any) -> bool:
 
 def _abi(role: str, row: int, col: int, mma_k: int) -> tuple[int, int, tuple[int, int]]:
     if role in ("D", "C"):
-        return 4 * (row % 8) + (col % 8) // 2, 2 * ((row % 16) // 8) + col % 2, (row // 16, col // 8)
+        return (
+            4 * (row % 8) + (col % 8) // 2,
+            2 * ((row % 16) // 8) + col % 2,
+            (row // 16, col // 8),
+        )
     if role == "A":
-        return (4 * (row % 8) + (col % 8) // 2, 4 * ((col % mma_k) // 8) + 2 * ((row % 16) // 8) + col % 2,
-                (row // 16, col // mma_k))
-    return 4 * (col % 8) + (row % 8) // 2, 2 * ((row % mma_k) // 8) + row % 2, (row // mma_k, col // 8)
+        return (
+            4 * (row % 8) + (col % 8) // 2,
+            4 * ((col % mma_k) // 8) + 2 * ((row % 16) // 8) + col % 2,
+            (row // 16, col // mma_k),
+        )
+    return (
+        4 * (col % 8) + (row % 8) // 2,
+        2 * ((row % mma_k) // 8) + row % 2,
+        (row // mma_k, col // 8),
+    )
 
 
 def _region(arg: Any) -> tuple[Any, list[int]] | None:
@@ -63,7 +101,7 @@ def _region(arg: Any) -> tuple[Any, list[int]] | None:
         return None
     ty = getattr(arg.source, "ty", None)
     layout = getattr(ty, "layout", None) if ty is not None else None
-    if layout is None or type_key(layout) != "tirx.TileLayout":
+    if ty is None or layout is None or type_key(layout) != "tirx.TileLayout":
         return None
     try:
         shape = [int(s) for s in ty.shape]
@@ -76,38 +114,54 @@ def _region(arg: Any) -> tuple[Any, list[int]] | None:
     return layout, shape
 
 
-def _check_fragment(layout: Any, shape: list[int], role: str, rows: int, cols: int, mma_k: int,
-                    transpose: bool) -> str | None:
+def _check_fragment(
+    layout: Any, shape: list[int], role: str, rows: int, cols: int, mma_k: int, transpose: bool
+) -> str | None:
     from tvm import tirx
 
     if len(layout.replica) != 0:
-        return (f"TilePrimitiveCall(gemm): {role} fragment layout has replica axes, which "
-                f"mma.sync.m16n8k{mma_k} does not support")
+        return (
+            f"TilePrimitiveCall(gemm): {role} fragment layout has replica axes, which "
+            f"mma.sync.m16n8k{mma_k} does not support"
+        )
     bases: dict[tuple[int, int], int] = {}
     for row in range(rows):
         for col in range(cols):
             srow, scol = (col, row) if transpose else (row, col)
-            mapped = {str(k): v for k, v in layout.apply(tirx.IntImm("int32", srow * shape[1] + scol)).items()}
-            if set(mapped) != {"laneid", "m"} or any(type_key(v) != "ir.IntImm" for v in mapped.values()):
-                return (f"TilePrimitiveCall(gemm): {role} fragment layout must map exactly to laneid and m "
-                        f"for mma.sync.m16n8k{mma_k}, got {sorted(mapped)}")
+            mapped = {
+                str(k): v
+                for k, v in layout.apply(tirx.IntImm("int32", srow * shape[1] + scol)).items()
+            }
+            if set(mapped) != {"laneid", "m"} or any(
+                type_key(v) != "ir.IntImm" for v in mapped.values()
+            ):
+                return (
+                    f"TilePrimitiveCall(gemm): {role} fragment layout must map exactly to laneid and m "
+                    f"for mma.sync.m16n8k{mma_k}, got {sorted(mapped)}"
+                )
             lane, slot = int(mapped["laneid"].value), int(mapped["m"].value)
             expected_lane, expected_slot, tile = _abi(role, row, col, mma_k)
             if lane != expected_lane:
-                return (f"TilePrimitiveCall(gemm): {role} fragment layout does not match fixed "
-                        f"mma.sync.m16n8k{mma_k} ABI at logical ({row}, {col}): expected laneid={expected_lane}, "
-                        f"got {lane}")
+                return (
+                    f"TilePrimitiveCall(gemm): {role} fragment layout does not match fixed "
+                    f"mma.sync.m16n8k{mma_k} ABI at logical ({row}, {col}): expected laneid={expected_lane}, "
+                    f"got {lane}"
+                )
             base = bases.setdefault(tile, slot - expected_slot)
             if slot - expected_slot != base:
-                return (f"TilePrimitiveCall(gemm): {role} fragment layout does not match fixed "
-                        f"mma.sync.m16n8k{mma_k} ABI at logical ({row}, {col}): register slot {slot} is not "
-                        f"ABI slot {expected_slot} relative to one fragment base")
+                return (
+                    f"TilePrimitiveCall(gemm): {role} fragment layout does not match fixed "
+                    f"mma.sync.m16n8k{mma_k} ABI at logical ({row}, {col}): register slot {slot} is not "
+                    f"ABI slot {expected_slot} relative to one fragment base"
+                )
     per_tile = {"D": 4, "C": 4, "A": mma_k // 2, "B": mma_k // 4}[role]
     spans = sorted(bases.items(), key=lambda item: item[1])
-    for (tile, base), (other, other_base) in zip(spans, spans[1:]):
+    for (tile, base), (other, other_base) in itertools.pairwise(spans):
         if base + per_tile > other_base:
-            return (f"TilePrimitiveCall(gemm): {role} instruction tiles {tile} and {other} may alias the same "
-                    f"physical registers for mma.sync.m16n8k{mma_k}")
+            return (
+                f"TilePrimitiveCall(gemm): {role} instruction tiles {tile} and {other} may alias the same "
+                f"physical registers for mma.sync.m16n8k{mma_k}"
+            )
     return None
 
 
@@ -115,8 +169,9 @@ def _gemm_fragment_rejection(node: Any) -> str | None:
     args = list(node.args)
     if len(args) < 6:
         return None
-    regions = [_region(a) for a in args[:4]]
-    if any(r is None for r in regions):
+    found = [_region(a) for a in args[:4]]
+    regions = [r for r in found if r is not None]
+    if len(regions) != len(found):
         return None  # not a whole-buffer register-fragment gemm; TVM decides
     try:
         trans_a, trans_b = bool(args[4]), bool(args[5])
@@ -131,8 +186,12 @@ def _gemm_fragment_rejection(node: Any) -> str | None:
     for mma_k in (16, 8):
         if k % mma_k:
             continue
-        checks = (("D", regions[0], m, n, False), ("A", regions[1], m, k, trans_a),
-                  ("B", regions[2], k, n, trans_b), ("C", regions[3], m, n, False))
+        checks = (
+            ("D", regions[0], m, n, False),
+            ("A", regions[1], m, k, trans_a),
+            ("B", regions[2], k, n, trans_b),
+            ("C", regions[3], m, n, False),
+        )
         failure = None
         for role, (layout, shape), rows, cols, transpose in checks:
             failure = _check_fragment(layout, shape, role, rows, cols, mma_k, transpose)

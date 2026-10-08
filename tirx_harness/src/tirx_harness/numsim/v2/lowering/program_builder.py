@@ -35,31 +35,103 @@ SITE_NONE = 0xFFFF_FFFF
 
 # TVM dtype element name -> numsim_core::Dtype.
 _DTYPES = {
-    "bool": "Pred", "int8": "S8", "uint8": "U8", "int16": "S16", "uint16": "U16",
-    "int32": "S32", "uint32": "U32", "int64": "S64", "uint64": "U64",
-    "int128": "B128", "uint128": "B128", "float16": "F16", "bfloat16": "BF16",
-    "float32": "F32", "float64": "F64", "float8_e4m3fn": "E4M3", "float8_e5m2": "E5M2",
-    "float8_e8m0fnu": "UE8M0", "float6_e2m3fn": "E2M3", "float6_e3m2fn": "E3M2",
-    "float4_e2m1fn": "E2M1", "int4": "S4", "uint4": "U4", "tf32": "TF32",
-    "handle": "U64", "uint6": "U6", "float8_e3m4": "E3M4", "float8_e4m3": "E4M3Ieee",
-    "float8_e4m3b11fnuz": "E4M3B11Fnuz", "float8_e4m3fnuz": "E4M3Fnuz", "float8_e5m2fnuz": "E5M2Fnuz",
+    "bool": "Pred",
+    "int8": "S8",
+    "uint8": "U8",
+    "int16": "S16",
+    "uint16": "U16",
+    "int32": "S32",
+    "uint32": "U32",
+    "int64": "S64",
+    "uint64": "U64",
+    "int128": "B128",
+    "uint128": "B128",
+    "float16": "F16",
+    "bfloat16": "BF16",
+    "float32": "F32",
+    "float64": "F64",
+    "float8_e4m3fn": "E4M3",
+    "float8_e5m2": "E5M2",
+    "float8_e8m0fnu": "UE8M0",
+    "float6_e2m3fn": "E2M3",
+    "float6_e3m2fn": "E3M2",
+    "float4_e2m1fn": "E2M1",
+    "int4": "S4",
+    "uint4": "U4",
+    "tf32": "TF32",
+    "handle": "U64",
+    "uint6": "U6",
+    "float8_e3m4": "E3M4",
+    "float8_e4m3": "E4M3Ieee",
+    "float8_e4m3b11fnuz": "E4M3B11Fnuz",
+    "float8_e4m3fnuz": "E4M3Fnuz",
+    "float8_e5m2fnuz": "E5M2Fnuz",
 }
 
 _DTYPE_BITS = {
-    "Pred": 8, "U8": 8, "S8": 8, "E4M3": 8, "E5M2": 8, "UE8M0": 8, "UE4M3": 8, "UE5M3": 8,
-    "U16": 16, "S16": 16, "F16": 16, "BF16": 16, "U32": 32, "S32": 32, "F32": 32, "TF32": 32,
-    "U64": 64, "S64": 64, "F64": 64, "B128": 128, "E2M3": 6, "E3M2": 6, "S2F6": 6,
-    "E2M1": 4, "U4": 4, "S4": 4, "U6": 6, "E3M4": 8, "E4M3Ieee": 8, "E4M3B11Fnuz": 8, "E4M3Fnuz": 8,
+    "Pred": 8,
+    "U8": 8,
+    "S8": 8,
+    "E4M3": 8,
+    "E5M2": 8,
+    "UE8M0": 8,
+    "UE4M3": 8,
+    "UE5M3": 8,
+    "U16": 16,
+    "S16": 16,
+    "F16": 16,
+    "BF16": 16,
+    "U32": 32,
+    "S32": 32,
+    "F32": 32,
+    "TF32": 32,
+    "U64": 64,
+    "S64": 64,
+    "F64": 64,
+    "B128": 128,
+    "E2M3": 6,
+    "E3M2": 6,
+    "S2F6": 6,
+    "E2M1": 4,
+    "U4": 4,
+    "S4": 4,
+    "U6": 6,
+    "E3M4": 8,
+    "E4M3Ieee": 8,
+    "E4M3B11Fnuz": 8,
+    "E4M3Fnuz": 8,
     "E5M2Fnuz": 8,
 }
 
 # PTX type token -> Dtype (b-types map to unsigned of the same width).
 PTX_DTYPES = {
-    "pred": "Pred", "b8": "U8", "u8": "U8", "s8": "S8", "b16": "U16", "u16": "U16",
-    "s16": "S16", "b32": "U32", "u32": "U32", "s32": "S32", "b64": "U64", "u64": "U64",
-    "s64": "S64", "b128": "B128", "f16": "F16", "bf16": "BF16", "f32": "F32", "f64": "F64",
-    "tf32": "TF32", "e4m3": "E4M3", "e5m2": "E5M2", "ue8m0": "UE8M0", "e2m1": "E2M1",
-    "e2m3": "E2M3", "e3m2": "E3M2", "ue4m3": "UE4M3", "ue5m3": "UE5M3",
+    "pred": "Pred",
+    "b8": "U8",
+    "u8": "U8",
+    "s8": "S8",
+    "b16": "U16",
+    "u16": "U16",
+    "s16": "S16",
+    "b32": "U32",
+    "u32": "U32",
+    "s32": "S32",
+    "b64": "U64",
+    "u64": "U64",
+    "s64": "S64",
+    "b128": "B128",
+    "f16": "F16",
+    "bf16": "BF16",
+    "f32": "F32",
+    "f64": "F64",
+    "tf32": "TF32",
+    "e4m3": "E4M3",
+    "e5m2": "E5M2",
+    "ue8m0": "UE8M0",
+    "e2m1": "E2M1",
+    "e2m3": "E2M3",
+    "e3m2": "E3M2",
+    "ue4m3": "UE4M3",
+    "ue5m3": "UE5M3",
 }
 
 
@@ -75,7 +147,7 @@ class Ty:
     lanes: int = 1
 
     @staticmethod
-    def from_tvm(name: str) -> "Ty":
+    def from_tvm(name: str) -> Ty:
         if name in _DTYPES:
             return Ty(_DTYPES[name])
         base, sep, lanes = name.rpartition("x")
@@ -86,7 +158,7 @@ class Ty:
         raise UnrepresentableType(f"dtype {name!r} has no numsim_core::Ty")
 
     @staticmethod
-    def from_ptx(token: str, lanes: int = 1) -> "Ty":
+    def from_ptx(token: str, lanes: int = 1) -> Ty:
         base, sep, count = token.rpartition("x")
         if sep and count.isdigit() and base in PTX_DTYPES:
             return Ty(PTX_DTYPES[base], int(count) * lanes)
@@ -98,7 +170,7 @@ class Ty:
     def bits(self) -> int:
         return _DTYPE_BITS[self.elem] * self.lanes
 
-    def with_lanes(self, lanes: int) -> "Ty":
+    def with_lanes(self, lanes: int) -> Ty:
         return Ty(self.elem, lanes)
 
     def to_json(self) -> Any:
@@ -144,10 +216,22 @@ def opt_opnd(value: Operand | None) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def mem_mods(cache: str = "Default", evict: str = "Normal", l2_prefetch: int = 0,
-             policy: Operand | None = None, nc: bool = False, uniform: bool = False) -> dict:
-    return {"cache": cache, "evict": evict, "l2_prefetch": l2_prefetch, "policy": opt_opnd(policy),
-            "nc": nc, "uniform": uniform}
+def mem_mods(
+    cache: str = "Default",
+    evict: str = "Normal",
+    l2_prefetch: int = 0,
+    policy: Operand | None = None,
+    nc: bool = False,
+    uniform: bool = False,
+) -> dict[str, Any]:
+    return {
+        "cache": cache,
+        "evict": evict,
+        "l2_prefetch": l2_prefetch,
+        "policy": opt_opnd(policy),
+        "nc": nc,
+        "uniform": uniform,
+    }
 
 
 def bulk_completion(mbar: Operand | None, space: str = "Shared") -> Any:
@@ -171,16 +255,16 @@ def phase_state(value: Operand) -> Any:
 
 @dataclass(frozen=True)
 class DimExpr:
-    op: str                       # Const Param Add Sub Mul FloorDiv CeilDiv Min Max
+    op: str  # Const Param Add Sub Mul FloorDiv CeilDiv Min Max
     value: int = 0
-    args: tuple["DimExpr", ...] = ()
+    args: tuple[DimExpr, ...] = ()
 
     @staticmethod
-    def const(value: int) -> "DimExpr":
+    def const(value: int) -> DimExpr:
         return DimExpr("Const", int(value))
 
     @staticmethod
-    def param(slot: int) -> "DimExpr":
+    def param(slot: int) -> DimExpr:
         return DimExpr("Param", int(slot))
 
     @property
@@ -201,7 +285,12 @@ class DimExpr:
 # opt_str_id, buf, param, pred, opid, json (pre-built JSON; Reg -> int).
 SCHEMA: dict[str, dict[str, str] | None] = {
     # control
-    "Nop": None, "EndIf": None, "Break": None, "Continue": None, "Exit": None, "GridSync": None,
+    "Nop": None,
+    "EndIf": None,
+    "Break": None,
+    "Continue": None,
+    "Exit": None,
+    "GridSync": None,
     "If": {"cond": "op", "else_pc": "pc", "end_pc": "pc", "elect": "bool"},
     "Else": {"end_pc": "pc"},
     "LoopBegin": {"end_pc": "pc"},
@@ -223,28 +312,87 @@ SCHEMA: dict[str, dict[str, str] | None] = {
     "LoadRegIndexed": {"dst": "reg", "base": "reg", "len": "int", "idx": "op"},
     "StoreRegIndexed": {"base": "reg", "len": "int", "idx": "op", "value": "op"},
     # warp collectives
-    "Shfl": {"mode": "json", "ty": "ty", "dst": "reg", "dst_pred": "opt_reg", "src": "op",
-             "lane": "op", "clamp": "op", "membermask": "op"},
+    "Shfl": {
+        "mode": "json",
+        "ty": "ty",
+        "dst": "reg",
+        "dst_pred": "opt_reg",
+        "src": "op",
+        "lane": "op",
+        "clamp": "op",
+        "membermask": "op",
+    },
     "Vote": {"mode": "json", "dst": "reg", "pred": "op", "membermask": "op"},
     "Redux": {"op": "json", "ty": "ty", "dst": "reg", "src": "op", "membermask": "op"},
     "Elect": {"dst_pred": "reg", "dst_lane": "opt_reg", "membermask": "op"},
     "WarpSync": {"membermask": "op"},
-    "LdMatrix": {"dsts": "regs", "addr": "op", "space": "json", "shape": "json", "num": "int",
-                 "trans": "bool", "fmt": "json"},
-    "StMatrix": {"srcs": "ops", "addr": "op", "space": "json", "shape": "json", "num": "int",
-                 "trans": "bool"},
+    "LdMatrix": {
+        "dsts": "regs",
+        "addr": "op",
+        "space": "json",
+        "shape": "json",
+        "num": "int",
+        "trans": "bool",
+        "fmt": "json",
+    },
+    "StMatrix": {
+        "srcs": "ops",
+        "addr": "op",
+        "space": "json",
+        "shape": "json",
+        "num": "int",
+        "trans": "bool",
+    },
     # memory
-    "Load": {"ty": "ty", "dst": "reg", "buf": "buf", "offset": "op", "sem": "json", "scope": "json",
-             "mods": "json"},
-    "Store": {"ty": "ty", "buf": "buf", "offset": "op", "value": "op", "sem": "json", "scope": "json",
-              "mods": "json"},
-    "LoadAddr": {"ty": "ty", "dst": "reg", "addr": "op", "space": "json", "sem": "json",
-                 "scope": "json", "mods": "json"},
-    "StoreAddr": {"ty": "ty", "addr": "op", "space": "json", "value": "op", "sem": "json",
-                  "scope": "json", "mods": "json"},
+    "Load": {
+        "ty": "ty",
+        "dst": "reg",
+        "buf": "buf",
+        "offset": "op",
+        "sem": "json",
+        "scope": "json",
+        "mods": "json",
+    },
+    "Store": {
+        "ty": "ty",
+        "buf": "buf",
+        "offset": "op",
+        "value": "op",
+        "sem": "json",
+        "scope": "json",
+        "mods": "json",
+    },
+    "LoadAddr": {
+        "ty": "ty",
+        "dst": "reg",
+        "addr": "op",
+        "space": "json",
+        "sem": "json",
+        "scope": "json",
+        "mods": "json",
+    },
+    "StoreAddr": {
+        "ty": "ty",
+        "addr": "op",
+        "space": "json",
+        "value": "op",
+        "sem": "json",
+        "scope": "json",
+        "mods": "json",
+    },
     "AddrOf": {"dst": "reg", "buf": "buf", "offset": "op"},
-    "Atom": {"op": "json", "ty": "ty", "dst": "opt_reg", "addr": "op", "space": "json",
-             "value": "op", "cmp": "opt_op", "sem": "json", "scope": "json", "ftz": "bool"},
+    "Atom": {
+        "op": "json",
+        "ty": "ty",
+        "dst": "opt_reg",
+        "addr": "op",
+        "space": "json",
+        "value": "op",
+        "cmp": "opt_op",
+        "sem": "json",
+        "scope": "json",
+        "ftz": "bool",
+    },
     "StBulk": {"addr": "op", "space": "json", "size": "op"},
     "Discard": {"addr": "op", "space": "json", "size": "int"},
     "Cvta": {"dst": "reg", "src": "op", "space": "json", "to_generic": "bool"},
@@ -252,20 +400,63 @@ SCHEMA: dict[str, dict[str, str] | None] = {
     "Mapa": {"dst": "reg", "src": "op", "rank": "op", "space": "json"},
     "GetCtaRank": {"dst": "reg", "src": "op", "space": "json"},
     # async copies
-    "CpAsync": {"dst": "op", "src": "op", "cp_size": "int", "src_size": "opt_op",
-                "ignore_src": "opt_op", "mods": "json"},
+    "CpAsync": {
+        "dst": "op",
+        "src": "op",
+        "cp_size": "int",
+        "src_size": "opt_op",
+        "ignore_src": "opt_op",
+        "mods": "json",
+    },
     "AsyncCommit": {"domain": "json"},
     "AsyncWait": {"domain": "json", "n": "int", "read": "bool"},
     "CpAsyncMbarArrive": {"mbar": "op", "space": "json", "noinc": "bool"},
-    "BulkCopy": {"dst": "op", "dst_space": "json", "src": "op", "src_space": "json", "size": "op",
-                 "completion": "json", "multicast": "opt_op", "reduce": "json", "byte_mask": "opt_op",
-                 "ignore_oob": "json", "report": "json", "mods": "json"},
-    "Tma": {"dir": "json", "mode": "json", "tmap": "op", "tmap_space": "json", "coords": "ops",
-            "im2col_offsets": "ops", "smem": "op", "smem_space": "json", "completion": "json",
-            "multicast": "opt_op", "cta_group": "int", "overrides": "json", "report": "json", "mods": "json"},
-    "StAsync": {"ty": "ty", "value": "op", "addr": "op", "mbar": "opt_op", "red": "json", "sem": "json",
-                "scope": "json"},
-    "TensorMapReplace": {"tmap": "op", "space": "json", "field": "json", "ord": "json", "value": "op"},
+    "BulkCopy": {
+        "dst": "op",
+        "dst_space": "json",
+        "src": "op",
+        "src_space": "json",
+        "size": "op",
+        "completion": "json",
+        "multicast": "opt_op",
+        "reduce": "json",
+        "byte_mask": "opt_op",
+        "ignore_oob": "json",
+        "report": "json",
+        "mods": "json",
+    },
+    "Tma": {
+        "dir": "json",
+        "mode": "json",
+        "tmap": "op",
+        "tmap_space": "json",
+        "coords": "ops",
+        "im2col_offsets": "ops",
+        "smem": "op",
+        "smem_space": "json",
+        "completion": "json",
+        "multicast": "opt_op",
+        "cta_group": "int",
+        "overrides": "json",
+        "report": "json",
+        "mods": "json",
+    },
+    "StAsync": {
+        "ty": "ty",
+        "value": "op",
+        "addr": "op",
+        "mbar": "opt_op",
+        "red": "json",
+        "sem": "json",
+        "scope": "json",
+    },
+    "TensorMapReplace": {
+        "tmap": "op",
+        "space": "json",
+        "field": "json",
+        "ord": "json",
+        "value": "op",
+    },
     "TensorMapCopyFence": {"dst": "op", "src": "op", "size": "int", "scope": "json"},
     # synchronization
     "Barrier": {"kind": "json", "id": "op", "count": "opt_op", "aligned": "bool"},
@@ -273,57 +464,158 @@ SCHEMA: dict[str, dict[str, str] | None] = {
     "ClusterWait": {"acquire": "bool", "aligned": "bool"},
     "MbarInit": {"mbar": "op", "space": "json", "count": "op", "layout_v1": "bool"},
     "MbarInval": {"mbar": "op", "space": "json"},
-    "MbarArrive": {"mbar": "op", "space": "json", "count": "opt_op", "expect_tx": "opt_op",
-                   "drop": "bool", "no_complete": "bool", "sem": "json", "scope": "json",
-                   "multicast": "opt_op", "state": "opt_reg"},
-    "MbarTx": {"op": "json", "mbar": "op", "space": "json", "bytes": "op", "multicast": "opt_op",
-               "scope": "json"},
-    "MbarTestWait": {"kind": "json", "mbar": "op", "space": "json", "phase": "json", "sem": "json",
-                     "scope": "json", "dst": "opt_reg", "report": "opt_reg", "report_value": "opt_reg"},
+    "MbarArrive": {
+        "mbar": "op",
+        "space": "json",
+        "count": "opt_op",
+        "expect_tx": "opt_op",
+        "drop": "bool",
+        "no_complete": "bool",
+        "sem": "json",
+        "scope": "json",
+        "multicast": "opt_op",
+        "state": "opt_reg",
+    },
+    "MbarTx": {
+        "op": "json",
+        "mbar": "op",
+        "space": "json",
+        "bytes": "op",
+        "multicast": "opt_op",
+        "scope": "json",
+    },
+    "MbarTestWait": {
+        "kind": "json",
+        "mbar": "op",
+        "space": "json",
+        "phase": "json",
+        "sem": "json",
+        "scope": "json",
+        "dst": "opt_reg",
+        "report": "opt_reg",
+        "report_value": "opt_reg",
+    },
     "MbarWait": {"mbar": "op", "space": "json", "phase": "json", "sem": "json", "scope": "json"},
     "MbarQuery": {"dst": "reg", "op": "json"},
     "Fence": {"kind": "json", "sem": "json", "scope": "json"},
     "SetMaxNReg": {"inc": "bool", "count": "int"},
-    "WaitUntil": {"dst": "reg", "addr": "op", "ty": "ty", "space": "json", "sem": "json",
-                  "scope": "json", "pred": "pred", "captures": "regs"},
+    "WaitUntil": {
+        "dst": "reg",
+        "addr": "op",
+        "ty": "ty",
+        "space": "json",
+        "sem": "json",
+        "scope": "json",
+        "pred": "pred",
+        "captures": "regs",
+    },
     "GridDepControl": {"launch_dependents": "bool"},
     "ClcTryCancel": {"resp": "op", "mbar": "op", "multicast": "bool"},
     # tcgen05
     "TcgenAlloc": {"dst": "op", "ncols": "op", "cta_group": "int", "exclusive": "bool"},
     "TcgenDealloc": {"taddr": "op", "ncols": "op", "cta_group": "int", "exclusive": "bool"},
     "TcgenRelinquish": {"cta_group": "int"},
-    "TcgenCommit": {"mbar": "op", "space": "json", "cta_group": "int", "multicast": "opt_op",
-                    "sync_restrict": "bool", "multicast_width": "json"},
-    "TcgenLd": {"dsts": "regs", "taddr": "op", "row": "op", "col": "op", "shape": "json", "num": "int", "pack": "bool",
-                "red": "json", "red_abs": "bool", "red_nan": "bool", "spcompress": "bool"},
-    "TcgenSt": {"srcs": "ops", "taddr": "op", "row": "op", "col": "op", "shape": "json", "num": "int", "unpack": "bool"},
+    "TcgenCommit": {
+        "mbar": "op",
+        "space": "json",
+        "cta_group": "int",
+        "multicast": "opt_op",
+        "sync_restrict": "bool",
+        "multicast_width": "json",
+    },
+    "TcgenLd": {
+        "dsts": "regs",
+        "taddr": "op",
+        "row": "op",
+        "col": "op",
+        "shape": "json",
+        "num": "int",
+        "pack": "bool",
+        "red": "json",
+        "red_abs": "bool",
+        "red_nan": "bool",
+        "spcompress": "bool",
+    },
+    "TcgenSt": {
+        "srcs": "ops",
+        "taddr": "op",
+        "row": "op",
+        "col": "op",
+        "shape": "json",
+        "num": "int",
+        "unpack": "bool",
+    },
     "TcgenWait": {"st": "bool"},
-    "TcgenCp": {"taddr": "op", "row": "op", "col": "op", "sdesc": "op", "rows": "int", "bits": "int", "multicast": "int",
-                "decompress_bits": "int", "cta_group": "int"},
-    "TcgenMma": {"kind": "json", "cta_group": "int", "d": "op", "a": "json", "b_desc": "op",
-                 "idesc": "op", "enable_input_d": "op", "ws": "bool", "ws_b_buffer": "int",
-                 "block_scale": "json", "scale_input_d": "opt_op", "sparse_meta": "opt_op",
-                 "disable_output_lane": "ops", "collector_a": "json", "collector_b": "json",
-                 "ashift": "bool", "lut_b": "bool", "lut_b_addr": "opt_op"},
+    "TcgenCp": {
+        "taddr": "op",
+        "row": "op",
+        "col": "op",
+        "sdesc": "op",
+        "rows": "int",
+        "bits": "int",
+        "multicast": "int",
+        "decompress_bits": "int",
+        "cta_group": "int",
+    },
+    "TcgenMma": {
+        "kind": "json",
+        "cta_group": "int",
+        "d": "op",
+        "a": "json",
+        "b_desc": "op",
+        "idesc": "op",
+        "enable_input_d": "op",
+        "ws": "bool",
+        "ws_b_buffer": "int",
+        "block_scale": "json",
+        "scale_input_d": "opt_op",
+        "sparse_meta": "opt_op",
+        "disable_output_lane": "ops",
+        "collector_a": "json",
+        "collector_b": "json",
+        "ashift": "bool",
+        "lut_b": "bool",
+        "lut_b_addr": "opt_op",
+        "declared": "json",
+    },
 }
 
 # Variants that may return Blocked (mirror of Instr::may_block).
 BLOCKING = frozenset(
-    {"ClusterWait", "GridSync", "MbarWait", "AsyncWait", "TcgenAlloc", "TcgenWait", "WaitUntil",
-     "WarpSync"}
+    {
+        "ClusterWait",
+        "GridSync",
+        "MbarWait",
+        "AsyncWait",
+        "TcgenAlloc",
+        "TcgenWait",
+        "WaitUntil",
+        "WarpSync",
+    }
 )
 
 # Instructions allowed inside a wait_until predicate range.
 PRED_ALLOWED = frozenset(
-    {"Mov", "Unary", "Binary", "Ternary", "Compare", "Select", "Cast", "Ptx", "Load", "LoadAddr",
-     "LoadRegIndexed"}
+    {
+        "Mov",
+        "Unary",
+        "Binary",
+        "Ternary",
+        "Compare",
+        "Select",
+        "Cast",
+        "Ptx",
+        "Load",
+        "LoadAddr",
+        "LoadRegIndexed",
+    }
 )
 
 
 class Instr:
     """One ``numsim_core::Instr`` (variant + fields, checked against SCHEMA)."""
 
-    __slots__ = ("variant", "fields")
+    __slots__ = ("fields", "variant")
 
     def __init__(self, variant: str, /, **fields: Any):
         if variant not in SCHEMA:
@@ -346,7 +638,11 @@ class Instr:
         raise AttributeError("Instr is immutable")
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, Instr) and self.variant == other.variant and self.fields == other.fields
+        return (
+            isinstance(other, Instr)
+            and self.variant == other.variant
+            and self.fields == other.fields
+        )
 
     def __hash__(self) -> int:
         return hash((self.variant, tuple(sorted(self.fields))))
@@ -358,11 +654,11 @@ class Instr:
     @property
     def may_block(self) -> bool:
         if self.variant == "Barrier":
-            return self.fields["kind"] != "Arrive"
+            return bool(self.fields["kind"] != "Arrive")
         if self.variant == "SetMaxNReg":
             return True
         if self.variant in ("TcgenDealloc", "TcgenRelinquish"):
-            return self.fields["cta_group"] == 2
+            return bool(self.fields["cta_group"] == 2)
         return self.variant in BLOCKING
 
     def operands(self) -> list[Operand]:
@@ -374,7 +670,11 @@ class Instr:
                 out.append(value)
             elif kind == "ops":
                 out.extend(value)
-            elif kind == "reg" and self.variant in ("LoadRegIndexed", "StoreRegIndexed") and name == "base":
+            elif (
+                kind == "reg"
+                and self.variant in ("LoadRegIndexed", "StoreRegIndexed")
+                and name == "base"
+            ):
                 out.append(value)
         return out
 
@@ -392,7 +692,11 @@ class Instr:
         schema = SCHEMA[self.variant]
         if schema is None:
             return self.variant
-        return {self.variant: {name: _field_json(kind, self.fields[name]) for name, kind in schema.items()}}
+        return {
+            self.variant: {
+                name: _field_json(kind, self.fields[name]) for name, kind in schema.items()
+            }
+        }
 
 
 def _plain_json(value: Any) -> Any:
@@ -443,8 +747,13 @@ class SourceSpan:
     end_column: int
 
     def to_json(self) -> Any:
-        return {"file": self.file, "line": self.line, "col": self.column, "end_line": self.end_line,
-                "end_col": self.end_column}
+        return {
+            "file": self.file,
+            "line": self.line,
+            "col": self.column,
+            "end_line": self.end_line,
+            "end_col": self.end_column,
+        }
 
 
 @dataclass(frozen=True)
@@ -466,9 +775,15 @@ class SiteInfo:
 
     def to_json(self) -> Any:
         buffers = self.all_buffers()
-        return {"kind": self.kind, "spans": [s.to_json() for s in self.spans], "op_name": self.op_name,
-                "text": self.text, "dtype": self.dtype, "buffer": buffers[0] if buffers else None,
-                "buffers": buffers}
+        return {
+            "kind": self.kind,
+            "spans": [s.to_json() for s in self.spans],
+            "op_name": self.op_name,
+            "text": self.text,
+            "dtype": self.dtype,
+            "buffer": buffers[0] if buffers else None,
+            "buffers": buffers,
+        }
 
 
 @dataclass(frozen=True)
@@ -484,7 +799,7 @@ class RegDecl:
 @dataclass(frozen=True)
 class BufferDecl:
     name: str
-    space: str                       # Global Shared Local Param Tmem Reg
+    space: str  # Global Shared Local Param Tmem Reg
     dtype: Ty
     shape: tuple[DimExpr, ...]
     strides: tuple[DimExpr, ...] = ()
@@ -494,16 +809,22 @@ class BufferDecl:
     align: int = 16
     view_of: int | None = None
     sync_words: bool = False
-    base_reg: Reg | None = None      # runtime TMEM base (contract item 22); base must be 0
+    base_reg: Reg | None = None  # runtime TMEM base (contract item 22); base must be 0
 
     def to_json(self) -> Any:
         return {
             # arena::Space serializes snake_case (contract e2551cf).
-            "name": self.name, "space": self.space.lower(), "dtype": self.dtype.to_json(),
-            "shape": [d.to_json() for d in self.shape], "strides": [d.to_json() for d in self.strides],
-            "param_slot": self.param_slot, "base": self.base,
+            "name": self.name,
+            "space": self.space.lower(),
+            "dtype": self.dtype.to_json(),
+            "shape": [d.to_json() for d in self.shape],
+            "strides": [d.to_json() for d in self.strides],
+            "param_slot": self.param_slot,
+            "base": self.base,
             "byte_len": None if self.byte_len is None else self.byte_len.to_json(),
-            "align": self.align, "view_of": self.view_of, "sync_words": self.sync_words,
+            "align": self.align,
+            "view_of": self.view_of,
+            "sync_words": self.sync_words,
             "base_reg": None if self.base_reg is None else self.base_reg.index,
         }
 
@@ -526,8 +847,13 @@ class PredProgram:
     reads_memory: bool
 
     def to_json(self) -> Any:
-        return {"arg": self.arg.index, "start": self.start, "end": self.end,
-                "result": self.result.index, "reads_memory": self.reads_memory}
+        return {
+            "arg": self.arg.index,
+            "start": self.start,
+            "end": self.end,
+            "result": self.result.index,
+            "reads_memory": self.reads_memory,
+        }
 
 
 @dataclass
@@ -536,7 +862,7 @@ class Launch:
     cluster: tuple[int, int, int] = (1, 1, 1)
     block: tuple[int, int, int] = (32, 1, 1)
     static_smem_bytes: int = 0
-    dyn_smem_bytes: DimExpr = DimExpr.const(0)
+    dyn_smem_bytes: DimExpr = field(default_factory=lambda: DimExpr.const(0))
     min_blocks_per_sm: int | None = None
     cooperative: bool = False
     regs_per_thread: int = 0
@@ -551,45 +877,53 @@ class Launch:
 
     def to_json(self) -> Any:
         return {
-            "grid": [d.to_json() for d in self.grid], "cluster": list(self.cluster),
-            "block": list(self.block), "static_smem_bytes": self.static_smem_bytes,
-            "dyn_smem_bytes": self.dyn_smem_bytes.to_json(), "min_blocks_per_sm": self.min_blocks_per_sm,
-            "cooperative": self.cooperative, "regs_per_thread": self.regs_per_thread,
+            "grid": [d.to_json() for d in self.grid],
+            "cluster": list(self.cluster),
+            "block": list(self.block),
+            "static_smem_bytes": self.static_smem_bytes,
+            "dyn_smem_bytes": self.dyn_smem_bytes.to_json(),
+            "min_blocks_per_sm": self.min_blocks_per_sm,
+            "cooperative": self.cooperative,
+            "regs_per_thread": self.regs_per_thread,
         }
 
 
 @dataclass(frozen=True)
 class TensorMapSpec:
-    dtype: str                       # numsim_core::Dtype name
+    dtype: str  # numsim_core::Dtype name
     rank: int
     global_dim: tuple[DimExpr, ...]
     global_stride: tuple[DimExpr, ...]
-    box_dim: tuple[DimExpr, ...]          # contract item 30: DimExpr (runtime prologue values)
+    box_dim: tuple[DimExpr, ...]  # contract item 30: DimExpr (runtime prologue values)
     element_stride: tuple[DimExpr, ...]
     interleave: int
     swizzle: int
     l2_promotion: int
     oob_fill: int
     base_offset: DimExpr
-    force_cu_dtype: int | None = None   # raw CUtensorMapDataType when it differs from dtype
+    force_cu_dtype: int | None = None  # raw CUtensorMapDataType when it differs from dtype
 
     def to_json(self) -> Any:
         return {
-            "dtype": self.dtype, "rank": self.rank,
+            "dtype": self.dtype,
+            "rank": self.rank,
             "global_dim": [d.to_json() for d in self.global_dim],
             "global_stride": [d.to_json() for d in self.global_stride],
             "box_dim": [d.to_json() for d in self.box_dim],
             "element_stride": [d.to_json() for d in self.element_stride],
-            "interleave": self.interleave, "swizzle": self.swizzle,
-            "l2_promotion": self.l2_promotion, "oob_fill": self.oob_fill,
-            "base_offset": self.base_offset.to_json(), "force_cu_dtype": self.force_cu_dtype,
+            "interleave": self.interleave,
+            "swizzle": self.swizzle,
+            "l2_promotion": self.l2_promotion,
+            "oob_fill": self.oob_fill,
+            "base_offset": self.base_offset.to_json(),
+            "force_cu_dtype": self.force_cu_dtype,
         }
 
 
 @dataclass
 class ParamSlot:
     name: str
-    kind: str                        # Buffer Pointer Scalar TensorMap ImplicitShape
+    kind: str  # Buffer Pointer Scalar TensorMap ImplicitShape
     dtype: Ty | None = None
     shape: tuple[DimExpr, ...] = ()
     tensor_map: TensorMapSpec | None = None
@@ -603,13 +937,17 @@ class ParamSlot:
 
     def to_json(self) -> Any:
         return {
-            "name": self.name, "local_name": self.local_name or self.name, "aliases": list(self.aliases),
-            "kind": self.kind if self.shape_of is None else
-            {"ImplicitShape": {"buffer": self.shape_of[0], "axis": self.shape_of[1]}},
+            "name": self.name,
+            "local_name": self.local_name or self.name,
+            "aliases": list(self.aliases),
+            "kind": self.kind
+            if self.shape_of is None
+            else {"ImplicitShape": {"buffer": self.shape_of[0], "axis": self.shape_of[1]}},
             "dtype": None if self.dtype is None else self.dtype.to_json(),
             "shape": [d.to_json() for d in self.shape],
             "tensor_map": None if self.tensor_map is None else self.tensor_map.to_json(),
-            "implicit_base": self.implicit_base, "buf": self.buf,
+            "implicit_base": self.implicit_base,
+            "buf": self.buf,
         }
 
 
@@ -767,7 +1105,9 @@ class ProgramBuilder:
             # stable synthetic name (view: parent + byte base + dtype).
             buffers = self.program.buffers
             if decl.view_of is not None:
-                ty = decl.dtype.elem.lower() + ("" if decl.dtype.lanes == 1 else f"x{decl.dtype.lanes}")
+                ty = decl.dtype.elem.lower() + (
+                    "" if decl.dtype.lanes == 1 else f"x{decl.dtype.lanes}"
+                )
                 name = f"{buffers[decl.view_of].name}+{decl.base}.{ty}"
                 if any(b.name == name for b in buffers):
                     # Distinct unnamed DeclBuffers stay distinct identities
@@ -789,6 +1129,19 @@ class ProgramBuilder:
         self.code_sites.append(SITE_NONE if site is None else site)
         return len(self.code) - 1
 
+    def emit_cast(
+        self,
+        dst: Reg,
+        src: Operand,
+        from_ty: Ty,
+        to_ty: Ty,
+        rnd: str = "Default",
+        sat: bool = False,
+    ) -> int:
+        """``Cast`` (its ``from`` field is a Python keyword)."""
+        fields: dict[str, Any] = {"from": from_ty, "to": to_ty}
+        return self.emit("Cast", dst=dst, src=src, rnd=rnd, sat=sat, **fields)
+
     def patch(self, pc: int, variant: str, /, **fields: Any) -> None:
         self.code[pc] = Instr(variant, **fields)
 
@@ -806,8 +1159,32 @@ class ProgramBuilder:
 
 
 __all__ = [
-    "BufferDecl", "Const", "DimExpr", "FORMAT_VERSION", "Instr", "Launch", "Module", "OpKey",
-    "Operand", "ParamSlot", "PredProgram", "Program", "ProgramBuilder", "Reg", "RegDecl",
-    "Requirements", "SCHEMA", "SITE_NONE", "SiteInfo", "SourceSpan", "TensorMapSpec", "Ty",
-    "UnrepresentableType", "bulk_completion", "mem_mods", "opnd", "phase_parity", "phase_state",
+    "FORMAT_VERSION",
+    "SCHEMA",
+    "SITE_NONE",
+    "BufferDecl",
+    "Const",
+    "DimExpr",
+    "Instr",
+    "Launch",
+    "Module",
+    "OpKey",
+    "Operand",
+    "ParamSlot",
+    "PredProgram",
+    "Program",
+    "ProgramBuilder",
+    "Reg",
+    "RegDecl",
+    "Requirements",
+    "SiteInfo",
+    "SourceSpan",
+    "TensorMapSpec",
+    "Ty",
+    "UnrepresentableType",
+    "bulk_completion",
+    "mem_mods",
+    "opnd",
+    "phase_parity",
+    "phase_state",
 ]

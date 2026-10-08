@@ -417,3 +417,15 @@ def test_shared_window_above_the_sm100_per_cta_capacity_fails_closed(lower_sourc
     # Targets without a modeled capacity (sm_107a, no tirx.cuda_arch) are not checked.
     for arch in ("sm_107a", None):
         assert lower_source(_window_kernel(arch, 300000, 0, 32)).topology.static_smem_bytes == 300000
+
+
+def test_explicit_alignment_places_a_swizzled_shared_backing(lower_source):
+    """An explicit ``align=`` is the placement (legacy cvta alignment test);
+    without one a swizzled operand starts on its swizzle repeat (1024 B here)."""
+    from tests.numsim.support.kernels import shared_virtual_swizzled_backing_alignment
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(shared_virtual_swizzled_backing_alignment)
+    bases = {b.name: (b.base, b.align) for b in program.buffers if b.space == "Shared"}
+    assert bases["first"][0] == 0
+    assert bases["second"] == (128, 128)

@@ -17,7 +17,8 @@ Unknown non-ALU families and contract gaps raise ``_Unsupported``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from . import program_builder as pb
 from . import ptx_decode
@@ -29,40 +30,100 @@ if TYPE_CHECKING:
 
 
 SPACES = {
-    "": "Generic", "global": "Global", "shared": "Shared", "shared::cta": "Shared",
-    "shared::cluster": "SharedCluster", "local": "Local", "param": "Param", "param::entry": "Param",
-    "const": "Const", "tmem": "Tmem",
+    "": "Generic",
+    "global": "Global",
+    "shared": "Shared",
+    "shared::cta": "Shared",
+    "shared::cluster": "SharedCluster",
+    "local": "Local",
+    "param": "Param",
+    "param::entry": "Param",
+    "const": "Const",
+    "tmem": "Tmem",
 }
-SEMS = {"": "Weak", "weak": "Weak", "relaxed": "Relaxed", "acquire": "Acquire", "release": "Release",
-        "acq_rel": "AcqRel", "sc": "Sc", "volatile": "Volatile", "mmio": "Mmio"}
+SEMS = {
+    "": "Weak",
+    "weak": "Weak",
+    "relaxed": "Relaxed",
+    "acquire": "Acquire",
+    "release": "Release",
+    "acq_rel": "AcqRel",
+    "sc": "Sc",
+    "volatile": "Volatile",
+    "mmio": "Mmio",
+}
 SCOPES = {"cta": "Cta", "cluster": "Cluster", "gpu": "Gpu", "sys": "Sys"}
-ATOM_OPS = {"add": "Add", "min": "Min", "max": "Max", "inc": "Inc", "dec": "Dec", "and": "And", "or": "Or",
-            "xor": "Xor", "exch": "Exch", "cas": "Cas"}
+ATOM_OPS = {
+    "add": "Add",
+    "min": "Min",
+    "max": "Max",
+    "inc": "Inc",
+    "dec": "Dec",
+    "and": "And",
+    "or": "Or",
+    "xor": "Xor",
+    "exch": "Exch",
+    "cas": "Cas",
+}
 REDUX_OPS = {"add": "Add", "min": "Min", "max": "Max", "and": "And", "or": "Or", "xor": "Xor"}
-CACHE_OPS = {"": "Default", "ca": "Ca", "cg": "Cg", "cs": "Cs", "lu": "Lu", "cv": "Cv", "wb": "Wb", "wt": "Wt"}
-EVICT = {"": "Normal", "L1::evict_normal": "Normal", "L1::evict_first": "First", "L1::evict_last": "Last",
-         "L1::evict_unchanged": "Unchanged", "L1::no_allocate": "NoAllocate"}
+CACHE_OPS = {
+    "": "Default",
+    "ca": "Ca",
+    "cg": "Cg",
+    "cs": "Cs",
+    "lu": "Lu",
+    "cv": "Cv",
+    "wb": "Wb",
+    "wt": "Wt",
+}
+EVICT = {
+    "": "Normal",
+    "L1::evict_normal": "Normal",
+    "L1::evict_first": "First",
+    "L1::evict_last": "Last",
+    "L1::evict_unchanged": "Unchanged",
+    "L1::no_allocate": "NoAllocate",
+}
 L2_PREFETCH = {"": 0, "L2::64B": 64, "L2::128B": 128, "L2::256B": 256}
 TC_SHAPES = {"32x32b": "S32x32b", "16x64b": "S16x64b", "16x128b": "S16x128b", "16x256b": "S16x256b"}
-TCGEN_DESCRIPTOR_ARCHES = frozenset({"sm_100a", "sm_100f", "sm_103a", "sm_103f", "sm_107a", "sm_107f"})
-MMA_KINDS = {"kind::f16": "F16", "kind::tf32": "Tf32", "kind::f8f6f4": "F8f6f4", "kind::i8": "I8",
-             "kind::mxf8f6f4": "MxF8f6f4", "kind::mxf4": "MxF4", "kind::mxf4nvf4": "MxF4Nvf4",
-             "kind::ti16": "Ti16"}
+TCGEN_DESCRIPTOR_ARCHES = frozenset(
+    {"sm_100a", "sm_100f", "sm_103a", "sm_103f", "sm_107a", "sm_107f"}
+)
+MMA_KINDS = {
+    "kind::f16": "F16",
+    "kind::tf32": "Tf32",
+    "kind::f8f6f4": "F8f6f4",
+    "kind::i8": "I8",
+    "kind::mxf8f6f4": "MxF8f6f4",
+    "kind::mxf4": "MxF4",
+    "kind::mxf4nvf4": "MxF4Nvf4",
+    "kind::ti16": "Ti16",
+}
+# Per-instruction K of a dense tcgen05.mma by kind (doubled when sparse).
+MMA_K = {"F16": 16, "Tf32": 8, "F8f6f4": 32, "I8": 32, "MxF8f6f4": 32, "MxF4": 64, "MxF4Nvf4": 64}
 COLLECTOR = {"": "None", "fill": "Fill", "use": "Use", "lastuse": "LastUse", "discard": "Discard"}
 
 
 class PtxCtx:
     """One decoded call being lowered."""
 
-    def __init__(self, lw: "Lowerer", node: Any, decoded: ptx_decode.DecodedPtx):
+    def __init__(self, lw: Lowerer, node: Any, decoded: ptx_decode.DecodedPtx):
         self.lw = lw
         self.node = node
         self.d = decoded
         self.mods = dict(decoded.modifiers)
-        self.ops = {info.name: (info, values) for info, values in zip(decoded.operands, decoded.values)}
-        self.pred_lanes = {info.name: flags for info, flags in zip(decoded.operands, decoded.pred_lanes)}
+        self.ops = {
+            info.name: (info, values) for info, values in zip(decoded.operands, decoded.values)
+        }
+        self.pred_lanes = {
+            info.name: flags for info, flags in zip(decoded.operands, decoded.pred_lanes)
+        }
         self.write_backs: list[Callable[[], None]] = []
-        self.pred = lw.cast_to(lw.expr(decoded.predicate), pb.Ty("Pred")) if decoded.predicate is not None else None
+        self.pred = (
+            lw.cast_to(lw.expr(decoded.predicate), pb.Ty("Pred"))
+            if decoded.predicate is not None
+            else None
+        )
         self._site: int | None = None
 
     # -- modifiers --------------------------------------------------------
@@ -88,7 +149,7 @@ class PtxCtx:
 
     def int_mod(self, name: str, prefix: str = "") -> int:
         token = self.mod(name)
-        return int(token[len(prefix):]) if token else 0
+        return int(token[len(prefix) :]) if token else 0
 
     # -- operands ---------------------------------------------------------
     def has(self, name: str) -> bool:
@@ -96,7 +157,11 @@ class PtxCtx:
         if entry is None:
             return False
         info, values = entry
-        return info.literal is None and len(values) > 0 and any(v is not ptx_decode.SINK for v in values)
+        return (
+            info.literal is None
+            and len(values) > 0
+            and any(v is not ptx_decode.SINK for v in values)
+        )
 
     def info(self, name: str) -> ptx_decode.OperandInfo:
         return self.ops[name][0]
@@ -107,7 +172,9 @@ class PtxCtx:
     def src(self, name: str) -> pb.Operand:
         values = self.nodes(name)
         if len(values) != 1:
-            raise _Unsupported(self.node, f"{self.d.op_name}: operand {name} has {len(values)} lanes")
+            raise _Unsupported(
+                self.node, f"{self.d.op_name}: operand {name} has {len(values)} lanes"
+            )
         return self.read(name, 0, values[0])
 
     def is_pred_lane(self, name: str, lane: int) -> bool:
@@ -125,12 +192,18 @@ class PtxCtx:
         return self.src(name) if self.has(name) else None
 
     def srcs(self, name: str) -> list[pb.Operand]:
-        return [self.read(name, i, v) for i, v in enumerate(self.nodes(name))] if name in self.ops else []
+        return (
+            [self.read(name, i, v) for i, v in enumerate(self.nodes(name))]
+            if name in self.ops
+            else []
+        )
 
     def uimm(self, name: str, bits: int = 32) -> int:
         value = self.imm(name)
         if not 0 <= value < 1 << bits:
-            raise _Unsupported(self.node, f"{self.d.op_name}: immediate {name}={value} out of range")
+            raise _Unsupported(
+                self.node, f"{self.d.op_name}: immediate {name}={value} out of range"
+            )
         return value
 
     def imm(self, name: str) -> int:
@@ -163,7 +236,9 @@ class PtxCtx:
         if not isinstance(value, pb.Reg):
             return False
         writers = [i for i in self.lw.builder.code if value in i.writes()]
-        return bool(writers) and all(i.variant == "Mapa" and i.space == "SharedCluster" for i in writers)
+        return bool(writers) and all(
+            i.variant == "Mapa" and i.space == "SharedCluster" for i in writers
+        )
 
     def addr(self, name: str, default_space: str | None = None) -> tuple[pb.Operand, str]:
         info = self.info(name)
@@ -177,8 +252,17 @@ class PtxCtx:
     def dst(self, name: str) -> pb.Reg | None:
         values = self.nodes(name)
         if len(values) != 1:
-            raise _Unsupported(self.node, f"{self.d.op_name}: destination {name} has {len(values)} lanes")
+            raise _Unsupported(
+                self.node, f"{self.d.op_name}: destination {name} has {len(values)} lanes"
+            )
         return self._bind(values[0], self.info(name))
+
+    def dst_reg(self, name: str) -> pb.Reg:
+        """A destination that must be a register (not the ``_`` sink)."""
+        reg = self.dst(name)
+        if reg is None:
+            raise _Unsupported(self.node, f"{self.d.op_name}: destination {name} cannot be a sink")
+        return reg
 
     def dsts(self, name: str) -> list[pb.Reg | None]:
         return [self._bind(v, self.info(name)) for v in self.nodes(name)]
@@ -205,8 +289,13 @@ class PtxCtx:
         if self._site is None:
             # W5-15: one logical buffer per pointer operand, in PTX operand order
             # (copies: dst then src; then the completion mbarrier).
-            pointers = [value for info, values in zip(self.d.operands, self.d.values)
-                        if info.kind in ("addr", "ptr") for value in values if value is not ptx_decode.SINK]
+            pointers = [
+                value
+                for info, values in zip(self.d.operands, self.d.values)
+                if info.kind in ("addr", "ptr")
+                for value in values
+                if value is not ptx_decode.SINK
+            ]
             self._site = self.lw.site(self.node, op_name=self.d.op_name, operands=pointers or None)
         return self._site
 
@@ -229,7 +318,7 @@ class PtxCtx:
         self.write_backs = []
 
 
-def bool_carrier(lw: "Lowerer", value: pb.Operand) -> pb.Operand:
+def bool_carrier(lw: Lowerer, value: pb.Operand) -> pb.Operand:
     """``value != 0`` as 0/1 in ``value``'s own type (TVM's ``.pred`` bridge)."""
     ty = lw.operand_ty(value)
     if ty.elem == "Pred":
@@ -237,7 +326,7 @@ def bool_carrier(lw: "Lowerer", value: pb.Operand) -> pb.Operand:
     return lw.cast_to(lw.cast_to(value, pb.Ty("Pred")), ty)
 
 
-def _register_lvalue(lw: "Lowerer", node: Any) -> bool:
+def _register_lvalue(lw: Lowerer, node: Any) -> bool:
     """Is ``node`` a register-array element or a ``local`` buffer element?"""
     from .memory import MemRef, RegArray
 
@@ -304,14 +393,22 @@ def lower_generic(c: PtxCtx) -> None:
                 dsts.append(c.scratch(pb.Ty.from_tvm(info.dtype) if info.dtype else pb.Ty("U32")))
                 continue
             reg = c._bind(value, info)
+            assert reg is not None  # not the sink (handled above)
             if info.rw == "rw":
                 srcs.append(reg)
             dsts.append(reg)
     op = lw.builder.op(pb.OpKey(c.d.op_name, c.d.mod_tokens))
     # A guarded op leaves its destinations untouched where the guard is off
     # (legacy `keep` semantics; e.g. a CLC response sentinel survives).
-    lw.builder.emit("Ptx", site=c.site(), op=op, dsts=dsts, srcs=srcs, pred=c.pred,
-                    keep_dst=c.d.preserve_dst or c.pred is not None)
+    lw.builder.emit(
+        "Ptx",
+        site=c.site(),
+        op=op,
+        dsts=dsts,
+        srcs=srcs,
+        pred=c.pred,
+        keep_dst=c.d.preserve_dst or c.pred is not None,
+    )
     if c.pred is not None and c.write_backs:
         # Memory destinations are written back only where the guard held.
         b = lw.builder
@@ -328,11 +425,16 @@ def lower_generic(c: PtxCtx) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _mods(c: PtxCtx) -> dict:
+def _mods(c: PtxCtx) -> dict[str, Any]:
     policy = c.opt_src("cache_policy") if "cache_policy" in c.ops else None
-    return pb.mem_mods(cache=CACHE_OPS.get(c.mod("cop"), "Default"), evict=EVICT.get(c.mod("l1ev"), "Normal"),
-                       l2_prefetch=L2_PREFETCH.get(c.mod("prefetch"), 0), policy=policy, nc=c.flag("nc"),
-                       uniform=c.name.startswith("ldu"))
+    return pb.mem_mods(
+        cache=CACHE_OPS.get(c.mod("cop"), "Default"),
+        evict=EVICT.get(c.mod("l1ev"), "Normal"),
+        l2_prefetch=L2_PREFETCH.get(c.mod("prefetch"), 0),
+        policy=policy,
+        nc=c.flag("nc"),
+        uniform=c.name.startswith("ldu"),
+    )
 
 
 def _vec_lanes(c: PtxCtx) -> int:
@@ -391,7 +493,9 @@ def lower_st(c: PtxCtx) -> None:
         c.emit("Store", ty=ty, buf=buf, offset=offset, value=value, sem=sem, scope=scope, mods=mods)
     else:
         addr, space = c.addr("addr")
-        c.emit("StoreAddr", ty=ty, addr=addr, space=space, value=value, sem=sem, scope=scope, mods=mods)
+        c.emit(
+            "StoreAddr", ty=ty, addr=addr, space=space, value=value, sem=sem, scope=scope, mods=mods
+        )
 
 
 def lower_discard(c: PtxCtx) -> None:
@@ -421,8 +525,20 @@ def lower_atom(c: PtxCtx) -> None:
     if_pc = None
     if c.pred is not None:
         if_pc = b.emit("If", site=c.site(), cond=c.pred, else_pc=0, end_pc=0, elect=False)
-    b.emit("Atom", site=c.site(), op=op, ty=ty, dst=result, addr=addr, space=space, value=value,
-           cmp=cmp, sem=sem, scope=c.scope(), ftz=not c.flag("noftz") and ty.elem == "F32")
+    b.emit(
+        "Atom",
+        site=c.site(),
+        op=op,
+        ty=ty,
+        dst=result,
+        addr=addr,
+        space=space,
+        value=value,
+        cmp=cmp,
+        sem=sem,
+        scope=c.scope(),
+        ftz=not c.flag("noftz") and ty.elem == "F32",
+    )
     if result is not None:
         outs = [result] if len(dsts) == 1 else lw.unpack(result, len(dsts))
         for reg, lane in zip(dsts, outs):
@@ -440,11 +556,17 @@ def lower_cvta(c: PtxCtx) -> None:
     src = c.src("ptr") if "ptr" in c.ops else c.src("a")
     dst = c.dst("d")
     to_generic = c.name == "cvta_generic" or c.mod("dir") != "to"
-    c.emit("Cvta", dst=dst, src=src, space=space, to_generic=to_generic if c.name != "cvta" else False)
+    c.emit(
+        "Cvta", dst=dst, src=src, space=space, to_generic=to_generic if c.name != "cvta" else False
+    )
 
 
 def lower_mapa(c: PtxCtx) -> None:
-    space = "SharedCluster" if c.name in ("mapa_u32", "mapa_u64_shared") or c.mod("space") else "Generic"
+    space = (
+        "SharedCluster"
+        if c.name in ("mapa_u32", "mapa_u64_shared") or c.mod("space")
+        else "Generic"
+    )
     c.emit("Mapa", dst=c.dst("d"), src=c.src("a"), rank=c.src("b"), space=space)
 
 
@@ -471,14 +593,29 @@ def lower_ldmatrix(c: PtxCtx) -> None:
     elif c.name == "ldmatrix_b8fmt":
         fmt = {"b6x16_p32": "B6x16P32", "b4x16_p64": "B4x16P64"}[c.mod("src_fmt")]
     dsts = [d if d is not None else c.scratch(pb.Ty("U32")) for d in c.dsts("r")]
-    c.emit("LdMatrix", dsts=dsts, addr=addr, space=space, shape=_matrix_shape(c.mod("shape")),
-           num=c.int_mod("num", "x"), trans=c.flag("trans"), fmt=fmt)
+    c.emit(
+        "LdMatrix",
+        dsts=dsts,
+        addr=addr,
+        space=space,
+        shape=_matrix_shape(c.mod("shape")),
+        num=c.int_mod("num", "x"),
+        trans=c.flag("trans"),
+        fmt=fmt,
+    )
 
 
 def lower_stmatrix(c: PtxCtx) -> None:
     addr, space = c.addr("p", "Shared")
-    c.emit("StMatrix", srcs=c.srcs("r"), addr=addr, space=space, shape=_matrix_shape(c.mod("shape")),
-           num=c.int_mod("num", "x"), trans=c.flag("trans"))
+    c.emit(
+        "StMatrix",
+        srcs=c.srcs("r"),
+        addr=addr,
+        space=space,
+        shape=_matrix_shape(c.mod("shape")),
+        num=c.int_mod("num", "x"),
+        trans=c.flag("trans"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +626,20 @@ def lower_stmatrix(c: PtxCtx) -> None:
 def lower_cp_async(c: PtxCtx) -> None:
     dst, _ = c.addr("dst_mem", "Shared")
     src, _ = c.addr("src_mem", "Global")
-    mods = pb.mem_mods(cache=CACHE_OPS[c.mod("cop")], l2_prefetch=L2_PREFETCH.get(c.mod("prefetch"), 0),
-                       policy=c.opt_src("cache_policy"))
-    c.emit("CpAsync", dst=dst, src=src, cp_size=c.uimm("cp_size", 8), src_size=c.opt_src("src_size"),
-           ignore_src=c.opt_src("ignore_src"), mods=mods)
+    mods = pb.mem_mods(
+        cache=CACHE_OPS[c.mod("cop")],
+        l2_prefetch=L2_PREFETCH.get(c.mod("prefetch"), 0),
+        policy=c.opt_src("cache_policy"),
+    )
+    c.emit(
+        "CpAsync",
+        dst=dst,
+        src=src,
+        cp_size=c.uimm("cp_size", 8),
+        src_size=c.opt_src("src_size"),
+        ignore_src=c.opt_src("ignore_src"),
+        mods=mods,
+    )
 
 
 def lower_async_commit(c: PtxCtx) -> None:
@@ -544,13 +691,23 @@ def lower_bulk_copy(c: PtxCtx) -> None:
     if c.name.startswith("cp_reduce"):
         reduce = [ATOM_OPS[c.mod("redop")], pb.Ty.from_ptx(c.mod("type")).elem]
     mods = pb.mem_mods(policy=c.opt_src("cache_policy"))
-    c.emit("BulkCopy", dst=dst, dst_space=dst_space, src=src, src_space=src_space, size=c.src("size"),
-           # The completion barrier lives with a shared::cluster destination
-           # (possibly in the peer CTA), W2-20 flash_attention_backward:1277.
-           completion=_completion(c, cluster=dst_space == "SharedCluster"),
-           multicast=_multicast(c), reduce=reduce,
-           byte_mask=c.opt_src("byte_mask") if "byte_mask" in c.ops else None,
-           ignore_oob=_ignore_oob(c), report=_report(c), mods=mods)
+    c.emit(
+        "BulkCopy",
+        dst=dst,
+        dst_space=dst_space,
+        src=src,
+        src_space=src_space,
+        size=c.src("size"),
+        # The completion barrier lives with a shared::cluster destination
+        # (possibly in the peer CTA), W2-20 flash_attention_backward:1277.
+        completion=_completion(c, cluster=dst_space == "SharedCluster"),
+        multicast=_multicast(c),
+        reduce=reduce,
+        byte_mask=c.opt_src("byte_mask") if "byte_mask" in c.ops else None,
+        ignore_oob=_ignore_oob(c),
+        report=_report(c),
+        mods=mods,
+    )
 
 
 def _report(c: PtxCtx) -> Any:
@@ -566,29 +723,57 @@ def _report(c: PtxCtx) -> Any:
         digits = token.rsplit("per_16bytes", 1)[1].lstrip(":")
         if not digits:
             return "Per16Bytes"
-        if len(digits) not in (1, 2, 4, 8) or any(ch not in "0123456789abcdefABCDEF" for ch in digits):
+        if len(digits) not in (1, 2, 4, 8) or any(
+            ch not in "0123456789abcdefABCDEF" for ch in digits
+        ):
             raise _Unsupported(c.node, f"{c.d.op_name}: report pattern {digits!r}")
         return {"Per16BytesPattern": {"pattern": int(digits, 16), "bits": 4 * len(digits)}}
     raise _Unsupported(c.node, f"{c.d.op_name}: report mode {token!r}")
 
 
-def _overrides(c: PtxCtx) -> list[dict]:
+def _overrides(c: PtxCtx) -> list[dict[str, Any]]:
     """Per-instruction tensor-map overrides (contract item 13)."""
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     elem_bits = 16 if c.name.endswith("_b16") else 8 if c.name.endswith("_b8") else 0
     if "global_address" in c.ops and c.has("global_address"):
-        out.append({"field": "GlobalAddress", "ord": None, "value": pb.opnd(c.src("global_address")),
-                    "elem_bits": 0})
+        out.append(
+            {
+                "field": "GlobalAddress",
+                "ord": None,
+                "value": pb.opnd(c.src("global_address")),
+                "elem_bits": 0,
+            }
+        )
     if "tensor_size" in c.ops:
         for ordinal, value in enumerate(c.srcs("tensor_size")):
-            out.append({"field": "GlobalDim", "ord": ordinal, "value": pb.opnd(value), "elem_bits": elem_bits})
+            out.append(
+                {
+                    "field": "GlobalDim",
+                    "ord": ordinal,
+                    "value": pb.opnd(value),
+                    "elem_bits": elem_bits,
+                }
+            )
     # Contract item 21: per-dimension lower strides + one shared upper operand.
     if "lower_stride" in c.ops:
         for ordinal, value in enumerate(c.srcs("lower_stride")):
-            out.append({"field": "GlobalStride", "ord": ordinal, "value": pb.opnd(value), "elem_bits": elem_bits})
+            out.append(
+                {
+                    "field": "GlobalStride",
+                    "ord": ordinal,
+                    "value": pb.opnd(value),
+                    "elem_bits": elem_bits,
+                }
+            )
     if "upper_stride" in c.ops and c.has("upper_stride"):
-        out.append({"field": "GlobalStrideUpper", "ord": None, "value": pb.opnd(c.src("upper_stride")),
-                    "elem_bits": elem_bits})
+        out.append(
+            {
+                "field": "GlobalStrideUpper",
+                "ord": None,
+                "value": pb.opnd(c.src("upper_stride")),
+                "elem_bits": elem_bits,
+            }
+        )
     return out
 
 
@@ -648,11 +833,15 @@ def _check_tma_reduce_dtype(c: PtxCtx, redop: str) -> None:
     allowed = _TMA_REDUCE_DTYPES.get(redop)
     ok = pb._DTYPE_BITS.get(dtype) in (32, 64) if allowed is None else dtype in allowed
     if not ok:
-        raise _Unsupported(c.node, f"cp.reduce.async.bulk.tensor operation .{redop} is invalid for TensorMap dtype {dtype}")
+        raise _Unsupported(
+            c.node,
+            f"cp.reduce.async.bulk.tensor operation .{redop} is invalid for TensorMap dtype {dtype}",
+        )
 
 
 def lower_tma(c: PtxCtx) -> None:
     name = c.name
+    direction: str | dict[str, str]
     if name.startswith("cp_reduce_async_bulk_tensor"):
         direction = {"Reduce": ATOM_OPS[c.mod("redop")]}
         _check_tma_reduce_dtype(c, c.mod("redop"))
@@ -663,12 +852,19 @@ def lower_tma(c: PtxCtx) -> None:
     else:
         direction = "Load"
     mode_token = c.mod("load_mode")
-    mode = {"": "Tile", "tile": "Tile", "tile::gather4": "TileGather4", "tile::scatter4": "TileScatter4",
-            "im2col": "Im2col", "im2col::w": "Im2colW", "im2col::w::128": "Im2colW128",
-            "im2col_no_offs": "Im2colNoOffs",
-            # W4-17: the wide no-offsets store/reduce plans as Im2colW (the
-            # wide layout; stores take no offsets either way).
-            "im2col_no_offs::w": "Im2colW"}.get(mode_token)
+    mode = {
+        "": "Tile",
+        "tile": "Tile",
+        "tile::gather4": "TileGather4",
+        "tile::scatter4": "TileScatter4",
+        "im2col": "Im2col",
+        "im2col::w": "Im2colW",
+        "im2col::w::128": "Im2colW128",
+        "im2col_no_offs": "Im2colNoOffs",
+        # W4-17: the wide no-offsets store/reduce plans as Im2colW (the
+        # wide layout; stores take no offsets either way).
+        "im2col_no_offs::w": "Im2colW",
+    }.get(mode_token)
     if mode is None and "no_offs_w" in name:
         mode = "Im2colNoOffs"
     if mode is None:
@@ -689,10 +885,23 @@ def lower_tma(c: PtxCtx) -> None:
     else:
         smem, smem_space = c.addr("src_mem")
     cta_group = c.int_mod("cta_group", "cta_group::")
-    c.emit("Tma", dir=direction, mode=mode, tmap=tmap, tmap_space=tmap_space, coords=coords,
-           im2col_offsets=offsets, smem=smem, smem_space=smem_space, completion=_completion(c),
-           multicast=_multicast(c), cta_group=cta_group, overrides=_overrides(c), report=_report(c),
-           mods=pb.mem_mods(policy=c.opt_src("cache_policy")))
+    c.emit(
+        "Tma",
+        dir=direction,
+        mode=mode,
+        tmap=tmap,
+        tmap_space=tmap_space,
+        coords=coords,
+        im2col_offsets=offsets,
+        smem=smem,
+        smem_space=smem_space,
+        completion=_completion(c),
+        multicast=_multicast(c),
+        cta_group=cta_group,
+        overrides=_overrides(c),
+        report=_report(c),
+        mods=pb.mem_mods(policy=c.opt_src("cache_policy")),
+    )
 
 
 def lower_st_async(c: PtxCtx) -> None:
@@ -705,8 +914,16 @@ def lower_st_async(c: PtxCtx) -> None:
     # Contract item 12: the .release forms have no completion mbarrier.
     mbar = None if release else c.addr("mbar", "SharedCluster")[0]
     red = ATOM_OPS[c.mod("op")] if c.name.startswith("red_async") else None
-    c.emit("StAsync", ty=ty, value=value, addr=addr, mbar=mbar, red=red, sem=c.sem("Weak"),
-           scope=c.scope("Cluster"))
+    c.emit(
+        "StAsync",
+        ty=ty,
+        value=value,
+        addr=addr,
+        mbar=mbar,
+        red=red,
+        sem=c.sem("Weak"),
+        scope=c.scope("Cluster"),
+    )
 
 
 def lower_st_bulk(c: PtxCtx) -> None:
@@ -715,10 +932,18 @@ def lower_st_bulk(c: PtxCtx) -> None:
 
 
 def lower_tensormap_replace(c: PtxCtx) -> None:
-    field = {"global_address": "GlobalAddress", "rank": "Rank", "box_dim": "BoxDim", "global_dim": "GlobalDim",
-             "global_stride": "GlobalStride", "element_stride": "ElementStride", "elemtype": "ElemType",
-             "interleave_layout": "InterleaveLayout", "swizzle_mode": "SwizzleMode",
-             "fill_mode": "FillMode"}[c.mod("field")]
+    field = {
+        "global_address": "GlobalAddress",
+        "rank": "Rank",
+        "box_dim": "BoxDim",
+        "global_dim": "GlobalDim",
+        "global_stride": "GlobalStride",
+        "element_stride": "ElementStride",
+        "elemtype": "ElemType",
+        "interleave_layout": "InterleaveLayout",
+        "swizzle_mode": "SwizzleMode",
+        "fill_mode": "FillMode",
+    }[c.mod("field")]
     # No state-space qualifier = generic addressing (PTX); a descriptor image
     # in shared memory then resolves through the generic shared window.
     addr, space = c.addr("addr")
@@ -769,7 +994,9 @@ def lower_bar(c: PtxCtx) -> None:
     else:
         op = {"popc": "Popc", "and": "And", "or": "Or"}[c.mod("op")]
         dst = c.dst("d")
-        kind = {"Red": {"op": op, "pred": pb.opnd(lw.cast_to(c.src("c"), pb.Ty("Pred"))), "dst": dst}}
+        kind = {
+            "Red": {"op": op, "pred": pb.opnd(lw.cast_to(c.src("c"), pb.Ty("Pred"))), "dst": dst}
+        }
     c.emit("Barrier", kind=kind, id=ident, count=count, aligned=aligned)
 
 
@@ -797,13 +1024,22 @@ def lower_fence(c: PtxCtx) -> None:
             c.emit("Fence", kind="ProxyAlias", sem="Weak", scope="Cta")
         else:
             token = c.mod("space")
-            c.emit("Fence", kind={"ProxyAsync": SPACES[token] if token else None}, sem="Weak", scope="Cta")
+            c.emit(
+                "Fence",
+                kind={"ProxyAsync": SPACES[token] if token else None},
+                sem="Weak",
+                scope="Cta",
+            )
     elif name == "fence_proxy_tensormap_release":
         c.emit("Fence", kind="TensormapRelease", sem="Release", scope=c.scope())
     elif name == "fence_proxy_tensormap_acquire":
         addr, space = c.addr("addr", "Generic")
-        c.emit("Fence", kind={"TensormapAcquire": {"addr": pb.opnd(addr), "space": space}}, sem="Acquire",
-               scope=c.scope())
+        c.emit(
+            "Fence",
+            kind={"TensormapAcquire": {"addr": pb.opnd(addr), "space": space}},
+            sem="Acquire",
+            scope=c.scope(),
+        )
     else:
         raise _Unsupported(c.node, f"{c.d.op_name}: fence kind")
 
@@ -813,8 +1049,13 @@ def lower_mbarrier(c: PtxCtx) -> None:
     action = c.mod("action")
     if name == "mbarrier_init":
         mbar, space = c.mbar_addr("addr")
-        c.emit("MbarInit", mbar=mbar, space=space, count=c.src("count"),
-               layout_v1=c.mod("layout") == "layout::v1")
+        c.emit(
+            "MbarInit",
+            mbar=mbar,
+            space=space,
+            count=c.src("count"),
+            layout_v1=c.mod("layout") == "layout::v1",
+        )
     elif name == "mbarrier_inval":
         mbar, space = c.mbar_addr("addr")
         c.emit("MbarInval", mbar=mbar, space=space)
@@ -827,13 +1068,30 @@ def lower_mbarrier(c: PtxCtx) -> None:
             if "tx_count" not in c.ops:
                 count = None
         state = c.dst("state") if c.has("state") and c.info("state").rw != "r" else None
-        c.emit("MbarArrive", mbar=mbar, space=space, count=count, expect_tx=expect, drop=action == "arrive_drop",
-               no_complete=c.flag("nocomplete"), sem=c.sem("Release"), scope=c.scope("Cta"),
-               multicast=_multicast(c), state=state)
+        c.emit(
+            "MbarArrive",
+            mbar=mbar,
+            space=space,
+            count=count,
+            expect_tx=expect,
+            drop=action == "arrive_drop",
+            no_complete=c.flag("nocomplete"),
+            sem=c.sem("Release"),
+            scope=c.scope("Cta"),
+            multicast=_multicast(c),
+            state=state,
+        )
     elif action in ("expect_tx", "complete_tx"):
         mbar, space = c.mbar_addr("addr")
-        c.emit("MbarTx", op="Expect" if action == "expect_tx" else "Complete", mbar=mbar, space=space,
-               bytes=c.src("tx_count"), multicast=_multicast(c), scope=c.scope("Cta"))
+        c.emit(
+            "MbarTx",
+            op="Expect" if action == "expect_tx" else "Complete",
+            mbar=mbar,
+            space=space,
+            bytes=c.src("tx_count"),
+            multicast=_multicast(c),
+            scope=c.scope("Cta"),
+        )
     elif action in ("test_wait", "try_wait"):
         mbar, space = c.mbar_addr("addr")
         if c.flag("parity"):
@@ -844,16 +1102,34 @@ def lower_mbarrier(c: PtxCtx) -> None:
         # Contract item 11: report forms read the report predicate/value from the same snapshot.
         report = c.dst("report_predicate") if "report_predicate" in c.ops else None
         report_value = c.dst("report_value") if "report_value" in c.ops else None
-        c.emit("MbarTestWait", kind="Test" if action == "test_wait" else "Try", mbar=mbar, space=space,
-               phase=phase, sem=c.sem("Acquire"), scope=c.scope("Cta"), dst=dst, report=report,
-               report_value=report_value)
+        c.emit(
+            "MbarTestWait",
+            kind="Test" if action == "test_wait" else "Try",
+            mbar=mbar,
+            space=space,
+            phase=phase,
+            sem=c.sem("Acquire"),
+            scope=c.scope("Cta"),
+            dst=dst,
+            report=report,
+            report_value=report_value,
+        )
     elif name == "mbarrier_pending_count":
-        state = c.src("state")
-        c.emit("MbarQuery", dst=c.dst("count"), op={"PendingCount": {"state": pb.opnd(state)}})
+        pending = c.src("state")
+        c.emit("MbarQuery", dst=c.dst("count"), op={"PendingCount": {"state": pb.opnd(pending)}})
     elif name == "mbarrier_check_layout":
         mbar, space = c.mbar_addr("addr")
-        c.emit("MbarQuery", dst=c.dst("matches"), op={"CheckLayout": {"mbar": pb.opnd(mbar), "space": space,
-                                                                         "layout_v1": c.mod("layout") == "layout::v1"}})
+        c.emit(
+            "MbarQuery",
+            dst=c.dst("matches"),
+            op={
+                "CheckLayout": {
+                    "mbar": pb.opnd(mbar),
+                    "space": space,
+                    "layout_v1": c.mod("layout") == "layout::v1",
+                }
+            },
+        )
     else:
         raise _Unsupported(c.node, f"{c.d.op_name}: mbarrier action {action!r}")
 
@@ -880,10 +1156,19 @@ def lower_clc_try_cancel(c: PtxCtx) -> None:
 
 def lower_shfl(c: PtxCtx) -> None:
     mode = {"up": "Up", "down": "Down", "bfly": "Bfly", "idx": "Idx"}[c.mod("mode")]
-    dst = c.dst("d")
+    dst = c.dst_reg("d")
     dst_pred = c.dst("p") if "p" in c.ops else None
-    c.emit("Shfl", mode=mode, ty=c.lw.builder.reg_ty(dst), dst=dst, dst_pred=dst_pred, src=c.src("a"),
-           lane=c.src("b"), clamp=c.src("c"), membermask=c.src("membermask"))
+    c.emit(
+        "Shfl",
+        mode=mode,
+        ty=c.lw.builder.reg_ty(dst),
+        dst=dst,
+        dst_pred=dst_pred,
+        src=c.src("a"),
+        lane=c.src("b"),
+        clamp=c.src("c"),
+        membermask=c.src("membermask"),
+    )
 
 
 def lower_vote(c: PtxCtx) -> None:
@@ -900,7 +1185,7 @@ def lower_redux(c: PtxCtx) -> None:
         absolute = c.lw.builder.reg(ty)
         c.lw.builder.emit("Unary", op="Abs", ty=ty, dst=absolute, a=src)
         src = absolute
-    dst = c.dst("d")
+    dst = c.dst_reg("d")
     mask = c.src("membermask")
     if not c.flag("nan"):
         c.emit("Redux", op=REDUX_OPS[c.mod("op")], ty=ty, dst=dst, src=src, membermask=mask)
@@ -911,7 +1196,15 @@ def lower_redux(c: PtxCtx) -> None:
     reduced = b.reg(ty)
     is_nan = b.reg(pb.Ty("Pred"))
     any_nan = b.reg(pb.Ty("Pred"))
-    b.emit("Redux", site=c.site(), op=REDUX_OPS[c.mod("op")], ty=ty, dst=reduced, src=src, membermask=mask)
+    b.emit(
+        "Redux",
+        site=c.site(),
+        op=REDUX_OPS[c.mod("op")],
+        ty=ty,
+        dst=reduced,
+        src=src,
+        membermask=mask,
+    )
     b.emit("Unary", op="IsNan", ty=ty, dst=is_nan, a=src)
     b.emit("Vote", site=c.site(), mode="Any", dst=any_nan, pred=is_nan, membermask=mask)
     result = b.reg(ty)
@@ -949,19 +1242,43 @@ def lower_tcgen05(c: PtxCtx) -> None:
     zero = lw.const("int32", 0)
     if name.startswith("tcgen05_alloc"):
         dst, _ = c.addr("dst", "Shared")
-        c.emit("TcgenAlloc", dst=dst, ncols=c.src("ncols"), cta_group=_cta_group(c), exclusive="exclusive" in name)
+        c.emit(
+            "TcgenAlloc",
+            dst=dst,
+            ncols=c.src("ncols"),
+            cta_group=_cta_group(c),
+            exclusive="exclusive" in name,
+        )
     elif name.startswith("tcgen05_dealloc"):
-        c.emit("TcgenDealloc", taddr=c.src("taddr"), ncols=c.src("ncols"), cta_group=_cta_group(c),
-               exclusive="exclusive" in name)
+        c.emit(
+            "TcgenDealloc",
+            taddr=c.src("taddr"),
+            ncols=c.src("ncols"),
+            cta_group=_cta_group(c),
+            exclusive="exclusive" in name,
+        )
     elif name == "tcgen05_relinquish_alloc_permit":
         c.emit("TcgenRelinquish", cta_group=_cta_group(c))
     elif name.startswith("tcgen05_commit"):
         mbar, space = c.mbar_addr("mbar")
-        multicast = c.src("mask") if c.has("mask") else (c.src("cta_mask") if c.has("cta_mask") else None)
+        multicast = (
+            c.src("mask") if c.has("mask") else (c.src("cta_mask") if c.has("cta_mask") else None)
+        )
         token = c.mod("multicast")
-        width = int(token.rsplit("::", 1)[1].rstrip("b")) if token.endswith(("::16b", "::32b")) else None
-        c.emit("TcgenCommit", mbar=mbar, space=space, cta_group=_cta_group(c), multicast=multicast,
-               sync_restrict=c.flag("sync_restrict"), multicast_width=width)
+        width = (
+            int(token.rsplit("::", 1)[1].rstrip("b"))
+            if token.endswith(("::16b", "::32b"))
+            else None
+        )
+        c.emit(
+            "TcgenCommit",
+            mbar=mbar,
+            space=space,
+            cta_group=_cta_group(c),
+            multicast=multicast,
+            sync_restrict=c.flag("sync_restrict"),
+            multicast_width=width,
+        )
     elif name == "tcgen05_wait":
         c.emit("TcgenWait", st=c.mod("action") == "wait::st")
     elif name == "tcgen05_fence":
@@ -976,25 +1293,60 @@ def lower_tcgen05(c: PtxCtx) -> None:
         dsts = [d if d is not None else c.scratch(pb.Ty("U32")) for g in groups for d in c.dsts(g)]
         red = None
         if "redval" in c.ops:
-            red_regs = [d if d is not None else c.scratch(pb.Ty.from_ptx(c.mod("type"))) for d in c.dsts("redval")]
+            red_regs = [
+                d if d is not None else c.scratch(pb.Ty.from_ptx(c.mod("type")))
+                for d in c.dsts("redval")
+            ]
             red = [REDUX_OPS[c.mod("redop") or c.mod("rowop")], red_regs]
         elif spcompress:
             # W4-17: the compression's max/min selection rides in `red` with
             # no reduction destinations (`.abs` in `red_abs`).
             red = [REDUX_OPS[c.mod("rowop")], []]
         taddr = c.src("taddr")
-        c.emit("TcgenLd", dsts=dsts, taddr=taddr, row=zero, col=zero, shape=shape, num=c.int_mod("num", "x"),
-               pack=c.flag("pack"), red=red, red_abs=c.flag("abs"), red_nan=c.flag("nan"), spcompress=spcompress)
+        c.emit(
+            "TcgenLd",
+            dsts=dsts,
+            taddr=taddr,
+            row=zero,
+            col=zero,
+            shape=shape,
+            num=c.int_mod("num", "x"),
+            pack=c.flag("pack"),
+            red=red,
+            red_abs=c.flag("abs"),
+            red_nan=c.flag("nan"),
+            spcompress=spcompress,
+        )
     elif name.startswith("tcgen05_st"):
         shape = _tc_shape(c)
-        c.emit("TcgenSt", srcs=c.srcs("r"), taddr=c.src("taddr"), row=zero, col=zero, shape=shape, num=c.int_mod("num", "x"),
-               unpack=c.flag("unpack"))
+        c.emit(
+            "TcgenSt",
+            srcs=c.srcs("r"),
+            taddr=c.src("taddr"),
+            row=zero,
+            col=zero,
+            shape=shape,
+            num=c.int_mod("num", "x"),
+            unpack=c.flag("unpack"),
+        )
     elif name == "tcgen05_cp":
-        rows, bits = (int(x) for x in c.mod("shape").rstrip("b").split("x"))
-        multicast = {"": 0, "warpx2::02_13": 1, "warpx2::01_23": 2, "warpx4": 3}[c.mod("multicast")]
+        cp_rows, cp_bits = (int(x) for x in c.mod("shape").rstrip("b").split("x"))
+        cp_multicast = {"": 0, "warpx2::02_13": 1, "warpx2::01_23": 2, "warpx4": 3}[
+            c.mod("multicast")
+        ]
         decompress = {"": 0, "b6x16_p32": 6, "b4x16_p64": 4}[c.mod("src_fmt")]
-        c.emit("TcgenCp", taddr=c.src("taddr"), row=zero, col=zero, sdesc=c.src("s_desc"), rows=rows, bits=bits, multicast=multicast,
-               decompress_bits=decompress, cta_group=_cta_group(c))
+        c.emit(
+            "TcgenCp",
+            taddr=c.src("taddr"),
+            row=zero,
+            col=zero,
+            sdesc=c.src("s_desc"),
+            rows=cp_rows,
+            bits=cp_bits,
+            multicast=cp_multicast,
+            decompress_bits=decompress,
+            cta_group=_cta_group(c),
+        )
     elif name.startswith("tcgen05_mma"):
         lower_tcgen05_mma(c)
     else:
@@ -1012,7 +1364,7 @@ def _tc_shape(c: PtxCtx) -> Any:
 def _collector(token: str) -> tuple[str, int]:
     if not token:
         return "None", 0
-    parts = token.split("::")          # collector::a::fill / collector::b0::use
+    parts = token.split("::")  # collector::a::fill / collector::b0::use
     which, op = parts[1], parts[2]
     buffer = int(which[1:]) if len(which) > 1 else 0
     return COLLECTOR[op], buffer
@@ -1028,7 +1380,11 @@ def lower_tcgen05_mma(c: PtxCtx) -> None:
         block = 16
     else:
         block = 32
-    a = {"Smem": pb.opnd(c.src("a_desc"))} if "a_desc" in c.ops else {"Tmem": pb.opnd(c.src("a_tmem"))}
+    a = (
+        {"Smem": pb.opnd(c.src("a_desc"))}
+        if "a_desc" in c.ops
+        else {"Tmem": pb.opnd(c.src("a_tmem"))}
+    )
     block_scale = None
     if "sfa_tmem" in c.ops:
         block_scale = [pb.opnd(c.src("sfa_tmem")), pb.opnd(c.src("sfb_tmem")), block]
@@ -1041,18 +1397,48 @@ def lower_tcgen05_mma(c: PtxCtx) -> None:
     # Contract item 18: the lut_b table operand (``b_decompress_metadata``; a TMEM
     # address in TVM's PTX table) travels in ``lut_b_addr``.
     lut_b_addr = c.src("b_decompress_metadata") if lut_b else None
-    if kind == "F8f6f4" and _cta_group(c) == 2 and c.lw.builder.program.arch not in TCGEN_DESCRIPTOR_ARCHES:
+    if (
+        kind == "F8f6f4"
+        and _cta_group(c) == 2
+        and c.lw.builder.program.arch not in TCGEN_DESCRIPTOR_ARCHES
+    ):
         # The CTA-pair f8f6f4 descriptor semantics differ between SM100/SM103
         # and SM107 (legacy require_tcgen_descriptor_layout): the kernel must
         # name its exact architecture.
-        raise _Unsupported(c.node, f"{c.d.op_name}: kind::f8f6f4 cta_group::2 requires tirx.cuda_arch in "
-                                   f"{sorted(TCGEN_DESCRIPTOR_ARCHES)}, got {c.lw.builder.program.arch!r}")
-    c.emit("TcgenMma", kind=kind, cta_group=_cta_group(c), d=c.src("d_tmem"), a=a, b_desc=b_desc,
-           idesc=c.src("idesc"), enable_input_d=c.lw.cast_to(c.src("enable_input_d"), pb.Ty("Pred")),
-           ws=c.flag("ws"), ws_b_buffer=b_buffer, block_scale=block_scale, scale_input_d=None,
-           sparse_meta=c.src("sp_meta_tmem") if "sp_meta_tmem" in c.ops else None,
-           disable_output_lane=lanes, collector_a=collector_a, collector_b=collector_b,
-           ashift=c.flag("ashift"), lut_b=lut_b, lut_b_addr=lut_b_addr)
+        raise _Unsupported(
+            c.node,
+            f"{c.d.op_name}: kind::f8f6f4 cta_group::2 requires tirx.cuda_arch in "
+            f"{sorted(TCGEN_DESCRIPTOR_ARCHES)}, got {c.lw.builder.program.arch!r}",
+        )
+    # W4-W11-7: the typed gemm's [M, N, K] (None for a raw tcgen05.mma), checked
+    # against the runtime instruction descriptor at issue.
+    declared = None
+    shape = c.lw.declared_mma_shape()
+    if shape is not None and kind in MMA_K:
+        k = MMA_K[kind] * (2 if "sp_meta_tmem" in c.ops else 1)
+        declared = [shape[0], shape[1], k]
+    c.emit(
+        "TcgenMma",
+        kind=kind,
+        cta_group=_cta_group(c),
+        declared=declared,
+        d=c.src("d_tmem"),
+        a=a,
+        b_desc=b_desc,
+        idesc=c.src("idesc"),
+        enable_input_d=c.lw.cast_to(c.src("enable_input_d"), pb.Ty("Pred")),
+        ws=c.flag("ws"),
+        ws_b_buffer=b_buffer,
+        block_scale=block_scale,
+        scale_input_d=None,
+        sparse_meta=c.src("sp_meta_tmem") if "sp_meta_tmem" in c.ops else None,
+        disable_output_lane=lanes,
+        collector_a=collector_a,
+        collector_b=collector_b,
+        ashift=c.flag("ashift"),
+        lut_b=lut_b,
+        lut_b_addr=lut_b_addr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1060,21 +1446,37 @@ def lower_tcgen05_mma(c: PtxCtx) -> None:
 # ---------------------------------------------------------------------------
 
 _EXACT: dict[str, Callable[[PtxCtx], None]] = {
-    "ld": lower_ld, "ld_vec": lower_ld, "ld_vec256": lower_ld, "ldu": lower_ld, "ldu_vec": lower_ld,
+    "ld": lower_ld,
+    "ld_vec": lower_ld,
+    "ld_vec256": lower_ld,
+    "ldu": lower_ld,
+    "ldu_vec": lower_ld,
     "ld_proxy_readonly": lower_ld,
-    "st": lower_st, "st_vec": lower_st, "st_vec256": lower_st,
+    "st": lower_st,
+    "st_vec": lower_st,
+    "st_vec256": lower_st,
     "discard": lower_discard,
-    "cvta": lower_cvta, "cvta_generic": lower_cvta, "isspacep": lower_isspacep,
-    "getctarank": lower_getctarank, "getctarank_generic": lower_getctarank,
-    "cp_async_commit_group": lower_async_commit, "cp_async_bulk_commit_group": lower_async_commit,
-    "cp_async_wait_group": lower_async_wait, "cp_async_wait_all": lower_async_wait,
+    "cvta": lower_cvta,
+    "cvta_generic": lower_cvta,
+    "isspacep": lower_isspacep,
+    "getctarank": lower_getctarank,
+    "getctarank_generic": lower_getctarank,
+    "cp_async_commit_group": lower_async_commit,
+    "cp_async_bulk_commit_group": lower_async_commit,
+    "cp_async_wait_group": lower_async_wait,
+    "cp_async_wait_all": lower_async_wait,
     "cp_async_bulk_wait_group": lower_async_wait,
     "cp_async_mbarrier_arrive": lower_cp_async_mbar_arrive,
-    "st_bulk": lower_st_bulk, "tensormap_cp_fenceproxy": lower_tensormap_cp_fence,
-    "bar_warp_sync": lower_bar_warp_sync, "setmaxnreg": lower_setmaxnreg,
-    "griddepcontrol": lower_griddepcontrol, "clusterlaunchcontrol_try_cancel": lower_clc_try_cancel,
-    "elect_sync": lower_elect, "activemask": lower_activemask,
-    "barrier_cluster_arrive": lower_cluster_barrier, "barrier_cluster_wait": lower_cluster_barrier,
+    "st_bulk": lower_st_bulk,
+    "tensormap_cp_fenceproxy": lower_tensormap_cp_fence,
+    "bar_warp_sync": lower_bar_warp_sync,
+    "setmaxnreg": lower_setmaxnreg,
+    "griddepcontrol": lower_griddepcontrol,
+    "clusterlaunchcontrol_try_cancel": lower_clc_try_cancel,
+    "elect_sync": lower_elect,
+    "activemask": lower_activemask,
+    "barrier_cluster_arrive": lower_cluster_barrier,
+    "barrier_cluster_wait": lower_cluster_barrier,
 }
 
 _PREFIX: tuple[tuple[str, Callable[[PtxCtx], None]], ...] = (
@@ -1120,7 +1522,7 @@ def handler_for(table_name: str) -> Callable[[PtxCtx], None]:
     return lower_generic
 
 
-def lower_ptx(lw: "Lowerer", node: Any) -> None:
+def lower_ptx(lw: Lowerer, node: Any) -> None:
     try:
         decoded = ptx_decode.decode(node)
     except ptx_decode.PtxDecodeError as error:
@@ -1128,9 +1530,14 @@ def lower_ptx(lw: "Lowerer", node: Any) -> None:
     try:
         handler = handler_for(decoded.table_name)
     except KeyError:
-        raise _Unsupported(node, f"{decoded.op_name} is rejected (not modeled for the SM100 target)") from None
-    register_pairs = _check_distinct_registers(lw, node, decoded) \
-        if decoded.table_name.startswith("spdecompress") else []
+        raise _Unsupported(
+            node, f"{decoded.op_name} is rejected (not modeled for the SM100 target)"
+        ) from None
+    register_pairs = (
+        _check_distinct_registers(lw, node, decoded)
+        if decoded.table_name.startswith("spdecompress")
+        else []
+    )
     ctx = PtxCtx(lw, node, decoded)
     b = lw.builder
     if_pc = None
@@ -1160,7 +1567,13 @@ def lower_ptx(lw: "Lowerer", node: Any) -> None:
     del start
 
 
-def _check_distinct_registers(lw: "Lowerer", node: Any, decoded: ptx_decode.DecodedPtx) -> list:
+# An operand pair (ref, indices, bytes) x 2 and their names, checked at run time.
+RegisterPair = tuple[tuple[Any, Any, int], tuple[Any, Any, int], str]
+
+
+def _check_distinct_registers(
+    lw: Lowerer, node: Any, decoded: ptx_decode.DecodedPtx
+) -> list[RegisterPair]:
     """spdecompress register operands must be distinct physical registers (PTX:
     overlapping data/metadata registers are undefined; legacy rejected them).
 
@@ -1181,12 +1594,16 @@ def _check_distinct_registers(lw: "Lowerer", node: Any, decoded: ptx_decode.Deco
     for loop in lw.loop_scopes:
         try:
             analyzer.bind(loop.loop_var, tvm.ir.Range.from_min_extent(loop.min, loop.extent))
-        except Exception:  # noqa: BLE001 - an unbindable range leaves the var unbounded
+        except Exception:
             pass
-    operands: list[tuple] = []
+    operands: list[tuple[Any, Any, int, Any, Any, str]] = []
     for info, values in zip(decoded.operands, decoded.values):
         for value in values:
-            if value is ptx_decode.SINK or isinstance(value, str) or type_key(value) != "ir.TensorLoad":
+            if (
+                value is ptx_decode.SINK
+                or isinstance(value, str)
+                or type_key(value) != "ir.TensorLoad"
+            ):
                 continue
             ref = lw.ref_of(value.source)
             if isinstance(ref, RegArray):
@@ -1194,20 +1611,27 @@ def _check_distinct_registers(lw: "Lowerer", node: Any, decoded: ptx_decode.Deco
             elif isinstance(ref, MemRef) and ref.space in ("Local", "Reg"):
                 buffers = lw.builder.program.buffers
                 root_buf = ref.buf
-                while buffers[root_buf].view_of is not None:
-                    root_buf = buffers[root_buf].view_of
+                while (parent := buffers[root_buf].view_of) is not None:
+                    root_buf = parent
                 root, base = ("buf", root_buf), sum_bases(buffers, ref.buf)
                 elem_bytes = max(1, buffers[ref.buf].dtype.bits // 8)
             else:
                 continue
             shape = ref.info.static_shape
             flat = None
-            if shape is not None and not ref.info.strides and getattr(ref.info, "layout", None) is None:
+            if (
+                shape is not None
+                and not ref.info.strides
+                and getattr(ref.info, "layout", None) is None
+            ):
                 flat = 0
                 for extent, index in zip(shape, value.indices):
                     flat = flat * extent + index
-                flat = analyzer.simplify(flat * elem_bytes + base) if not isinstance(flat, int) \
+                flat = (
+                    analyzer.simplify(flat * elem_bytes + base)
+                    if not isinstance(flat, int)
                     else flat * elem_bytes + base
+                )
             operands.append((root, flat, elem_bytes, ref, value.indices, info.name))
 
     def bounds(flat: Any) -> tuple[int, int] | None:
@@ -1220,28 +1644,41 @@ def _check_distinct_registers(lw: "Lowerer", node: Any, decoded: ptx_decode.Deco
             return None
         return int(bound.min_value), int(bound.max_value)
 
-    runtime: list = []
+    runtime: list[RegisterPair] = []
     for i, (root_a, flat_a, size_a, ref_a, idx_a, name_a) in enumerate(operands):
         for root_b, flat_b, size_b, ref_b, idx_b, name_b in operands[:i]:
             if root_a != root_b:
                 continue
             if flat_a is not None and flat_b is not None:
-                diff = bounds(analyzer.simplify(flat_a - flat_b)) if not (
-                    isinstance(flat_a, int) and isinstance(flat_b, int)) else (flat_a - flat_b,) * 2
+                diff = (
+                    bounds(analyzer.simplify(flat_a - flat_b))
+                    if not (isinstance(flat_a, int) and isinstance(flat_b, int))
+                    else (flat_a - flat_b,) * 2
+                )
                 if diff is not None and diff[0] == diff[1] and -size_a < diff[0] < size_b:
-                    raise _Unsupported(node, f"{decoded.op_name}: undefined register overlap: {name_a} and "
-                                             f"{name_b} name the same physical register (aliased)")
+                    raise _Unsupported(
+                        node,
+                        f"{decoded.op_name}: undefined register overlap: {name_a} and "
+                        f"{name_b} name the same physical register (aliased)",
+                    )
                 range_a, range_b = bounds(flat_a), bounds(flat_b)
-                if range_a is not None and range_b is not None and (
-                        range_a[1] + size_a <= range_b[0] or range_b[1] + size_b <= range_a[0]):
-                    continue   # disjoint for every index value
+                if (
+                    range_a is not None
+                    and range_b is not None
+                    and (range_a[1] + size_a <= range_b[0] or range_b[1] + size_b <= range_a[0])
+                ):
+                    continue  # disjoint for every index value
                 if diff is not None and (diff[0] >= size_b or diff[1] <= -size_a):
-                    continue   # constant-sign separation
-            runtime.append(((ref_a, idx_a, size_a), (ref_b, idx_b, size_b), f"{name_a} and {name_b}"))
+                    continue  # constant-sign separation
+            runtime.append(
+                ((ref_a, idx_a, size_a), (ref_b, idx_b, size_b), f"{name_a} and {name_b}")
+            )
     return runtime
 
 
-def emit_register_checks(lw: "Lowerer", node: Any, decoded: ptx_decode.DecodedPtx, pairs: list) -> None:
+def emit_register_checks(
+    lw: Lowerer, node: Any, decoded: ptx_decode.DecodedPtx, pairs: list[RegisterPair]
+) -> None:
     """Run-time ``Assert`` that each unproven operand pair names disjoint registers."""
     from .memory import MemRef, sum_bases
 
@@ -1263,8 +1700,14 @@ def emit_register_checks(lw: "Lowerer", node: Any, decoded: ptx_decode.DecodedPt
         lw.builder.emit("Compare", op="Le", ty=i32, dst=before, a=end_a, b=start_b)
         lw.builder.emit("Compare", op="Le", ty=i32, dst=after, a=end_b, b=start_a)
         ok = lw.binary("Or", pb.Ty("Pred"), before, after)
-        lw.builder.emit("Assert", site=lw.site(node), cond=ok, msg=lw.builder.string(
-            f"{decoded.op_name}: undefined register overlap: {names} name the same physical register"))
+        lw.builder.emit(
+            "Assert",
+            site=lw.site(node),
+            cond=ok,
+            msg=lw.builder.string(
+                f"{decoded.op_name}: undefined register overlap: {names} name the same physical register"
+            ),
+        )
 
 
-__all__ = ["lower_ptx", "handler_for"]
+__all__ = ["handler_for", "lower_ptx"]

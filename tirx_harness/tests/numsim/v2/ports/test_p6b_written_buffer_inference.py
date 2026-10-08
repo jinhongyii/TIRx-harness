@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -36,14 +36,7 @@ def _first_stop(error: v2.ExecutionError) -> dict:
     [
         "bound",
         "null",
-        pytest.param(
-            "unbound",
-            marks=v2_gap(
-                "an integer address naming no binding (0x1000) is an error bad_address; "
-                "expected verdict incomplete (integer_address_without_binding). Ruling "
-                "requested: CONTRACT_REQUESTS W12-gaps 1 (W2)"
-            ),
-        ),
+        "unbound",
     ],
 )
 def test_dynamic_raw_write_requires_bound_address(address_kind):

@@ -22,11 +22,27 @@ from .copy import check_common, lower_snapshot_copy, region
 if TYPE_CHECKING:
     from ..ir_walk import Lowerer
 
-SNAPSHOT_DTYPES = frozenset({"float16", "bfloat16", "float32", "float64", "int8", "int16", "int32", "int64",
-                             "uint8", "uint16", "uint32", "uint64", "float8_e4m3fn", "float8_e8m0fnu"})
+SNAPSHOT_DTYPES = frozenset(
+    {
+        "float16",
+        "bfloat16",
+        "float32",
+        "float64",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float8_e4m3fn",
+        "float8_e8m0fnu",
+    }
+)
 
 
-def lower(call: Any, ctx: "Lowerer") -> None:
+def lower(call: Any, ctx: Lowerer) -> None:
     scope = check_common(call)
     if scope != "warp":
         raise _Unsupported(call, f"tile op {call.op.name}: requires warp scope, got {scope}")
@@ -35,5 +51,7 @@ def lower(call: Any, ctx: "Lowerer") -> None:
     dst = region(ctx, call, call.args[0], "dst")
     src = region(ctx, call, call.args[1], "src")
     if src.dtype not in SNAPSHOT_DTYPES:
-        raise _Unsupported(call, f"tile op {call.op.name}: snapshot copy of {src.dtype} is not implemented")
+        raise _Unsupported(
+            call, f"tile op {call.op.name}: snapshot copy of {src.dtype} is not implemented"
+        )
     lower_snapshot_copy(ctx, call, scope, dst, src)

@@ -29,6 +29,9 @@ mod tma;
 mod warp;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "atomic_differential_tests.rs"]
+mod atomic_differential_tests;
 
 use crate::dtype::{Dtype, Ty};
 use crate::program::{BinOp, CmpOp, OpKey, ReduxOp, Rounding, ShflMode, TerOp, TmapField, UnOp};
@@ -533,8 +536,19 @@ impl TensorMapDesc {
     /// combined with the shared `GlobalStrideUpper` nibbles as
     /// `stride[ord] = (lower | upper_nibble(ord) << 32) << 4`; every other
     /// field is applied as `replace`. Call this instead of looping `replace`.
-    pub fn apply_overrides(&mut self, overrides: &[(TmapField, Option<u8>, u64)]) -> OpResult {
-        tma::apply_overrides(self, overrides)
+    ///
+    /// Operand rules (PTX `cp.async.bulk.tensor` `.override::*`, legacy
+    /// `with_overrides`): a `GlobalAddress` override must name memory with at
+    /// least 128 KiB accessible from it (`accessible`
+    /// answers that for an address), and a dimension/stride override requires
+    /// every tensor `coords` operand to be zero. Violations are `Invalid`.
+    pub fn apply_overrides(
+        &mut self,
+        overrides: &[(TmapField, Option<u8>, u64)],
+        coords: &[i64],
+        accessible: &dyn Fn(u64, u64) -> bool,
+    ) -> OpResult {
+        tma::apply_overrides(self, overrides, coords, accessible)
     }
 }
 
@@ -674,6 +688,45 @@ pub fn tma_reduce_valid(op: crate::program::AtomOp, dtype: Dtype) -> OpResult<()
             "cp.reduce.async.bulk.tensor operation {op:?} is invalid for TensorMap dtype {dtype:?}"
         )))
     }
+}
+
+/// Layout operands of a non-tensor bulk copy or reduction (`cp.async.bulk`,
+/// `cp.reduce.async.bulk`, PTX 9.7.9.25.4): the byte count is a positive
+/// multiple of 16 and both the source and destination addresses are 16-byte
+/// aligned. No numerics. Violations are `Invalid` with the legacy wording
+/// ("positive multiple of 16", "16-byte aligned source and destination").
+pub fn bulk_copy_layout(size: u64, src: u64, dst: u64, lane: usize, reduce: bool) -> OpResult<()> {
+    let operation = if reduce { "cp.reduce.async.bulk" } else { "cp.async.bulk" };
+    let size = i64::try_from(size).unwrap_or(i64::MAX);
+    numsim_oplib::tma::bulk_byte_len(size, lane, operation).map_err(|e| OpError::invalid(e.0))?;
+    numsim_oplib::tma::validate_bulk_alignment(src as usize, dst as usize, lane, operation)
+        .map_err(|e| OpError::invalid(e.0))
+}
+
+/// W11-7: a runtime `tcgen05.mma` instruction descriptor must encode the MMA
+/// shape the typed op declared (`declared = [M, N, K]`, the `gemm_async` tile
+/// op's shape), read with `kind`'s descriptor layout (oplib
+/// `tcgen05::instr_desc::idesc_shape`). No numerics. A mismatch is `Invalid`
+/// and names both shapes.
+pub fn tcgen_mma_check_declared(kind: crate::program::TcMmaKind, idesc: u32, declared: [u16; 3]) -> OpResult<()> {
+    use crate::program::TcMmaKind as K;
+    use numsim_oplib::tcgen05::instr_desc::{check_declared_shape, IdescFamily, MmaShape};
+    let family = match kind {
+        K::F16 => IdescFamily::Dense { k: 16 },
+        K::Tf32 => IdescFamily::Dense { k: 8 },
+        K::F8f6f4 | K::I8 | K::Ti16 => IdescFamily::Dense { k: 32 },
+        K::MxF8f6f4 => IdescFamily::Mxf8f6f4,
+        K::MxF4 | K::MxF4Nvf4 => IdescFamily::Mxf4,
+    };
+    let [m, n, k] = declared.map(usize::from);
+    check_declared_shape(idesc, family, MmaShape { m, n, k }).map_err(|e| OpError::invalid(e.0))
+}
+
+/// Static legality of a declared `[M, N, K]` for `kind` at `cta_group`
+/// ([`crate::program::declared_mma_shape_legal`], decision 16) as an `Invalid`
+/// operand error. No numerics.
+pub fn tcgen_mma_declared_legal(kind: crate::program::TcMmaKind, cta_group: u8, declared: [u16; 3]) -> OpResult<()> {
+    crate::program::declared_mma_shape_legal(kind, cta_group, declared).map_err(OpError::invalid)
 }
 
 /// Decoded tcgen05/wgmma shared-memory matrix descriptor.
@@ -831,27 +884,9 @@ pub use mem::{
 // Op registry -> SUPPORTED_OPS.md
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Fidelity {
-    Modeled,
-    DeterministicRepresentative,
-    OrderingOnly,
-    ExactProtocol,
-    Rejected,
-}
-
-impl Fidelity {
-    /// The SUPPORTED_OPS.md spelling of this fidelity.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Fidelity::Modeled => "modeled",
-            Fidelity::DeterministicRepresentative => "deterministic_representative",
-            Fidelity::OrderingOnly => "ordering_only",
-            Fidelity::ExactProtocol => "exact_protocol",
-            Fidelity::Rejected => "rejected",
-        }
-    }
-}
+/// How faithfully NumSim models an op: the one definition is the oplib
+/// registry's (`numsim_oplib::registry::Fidelity`), re-exported here.
+pub use numsim_oplib::registry::Fidelity;
 
 /// One TIRx op as lowering accepts it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

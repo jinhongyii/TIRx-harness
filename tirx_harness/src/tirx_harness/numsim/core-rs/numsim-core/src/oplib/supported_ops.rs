@@ -198,7 +198,7 @@ specialization domain; such forms fail closed (`Unsupported`, run verdict `incom
                 "| {} | {} | {} | {} | {} | {} |\n",
                 cell(&format!("`{}`", e.name)),
                 cell(e.family),
-                e.fidelity.name(),
+                e.fidelity.as_str(),
                 cell(&path.describe()),
                 cell(deltas),
                 cell(e.notes)
@@ -227,7 +227,7 @@ structural calls, CUDA helpers), with how it runs them.\n\n| Operation | v2 | De
     s.push_str("## Gaps vs legacy\n\nLegacy documented these as supported; v2 fails closed on them.\n\n");
     s.push_str("| Operation | Legacy fidelity | v2 |\n| --- | --- | --- |\n");
     for (e, path, _) in gaps {
-        s.push_str(&format!("| `{}` | {} | {} |\n", e.name, e.fidelity.name(), cell(&path.describe())));
+        s.push_str(&format!("| `{}` | {} | {} |\n", e.name, e.fidelity.as_str(), cell(&path.describe())));
     }
     s
 }

@@ -1,8 +1,8 @@
 //! Explicit low-precision codecs: binary16, bfloat16, tf32, and the OCP
 //! narrow formats (e4m3, e5m2, e2m1, e2m3, e3m2, ue5m3, ue8m0).
 //!
-//! Moved from the legacy `numpy_backend.rs`; the NumPy matmul half lives in
-//! `crate::mma::numpy` behind the `numpy` feature.
+//! Moved from the legacy `numpy_backend.rs` (its NumPy matmul half was removed
+//! with the tile-GEMM path; see `crate::mma`).
 
 /// Encode one `f32` as IEEE 754 binary16 using round-to-nearest, ties-to-even.
 pub fn f32_to_fp16_bits(value: f32) -> u16 {

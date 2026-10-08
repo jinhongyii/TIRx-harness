@@ -5,7 +5,7 @@
 //! (`DeferredGlobalReduction::{byte_len, apply}`, ~lines 533-745); the deferral
 //! and publication machinery stays in the engine.  Note that `MinF16`/`MaxF16`
 //! use the CUDA min/max oracles while the `atom` half forms use
-//! `ptx_{min,max}_f32` (`rmw::atomic_half`), as legacy did.
+//! `ptx_{min,max}_f32`, as legacy did.
 
 use crate::cvt::formats::{bf16_bits_to_f32, f32_to_bf16_bits, f32_to_fp16_bits, fp16_bits_to_f32};
 use crate::scalar::{cuda_f32_max, cuda_f32_min, F32RoundingMode};

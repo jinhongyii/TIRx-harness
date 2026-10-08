@@ -3140,3 +3140,21 @@ These are legacy run-time rejections that v2 accepts. Each reproducer is the leg
   - `WorkCmd::CommitSharedA`;
   - W5 tcgen `preds` (per-thread);
   - intra-cluster partitioning (design sent to the coordinator).
+
+## W6-P1 (for W2, 2026-10-08): `WaitVerdicts` indices are partition-local when two partitions write one declared word in a round
+
+Review of 934f2b3 (partitioned declared words), invariant I10: verdict indices must equal racecheck's delivery-order numbering.
+
+- **Cause.** `emit_verdicts` numbers the history in the partition's local copy: the launch table plus that partition's own entries. `merge_words` then appends the partitions' entries in replay order. Suppose an earlier-delivered partition also wrote the word this round. The later partition's local indices are then off by that partition's entry count.
+- **Why the replay order doesn't prevent it.** The S-a fix (own-write reads are not round-start reads) means a partition polling its own store adds no read→write edge. The replay order falls back to partition order, so nothing reorders the waiter first.
+- **Scenario.** `tests/sched_partition_review.rs::same_round_writers_each_waiting_on_their_own_value` (`#[ignore]`, xfail).
+  - Two single-CTA clusters each `st.release flag = cta+1` and then `wait_until(flag == cta+1)`.
+  - Delivered writers are `[warp 0, warp 1]`.
+  - Warp 1's verdict says `observed: 1, accepted: [1]`. Index 1 is warp 0's write (value 1), which does not satisfy `== 2`. The right answer is `observed: 2, accepted: [2]`.
+  - Same result at 1 and 8 workers.
+- **Effect.** Racecheck acquires warp 0's release instead of warp 1's own write. That is a spurious HB edge, so a race can be missed. Any `wait_until` across clusters on a word that several clusters store to in the same round is affected.
+- **Fix options.**
+  - (a) Rebase at replay. Run `merge_words` before `EventBuffer::replay`, keeping each partition's local→merged index map. Rewrite each buffered `WaitVerdicts` (accepted bits and `observed`) through the map while replaying. Also rebase the partition's `aux.verdicts` cache (`evaluated`, `bits`), whose indices persist across rounds.
+  - (b) Compute verdicts after the merge. Buffer the predicate inputs and evaluate the bitset on the merged history at replay.
+  - Either way, `observed` must count the merged entries delivered before the verdict.
+- **Not affected.** Serial-phase writers (`wait_satisfied_by_serial_phase_writes_numbers_like_the_delivery`) and a third partition reading round-start bytes (`two_writers_and_a_poller_number_like_the_delivery`) pass.

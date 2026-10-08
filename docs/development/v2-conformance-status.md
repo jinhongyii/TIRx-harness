@@ -32,6 +32,12 @@ fail-closed reason); **crash** (engine runtime error or binder exception); **no 
 | V2C-TF1 (closed) | W1, W12 | Coverage regression: TVM's `TilePrimitiveDispatch` rejected tile ops in 58 public-API kernels that legacy compiled. All 58 are now resolved: lowered through TVM after a legacy-spelling repair or by a v2 tile form (`v2/lowering/tile_forms/`, lowering-inventory Part F), or ruled hardware-invalid (deltas L4–L7, with the tests moved to valid shapes), or blocked only by L1 (replicated TMEM view). | `tests/numsim/v2/tile_forms/legacy_compiled.tsv`; `test_legacy_compiled_tile_forms.py`: 62 pass, 1 strict-xfail (L1) |
 | V2C-31 | synccheck | synccheck exhausts its state/transition budget where legacy completed within the same ResourceLimits | 1: `kda_forward_portfolio_multishape` (s) |
 
+## Decisions deferred to after the legacy deletion
+
+| decision | current v2 behaviour | why deferred |
+| --- | --- | --- |
+| Enforce the hardware cluster-size limit (16 CTAs, non-portable, sm_90/sm_100) | Legacy engine limit: more than 64 CTAs per cluster fails closed at transpile | 14 sweep kernels use 20-CTA clusters that legacy accepted; enforcing needs a delta row and a test migration. See numsim-isa-answers.md, "Cluster size". |
+
 ## Cases without a legacy result
 
 | case | legacy | v2 status |

@@ -184,10 +184,11 @@ pub(crate) fn flush_f32_result(rounded: f32, is_tiny: impl FnOnce() -> bool) -> 
     }
 }
 
-/// Binary32 `lhs / rhs`, round-to-nearest-even, no FTZ. NaN payload is the host
-/// division's (x86 `divss`: first NaN operand quieted, else `0xffc0_0000`); not pinned.
+/// Binary32 `lhs / rhs`, round-to-nearest-even, no FTZ. A NaN result is pinned by
+/// [`pin_nan2_f32`] (delta D8): the first NaN operand quieted, else (`0/0`,
+/// `inf/inf`) the default NaN `0xffc0_0000`.
 pub fn div_f32_rn(lhs: f32, rhs: f32) -> f32 {
-    lhs / rhs
+    pin_nan2_f32(lhs, rhs, lhs / rhs)
 }
 
 /// PTX `div.{rnd}{.ftz}.f32` (IEEE division): RN from the host quotient, RZ/RM/RP by
@@ -317,14 +318,15 @@ pub fn ptx_neg_f16x2_bits(value: u32, ftz: bool) -> u32 {
 
 /// PTX `sqrt.{rnd}{.ftz}.f32`: RN from the host root, RZ/RM/RP by exact square
 /// comparison. `ftz` flushes subnormal input/result to signed zero. `sqrt(-0) = -0`;
-/// negative or NaN input gives the host NaN (NaN operand quieted, else `0xffc0_0000`).
+/// negative or NaN input gives the pinned NaN of [`pin_nan1_f32`] (NaN operand
+/// quieted, else `0xffc0_0000`; delta D8).
 pub fn ptx_sqrt_f32(value: f32, mode: F32RoundingMode, ftz: bool) -> f32 {
     let value = if ftz {
         flush_subnormal_f32(value)
     } else {
         value
     };
-    let nearest = value.sqrt();
+    let nearest = pin_nan1_f32(value, value.sqrt());
     let rounded = if mode == F32RoundingMode::Nearest
         || !value.is_finite()
         || value <= 0.0
@@ -409,9 +411,10 @@ pub(crate) fn compare_f64_square_to_input(root: f64, input: f64) -> Ordering {
 }
 
 /// PTX `sqrt.{rnd}.f64`: RN from the host root, RZ/RM/RP by exact dyadic square
-/// comparison. Subnormals kept; `sqrt(-0) = -0`; negative/NaN input gives the host NaN.
+/// comparison. Subnormals kept; `sqrt(-0) = -0`; negative/NaN input gives the pinned
+/// NaN of [`pin_nan1_f64`] (delta D8).
 pub fn ptx_sqrt_f64(value: f64, mode: F32RoundingMode) -> f64 {
-    let nearest = value.sqrt();
+    let nearest = pin_nan1_f64(value, value.sqrt());
     if mode == F32RoundingMode::Nearest || !value.is_finite() || value <= 0.0 || nearest.is_nan() {
         return nearest;
     }
@@ -448,6 +451,22 @@ pub fn pin_nan2_f32(lhs: f32, rhs: f32, result: f32) -> f32 {
         }
     }
     f32::from_bits(0xffc0_0000)
+}
+
+/// Pinned NaN of a host binary32 unary operation (`sqrt`, `1/x`, libm
+/// functions) whose result is NaN: a NaN `input` quieted (payload and sign
+/// kept), else the x86 default NaN `0xffc0_0000` (`sqrt(-1)`, `sin(inf)`).
+/// This is the one-operand case of [`pin_nan2_f32`] (delta D8); it does not
+/// depend on the host libm or on the f64->f32 cast's payload handling.
+#[inline]
+pub fn pin_nan1_f32(input: f32, result: f32) -> f32 {
+    pin_nan2_f32(input, input, result)
+}
+
+/// Binary64 [`pin_nan1_f32`] (default NaN `0xfff8_0000_0000_0000`).
+#[inline]
+pub fn pin_nan1_f64(input: f64, result: f64) -> f64 {
+    pin_nan2_f64(input, input, result)
 }
 
 /// Binary64 [`pin_nan2_f32`] (default NaN `0xfff8_0000_0000_0000`).
@@ -612,9 +631,9 @@ pub fn mul_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
 }
 
 /// PTX `div.{rnd}.f64`: RN host quotient, RZ/RM/RP by exact comparison of the
-/// candidate. Subnormals kept; NaN payload is the host division's (not pinned).
+/// candidate. Subnormals kept; a NaN result is pinned by [`pin_nan2_f64`] (delta D8).
 pub fn div_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
-    let rounded = lhs / rhs;
+    let rounded = pin_nan2_f64(lhs, rhs, lhs / rhs);
     if mode == F32RoundingMode::Nearest
         || !lhs.is_finite()
         || !rhs.is_finite()

@@ -952,6 +952,88 @@ pub fn tf32_family_input_scale(scale_input_d: usize) -> OpResult<f32> {
     input_scale(scale_input_d, "raw TF32 input scale conversion failed")
 }
 
+/// Which instruction-descriptor bit layout a `tcgen05.mma` kind uses for its
+/// shape fields (PTX instruction-descriptor tables).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdescFamily {
+    /// `kind::f16` (K 16), `kind::tf32` (K 8), `kind::f8f6f4`/`kind::i8`
+    /// (K 32; 64 with bit 29 on SM107): M = bits 24..29 x 16, N = bits 17..23 x 8.
+    Dense { k: usize },
+    /// `kind::mxf8f6f4`: M = bits 24..29 (bit 26 excluded) x 16, N = bits 17..23 x 8,
+    /// K = 32 (64 with bit 31).
+    Mxf8f6f4,
+    /// `kind::mxf4`/`mxf4nvf4`: M = bits 27..29 x 128, N = bits 17..23 x 8,
+    /// K = 64 (bit 31: 96, bit 3: 128).
+    Mxf4,
+}
+
+/// M, N, K of one MMA, in elements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmaShape {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
+impl std::fmt::Display for MmaShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "M={} N={} K={}", self.m, self.n, self.k)
+    }
+}
+
+/// The M/N/K a runtime instruction descriptor encodes, read with `family`'s
+/// layout; sparse descriptors (bit 2) double K. No numerics and no legality
+/// checks: the per-kind decoders above validate the fields; this only reads
+/// the shape so it can be compared with a statically declared one.
+pub fn idesc_shape(descriptor: u32, family: IdescFamily) -> MmaShape {
+    let n = ((descriptor >> 17) & 0x3f) as usize * 8;
+    let sparse = descriptor & 4 != 0;
+    let (m, k) = match family {
+        IdescFamily::Dense { k } => {
+            let k = if k == 32 && descriptor & (1 << 29) != 0 {
+                64
+            } else {
+                k
+            };
+            (((descriptor >> 24) & 0x1f) as usize * 16, k)
+        }
+        IdescFamily::Mxf8f6f4 => (
+            (((descriptor & !(1 << 26)) >> 24) & 0x1f) as usize * 16,
+            if descriptor & (1 << 31) != 0 { 64 } else { 32 },
+        ),
+        IdescFamily::Mxf4 => (
+            ((descriptor >> 27) & 0x3) as usize * 128,
+            match ((descriptor >> 3) & 1, descriptor >> 31) {
+                (1, _) => 128,
+                (0, 1) => 96,
+                _ => 64,
+            },
+        ),
+    };
+    MmaShape {
+        m,
+        n,
+        k: if sparse { 2 * k } else { k },
+    }
+}
+
+/// A runtime instruction descriptor must encode the shape the typed MMA
+/// declared (the `gemm_async` tile op's M/N/K; legacy "does not match the typed
+/// TCGEN ABI"). No numerics. Errors (an operand error) name both shapes.
+pub fn check_declared_shape(
+    descriptor: u32,
+    family: IdescFamily,
+    declared: MmaShape,
+) -> OpResult<()> {
+    let encoded = idesc_shape(descriptor, family);
+    if encoded != declared {
+        return Err(OpError::message(format!(
+            "tcgen05.mma runtime instruction descriptor {descriptor:#010x} encodes {encoded}, which does not match the declared MMA shape {declared}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "instr_desc_tests.rs"]
 mod tests;

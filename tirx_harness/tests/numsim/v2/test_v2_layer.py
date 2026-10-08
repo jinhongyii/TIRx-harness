@@ -61,25 +61,12 @@ def test_load_module_rejects_bad_documents():
         v2.from_document({"format_version": 1, "kernels": [{"name": "x"}]})
 
 
-def test_native_run_rejects_unknown_mode_and_backend(module):
+def test_native_run_rejects_unknown_mode(module):
     with pytest.raises(ValueError, match="unknown mode"):
         numsim_core_py.run(module.handle, {}, mode="nope")
-    with pytest.raises(ValueError, match="unknown backend"):
-        numsim_core_py.run(module.handle, {}, backend="nope")
-
-
-@pytest.mark.skipif(
-    not __import__("os").environ.get("NUMSIM_V2_TEST_CODEGEN"),
-    reason="codegen ABI follows the live rlib; set NUMSIM_V2_TEST_CODEGEN=1 after rebuilding",
-)
-def test_codegen_backend_matches_interpreter(module, tmp_path, monkeypatch):
-    monkeypatch.setenv("NUMSIM_CACHE_DIR", str(tmp_path))
-    inputs = _inputs()
-    interp = _skip_if_unimplemented(lambda: v2.Engine(backend="interp").run(module, inputs))
-    codegen = _skip_if_unimplemented(lambda: v2.Engine(backend="codegen").run(module, inputs))
-    assert codegen.status == interp.status
-    for name, value in interp.outputs.items():
-        np.testing.assert_array_equal(codegen.outputs[name], value)
+    # One executor (the interpreter): there is no backend knob.
+    with pytest.raises(TypeError):
+        numsim_core_py.run(module.handle, {}, backend="interp")
 
 
 # -- inputs ----------------------------------------------------------------
@@ -129,7 +116,21 @@ def test_scalar_parameter_rejects_buffer_values():
     with pytest.raises(v2.InputError, match=r"scalar argument 'mode' has a buffer value \(ndarray of shape \(128,\)\)"):
         _scalar_bits("mode", np.zeros(128, np.uint8), {"elem": "S32"})
     assert _scalar_bits("mode", np.array(7, np.int32), {"elem": "S32"}) == 7
+    assert _scalar_bits("mode", np.int32(-1), {"elem": "S32"}) == 0xFFFFFFFF
+    assert _scalar_bits("mode", -1, {"elem": "S32"}) == 0xFFFFFFFF
+    # Any integer value that fits is accepted, whatever its NumPy width (H8);
+    # out-of-range values and non-integers are typed errors.
     assert _scalar_bits("mode", np.int64(-1), {"elem": "S32"}) == 0xFFFFFFFF
+    assert _scalar_bits("offset", np.uint32(7), {"elem": "S32"}) == 7
+    assert _scalar_bits("descriptor", np.int64(0x8000_0000), {"elem": "U32"}) == 0x8000_0000
+    with pytest.raises(v2.InputError, match="outside uint32 range"):
+        _scalar_bits("descriptor", np.int64(1 << 32), {"elem": "U32"})
+    with pytest.raises(v2.InputError, match="outside int32 range"):
+        _scalar_bits("offset", 1 << 31, {"elem": "S32"})
+    with pytest.raises(v2.InputError, match="scalar 'offset' requires dtype int32, got float32"):
+        _scalar_bits("offset", np.float32(7), {"elem": "S32"})
+    with pytest.raises(v2.InputError, match="scalar 'offset' requires dtype int32, got float"):
+        _scalar_bits("offset", 7.0, {"elem": "S32"})
 
 
 def test_engine_subset_selects_clusters(module):
@@ -178,8 +179,8 @@ def test_numsim_vector_add(module):
     assert result.status["kind"] == "completed", result.status
     np.testing.assert_array_equal(result.outputs["c"], inputs["a"] + inputs["b"])
     assert result.verdict == "clean"
-    assert set(result.timing) == {"lower", "module_cache", "bind", "build", "run", "check", "report"}
-    assert result.timing["run"] > 0 and result.timing["build"] >= 0
+    assert set(result.timing) == {"lower", "module_cache", "bind", "run", "check", "report"}
+    assert result.timing["run"] > 0
     report = v2.compare(result, {"c": inputs["a"] + inputs["b"]})
     report.require_ok()
 
@@ -190,7 +191,7 @@ def test_checkers_vector_add_clean(module, checker):
     run_phase = getattr(engine, f"run_{checker}_phase")
     result = _skip_if_unimplemented(lambda: run_phase(module, _inputs(), phase_index=0))
     payload = result.to_dict()
-    assert set(payload["timing"]) == {"lower", "module_cache", "bind", "build", "run", "check", "report"}
+    assert set(payload["timing"]) == {"lower", "module_cache", "bind", "run", "check", "report"}
     assert payload["schema_version"] == rep.SCHEMA_VERSION
     assert payload["verdict"] == "clean", payload
     assert payload["findings"] == [] and payload["advisories"] == []

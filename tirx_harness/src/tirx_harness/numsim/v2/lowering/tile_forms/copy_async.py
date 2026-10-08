@@ -28,9 +28,15 @@ def repair(call: Any) -> Any | None:
     target = _LEGACY_VARIANTS.get(dispatch or "")
     if target is None:
         return None
-    return tirx.TilePrimitiveCall(*call.args, op=call.op, workspace=dict(call.workspace),
-                                  config=dict(call.config), dispatch=target, scope=call.scope)
+    return tirx.TilePrimitiveCall(
+        *call.args,
+        op=call.op,
+        workspace=dict(call.workspace),
+        config=dict(call.config),
+        dispatch=target,
+        scope=call.scope,
+    )
 
 
-def lower(call: Any, ctx: "Lowerer") -> None:
+def lower(call: Any, ctx: Lowerer) -> None:
     unported(call, "copy_async")

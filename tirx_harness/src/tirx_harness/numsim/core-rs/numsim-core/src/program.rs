@@ -927,6 +927,30 @@ pub enum CollectorOp {
     Discard,
 }
 
+/// Static legality of a `TcgenMmaArgs::declared` `[M, N, K]` (decision 16),
+/// from the PTX tcgen05 shape table: K is the kind's instruction K (f16 16;
+/// tf32 8; f8f6f4/i8 32, 64 on SM107; mxf8f6f4 32/64; mxf4 64/96/128), or
+/// twice that when sparse; M in {32, 64, 128} for cta_group::1 (32 only with
+/// `.ws`) and {128, 256} for cta_group::2; N in 8..=256 by 8. Kept free of
+/// engine code so the contract-only validator can run it.
+pub fn declared_mma_shape_legal(kind: TcMmaKind, cta_group: u8, declared: [u16; 3]) -> Result<(), String> {
+    let [m, n, k] = declared;
+    let ks: &[u16] = match kind {
+        TcMmaKind::F16 => &[16, 32],
+        TcMmaKind::Tf32 => &[8, 16],
+        TcMmaKind::F8f6f4 | TcMmaKind::I8 | TcMmaKind::Ti16 | TcMmaKind::MxF8f6f4 => &[32, 64, 128],
+        TcMmaKind::MxF4 | TcMmaKind::MxF4Nvf4 => &[64, 96, 128, 256],
+    };
+    let ms: &[u16] = if cta_group == 2 { &[128, 256] } else { &[32, 64, 128] };
+    if !ks.contains(&k) || !ms.contains(&m) || !(8..=256).contains(&n) || !n.is_multiple_of(8) {
+        return Err(format!(
+            "M={m} N={n} K={k} is not a legal kind::{kind:?} cta_group::{} shape",
+            cta_group.max(1)
+        ));
+    }
+    Ok(())
+}
+
 /// `tcgen05.mma` (all ss/ts/ws/sp/block-scale/collector/lut/ashift forms).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -960,6 +984,15 @@ pub struct TcgenMmaArgs {
     /// closed if it does not name a column inside a live TMEM allocation.
     #[serde(deserialize_with = "required")]
     pub lut_b_addr: Option<Operand>,
+    /// `[M, N, K]` the typed tile op (`gemm`/`gemm_async` dispatch) declares
+    /// for this MMA: M is the full M (256 for cta_group::2 M256), K the
+    /// per-instruction K (doubled when sparse). `None` for raw instructions
+    /// that declare nothing. When present, `validate` checks it against the
+    /// kind's legal shapes and the engine rejects (`Invalid`) a runtime
+    /// instruction descriptor that encodes a different shape (README
+    /// decision 16, W11-7). JSON key `declared`; absent = `None`.
+    #[serde(default)]
+    pub declared: Option<[u16; 3]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,6 +2390,11 @@ impl Program {
             if let Instr::TcgenMma(a) = ins {
                 if a.lut_b != a.lut_b_addr.is_some() {
                     return Err(at(pc, "TcgenMma: lut_b_addr must be set iff lut_b".into()));
+                }
+                if let Some(d) = a.declared {
+                    if let Err(e) = declared_mma_shape_legal(a.kind, a.cta_group, d) {
+                        return Err(at(pc, format!("TcgenMma: declared {d:?}: {e}")));
+                    }
                 }
             }
             let s = self.code_sites[pc];

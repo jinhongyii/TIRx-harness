@@ -766,3 +766,50 @@ fn replace_rejects_ordinals_outside_the_descriptor_slots() {
     desc.replace(TmapField::Rank, None, 2).unwrap();
     assert_eq!(desc.rank, 3);
 }
+
+/// W12-gaps 2: TMA `.override::*` operand rules (legacy `with_overrides`). The
+/// override address needs 128 KiB of accessible memory, and a dimension/stride
+/// override requires zero tensor coordinates; both are `Invalid`.
+#[test]
+fn tma_overrides_reject_short_address_window_and_nonzero_coordinates() {
+    let base = desc2d(Dtype::F32, [8, 8], 32, [4, 2], 0);
+    let window_end = 0x9000_0000_u64 + 128 * 1024 + 16;
+    let accessible = |va: u64, len: u64| va >= 0x9000_0000 && va + len <= window_end;
+    let address = |va| (TmapField::GlobalAddress, None, va);
+    let dims = [
+        (TmapField::GlobalDim, Some(0), 4),
+        (TmapField::GlobalDim, Some(1), 2),
+        (TmapField::GlobalStride, Some(0), 2),
+        (TmapField::GlobalStrideUpper, None, 0),
+    ];
+    let with = |extra: &[(TmapField, Option<u8>, u64)], va| {
+        let mut v = vec![address(va)];
+        v.extend_from_slice(extra);
+        v
+    };
+    // In-window address (exactly 128 KiB remain, and 16 more), zero coordinates: accepted.
+    for va in [0x9000_0000_u64, 0x9000_0010] {
+        let mut d = base.clone();
+        d.apply_overrides(&with(&dims, va), &[0, 0], &accessible).unwrap();
+        assert_eq!(d.global_address, va);
+        assert_eq!(d.global_dim[..2], [4, 2]);
+    }
+    // 32 bytes too far: fewer than 128 KiB accessible.
+    let mut d = base.clone();
+    let err = d.apply_overrides(&with(&dims, 0x9000_0020), &[0, 0], &accessible).unwrap_err();
+    assert_eq!(err.kind, OpErrorKind::Invalid, "{err:?}");
+    assert!(err.to_string().contains("128 KiB"), "{err}");
+    // Address-only override: the window rule still applies.
+    let mut d = base.clone();
+    assert!(d.apply_overrides(&with(&[], 0x9000_0020), &[3, 1], &accessible).is_err());
+    // Address-only override with nonzero coordinates: allowed (no attribute override).
+    let mut d = base.clone();
+    d.apply_overrides(&with(&[], 0x9000_0000), &[3, 1], &accessible).unwrap();
+    // Dimension/stride override with a nonzero coordinate: rejected, either axis.
+    for coords in [[1, 0], [0, 1], [-1, 0]] {
+        let mut d = base.clone();
+        let err = d.apply_overrides(&with(&dims, 0x9000_0000), &coords, &accessible).unwrap_err();
+        assert_eq!(err.kind, OpErrorKind::Invalid, "{err:?}");
+        assert!(err.to_string().contains("zero coordinates"), "{err}");
+    }
+}

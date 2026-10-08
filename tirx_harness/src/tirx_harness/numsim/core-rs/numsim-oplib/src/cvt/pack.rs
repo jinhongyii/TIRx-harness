@@ -514,7 +514,7 @@ pub fn low_minmax(
     let sign = (lhs ^ rhs) & 0x8000;
     let prepare = |bits| {
         let bits = if ftz {
-            flush_subnormal_f16_bits(bits)
+            format.flush_subnormal(bits)
         } else {
             bits
         };

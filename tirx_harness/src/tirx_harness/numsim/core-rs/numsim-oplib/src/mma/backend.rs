@@ -1,4 +1,4 @@
-//! Dense matmul numeric cores and the pluggable `MatmulBackend`.
+//! Dense matmul numeric cores (increasing-K FMA chains).
 //!
 //! Legacy sources:
 //! - `engine-rs/src/runtime/tcgen_ops.rs`: `mma_f32_dot_increasing_k`,
@@ -265,53 +265,6 @@ pub fn narrow_i64_accumulator(values: Vec<i64>, saturate: bool) -> Vec<i32> {
         .collect()
 }
 
-/// A provider of the plain f32 product `C = A * B^T` (no input D).
-///
-/// `a` is row-major `[m, k]`, `b` is row-major `[n, k]`, `c` is row-major
-/// `[m, n]` and is overwritten. The only legacy call site is the typed
-/// canonical BF16 tile GEMM (`tile_gemm_bf16_f32_ss_cta1`, which is only
-/// emitted for `accumulate=false`). Every fused-D accumulation (mma.sync,
-/// raw tcgen05, banked) must call `mma_f32_abt_increasing_k` directly.
-pub trait MatmulBackend {
-    fn matmul_f32_abt(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-        a: &[f32],
-        b: &[f32],
-        c: &mut [f32],
-    ) -> OpResult<()>;
-}
-
-/// Pure-Rust backend: increasing-K binary32 FMA chain from +0.0. This is the
-/// legacy non-`python` build and the observed (checker) path.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReferenceBackend;
-
-impl MatmulBackend for ReferenceBackend {
-    fn matmul_f32_abt(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-        a: &[f32],
-        b: &[f32],
-        c: &mut [f32],
-    ) -> OpResult<()> {
-        let output = mma_f32_abt_increasing_k(m, n, k, a, b, None)?;
-        if c.len() != output.len() {
-            return Err(OpError::message(format!(
-                "matmul output has {} values, expected {}",
-                c.len(),
-                output.len()
-            )));
-        }
-        c.copy_from_slice(&output);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,24 +407,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(up[0], 1.0 + f64::EPSILON);
-    }
-
-    #[test]
-    fn reference_backend_is_the_increasing_k_product() {
-        let mut c = vec![f32::NAN; 1];
-        ReferenceBackend
-            .matmul_f32_abt(
-                1,
-                1,
-                3,
-                &[1.0, 1.0, 1.0],
-                &[16_777_216.0, 1.0, -16_777_216.0],
-                &mut c,
-            )
-            .unwrap();
-        assert_eq!(c[0], 0.0);
-        assert!(ReferenceBackend
-            .matmul_f32_abt(1, 1, 1, &[1.0], &[1.0], &mut [0.0; 2])
-            .is_err());
     }
 }

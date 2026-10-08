@@ -209,8 +209,19 @@ fn cuda_f64_minmax_match_nan_and_signed_zero_rules() {
     let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
     let nan_b = f64::from_bits(0xfff8_0000_0000_0002);
 
-    assert_eq!(cuda_f64_max(nan_a, nan_b).to_bits(), nan_b.to_bits());
-    assert_eq!(cuda_f64_min(nan_a, nan_b).to_bits(), nan_b.to_bits());
+    // Two NaNs: the canonical f64 NaN, as f32 gives 0x7fff_ffff.
+    assert_eq!(
+        cuda_f64_max(nan_a, nan_b).to_bits(),
+        CUDA_CANONICAL_NAN_F64_BITS
+    );
+    assert_eq!(
+        cuda_f64_min(nan_a, nan_b).to_bits(),
+        CUDA_CANONICAL_NAN_F64_BITS
+    );
+    assert_eq!(
+        cuda_f64_max(nan_b, nan_a).to_bits(),
+        CUDA_CANONICAL_NAN_F64_BITS
+    );
     assert_eq!(cuda_f64_max(nan_a, 3.0), 3.0);
     assert_eq!(cuda_f64_max(3.0, nan_a), 3.0);
     assert_eq!(cuda_f64_min(nan_a, -3.0), -3.0);
@@ -1209,4 +1220,96 @@ fn erf_exp10_log10_nearbyint_definitions() {
     }
     assert_eq!(log10_f64(-2.0).to_bits(), 0xfff8_0000_0000_0000);
     assert_eq!(nearbyint_f64(2.5), 2.0);
+}
+
+/// D8 pins for the operations that used to return whatever NaN the host made:
+/// a NaN operand comes back quieted with its payload and sign, an invalid
+/// operation gives the x86 default NaN, independent of libm and of casts.
+#[test]
+fn host_nan_results_are_pinned_per_d8() {
+    let snan = f32::from_bits(0xff80_1234); // signalling, negative, payload 0x1234
+    let quiet = 0xffc0_1234_u32;
+    let default = 0xffc0_0000_u32;
+    let bits = |v: f32| v.to_bits();
+    // Division: first NaN operand, else default.
+    assert_eq!(bits(div_f32_rn(snan, 2.0)), quiet);
+    assert_eq!(bits(div_f32_rn(2.0, snan)), quiet);
+    assert_eq!(
+        bits(div_f32_rn(f32::from_bits(0x7f80_0001), snan)),
+        0x7fc0_0001
+    );
+    assert_eq!(bits(div_f32_rn(0.0, 0.0)), default);
+    assert_eq!(bits(div_f32_rn(f32::INFINITY, f32::NEG_INFINITY)), default);
+    for mode in [
+        F32RoundingMode::Nearest,
+        F32RoundingMode::Zero,
+        F32RoundingMode::Down,
+        F32RoundingMode::Up,
+    ] {
+        assert_eq!(bits(ptx_div_f32(snan, 3.0, mode, false)), quiet);
+        assert_eq!(bits(ptx_div_f32(0.0, 0.0, mode, true)), default);
+        assert_eq!(bits(ptx_sqrt_f32(-1.0, mode, false)), default);
+        assert_eq!(bits(ptx_sqrt_f32(snan, mode, true)), quiet);
+        let d = div_f64(f64::from_bits(0x7ff0_0000_0000_0042), 1.0, mode);
+        assert_eq!(d.to_bits(), 0x7ff8_0000_0000_0042);
+        assert_eq!(div_f64(0.0, 0.0, mode).to_bits(), 0xfff8_0000_0000_0000);
+        assert_eq!(ptx_sqrt_f64(-4.0, mode).to_bits(), 0xfff8_0000_0000_0000);
+        assert_eq!(
+            ptx_sqrt_f64(f64::from_bits(0x7ff0_0000_0000_0042), mode).to_bits(),
+            0x7ff8_0000_0000_0042
+        );
+    }
+    // Approximations and libm-based representatives.
+    assert_eq!(bits(ptx_rcp_approx_f32(snan)), quiet);
+    assert_eq!(bits(ptx_rcp_approx_ftz_f32(snan)), quiet);
+    assert_eq!(bits(ptx_rsqrt_approx_f32(snan)), quiet);
+    assert_eq!(bits(ptx_rsqrt_approx_f32(-1.0)), default);
+    assert_eq!(bits(ptx_rsqrt_approx_ftz_f32(-1.0)), default);
+    assert_eq!(bits(ptx_exp2_approx_f32(snan)), quiet);
+    assert_eq!(bits(ptx_exp2_approx_ftz_f32(snan)), quiet);
+    assert_eq!(bits(ptx_sin_approx_f32(snan, false)), quiet);
+    assert_eq!(bits(ptx_sin_approx_f32(f32::INFINITY, true)), default);
+    assert_eq!(bits(ptx_cos_approx_f32(snan, true)), quiet);
+    assert_eq!(bits(ptx_cos_approx_f32(f32::NEG_INFINITY, false)), default);
+    assert_eq!(bits(ptx_lg2_approx_ftz_f32(snan)), quiet);
+    assert_eq!(bits(ptx_lg2_approx_ftz_f32(-2.0)), default);
+    assert_eq!(bits(ptx_tanh_approx_f32(snan)), quiet);
+    // A positive quiet NaN keeps its sign.
+    let positive = f32::from_bits(0x7fc0_0007);
+    assert_eq!(bits(ptx_tanh_approx_f32(positive)), 0x7fc0_0007);
+    assert_eq!(bits(ptx_sin_approx_f32(positive, false)), 0x7fc0_0007);
+}
+
+/// fp16/bf16 reduce max/min follow PTX default `max`/`min`: one NaN loses, two
+/// NaNs give the canonical NaN, and signed zeros order `-0 < +0` either way round.
+#[test]
+fn narrow_reduce_minmax_use_ptx_default_nan_and_zero_rules() {
+    let nan = f32::NAN;
+    // The canonical NaN in each format's f32 carrier: f16 0x7fff widens to the CUDA
+    // canonical f32 NaN, bf16 0x7fff to 0x7fff_0000.
+    for (max, min, canonical) in [
+        (
+            cuda_reduce_fp16_max as fn(f32, f32) -> f32,
+            cuda_reduce_fp16_min as fn(f32, f32) -> f32,
+            cuda_fp16_bits_to_f32(0x7fff).to_bits(),
+        ),
+        (
+            cuda_reduce_bf16_max,
+            cuda_reduce_bf16_min,
+            bf16_bits_to_f32(0x7fff).to_bits(),
+        ),
+    ] {
+        assert_eq!(max(nan, 2.0), 2.0);
+        assert_eq!(max(2.0, nan), 2.0);
+        assert_eq!(min(nan, -2.0), -2.0);
+        assert_eq!(min(-2.0, nan), -2.0);
+        assert_eq!(max(nan, nan).to_bits(), canonical);
+        assert_eq!(min(nan, nan).to_bits(), canonical);
+        assert_eq!(max(-0.0, 0.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(max(0.0, -0.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(min(0.0, -0.0).to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(min(-0.0, 0.0).to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(max(1.0, 3.0), 3.0);
+        assert_eq!(min(1.0, 3.0), 1.0);
+    }
 }

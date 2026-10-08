@@ -525,11 +525,11 @@ mod tests {
         );
         assert_eq!(
             f64::combine(CtaReduceOp::Max, nan_a, nan_b).to_bits(),
-            nan_b.to_bits()
+            crate::scalar::CUDA_CANONICAL_NAN_F64_BITS
         );
         assert_eq!(
             f64::combine(CtaReduceOp::Min, nan_a, nan_b).to_bits(),
-            nan_b.to_bits()
+            crate::scalar::CUDA_CANONICAL_NAN_F64_BITS
         );
     }
 

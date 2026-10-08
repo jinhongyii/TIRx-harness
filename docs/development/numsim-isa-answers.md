@@ -66,3 +66,19 @@ cannot be one TMA box, because TMA writes a dense box.
   ("TMA shared payload component 1 … must be 128-byte aligned").
 - v2 rejects it at transpile time instead. It still fails closed; only the
   phase differs.
+
+## Cluster size (open hardware limit)
+
+CUDA limits a thread-block cluster to 8 CTAs (portable) or 16 CTAs with the
+non-portable cluster-size opt-in on sm_90 and sm_100. A kernel declaring more
+cannot launch.
+
+- v2 keeps the legacy engine limit: more than 64 CTAs per cluster fails closed
+  at transpile (`topology: N CTAs per cluster, maximum 64`). The 16-CTA hardware
+  limit is **not** enforced.
+- Reason: 14 kernels in the lowering sweep use 20-CTA clusters, and legacy
+  accepted them. Enforcing the hardware limit needs a behaviour-delta row and a
+  test migration; that decision is deferred to after the legacy deletion
+  (coordinator ruling, 2026-10-08).
+- Threads per CTA: more than 1024 (32 warps) fails closed at transpile, which is
+  both the hardware limit and legacy's `warps_per_cta` maximum.

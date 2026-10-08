@@ -163,69 +163,6 @@ fn access_view_window_bounds_are_enforced() {
         .contains("exceeds selected shared view"));
 }
 
-#[test]
-fn tile_gemm_bf16_snapshot_decode_reverses_inner_swizzle() {
-    let rows = 8;
-    let columns = 64;
-    let logical = (0..rows * columns)
-        .map(|value| (value % 16) as f32)
-        .collect::<Vec<_>>();
-    let mut snapshot = vec![0_u8; logical.len() * 2];
-    for (unswizzled, value) in logical.iter().enumerate() {
-        let quotient = unswizzled >> 3;
-        let physical = ((quotient ^ ((quotient & 56) >> 3)) << 3) | (unswizzled & 7);
-        snapshot[physical * 2..physical * 2 + 2]
-            .copy_from_slice(&crate::cvt::f32_to_bf16_bits(*value).to_le_bytes());
-    }
-    assert_eq!(
-        decode_tile_gemm_bf16_snapshot(
-            &snapshot,
-            rows,
-            columns,
-            TileGemmBf16OperandLayout::new(64, 3, 56, 3)
-        )
-        .unwrap(),
-        logical
-    );
-}
-
-#[test]
-fn tile_gemm_bf16_snapshot_decode_reorders_column_atoms() {
-    let rows = 8;
-    let columns = 128;
-    let mut snapshot = vec![0_u8; rows * columns * 2];
-    let mut logical = vec![0.0_f32; rows * columns];
-    for row in 0..rows {
-        for column in 0..columns {
-            let unswizzled = (column / 64) * rows * 64 + row * 64 + column % 64;
-            let quotient = unswizzled >> 3;
-            let physical = ((quotient ^ ((quotient & 56) >> 3)) << 3) | (unswizzled & 7);
-            let value = ((row * columns + column) % 16) as f32;
-            logical[row * columns + column] = value;
-            snapshot[physical * 2..physical * 2 + 2]
-                .copy_from_slice(&crate::cvt::f32_to_bf16_bits(value).to_le_bytes());
-        }
-    }
-    let decoded = decode_tile_gemm_bf16_snapshot(
-        &snapshot,
-        rows,
-        columns,
-        TileGemmBf16OperandLayout::new(64, 3, 56, 3),
-    )
-    .unwrap();
-    assert_eq!(decoded, logical);
-}
-
-#[test]
-fn tile_gemm_fp8_swizzle_maps_a_non_power_of_two_row_count_bijectively() {
-    let mut physical =
-        tile_gemm_operand_physical_elements(120, 128, TileGemmOperandLayout::new(128, 4, 56, 3))
-            .unwrap();
-    assert_eq!(physical.len(), 120 * 128);
-    physical.sort_unstable();
-    assert_eq!(physical, (0..120 * 128).collect::<Vec<_>>());
-}
-
 /// Swizzle modes of the tcgen05 matrix descriptor (bits 61..63).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RefMode {

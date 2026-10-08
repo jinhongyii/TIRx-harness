@@ -27,7 +27,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Helper:
     roles: str
-    kind: str = "pure"          # pure | special
+    kind: str = "pure"  # pure | special
 
 
 def _p(roles: str = "a*") -> Helper:
@@ -128,22 +128,43 @@ HELPERS: dict[str, Helper] = {
 
 # tirx.* math ops lowered to ``Instr::Unary`` (``UnOp``).
 UNARY_OPS: dict[str, str] = {
-    "tirx.exp": "Exp", "tirx.exp2": "Exp2", "tirx.log": "Log", "tirx.log2": "Log2", "prim.log2": "Log2",
-    "tirx.sqrt": "Sqrt", "tirx.rsqrt": "Rsqrt", "tirx.fabs": "Abs", "tirx.sin": "Sin", "tirx.cos": "Cos",
-    "tirx.tanh": "Tanh", "tirx.popcount": "Popcount", "tirx.clz": "Clz", "tirx.floor": "Floor",
-    "tirx.ceil": "Ceil", "tirx.round": "Round", "tirx.trunc": "Trunc", "tirx.isnan": "IsNan",
-    "tirx.isinf": "IsInf", "tirx.isfinite": "IsFinite",
+    "tirx.exp": "Exp",
+    "tirx.exp2": "Exp2",
+    "tirx.log": "Log",
+    "prim.log2": "Log2",
+    "tirx.sqrt": "Sqrt",
+    "tirx.rsqrt": "Rsqrt",
+    "tirx.fabs": "Abs",
+    "tirx.sin": "Sin",
+    "tirx.cos": "Cos",
+    "tirx.tanh": "Tanh",
+    "tirx.popcount": "Popcount",
+    "prim.clz": "Clz",
+    "tirx.floor": "Floor",
+    "prim.ceil": "Ceil",
+    "tirx.round": "Round",
+    "tirx.trunc": "Trunc",
+    "tirx.isnan": "IsNan",
+    "tirx.isinf": "IsInf",
+    "tirx.isfinite": "IsFinite",
 }
 
 # CUDA helpers recognized by name and normalized-source hash (legacy
-# emit/cuda_helper.rs). Pure ones become ``Ptx`` ops; effectful ones must be
-# lowered to primitives (not done yet: they fail closed).
+# emit/cuda_helper.rs). Pure ones become ``Ptx`` ops; any other helper is not
+# modeled and fails closed.
 PURE_FUNC_CALLS = frozenset(
     {
-        "gdn_lg2_approx_ftz", "flashkda_rsqrtf", "flashkda_tanh_approx", "flashkda_fmaf_rn",
-        "tvm_builtin_fma_scale_sub_f32x2", "combine_int_frac_ex2", "shl_u32_clamp",
-        "smem_desc_add_16B_offset", "tvm_builtin_cast_float32x2_float16x2",
-        "tvm_builtin_cast_float16x2_float32x2", "tvm_builtin_smem_desc_add_16B_offset",
+        "gdn_lg2_approx_ftz",
+        "flashkda_rsqrtf",
+        "flashkda_tanh_approx",
+        "flashkda_fmaf_rn",
+        "tvm_builtin_fma_scale_sub_f32x2",
+        "combine_int_frac_ex2",
+        "shl_u32_clamp",
+        "smem_desc_add_16B_offset",
+        "tvm_builtin_cast_float32x2_float16x2",
+        "tvm_builtin_cast_float16x2_float32x2",
+        "tvm_builtin_smem_desc_add_16B_offset",
     }
 )
 
@@ -154,22 +175,54 @@ PURE_FUNC_CALLS = frozenset(
 # helper whose body or signature differs is not the reviewed one and fails
 # closed with the legacy reason.
 REVIEWED_HELPERS: dict[str, tuple[str, tuple[str, ...], str, str]] = {
-    "combine_int_frac_ex2": ("4b134dcd27e35d98", ("float32", "float32"), "float32",
-                             "validated bit-composition implementation"),
-    "flashkda_fmaf_rn": ("f8e53464d3e437cc", ("float32", "float32", "float32"), "float32",
-                         "validated fused round-to-nearest float32 implementation"),
-    "flashkda_rsqrtf": ("3c5001e580bc296a", ("float32",), "float32",
-                        "validated float32 reciprocal-square-root implementation"),
-    "flashkda_tanh_approx": ("571e03c6d4d0c042", ("float32",), "float32",
-                             "validated tanh.approx.f32 implementation"),
-    "gdn_lg2_approx_ftz": ("cb5de3ec432d0b59", ("float32",), "float32",
-                           "validated lg2.approx.ftz.f32 implementation"),
-    "shl_u32_clamp": ("4e9357a6d632e267", ("uint32", "uint32"), "uint32",
-                      "validated PTX clamping-shift implementation"),
-    "tvm_builtin_fma_scale_sub_f32x2": ("ee5c4b843f718df3", ("uint64", "uint64", "uint64"), "uint64",
-                                        "validated packed float32 FMA implementation"),
-    "tvm_builtin_smem_desc_add_16B_offset": ("58c07995af0dadea", (), "",
-                                             "validated low-32-bit wrapping descriptor offset"),
+    "combine_int_frac_ex2": (
+        "4b134dcd27e35d98",
+        ("float32", "float32"),
+        "float32",
+        "validated bit-composition implementation",
+    ),
+    "flashkda_fmaf_rn": (
+        "f8e53464d3e437cc",
+        ("float32", "float32", "float32"),
+        "float32",
+        "validated fused round-to-nearest float32 implementation",
+    ),
+    "flashkda_rsqrtf": (
+        "3c5001e580bc296a",
+        ("float32",),
+        "float32",
+        "validated float32 reciprocal-square-root implementation",
+    ),
+    "flashkda_tanh_approx": (
+        "571e03c6d4d0c042",
+        ("float32",),
+        "float32",
+        "validated tanh.approx.f32 implementation",
+    ),
+    "gdn_lg2_approx_ftz": (
+        "cb5de3ec432d0b59",
+        ("float32",),
+        "float32",
+        "validated lg2.approx.ftz.f32 implementation",
+    ),
+    "shl_u32_clamp": (
+        "4e9357a6d632e267",
+        ("uint32", "uint32"),
+        "uint32",
+        "validated PTX clamping-shift implementation",
+    ),
+    "tvm_builtin_fma_scale_sub_f32x2": (
+        "ee5c4b843f718df3",
+        ("uint64", "uint64", "uint64"),
+        "uint64",
+        "validated packed float32 FMA implementation",
+    ),
+    "tvm_builtin_smem_desc_add_16B_offset": (
+        "58c07995af0dadea",
+        (),
+        "",
+        "validated low-32-bit wrapping descriptor offset",
+    ),
 }
 
 
@@ -180,4 +233,4 @@ def role(roles: str, position: int) -> str:
     return roles[position] if position < len(roles) else "?"
 
 
-__all__ = ["HELPERS", "Helper", "PURE_FUNC_CALLS", "REVIEWED_HELPERS", "UNARY_OPS", "role"]
+__all__ = ["HELPERS", "PURE_FUNC_CALLS", "REVIEWED_HELPERS", "UNARY_OPS", "Helper", "role"]

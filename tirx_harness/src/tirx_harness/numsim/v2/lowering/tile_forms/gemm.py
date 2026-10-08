@@ -10,5 +10,5 @@ if TYPE_CHECKING:
     from ..ir_walk import Lowerer
 
 
-def lower(call: Any, ctx: "Lowerer") -> None:
+def lower(call: Any, ctx: Lowerer) -> None:
     unported(call, "gemm")

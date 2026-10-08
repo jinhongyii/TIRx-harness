@@ -4,11 +4,16 @@ orphan: true
 
 # Lowering: TIRx inventory and `Program` design (W1)
 
-Status: draft, 2026-10-07, branch `refactor/clean-core`. This is the W1 input to
-[`numsim-redesign.md`](numsim-redesign.md), covering §2.1 (Lowering), §2.2
-(`Program`), §4.1 (W1) and §6 (the tile-form/layout risk). The skeleton lives in
-`tirx_harness/src/tirx_harness/numsim/v2/lowering/`. Its tests are in
-`tirx_harness/tests/numsim/v2/test_lowering_vector_add.py`.
+Status: implemented (2026-10-08, branch `refactor/clean-core`). The lowering
+lives in `tirx_harness/src/tirx_harness/numsim/v2/lowering/` (its `README.md`
+has the pipeline and invariants); its tests are
+`tirx_harness/tests/numsim/v2/test_lowering_*.py`. Corpus sweep
+(`scripts/numsim-v2/lower_sweep.py`, all 2343 captured kernels): 2231 lower
+with no `Unsupported`, 0 lowering exceptions, 2341 Modules validate in Rust.
+The remaining residuals are Part F; tile forms are Part G; B.0 maps each op
+family to its function. Parts A–E keep the original inventory, design and
+phase notes, updated where the code changed. This was the W1 input to
+[`numsim-redesign.md`](numsim-redesign.md) (§2.1, §2.2, §4.1, §6).
 
 The contract crate `core-rs/numsim-core` is not final. Anything this document
 asks of it is listed in [§B.13](#b13-what-the-contract-needs-that-the-sketch-lacks).
@@ -506,14 +511,58 @@ Python, so the new lowering needs **no native helper**:
 
 ## Part B: Design
 
+### B.0 Op family map (final code)
+
+Paths are under `numsim/v2/lowering/`. "`call_X`" is the `CallsMixin` handler
+`calls.py:call_X` (dispatch: the op name with `.` → `_`); "`stmt_X`" is
+`ir_walk.py:Lowerer.stmt_X`.
+
+| op family | lowered by |
+| --- | --- |
+| statements (`SeqStmt`, `Bind`, `IfThenElse`, `For`, `While`, `Break`/`Continue`/`Return`, `AssertStmt`, `Evaluate`) | `ir_walk.py:stmt_tirx_*` |
+| `AttrStmt` (thread extents, `numsim.tile_op` markers, ignored attrs) | `ir_walk.py:stmt_tirx_AttrStmt`, `single_issuer_check` |
+| scope ids and launch topology | `ir_walk.py:collect_topology`, `stmt_tirx_ScopeIdDefStmt`, `scope_flat_id`, `thread_extent_topology` |
+| expressions, casts, constants, vector pack/unpack | `ir_walk.py:expr`, `binary`, `cast_to`, `convert`, `pack`, `unpack` |
+| half-precision expression chains | `ir_walk.py:half_chain` |
+| unary math (`tirx.exp`…, `prim.log2`, `prim.clz`, `prim.ceil`) | `calls.py:call` via `builtins.UNARY_OPS` |
+| pure helpers with operand roles | `calls.py:pure_helper` via `builtins.HELPERS` |
+| `prim.if_then_else`, `prim.likely`, `tirx.fma`, `tirx.reinterpret` | `call_prim_if_then_else`, `call_prim_likely`, `call_tirx_fma`, `call_tirx_reinterpret` |
+| allocations, views, TMEM views, shared pool layout, capacity | `memory.py:declare_alloc`, `declare_view`, `declare_tmem_view`, `finish_shared`; `ir_walk.py:finish` |
+| buffer loads/stores, layouts, swizzles, register ownership asserts | `memory.py:load`, `store`, `flat_offset`, `apply_layout`, `apply_tmem_layout` |
+| local promotion, escape analysis, uninitialized reads | `memory.py:promotable_locals`, `escaped_locals`; `uninit.py:maybe_uninit_locals` |
+| PTX destinations (lvalues) | `memory.py:lvalue_target`; `ptx_lower.py:PtxCtx.dst` / `dst_reg` |
+| pointers (`address_of`, `buffer_data`, `tvm_access_ptr`, byte offsets, `cvta`) | `call_tirx_address_of` … `call_tirx_cuda_cvta_generic_to_shared`; `calls.py:pointer_offset` |
+| special registers, clocks, `mov_sreg` | `calls.py:read_special`, `call_tirx_cuda_mov_sreg`, `call_tirx_cuda_clock64` |
+| barriers and syncs (`cta_sync`, `warp_sync`, `cluster_sync`, `grid_sync`, `syncthreads_and/or`) | `calls.py:barrier`, `syncthreads_red`, `call_tirx_cuda_*_sync` |
+| mbarrier waits from CUDA helpers | `calls.py:mbar_wait`, `call_tirx_cuda_mbarrier_wait*` |
+| `wait_until` predicate programs | `calls.py:call_tirx_cuda_wait_until`, `lower_predicate` |
+| shuffles, votes, warp/CTA reductions | `calls.py:shfl`, `vote`, `redux`, `butterfly`, `call_tirx_cuda_warp_reduce`, `call_tirx_cuda_cta_reduce` |
+| `cuda.ldg`, `s_tir.ldg32`, atomics | `call_tirx_cuda_ldg`, `call_tirx_s_tir_ldg32`, `calls.py:atomic` |
+| `mma_fill` / `mma_store` (and `_legacy`), pair casts | `call_tirx_mma_fill`, `call_tirx_mma_store`, `call_tirx_cuda_float22half2` … |
+| `cuda.func_call` helpers (reviewed bodies) | `call_tirx_cuda_func_call`, `check_reviewed_helper`, `single_asm_helper`, `pair_cast_helper`, `smem_desc_make_lo_uniform` |
+| `tirx.ptx.*` table ops | `ptx_decode.py:decode` → `ptx_lower.py:lower_ptx` → `handler_for` (`_EXACT`, `_PREFIX`, else `lower_generic`) |
+| ld/st, atom/red, cvta, mapa, ldmatrix/stmatrix | `ptx_lower.py:lower_ld`, `lower_st`, `lower_atom`, `lower_cvta`, `lower_mapa`, `lower_ldmatrix`, `lower_stmatrix` |
+| TMA, bulk copies, cp.async, tensormap | `ptx_lower.py:lower_tma`, `lower_bulk_copy`, `lower_bulk_prefetch`, `lower_cp_async`, `lower_tensormap_replace`, `lower_tensormap_cp_fence` |
+| bar/barrier, fence, mbarrier | `ptx_lower.py:lower_bar`, `lower_fence`, `lower_mbarrier`, `lower_cluster_barrier` |
+| shfl/vote/redux/elect/activemask (PTX forms) | `ptx_lower.py:lower_shfl`, `lower_vote`, `lower_redux`, `lower_elect`, `lower_activemask` |
+| tcgen05 (alloc, ld/st, cp, mma, commit, fences) | `ptx_lower.py:lower_tcgen05`, `lower_tcgen05_mma` |
+| spdecompress register disjointness | `ptx_lower.py:_check_distinct_registers`, `emit_register_checks` |
+| PTX ops rejected for SM100 (`wgmma`, `multimem`, `fabric`) | `ptx_lower.py:REJECTED` |
+| host prelude, params, `DimExpr`, TensorMap encode | `host_prelude.py:split_prelude`, `bind_params`, `read_params`, `dim_expr`, `encode_tensor_map` |
+| `tirx.tile.*` | `ir_walk.py:_dispatch_tile_primitives` (TVM `TilePrimitiveDispatch` first), `tile_forms/` for ops TVM rejects, `owner_transport.py` for cross-owner element-wise ops; see Part G |
+| legacy tile rules TVM does not enforce | `tile_checks.py:tile_rejection` |
+| Program assembly, schema check, JSON | `program_builder.py:ProgramBuilder`, `Instr`, `SCHEMA`, `Module.to_json` |
+
 ### B.1 Pipeline
 
 ```text
-PrimFunc ──normalize_host_prelude──► PrimFunc'  (port host_prelude.rs to Python, accepting
-                                                  the Evaluate(tensormap_encode_tiled) form)
-        ──pre-pass──► topology, buffer/backing plan, local-array promotion set,
-                      elect taint, unsupported list (collect, don't stop)
+PrimFunc ──source walk──► user-vectorized loops (ir_walk.lower)
+        ──tile dispatch──► TVM TilePrimitiveDispatch; rejected ops → tile_forms placeholders;
+                           cross-owner element-wise functions → owner_transport
+                           (ir_walk._dispatch_tile_primitives)
+        ──pre-pass──► host prelude split, escaped/promotable locals, uninit locals, topology
         ──walk──► Program (code, consts, sites, layouts, regs, buffers, host_abi, topology)
+        ──finish──► shared pool bases and sizes, per-CTA capacity, requirements, wait_until predicates
         ──strict?──► raise LoweringUnsupported(all reasons)  |  keep Unsupported instrs
 ```
 
@@ -571,8 +620,7 @@ fields plus five more:
 
   - Proposed: **do not unroll `T.unroll` loops in the lowering.** Indexed
     register access is exact, and unrolling 2425 loops multiplies `code` and
-    sites by the trip counts. An optional later pass can unroll for the
-    codegen backend.
+    sites by the trip counts.
 - **Local arrays used through `address_of`.** If a local array's address
   escapes (`address_of(local[i])` passed as a `ptr` operand), the array is
   *not* promoted. It gets a per-lane `Local` backing instead
@@ -582,8 +630,7 @@ fields plus five more:
 - **Uniformity** is a static hint (`RegDecl.uniform`). It is true when every
   write is provably warp-uniform. The sources are scope ids for
   cluster/CTA/warp/warpgroup, constants, and uniform loop bounds. The engine
-  must be correct when it ignores the hint. The codegen backend may use it to
-  store a scalar.
+  must be correct when it ignores the hint.
 - **Wide and vector dtypes:**
   - `uint128`, `float16x2`, `uint32x4`, and so on are register dtypes whose
     lane payload is wider than 64 bits.
@@ -761,33 +808,20 @@ There are two address forms.
 
 ### B.7 Tile ops
 
-The corpus barely uses tile ops (B.0). They should land *after* the corpus
-works on raw PTX, and the frontend-rs `tile_forms` logic should not be
-re-derived. Use TVM's own production dispatch instead:
+Final design (amended Decision 6; details in Part G):
 
-- Run `tirx.transform.TilePrimitiveDispatch` / `LowerTIRxOpaque` *only on the
-  tile-op subtrees*. The tcgen05.cp plan already comes from TVM
-  `_build_plan`. This yields raw PTX-level IR that the normal path lowers.
-  Then the simulated semantics are, by construction, the semantics of the code
-  that runs on the GPU. Today they are a parallel reimplementation (§6 risk).
-- If dispatch output is too low-level (for example, it loses
-  `copy_async`/`gemm_async` as one async op that racecheck must see as one
-  footprint), fall back to an element-map instruction:
-
-  ```
-  TileOp { kind, dst: Region, srcs: [Region…], map: LayoutId, scalars, site }
-  TileLayout { buffer, lanes, slots, entries[lane][slot] -> elem offset | -1 }
-  ```
-
-  - The table is computed at lowering time with
-    `Layout.canonicalize().apply_with_shape(...)`, the same call the legacy
-    `emit/layout.rs` makes, when the region mins are static.
-  - When they are dynamic, it uses a base-offset register plus a static table
-    of relative offsets.
-  - Tables are deduplicated by content in `Program.layouts`.
-
-Recommendation: try dispatch first (Q6). Measure on the 401 unit-test tile
-kernels against the legacy goldens.
+- `tirx.transform.TilePrimitiveDispatch` runs on the whole function first
+  (`ir_walk._dispatch_tile_primitives`), so a tile op simulates the code TVM
+  emits for the GPU.
+- An op TVM rejects is swapped for a `numsim_v2_tile_form` placeholder and
+  lowered by the legacy-equivalent form in `tile_forms/` (copy, cast/add,
+  fill, reductions, permute, `copy_async`, `gemm_async`). TVM's single-thread
+  copy fallback on register operands is rerouted there too (delta F4).
+- Element-wise ops that move values between register-fragment owners are
+  lowered by `owner_transport.py` (shared scratch transport); TVM has no form
+  for them.
+- Legacy fail-closed rules TVM does not enforce run first
+  (`tile_checks.tile_rejection`).
 
 ### B.8 `wait_until` predicates
 
@@ -1034,13 +1068,13 @@ fact.
 
 | item | why |
 | --- | --- |
-| `Program.regs: Vec<RegDecl{dtype, uniform}>` | `[T;32]` registers have a static dtype; the codegen backend needs it for monomorphic handlers |
+| `Program.regs: Vec<RegDecl{dtype, uniform}>` | `[T;32]` registers have a static dtype; handlers are monomorphic over it |
 | `Program.buffers: Vec<BufferDecl{name, space, dtype, shape, strides, param_slot, base, byte_len, align, view_of}>` | buffer-relative accesses, shared pool layout and views, exact OOB, racecheck `(alloc, range)` |
 | `Program.arch` | tcgen descriptor variants (sm_100/103/107) and arch-gated ops |
 | `Program.requirements` / flags | `implicit_tmem`, `dynamic_tmem_lifecycle`, `readonly_proxy`, `grid_dependency`, `raw_tensor_map_registry` |
 | `Program.preds: Vec<PredProgram>` | `wait_until` sub-programs (B.8) |
 | `Program.ops: Vec<OpKey{op_name, mods}>` | the generic `Ptx` variant's op table, interned |
-| `Operand = Reg(u32) \| Const(u32)` | avoids `Mov`-from-immediate and keeps consts foldable by codegen |
+| `Operand = Reg(u32) \| Const(u32)` | avoids `Mov`-from-immediate and keeps consts foldable |
 | `Scalar{dtype, bits: u64}` plus 128-bit and vector-lane dtypes | `uint128`, `float16x2`, `uint32x4`, … (Q4) |
 | `SpecialReg` enum + `ReadSpecial` | lane, warp, thread, CTA, cluster ids |
 | `ReadParam { dst, slot }` | scalar params |
@@ -1111,18 +1145,23 @@ validates each module in Rust: 131 cases.
 
 ### C.2 Modules
 
-All modules live in `numsim/v2/lowering/`; each is under 900 lines.
+All modules live in `numsim/v2/lowering/`. Its `README.md` has the pipeline
+and invariants; B.0 maps each op family to its function.
 
 | module | role |
 | --- | --- |
 | `program_builder.py` | contract mirror: `Instr(variant, **fields)` checked against a per-variant `SCHEMA`; the tables; `Module` JSON |
-| `ir_walk.py` | statements, expressions, topology, control flow, `thread_extent`, tile dispatch |
-| `memory.py` | register promotion and escape analysis; shared pool and views; layouts and swizzles; lvalues |
+| `ir_walk.py` | `lower` / `lower_module`; statements, expressions, topology, control flow, tile dispatch |
+| `memory.py` | register promotion and escape analysis; shared pool and views; TMEM views; layouts and swizzles; lvalues |
 | `host_prelude.py` | parameters, implicit shape variables, host TensorMap prelude, `DimExpr` |
-| `calls.py` | CUDA helpers, pointer plumbing, `wait_until` predicate programs |
+| `calls.py` | CUDA builtins and helpers, pointer plumbing, `wait_until` predicate programs |
 | `ptx_lower.py` | `tirx.ptx.*` table ops mapped to dedicated variants; pure tail to `Ptx` |
 | `ptx_decode.py` | pure-Python decoder for the TVM PTX table |
-| `builtins.py` | helper operand roles |
+| `builtins.py` | unary ops, helper operand roles, reviewed `cuda.func_call` helpers |
+| `uninit.py` | locals that may be read before written (kept in tracked memory) |
+| `tile_checks.py` | legacy tile fail-closed rules |
+| `tile_forms/` | v2 tile forms for ops TVM's dispatch rejects (Part G) |
+| `owner_transport.py` | element-wise tile ops across register-fragment owners |
 | `dtypes.py` | dtype helpers |
 
 ### C.3 Conventions the contract does not spell out

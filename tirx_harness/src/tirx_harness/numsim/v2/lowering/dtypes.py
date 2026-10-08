@@ -8,13 +8,35 @@ from functools import cache
 from typing import Any
 
 _SCALAR_BITS = {
-    "bool": 8, "int8": 8, "uint8": 8, "int16": 16, "uint16": 16, "int32": 32,
-    "uint32": 32, "int64": 64, "uint64": 64, "uint128": 128, "int128": 128,
-    "float16": 16, "bfloat16": 16, "float32": 32, "float64": 64,
-    "float8_e4m3fn": 8, "float8_e5m2": 8, "float8_e8m0fnu": 8, "float8_e3m4": 8,
-    "float8_e4m3": 8, "float8_e4m3fnuz": 8, "float8_e5m2fnuz": 8,
-    "float6_e2m3fn": 6, "float6_e3m2fn": 6, "float4_e2m1fn": 4,
-    "uint6": 6, "tf32": 32, "handle": 64, "float8_e4m3b11fnuz": 8,
+    "bool": 8,
+    "int8": 8,
+    "uint8": 8,
+    "int16": 16,
+    "uint16": 16,
+    "int32": 32,
+    "uint32": 32,
+    "int64": 64,
+    "uint64": 64,
+    "uint128": 128,
+    "int128": 128,
+    "float16": 16,
+    "bfloat16": 16,
+    "float32": 32,
+    "float64": 64,
+    "float8_e4m3fn": 8,
+    "float8_e5m2": 8,
+    "float8_e8m0fnu": 8,
+    "float8_e3m4": 8,
+    "float8_e4m3": 8,
+    "float8_e4m3fnuz": 8,
+    "float8_e5m2fnuz": 8,
+    "float6_e2m3fn": 6,
+    "float6_e3m2fn": 6,
+    "float4_e2m1fn": 4,
+    "uint6": 6,
+    "tf32": 32,
+    "handle": 64,
+    "float8_e4m3b11fnuz": 8,
 }
 
 _VECTOR = re.compile(r"^(.*?)x(\d+)$")
@@ -77,18 +99,20 @@ def dtype_of(node: Any) -> str:
 
 def _float_bits(element: str, value: float) -> int:
     if element == "float32":
-        return struct.unpack("<I", struct.pack("<f", value))[0]
+        return int(struct.unpack("<I", struct.pack("<f", value))[0])
     if element == "float64":
-        return struct.unpack("<Q", struct.pack("<d", value))[0]
+        return int(struct.unpack("<Q", struct.pack("<d", value))[0])
     if element == "float16":
-        return struct.unpack("<H", struct.pack("<e", value))[0]
+        return int(struct.unpack("<H", struct.pack("<e", value))[0])
     import ml_dtypes
     import numpy as np
 
     scalar = getattr(ml_dtypes, element, None)
     if scalar is None:
         raise ValueError(f"constant of dtype {element} is not encodable")
-    raw = np.array([value], dtype=scalar).view(np.uint8 if np.dtype(scalar).itemsize == 1 else np.uint16)
+    raw = np.array([value], dtype=scalar).view(
+        np.uint8 if np.dtype(scalar).itemsize == 1 else np.uint16
+    )
     return int(raw[0]) & ((1 << _SCALAR_BITS[element]) - 1)
 
 

@@ -314,7 +314,4 @@ pub(crate) const BINDINGS: &[Binding] = &[
         "tirx.ptx.tcgen05_mma_sp_block_scale_collector_ab_ts",
         "tcgen05::mma::sparse_float_mma",
     ),
-    // tile-level GEMM (canonical BF16 CTA1 path)
-    b("tirx.tile.gemm", "tcgen05::mma::tile_gemm_bf16_f32"),
-    b("tirx.tile.gemm_async", "tcgen05::mma::tile_gemm_bf16_f32"),
 ];

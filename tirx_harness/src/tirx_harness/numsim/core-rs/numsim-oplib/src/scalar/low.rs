@@ -48,6 +48,34 @@ impl LowPrecisionFormat {
         }
     }
 
+    /// Raw bits of `+1.0` in this format (f16 `0x3c00`, bf16 `0x3f80`): the
+    /// `.sat` upper clamp.
+    pub const fn one(self) -> u16 {
+        match self {
+            Self::F16 => 0x3c00,
+            Self::Bf16 => 0x3f80,
+        }
+    }
+
+    /// True for a subnormal encoding of this format (zero exponent field,
+    /// nonzero fraction). No numerics: a pure bit test.
+    pub const fn is_subnormal(self, bits: u16) -> bool {
+        let fraction = (1_u16 << self.fraction_bits()) - 1;
+        bits & self.infinity() == 0 && bits & fraction != 0
+    }
+
+    /// FTZ of raw bits in this format: a subnormal becomes the zero of the same
+    /// sign; every other encoding (zeros, normals, inf, NaN with its payload) is
+    /// returned unchanged. The format decides the subnormal test, so f16 and
+    /// bf16 bits cannot be flushed with the other format's rule.
+    pub const fn flush_subnormal(self, bits: u16) -> u16 {
+        if self.is_subnormal(bits) {
+            bits & 0x8000
+        } else {
+            bits
+        }
+    }
+
     pub(crate) fn encode_host_result(self, value: f32) -> u16 {
         match self {
             Self::F16 => cuda_f32_to_fp16_bits(value),
@@ -166,8 +194,8 @@ pub fn decode_low(bits: u16, format: LowPrecisionFormat) -> f32 {
 
 /// PTX `add/sub.rn{.ftz}` on one f16/bf16 payload: exact sum rounded once to the
 /// target format (RN-even, overflow to inf). Any NaN result is canonical `0x7fff`.
-/// `ftz` flushes subnormal inputs (f16 encoding test) and results tiny before
-/// rounding; PTX defines `.ftz` for f16 only, so callers must pass `false` for bf16.
+/// `ftz` flushes subnormal inputs and results tiny before rounding, using
+/// `format`'s own subnormal test ([`LowPrecisionFormat::flush_subnormal`]).
 pub fn low_add_rn(
     lhs: u16,
     rhs: u16,
@@ -176,7 +204,7 @@ pub fn low_add_rn(
     ftz: bool,
 ) -> u16 {
     let (lhs, rhs) = if ftz {
-        (flush_subnormal_f16_bits(lhs), flush_subnormal_f16_bits(rhs))
+        (format.flush_subnormal(lhs), format.flush_subnormal(rhs))
     } else {
         (lhs, rhs)
     };
@@ -196,13 +224,13 @@ pub fn low_add_rn(
 
 /// PTX `fma.rn{.ftz}` on one f16/bf16 payload: exact `lhs*rhs+addend` rounded once
 /// (RN-even, overflow to inf); NaN result canonical `0x7fff`. `ftz` as in
-/// [`low_add_rn`] (f16 only).
+/// [`low_add_rn`] (format-aware subnormal test).
 pub fn low_fma_rn(lhs: u16, rhs: u16, addend: u16, format: LowPrecisionFormat, ftz: bool) -> u16 {
     let (lhs, rhs, addend) = if ftz {
         (
-            flush_subnormal_f16_bits(lhs),
-            flush_subnormal_f16_bits(rhs),
-            flush_subnormal_f16_bits(addend),
+            format.flush_subnormal(lhs),
+            format.flush_subnormal(rhs),
+            format.flush_subnormal(addend),
         )
     } else {
         (lhs, rhs, addend)

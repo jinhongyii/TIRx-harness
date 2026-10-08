@@ -171,10 +171,11 @@ mod tests {
         assert_eq!(maximum[1].to_bits(), 0.0_f64.to_bits());
         assert_eq!(minimum[0].to_bits(), (-0.0_f64).to_bits());
         assert_eq!(minimum[1].to_bits(), (-0.0_f64).to_bits());
-        assert_eq!(maximum[4].to_bits(), nan_b.to_bits());
-        assert_eq!(maximum[5].to_bits(), nan_a.to_bits());
-        assert_eq!(minimum[4].to_bits(), nan_b.to_bits());
-        assert_eq!(minimum[5].to_bits(), nan_a.to_bits());
+        use crate::scalar::CUDA_CANONICAL_NAN_F64_BITS;
+        assert_eq!(maximum[4].to_bits(), CUDA_CANONICAL_NAN_F64_BITS);
+        assert_eq!(maximum[5].to_bits(), CUDA_CANONICAL_NAN_F64_BITS);
+        assert_eq!(minimum[4].to_bits(), CUDA_CANONICAL_NAN_F64_BITS);
+        assert_eq!(minimum[5].to_bits(), CUDA_CANONICAL_NAN_F64_BITS);
     }
 
     #[test]

@@ -21,14 +21,9 @@ from tvm.tirx.layout import S, TCol, TileLayout, TLane
 
 from tirx_harness.numsim import v2
 
-from ._runnable import assert_clean, assert_no_incomplete, kinds_of, requires_v2_engine, v2_gap
+from ._runnable import assert_clean, assert_no_incomplete, kinds_of, requires_v2_engine
 
 pytestmark = requires_v2_engine
-
-_TMEM_NUMERIC_GAP = v2_gap(
-    "numerics fixed (V2C-24); racecheck reports alias_stale_read for a TMEM view of the same "
-    "bytes (view gets its own logical identity): CONTRACT_REQUESTS W12-gaps 5 (W1)"
-)
 
 _TMEM_LAYOUT = TileLayout(S[(128, 4) : (1 @ TLane, 1 @ TCol)])
 _TMEM_WIDE_LAYOUT = TileLayout(S[(128, 8) : (1 @ TLane, 1 @ TCol)])
@@ -195,7 +190,6 @@ def test_explicit_view_keeps_one_logical_identity():
     assert_clean(v2.racecheck(native_explicit_view_provenance, {"output": np.zeros(1, dtype=np.int32)}))
 
 
-@_TMEM_NUMERIC_GAP
 def test_tmem_view_keeps_one_logical_identity():
     """Replaces ``tests/analysis_tools/racecheck/test_native_alias_advisory.py::test_public_native_tmem_view_keeps_one_logical_identity``.
 
@@ -205,14 +199,12 @@ def test_tmem_view_keeps_one_logical_identity():
     _assert_numeric_then_clean(native_tmem_view_provenance)
 
 
-@_TMEM_NUMERIC_GAP
 def test_partitioned_tmem_views_keep_one_logical_identity():
     """Replaces ``tests/analysis_tools/racecheck/test_native_alias_advisory.py::test_public_native_partitioned_tmem_views_keep_one_logical_identity``."""
 
     _assert_numeric_then_clean(native_tmem_partitioned_view_provenance)
 
 
-@_TMEM_NUMERIC_GAP
 def test_full_extent_tmem_subview_keeps_one_logical_identity():
     """Replaces ``tests/analysis_tools/racecheck/test_native_alias_advisory.py::test_public_native_full_extent_tmem_subview_keeps_one_logical_identity``."""
 

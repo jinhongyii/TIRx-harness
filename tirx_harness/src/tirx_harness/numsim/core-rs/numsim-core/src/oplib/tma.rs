@@ -450,12 +450,26 @@ pub(super) fn replace(
     Ok(())
 }
 
-/// Per-instruction overrides (legacy `override_tensor_map`).
-pub(super) fn apply_overrides(desc: &mut TensorMapDesc, overrides: &[(TmapField, Option<u8>, u64)]) -> OpResult {
+/// Bytes a TMA `.override::global_address` operand must have accessible from
+/// it (legacy `with_overrides`: "requires 128 KiB of accessible memory").
+pub(super) const TMA_OVERRIDE_WINDOW_BYTES: u64 = 128 * 1024;
+
+/// Per-instruction overrides (legacy `override_tensor_map` + `with_overrides`).
+pub(super) fn apply_overrides(
+    desc: &mut TensorMapDesc,
+    overrides: &[(TmapField, Option<u8>, u64)],
+    coords: &[i64],
+    accessible: &dyn Fn(u64, u64) -> bool,
+) -> OpResult {
     let mut dims: Vec<(u8, u64)> = Vec::new();
     let mut lowers: Vec<(u8, u64)> = Vec::new();
     let mut upper: Option<u64> = None;
     for &(field, ord, value) in overrides {
+        if field == TmapField::GlobalAddress && !accessible(value, TMA_OVERRIDE_WINDOW_BYTES) {
+            return Err(OpError::invalid(format!(
+                "TMA override address {value:#x} requires 128 KiB of accessible memory"
+            )));
+        }
         match field {
             TmapField::GlobalDim => dims.push((ord.ok_or_else(|| OpError::invalid("GlobalDim override needs an ordinal"))?, value)),
             TmapField::GlobalStride => {
@@ -483,6 +497,9 @@ pub(super) fn apply_overrides(desc: &mut TensorMapDesc, overrides: &[(TmapField,
     let as_i64 = |v: u64| i64::try_from(v).map_err(|_| OpError::invalid("TMA override operand out of range"));
     let dims = dims.iter().map(|&(_, v)| as_i64(v)).collect::<OpResult<Vec<_>>>()?;
     let lowers = lowers.iter().map(|&(_, v)| as_i64(v)).collect::<OpResult<Vec<_>>>()?;
+    if !dims.is_empty() && coords.iter().any(|&c| c != 0) {
+        return Err(OpError::invalid("TMA attribute override requires zero coordinates"));
+    }
     let zeros = vec![0i64; rank];
     image.apply_overrides(rank, &dims, &lowers, as_i64(upper.unwrap_or(0))?, &zeros)?;
     *desc = image_to_desc(&image, desc.l2_promotion)?;

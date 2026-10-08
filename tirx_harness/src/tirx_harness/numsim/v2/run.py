@@ -23,7 +23,7 @@ import numpy as np
 from tirx_harness.numsim.errors import NumSimExecutionError
 
 from .compile import CompiledModule, native
-from .options import BACKENDS, options
+from .options import options
 from .report import (
     AnalysisResult,
     NumSimResult,
@@ -236,12 +236,42 @@ def _attach_subset_scope(payload: dict[str, Any], topology: Mapping[str, Any]) -
     payload["analysis_scope"] = scope
 
 
+_SCALAR_NUMPY = {
+    "S8": "int8",
+    "S16": "int16",
+    "S32": "int32",
+    "S64": "int64",
+    "U8": "uint8",
+    "U16": "uint16",
+    "U32": "uint32",
+    "U64": "uint64",
+    "F16": "float16",
+    "BF16": "bfloat16",
+    "F32": "float32",
+    "F64": "float64",
+    "PRED": "bool",
+}
+
+
 def _scalar_bits(name: str, value: Any, ty: Mapping[str, Any] | None) -> int:
     elem = str((ty or {}).get("elem", "S64")).upper()
     if isinstance(value, np.ndarray) and value.ndim == 0:
         value = value[()]
+    want = _SCALAR_NUMPY.get(elem)
     if isinstance(value, np.generic):
+        # Any integer value that fits an integer parameter is accepted (Python
+        # int or any NumPy integer; the range is checked below); a float or
+        # other non-integer for an integer parameter is a typed error
+        # (numsim-behaviour-deltas H8).
+        if (
+            want is not None
+            and want.startswith(("int", "uint"))
+            and not isinstance(value, (np.integer, np.bool_))
+        ):
+            raise InputError(f"scalar {name!r} requires dtype {want}, got {value.dtype.name}")
         value = value.item()
+    elif want is not None and want.startswith(("int", "uint")) and isinstance(value, float):
+        raise InputError(f"scalar {name!r} requires dtype {want}, got float")
     if isinstance(value, (np.ndarray, list, tuple, bytes, bytearray, memoryview)) or hasattr(
         value, "__dlpack__"
     ):
@@ -268,7 +298,7 @@ def _scalar_bits(name: str, value: Any, ty: Mapping[str, Any] | None) -> int:
         packed = struct.pack(fmt, value)
     except struct.error as error:
         raise InputError(
-            f"scalar argument {name!r}={value!r} does not fit {elem}: {error}"
+            f"scalar argument {name!r}={value!r} is outside {_SCALAR_NUMPY.get(elem, elem)} range: {error}"
         ) from error
     return int.from_bytes(packed, "little")
 
@@ -701,16 +731,25 @@ def _select_outputs(
     if isinstance(outputs, str):
         raise TypeError("NumSim outputs must be an iterable of names, not a string")
     pairs = outputs.items() if isinstance(outputs, Mapping) else ((n, n) for n in outputs)
-    aliases = {}
+    aliases: dict[str, str] = {}
+    ambiguous: set[str] = set()
     for kernel in module.spec.kernels:
         for slot in kernel.host_abi:
             for alias in (slot["name"], slot.get("local_name"), *(slot.get("aliases") or ())):
                 if alias:
-                    aliases.setdefault(str(alias), str(slot["name"]))
+                    previous = aliases.setdefault(str(alias), str(slot["name"]))
+                    if previous != str(slot["name"]):
+                        ambiguous.add(str(alias))
                     aliases.setdefault(f"k{kernel.index}:{alias}", str(slot["name"]))
     selected: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for external, selector in pairs:
+        if selector in ambiguous and selector not in buffers:
+            # Several kernels' parameters answer to this name (legacy: "output
+            # alias '<name>' is ambiguous"); select one with `k<i>:<name>`.
+            raise InputError(
+                f"NumSim output alias {selector!r} is ambiguous: qualify it as 'k<i>:{selector}'"
+            )
         canonical = aliases.get(selector, selector)
         if (
             canonical in bound
@@ -818,8 +857,8 @@ class Engine:
     ``max_workers`` (default 8, ``"auto"`` = detected CPU count) is the
     scheduler's worker-thread count (``RunConfig.workers``; results do not
     depend on it). ``native_loop_iteration_budget`` / ``native_loop_reschedule_quantum``
-    map to the loop budget and slice quantum, ``backend`` selects
-    ``"interp"`` or ``"codegen"`` (default ``NUMSIM_V2_BACKEND``)."""
+    map to the loop budget and slice quantum. The engine has one executor,
+    the interpreter (backend decision: docs/development/backend-comparison.md)."""
 
     def __init__(
         self,
@@ -828,8 +867,6 @@ class Engine:
         native_loop_iteration_budget: int | None = None,
         native_loop_reschedule_quantum: int | None = None,
         seed: int | None = None,
-        backend: str | None = None,
-        opt_level: int = 1,
     ):
         opts = options()
         if not (isinstance(max_workers, str) and max_workers == "auto"):
@@ -847,10 +884,6 @@ class Engine:
         self.loop_budget = native_loop_iteration_budget
         self.quantum = native_loop_reschedule_quantum
         self.seed = opts.seed if seed is None else int(seed)
-        self.backend = backend or opts.backend
-        if self.backend not in BACKENDS:
-            raise ValueError(f"backend must be one of {BACKENDS}")
-        self.opt_level = opt_level
         self._phase_memo: dict[tuple, list[dict[str, Any]]] = {}
 
     # -- core call ---------------------------------------------------------
@@ -859,14 +892,7 @@ class Engine:
     ) -> dict[str, Any]:
         if "synccheck_limits" in extra:
             extra = {**extra, "synccheck_limits": dict(extra["synccheck_limits"])}
-        try:
-            return self._native_call(module, bound, mode, extra)
-        except ValueError as error:
-            if str(error).startswith("codegen backend:"):
-                from tirx_harness.numsim.errors import NumSimBuildError
-
-                raise NumSimBuildError(str(error)) from error
-            raise
+        return self._native_call(module, bound, mode, extra)
 
     def _native_call(
         self, module: CompiledModule, bound, mode: str, extra: Mapping[str, Any]
@@ -875,13 +901,10 @@ class Engine:
             module.handle,
             {name: b.native for name, b in bound.items()},
             mode=mode,
-            backend=self.backend,
             workers=self.max_workers,
             seed=self.seed,
             loop_budget=self.loop_budget,
             quantum=self.quantum,
-            opt_level=self.opt_level,
-            codegen_cache_dir=str(options().cache_root / "v2-codegen"),
             host_addrs=host_addresses(bound),
             **extra,
         )
@@ -1246,7 +1269,6 @@ def _timing(
         "lower": 0.0 if module.cache_hit else lower_ms,
         "module_cache": lower_ms if module.cache_hit else 0.0,
         "bind": bind_ms,
-        "build": float(engine.get("build", 0.0)),
         "run": float(engine.get("run", 0.0)),
         "check": float(engine.get("check", 0.0)),
         "report": (time.perf_counter() - report_started) * 1e3,

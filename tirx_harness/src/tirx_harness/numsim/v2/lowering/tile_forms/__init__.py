@@ -19,7 +19,8 @@ unregistered variants), ``copy_async`` (TMA), ``permute`` (permute_layout),
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from ..memory import _Unsupported
 
@@ -32,13 +33,13 @@ PLACEHOLDER = "numsim_v2_tile_form"
 PENDING: dict[int, Any] = {}
 
 
-def _family(op: str) -> Callable[[Any, "Lowerer"], None] | None:
+def _family(op: str) -> Callable[[Any, Lowerer], None] | None:
     from . import copy, copy_async, fill, gemm, permute, reduce
 
     return {
         "gemm_async": gemm.lower,
         "copy": copy.lower,
-        "add": copy.lower,    # forced-variant element-wise forms (W12, copy.py)
+        "add": copy.lower,  # forced-variant element-wise forms (W12, copy.py)
         "cast": copy.lower,
         "copy_async": copy_async.lower,
         "permute_layout": permute.lower,
@@ -77,7 +78,7 @@ def repair(call: Any) -> Any | None:
     return None
 
 
-def lower(call: Any, ctx: "Lowerer") -> None:
+def lower(call: Any, ctx: Lowerer) -> None:
     """Lower one TVM-rejected tile call to Program ops, or raise ``Unsupported``."""
     op = str(call.op.name).rpartition(".")[2]
     family = _family(op)

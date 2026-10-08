@@ -41,12 +41,12 @@ SINK = None
 @dataclass(frozen=True)
 class OperandInfo:
     name: str
-    kind: str            # reg | addr | ptr | imm
-    rw: str              # r | w | rw
+    kind: str  # reg | addr | ptr | imm
+    rw: str  # r | w | rw
     lanes: int
-    ptx_type: str        # "" when the table leaves it untyped
-    dtype: str           # canonical TVM dtype ("" when untyped)
-    space: str           # addr operands only
+    ptx_type: str  # "" when the table leaves it untyped
+    dtype: str  # canonical TVM dtype ("" when untyped)
+    space: str  # addr operands only
     literal: str | None
 
 
@@ -56,7 +56,7 @@ class DecodedPtx:
     table_name: str
     modifiers: tuple[tuple[str, str], ...]
     operands: tuple[OperandInfo, ...]
-    values: tuple[tuple[Any, ...], ...]   # per operand; literal imm -> (literal,)
+    values: tuple[tuple[Any, ...], ...]  # per operand; literal imm -> (literal,)
     predicate: Any | None
     preserve_dst: bool
     orders_memory: bool
@@ -161,18 +161,29 @@ def decode(call: Any) -> DecodedPtx:
                 pass
         space = operand_space(slot, mod_map) if slot.kind == "addr" else ""
         if slot.kind == "imm" and slot.literal is not None:
-            infos.append(OperandInfo(slot.name, "imm", slot.rw, 1, ptx_type, dtype, space, str(slot.literal)))
+            infos.append(
+                OperandInfo(slot.name, "imm", slot.rw, 1, ptx_type, dtype, space, str(slot.literal))
+            )
             values.append((slot.literal,))
             pred_lanes.append((False,))
             continue
         first, lanes = rows[id(slot)]
-        infos.append(OperandInfo(slot.name, slot.kind, slot.rw, lanes_of(slot, mod_map),
-                                 ptx_type, dtype, space, None))
-        values.append(tuple(SINK if first + lane in sinks else next(present) for lane in range(lanes)))
+        infos.append(
+            OperandInfo(
+                slot.name, slot.kind, slot.rw, lanes_of(slot, mod_map), ptx_type, dtype, space, None
+            )
+        )
+        values.append(
+            tuple(SINK if first + lane in sinks else next(present) for lane in range(lanes))
+        )
         # A ``.pred``-typed register always goes through TVM's ``BRIDGE["pred"]``.
         is_pred = slot.kind == "reg" and ptx_type == "pred"
-        pred_lanes.append(tuple((is_pred or first + lane in preds) and first + lane not in sinks
-                                for lane in range(lanes)))
+        pred_lanes.append(
+            tuple(
+                (is_pred or first + lane in preds) and first + lane not in sinks
+                for lane in range(lanes)
+            )
+        )
     return DecodedPtx(
         op_name=op_name,
         table_name=entry.name,
@@ -186,4 +197,4 @@ def decode(call: Any) -> DecodedPtx:
     )
 
 
-__all__ = ["DecodedPtx", "OperandInfo", "PtxDecodeError", "SINK", "decode", "is_table_op"]
+__all__ = ["SINK", "DecodedPtx", "OperandInfo", "PtxDecodeError", "decode", "is_table_op"]

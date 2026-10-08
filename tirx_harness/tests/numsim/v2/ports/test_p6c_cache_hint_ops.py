@@ -91,8 +91,11 @@ def test_async_applypriority_bulk_groups_are_visible_to_checkers(checker):
 def test_valid_address_prefetch_checks_only_predicate_selected_lanes():
     """Port of ``tests/numsim/runtime/test_cache_hint_ops.py::test_valid_address_prefetch_checks_only_predicate_selected_lanes``.
 
-    Dropped pin: the legacy message ``"out-of-bounds"``; the port asserts the
-    run with the predicate on stops with the v2 error kind ``bad_address``.
+    The run with the predicate on stops with the error kind ``out_of_bounds``
+    (legacy message "out-of-bounds"): the address lies just past ``source``,
+    in its guard gap, which W2's integer-address rule (CONTRACT_REQUESTS
+    W12-gaps 1) keeps an ``out_of_bounds`` error; only addresses naming no
+    allocation at all are ``incomplete``.
     """
 
     module = v2.transpile(predicated_valid_address)
@@ -102,4 +105,4 @@ def test_valid_address_prefetch_checks_only_predicate_selected_lanes():
     with pytest.raises(v2.ExecutionError) as caught:
         v2.Engine().run(module, {"source": np.zeros(256, dtype=np.uint8), "enabled": 1})
     stops = [d for d in caught.value.diagnostics if d.get("status") in ("error", "incomplete")]
-    assert stops and (stops[0]["status"], stops[0]["kind"]) == ("error", "bad_address"), stops
+    assert stops and (stops[0]["status"], stops[0]["kind"]) == ("error", "out_of_bounds"), stops

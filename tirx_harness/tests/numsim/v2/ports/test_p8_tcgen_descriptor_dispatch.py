@@ -29,7 +29,7 @@ from tvm_ffi import structural_map, structural_walk
 from tests.numsim.microtests.harness import require_numsim_gpu, run_gpu_primfunc
 from tests.numsim.runtime.test_tcgen05_ti16 import ti16_kernel
 from tests.numsim.support.tcgen_descriptor import INSTR_DESC, encode_dense_instr_descriptor_fields
-from tests.numsim.v2.checkers._runnable import assert_clean, requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import assert_clean, requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -281,14 +281,6 @@ def test_tcgen_runtime_descriptor_dispatch_outcomes(input_descriptor, bf16, enab
     replay(*dispatch_case(bf16=bf16, enabled=enabled, input_descriptor=input_descriptor))
 
 
-_MULTIPLE_ISSUERS_GAP = (
-    "CONTRACT_REQUESTS W12-gaps 3 (W2/W6): "
-    "two lanes issuing one tcgen05.mma site (and its commit) are not rejected as a "
-    "multi-lane issue (sync-semantics.md 6.3: exactly one issuing lane); v2 runs both "
-    "issues and stops later with sync_protocol_error 'mbarrier completion after "
-    "complete' in synccheck, racecheck and NumSim instead of 'requires exactly one "
-    "issuing lane'"
-)
 
 
 @pytest.mark.parametrize("input_descriptor", (False, True), ids=("select", "input"))
@@ -304,14 +296,13 @@ def test_tcgen_runtime_descriptor_dispatch_multiple_issuers_fail_closed(input_de
         v2.Engine().run(v2.transpile(kernel), _copy(inputs))
 
 
-@v2_gap(_MULTIPLE_ISSUERS_GAP)
 @pytest.mark.parametrize("input_descriptor", (False, True), ids=("select", "input"))
 def test_tcgen_runtime_descriptor_dispatch_rejects_multiple_issuers(input_descriptor):
     """Port of the multiple-issuer rejection of ``tests/numsim/microtests/test_tcgen_descriptor_dispatch.py::test_tcgen_runtime_descriptor_dispatch``
-    (legacy reason text kept)."""
+    (v2 wording: legacy said "requires exactly one issuing lane")."""
 
     kernel, inputs, _ = dispatch_case(multiple_issuers=True, input_descriptor=input_descriptor)
-    assert_rejected(kernel, inputs, "requires exactly one issuing lane")
+    assert_rejected(kernel, inputs, "must be issued by a single thread")
 
 
 def test_tcgen_runtime_descriptor_signs_stay_runtime_fields():

@@ -156,3 +156,45 @@ def test_thread_scope_gemm_async_asserts_a_single_issuing_lane():
     program = lower(dense_gemm_async_two_thread_issuers_n16)
     messages = [program.strings[i.msg] for i in all_of(program, "Assert") if i.msg is not None]
     assert any("exactly one active issuing lane" in m for m in messages)
+
+
+def test_tmem_views_take_the_containing_named_buffers_logical_identity():
+    """W12-gaps 5 (legacy ``tmem_logical_buffer_name``): TVM re-declares a TMEM
+    view by address, so a contained view (or an exact-cell representation
+    change) names its root; same cells and geometry under another name do not."""
+    from tests.numsim.v2.checkers import test_alias_advisory as kernels
+    from tirx_harness.numsim.v2.lowering import lower
+
+    def access_buffers(func):
+        program = lower(func)
+        return [
+            (instr.variant, program.sites[program.code_sites[pc]].buffer)
+            for pc, instr in enumerate(program.code)
+            if instr.variant in ("Load", "Store")
+        ]
+
+    assert access_buffers(kernels.native_tmem_view_provenance)[:2] == [
+        ("Store", "tmem"),
+        ("Load", "tmem"),
+    ]
+    assert access_buffers(kernels.native_tmem_partitioned_view_provenance)[:2] == [
+        ("Store", "tmem"),
+        ("Load", "tmem"),
+    ]
+    assert access_buffers(kernels.native_tmem_reused_lifetime_provenance)[:3] == [
+        ("Store", "first"),
+        ("Store", "second"),
+        ("Load", "first"),
+    ]
+
+
+def test_gemm_async_declared_shape_rides_on_each_dispatched_mma():
+    """W4-W11-7: a gemm_async that declares mma_m/mma_n carries [M, N, K]
+    (K = the per-instruction K of the kind) on every tcgen05.mma it dispatches
+    to; one without a declared shape, like a raw tcgen05.mma, carries None."""
+    from tests.numsim.v2.ports.test_validshape_gemm_async_artifact import dense_gemm_async_cta1_n16
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(dense_gemm_async_cta1_n16)
+    declared = [i.declared for i in program.code if i.variant == "TcgenMma"]
+    assert declared == [[128, 16, 16], None]

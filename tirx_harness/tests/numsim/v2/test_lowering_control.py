@@ -193,3 +193,60 @@ def k(output: T.Buffer((4,), "int32")):
 ''', strict=False)
     reasons = " ".join(program.unsupported)
     assert "VECTORIZED" in reasons and "numsim.unknown_loop" in reasons
+
+
+def test_prim_likely_clz_and_ceil_lower_by_their_registered_op_names(lower_source):
+    # TVM registers these as prim.likely / prim.clz / prim.ceil (not tirx.*).
+    program = lower_source('''
+@T.prim_func
+def k(a: T.Buffer((32,), "int32"), f: T.Buffer((32,), "float32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    T.warp_id([1])
+    lane = T.lane_id([32])
+    if T.likely(lane < 16):
+        a[lane] = T.clz(a[lane])
+        f[lane] = T.ceil(f[lane])
+''')
+    unary = {i.op for i in program.code if i.variant == "Unary"}
+    assert {"Clz", "Ceil"} <= unary, unary
+
+
+def test_short_circuit_and_or_and_impure_select_evaluate_only_the_taken_operand(lower_source):
+    """Legacy and_rhs_mask / or_rhs_mask / select_*_mask: a right operand or
+    Select arm that loads memory runs under If/Else, so an out-of-range load on
+    the untaken side is never evaluated. Pure operands keep Binary / Select."""
+    program = lower_source('''
+@T.prim_func
+def k(source: T.Buffer((2,), "int32"), output: T.Buffer((32,), "int32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    T.warp_id([1])
+    lane = T.lane_id([32])
+    a: T.let = (lane == 0) and (source[lane] == 5)
+    o: T.let = (lane != 0) or (source[lane] == 5)
+    s: T.let = T.Select(lane < 2, source[lane], 100 + lane)
+    p: T.let = T.Select(lane < 2, lane, 100 + lane)
+    output[lane] = T.cast(a, "int32") + T.cast(o, "int32") + s + p
+''')
+    variants = [i.variant for i in program.code]
+    loads = [pc for pc, v in enumerate(variants) if v == "Load"]
+    # Each of the three source loads sits between an If and its EndIf.
+    assert len(loads) == 3, variants
+    for pc in loads:
+        opened = sum(v == "If" for v in variants[:pc]) - sum(v == "EndIf" for v in variants[:pc])
+        assert opened >= 1, (pc, variants)
+    # The pure Select stays a Select instruction.
+    assert variants.count("Select") == 1, variants
+
+
+def test_cta_thread_and_cluster_size_limits_fail_closed(lower_source):
+    """Legacy NumSimBuildError "warps_per_cta=33 ... maximum 32" and
+    "ctas_per_cluster=65 ... maximum 64"."""
+    from tests.numsim.integration.test_topology_artifact import too_many_cluster_ctas, too_many_warps
+    from tirx_harness.numsim.v2.lowering import lower
+
+    assert lower(too_many_warps, strict=False).unsupported == [
+        "topology: 1056 threads (33 warps) per CTA, maximum 1024 (32 warps)"
+    ]
+    assert lower(too_many_cluster_ctas, strict=False).unsupported == [
+        "topology: 65 CTAs per cluster, maximum 64"
+    ]

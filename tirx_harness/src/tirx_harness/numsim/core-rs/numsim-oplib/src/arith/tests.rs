@@ -560,3 +560,46 @@ fn ptx_add_sub_mul_nan_bits_are_build_independent() {
         }
     }
 }
+
+/// FTZ and `.sat` take the operand format, so bf16 bits are never judged by the
+/// f16 encoding. `0x0300` is an f16 subnormal but a bf16 normal (exponent 6).
+#[test]
+fn low_precision_ftz_and_sat_are_format_aware() {
+    use crate::scalar::{low_add_rn, low_fma_rn, low_mul_rn};
+    let (f16, bf16) = (LowPrecisionFormat::F16, LowPrecisionFormat::Bf16);
+    // Subnormal tests per format.
+    assert!(f16.is_subnormal(0x0300) && !bf16.is_subnormal(0x0300));
+    assert!(f16.is_subnormal(0x8001) && bf16.is_subnormal(0x8001));
+    assert!(!f16.is_subnormal(0x0400) && bf16.is_subnormal(0x0040));
+    assert_eq!(bf16.flush_subnormal(0x807f), 0x8000);
+    assert_eq!(bf16.flush_subnormal(0x0080), 0x0080);
+    assert_eq!(bf16.flush_subnormal(0x7fc1), 0x7fc1); // NaN payload untouched
+                                                      // add/sub/mul/fma: a bf16 normal survives FTZ; f16 bits with the same
+                                                      // pattern flush to +0.
+    assert_eq!(low_add_rn(0x0300, 0x0000, bf16, false, true), 0x0300);
+    assert_eq!(low_add_rn(0x0300, 0x0000, f16, false, true), 0x0000);
+    assert_eq!(low_mul_rn(0x0300, 0x3f80, bf16, true), 0x0300);
+    assert_eq!(low_fma_rn(0x0300, 0x3f80, 0x0000, bf16, true), 0x0300);
+    // A bf16 subnormal input does flush.
+    assert_eq!(low_add_rn(0x0001, 0x0000, bf16, false, true), 0x0000);
+    assert_eq!(low_add_rn(0x0001, 0x0000, bf16, false, false), 0x0001);
+    // -0 * 1 + +0 is +0 under RN.
+    assert_eq!(low_fma_rn(0x8040, 0x3f80, 0x0000, bf16, true), 0x0000);
+    assert_eq!(low_mul_rn(0x8040, 0x3f80, bf16, true), 0x8000);
+    // .sat clamps at each format's 1.0.
+    assert_eq!(apply_half_clamp(0x4000, bf16, HalfClamp::Sat), 0x3f80);
+    assert_eq!(apply_half_clamp(0x3f00, bf16, HalfClamp::Sat), 0x3f00); // 0.5 kept
+    assert_eq!(apply_half_clamp(0x4000, f16, HalfClamp::Sat), 0x3c00);
+    assert_eq!(apply_half_clamp(0x3800, f16, HalfClamp::Sat), 0x3800);
+    assert_eq!(apply_half_clamp(0x7fc1, bf16, HalfClamp::Sat), 0x0000);
+    assert_eq!(apply_half_clamp(0xbf80, bf16, HalfClamp::Sat), 0x0000);
+    // min/max FTZ: bf16 0x0300 > 0x0200, both normal in bf16.
+    assert_eq!(
+        crate::cvt::low_minmax(0x0300, 0x0200, bf16, true, false, false, true),
+        0x0300
+    );
+    assert_eq!(
+        crate::cvt::low_minmax(0x0300, 0x0200, f16, true, false, false, true),
+        0x0000
+    );
+}

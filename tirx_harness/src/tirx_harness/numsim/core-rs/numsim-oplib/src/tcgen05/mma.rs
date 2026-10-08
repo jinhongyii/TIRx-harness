@@ -3,8 +3,10 @@
 //! Legacy source: `engine-rs/src/runtime/tcgen_ops.rs` (
 //! `raw_tcgen05_sparse_2of4_indices`, `raw_tcgen05_expand_sparse_2of4`,
 //! `raw_tcgen05_expand_sparse_mxf4_a`, the numeric closure of
-//! `raw_tcgen05_sparse_float_tail`, `RawMmaTail::run{,_with}`, and the compute
-//! half of `tile_gemm_bf16_f32_ss_cta1{,_increasing_k}`).
+//! `raw_tcgen05_sparse_float_tail` and `RawMmaTail::run{,_with}`). The legacy
+//! tile-GEMM compute half (`tile_gemm_bf16_f32_ss_cta1`) was removed with the
+//! tile layer: `tirx.tile.gemm{,_async}` lowers through TVM dispatch to
+//! tcgen05.mma (decision 6).
 //!
 //! Every accumulation is the stable logical oracle: each output element is a
 //! binary32 FMA chain over increasing K, seeded with `D * scale`. The f32
@@ -13,8 +15,7 @@
 
 use super::instr_desc::FloatKind;
 use super::layouts::{DenseTmemLayout, CTA1_PACKED_A_COLUMNS};
-use super::smem_desc::TileGemmBf16Descriptor;
-use crate::mma::{mma_f32_abt_banked_a_increasing_k, mma_f32_abt_increasing_k, MatmulBackend};
+use crate::mma::{mma_f32_abt_banked_a_increasing_k, mma_f32_abt_increasing_k};
 use crate::types::{OpError, OpResult};
 
 /// The dense tail's numeric choice: banked core when A came from TMEM in a
@@ -191,52 +192,6 @@ pub fn sparse_float_mma(
     Ok(output)
 }
 
-/// Compute half of `tile_gemm_bf16_f32_ss_cta1{,_increasing_k}`: decode both
-/// snapshots (B reuses A when `reuse_a_as_b`) and multiply with `backend`.
-///
-/// Legacy used NumPy `matmul_f32_abt` under the `python` feature
-/// (`tcgen_ops.rs:342-356`) and the increasing-K oracle otherwise and for the
-/// `_increasing_k` entry: pass `crate::mma::NumpyBackend` or
-/// `crate::mma::ReferenceBackend` accordingly.
-pub fn tile_gemm_bf16_f32(
-    descriptor: TileGemmBf16Descriptor,
-    a_snapshot: &[u8],
-    b_snapshot: Option<&[u8]>,
-    backend: &dyn MatmulBackend,
-) -> OpResult<Vec<f32>> {
-    use super::smem_desc::decode_tile_gemm_bf16_snapshot;
-    descriptor.validate_dense_cta1()?;
-    let a = decode_tile_gemm_bf16_snapshot(
-        a_snapshot,
-        descriptor.m,
-        descriptor.k,
-        descriptor.a_layout,
-    )?;
-    let b = if descriptor.reuse_a_as_b {
-        None
-    } else {
-        let snapshot =
-            b_snapshot.ok_or_else(|| OpError::message("tile BF16 GEMM B operand is missing"))?;
-        Some(decode_tile_gemm_bf16_snapshot(
-            snapshot,
-            descriptor.n,
-            descriptor.k,
-            descriptor.b_layout,
-        )?)
-    };
-    let b_values = b.as_ref().map_or(a.as_slice(), Vec::as_slice);
-    let mut output = vec![0.0_f32; descriptor.m * descriptor.n];
-    backend.matmul_f32_abt(
-        descriptor.m,
-        descriptor.n,
-        descriptor.k,
-        &a,
-        b_values,
-        &mut output,
-    )?;
-    Ok(output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,26 +206,5 @@ mod tests {
         .unwrap();
         assert_eq!(dense, vec![1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0]);
         assert!(sparse_2of4_indices(0x0).is_err());
-    }
-
-    #[test]
-    fn tile_gemm_reference_backend_is_the_increasing_k_oracle() {
-        use super::super::smem_desc::TileGemmOperandLayout;
-        let layout = TileGemmOperandLayout::new(64, 3, 0, 3);
-        let descriptor = TileGemmBf16Descriptor::new(64, 64, 64, layout, layout, true);
-        let mut snapshot = vec![0_u8; 64 * 64 * 2];
-        for (i, pair) in snapshot.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-            pair.copy_from_slice(&crate::cvt::f32_to_bf16_bits((i % 3) as f32).to_le_bytes());
-        }
-        let out =
-            tile_gemm_bf16_f32(descriptor, &snapshot, None, &crate::mma::ReferenceBackend).unwrap();
-        let a = super::super::smem_desc::decode_tile_gemm_bf16_snapshot(&snapshot, 64, 64, layout)
-            .unwrap();
-        assert_eq!(
-            out,
-            mma_f32_abt_increasing_k(64, 64, 64, &a, &a, None).unwrap()
-        );
-        let bad = TileGemmBf16Descriptor::new(32, 64, 64, layout, layout, false);
-        assert!(tile_gemm_bf16_f32(bad, &snapshot, None, &crate::mma::ReferenceBackend).is_err());
     }
 }

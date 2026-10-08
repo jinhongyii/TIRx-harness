@@ -308,19 +308,18 @@ pub fn cuda_reduce_fp16_add(lhs: f32, rhs: f32) -> f32 {
     cuda_round_fp16(cuda_f32_add(cuda_round_fp16(lhs), cuda_round_fp16(rhs)))
 }
 
-/// One fp16 max step: operands rounded to binary16 (RN, NaN canonical), then
-/// `lhs > rhs ? lhs : rhs` (a NaN or an equal/zero pair yields `rhs`).
+/// One fp16 max step: operands rounded to binary16 (RN, NaN canonical), then PTX
+/// default `max` ([`cuda_f32_max`]): one NaN loses to the other operand, two NaNs give
+/// the canonical NaN, `max(-0, +0) = +0`. The same rule as the engine's TIR `Max` on
+/// f16, which the v2 butterfly reduction lowers to.
 pub fn cuda_reduce_fp16_max(lhs: f32, rhs: f32) -> f32 {
-    let lhs = cuda_round_fp16(lhs);
-    let rhs = cuda_round_fp16(rhs);
-    cuda_round_fp16(if lhs > rhs { lhs } else { rhs })
+    cuda_round_fp16(cuda_f32_max(cuda_round_fp16(lhs), cuda_round_fp16(rhs)))
 }
 
-/// One fp16 min step: as [`cuda_reduce_fp16_max`] with `lhs < rhs ? lhs : rhs`.
+/// One fp16 min step: as [`cuda_reduce_fp16_max`] with [`cuda_f32_min`]
+/// (`min(-0, +0) = -0`).
 pub fn cuda_reduce_fp16_min(lhs: f32, rhs: f32) -> f32 {
-    let lhs = cuda_round_fp16(lhs);
-    let rhs = cuda_round_fp16(rhs);
-    cuda_round_fp16(if lhs < rhs { lhs } else { rhs })
+    cuda_round_fp16(cuda_f32_min(cuda_round_fp16(lhs), cuda_round_fp16(rhs)))
 }
 
 /// One bf16 warp-reduce step on f32 carriers: round both to bfloat16 (RN), add in
@@ -329,19 +328,16 @@ pub fn cuda_reduce_bf16_add(lhs: f32, rhs: f32) -> f32 {
     cuda_round_bf16(cuda_f32_add(cuda_round_bf16(lhs), cuda_round_bf16(rhs)))
 }
 
-/// One bf16 max step: operands rounded to bfloat16 (RN, NaN canonical), then
-/// `lhs > rhs ? lhs : rhs` (a NaN or an equal/zero pair yields `rhs`).
+/// One bf16 max step: operands rounded to bfloat16 (RN, NaN canonical), then PTX
+/// default `max` ([`cuda_f32_max`], NaN and signed-zero rules as in
+/// [`cuda_reduce_fp16_max`]).
 pub fn cuda_reduce_bf16_max(lhs: f32, rhs: f32) -> f32 {
-    let lhs = cuda_round_bf16(lhs);
-    let rhs = cuda_round_bf16(rhs);
-    cuda_round_bf16(if lhs > rhs { lhs } else { rhs })
+    cuda_round_bf16(cuda_f32_max(cuda_round_bf16(lhs), cuda_round_bf16(rhs)))
 }
 
-/// One bf16 min step: as [`cuda_reduce_bf16_max`] with `lhs < rhs ? lhs : rhs`.
+/// One bf16 min step: as [`cuda_reduce_bf16_max`] with [`cuda_f32_min`].
 pub fn cuda_reduce_bf16_min(lhs: f32, rhs: f32) -> f32 {
-    let lhs = cuda_round_bf16(lhs);
-    let rhs = cuda_round_bf16(rhs);
-    cuda_round_bf16(if lhs < rhs { lhs } else { rhs })
+    cuda_round_bf16(cuda_f32_min(cuda_round_bf16(lhs), cuda_round_bf16(rhs)))
 }
 
 /// CUDA `fmaxf`: one NaN loses to the other operand, two NaNs give `0x7fff_ffff`;
@@ -403,11 +399,16 @@ pub fn cuda_f64_add(lhs: f64, rhs: f64) -> f64 {
     }
 }
 
-/// CUDA `fmax`: one NaN loses to the other operand; two NaNs return `rhs` unchanged
-/// (not canonicalized, unlike [`cuda_f32_max`]); `max(-0, +0) = +0`.
+/// Canonical binary64 NaN `0x7fff_ffff_ffff_ffff`: the f64 analogue of the CUDA
+/// canonical `0x7fff_ffff`, returned by `max`/`min` when both operands are NaN.
+pub const CUDA_CANONICAL_NAN_F64_BITS: u64 = 0x7fff_ffff_ffff_ffff;
+
+/// CUDA `fmax` / PTX `max.f64`: one NaN loses to the other operand; two NaNs give the
+/// canonical NaN [`CUDA_CANONICAL_NAN_F64_BITS`] (the [`cuda_f32_max`] rule);
+/// `max(-0, +0) = +0`.
 pub fn cuda_f64_max(lhs: f64, rhs: f64) -> f64 {
     match (lhs.is_nan(), rhs.is_nan()) {
-        (true, true) => rhs,
+        (true, true) => f64::from_bits(CUDA_CANONICAL_NAN_F64_BITS),
         (true, false) => rhs,
         (false, true) => lhs,
         (false, false) if lhs == 0.0 && rhs == 0.0 => {
@@ -422,10 +423,11 @@ pub fn cuda_f64_max(lhs: f64, rhs: f64) -> f64 {
     }
 }
 
-/// CUDA `fmin`: one NaN loses; two NaNs return `rhs` unchanged; `min(-0, +0) = -0`.
+/// CUDA `fmin` / PTX `min.f64`: one NaN loses; two NaNs give the canonical NaN
+/// [`CUDA_CANONICAL_NAN_F64_BITS`]; `min(-0, +0) = -0`.
 pub fn cuda_f64_min(lhs: f64, rhs: f64) -> f64 {
     match (lhs.is_nan(), rhs.is_nan()) {
-        (true, true) => rhs,
+        (true, true) => f64::from_bits(CUDA_CANONICAL_NAN_F64_BITS),
         (true, false) => rhs,
         (false, true) => lhs,
         (false, false) if lhs == 0.0 && rhs == 0.0 => {
@@ -441,12 +443,13 @@ pub fn cuda_f64_min(lhs: f64, rhs: f64) -> f64 {
 }
 
 /// PTX `ex2.approx.f32` representative: libm binary64 `exp2` rounded once to binary32
-/// (RN), no FTZ. Not a GPU polynomial; a NaN input stays NaN (payload from the host cast).
+/// (RN), no FTZ. Not a GPU polynomial; a NaN result is pinned by [`pin_nan1_f32`]
+/// (NaN input quieted, payload and sign kept; delta D8).
 pub fn ptx_exp2_approx_f32(value: f32) -> f32 {
     // Use the software f64 implementation as a target-independent canonical
     // representative, then round once to binary32. This deliberately does not
     // replay any GPU architecture's approximation polynomial.
-    libm::exp2(value as f64) as f32
+    pin_nan1_f32(value, libm::exp2(value as f64) as f32)
 }
 
 /// [`ptx_exp2_approx_f32`] with `.ftz`: subnormal input and result flush to signed zero.
@@ -456,7 +459,8 @@ pub fn ptx_exp2_approx_ftz_f32(value: f32) -> f32 {
 }
 
 /// PTX `sin.approx{.ftz}.f32` representative: libm binary64 `sin` rounded to binary32;
-/// `ftz` flushes subnormal input/result. NaN/inf input gives NaN (host payload).
+/// `ftz` flushes subnormal input/result. NaN input gives it back quieted, `±inf` the
+/// default NaN `0xffc0_0000` ([`pin_nan1_f32`], delta D8).
 pub fn ptx_sin_approx_f32(value: f32, ftz: bool) -> f32 {
     let value = if ftz {
         flush_subnormal_f32(value)
@@ -465,7 +469,7 @@ pub fn ptx_sin_approx_f32(value: f32, ftz: bool) -> f32 {
     };
     // A high-accuracy software sine is a stable representative inside PTX's
     // architecture-dependent approximation bound.
-    let result = libm::sin(value as f64) as f32;
+    let result = pin_nan1_f32(value, libm::sin(value as f64) as f32);
     if ftz {
         flush_subnormal_f32(result)
     } else {
@@ -474,7 +478,8 @@ pub fn ptx_sin_approx_f32(value: f32, ftz: bool) -> f32 {
 }
 
 /// PTX `cos.approx{.ftz}.f32` representative: libm binary64 `cos` rounded to binary32;
-/// `ftz` flushes subnormal input/result. NaN/inf input gives NaN (host payload).
+/// `ftz` flushes subnormal input/result. NaN input gives it back quieted, `±inf` the
+/// default NaN `0xffc0_0000` ([`pin_nan1_f32`], delta D8).
 pub fn ptx_cos_approx_f32(value: f32, ftz: bool) -> f32 {
     let value = if ftz {
         flush_subnormal_f32(value)
@@ -483,7 +488,7 @@ pub fn ptx_cos_approx_f32(value: f32, ftz: bool) -> f32 {
     };
     // As with sine, do not pretend to reproduce one GPU's approximation
     // polynomial; keep one target-independent value within the PTX contract.
-    let result = libm::cos(value as f64) as f32;
+    let result = pin_nan1_f32(value, libm::cos(value as f64) as f32);
     if ftz {
         flush_subnormal_f32(result)
     } else {
@@ -522,21 +527,22 @@ pub fn ptx_exp2_approx_f16x2(value: u32) -> u32 {
 }
 
 /// PTX `lg2.approx.ftz.f32` representative: subnormal input flushed (so `lg2(±subnormal)
-/// = -inf`), libm binary64 `log2` rounded to binary32; negative input gives NaN.
+/// = -inf`), libm binary64 `log2` rounded to binary32; negative input gives the default
+/// NaN `0xffc0_0000`, a NaN input itself quieted ([`pin_nan1_f32`], delta D8).
 pub fn ptx_lg2_approx_ftz_f32(value: f32) -> f32 {
     let value = flush_subnormal_f32(value);
     // As with the exp2 adapter, use a target-independent software value as the
     // canonical representative instead of replaying an architecture-specific
     // approximation polynomial.
-    flush_subnormal_f32(libm::log2(value as f64) as f32)
+    flush_subnormal_f32(pin_nan1_f32(value, libm::log2(value as f64) as f32))
 }
 
 /// PTX `tanh.approx.f32` representative: libm binary64 `tanh` rounded to binary32, no
-/// FTZ; NaN input stays NaN (host payload).
+/// FTZ; a NaN input is returned quieted ([`pin_nan1_f32`], delta D8).
 pub fn ptx_tanh_approx_f32(value: f32) -> f32 {
     // Use one target-independent software representative rather than replaying
     // an architecture-specific tanh.approx polynomial.
-    libm::tanh(value as f64) as f32
+    pin_nan1_f32(value, libm::tanh(value as f64) as f32)
 }
 
 /// PTX `tanh.approx.f16`: exact widening, [`ptx_tanh_approx_f32`], RN to binary16
@@ -566,27 +572,31 @@ pub fn ptx_tanh_approx_bf16x2(value: u32) -> u32 {
 }
 
 /// PTX `rsqrt.approx.ftz.f32` representative: `1 / sqrt(x)` in binary32 (two RN roundings),
-/// subnormal input/result flushed; `rsqrt(±0) = ±inf`, negative input gives the host NaN.
+/// subnormal input/result flushed; `rsqrt(±0) = ±inf`; negative input gives the default
+/// NaN `0xffc0_0000`, a NaN input itself quieted ([`pin_nan1_f32`], delta D8).
 pub fn ptx_rsqrt_approx_ftz_f32(value: f32) -> f32 {
     let value = flush_subnormal_f32(value);
-    flush_subnormal_f32(1.0_f32 / value.sqrt())
+    flush_subnormal_f32(pin_nan1_f32(value, 1.0_f32 / value.sqrt()))
 }
 
-/// PTX `rsqrt.approx.f32` representative: `1 / sqrt(x)` in binary32, no FTZ.
+/// PTX `rsqrt.approx.f32` representative: `1 / sqrt(x)` in binary32, no FTZ; NaN as in
+/// [`ptx_rsqrt_approx_ftz_f32`].
 pub fn ptx_rsqrt_approx_f32(value: f32) -> f32 {
-    1.0_f32 / value.sqrt()
+    pin_nan1_f32(value, 1.0_f32 / value.sqrt())
 }
 
 /// PTX `rcp.approx.ftz.f32` representative: binary32 `1 / x` (RN), subnormal input and
-/// result flushed to signed zero; NaN payload from the host division.
+/// result flushed to signed zero; a NaN input is returned quieted ([`pin_nan1_f32`],
+/// delta D8).
 pub fn ptx_rcp_approx_ftz_f32(value: f32) -> f32 {
     let value = flush_subnormal_f32(value);
-    flush_subnormal_f32(1.0_f32 / value)
+    flush_subnormal_f32(pin_nan1_f32(value, 1.0_f32 / value))
 }
 
-/// PTX `rcp.approx.f32` representative: binary32 `1 / x` (RN), no FTZ.
+/// PTX `rcp.approx.f32` representative: binary32 `1 / x` (RN), no FTZ; NaN as in
+/// [`ptx_rcp_approx_ftz_f32`].
 pub fn ptx_rcp_approx_f32(value: f32) -> f32 {
-    1.0_f32 / value
+    pin_nan1_f32(value, 1.0_f32 / value)
 }
 
 /// PTX `max{.ftz}{.NaN}.f32`: [`cuda_f32_max`]; `propagate_nan` returns `0x7fff_ffff` if

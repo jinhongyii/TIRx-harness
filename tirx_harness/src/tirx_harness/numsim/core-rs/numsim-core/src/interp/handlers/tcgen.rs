@@ -292,7 +292,9 @@ pub fn tcgen_commit(
     for l in active.lanes() {
         let batch = [
             (ResourceId::TcgenKernel, SyncCmd::TcgenGroup(g)),
-            (work_res(ctx, l), SyncCmd::TcgenWork(tcgen::WorkCmd::Commit)),
+            // `.sync_restrict`: tracks only the shared-A reads; the MMAs stay
+            // uncommitted for a later full commit (sync §6.7, W6).
+            (work_res(ctx, l), SyncCmd::TcgenWork(if sync_restrict { tcgen::WorkCmd::CommitSharedA } else { tcgen::WorkCmd::Commit })),
         ];
         support::step_all(ctx, &batch)?;
         all.extend(batch);
@@ -370,6 +372,7 @@ pub fn tcgen_commit(
                 lut_b: None,
                 strong: None,
                 restricted,
+                preds: None,
             },
         );
     }
@@ -442,6 +445,7 @@ fn ldst_op(ctx: &mut ExecCtx<'_>, class: AsyncClass) -> AsyncId {
             lut_b: None,
             strong: None,
             restricted: false,
+            preds: None,
         },
     )
 }
@@ -768,6 +772,10 @@ pub fn tcgen_cp(ctx: &mut ExecCtx<'_>, args: TcgenCpArgs) -> HResult {
         support::step_all(ctx, &batch)?;
         all.extend(batch);
         let after: Vec<AsyncId> = ctx.aux.tcgen_last.get(&ctx.cta.id).copied().into_iter().collect();
+        // Landing follows the CTA's pipeline order (`after`), which also
+        // covers cross-thread order established by the tcgen05 fence pair;
+        // the architected predecessor is only this thread's previous op.
+        let thread_pred: Vec<AsyncId> = ctx.aux.tcgen_last_thread.get(&(ctx.warp.id, l as u8)).copied().into_iter().collect();
         let op = issue_async(
             ctx,
             one,
@@ -786,9 +794,11 @@ pub fn tcgen_cp(ctx: &mut ExecCtx<'_>, args: TcgenCpArgs) -> HResult {
                 lut_b: None,
                 strong: None,
                 restricted: false,
+                preds: Some(thread_pred),
             },
         );
         ctx.aux.tcgen_last.insert(ctx.cta.id, op);
+        ctx.aux.tcgen_last_thread.insert((ctx.warp.id, l as u8), op);
         ctx.aux.tcgen_uncommitted.entry((ctx.warp.id, l as u8)).or_default().push(op);
     }
     support::protocol(ctx, active, all, ProtoExtra::default());
@@ -883,6 +893,10 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
         support::step_all(ctx, &batch)?;
         all.extend(batch);
         let after: Vec<AsyncId> = ctx.aux.tcgen_last.get(&ctx.cta.id).copied().into_iter().collect();
+        // Landing follows the CTA's pipeline order (`after`), which also
+        // covers cross-thread order established by the tcgen05 fence pair;
+        // the architected predecessor is only this thread's previous op.
+        let thread_pred: Vec<AsyncId> = ctx.aux.tcgen_last_thread.get(&(ctx.warp.id, l as u8)).copied().into_iter().collect();
         let mma_payload = matches!(args.a, TcA::Smem(_)).then(|| payload.clone());
         let op = issue_async(
             ctx,
@@ -902,9 +916,11 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
                 lut_b,
                 strong: None,
                 restricted: false,
+                preds: Some(thread_pred),
             },
         );
         ctx.aux.tcgen_last.insert(ctx.cta.id, op);
+        ctx.aux.tcgen_last_thread.insert((ctx.warp.id, l as u8), op);
         ctx.aux.tcgen_uncommitted.entry((ctx.warp.id, l as u8)).or_default().push(op);
         if let (TcA::Smem(_), Some(p)) = (args.a, mma_payload) {
             shared_a_read(ctx, l, op, &p)?;
@@ -982,6 +998,7 @@ fn shared_a_read(ctx: &mut ExecCtx<'_>, l: usize, mma: AsyncId, p: &TcgenMmaPayl
             lut_b: None,
             strong: None,
             restricted: false,
+            preds: None,
         },
     );
     // Lands after the MMA (whose landing performs the read).

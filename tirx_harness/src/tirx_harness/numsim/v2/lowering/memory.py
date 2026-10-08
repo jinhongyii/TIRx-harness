@@ -30,8 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from tvm_ffi import structural_visit
 
-from . import builtins
-from . import dtypes
+from . import builtins, dtypes
 from . import program_builder as pb
 from .dtypes import type_key
 from .uninit import TRACKED_SPACE
@@ -41,8 +40,12 @@ if TYPE_CHECKING:
 
 
 _SPACES = {
-    "global": "Global", "shared": "Shared", "shared.dyn": "Shared", "local": "Local",
-    "tmem": "Tmem", "param": "Param",
+    "global": "Global",
+    "shared": "Shared",
+    "shared.dyn": "Shared",
+    "local": "Local",
+    "tmem": "Tmem",
+    "param": "Param",
 }
 
 _WEAK = {"sem": "Weak", "scope": "Gpu"}
@@ -61,15 +64,17 @@ class _Unsupported(Exception):
 
 @dataclass
 class Shape:
-    dtype: str                      # TVM dtype string
-    shape: tuple[Any, ...]          # PrimExpr nodes
-    strides: tuple[Any, ...]        # explicit stride PrimExprs, or ()
-    layout: Any | None              # non-trivial TVM layout, else None
-    tmem_cols: int | None = None    # TMEM view: physical column span (dense lane x column addressing)
-    tmem_per_cell: int = 1          # TMEM view: elements per 32-bit cell (contract item 28)
-    tmem_refresh: Any = None        # TMEM view with a runtime base: emits the base_reg update
-    tmem_origin: tuple[Any, Any] | None = None  # TMEM layout offset (lane, col) folded into the base
-    elem_base: int = 0              # global same-dtype view folded into its root: element offset
+    dtype: str  # TVM dtype string
+    shape: tuple[Any, ...]  # PrimExpr nodes
+    strides: tuple[Any, ...]  # explicit stride PrimExprs, or ()
+    layout: Any | None  # non-trivial TVM layout, else None
+    tmem_cols: int | None = None  # TMEM view: physical column span (dense lane x column addressing)
+    tmem_per_cell: int = 1  # TMEM view: elements per 32-bit cell (contract item 28)
+    tmem_refresh: Any = None  # TMEM view with a runtime base: emits the base_reg update
+    tmem_origin: tuple[Any, Any] | None = (
+        None  # TMEM layout offset (lane, col) folded into the base
+    )
+    elem_base: int = 0  # global same-dtype view folded into its root: element offset
 
     @property
     def static_shape(self) -> tuple[int, ...] | None:
@@ -90,16 +95,17 @@ class RegArray:
 @dataclass
 class MemRef:
     buf: int
-    space: str                      # AddrSpace of its accesses
+    space: str  # AddrSpace of its accesses
     info: Shape
 
 
 @dataclass
 class PtrRef:
-    base: pb.Operand                # u64 generic address (or a shared::cluster window address)
+    base: pb.Operand  # u64 generic address (or a shared::cluster window address)
     info: Shape
-    elem_offset: Any                # PrimExpr
-    space: str = "Generic"          # "SharedCluster": base is a mapa.shared::cluster result
+    elem_offset: Any  # PrimExpr
+    space: str = "Generic"  # "SharedCluster": base is a mapa.shared::cluster result
+    access: Any = None  # AccessPtr facts when the data pointer is a tvm_access_ptr
 
 
 BufferRef = RegArray | MemRef | PtrRef
@@ -111,8 +117,12 @@ def buffer_shape(ty: Any) -> Shape:
         trivial = getattr(layout, "is_trivial", None)
         if trivial is not None and trivial():
             layout = None
-    return Shape(dtype=str(ty.dtype.dtype), shape=tuple(ty.shape),
-                 strides=tuple(getattr(ty, "strides", ()) or ()), layout=layout)
+    return Shape(
+        dtype=str(ty.dtype.dtype),
+        shape=tuple(ty.shape),
+        strides=tuple(getattr(ty, "strides", ()) or ()),
+        layout=layout,
+    )
 
 
 def escaped_locals(body: Any) -> set[int]:
@@ -157,8 +167,11 @@ def escaped_locals(body: Any) -> set[int]:
 
     def visit_decl(node: Any, visitor: Any) -> None:
         target = addressed(node.data)
-        if target is None and type_key(node.data) == "ir.Call" and \
-                str(getattr(node.data.op, "name", "")) == "tirx.buffer_data":
+        if (
+            target is None
+            and type_key(node.data) == "ir.Call"
+            and str(getattr(node.data.op, "name", "")) == "tirx.buffer_data"
+        ):
             target = addressed(node.data.args[0])
         if target is not None:
             escaped.add(target)
@@ -171,9 +184,9 @@ def escaped_locals(body: Any) -> set[int]:
 def sum_bases(buffers: list[pb.BufferDecl], index: int) -> int:
     """Byte offset of ``buffers[index]`` from the start of its view_of chain root."""
     total = 0
-    while buffers[index].view_of is not None:
+    while (parent := buffers[index].view_of) is not None:
         total += buffers[index].base
-        index = buffers[index].view_of
+        index = parent
     return total
 
 
@@ -187,8 +200,13 @@ def promotable_locals(body: Any, escaped: set[int]) -> dict[int, tuple[int, ...]
         var = node.buffer
         info = buffer_shape(var.ty)
         static = info.static_shape
-        if str(var.ty.storage_scope) == "local" and static is not None and info.layout is None \
-                and not info.strides and handle(var) not in escaped:
+        if (
+            str(var.ty.storage_scope) == "local"
+            and static is not None
+            and info.layout is None
+            and not info.strides
+            and handle(var) not in escaped
+        ):
             found[handle(var)] = tuple(static)
         visitor.default_visit(node)
 
@@ -196,11 +214,73 @@ def promotable_locals(body: Any, escaped: set[int]) -> dict[int, tuple[int, ...]
     return found
 
 
+@dataclass(frozen=True)
+class AccessPtr:
+    """Static facts of a ``tvm_access_ptr(type, data, offset, extent, rw_mask)``
+    value: the TIR contract that accesses through it are within ``extent``
+    elements of ``elem`` and only of the kinds ``rw_mask`` grants (1 read,
+    2 write). TVM's analyses rely on it; the GPU does not check it, so a
+    violation is malformed IR (legacy failed closed on each case)."""
+
+    mask: int
+    elem: str
+    extent: int | None
+
+
+_ACCESS_KIND = {"read": 1, "write": 2}
+
+
+def copy_sources(code: list[Any]) -> dict[int, Any]:
+    """Register -> its source operand, for registers whose only writer is a
+    ``Mov``/``Cast`` copy (-1 marks a register with any other writer)."""
+    sources: dict[int, Any] = {}
+    for instr in code:
+        for reg in instr.writes():
+            if reg.index in sources or instr.variant not in ("Mov", "Cast"):
+                sources[reg.index] = -1
+            else:
+                sources[reg.index] = instr.fields["src"]
+    return sources
+
+
+def access_facts(
+    lowerer: Any, value: Any, sources: dict[int, Any] | None = None
+) -> AccessPtr | None:
+    """The access facts of ``value``, through register copies (``Mov``/``Cast``
+    of a let-bound pointer); None unless the copy chain ends at one access pointer."""
+    facts: dict[int, AccessPtr] = lowerer.access_ptrs
+    if not facts:
+        return None
+    if sources is None:
+        sources = copy_sources(lowerer.builder.code)
+    seen: set[int] = set()
+    while isinstance(value, pb.Reg) and value.index not in seen:
+        seen.add(value.index)
+        if value.index in facts:
+            return facts[value.index]
+        value = sources.get(value.index, -1)
+    return None
+
+
+def check_view_access(node: Any, name: str, ref: Any, kind: str) -> None:
+    access = getattr(ref, "access", None)
+    if access is not None and not access.mask & _ACCESS_KIND[kind]:
+        what = "non-writable" if kind == "write" else "non-readable"
+        raise _Unsupported(
+            node,
+            f"{kind} through {what} DeclBuffer view {name} (tvm_access_ptr mask {access.mask})",
+        )
+
+
+def var_name(var: Any) -> str:
+    return str(getattr(var, "name", var))
+
+
 class MemoryMixin:
     """Buffer resolution and access lowering (mixed into ``Lowerer``)."""
 
     # -- declarations ------------------------------------------------------
-    def declare_alloc(self: "Lowerer", node: Any) -> None:
+    def declare_alloc(self: Lowerer, node: Any) -> None:
         var = node.buffer
         ty = var.ty
         scope = str(ty.storage_scope)
@@ -208,8 +288,14 @@ class MemoryMixin:
         static = info.static_shape
         name = str(var.name)
         elem_ty = self.ty(info.dtype, node)
-        if scope == "local" and static is not None and info.layout is None and not info.strides \
-                and handle(var) not in self.escaped and handle(var) not in self.uninit_locals:
+        if (
+            scope == "local"
+            and static is not None
+            and info.layout is None
+            and not info.strides
+            and handle(var) not in self.escaped
+            and handle(var) not in self.uninit_locals
+        ):
             count = 1
             for extent in static:
                 count *= extent
@@ -221,21 +307,27 @@ class MemoryMixin:
             # May be read before written (V2C-19/20): keep it in tracked memory.
             space = TRACKED_SPACE
         if space not in ("Local", "Shared", "Reg") or static is None:
-            raise _Unsupported(node, f"allocation in scope {scope!r} with shape {[str(s) for s in info.shape]}")
+            raise _Unsupported(
+                node, f"allocation in scope {scope!r} with shape {[str(s) for s in info.shape]}"
+            )
         numel = _numel(static)
         buf = self.builder.buffer(
             pb.BufferDecl(
-                name=name, space=space, dtype=elem_ty,
+                name=name,
+                space=space,
+                dtype=elem_ty,
                 shape=tuple(pb.DimExpr.const(e) for e in static),
-                byte_len=pb.DimExpr.const((_layout_span(info.layout, numel) * dtypes.bits(info.dtype) + 7) // 8),
-                align=max(16, int(ty.data_alignment), _swizzle_period_bytes(info.layout, info.dtype)),
+                byte_len=pb.DimExpr.const(
+                    (_layout_span(info.layout, numel) * dtypes.bits(info.dtype) + 7) // 8
+                ),
+                align=_allocation_alignment(ty, info),
             )
         )
         if scope == "shared.dyn":
             self.dyn_pools.add(buf)
         self.refs[handle(var)] = MemRef(buf=buf, space=space, info=info)
 
-    def declare_view(self: "Lowerer", node: Any) -> None:
+    def declare_view(self: Lowerer, node: Any) -> None:
         var = node.buffer
         ty = var.ty
         scope = str(ty.storage_scope)
@@ -254,8 +346,13 @@ class MemoryMixin:
             return
         if isinstance(backing, MemRef) and type_key(offset) == "ir.IntImm":
             parent = self.builder.program.buffers[backing.buf]
-            if parent.space == "Global" and parent.view_of is None and parent.dtype == elem_ty \
-                    and info.layout is None and not info.strides:
+            if (
+                parent.space == "Global"
+                and parent.view_of is None
+                and parent.dtype == elem_ty
+                and info.layout is None
+                and not info.strides
+            ):
                 # A same-dtype view of a global buffer is an offset into it, like a
                 # C pointer: indices may legally reach before or past the view
                 # (W2-20, mega_moe's signed delta to a sibling plane), so it is
@@ -264,12 +361,19 @@ class MemoryMixin:
                 self.refs[handle(var)] = MemRef(buf=backing.buf, space=backing.space, info=info)
                 return
             static = info.static_shape
-            shape = tuple(pb.DimExpr.const(e) for e in static) if static is not None else \
-                tuple(self.dim_expr(e) for e in info.shape)
+            shape = (
+                tuple(pb.DimExpr.const(e) for e in static)
+                if static is not None
+                else tuple(self.dim_expr(e) for e in info.shape)
+            )
             span = _strided_span(static, info.strides) if static is not None else None
             if span is not None and info.layout is not None:
                 span = _layout_span(info.layout, span)
-            byte_len = pb.DimExpr.const((span * dtypes.bits(info.dtype) + 7) // 8) if span is not None else None
+            byte_len = (
+                pb.DimExpr.const((span * dtypes.bits(info.dtype) + 7) // 8)
+                if span is not None
+                else None
+            )
             # `elem_offset` counts from the backing's *data pointer*, which a view
             # shares with its own view_of chain root; BufferDecl.base is relative
             # to view_of, so subtract the parent's offset within that chain.
@@ -277,16 +381,22 @@ class MemoryMixin:
             view_of = backing.buf
             buffers = self.builder.program.buffers
             chain = view_of
-            while buffers[chain].view_of is not None:
+            while (up := buffers[chain].view_of) is not None:
                 base -= buffers[chain].base
-                chain = buffers[chain].view_of
+                chain = up
             if base < 0:  # starts before the parent: hang it off the chain root
                 base += sum_bases(buffers, view_of)
                 view_of = chain
             buf = self.builder.buffer(
                 pb.BufferDecl(
-                    name=name, space=parent.space, dtype=elem_ty, shape=shape,
-                    byte_len=byte_len, align=int(ty.data_alignment), view_of=view_of, base=base,
+                    name=name,
+                    space=parent.space,
+                    dtype=elem_ty,
+                    shape=shape,
+                    byte_len=byte_len,
+                    align=int(ty.data_alignment),
+                    view_of=view_of,
+                    base=base,
                 )
             )
             self.refs[handle(var)] = MemRef(buf=buf, space=backing.space, info=info)
@@ -298,18 +408,40 @@ class MemoryMixin:
             # base), not from the backing view's first element: adding the
             # backing's own offset again would apply it twice (W2,
             # sparse_flashmla_decode_head64 `o_ptr.view("uint64")`).
-            self.refs[handle(var)] = PtrRef(base=backing.base, info=info, elem_offset=offset, space=backing.space)
+            self.refs[handle(var)] = PtrRef(
+                base=backing.base,
+                info=info,
+                elem_offset=offset,
+                space=backing.space,
+                access=backing.access,
+            )
             return
         value = self.expr(data)
+        access = access_facts(self, value)
+        if access is not None:
+            static = info.static_shape
+            numel = _numel(static) if static is not None else None
+            if (
+                numel is not None
+                and access.extent is not None
+                and numel * dtypes.bits(info.dtype) > access.extent * dtypes.bits(access.elem)
+            ):
+                raise _Unsupported(
+                    node,
+                    f"DeclBuffer {name} spans {numel} {info.dtype} elements, outside "
+                    f"tvm_access_ptr range of {access.extent} {access.elem}",
+                )
         space = "Generic"
         if scope in ("shared", "shared.dyn") and self.is_cluster_window(value):
             # A shared-scope buffer over a `mapa.shared::cluster` result: the base
             # is a shared::cluster window address, not a generic pointer (W2).
             space = "SharedCluster"
-        base = self.as_address(value)
-        self.refs[handle(var)] = PtrRef(base=base, info=info, elem_offset=offset, space=space)
+        address = self.as_address(value)
+        self.refs[handle(var)] = PtrRef(
+            base=address, info=info, elem_offset=offset, space=space, access=access
+        )
 
-    def is_cluster_window(self: "Lowerer", value: pb.Operand) -> bool:
+    def is_cluster_window(self: Lowerer, value: pb.Operand) -> bool:
         """Is ``value`` (through Mov/Cast copies) only ever a mapa.shared::cluster result?"""
         seen: set[int] = set()
         pending = [value]
@@ -333,7 +465,9 @@ class MemoryMixin:
                     return False
         return True
 
-    def declare_tmem_view(self: "Lowerer", node: Any, var: Any, ty: Any, info: Shape, elem_ty: pb.Ty) -> None:
+    def declare_tmem_view(
+        self: Lowerer, node: Any, var: Any, ty: Any, info: Shape, elem_ty: pb.Ty
+    ) -> None:
         """TMEM ``DeclBuffer`` -> ``Buf`` in ``Space::Tmem`` (coordinator ruling, phase 3).
 
         CONTRACT convention: the Buf is the physical rectangle the view covers,
@@ -352,8 +486,11 @@ class MemoryMixin:
         layout = getattr(ty, "layout", None)
         spans = _tmem_spans(layout)
         if spans is None:
-            raise _Unsupported(node, f"TMEM layout {str(layout)[:80]} is not a dense lane x column map")
+            raise _Unsupported(
+                node, f"TMEM layout {str(layout)[:80]} is not a dense lane x column map"
+            )
         lane_span, col_span, replicated = spans
+        assert layout is not None  # _tmem_spans(None) is None
         # Contract item 28: 8/16-bit views pack `32 / bits` elements per 32-bit
         # cell. TIR counts their TCol in elements, so `col_span` and the column
         # origin are element columns; the Buf's column extent is in cells.
@@ -362,17 +499,25 @@ class MemoryMixin:
         cells = -(-col_span // per_cell)
         # The layout's (TLane, TCol) offset moves the view's origin: fold it into the
         # base taddr (``lane << 16 | col``) and subtract it from each access.
-        offsets = {str(axis.name): expr for axis, expr in (layout.offset.items() if layout.offset else ())}
+        offsets = {
+            str(axis.name): expr for axis, expr in (layout.offset.items() if layout.offset else ())
+        }
         lane_off, col_off = offsets.get("TLane"), offsets.get("TCol")
         start = addrs[0]
         static = type_key(start) == "ir.IntImm" and all(
-            o is None or type_key(o) == "ir.IntImm" for o in (lane_off, col_off))
+            o is None or type_key(o) == "ir.IntImm" for o in (lane_off, col_off)
+        )
         base, base_reg = 0, None
         if static and col_off is not None and int(col_off.value) % per_cell:
-            raise _Unsupported(node, f"TMEM view column origin {int(col_off.value)} splits a 32-bit cell")
+            raise _Unsupported(
+                node, f"TMEM view column origin {int(col_off.value)} splits a 32-bit cell"
+            )
         if static:
-            base = int(start.value) + (int(lane_off.value) << 16 if lane_off is not None else 0) + (
-                int(col_off.value) // per_cell if col_off is not None else 0)
+            base = (
+                int(start.value)
+                + (int(lane_off.value) << 16 if lane_off is not None else 0)
+                + (int(col_off.value) // per_cell if col_off is not None else 0)
+            )
         else:
             # Contract item 22: runtime taddr in a register, read at each access;
             # base 0. The address expression is evaluated right before every
@@ -380,17 +525,28 @@ class MemoryMixin:
             # `tcgen05.alloc` writes the address (W2-20, mxf8_cta2).
             base_reg = self.builder.reg(pb.Ty("U32"), name=f"{var.name}.taddr")
 
-            def refresh(start=start, lane_off=lane_off, col_off=col_off, per_cell=per_cell,
-                        base_reg=base_reg) -> None:
+            def refresh(
+                start: Any = start,
+                lane_off: Any = lane_off,
+                col_off: Any = col_off,
+                per_cell: int = per_cell,
+                base_reg: pb.Reg = base_reg,
+            ) -> None:
                 value = self.cast_to(self.expr(start), pb.Ty("U32"))
                 if lane_off is not None:
-                    lane_bits = self.binary("Shl", pb.Ty("U32"), self.cast_to(self.expr(lane_off), pb.Ty("U32")),
-                                            self.const("uint32", 16))
+                    lane_bits = self.binary(
+                        "Shl",
+                        pb.Ty("U32"),
+                        self.cast_to(self.expr(lane_off), pb.Ty("U32")),
+                        self.const("uint32", 16),
+                    )
                     value = self.binary("Add", pb.Ty("U32"), value, lane_bits)
                 if col_off is not None:
                     cell_off = self.cast_to(self.expr(col_off), pb.Ty("U32"))
                     if per_cell > 1:
-                        cell_off = self.binary("FloorDiv", pb.Ty("U32"), cell_off, self.const("uint32", per_cell))
+                        cell_off = self.binary(
+                            "FloorDiv", pb.Ty("U32"), cell_off, self.const("uint32", per_cell)
+                        )
                     value = self.binary("Add", pb.Ty("U32"), value, cell_off)
                 self.builder.emit("Mov", dst=base_reg, src=value)
 
@@ -404,9 +560,14 @@ class MemoryMixin:
             info.tmem_origin = (lane_off, col_off)
         buf = self.builder.buffer(
             pb.BufferDecl(
-                name=str(var.name), space="Tmem", dtype=elem_ty,
+                name=str(var.name),
+                space="Tmem",
+                dtype=elem_ty,
                 shape=(pb.DimExpr.const(lane_span), pb.DimExpr.const(cells)),
-                base=base, byte_len=pb.DimExpr.const(lane_span * cells * 4), align=4, base_reg=base_reg,
+                base=base,
+                byte_len=pb.DimExpr.const(lane_span * cells * 4),
+                align=4,
+                base_reg=base_reg,
             )
         )
         info.layout = layout
@@ -414,8 +575,21 @@ class MemoryMixin:
         info.tmem_per_cell = per_cell
         self.tmem_views = True
         self.refs[handle(var)] = MemRef(buf=buf, space="Tmem", info=info)
+        if base_reg is None:
+            lane0, col0 = base >> 16, base & 0xFFFF
+            record = TmemView(
+                buf=buf,
+                name=str(var.name),
+                lanes=(lane0, lane0 + lane_span),
+                cols=(col0, col0 + cells),
+                geometry=(str(layout), tuple(str(s) for s in ty.shape), str(info.dtype)),
+            )
+            root = _tmem_logical_root(self.tmem_records, record)
+            if root is not None:
+                self.tmem_roots[buf] = self.tmem_roots.get(root, root)
+            self.tmem_records.append(record)
 
-    def finish_shared(self: "Lowerer") -> int:
+    def finish_shared(self: Lowerer) -> int:
         """Size dynamic pools from their views, assign CTA shared bases; returns static bytes."""
         program = self.builder.program
         ends: dict[int, int] = {}
@@ -428,7 +602,11 @@ class MemoryMixin:
             if decl.space != "Shared" or decl.view_of is not None:
                 continue
             size = decl.byte_len.value if decl.byte_len is not None else 0
-            if index in self.dyn_pools and self.dyn_smem_bytes is not None and len(self.dyn_pools) == 1:
+            if (
+                index in self.dyn_pools
+                and self.dyn_smem_bytes is not None
+                and len(self.dyn_pools) == 1
+            ):
                 # The committed `tirx.dyn_smem_bytes` is the CTA's dynamic shared memory.
                 size = max(size, self.dyn_smem_bytes)
             elif size == 0:
@@ -441,18 +619,19 @@ class MemoryMixin:
             align = max(16, decl.align)
             cursor = (cursor + align - 1) // align * align
             program.buffers[index] = dataclasses.replace(
-                decl, base=cursor, byte_len=pb.DimExpr.const(size), align=align)
+                decl, base=cursor, byte_len=pb.DimExpr.const(size), align=align
+            )
             cursor += size
         return cursor
 
     # -- offsets -----------------------------------------------------------
-    def index_dtype(self: "Lowerer", indices: Any) -> str:
+    def index_dtype(self: Lowerer, indices: Any) -> str:
         for index in indices:
             if dtypes.dtype_of(index) in ("int64", "uint64"):
                 return "int64"
         return "int32"
 
-    def flat_offset(self: "Lowerer", ref: BufferRef, indices: Any) -> tuple[pb.Operand, int]:
+    def flat_offset(self: Lowerer, ref: BufferRef, indices: Any) -> tuple[pb.Operand, int]:
         """Physical element offset of ``indices`` and the access lane count."""
         info = ref.info
         lanes = 1
@@ -472,31 +651,35 @@ class MemoryMixin:
             for term in terms[1:]:
                 flat = self.binary("Add", idx_dtype, flat, term)
         else:
-            flat = None
-            for axis, value in enumerate(lowered):
-                if flat is None:
-                    flat = value
-                else:
-                    flat = self.mul_extent(flat, info.shape[axis], idx_dtype)
-                    flat = self.binary("Add", idx_dtype, flat, value)
-            if flat is None:
-                flat = self.const(idx_dtype, 0)
+            flat = lowered[0] if lowered else self.const(idx_dtype, 0)
+            for axis in range(1, len(lowered)):
+                flat = self.mul_extent(flat, info.shape[axis], idx_dtype)
+                flat = self.binary("Add", idx_dtype, flat, lowered[axis])
         if isinstance(ref, MemRef) and ref.space == "Tmem":
             if info.tmem_cols is None:
                 # Contract item 29.
-                raise _Unsupported(None, f"tmem_replicated_view: {self.builder.program.buffers[ref.buf].name}")
+                raise _Unsupported(
+                    None, f"tmem_replicated_view: {self.builder.program.buffers[ref.buf].name}"
+                )
             if info.tmem_refresh is not None:
                 info.tmem_refresh()
             width = dtypes.bits(info.dtype) * lanes
             if width not in (8, 16, 32) or (width < 32 and info.tmem_per_cell == 1):
-                raise _Unsupported(None, f"direct TMEM access of {info.dtype}x{lanes} (32-bit, 16-bit or 8-bit cells only)")
+                raise _Unsupported(
+                    None,
+                    f"direct TMEM access of {info.dtype}x{lanes} (32-bit, 16-bit or 8-bit cells only)",
+                )
             lane, col = self.apply_tmem_layout(info.layout, flat, idx_dtype)
             if info.tmem_origin is not None:
                 lane_off, col_off = info.tmem_origin
                 if lane_off is not None:
-                    lane = self.binary("Sub", idx_dtype, lane, self.cast_to(self.expr(lane_off), idx_dtype))
+                    lane = self.binary(
+                        "Sub", idx_dtype, lane, self.cast_to(self.expr(lane_off), idx_dtype)
+                    )
                 if col_off is not None:
-                    col = self.binary("Sub", idx_dtype, col, self.cast_to(self.expr(col_off), idx_dtype))
+                    col = self.binary(
+                        "Sub", idx_dtype, col, self.cast_to(self.expr(col_off), idx_dtype)
+                    )
             # Element offset: cell (lane * cols + col / per_cell) * per_cell + col % per_cell.
             row = self.mul_extent(lane, _imm(info.tmem_cols * info.tmem_per_cell), idx_dtype)
             return self.binary("Add", idx_dtype, row, col), lanes
@@ -516,7 +699,7 @@ class MemoryMixin:
                 flat = self.mul_extent(flat, _imm(vector), idx_dtype)
         return flat, lanes
 
-    def mul_extent(self: "Lowerer", value: pb.Operand, factor: Any, dtype: str) -> pb.Operand:
+    def mul_extent(self: Lowerer, value: pb.Operand, factor: Any, dtype: str) -> pb.Operand:
         if type_key(factor) == "ir.IntImm":
             amount = int(factor.value)
             if amount == 1:
@@ -526,7 +709,7 @@ class MemoryMixin:
             return self.binary("Mul", dtype, value, self.const(dtype, amount))
         return self.binary("Mul", dtype, value, self.cast_to(self.expr(factor), dtype))
 
-    def apply_layout(self: "Lowerer", layout: Any, flat: pb.Operand, dtype: str) -> pb.Operand:
+    def apply_layout(self: Lowerer, layout: Any, flat: pb.Operand, dtype: str) -> pb.Operand:
         key = handle(layout)
         cached = self.layout_exprs.get(key)
         if cached is None:
@@ -554,17 +737,23 @@ class MemoryMixin:
                 self.builder.emit("Compare", op="Eq", ty=pb.Ty("S32"), dst=ok, a=owner, b=own)
                 # Anchor the check at the tile call that produced the access
                 # (W11-5), else at the access itself.
-                anchor = self.tile_ops[-1] if getattr(self, "tile_ops", None) else getattr(self, "access_node", None)
+                anchor = self.tile_ops[-1] if self.tile_ops else self.access_node
                 site = self.site(anchor) if anchor is not None else None
-                self.builder.emit("Assert", site=site, cond=ok, msg=self.builder.string(
-                    f"register-layout element owned by another thread ({name})"))
+                self.builder.emit(
+                    "Assert",
+                    site=site,
+                    cond=ok,
+                    msg=self.builder.string(
+                        f"register-layout element owned by another thread ({name})"
+                    ),
+                )
             if expr is None:
                 return self.const(dtype, 0)
             return self.cast_to(self.expr(expr), dtype)
         finally:
             del self.vars[handle(var)]
 
-    def thread_coordinate(self: "Lowerer", axis: str) -> pb.Operand:
+    def thread_coordinate(self: Lowerer, axis: str) -> pb.Operand:
         sreg, modulus = _THREAD_AXES[axis]
         reg = self.builder.reg(pb.Ty("S32"), name=axis)
         self.builder.emit("ReadSpecial", dst=reg, sreg=sreg)
@@ -572,7 +761,9 @@ class MemoryMixin:
             return reg
         return self.binary("FloorMod", "int32", reg, self.const("int32", modulus))
 
-    def apply_tmem_layout(self: "Lowerer", layout: Any, flat: pb.Operand, dtype: str) -> tuple[pb.Operand, pb.Operand]:
+    def apply_tmem_layout(
+        self: Lowerer, layout: Any, flat: pb.Operand, dtype: str
+    ) -> tuple[pb.Operand, pb.Operand]:
         from tvm import tirx
 
         var = tirx.Var("flat", dtype)
@@ -581,22 +772,33 @@ class MemoryMixin:
             raise _Unsupported(None, f"TMEM layout maps to axes {sorted(axes)}")
         self.vars[handle(var)] = flat
         try:
-            return (self.cast_to(self.expr(axes["TLane"]), dtype), self.cast_to(self.expr(axes["TCol"]), dtype))
+            return (
+                self.cast_to(self.expr(axes["TLane"]), dtype),
+                self.cast_to(self.expr(axes["TCol"]), dtype),
+            )
         finally:
             del self.vars[handle(var)]
 
-    def element_bytes(self: "Lowerer", dtype: str, offset: pb.Operand) -> pb.Operand:
+    def element_bytes(self: Lowerer, dtype: str, offset: pb.Operand) -> pb.Operand:
         """Byte offset (u64) of ``offset`` elements of TVM ``dtype``."""
         width = dtypes.bits(dtype)
         wide = self.cast_to(offset, "int64")
         if width % 8 == 0:
-            scaled = wide if width == 8 else self.binary("Mul", "int64", wide, self.const("int64", width // 8))
+            scaled = (
+                wide
+                if width == 8
+                else self.binary("Mul", "int64", wide, self.const("int64", width // 8))
+            )
         else:
-            scaled = self.binary("Shr", "int64", self.binary("Mul", "int64", wide, self.const("int64", width)),
-                                 self.const("int64", 3))
+            scaled = self.binary(
+                "Shr",
+                "int64",
+                self.binary("Mul", "int64", wide, self.const("int64", width)),
+                self.const("int64", 3),
+            )
         return self.reinterpret(scaled, pb.Ty("U64"))
 
-    def as_address(self: "Lowerer", value: pb.Operand) -> pb.Operand:
+    def as_address(self: Lowerer, value: pb.Operand) -> pb.Operand:
         """A 64-bit generic address value."""
         ty = self.operand_ty(value)
         if ty == pb.Ty("U64"):
@@ -606,14 +808,14 @@ class MemoryMixin:
         return self.cast_to(value, pb.Ty("U64"))
 
     # -- accesses ----------------------------------------------------------
-    def ref_of(self: "Lowerer", var: Any) -> BufferRef | None:
+    def ref_of(self: Lowerer, var: Any) -> BufferRef | None:
         return self.refs.get(handle(var))
 
-    def access_ty(self: "Lowerer", ref: BufferRef, lanes: int, node: Any) -> pb.Ty:
+    def access_ty(self: Lowerer, ref: BufferRef, lanes: int, node: Any) -> pb.Ty:
         ty = self.ty(ref.info.dtype, node)
         return ty if lanes == 1 else ty.with_lanes(ty.lanes * lanes)
 
-    def load(self: "Lowerer", node: Any) -> pb.Operand:
+    def load(self: Lowerer, node: Any) -> pb.Operand:
         ref = self.ref_of(node.source)
         if ref is None:
             raise _Unsupported(node, f"load from unknown buffer {node.source.name}")
@@ -625,18 +827,35 @@ class MemoryMixin:
         dst = self.builder.reg(ty)
         if isinstance(ref, MemRef):
             site = self.site(node, buffer=ref.buf)
-            self.builder.emit("Load", site=site, ty=ty, dst=dst, buf=ref.buf, offset=offset,
-                              mods=pb.mem_mods(), **_WEAK)
+            self.builder.emit(
+                "Load",
+                site=site,
+                ty=ty,
+                dst=dst,
+                buf=ref.buf,
+                offset=offset,
+                mods=pb.mem_mods(),
+                **_WEAK,
+            )
         else:
+            check_view_access(node, var_name(node.source), ref, "read")
             addr = self.ptr_address(ref, offset)
             space = ref.space
             if space == "SharedCluster":
                 addr = self.cast_to(addr, pb.Ty("U32"))  # 32-bit shared::cluster window address
-            self.builder.emit("LoadAddr", site=self.site(node), ty=ty, dst=dst, addr=addr, space=space,
-                              mods=pb.mem_mods(), **_WEAK)
+            self.builder.emit(
+                "LoadAddr",
+                site=self.site(node),
+                ty=ty,
+                dst=dst,
+                addr=addr,
+                space=space,
+                mods=pb.mem_mods(),
+                **_WEAK,
+            )
         return dst
 
-    def store(self: "Lowerer", node: Any, var: Any, indices: Any, value: pb.Operand) -> None:
+    def store(self: Lowerer, node: Any, var: Any, indices: Any, value: pb.Operand) -> None:
         ref = self.ref_of(var)
         if ref is None:
             raise _Unsupported(node, f"store to unknown buffer {var.name}")
@@ -649,24 +868,41 @@ class MemoryMixin:
         value = self.cast_to(value, ty)
         if isinstance(ref, MemRef):
             site = self.site(node, buffer=ref.buf)
-            self.builder.emit("Store", site=site, ty=ty, buf=ref.buf, offset=offset, value=value,
-                              mods=pb.mem_mods(), **_WEAK)
+            self.builder.emit(
+                "Store",
+                site=site,
+                ty=ty,
+                buf=ref.buf,
+                offset=offset,
+                value=value,
+                mods=pb.mem_mods(),
+                **_WEAK,
+            )
         else:
+            check_view_access(node, var_name(var), ref, "write")
             addr = self.ptr_address(ref, offset)
             space = ref.space
             if space == "SharedCluster":
                 addr = self.cast_to(addr, pb.Ty("U32"))  # 32-bit shared::cluster window address
-            self.builder.emit("StoreAddr", site=self.site(node), ty=ty, addr=addr, space=space,
-                              value=value, mods=pb.mem_mods(), **_WEAK)
+            self.builder.emit(
+                "StoreAddr",
+                site=self.site(node),
+                ty=ty,
+                addr=addr,
+                space=space,
+                value=value,
+                mods=pb.mem_mods(),
+                **_WEAK,
+            )
 
-    def ptr_address(self: "Lowerer", ref: PtrRef, offset: pb.Operand) -> pb.Operand:
+    def ptr_address(self: Lowerer, ref: PtrRef, offset: pb.Operand) -> pb.Operand:
         total = offset
         if not (type_key(ref.elem_offset) == "ir.IntImm" and int(ref.elem_offset.value) == 0):
             ty = self.operand_ty(offset)
             total = self.binary("Add", ty, offset, self.cast_to(self.expr(ref.elem_offset), ty))
         return self.binary("Add", pb.Ty("U64"), ref.base, self.element_bytes(ref.info.dtype, total))
 
-    def address_of(self: "Lowerer", node: Any) -> pb.Operand:
+    def address_of(self: Lowerer, node: Any) -> pb.Operand:
         """``address_of(x)``: generic 64-bit address."""
         target = node.args[0]
         kind = type_key(target)
@@ -687,12 +923,12 @@ class MemoryMixin:
             return self.addr_of(ref.buf, offset)
         return self.ptr_address(ref, offset)
 
-    def addr_of(self: "Lowerer", buf: int, offset: pb.Operand) -> pb.Reg:
+    def addr_of(self: Lowerer, buf: int, offset: pb.Operand) -> pb.Reg:
         dst = self.builder.reg(pb.Ty("U64"))
         self.builder.emit("AddrOf", dst=dst, buf=buf, offset=offset)
         return dst
 
-    def buffer_data(self: "Lowerer", node: Any) -> pb.Operand:
+    def buffer_data(self: Lowerer, node: Any) -> pb.Operand:
         var = node.args[0]
         ref = self.refs.get(handle(var))
         if isinstance(ref, MemRef):
@@ -701,9 +937,12 @@ class MemoryMixin:
             return self.ptr_address(ref, self.const("int32", 0))
         raise _Unsupported(node, f"buffer_data of {var.name}")
 
-    def buffer_target(self: "Lowerer", addr_node: Any) -> tuple[int, pb.Operand] | None:
+    def buffer_target(self: Lowerer, addr_node: Any) -> tuple[int, pb.Operand] | None:
         """``(buf, element offset)`` if ``addr_node`` is ``address_of(buf[...])`` of a MemRef."""
-        if type_key(addr_node) != "ir.Call" or str(getattr(addr_node.op, "name", "")) != "tirx.address_of":
+        if (
+            type_key(addr_node) != "ir.Call"
+            or str(getattr(addr_node.op, "name", "")) != "tirx.address_of"
+        ):
             return None
         target = addr_node.args[0]
         if type_key(target) != "ir.TensorLoad":
@@ -715,7 +954,7 @@ class MemoryMixin:
         return ref.buf, offset
 
     # -- register arrays ---------------------------------------------------
-    def reg_array_slot(self: "Lowerer", ref: RegArray, indices: Any) -> int | pb.Operand:
+    def reg_array_slot(self: Lowerer, ref: RegArray, indices: Any) -> int | pb.Operand:
         static = ref.info.static_shape
         assert static is not None
         if all(type_key(i) == "ir.IntImm" for i in indices):
@@ -732,7 +971,7 @@ class MemoryMixin:
             raise _Unsupported(None, "vector access to a register-promoted local")
         return offset
 
-    def reg_array_read(self: "Lowerer", node: Any, ref: RegArray, indices: Any) -> pb.Operand:
+    def reg_array_read(self: Lowerer, node: Any, ref: RegArray, indices: Any) -> pb.Operand:
         if any(type_key(i) == "prim.Ramp" for i in indices):
             raise _Unsupported(node, "vector (Ramp) read of a register-promoted local")
         slot = self.reg_array_slot(ref, indices)
@@ -740,11 +979,19 @@ class MemoryMixin:
             reg = ref.regs[slot]
             return self.pred_args.get(reg.index, reg)
         dst = self.builder.reg(self.builder.reg_ty(ref.regs[0]))
-        self.builder.emit("LoadRegIndexed", site=self.site(node), dst=dst, base=ref.regs[0],
-                          len=len(ref.regs), idx=slot)
+        self.builder.emit(
+            "LoadRegIndexed",
+            site=self.site(node),
+            dst=dst,
+            base=ref.regs[0],
+            len=len(ref.regs),
+            idx=slot,
+        )
         return dst
 
-    def reg_array_write(self: "Lowerer", node: Any, ref: RegArray, indices: Any, value: pb.Operand) -> None:
+    def reg_array_write(
+        self: Lowerer, node: Any, ref: RegArray, indices: Any, value: pb.Operand
+    ) -> None:
         if any(type_key(i) == "prim.Ramp" for i in indices):
             raise _Unsupported(node, "vector (Ramp) write of a register-promoted local")
         elem = self.builder.reg_ty(ref.regs[0])
@@ -755,11 +1002,17 @@ class MemoryMixin:
             self.builder.set_uniform(reg, False)
             self.builder.emit("Mov", dst=reg, src=value)
             return
-        self.builder.emit("StoreRegIndexed", site=self.site(node), base=ref.regs[0], len=len(ref.regs),
-                          idx=slot, value=value)
+        self.builder.emit(
+            "StoreRegIndexed",
+            site=self.site(node),
+            base=ref.regs[0],
+            len=len(ref.regs),
+            idx=slot,
+            value=value,
+        )
 
     # -- lvalues (destination operands) -----------------------------------
-    def lvalue_target(self: "Lowerer", node: Any, ty_hint: pb.Ty | None = None) -> tuple[pb.Reg, Any]:
+    def lvalue_target(self: Lowerer, node: Any, ty_hint: pb.Ty | None = None) -> tuple[pb.Reg, Any]:
         """A register to write for lvalue ``node`` and a write-back thunk (or None)."""
         kind = type_key(node)
         if kind == "ir.Call" and str(node.op.name) == "tirx.address_of":
@@ -775,7 +1028,10 @@ class MemoryMixin:
                 self.builder.set_uniform(reg, False)
                 return reg, None
         dtype = dtypes.dtype_of(node)
-        temp = self.builder.reg(self.ty(dtype, node) if dtype else ty_hint)
+        temp_ty = self.ty(dtype, node) if dtype else ty_hint
+        if temp_ty is None:
+            raise _Unsupported(node, "destination operand without a dtype")
+        temp = self.builder.reg(temp_ty)
         source, indices = node.source, node.indices
 
         def write_back() -> None:
@@ -807,6 +1063,53 @@ def _imm(value: int) -> Any:
     return tirx.IntImm("int32", value)
 
 
+@dataclass(frozen=True)
+class TmemView:
+    """A TMEM view with a static address: its cell rectangle and geometry."""
+
+    buf: int
+    name: str  # the TIR name ("" for the anonymous views `rearrange`/`sub` emit)
+    lanes: tuple[int, int]
+    cols: tuple[int, int]  # 32-bit cells
+    geometry: tuple[str, tuple[str, ...], str]  # layout, shape, dtype
+
+    def contains(self, other: TmemView) -> bool:
+        return (
+            self.lanes[0] <= other.lanes[0]
+            and other.lanes[1] <= self.lanes[1]
+            and self.cols[0] <= other.cols[0]
+            and other.cols[1] <= self.cols[1]
+        )
+
+
+def _tmem_logical_root(earlier: list[TmemView], view: TmemView) -> int | None:
+    """The buffer whose logical identity a TMEM view takes (legacy
+    ``tmem_logical_buffer_name``): the earliest named view containing it.
+
+    TVM re-declares a TMEM view by address only (``rearrange``/``sub`` emit new
+    ``decl_buffer``s at the same ``allocated_addr``), so containment decides.
+    A named declaration with exactly the same cells and geometry under another
+    name is a separate lifetime reusing the cells, unless an anonymous view
+    with the same cells sits between them (a representation change).
+    """
+    for index, candidate in enumerate(earlier):
+        if not candidate.name or not candidate.contains(view):
+            continue
+        same_cells = view.contains(candidate)
+        if (
+            same_cells
+            and candidate.name != view.name
+            and candidate.geometry == view.geometry
+            and not any(
+                not bridge.name and bridge.contains(view) and view.contains(bridge)
+                for bridge in earlier[index + 1 :]
+            )
+        ):
+            continue
+        return candidate.buf
+    return None
+
+
 def _tmem_spans(layout: Any) -> tuple[int, int, bool] | None:
     """(lane span, column span, replicated) of a TMEM TileLayout, or None."""
     if layout is None or type_key(layout) != "tirx.TileLayout":
@@ -816,10 +1119,33 @@ def _tmem_spans(layout: Any) -> tuple[int, int, bool] | None:
     spans = {"TLane": 0, "TCol": 0}
     for iterator in list(layout.shard) + list(layout.replica):
         axis = str(iterator.axis.name)
-        if axis not in spans or type_key(iterator.extent) != "ir.IntImm" or type_key(iterator.stride) != "ir.IntImm":
+        if (
+            axis not in spans
+            or type_key(iterator.extent) != "ir.IntImm"
+            or type_key(iterator.stride) != "ir.IntImm"
+        ):
             return None
         spans[axis] += (int(iterator.extent.value) - 1) * int(iterator.stride.value)
     return spans["TLane"] + 1, spans["TCol"] + 1, len(layout.replica) > 0
+
+
+# TVM's default `Buffer.data_alignment` (no `align=` in the source).
+DEFAULT_DATA_ALIGNMENT = 64
+
+
+def _allocation_alignment(ty: Any, info: Shape) -> int:
+    """Byte alignment of an allocation's placement.
+
+    An explicit ``align=`` is the placement contract (legacy
+    ``test_cvta_aligns_each_shared_backing_to_its_declared_alignment``: a
+    128B-swizzled buffer declared ``align=128`` starts at 128). Without one, a
+    swizzled operand starts on its swizzle repeat (``_swizzle_period_bytes``),
+    as TIRx's pool allocator places MMA operands.
+    """
+    declared = int(ty.data_alignment)
+    if declared != DEFAULT_DATA_ALIGNMENT:
+        return max(16, declared)
+    return max(16, declared, _swizzle_period_bytes(info.layout, info.dtype))
 
 
 def _swizzle_period_bytes(layout: Any, dtype: str) -> int:
@@ -857,7 +1183,7 @@ def _layout_span(layout: Any, numel: int) -> int:
             if set(mapped) - {"m"} or value is None or type_key(value) != "ir.IntImm":
                 return numel
             top = max(top, int(value.value))
-    except Exception:  # noqa: BLE001 - layouts TVM cannot evaluate keep the logical size
+    except Exception:
         return numel
     return top + 1
 

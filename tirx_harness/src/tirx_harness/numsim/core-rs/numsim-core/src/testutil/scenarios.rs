@@ -753,6 +753,40 @@ pub fn atomic_count_wait(ctas: u32) -> Scenario {
     sc
 }
 
+/// W6 (sync §4.6, Q11): non-`.aligned` `barrier.cluster.arrive` by the two
+/// arms of a divergent `If` (lanes < 16 / lanes >= 16), then every lane
+/// waits; lane 0 writes `out[0] = 2`. `exit_else`: the else arm exits
+/// instead of arriving (the gathered lanes' missing lanes exit:
+/// `PartialWarp`).
+pub fn cluster_partial_arrive(exit_else: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("cluster_partial_arrive", 32);
+    b.cluster(1, 1, 1);
+    let out = b.global("out", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k2 = b.k_u32(2);
+    let k16 = b.k_u32(16);
+    b.compare(CmpOp::Lt, Ty::U32, p, lane, k16);
+    b.if_(p);
+    b.push(Instr::ClusterArrive { sem: Sem::Release, aligned: false });
+    b.else_();
+    if exit_else {
+        b.exit();
+    } else {
+        b.push(Instr::ClusterArrive { sem: Sem::Release, aligned: false });
+    }
+    b.end_if();
+    b.push(Instr::ClusterWait { acquire: true, aligned: false });
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.st_u32(out, k0, k2);
+    b.end_if();
+    b.exit();
+    scenario("cluster_partial_arrive", b.build_module(), inputs(vec![("out", u32_buf([0]))]))
+}
+
 /// A register-only scalar loop (`iters` iterations of fma) per thread:
 /// dispatch cost per instruction.
 pub fn scalar_loop(iters: u32) -> Scenario {
@@ -4150,6 +4184,7 @@ pub const MAX_HISTORY_PROBE: u32 = (crate::interp::aux::MAX_WORD_HISTORY as u32)
 pub fn all() -> Vec<Scenario> {
     vec![
         vector_add(),
+        cluster_partial_arrive(false),
         atomic_count_wait(4),
         wait_until_chain(6),
         addr_of_vector_buffer(),

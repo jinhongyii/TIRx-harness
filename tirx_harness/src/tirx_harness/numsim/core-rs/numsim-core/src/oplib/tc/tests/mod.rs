@@ -198,6 +198,7 @@ fn payload(
             ashift: false,
             lut_b: false,
             lut_b_addr: None,
+            declared: None,
         },
         d_taddr: D_COL,
         a: a_bits,

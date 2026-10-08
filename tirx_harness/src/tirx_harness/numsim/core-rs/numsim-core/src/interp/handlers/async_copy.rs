@@ -58,6 +58,11 @@ pub struct Issue {
     /// `tcgen05.commit .sync_restrict`: `after` holds only the shared-operand
     /// read ops (`SyncKind::AsyncIssue::restricted`).
     pub restricted: bool,
+    /// `AsyncIssue.preds` when it differs from the landing order `after`:
+    /// tcgen05 ops land in the CTA's pipeline order but name only the
+    /// issuing thread's predecessor (PTX §9.7.16.6; W5 note). `None` =
+    /// `after`.
+    pub preds: Option<Vec<AsyncId>>,
 }
 
 /// Issue an async op: allocate its id, emit `AsyncIssue`, queue it.
@@ -80,7 +85,7 @@ pub fn issue_async(ctx: &mut ExecCtx<'_>, lanes: WarpMask, is: Issue) -> AsyncId
                 op: id,
                 class: is.class,
                 proxy: is.proxy,
-                preds: is.after.clone(),
+                preds: is.preds.clone().unwrap_or_else(|| is.after.clone()),
                 footprint: fp,
                 targets: is.targets.clone(),
                 restricted: is.restricted,
@@ -251,6 +256,7 @@ pub fn cp_async(
                 lut_b: None,
                 strong: None,
                 restricted: false,
+                preds: None,
             },
         );
         ctx.aux.groups.issue(group_res(ctx, l, Domain::CpAsync), op);
@@ -411,6 +417,9 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
     for l in active.lanes() {
         let size = lane_val(ctx, args.size, l);
         let sa = lane_val(ctx, args.src, l);
+        // W4 (W12-gaps): PTX bulk-copy layout (size multiple of 16, 16-byte aligned ends).
+        let da = lane_val(ctx, args.dst, l);
+        crate::oplib::bulk_copy_layout(size, sa, da, l, args.reduce.is_some()).map_err(|e| support::op_err(ctx, e))?;
         // `.ignore_oob`: the first `left` and last `right` source bytes are
         // not read and their destination bytes are left unchanged (tx still
         // counts `size`).
@@ -536,6 +545,7 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
                 lut_b: None,
                 strong: None,
                 restricted: false,
+                preds: None,
             },
         );
         if !dead.is_empty() {
@@ -652,11 +662,14 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
                 ));
             }
         }
+        let coords: Vec<i64> = args.coords.iter().map(|&c| lane_int(ctx, c, l)).collect();
         if !args.overrides.is_empty() {
             let ov: Vec<_> = args.overrides.iter().map(|o| (o.field, o.ord, lane_val(ctx, o.value, l))).collect();
-            desc.apply_overrides(&ov).map_err(|e| support::op_err(ctx, e))?;
+            // W4 (W12-gaps 2): the override address window and zero-coordinate rules.
+            let arena = &ctx.arena;
+            let applied = desc.apply_overrides(&ov, &coords, &|va, len| arena.resolve_global(va, len).is_ok());
+            applied.map_err(|e| support::op_err(ctx, e))?;
         }
-        let coords: Vec<i64> = args.coords.iter().map(|&c| lane_int(ctx, c, l)).collect();
         let offs: Vec<i64> = args.im2col_offsets.iter().map(|&c| lane_int(ctx, c, l)).collect();
         if args.dir == TmaDir::Prefetch {
             // W4-17: a tensor prefetch only checks the rank (legacy), no plan.
@@ -801,6 +814,7 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
                 lut_b: None,
                 strong: None,
                 restricted: false,
+                preds: None,
             },
         );
         if !bit_frags.is_empty() {
@@ -874,6 +888,7 @@ pub fn st_async(ctx: &mut ExecCtx<'_>, args: StAsyncArgs) -> HResult {
                 lut_b: None,
                 strong: Some(args.scope),
                 restricted: false,
+                preds: None,
             },
         );
     }

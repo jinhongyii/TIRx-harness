@@ -25,6 +25,7 @@ statement tree:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from . import builtins, ptx_decode
@@ -58,10 +59,13 @@ class _Analysis:
             return env.get(_handle(node))
         if kind == "ir.Cast":
             return self.value(node.value, env)
-        ops = {"prim.Add": lambda a, b: a + b, "prim.Sub": lambda a, b: a - b,
-               "prim.Mul": lambda a, b: a * b,
-               "prim.FloorDiv": lambda a, b: a // b if b else None,
-               "prim.FloorMod": lambda a, b: a % b if b else None}
+        ops: dict[str, Callable[[int, int], int | None]] = {
+            "prim.Add": lambda a, b: a + b,
+            "prim.Sub": lambda a, b: a - b,
+            "prim.Mul": lambda a, b: a * b,
+            "prim.FloorDiv": lambda a, b: a // b if b else None,
+            "prim.FloorMod": lambda a, b: a % b if b else None,
+        }
         if kind in ops:
             a, b = self.value(node.a, env), self.value(node.b, env)
             return None if a is None or b is None else ops[kind](a, b)
@@ -114,15 +118,20 @@ class _Analysis:
         return out
 
     # -- reads --------------------------------------------------------------
-    def reads(self, node: Any, state: dict[int, Any], env: dict[int, int], skip: Any = None) -> None:
+    def reads(
+        self, node: Any, state: dict[int, Any], env: dict[int, int], skip: Any = None
+    ) -> None:
         """Every candidate element ``node`` reads must be written already."""
         from tvm_ffi import structural_visit
+
         import tvm
 
         def on_load(load: Any, visitor: Any) -> None:
             if load is not skip:
                 buf = _handle(load.source)
-                if buf in self.shapes and not self.written(state, buf, self.flat(buf, load.indices, env)):
+                if buf in self.shapes and not self.written(
+                    state, buf, self.flat(buf, load.indices, env)
+                ):
                     self.maybe_uninit.add(buf)
             for index in load.indices:
                 visitor.visit(index)
@@ -132,7 +141,9 @@ class _Analysis:
         structural_visit(node, [(tvm.ir.TensorLoad, on_load)])
 
     # -- statements ---------------------------------------------------------
-    def stmt(self, node: Any, state: dict[int, Any], env: dict[int, int]) -> tuple[dict[int, Any], bool]:
+    def stmt(
+        self, node: Any, state: dict[int, Any], env: dict[int, int]
+    ) -> tuple[dict[int, Any], bool]:
         """State after ``node`` and whether it may ``break``."""
         kind = type_key(node)
         if kind == "tirx.SeqStmt":
@@ -257,8 +268,14 @@ class _Analysis:
             writes = []
             for position, arg in enumerate(value.args):
                 role = builtins.role(helper.roles, position)
-                target = arg.args[0] if (type_key(arg) == "ir.Call"
-                                         and str(getattr(arg.op, "name", "")) == "tirx.address_of") else None
+                target = (
+                    arg.args[0]
+                    if (
+                        type_key(arg) == "ir.Call"
+                        and str(getattr(arg.op, "name", "")) == "tirx.address_of"
+                    )
+                    else None
+                )
                 if role in "ox" and target is not None and type_key(target) == "ir.TensorLoad":
                     if role == "x":
                         self.reads(target, state, env)
@@ -272,7 +289,9 @@ class _Analysis:
         self.reads(value, state, env)
         return state
 
-    def store_all(self, loads: list[Any], state: dict[int, Any], env: dict[int, int]) -> dict[int, Any]:
+    def store_all(
+        self, loads: list[Any], state: dict[int, Any], env: dict[int, int]
+    ) -> dict[int, Any]:
         state = self.copy(state)
         for load in loads:
             if type_key(load) != "ir.TensorLoad":
@@ -285,7 +304,11 @@ class _Analysis:
 
 def _tile_placeholder(value: Any) -> Any | None:
     """The original tile call behind a v2 tile-form placeholder, or None."""
-    if type_key(value) != "ir.Call" or str(getattr(value.op, "name", "")) != "tirx.call_extern" or not value.args:
+    if (
+        type_key(value) != "ir.Call"
+        or str(getattr(value.op, "name", "")) != "tirx.call_extern"
+        or not value.args
+    ):
         return None
     from . import tile_forms
 

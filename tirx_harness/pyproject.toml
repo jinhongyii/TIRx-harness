@@ -18,3 +18,48 @@ select = ["E", "F"]
 "src/tirx_harness/**/*.py" = ["E402", "E501", "E701", "E702", "E741", "F821", "F823", "F841", "F842"]
 "src/tirx_harness/**/__init__.py" = ["F401"]
 "tests/**/*.py" = ["E501", "E741", "F821", "F823", "F841", "F842"]
+
+# Same formatter settings as the repository root pyproject.toml.
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = true
+line-ending = "auto"
+docstring-code-format = false
+docstring-code-line-length = "dynamic"
+
+# Type checking is enforced on NumSim v2 lowering only:
+#   cd tirx_harness/src && mypy -p tirx_harness.numsim.v2.lowering
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true   # tvm / tvm_ffi ship no stubs
+follow_imports = "silent"
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+module = ["tirx_harness.numsim.v2.lowering", "tirx_harness.numsim.v2.lowering.*"]
+# `--strict`, flag by flag (strict cannot be set per module).
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_any_generics = true
+disallow_subclassing_any = false  # TVM classes are untyped (Any)
+check_untyped_defs = true
+no_implicit_reexport = true
+strict_equality = true
+warn_return_any = true
+warn_unused_ignores = true
+extra_checks = true
+
+[[tool.mypy.overrides]]
+# The Lowerer mixins annotate `self: Lowerer` (the class that mixes them in);
+# mypy reports each such method as "erased type of self is not a supertype"
+# [misc]. That is the only [misc] error these modules raise.
+module = [
+  "tirx_harness.numsim.v2.lowering.calls",
+  "tirx_harness.numsim.v2.lowering.host_prelude",
+  "tirx_harness.numsim.v2.lowering.memory",
+  "tirx_harness.numsim.v2.lowering.owner_transport",
+]
+disable_error_code = ["misc"]

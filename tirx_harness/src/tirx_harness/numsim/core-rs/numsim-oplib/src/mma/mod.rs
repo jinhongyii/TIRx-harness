@@ -1,11 +1,10 @@
 //! Warp-level MMA numerics (`mma.sync`, `mma.sp.sync`) and the dense matmul
-//! cores shared with tcgen05 / tile GEMM.
+//! cores shared with tcgen05.
 //!
 //! Legacy sources: `engine-rs/src/runtime/matrix_ops.rs`,
 //! `engine-rs/src/runtime/instructions/matrix.rs` (ABI variants only; the
 //! marker types became the runtime enums in `fragments` / `sparse`),
-//! `engine-rs/src/numpy_backend.rs` (`python` module -> `numpy`), and the
-//! generic matmul helpers of `engine-rs/src/runtime/tcgen_ops.rs`.
+//! and the generic matmul helpers of `engine-rs/src/runtime/tcgen_ops.rs`.
 //!
 //! # Accumulation contract
 //!
@@ -40,23 +39,11 @@
 //! in i64 from C; `.satfinite` clamps to s32, otherwise wraps; `b1.xor` is
 //! `popc(a) + sum((1-2a) * b)` (`matrix_ops.rs:532-566`).
 //!
-//! **The NumPy exception.** Legacy `tile_gemm_bf16_f32_ss_cta1`
-//! (`tcgen_ops.rs:296-378`) computes the plain product (no input D; the
-//! frontend only emits it for `accumulate=false`, `cta_group=1`, bf16 inputs,
-//! `M in {64,128}`, `N,K >= 64`) with `numpy.matmul` when built with the
-//! `python` feature (`tcgen_ops.rs:342-356`) and with the increasing-K chain
-//! otherwise (`:357-361`). The `python` feature is always on for transpiled
-//! artifacts (`transpiler/build.py:970`), but `instructions/tile.rs:6042-6070`
-//! calls the increasing-K twin `tile_gemm_bf16_f32_ss_cta1_increasing_k`
-//! whenever the engine observes operations (racecheck/synccheck), so only
-//! plain `numsim` runs of that one canonical GEMM use BLAS order. Here that
-//! choice is the `MatmulBackend` trait: `ReferenceBackend` (default, pure Rust,
-//! the increasing-K contract) and `NumpyBackend` (feature `numpy`, BLAS order,
-//! bit-identical to the legacy plain run). No unit test or Python golden pins
-//! NumPy-specific bits: every Python test comparing against `np.matmul` uses
-//! small-integer data where any order is exact. Conformance snapshots hashed
-//! from legacy plain runs would pin them if a canonical case hits that path
-//! with inexact data.
+//! **The NumPy exception (removed).** Legacy `tile_gemm_bf16_f32_ss_cta1`
+//! used `numpy.matmul` in plain runs (delta T1). That tile-GEMM path, and the
+//! `MatmulBackend`/`NumpyBackend` choice that served it, went with the tile
+//! layer: `tirx.tile.gemm{,_async}` now lowers through TVM dispatch to
+//! tcgen05.mma, whose numerics are the increasing-K chain above.
 //!
 //! ldmatrix/stmatrix/movmatrix lane maps are not in these legacy files
 //! (`runtime/memory_ops.rs`, `runtime/instructions/warp.rs`), so they are not
@@ -64,15 +51,11 @@
 
 pub mod backend;
 pub mod fragments;
-#[cfg(feature = "numpy")]
-pub mod numpy;
 pub mod sparse;
 pub mod sync;
 
 pub use backend::*;
 pub use fragments::*;
-#[cfg(feature = "numpy")]
-pub use numpy::{F32Matrix, NumpyBackend, NumpyBackendError};
 pub use sparse::*;
 pub use sync::*;
 
@@ -103,6 +86,5 @@ pub(crate) const BINDINGS: &[Binding] = &[
     bind("tirx.ptx.mma_sp_int_pair", "mma::mma_sp_sync"),
     bind("tirx.ptx.mma_sp", "mma::sparse_metadata_source_mask"),
     bind("mma.sync", "mma::mma_f32"),
-    bind("tirx.tile.gemm_async", "mma::MatmulBackend::matmul_f32_abt"),
     bind("tirx.tile.gemm_async", "mma::mma_f32_abt_increasing_k"),
 ];

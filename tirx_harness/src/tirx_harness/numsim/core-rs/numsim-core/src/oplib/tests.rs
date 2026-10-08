@@ -126,3 +126,93 @@ fn reserved_operand_bits_are_operand_errors_not_unsupported() {
     assert_eq!(lift("s1z4m11 operand has nonzero reserved bits"), OpErrorKind::Invalid);
     assert_eq!(lift("ti16_transpose_unmodeled requires an unmodeled analysis contract"), OpErrorKind::Unsupported);
 }
+
+/// W12-gaps: non-tensor bulk copy/reduce layout operands (PTX: byte count a
+/// positive multiple of 16, both addresses 16-byte aligned) are `Invalid`.
+#[test]
+fn bulk_copy_layout_requires_16_byte_sizes_and_alignment() {
+    use super::{bulk_copy_layout, OpErrorKind};
+    for reduce in [false, true] {
+        bulk_copy_layout(16, 0x1000, 0x2000, 0, reduce).unwrap();
+        bulk_copy_layout(4096, 0x1010, 0x20f0, 3, reduce).unwrap();
+        for (size, src, dst, needle) in [
+            (12, 0x1000, 0x2000, "positive multiple of 16"),
+            (0, 0x1000, 0x2000, "positive multiple of 16"),
+            (u64::MAX, 0x1000, 0x2000, "positive multiple of 16"),
+            (16, 0x1004, 0x2000, "16-byte aligned source and destination"),
+            (16, 0x1000, 0x2001, "16-byte aligned source and destination"),
+        ] {
+            let err = bulk_copy_layout(size, src, dst, 1, reduce).unwrap_err();
+            assert_eq!(err.kind, OpErrorKind::Invalid, "{err}");
+            assert!(err.message.contains(needle), "{err}");
+            assert!(err.message.contains(if reduce { "cp.reduce.async.bulk" } else { "cp.async.bulk" }));
+        }
+    }
+}
+
+/// W11-7: the contract wrapper maps each kind to its descriptor layout and
+/// reports a declared/encoded shape mismatch as `Invalid`.
+#[test]
+fn tcgen_mma_runtime_descriptor_must_match_declared_shape() {
+    use crate::program::TcMmaKind;
+    let mx = (8_u32 << 24) | (2 << 17) | (1 << 23);
+    tcgen_mma_check_declared(TcMmaKind::MxF8f6f4, mx, [128, 16, 32]).unwrap();
+    let err = tcgen_mma_check_declared(TcMmaKind::MxF8f6f4, mx ^ (1 << 17), [128, 16, 32]).unwrap_err();
+    assert_eq!(err.kind, OpErrorKind::Invalid);
+    assert!(err.message.contains("N=24") && err.message.contains("N=16"), "{err}");
+    let f16 = (8_u32 << 24) | (2 << 17) | (1 << 4);
+    tcgen_mma_check_declared(TcMmaKind::F16, f16, [128, 16, 16]).unwrap();
+    assert!(tcgen_mma_check_declared(TcMmaKind::Tf32, f16, [128, 16, 16]).is_err());
+}
+
+/// Decision 16: `TcgenMmaArgs.declared` defaults to `None` when the JSON key
+/// is absent (older modules load), round-trips when present, and its static
+/// legality follows the kind's shape table.
+#[test]
+fn tcgen_mma_declared_field_serde_and_legality() {
+    use crate::program::{CollectorOp, ConstId, Operand, TcA, TcMmaKind, TcgenMmaArgs};
+    let op = Operand::Const(ConstId(0));
+    let args = TcgenMmaArgs {
+        kind: TcMmaKind::MxF8f6f4,
+        cta_group: 1,
+        d: op,
+        a: TcA::Smem(op),
+        b_desc: op,
+        idesc: op,
+        enable_input_d: op,
+        ws: false,
+        ws_b_buffer: 0,
+        block_scale: Some((op, op, 32)),
+        scale_input_d: None,
+        sparse_meta: None,
+        disable_output_lane: Vec::new(),
+        collector_a: CollectorOp::None,
+        collector_b: CollectorOp::None,
+        ashift: false,
+        lut_b: false,
+        lut_b_addr: None,
+        declared: None,
+    };
+    let mut json = serde_json::to_value(&args).unwrap();
+    assert_eq!(json["declared"], serde_json::Value::Null);
+    json.as_object_mut().unwrap().remove("declared");
+    let back: TcgenMmaArgs = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(back.declared, None);
+    json["declared"] = serde_json::json!([128, 16, 32]);
+    let back: TcgenMmaArgs = serde_json::from_value(json).unwrap();
+    assert_eq!(back.declared, Some([128, 16, 32]));
+
+    tcgen_mma_declared_legal(TcMmaKind::MxF8f6f4, 1, [128, 16, 32]).unwrap();
+    tcgen_mma_declared_legal(TcMmaKind::MxF8f6f4, 2, [256, 32, 32]).unwrap();
+    tcgen_mma_declared_legal(TcMmaKind::F16, 1, [64, 8, 16]).unwrap();
+    tcgen_mma_declared_legal(TcMmaKind::MxF4Nvf4, 1, [128, 256, 64]).unwrap();
+    for (kind, cg, d) in [
+        (TcMmaKind::MxF8f6f4, 1, [256, 16, 32]), // M=256 needs cta_group::2
+        (TcMmaKind::F16, 1, [128, 12, 16]),      // N not a multiple of 8
+        (TcMmaKind::F16, 1, [128, 16, 32 + 8]),  // K not the kind's
+        (TcMmaKind::Tf32, 1, [128, 512, 8]),     // N > 256
+    ] {
+        let e = tcgen_mma_declared_legal(kind, cg, d).unwrap_err();
+        assert_eq!(e.kind, OpErrorKind::Invalid, "{e}");
+    }
+}

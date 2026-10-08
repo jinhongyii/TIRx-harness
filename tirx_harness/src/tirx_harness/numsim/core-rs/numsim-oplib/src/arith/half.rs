@@ -48,7 +48,8 @@ pub fn map_half2<const N: usize>(args: [u32; N], operation: impl Fn([u16; N]) ->
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HalfClamp {
     None,
-    /// `.sat`: NaN and negatives map to `+0`; values above 1.0 map to 1.0.
+    /// `.sat`: NaN and negatives map to `+0`; values above 1.0 map to the
+    /// format's 1.0 ([`LowPrecisionFormat::one`]).
     Sat,
     /// `.relu`: negatives map to `+0`, NaN maps to canonical `0x7fff`.
     Relu,
@@ -62,7 +63,7 @@ pub fn apply_half_clamp(bits: u16, format: LowPrecisionFormat, clamp: HalfClamp)
             if bits & 0x7fff > format.infinity() || bits & 0x8000 != 0 {
                 0
             } else {
-                bits.min(0x3c00)
+                bits.min(format.one())
             }
         }
         HalfClamp::Relu => {

@@ -23,23 +23,57 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import tvm
 from tvm import tirx
 
 from . import program_builder as pb
 from .dtypes import type_key
 from .memory import MemRef, _Unsupported, buffer_shape, handle
+from .tile_forms.copy import layout_thread_axes as _thread_axes
+from .tile_forms.copy import unflatten
 
 if TYPE_CHECKING:
     from .ir_walk import Lowerer
 
-ELEMENTWISE = frozenset({"copy", "cast", "add", "sub", "mul", "fdiv", "div", "maximum", "minimum",
-                         "sqrt", "exp", "exp2", "log", "log2", "abs", "neg", "rsqrt", "reciprocal"})
-_THREAD_AXES = ("laneid", "tid_in_wg", "tid_in_cta", "wid_in_wg", "warpid")
-_BINARY = {"add": tirx.Add, "sub": tirx.Sub, "mul": tirx.Mul, "fdiv": tirx.Div, "div": tirx.Div,
-           "maximum": tirx.Max, "minimum": tirx.Min}
-_UNARY = {"sqrt": "sqrt", "exp": "exp", "exp2": "exp2", "log": "log", "log2": "log2", "abs": "abs",
-          "rsqrt": "rsqrt"}
+ELEMENTWISE = frozenset(
+    {
+        "copy",
+        "cast",
+        "add",
+        "sub",
+        "mul",
+        "fdiv",
+        "div",
+        "maximum",
+        "minimum",
+        "sqrt",
+        "exp",
+        "exp2",
+        "log",
+        "log2",
+        "abs",
+        "neg",
+        "rsqrt",
+        "reciprocal",
+    }
+)
+_BINARY = {
+    "add": tirx.Add,
+    "sub": tirx.Sub,
+    "mul": tirx.Mul,
+    "fdiv": tirx.Div,
+    "div": tirx.Div,
+    "maximum": tirx.Max,
+    "minimum": tirx.Min,
+}
+_UNARY = {
+    "sqrt": "sqrt",
+    "exp": "exp",
+    "exp2": "exp2",
+    "log": "log",
+    "log2": "log2",
+    "abs": "abs",
+    "rsqrt": "rsqrt",
+}
 
 
 def _region_parts(arg: Any) -> tuple[Any, Any] | None:
@@ -48,23 +82,17 @@ def _region_parts(arg: Any) -> tuple[Any, Any] | None:
     if source is None or not hasattr(arg, "region"):
         return None
     ty = getattr(source, "ty", None)
+    if ty is None:
+        return None
     try:
         shape = [int(s) for s in ty.shape]
-        if [int(r.min) for r in arg.region] != [0] * len(shape) or [int(r.extent) for r in arg.region] != shape:
+        if [int(r.min) for r in arg.region] != [0] * len(shape) or [
+            int(r.extent) for r in arg.region
+        ] != shape:
             return None
     except (TypeError, ValueError, AttributeError):
         return None
     return source, getattr(ty, "layout", None)
-
-
-def _thread_axes(layout: Any) -> tuple[str, ...]:
-    if layout is None or type_key(layout) != "tirx.TileLayout":
-        return ()
-    try:
-        mapped = layout.apply(tirx.IntImm("int32", 0))
-    except Exception:  # noqa: BLE001
-        return ()
-    return tuple(sorted(str(k) for k in mapped.keys() if str(k) in _THREAD_AXES))
 
 
 def is_owner_transport(node: Any) -> bool:
@@ -86,8 +114,11 @@ def function_is_owner_transport(func: Any) -> bool:
 
     calls: list[Any] = []
     structural_visit(func.body, [(tirx.TilePrimitiveCall, lambda n, v: calls.append(n))])
-    return bool(calls) and any(is_owner_transport(c) for c in calls) and all(
-        _lowerable(c) for c in calls)
+    return (
+        bool(calls)
+        and any(is_owner_transport(c) for c in calls)
+        and all(_lowerable(c) for c in calls)
+    )
 
 
 def _lowerable(node: Any) -> bool:
@@ -100,8 +131,9 @@ def _lowerable(node: Any) -> bool:
             return False
     elif len(present) != 2:
         return False
-    regions = [_region_parts(a) for a in node.args if hasattr(a, "region")]
-    if not regions or any(r is None for r in regions):
+    found = [_region_parts(a) for a in node.args if hasattr(a, "region")]
+    regions = [r for r in found if r is not None]
+    if not regions or len(regions) != len(found):
         return False
     shapes = {tuple(int(s) for s in r[0].ty.shape) for r in regions}
     return len(shapes) == 1
@@ -110,11 +142,15 @@ def _lowerable(node: Any) -> bool:
 class OwnerTransportMixin:
     """Lowers element-wise tile ops by explicit owner transport (mixed into ``Lowerer``)."""
 
-    def lower_owner_transport(self: "Lowerer", node: Any) -> None:
+    def lower_owner_transport(self: Lowerer, node: Any) -> None:
         op = str(node.op.name).rpartition(".")[2]
         if not _lowerable(node):
-            raise _Unsupported(node, f"tile op {op}: not an element-wise op over whole buffers of one shape")
-        dst_var, dst_layout = _region_parts(node.args[0])
+            raise _Unsupported(
+                node, f"tile op {op}: not an element-wise op over whole buffers of one shape"
+            )
+        dst_parts = _region_parts(node.args[0])
+        assert dst_parts is not None  # _lowerable checked every region operand
+        dst_var, dst_layout = dst_parts
         # Unary tile ops carry optional trailing operands (None when unused).
         sources = [a for a in node.args[1:] if a is not None]
         shape = [int(s) for s in dst_var.ty.shape]
@@ -122,25 +158,19 @@ class OwnerTransportMixin:
         for extent in shape:
             numel *= extent
         dst_axes = _thread_axes(dst_layout)
-        fragments = [(_region_parts(a)) for a in sources if _region_parts(a) is not None]
+        fragments = [p for p in (_region_parts(a) for a in sources) if p is not None]
         if dst_axes:
             exec_layout = dst_layout
         else:
             owners = [p for p in fragments if _thread_axes(p[1])]
             if len({str(p[1]) for p in owners}) > 1:
-                raise _Unsupported(node, f"tile op {op}: memory destination fed by differently owned fragments")
+                raise _Unsupported(
+                    node, f"tile op {op}: memory destination fed by differently owned fragments"
+                )
             exec_layout = owners[0][1] if owners else None
         if exec_layout is None:
             raise _Unsupported(node, f"tile op {op}: no fragment operand to own the elements")
         flat = tirx.Var("owner_i", "int32")
-
-        def unflat(index: Any) -> list[Any]:
-            out, rest = [], index
-            for axis in reversed(range(len(shape))):
-                extent = tirx.IntImm("int32", shape[axis])
-                out.append(tirx.FloorMod(rest, extent) if axis else rest)
-                rest = tirx.FloorDiv(rest, extent)
-            return list(reversed(out))
 
         def owned(layout: Any) -> Any:
             mapped = {str(k): v for k, v in layout.apply(flat).items()}
@@ -162,21 +192,34 @@ class OwnerTransportMixin:
             var, layout = parts
             scratch = self.owner_scratch(var, numel)
             staged[position] = scratch
-            store = tirx.BufferStore(scratch, var[tuple(unflat(flat))], [flat])
-            stage_stmts.append(tirx.For(flat, tirx.IntImm("int32", 0), tirx.IntImm("int32", numel),
-                                        tirx.ForKind.SERIAL, tirx.IfThenElse(owned(layout), store, None)))
+            store = tirx.BufferStore(scratch, var[tuple(unflatten(flat, shape))], [flat])
+            stage_stmts.append(
+                tirx.For(
+                    flat,
+                    tirx.IntImm("int32", 0),
+                    tirx.IntImm("int32", numel),
+                    tirx.ForKind.SERIAL,
+                    tirx.IfThenElse(owned(layout), store, None),
+                )
+            )
         values = []
         for position, arg in enumerate(sources):
             if position in staged:
                 values.append(staged[position][flat])
             elif hasattr(arg, "region"):
-                values.append(arg.source[tuple(unflat(flat))])
+                values.append(arg.source[tuple(unflatten(flat, shape))])
             else:
                 values.append(arg)
         value = self.elementwise_value(node, op, values, dst_var.ty.dtype.dtype)
-        compute = tirx.For(flat, tirx.IntImm("int32", 0), tirx.IntImm("int32", numel), tirx.ForKind.SERIAL,
-                           tirx.IfThenElse(owned(exec_layout),
-                                           tirx.BufferStore(dst_var, value, unflat(flat)), None))
+        compute = tirx.For(
+            flat,
+            tirx.IntImm("int32", 0),
+            tirx.IntImm("int32", numel),
+            tirx.ForKind.SERIAL,
+            tirx.IfThenElse(
+                owned(exec_layout), tirx.BufferStore(dst_var, value, unflatten(flat, shape)), None
+            ),
+        )
         for stmt in stage_stmts:
             self.stmt(stmt)
         if stage_stmts:
@@ -185,7 +228,7 @@ class OwnerTransportMixin:
         if stage_stmts:
             self.scope_barrier(node, scope)
 
-    def elementwise_value(self: "Lowerer", node: Any, op: str, values: list[Any], dtype: Any) -> Any:
+    def elementwise_value(self: Lowerer, node: Any, op: str, values: list[Any], dtype: Any) -> Any:
         dtype = str(dtype)
 
         def as_dtype(v: Any) -> Any:
@@ -205,19 +248,28 @@ class OwnerTransportMixin:
             return getattr(tirx, _UNARY[op])(as_dtype(values[0]))
         raise _Unsupported(node, f"tile op {op} with {len(values)} operands")
 
-    def owner_scratch(self: "Lowerer", like: Any, numel: int) -> Any:
+    def owner_scratch(self: Lowerer, like: Any, numel: int) -> Any:
         dtype = str(like.ty.dtype.dtype)
         var = tirx.decl_buffer((numel,), dtype, scope="shared")
         elem = self.ty(dtype)
-        buf = self.builder.buffer(pb.BufferDecl(
-            name=f"{like.name}.transport", space="Shared", dtype=elem, shape=(pb.DimExpr.const(numel),),
-            byte_len=pb.DimExpr.const(numel * elem.bits // 8), align=16))
+        buf = self.builder.buffer(
+            pb.BufferDecl(
+                name=f"{like.name}.transport",
+                space="Shared",
+                dtype=elem,
+                shape=(pb.DimExpr.const(numel),),
+                byte_len=pb.DimExpr.const(numel * elem.bits // 8),
+                align=16,
+            )
+        )
         self.refs[handle(var)] = MemRef(buf=buf, space="Shared", info=buffer_shape(var.ty))
         return var
 
-    def scope_barrier(self: "Lowerer", node: Any, scope: str) -> None:
+    def scope_barrier(self: Lowerer, node: Any, scope: str) -> None:
         if "warpgroup" in scope:
-            self.barrier(node, "Sync", self.const("uint32", 8), self.const("uint32", 128))  # TVM warpgroup_sync(8)
+            self.barrier(
+                node, "Sync", self.const("uint32", 8), self.const("uint32", 128)
+            )  # TVM warpgroup_sync(8)
         elif "warp" in scope:
             self.builder.emit("WarpSync", site=self.site(node), membermask=self.full_mask())
         else:
