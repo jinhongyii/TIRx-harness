@@ -2162,3 +2162,35 @@ binds through `TensorMapOf` and is unaffected.
   - Read-then-write: this is now ordered by hb, since the ISA defines the tensormap fence only for generic→tensormap.
   - On gdn_prefill_sm100 the kernel's release/acquire pattern is correct, so both directions are now clean.
   - Delta I9. Tests: `racecheck_tmap_lane`.
+
+## v2 conformance, sweep 3 (W8, 2026-10-08, at 27b485c + W8 fixes)
+
+Current table: `docs/development/v2-conformance-status.md` (numsim 88 / racecheck 59 / synccheck 83 of 101 match;
+public-API set 484 of 762 pass). Resolved since sweep 2: V2C-1, -3, -4, -5, -14, -15, -18, -19, -20, -29,
+-30, -32, -33, -34 rows no longer appear (rows of the 12 V2C-35 cases may be masked by that crash). V2C-35 is a regression from the `arena::addr` low-bits ruling and
+needs a decision before more rows can be judged. New rows:
+
+### V2C-35 [coordinator ruling + sched]: vector access at buffer offset 0 is misaligned: the engine now keeps the host pointer's low 8 bits (`arena::addr` ruling, `Inputs.host_addrs`) and numpy arrays are only 16-byte aligned; legacy ran these
+
+- Cases (12): `cudnn_sm100_gdn2_bprop_f16` (numsim/racecheck/synccheck), `cudnn_sm100_gdn2_prefill_f16` (numsim/racecheck/synccheck), `cudnn_sm100_gdn_bprop_f16` (numsim/racecheck/synccheck), `cudnn_sm100_gdn_prefill_f16` (racecheck/synccheck), `cudnn_sm100_gdn_recompute_f16` (numsim/racecheck/synccheck), `cudnn_sm100_kda_bprop_f16` (numsim/racecheck/synccheck), `flash_mla_sparse_fwd` (synccheck), `flashinfer_fused_dit_layernorm` (numsim/racecheck/synccheck), `kda_backward_packed` (numsim/racecheck/synccheck), `sparse_flashmla_decode_head64` (numsim), `sparse_flashmla_prefill_head128_phase1` (racecheck/synccheck), `sparse_flashmla_prefill_head128_small_topk_phase1` (numsim/racecheck)
+- Minimal reproduction: `kda_backward_packed` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "kda_backward_packed-numsim"`
+- Observed: ExecutionError: NumSim execution error: misaligned: 32-byte access at offset 0 of h0 is not 32-byte aligned at /localhome/local-hongyij/TIRx-harness/.venv/lib/python3.12/site-packages/tirx_kernels/kda/kda_backward_packed.py:4061
+
+### V2C-36 [racecheck]: new `scope_mismatch` (+ `data_race`) findings where legacy was clean (cf. racecheck-behaviour-deltas R4/B1 scope rules) -- verify
+
+- Cases (8): `bmm_fp8_rubin` (racecheck), `cudnn_sm100_dense_blockscaled_gemm_persistent_dsrelu_quant` (racecheck), `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` (racecheck), `deepgemm_sm100_fp8_gemm_1d1d` (racecheck), `fastcu_nvfp4_gemm_gb300` (racecheck), `flash_attention_backward_sm100` (racecheck), `nvfp4_gemm` (racecheck), `sm100_fp8_fp4_mega_moe` (racecheck)
+- Minimal reproduction: `nvfp4_gemm` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "nvfp4_gemm-racecheck"`
+- Observed: release .cta (warp 196) and acquire .cluster (warp 204) do not mutually cover each other's thread
+
+### V2C-37 [racecheck]: new `data_race` where legacy was clean or review
+
+- Cases (6): `cudnn_sm100_dsa_sparse_attention_backward` (racecheck), `deepgemm_sm100_fp4_mqa_logits` (racecheck), `flash_attention4` (racecheck), `gdn_prefill_sm100` (racecheck), `msa_prefill_multishape` (racecheck), `vsa_multishape` (racecheck)
+- Minimal reproduction: `vsa_multishape` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "vsa_multishape-racecheck"`
+- Observed: read_write conflict on bytes [0..16384) of allocation 6: async_lifetime_not_drained
+
+### V2C-38 [racecheck]: same finding kinds, different source anchors (witness site pair) and/or footprint
+
+- Cases (9): `cudnn_sm100_bsa_forward_blk128` (racecheck), `cudnn_sm100_bsa_forward_blk64` (racecheck), `cudnn_sm100_gdn2_recompute_f16` (racecheck), `cudnn_sm103_flex_attention_forward` (racecheck), `flash_mla_sparse_fwd` (racecheck), `gdn_cp_prefill_sm100` (racecheck), `msa_sparse_atten_fwd_nvfp4_kv_sm100` (racecheck), `sparse_flashmla_prefill_head64_phase1` (racecheck), `stable_sort_topk_by_value` (racecheck)
+- Minimal reproduction: `flash_mla_sparse_fwd` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "flash_mla_sparse_fwd-racecheck"`
+- Observed: expected diagnostics [{"diagnostics": [{"anchors": ["tirx_kernels/ported/flashmla/sparse_prefill_head64_phase1.py:1383:1-1383:42", "tirx_kernels/ported/flashmla/sparse_prefill_head64_phase1.py:714:1-714:39"], "bytes": {"shared": "229376-229380"}, "category": "advisories" / actual [{"verdict": "review", "diagnostics": [{"category": "advisories", "kind": "alias_stale_read", "status": "review", "space": "shared", "anchors": ["<unmapped op 164>", "tirx_kernels/ported/flashmla/sparse_prefill_head64_phase1.py:1383:1-1383:42", "tirx
+

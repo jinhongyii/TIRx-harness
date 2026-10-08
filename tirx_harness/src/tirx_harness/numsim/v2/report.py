@@ -246,6 +246,41 @@ def attach_sources(value: Any, span_of_kernel: Callable[[int, int | None], Any],
     return value
 
 
+def operation_of(site_info: Mapping[str, Any] | None, *, kernel: int, site: int,
+                 span: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Legacy-shaped ``operation`` of a record's primary site: the faulting
+    instruction's id, op name, text and span (``details["operation"]``)."""
+
+    info = site_info or {}
+    source = {
+        "source_op_id": site,
+        "kind": info.get("kind", ""),
+        "source_text": info.get("text", ""),
+        "source_span": dict(span) if span else None,
+    }
+    if info.get("op_name"):
+        source["op_name"] = info["op_name"]
+    return {"kernel_index": kernel, "source_op_id": site, "source": source}
+
+
+def attach_operations(records: Iterable[dict[str, Any]], kernel: int,
+                      site_info_of: Callable[[int, int], Any], span_of_kernel: Callable[[int, int | None], Any]) -> None:
+    """Give every record with a primary site a legacy ``operation`` field."""
+
+    for record in records:
+        if not isinstance(record, dict) or isinstance(record.get("operation"), Mapping):
+            continue
+        k = record.get("kernel_index", kernel)
+        k = k if isinstance(k, int) and not isinstance(k, bool) else kernel
+        site = record.get("site")
+        if not isinstance(site, int) or isinstance(site, bool):
+            sites = record.get("sites") or []
+            site = next((x for x in sites if isinstance(x, int) and not isinstance(x, bool)), None)
+        if site is None:
+            continue
+        record["operation"] = operation_of(site_info_of(k, site), kernel=k, site=site, span=span_of_kernel(k, site))
+
+
 def checker_phase_payload(
     base: Mapping[str, Any],
     *,
@@ -255,6 +290,7 @@ def checker_phase_payload(
     status: Mapping[str, Any],
     diagnostics: Iterable[Mapping[str, Any]],
     span_of_kernel: Callable[[int, int | None], Any],
+    site_info_of: Callable[[int, int], Any] | None = None,
 ) -> dict[str, Any]:
     """Complete a checker's own per-launch payload (``racecheck::serialize``
     / ``synccheck::serialize``) with phase facts, source spans and the
@@ -309,6 +345,11 @@ def checker_phase_payload(
     verdicts += [r.get("status", "error") for r in payload["findings"]]
     verdicts += ["review"] * bool(payload["advisories"]) + ["incomplete"] * bool(payload["incomplete"])
     verdicts += ["error"] * (payload["execution_error"] is not None)
+    if site_info_of is not None:
+        for key in ("findings", "advisories", "incomplete"):
+            attach_operations(payload[key], phase_index, site_info_of, span_of_kernel)
+        if isinstance(payload["execution_error"], dict):
+            attach_operations([payload["execution_error"]], phase_index, site_info_of, span_of_kernel)
     payload.update(
         schema_version=SCHEMA_VERSION,
         checker=checker,
@@ -575,6 +616,7 @@ __all__ = [
     "NumSimResult",
     "RaceReport",
     "SyncCheckReport",
+    "attach_operations",
     "attach_sources",
     "checker_phase_payload",
     "compare",

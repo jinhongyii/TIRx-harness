@@ -463,6 +463,9 @@ pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result
                 // `SyncEvent.kernel` into `Report.launch` / `Evidence.kernel`.
                 for (kernel, log) in &recorder.launches {
                     let mut sc = SynccheckConfig::default();
+                    // Exclusive tcgen05 column limit of the target (W6-5).
+                    let arch = module.kernels.get(*kernel as usize).and_then(|k| k.arch.as_deref());
+                    sc.tcgen_exclusive_max = Some(sched::exclusive_tmem_columns(arch));
                     if let Some(budget) = request.state_budget {
                         sc.state_budget = budget;
                     }
@@ -678,7 +681,7 @@ mod py {
     #[pyo3(signature = (module, inputs, *, mode="numsim", backend="interp", workers=1, seed=0,
                         loop_budget=None, quantum=None, max_rounds=None, opt_level=1,
                         validity=None, state_budget=None, transition_budget=None, max_findings=0,
-                        codegen_cache_dir=None, subset=None, synccheck_limits=None))]
+                        codegen_cache_dir=None, subset=None, synccheck_limits=None, host_addrs=None))]
     fn run<'py>(
         py: Python<'py>,
         module: &PyModuleHandle,
@@ -698,6 +701,7 @@ mod py {
         codegen_cache_dir: Option<std::path::PathBuf>,
         subset: Option<Vec<u32>>,
         synccheck_limits: Option<BTreeMap<String, u64>>,
+        host_addrs: Option<BTreeMap<String, u64>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let mode = Mode::parse(mode).ok_or_else(|| PyValueError::new_err(format!("unknown mode {mode:?}")))?;
         let backend = BackendKind::parse(backend).ok_or_else(|| PyValueError::new_err(format!("unknown backend {backend:?}")))?;
@@ -707,7 +711,9 @@ mod py {
             let arg = arg_value(&name, &value)?;
             args.insert(name, arg);
         }
-        let inputs = Inputs { args, ..Default::default() };
+        // Host pointers of buffer arguments: synthetic global addresses keep
+        // their low 8 bits (`arena::addr` ruling).
+        let inputs = Inputs { args, host_addrs: host_addrs.unwrap_or_default() };
         let mut request = RunRequest::new(mode);
         request.backend = backend;
         request.workers = workers;
@@ -760,6 +766,27 @@ mod py {
         Ok(out)
     }
 
+    /// Engine global addresses the given inputs would be bound at
+    /// (`sched::plan_global_addresses`): `{argument name: address}` for
+    /// buffer and view arguments.
+    #[pyfunction]
+    #[pyo3(signature = (module, inputs, *, host_addrs=None))]
+    fn plan_global_addresses(
+        module: &PyModuleHandle,
+        inputs: &Bound<'_, PyDict>,
+        host_addrs: Option<BTreeMap<String, u64>>,
+    ) -> PyResult<BTreeMap<String, u64>> {
+        let mut args = BTreeMap::new();
+        for (key, value) in inputs.iter() {
+            let name: String = key.extract()?;
+            let arg = arg_value(&name, &value)?;
+            args.insert(name, arg);
+        }
+        let inputs = Inputs { args, host_addrs: host_addrs.unwrap_or_default() };
+        let module = Arc::clone(&module.inner);
+        guarded(|| sched::plan_global_addresses(&module, &inputs).map_err(run_error)).map_err(to_py_err)
+    }
+
     /// Format version of serialized programs this extension accepts.
     #[pyfunction]
     fn program_format_version() -> u32 {
@@ -772,6 +799,7 @@ mod py {
         m.add_function(wrap_pyfunction!(program_format_version, m)?)?;
         m.add_function(wrap_pyfunction!(load_module, m)?)?;
         m.add_function(wrap_pyfunction!(run, m)?)?;
+        m.add_function(wrap_pyfunction!(plan_global_addresses, m)?)?;
         Ok(())
     }
 }

@@ -306,3 +306,16 @@ def test_aliased_host_buffers_share_one_allocation(module):
     result = _skip_if_unimplemented(lambda: v2.Engine().run(
         module, {"a": storage[:1024], "b": storage[512:1536], "c": np.zeros(1024, np.float32)}))
     np.testing.assert_array_equal(result.outputs["c"], storage[:1024] + storage[512:1536])
+
+
+def test_address_of_and_host_pointer_low_bits(module):
+    """W8-7: ``Engine.address_of`` gives the engine address a binding will
+    get; the synthetic address keeps the host pointer's low 8 bits
+    (``arena::addr`` ruling)."""
+
+    inputs = {"a": np.zeros(1024, np.float32), "b": np.zeros(1024, np.float32), "c": np.zeros(1024, np.float32)}
+    engine = v2.Engine()
+    address = _skip_if_unimplemented(lambda: engine.address_of(module, inputs, "a"))
+    assert address % 256 == inputs["a"].ctypes.data % 256
+    with pytest.raises(v2.InputError):
+        engine.address_of(module, inputs, "nope")

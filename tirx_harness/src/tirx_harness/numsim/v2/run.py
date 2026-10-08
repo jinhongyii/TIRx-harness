@@ -13,7 +13,7 @@ import json
 import time
 import struct
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import re
@@ -24,6 +24,7 @@ from .compile import CompiledModule, native
 from .options import BACKENDS, options
 from .report import (
     AnalysisResult,
+    attach_operations,
     checker_phase_payload,
     NumSimResult,
     diagnostic_from_core,
@@ -82,6 +83,12 @@ class BoundInput:
     # Tensor maps over a host array, and views of aliased host memory: the
     # buffer argument holding the bytes.
     base: str | None = None
+    # Host data pointer of a buffer (synthetic engine addresses keep its low
+    # 8 bits, `arena::addr` ruling).
+    host_addr: int | None = None
+    # A descriptor image bound to a plain buffer parameter: the pointer at
+    # bytes [0, 8) is rewritten to (engine address of `base`) + offset.
+    patch_offset: int | None = None
 
 
 _SCALAR_FORMATS = {
@@ -163,6 +170,28 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
     bound: dict[str, BoundInput] = {}
     tensor_map_bases: dict[int, str] = {}
     given_objects: dict[str, Any] = {}
+
+    def register_base(owner: str, base: np.ndarray) -> str:
+        """The buffer argument holding a host descriptor's base array."""
+
+        base_name = tensor_map_bases.get(id(base))
+        if base_name is None:
+            base_name = next(
+                (n for n, given in inputs.items() if given is base and lookup.get(n)),
+                f"{owner}.__base__",
+            )
+            base_name = lookup.get(base_name, base_name)
+            tensor_map_bases[id(base)] = base_name
+            if base_name not in bound:
+                given_objects.setdefault(base_name, base)
+                contiguous = np.ascontiguousarray(base)
+                bound[base_name] = BoundInput(
+                    base_name, "buffer", ("buffer", contiguous.view(np.uint8).reshape(-1).tobytes(), None),
+                    dtype=contiguous.dtype, shape=tuple(contiguous.shape),
+                    host_addr=int(base.__array_interface__["data"][0]),
+                )
+        return base_name
+
     for given, value in inputs.items():
         canonical = lookup.get(given)
         if canonical is None:
@@ -198,21 +227,7 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
             # array: bind that array as a buffer and let the engine encode the
             # map against its address (W8-3 ``TensorMapOf``).
             base = np.asarray(base)
-            base_name = tensor_map_bases.get(id(base))
-            if base_name is None:
-                base_name = next(
-                    (n for n, given in inputs.items() if given is base and lookup.get(n)),
-                    f"{canonical}.__base__",
-                )
-                base_name = lookup.get(base_name, base_name)
-                tensor_map_bases[id(base)] = base_name
-                if base_name not in bound:
-                    given_objects.setdefault(base_name, base)
-                    contiguous = np.ascontiguousarray(base)
-                    bound[base_name] = BoundInput(
-                        base_name, "buffer", ("buffer", contiguous.view(np.uint8).reshape(-1).tobytes(), None),
-                        dtype=contiguous.dtype, shape=tuple(contiguous.shape),
-                    )
+            base_name = register_base(canonical, base)
             pointer = int.from_bytes(image[0:8].tobytes(), "little")
             offset = pointer - int(base.__array_interface__["data"][0])
             if not 0 <= offset <= base.nbytes:
@@ -223,13 +238,28 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
         else:
             if hasattr(value, "detach") and hasattr(value, "cpu"):  # torch tensor
                 value = value.detach().cpu().numpy()
-            array = np.ascontiguousarray(np.asarray(value))
+            host = np.asarray(value)
+            array = np.ascontiguousarray(host)
             if array.dtype == object:
                 raise InputError(f"buffer argument {canonical!r} is not a numeric array")
             _reject_unpacked_sub_byte(canonical, array, slot)
+            descriptor_base = getattr(value, "_tensor_map_base", None)
+            patch = base_name = None
+            if descriptor_base is not None and array.nbytes == 128:
+                # A host descriptor image passed to a plain uint8[128]
+                # parameter: its pointer must name the engine address of the
+                # base array, not the host pointer.
+                descriptor_base = np.asarray(descriptor_base)
+                base_name = register_base(canonical, descriptor_base)
+                pointer = int.from_bytes(array.view(np.uint8)[0:8].tobytes(), "little")
+                patch = pointer - int(descriptor_base.__array_interface__["data"][0])
+                if not 0 <= patch <= descriptor_base.nbytes:
+                    raise InputError(f"descriptor {canonical!r} does not address its base array")
             bound[canonical] = BoundInput(
                 canonical, "buffer", ("buffer", array.view(np.uint8).reshape(-1).tobytes(), None),
                 dtype=array.dtype, shape=tuple(array.shape),
+                host_addr=int(host.__array_interface__["data"][0]) if host.size else None,
+                base=base_name, patch_offset=patch,
             )
     # Buffer slot shapes: check static dims, bind `Param` dims (W1 binder
     # convention: implicit shape variables are Scalar slots referenced from
@@ -261,6 +291,7 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
                 raise InputError(f"{name!r} disagrees with {buffer!r}.shape[{axis}]={source.shape[axis]}")
             bound[name] = BoundInput(name, "scalar", ("scalar", value))
     _resolve_aliased_buffers(bound, given_objects)
+    _patch_descriptor_pointers(module, bound)
     # A tensor-map parameter with no host value and no engine-encodable spec
     # (legacy accepted kernels that never use it): bind an all-zero image,
     # which the descriptor decoder rejects, so any use fails closed.
@@ -334,6 +365,33 @@ def _memory_span(value: Any) -> tuple[int, int] | None:
     return lo, hi
 
 
+def host_addresses(bound: Mapping[str, BoundInput]) -> dict[str, int]:
+    return {name: b.host_addr for name, b in bound.items() if b.kind == "buffer" and b.host_addr is not None}
+
+
+def _patch_descriptor_pointers(module: CompiledModule, bound: dict[str, BoundInput]) -> None:
+    """Rewrite host descriptor images bound to plain buffers so their global
+    address names the engine address of their base array."""
+
+    pending = {name: b for name, b in bound.items() if b.patch_offset is not None}
+    if not pending:
+        return
+    natives = {name: b.native for name, b in bound.items()}
+    addresses = native().plan_global_addresses(module.handle, natives, host_addrs=host_addresses(bound))
+    for name, b in pending.items():
+        if b.base not in addresses:
+            # The base array is not a kernel argument, and numsim-core only
+            # allocates arguments some parameter references
+            # (CONTRACT_REQUESTS W8-8).
+            raise NotImplementedError(
+                f"descriptor {name!r} is bound to a plain buffer parameter and addresses host array "
+                f"{b.base!r}, which is not a kernel argument; numsim-core cannot place it yet (W8-8)"
+            )
+        image = bytearray(b.native[1])
+        image[0:8] = int(addresses[b.base] + b.patch_offset).to_bytes(8, "little")
+        bound[name] = replace(b, native=("buffer", bytes(image), None))
+
+
 def _resolve_aliased_buffers(bound: dict[str, BoundInput], values: Mapping[str, Any]) -> None:
     """Host-input aliasing rule (dev-loop.md): buffer arguments bound to
     overlapping host memory share ONE engine allocation, so writes through
@@ -370,7 +428,7 @@ def _resolve_aliased_buffers(bound: dict[str, BoundInput], values: Mapping[str, 
         hi = max(h for _, h, _ in group)
         region = f"__host_region_{index}"
         bound[region] = BoundInput(region, "buffer", ("buffer", ctypes.string_at(lo, hi - lo), None),
-                                   dtype=np.dtype(np.uint8), shape=(hi - lo,))
+                                   dtype=np.dtype(np.uint8), shape=(hi - lo,), host_addr=lo)
         for start, end, name in group:
             b = bound[name]
             bound[name] = BoundInput(name, "view", ("view", region, start - lo, end - start),
@@ -490,8 +548,29 @@ class Engine:
             quantum=self.quantum,
             opt_level=self.opt_level,
             codegen_cache_dir=str(options().cache_root / "v2-codegen"),
+            host_addrs=host_addresses(bound),
             **extra,
         )
+
+    def address_of(self, module: CompiledModule, inputs: dict[str, Any], name: str) -> int:
+        """Engine global address argument ``name`` (or a selector of it)
+        will be bound at for these inputs (W8-7), e.g. to build raw-pointer
+        input words before the run."""
+
+        bound = canonicalize_inputs(module, inputs)
+        natives = {key: b.native for key, b in bound.items()}
+        addresses = native().plan_global_addresses(module.handle, natives, host_addrs=host_addresses(bound))
+        lookup = {}
+        for kernel in module.spec.kernels:
+            for slot in kernel.host_abi:
+                for alias in (slot["name"], slot.get("local_name"), *(slot.get("aliases") or ())):
+                    if alias:
+                        lookup.setdefault(str(alias), str(slot["name"]))
+                        lookup.setdefault(f"k{kernel.index}:{alias}", str(slot["name"]))
+        canonical = lookup.get(name, name)
+        if canonical not in addresses:
+            raise InputError(f"{name!r} is not a bound buffer argument")
+        return int(addresses[canonical])
 
     @staticmethod
     def _subset_extra(subset: Any, assumptions: Any = None) -> dict[str, Any]:
@@ -558,6 +637,7 @@ class Engine:
             )
             for d in raw["diagnostics"]
         ]
+        attach_operations(diagnostics, 0, _site_info_resolver(module), _kernel_span_resolver(module))
         timing = _timing(module, bind_ms, raw, report_started)
         _raise_unless_completed(raw["status"], diagnostics)
         return NumSimResult(outputs=result_outputs, diagnostics=diagnostics, stats=dict(raw["stats"]),
@@ -638,6 +718,7 @@ class Engine:
             status=raw["status"],
             diagnostics=diagnostics,
             span_of_kernel=span_of_kernel,
+            site_info_of=_site_info_resolver(module),
         )
         payload.setdefault("stats", {}).update(raw.get("stats") or {})
         # One engine run serves every phase of a module; its build/run/check
@@ -705,6 +786,17 @@ def _timing(module: CompiledModule, bind_ms: float, raw: Mapping[str, Any], repo
         "check": float(engine.get("check", 0.0)),
         "report": (time.perf_counter() - report_started) * 1e3,
     }
+
+
+def _site_info_resolver(module: CompiledModule):
+    kernels = module.spec.kernels
+
+    def site_info_of(kernel: int, site: int) -> dict[str, Any] | None:
+        if not 0 <= kernel < len(kernels) or not 0 <= site < len(kernels[kernel].sites):
+            return None
+        return kernels[kernel].sites[site]
+
+    return site_info_of
 
 
 def _kernel_span_resolver(module: CompiledModule):
