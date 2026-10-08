@@ -337,6 +337,102 @@ Conclusions:
 - The loaded-host check (another 16-worker job running alongside) was not run, because the change does not land.
 - **Lever, if 32-worker Mega MoE matters:** a per-round handoff that avoids the condvar park/wake. For example, workers that stay on a partition across rounds until the serial phase. That is a scheduler design question, not a spin budget.
 
+### Partition lookahead (workers keep partitions across rounds): design and verdict (W13, 2026-10-08)
+
+**Question.** Mega MoE at 32 workers is slower than at 16 (medium: 8.15 s against 7.12 s). Would a scheduler where each worker keeps its partitions and runs them through several rounds help? That means no park/wake and no barrier between rounds, until a partition needs merged state.
+
+**Answer: no, not as an exact protocol.** In Mega MoE nearly every round carries cross-partition state through the serial phase. A lookahead that must fall back whenever a partition needs merged state would fall back almost every round. Measured below; not built.
+
+#### 1. What the round boundary does today (`sched/mod.rs` `run_loop`)
+
+One round, in order:
+1. **`parallel_phase`:**
+   - Each partition gets an arena shard: a copy-on-write overlay of the shared allocations, with reads tracked when observing. `Partition::run_round` runs each partition on the pool; `par_for` hands out partition indices dynamically.
+   - **Barrier:** the caller waits until every partition is done.
+   - The first failing partition discards the later ones.
+   - When observing, `Arena::shard_replay_order` computes the replay order: a partition that read bytes another wrote this round goes first; a read/write cycle reports `incomplete`.
+   - Readonly-proxy conflicts are checked, then shards are merged in partition order: last writer wins, byte granularity.
+2. **`merge_words(order)`:** each partition's new declared-word history entries are appended in delivery order, buffered `WaitVerdicts` indices are renumbered to the merged history (W6-P1), and every partition gets the merged table back.
+3. **`replay_partitions(order)`:**
+   - `Access::seq` is assigned in replay order.
+   - Partitions are offered to `Observer::fork`; children replay on the pool, are joined in replay order, and the rest replay serially.
+   - Then one `phase_end`.
+4. **`serial_phase`:**
+   - Partition by partition, on the main arena, run the work parked at a serial point: global read-modify-writes inside a shard (atomics, reductions, CLC `try_cancel`) and deferred landings.
+   - Each partition's events are replayed and its words merged before the next partition runs (W6 S-b), then `phase_end`.
+5. **`turnover`:**
+   - Retire finished clusters and their partitions; collect leftover sync state.
+   - Admit pending clusters: new partitions, register files allocated or deferred, declared words, register-pool configuration.
+   - CLC claims are drawn from the launch-wide `Arc<ClcTasks>` queue during step 4.
+6. Bump `round`. If nothing made progress: `drain_all` (land everything ready); otherwise the deadlock/stuck diagnosis.
+
+**What a partition's round r+1 depends on, other than its own state:**
+- the shared allocations as merged after round r: other partitions' parallel-phase writes, plus every serial-phase write;
+- the declared-word table: only for observer verdict bookkeeping, never program-visible;
+- the CLC queue and admission (turnover).
+- Event replay and `phase_end` do not feed back into execution.
+
+#### 2. The design that was considered
+
+- **Execution.** A worker owns a fixed set of partitions and runs them round after round. Each partition buffers its round-r events and shard overlay under the round index.
+- **Commit.** Round r of partition p is committed (merged, words merged, replayed) by a sequencer thread in the same order as today: partition order, `shard_replay_order`, delivery-order history.
+- **Lookahead condition.** p may start round r+1 before the others finish round r only if nothing it will read in round r+1 can be changed by others' round-r work:
+  - no other partition wrote, in its round-r shard, a stripe p reads;
+  - the serial phase of round r did not run;
+  - turnover changed nothing p reads.
+- **Validation.** The first condition can only be checked after the fact: p's round r+1 read set against the others' round-r write sets. A failed check therefore needs a rollback of p's round r+1, i.e. a snapshot of p's warps, register files, private allocations and sync table taken before every speculative round. That is ~15 MB of register files per CTA on Mega MoE, too much for ~177 k partition-rounds. Without rollback, the protocol must be conservative: stop and wait whenever round r had a serial phase or p polls any shared word.
+- **Invariant (why results and streams would not depend on the worker count).**
+  - Every committed round is the lockstep round: p's round r+1 inputs are, by the lookahead condition, byte-identical to what the lockstep scheduler would give it.
+  - Commits, replay order, `seq` numbering, history delivery order and `phase_end` placement are produced by the sequencer exactly as today, from per-round buffers.
+  - Only *when* a partition computes changes, never *what* it computes or the order in which it is published.
+  - **Fallback:** when the condition fails, p waits for round r's commit, exactly today's barrier.
+
+#### 3. Dependency census (scratch instrumentation, private build of a6c5202)
+
+- **Memory dependencies:** every shard tracked its reads. For each partition-round, I counted whether it read a stripe byte that another partition wrote in the previous round's parallel phase.
+- **Serial dependencies:** I counted rounds whose serial phase ran.
+
+| Case | Rounds | Partition-rounds | Read another partition's round r-1 shard writes | Rounds with a serial phase |
+| --- | --- | --- | --- | --- |
+| mega_moe e24 (t8_h1024_i512_e24_k2_g1) | 174 | 12,876 | 0 | 126 (72%) |
+| mega_moe medium (t64_h2048_i1536_e96_k4_g1) | 2,391 | 176,934 | 0 | 2,148 (90%) |
+| gdn_decode_bf16_wide_vec_mtp | 10 | 1,280 | 0 | 0 |
+| recurrent_kda_decode_one_warp | 10 | 10,240 | 0 | 0 |
+
+- In Mega MoE, all cross-partition communication goes through global read-modify-writes: dispatch/combine counters and flags. Those run in the serial phase, which ran in 72–90% of rounds. The partitions that wait on those words poll them every round.
+- The conservative protocol would therefore resynchronize in 72–90% of rounds.
+- The kernels with no dependencies (gdn_decode, recurrent_kda) finish in 10 rounds and are not barrier-bound.
+
+#### 4. Cost model
+
+Phase timings (scratch counters; wall of `par_for`, CPU per partition-round, NoopObserver; host load 10–15):
+
+| Case | Workers | Wall | `par_for` wall | Σ partition CPU | Σ over rounds of max partition | Serial + turnover |
+| --- | --- | --- | --- | --- | --- | --- |
+| mega_moe medium | 16 | 6.5 s | 5.33 s | 59.4 s | 3.25 s | 0.11 s |
+| mega_moe medium | 32 | 7.3 s | 6.05 s | 89.5 s | 5.11 s | 0.20 s |
+| mega_moe e24 | 1 | 1.84 s | 1.80 s | 1.78 s | 0.15 s | 0.02 s |
+| mega_moe e24 | 16 | 0.36 s | 0.27 s | 2.85 s | 0.18 s | 0.02 s |
+| mega_moe e24 | 32 | 0.40 s | 0.32 s | 4.25 s | 0.27 s | 0.02 s |
+
+Upper bounds for the parallel phase:
+- **Lockstep:** each round costs at least its slowest partition, so `par_for` ≥ Σ over rounds of the max partition: 3.25 s at 16 workers and 5.11 s at 32 on medium.
+- **Barrier-free, no dependencies:** `par_for` ≥ Σ partition CPU / workers: 3.71 s at 16 and 2.80 s at 32.
+- **Best possible gain:** about 1.4x at 16 workers (5.33 → 3.71) and about 2.2x at 32 (6.05 → 2.80), and only if no round needed a resync.
+
+With resyncs in 90% (medium) or 72% (e24) of rounds:
+- Only the dependency-free rounds can overlap.
+- Expected gain is at most about 1.1x on medium (10% of rounds) and about 1.3x on e24 (28%), before the sequencer and snapshot costs.
+
+**Gate.** Not built: no criterion reaches ≥1.5x. The criterion would be `mega_moe medium` wall at 32 workers, min of 3 runs on a near-idle host, with digests identical at 1/8/32 workers.
+
+#### 5. What would help instead (measured or estimated)
+
+- **Cheaper barrier.** Spin-before-park, measured above: medium at 32 workers 8.15 → 5.83 s (1.40x), +10–90% CPU, small kernels neutral with `yield_now` polling. Below the bar on its own.
+- **Per-partition CPU inflation.** This is the bigger factor: Σ partition CPU is 59.4 s at 16 workers and 89.5 s at 32, against ~36–40 s at 1 worker. Its cause is unattributed: it is not register-file footprint, migration or the allocator (previous section). Hardware counters (`perf_event_paranoid` ≤ 2) would be the next step.
+- **Parallel serial phase.** Serial RMWs on disjoint words could run partition-parallel. The serial phase plus turnover is only 0.11–0.20 s on medium, so this would not move wall time.
+- **Choice of worker count.** For Mega MoE medium, 16 workers already beats 32 (7.12 s against 8.15 s). A default of at most about partitions/4 workers costs nothing in correctness.
+
 ## tcgen05.mma cost: arithmetic, not the callback boundary (2026-10-08)
 
 **Decision (coordinator): borrowed-view MMA I/O is not landed.** Rule: no optimization without a measured gain.
