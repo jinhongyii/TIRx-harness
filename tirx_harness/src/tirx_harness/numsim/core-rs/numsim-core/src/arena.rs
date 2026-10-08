@@ -169,6 +169,11 @@ impl BitSet {
         None
     }
 
+    /// Do `self` and `other` (same length) share a set bit?
+    pub fn intersects(&self, other: &BitSet) -> bool {
+        self.words.iter().zip(&other.words).any(|(a, b)| a & b != 0)
+    }
+
     /// First index in `[start, start+len)` whose bit is clear.
     pub fn first_clear(&self, start: u64, len: u64) -> Option<u64> {
         let mut i = start;
@@ -308,6 +313,9 @@ struct Shard {
     /// The base arena's global index (read-only while shards exist).
     global_index: *const Vec<(u64, u64, AllocId)>,
     overlay: HashMap<(AllocId, u64), Stripe>,
+    /// Bytes of shared allocations this shard read, per stripe (only when
+    /// read tracking is on; see [`Arena::shard_replay_order`]).
+    reads: Option<std::cell::RefCell<HashMap<(AllocId, u64), BitSet>>>,
 }
 
 // SAFETY: the scheduler keeps the base arena alive and does not touch it
@@ -512,11 +520,16 @@ impl Arena {
         // f(bytes, valid, index_of_first_byte_in_bytes/valid, alloc_offset, len)
         if let Some(sh) = self.shard.as_ref().filter(|_| self.is_overlaid(id)) {
             let base = self.get(id);
+            let mut reads = sh.reads.as_ref().map(|r| r.borrow_mut());
             let mut i = abs.start;
             while i < abs.end() {
                 let stripe = i / STRIPE;
                 let lo = i % STRIPE;
                 let n = (STRIPE - lo).min(abs.end() - i);
+                if let Some(r) = reads.as_mut() {
+                    let len = STRIPE.min(base.size - stripe * STRIPE);
+                    r.entry((id, stripe)).or_insert_with(|| BitSet::new(len, false)).set_range(lo, n, true);
+                }
                 match sh.overlay.get(&(id, stripe)) {
                     Some(st) => f(&st.bytes, &st.valid, lo, i, n),
                     None => f(&base.bytes, &base.valid, i, i, n),
@@ -798,8 +811,87 @@ impl Arena {
                 len: self.allocs.len(),
                 global_index: &self.global_index as *const _,
                 overlay: HashMap::new(),
+                reads: None,
             })),
         }
+    }
+
+    /// Record which shared-allocation bytes this shard reads (for
+    /// [`Arena::shard_replay_order`]). No effect on a plain arena.
+    pub fn track_shard_reads(&mut self) {
+        if let Some(sh) = self.shard.as_mut() {
+            sh.reads.get_or_insert_with(Default::default);
+        }
+    }
+
+    /// An order of `shards` (indices) in which replaying each shard's
+    /// events as a block is consistent with what the shards observed: a
+    /// shard that read bytes another shard wrote in the same round saw the
+    /// round-start value, so it goes first; two shards writing the same
+    /// bytes keep merge (index) order, so the last writer in the replay is
+    /// the merged value. Ties keep index order. `Err((a, b))` names two
+    /// shards of a cycle (e.g. each read what the other wrote: an outcome
+    /// no sequential stream represents). Shards must track reads
+    /// ([`Arena::track_shard_reads`]).
+    pub fn shard_replay_order(shards: &[Arena]) -> Result<Vec<usize>, (usize, usize)> {
+        let n = shards.len();
+        let mut by_stripe: HashMap<(AllocId, u64), Vec<usize>> = HashMap::new();
+        for (k, a) in shards.iter().enumerate() {
+            let Some(sh) = a.shard.as_ref() else { continue };
+            for key in sh.overlay.keys() {
+                by_stripe.entry(*key).or_default().push(k);
+            }
+            if let Some(r) = sh.reads.as_ref() {
+                for key in r.borrow().keys() {
+                    by_stripe.entry(*key).or_default().push(k);
+                }
+            }
+        }
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut indeg = vec![0usize; n];
+        let mut keys: Vec<_> = by_stripe.into_iter().filter(|(_, v)| v.len() > 1).collect();
+        keys.sort_by_key(|(k, _)| *k);
+        for (key, mut ks) in keys {
+            ks.sort();
+            ks.dedup();
+            for &a in &ks {
+                for &b in &ks {
+                    if a == b {
+                        continue;
+                    }
+                    let (sa, sb) = (shards[a].shard.as_ref().expect("shard"), shards[b].shard.as_ref().expect("shard"));
+                    let wb = sb.overlay.get(&key).map(|s| &s.written);
+                    let wa = sa.overlay.get(&key).map(|s| &s.written);
+                    let read_before_write = match (sa.reads.as_ref(), wb) {
+                        (Some(r), Some(wb)) => r.borrow().get(&key).is_some_and(|ra| ra.intersects(wb)),
+                        _ => false,
+                    };
+                    let write_order = a < b && matches!((wa, wb), (Some(x), Some(y)) if x.intersects(y));
+                    if (read_before_write || write_order) && !succ[a].contains(&b) {
+                        succ[a].push(b);
+                        indeg[b] += 1;
+                    }
+                }
+            }
+        }
+        let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> =
+            (0..n).filter(|&k| indeg[k] == 0).map(std::cmp::Reverse).collect();
+        let mut order = Vec::with_capacity(n);
+        while let Some(std::cmp::Reverse(k)) = ready.pop() {
+            order.push(k);
+            for &b in &succ[k] {
+                indeg[b] -= 1;
+                if indeg[b] == 0 {
+                    ready.push(std::cmp::Reverse(b));
+                }
+            }
+        }
+        if order.len() == n {
+            return Ok(order);
+        }
+        let a = (0..n).find(|&k| indeg[k] > 0).expect("cycle");
+        let b = succ[a].iter().copied().find(|&b| indeg[b] > 0).unwrap_or(a);
+        Err((a, b))
     }
 
     /// Drop a shard's writes to shared allocations (its private writes

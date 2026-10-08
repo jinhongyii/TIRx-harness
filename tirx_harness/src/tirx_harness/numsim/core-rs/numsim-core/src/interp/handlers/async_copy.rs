@@ -52,6 +52,9 @@ pub struct Issue {
     pub report: Option<ReportMode>,
     /// tcgen05.mma `.lut_b`: TMEM address of the lookup table.
     pub lut_b: Option<u32>,
+    /// `st.async` / `red.async`: the landing is a strong release write in
+    /// the generic proxy at this scope (W5-8).
+    pub strong: Option<Scope>,
 }
 
 /// Issue an async op: allocate its id, emit `AsyncIssue`, queue it.
@@ -92,6 +95,7 @@ pub fn issue_async(ctx: &mut ExecCtx<'_>, lanes: WarpMask, is: Issue) -> AsyncId
             tf32_round: is.tf32_round,
             report: is.report,
             lut_b: is.lut_b,
+            strong: is.strong,
         },
     );
     if is.queue {
@@ -148,7 +152,7 @@ fn smem_loc_in_rank(ctx: &ExecCtx<'_>, loc: Loc, rank: u32) -> Option<(AllocId, 
     Some((*ctx.cta.cluster_smem.get(rank as usize)?, loc.offset))
 }
 
-fn group_res(ctx: &ExecCtx<'_>, lane: usize, domain: Domain) -> ResourceId {
+pub fn group_res(ctx: &ExecCtx<'_>, lane: usize, domain: Domain) -> ResourceId {
     ResourceId::AsyncGroup { warp: ctx.warp.id, lane: lane as u8, domain }
 }
 
@@ -214,6 +218,7 @@ pub fn cp_async(
                 tf32_round: false,
                 report: None,
                 lut_b: None,
+                strong: None,
             },
         );
         ctx.aux.groups.issue(group_res(ctx, l, Domain::CpAsync), op);
@@ -248,45 +253,41 @@ pub fn async_wait(ctx: &mut ExecCtx<'_>, domain: Domain, n: u32, read: bool) -> 
     active_or_next!(ctx);
     let active = ctx.warp.active;
     let cmd = SyncCmd::AsyncGroup(async_group::Cmd::Wait { n: n as u64, read });
-    // Ops of the awaited prefix, per lane (for the AsyncComplete events).
+    // Ops of the awaited prefix, per lane (for the AsyncComplete events):
+    // exactly the groups `wait_prefix_len` covers, never the `n` youngest.
+    // All lanes or none (a partial retirement would lose its events).
     let mut covered: Vec<(AsyncId, WarpMask)> = Vec::new();
-    let mut retired_keys = Vec::new();
+    let mut prefixes: Vec<(usize, ResourceId, Vec<u64>)> = Vec::new();
     for l in active.lanes() {
         let res = group_res(ctx, l, domain);
-        match support::step(ctx, res, cmd)? {
-            Step::Blocked(r) => return Ok(Flow::Blocked(r)),
-            Step::Done(_) => {}
-        }
-        if !ctx.observing {
-            continue;
-        }
-        // Prefix ordinals: groups no longer in the state were retired by
-        // this wait; still-present ones are covered when `.read`.
-        let present: Vec<u64> = match ctx.sync.get(res) {
-            Some(crate::sync::Resource::AsyncGroup(s)) => s.groups.iter().map(|g| g.ordinal).collect(),
+        let prefix: Vec<u64> = match ctx.sync.get(res) {
+            Some(crate::sync::Resource::AsyncGroup(s)) => {
+                let k = async_group::wait_prefix_len(s, n as u64);
+                s.groups.iter().take(k).map(|g| g.ordinal).collect()
+            }
             _ => Vec::new(),
         };
-        let first_present = present.first().copied().unwrap_or(u64::MAX);
-        for (&(r, ord), ops) in ctx.aux.groups.members.iter() {
-            if r != res {
+        prefixes.push((l, res, prefix));
+    }
+    let all: Vec<(ResourceId, SyncCmd)> = prefixes.iter().map(|(_, r, _)| (*r, cmd)).collect();
+    if let Step::Blocked(r) = support::step_all(ctx, &all)? {
+        return Ok(Flow::Blocked(r));
+    }
+    for (l, res, prefix) in prefixes {
+        for ord in prefix {
+            let key = (res, ord);
+            // A full wait retires the group: its bookkeeping goes too.
+            let ops = if read { ctx.aux.groups.members.get(&key).cloned() } else { ctx.aux.groups.members.remove(&key) };
+            if !ctx.observing {
                 continue;
             }
-            let retired = ord < first_present;
-            if retired || read {
-                for &op in ops {
-                    match covered.iter_mut().find(|(o, _)| *o == op) {
-                        Some((_, m)) => *m = m.or(WarpMask::lane(l)),
-                        None => covered.push((op, WarpMask::lane(l))),
-                    }
+            for op in ops.unwrap_or_default() {
+                match covered.iter_mut().find(|(o, _)| *o == op) {
+                    Some((_, m)) => *m = m.or(WarpMask::lane(l)),
+                    None => covered.push((op, WarpMask::lane(l))),
                 }
             }
-            if retired && !read {
-                retired_keys.push((r, ord));
-            }
         }
-    }
-    for k in retired_keys {
-        ctx.aux.groups.members.remove(&k);
     }
     covered.sort_by_key(|(op, _)| *op);
     let cmds: Vec<(ResourceId, SyncCmd)> = active.lanes().map(|l| (group_res(ctx, l, domain), cmd)).collect();
@@ -295,17 +296,6 @@ pub fn async_wait(ctx: &mut ExecCtx<'_>, domain: Domain, n: u32, read: bool) -> 
     for (op, lanes) in covered {
         let target = PublishTarget::Warp { warp: ctx.warp.id, lanes };
         support::sync_event(ctx, lanes, SyncKind::AsyncComplete { op, milestone, target });
-    }
-    if !read {
-        // Free bookkeeping of fully retired groups even when not observing.
-        for l in active.lanes() {
-            let res = group_res(ctx, l, domain);
-            let first = match ctx.sync.get(res) {
-                Some(crate::sync::Resource::AsyncGroup(s)) => s.groups.front().map(|g| g.ordinal).unwrap_or(u64::MAX),
-                _ => u64::MAX,
-            };
-            ctx.aux.groups.members.retain(|(r, o), _| *r != res || *o >= first);
-        }
     }
     Ok(Flow::Next)
 }
@@ -474,6 +464,7 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
                 tf32_round: false,
                 report: args.report,
                 lut_b: None,
+                strong: None,
             },
         );
         if let Some(g) = group {
@@ -623,15 +614,27 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
         let mut group = None;
         match args.completion {
             BulkCompletion::Mbarrier { mbar, space } => {
-                let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
+                // `.cta_group::2`: the mbarrier operand is a shared::cluster
+                // address whose CTA-id bit 0 picks the CTA of each
+                // destination's pair that is signalled (kernels mask bit 24
+                // to signal the leader CTA): signal rank = (dst & !1) |
+                // (mbar rank & 1). Otherwise the same offset in each
+                // destination CTA.
+                let a = lane_val(ctx, mbar, l);
+                let pair = args.cta_group == 2;
+                let res = mbar_res(ctx, if pair { AddrSpace::SharedCluster } else { space }, a, l)?;
                 if args.report.is_some() {
                     require_layout_v1(ctx, res)?;
                 }
+                let mbar_rank = crate::arena::addr::decode_shared(a as u32).0;
+                let own = ctx.cta.rank_in_cluster;
                 let list: Vec<ResourceId> = ranks
                     .iter()
-                    .map(|r| match r {
-                        Some(r) => mbar_in_rank(ctx, res, *r).unwrap_or(res),
-                        None => res,
+                    .map(|r| match (r, pair) {
+                        (Some(r), true) => mbar_in_rank(ctx, res, (*r & !1) | (mbar_rank & 1)).unwrap_or(res),
+                        (None, true) => mbar_in_rank(ctx, res, (own & !1) | (mbar_rank & 1)).unwrap_or(res),
+                        (Some(r), false) => mbar_in_rank(ctx, res, *r).unwrap_or(res),
+                        (None, false) => res,
                     })
                     .collect();
                 bind_mbar_tx(ctx, &list, plan.bytes, &mut signals, &mut targets, &mut cmds)?;
@@ -663,6 +666,7 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
                 tf32_round,
                 report: args.report,
                 lut_b: None,
+                strong: None,
             },
         );
         if let Some(g) = group {
@@ -710,7 +714,8 @@ pub fn st_async(ctx: &mut ExecCtx<'_>, args: StAsyncArgs) -> HResult {
             Issue {
                 kind: AsyncKind::StAsync,
                 class: AsyncClass::Copy,
-                proxy: Proxy::Async,
+                // Performed in the generic proxy (PTX §9.7.10.12, W5-8).
+                proxy: Proxy::Generic,
                 payload,
                 signals,
                 after: Vec::new(),
@@ -720,6 +725,7 @@ pub fn st_async(ctx: &mut ExecCtx<'_>, args: StAsyncArgs) -> HResult {
                 tf32_round: false,
                 report: None,
                 lut_b: None,
+                strong: Some(args.scope),
             },
         );
     }

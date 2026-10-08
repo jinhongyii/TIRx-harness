@@ -397,6 +397,30 @@ fn ldmatrix_stmatrix_m8n8() {
     assert_eq!(u16s(&o, "out_st"), m, "stmatrix round trip");
 }
 
+fn tcgen_cp_expected() -> Vec<u32> {
+    let plan = numsim_core::oplib::tcgen_cp_plan(128, 256, 0, 0, scenarios::TCGEN_CP_SDESC, 0, 1, numsim_core::oplib::TcArch::Sm100).unwrap();
+    let (srcs, cells) = plan.pairs();
+    let input: Vec<u32> = (0..1024).map(|x| x * 3 + 7).collect();
+    let mut want = vec![0u32; 1024];
+    for (s, &(lane, col)) in srcs.iter().zip(&cells) {
+        want[lane as usize * 8 + col as usize] = input[(s.start / 4) as usize];
+    }
+    want
+}
+
+/// A second commit with nothing new issued still tracks the in-flight copy
+/// (found by gdn_prefill_sm100 under seeded latency).
+#[test]
+fn second_commit_tracks_in_flight_tcgen_ops() {
+    let want = tcgen_cp_expected();
+    for seed in 0..12 {
+        let s = scenarios::tcgen_cp_ld_with(true);
+        let o = run_cfg(&s, &RunConfig { seed, ..s.config.clone() });
+        completed(&o);
+        assert_eq!(u32s(&o, "out"), want, "seed {seed}");
+    }
+}
+
 #[test]
 fn tcgen_cp_then_ld() {
     let o = run(&scenarios::tcgen_cp_ld());
@@ -504,4 +528,372 @@ fn tcgen_alloc_orders_the_warp() {
     let site_of = |e: &SyncEvent| e.site;
     let alloc_site = scenarios::tcgen_ld_st().module.kernels[0].sites.iter().position(|s| s.op_name == "tcgen_alloc").unwrap();
     assert!(ev.syncs.iter().any(|e| site_of(e).0 as usize == alloc_site && matches!(e.kind, SyncKind::WarpSync { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// Engine-review regressions (docs/development/engine-review.md)
+// ---------------------------------------------------------------------------
+
+fn all_events(log: &RecordingObserver) -> Vec<&SyncEvent> {
+    log.per_warp.iter().flatten().chain(log.other.iter()).collect()
+}
+
+/// H1: exited warps leave count-less named barriers; an explicit-count
+/// barrier left waiting on exited warps is `incomplete` (G8), never Deadlock.
+#[test]
+fn exited_warps_release_count_less_barriers() {
+    for seed in 0..4 {
+        let s = scenarios::exit_then_barrier(false);
+        let o = run_cfg(&s, &RunConfig { seed, ..s.config.clone() });
+        completed(&o);
+        let out = u32s(&o, "out");
+        assert_eq!(&out[..32], &[7; 32]);
+        assert_eq!(&out[32..], &[0; 32]);
+        let s = scenarios::exit_then_barrier(true);
+        let o = run_cfg(&s, &RunConfig { seed, ..s.config.clone() });
+        match &o.status {
+            RunStatus::Incomplete { reason, .. } => assert!(reason.contains("G8"), "{reason}"),
+            other => panic!("expected incomplete (G8), got {other:?}"),
+        }
+    }
+}
+
+/// H2: a bounded probe loop of failed polls is never parked.
+#[test]
+fn bounded_probe_loop_is_not_a_spin() {
+    let o = run(&scenarios::bounded_probe_loop());
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![3; 32]);
+}
+
+/// M1: a failed poll inside an inner loop exited by `break` reaches the
+/// enclosing spin, which parks: Deadlock within a few rounds.
+#[test]
+fn nested_spin_with_break_parks() {
+    let o = run(&scenarios::nested_spin_break());
+    assert!(matches!(o.status, RunStatus::Deadlock { .. }), "{:?}", o.status);
+    assert!(o.stats.rounds < 10, "rounds {}", o.stats.rounds);
+}
+
+/// M2: a spin on `ld.acquire` parks (Deadlock when never released) and
+/// completes when another warp publishes.
+#[test]
+fn load_acquire_spin_parks_and_completes() {
+    let o = run(&scenarios::load_flag_spin(true));
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![5; 32]);
+    let o = run(&scenarios::load_flag_spin(false));
+    match &o.status {
+        RunStatus::Deadlock { blocked } => assert!(blocked.iter().any(|(_, r)| matches!(r, ResourceId::Word { .. })), "{blocked:?}"),
+        other => panic!("expected Deadlock, got {other:?}"),
+    }
+    assert!(o.stats.rounds < 10, "rounds {}", o.stats.rounds);
+}
+
+/// H6: `Seeded` completion keeps seed-dependent latency across rounds (a
+/// missing wait is visible for some seeds); `Eager` lands at the end of
+/// the issuing round.
+#[test]
+fn seeded_completion_latency_survives_rounds() {
+    let s = scenarios::cp_async_no_wait();
+    let mut failed = 0;
+    for seed in 0..32 {
+        let cfg = RunConfig { seed, validity: ValidityPolicy::Error, completions: CompletionPolicy::Seeded, ..s.config.clone() };
+        if matches!(run_cfg(&s, &cfg).status, RunStatus::Error(_)) {
+            failed += 1;
+        }
+    }
+    assert!(failed > 0 && failed < 32, "{failed} of 32 seeds read before landing");
+    let cfg = RunConfig { validity: ValidityPolicy::Error, completions: CompletionPolicy::Eager, ..s.config.clone() };
+    completed(&run_cfg(&s, &cfg));
+}
+
+/// H3: `wait_group.read 1` publishes the read milestone of the OLDER group
+/// only; `wait_group 0` then publishes both writes.
+#[test]
+fn wait_group_read_covers_only_the_awaited_prefix() {
+    let s = scenarios::bulk_wait_read();
+    let mut log = RecordingObserver::new();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), (0..32).collect::<Vec<_>>());
+    let mut reads = 0;
+    let mut writes = 0;
+    for e in all_events(&log) {
+        if let SyncKind::AsyncComplete { milestone, target: numsim_core::observe::PublishTarget::Warp { .. }, .. } = e.kind {
+            match milestone {
+                numsim_core::observe::Side::Read => reads += 1,
+                numsim_core::observe::Side::Write => writes += 1,
+            }
+        }
+    }
+    assert_eq!((reads, writes), (1, 2));
+}
+
+/// H4 / M3: per-target `Arrive` lanes; one Protocol per wait instruction.
+#[test]
+fn lane_split_mbarrier_events() {
+    let s = scenarios::lane_split_mbarrier();
+    let mut log = RecordingObserver::new();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    completed(&o);
+    let mut arrive_lanes: Vec<u32> = all_events(&log)
+        .iter()
+        .filter(|e| matches!(e.kind, SyncKind::Arrive { .. }))
+        .map(|e| e.lanes.bits())
+        .collect();
+    arrive_lanes.sort();
+    assert_eq!(arrive_lanes, vec![0x0000_ffff, 0xffff_0000]);
+    let waits = log.per_warp[0]
+        .iter()
+        .filter(|e| match &e.kind {
+            SyncKind::Protocol { cmds, .. } => cmds.iter().any(|c| format!("{:?}", c.cmd).contains("WaitParity")),
+            _ => false,
+        })
+        .count();
+    assert_eq!(waits, 1, "one Protocol event for the lane-varying wait");
+    let wait_events = all_events(&log).iter().filter(|e| matches!(e.kind, SyncKind::Wait { .. })).map(|e| e.lanes.bits()).count();
+    assert_eq!(wait_events, 2);
+}
+
+/// M4: lanes whose target completed leave a lane-varying wait.
+#[test]
+fn lane_varying_mbar_wait_latches() {
+    for seed in 0..4 {
+        let s = scenarios::mbar_latch();
+        let o = run_cfg(&s, &RunConfig { seed, ..s.config.clone() });
+        completed(&o);
+        assert_eq!(u32s(&o, "out"), vec![1; 32]);
+    }
+}
+
+/// H5: 128-bit exch/cas atomics.
+#[test]
+fn b128_exch_and_cas() {
+    let o = run(&scenarios::atom_b128());
+    completed(&o);
+    assert_eq!(u32s(&o, "g"), vec![9, 9, 9, 9, 7, 7, 7, 7]);
+    assert_eq!(u32s(&o, "out"), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+/// M5 / W5-8: st.async data lands; its accesses are generic-proxy strong
+/// release writes at the instruction's scope.
+#[test]
+fn st_async_lands_as_generic_release() {
+    struct Acc(Vec<(numsim_core::program::Proxy, numsim_core::program::Sem, numsim_core::program::Scope, bool)>);
+    impl Observer for Acc {
+        fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+            if let numsim_core::observe::Actor::Async { side: numsim_core::observe::Side::Write, .. } = a.actor {
+                self.0.push((a.proxy, a.sem, a.scope, a.atomic));
+            }
+        }
+    }
+    let s = scenarios::st_async_copy();
+    let mut acc = Acc(Vec::new());
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut acc, &Backend::Interp, &s.config).unwrap();
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), (100..132).collect::<Vec<_>>());
+    assert_eq!(acc.0.len(), 32);
+    use numsim_core::program::{Proxy, Scope, Sem};
+    assert!(acc.0.iter().all(|&x| x == (Proxy::Generic, Sem::Release, Scope::Cluster, true)), "{:?}", acc.0[0]);
+}
+
+/// M7: direct tcgen05.st to deallocated columns is a BadAddress error.
+#[test]
+fn tcgen_st_after_dealloc_is_bad_address() {
+    let o = run(&scenarios::tcgen_after_dealloc());
+    match &o.status {
+        RunStatus::Error(e) => assert_eq!(e.kind, ExecErrorKind::BadAddress, "{e:?}"),
+        other => panic!("expected BadAddress, got {other:?}"),
+    }
+}
+
+/// M6: a wait_until predicate's buffer reads are recorded.
+#[test]
+fn wait_until_predicate_reads_are_captured() {
+    let s = scenarios::wait_until_pred_reads();
+    let mut obs = (Trace(Vec::new(), true), RecordingObserver::new());
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).unwrap();
+    completed(&o);
+    let found = all_events(&obs.1).iter().any(|e| matches!(&e.kind, SyncKind::WaitVerdicts { pred_reads, .. } if !pred_reads.is_empty()));
+    assert!(found, "no WaitVerdicts with pred_reads");
+}
+
+/// M11: a declared-word history past MAX_WORD_HISTORY makes the verdict
+/// incomplete (history observers only); NumSim alone completes.
+#[test]
+fn word_history_overflow_is_incomplete() {
+    let s = scenarios::word_history_overflow(scenarios::MAX_HISTORY_PROBE);
+    let mut t = Trace(Vec::new(), true);
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut t, &Backend::Interp, &s.config).unwrap();
+    match &o.status {
+        RunStatus::Incomplete { reason, .. } => assert!(reason.contains("history"), "{reason}"),
+        other => panic!("expected incomplete, got {other:?}"),
+    }
+    let o = run(&s);
+    completed(&o);
+    // Below the limit the verdict is computed.
+    let s = scenarios::word_history_overflow(100);
+    let mut t = Trace(Vec::new(), true);
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut t, &Backend::Interp, &s.config).unwrap();
+    completed(&o);
+}
+
+/// M9 / review scenario 8: three-way divergent hand-off in a loop with
+/// `continue` in one arm.
+#[test]
+fn divergent_three_way_handoff() {
+    for seed in 0..4 {
+        let s = scenarios::divergent_nesting();
+        let o = run_cfg(&s, &RunConfig { seed, ..s.config.clone() });
+        completed(&o);
+        let out = u32s(&o, "out");
+        for (l, v) in out.iter().enumerate() {
+            let want = if (8..16).contains(&l) { 11 } else { 22 };
+            assert_eq!(*v, want, "lane {l}");
+        }
+    }
+}
+
+/// M10: two clusters; one publishes, the other spins (visible one round
+/// later); and the store-buffering cycle carries an incomplete diagnostic
+/// only when observed, with identical outputs.
+#[test]
+fn cross_cluster_visibility_and_stream_cycles() {
+    let o = run(&scenarios::cross_cluster_flag(true));
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![6]);
+    let s = scenarios::cross_cluster_sb();
+    let observed = run(&s);
+    completed(&observed);
+    assert_eq!(u32s(&observed, "out"), vec![0, 0], "both read the round-start value");
+    assert!(
+        observed.diagnostics.iter().any(|f| f.status == Status::Incomplete && f.message.contains("cannot order")),
+        "{:?}",
+        observed.diagnostics
+    );
+    let mut noop = numsim_core::observe::NoopObserver;
+    let plain = sched::run_with_config(&s.module, &s.inputs, &mut noop, &Backend::Interp, &s.config).unwrap();
+    assert_eq!(plain.outputs, observed.outputs);
+    assert!(plain.diagnostics.is_empty());
+}
+
+/// Review test gap: the partitioned (sharded) scheduler against the
+/// single-partition sequential reference on race-free multi-cluster
+/// programs, for several worker counts.
+#[test]
+fn sharded_matches_single_partition_reference() {
+    let cases = vec![
+        scenarios::vector_add(),
+        scenarios::moe_synthetic(12, 3),
+        scenarios::bulk_reduce(6),
+        scenarios::cross_cluster_flag(true),
+    ];
+    for s in cases {
+        for seed in [0, 3] {
+            let reference = run_cfg(&s, &RunConfig { seed, single_partition: true, ..s.config.clone() });
+            completed(&reference);
+            for workers in [1, 4] {
+                let o = run_cfg(&s, &RunConfig { seed, workers, ..s.config.clone() });
+                completed(&o);
+                assert_eq!(o.outputs, reference.outputs, "{} seed={seed} workers={workers}", s.name);
+            }
+        }
+    }
+}
+
+/// M8: an observer that panics during replay with `workers > 1` propagates
+/// the panic instead of hanging the process.
+#[test]
+fn observer_panic_with_workers_does_not_hang() {
+    struct Boom;
+    impl Observer for Boom {
+        fn sync(&mut self, _e: &SyncEvent) {
+            panic!("observer boom");
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let s = scenarios::moe_synthetic(4, 1);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = Boom;
+            let _ = sched::run_with_config(&s.module, &s.inputs, &mut b, &Backend::Interp, &RunConfig { workers: 2, ..s.config.clone() });
+        }));
+        let _ = tx.send(r.is_err());
+    });
+    let panicked = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("run hung after an observer panic");
+    assert!(panicked);
+}
+
+/// L7: a loop whose lanes all leave on its budget+1-th pass is not a
+/// budget error.
+#[test]
+fn loop_exit_on_last_pass_is_not_over_budget() {
+    let s = scenarios::bounded_probe_loop();
+    let o = run_cfg(&s, &RunConfig { loop_budget: 3, ..s.config.clone() });
+    completed(&o);
+}
+
+// ---------------------------------------------------------------------------
+// Conformance-sweep regressions
+// ---------------------------------------------------------------------------
+
+/// V2C-9: a global load of a parameter generic address reads the
+/// parameter; a store there is a BadAddress finding.
+#[test]
+fn param_aperture_reads_params_and_rejects_stores() {
+    let o = run(&scenarios::param_aperture(false));
+    completed(&o);
+    assert_eq!(o.outputs.buffers["out"].0, 0x1234_5678_9abcu64.to_le_bytes().to_vec());
+    let o = run(&scenarios::param_aperture(true));
+    match &o.status {
+        RunStatus::Error(e) => assert_eq!(e.kind, ExecErrorKind::BadAddress, "{e:?}"),
+        other => panic!("expected BadAddress, got {other:?}"),
+    }
+}
+
+/// V2C-14: without launch-bounds registers the initial budget follows the
+/// legacy caller base, logged as a host `Configure`.
+#[test]
+fn setmaxnreg_initial_budget_from_launch_bounds() {
+    let s = scenarios::setmaxnreg_default_budget();
+    let mut log = RecordingObserver::new();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    completed(&o);
+    assert!(log.other.iter().any(|e| format!("{:?}", e.kind).contains("Configure { count: 256 }")), "no Configure 256");
+    // min_blocks_per_sm = 4 caps the base at 512 / 4 = 128 (< 256: still an increase).
+    let mut s = scenarios::setmaxnreg_default_budget();
+    s.module.kernels[0].topology.min_blocks_per_sm = Some(4);
+    let mut log = RecordingObserver::new();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    assert!(log.other.iter().any(|e| format!("{:?}", e.kind).contains("Configure { count: 128 }")), "no Configure 128");
+    let _ = o;
+}
+
+/// W8-6: views of one host array share one allocation.
+#[test]
+fn aliased_views_share_one_allocation() {
+    let o = run(&scenarios::aliased_views());
+    completed(&o);
+    assert_eq!(u32s(&o, "mem"), vec![10, 11, 12, 13, 104, 105]);
+    assert_eq!(u32s(&o, "x"), vec![10, 11, 12, 13]);
+    assert_eq!(u32s(&o, "z"), vec![12, 13, 104, 105]);
+    assert_eq!(u32s(&o, "out"), vec![12, 13, 104, 105]);
+}
+
+/// W4-9: prefetch.valid_addr address check; applypriority.async.bulk in
+/// the bulk group.
+#[test]
+fn hint_ops_engine_effects() {
+    let s = scenarios::hint_ops(true);
+    let mut log = RecordingObserver::new();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    completed(&o);
+    let issued = log.per_warp[0].iter().any(|e| matches!(&e.kind, SyncKind::Protocol { cmds, .. } if cmds.iter().any(|c| format!("{:?}", c.cmd).contains("Issue"))));
+    assert!(issued, "applypriority.async.bulk did not join the bulk group");
+    let o = run(&scenarios::hint_ops(false));
+    match &o.status {
+        RunStatus::Error(e) => assert_eq!(e.kind, ExecErrorKind::BadAddress, "{e:?}"),
+        other => panic!("expected BadAddress, got {other:?}"),
+    }
 }

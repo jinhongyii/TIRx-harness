@@ -8,7 +8,6 @@
 use super::HResult;
 use crate::interp::support::{self, lane_val, ProtoExtra};
 use crate::interp::{ExecCtx, ExecErrorKind, Flow, FrameKind, MaskFrame};
-use crate::observe::SyncKind;
 use crate::program::{Instr, Operand, Pc, StrId};
 use crate::sync::{async_group, cluster, ResourceId, SyncCmd};
 use crate::value::WarpMask;
@@ -134,8 +133,9 @@ pub fn end_if(ctx: &mut ExecCtx<'_>) -> HResult {
 pub fn loop_begin(ctx: &mut ExecCtx<'_>, _end_pc: Pc) -> HResult {
     let entry = ctx.warp.active;
     let begin = ctx.warp.pc;
+    let outer = std::mem::take(&mut ctx.warp.poll);
     ctx.warp.frames.push(MaskFrame {
-        kind: FrameKind::Loop { begin, iteration: 0, broken: WarpMask::NONE, continued: WarpMask::NONE },
+        kind: FrameKind::Loop { begin, iteration: 0, broken: WarpMask::NONE, continued: WarpMask::NONE, outer, spin: 0 },
         origin: begin,
         entry,
         taken: entry,
@@ -143,11 +143,23 @@ pub fn loop_begin(ctx: &mut ExecCtx<'_>, _end_pc: Pc) -> HResult {
     Ok(Flow::Next)
 }
 
-/// Pop the loop frame on top and restore its entry lanes.
+/// Pop the loop frame on top and restore its entry lanes; its polls fold
+/// into the enclosing iteration.
 fn exit_loop(ctx: &mut ExecCtx<'_>) {
     if let Some(f) = ctx.warp.frames.pop() {
+        fold_poll(ctx, &f);
         let depth = ctx.warp.frames.len();
         ctx.warp.active = f.entry.and(alive_below(ctx, depth));
+    }
+}
+
+/// A loop frame is being dropped: the enclosing iteration's polls are its
+/// `outer` record plus the current ones.
+fn fold_poll(ctx: &mut ExecCtx<'_>, f: &MaskFrame) {
+    if let FrameKind::Loop { outer, .. } = &f.kind {
+        let mut p = *outer;
+        p.merge(&ctx.warp.poll);
+        ctx.warp.poll = p;
     }
 }
 
@@ -183,7 +195,7 @@ pub fn loop_end(ctx: &mut ExecCtx<'_>, head_pc: Pc) -> HResult {
     let live = ctx.warp.live;
     let budget = ctx.config.loop_budget;
     let Some(top) = ctx.warp.frames.last_mut() else { return Err(internal(ctx, "LoopEnd without frame")) };
-    let FrameKind::Loop { begin, iteration, broken, continued } = &mut top.kind else {
+    let FrameKind::Loop { begin, iteration, broken, continued, .. } = &mut top.kind else {
         return Err(internal(ctx, "LoopEnd without loop frame"));
     };
     *iteration += 1;
@@ -192,6 +204,12 @@ pub fn loop_end(ctx: &mut ExecCtx<'_>, head_pc: Pc) -> HResult {
     *continued = WarpMask::NONE;
     let next = top.taken.and(live).and_not(*broken);
     top.taken = next;
+    if next.is_empty() {
+        // Every lane left: the loop is done even on its budget+1-th pass.
+        ctx.warp.active = next;
+        exit_loop(ctx);
+        return Ok(Flow::Next);
+    }
     if it > budget {
         let mut e = ctx.error(
             ExecErrorKind::Budget,
@@ -201,16 +219,24 @@ pub fn loop_end(ctx: &mut ExecCtx<'_>, head_pc: Pc) -> HResult {
         return Err(e);
     }
     ctx.warp.active = next;
-    if next.is_empty() {
-        exit_loop(ctx);
-        ctx.warp.poll = Default::default();
-        return Ok(Flow::Next);
-    }
     let poll = std::mem::take(&mut ctx.warp.poll);
-    if let (Some(r), false) = (poll.failed_on, poll.progressed) {
-        // A whole iteration of failed polls: park until the next round.
+    // Spin parking (H2): an iteration whose only effects were failed polls
+    // parks only when it left the warp's state exactly as the previous such
+    // iteration did: the next iteration is then identical unless another
+    // actor or an async op changes what it polls. A loop whose state
+    // advances (a bounded probe loop, a retry counter) is never parked.
+    let spin = match (poll.failed_on, poll.progressed) {
+        (Some(_), false) => ctx.warp.spin_hash(),
+        _ => 0,
+    };
+    let top = ctx.warp.frames.last_mut().expect("loop frame");
+    let FrameKind::Loop { outer, spin: last, .. } = &mut top.kind else { unreachable!() };
+    outer.merge(&poll);
+    let fixed_point = spin != 0 && *last == spin;
+    *last = spin;
+    if fixed_point {
         ctx.warp.resume = Some(PARKED);
-        return Ok(Flow::Blocked(r));
+        return Ok(Flow::Blocked(poll.failed_on.expect("failed poll")));
     }
     if it % LOOP_QUANTUM == 0 {
         Ok(Flow::Yield(head_pc))
@@ -235,7 +261,10 @@ fn skip_if_iteration_done(ctx: &mut ExecCtx<'_>, li: usize) -> HResult {
     let remaining = ctx.warp.frames[li].taken.and(ctx.warp.live).and_not(broken.or(continued));
     if remaining.is_empty() {
         if let Some(end) = loop_end_pc(ctx, li) {
-            ctx.warp.frames.truncate(li + 1);
+            while ctx.warp.frames.len() > li + 1 {
+                let f = ctx.warp.frames.pop().expect("frame");
+                fold_poll(ctx, &f);
+            }
             return Ok(Flow::Jump(end));
         }
     }
@@ -302,18 +331,52 @@ pub fn exit(ctx: &mut ExecCtx<'_>) -> HResult {
     }
     if ctx.warp.live.is_empty() {
         ctx.aux.exited_warps += 1;
+        release_named_on_exit(ctx, lanes)?;
         // A grid barrier waiting only on exited warps completes.
         let g = &mut ctx.aux.grid;
         if !g.arrived.is_empty() && g.arrived.len() as u32 >= ctx.launch.num_warps() - ctx.aux.exited_warps {
             g.gen += 1;
             g.arrived.clear();
         }
-        if ctx.observing && ctx.loaded.uses_cluster_barrier {
-            let _ = SyncKind::WarpSync { mask: WarpMask::NONE };
-        }
         return Ok(Flow::Exit);
     }
     Ok(Flow::Next)
+}
+
+/// A warp whose every lane exited leaves the membership of the CTA's
+/// count-less named barriers (PTX §9.7.14.7: "barriers exclusively waiting
+/// on arrivals from exited threads are always released"; sync-isa-answers
+/// Q3/Q4). Later count-less generations expect its 32 threads fewer
+/// (`barrier`); an open generation it has not arrived at counts it as
+/// arrived: the exit commits a `Named` arrival of the exiting lanes (same
+/// flavor as the generation, so `.red` is not mixed), through the protocol
+/// like any other transition, and logs it. Generations with an explicit
+/// thread count name no membership: a hang there is reported as
+/// `incomplete` (G8) by the scheduler.
+fn release_named_on_exit(ctx: &mut ExecCtx<'_>, lanes: WarpMask) -> Result<(), crate::interp::ExecError> {
+    use crate::sync::{named, Resource};
+    let cta = ctx.cta.id;
+    let w = ctx.warp.warp_in_cta;
+    *ctx.aux.cta_exited.entry(cta).or_default() |= 1u64 << w.min(63);
+    for id in 0..named::NUM_IDS as u8 {
+        let Some(&gen) = ctx.aux.named_implicit.get(&(cta, id)) else { continue };
+        let res = ResourceId::Named { cta, id };
+        let Some(Resource::Named(s)) = ctx.sync.get(res) else { continue };
+        let Some(expected) = s.expected else { continue };
+        if s.gen != gen || s.complete || s.warps.keys().any(|&(x, _)| x == w) {
+            continue;
+        }
+        let red = s.warps.keys().any(|&(_, f)| f == named::Flavor::Red);
+        let c = named::Contribution { warp: w, mask: lanes.bits(), live: lanes.bits(), count: expected, aligned: false };
+        let cmd = SyncCmd::Named(if red { named::Cmd::Red(c) } else { named::Cmd::Arrive(c) });
+        support::step(ctx, res, cmd)?;
+        let extra = ProtoExtra {
+            counts: crate::observe::Counts { expected_threads: Some(expected), contributed_threads: Some(named::WARP_SIZE), ..Default::default() },
+            ..Default::default()
+        };
+        support::protocol(ctx, lanes, vec![(res, cmd)], extra);
+    }
+    Ok(())
 }
 
 #[inline]

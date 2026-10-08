@@ -72,7 +72,14 @@ pub enum FrameKind {
     Then,
     Else,
     /// A loop: `begin` = pc of its `LoopBegin` (site = loop-enter site).
-    Loop { begin: Pc, iteration: u64, broken: WarpMask, continued: WarpMask },
+    ///
+    /// `outer`: failed polls of the enclosing iteration before the loop
+    /// was entered plus those of this loop's finished iterations (merged
+    /// back into the enclosing iteration when the loop exits). `spin`: hash
+    /// of the warp's register state at the previous `LoopEnd` whose
+    /// iteration only failed polls (0 = none); spin parking requires the
+    /// next such `LoopEnd` to find the same state (a fixed point).
+    Loop { begin: Pc, iteration: u64, broken: WarpMask, continued: WarpMask, outer: PollState, spin: u64 },
 }
 
 /// One mask-stack frame.
@@ -157,9 +164,47 @@ pub struct Suspension {
     pub frames: Vec<MaskFrame>,
     pub resume: Option<u64>,
     pub poll: PollState,
+    /// What the suspended instruction blocked on (deadlock evidence when
+    /// the warp is resumed at it).
+    pub res: ResourceId,
+}
+
+impl PollState {
+    /// Fold `other`'s polls into `self`.
+    pub fn merge(&mut self, other: &PollState) {
+        self.progressed |= other.progressed;
+        self.overflow |= other.overflow;
+        for r in std::iter::once(other.failed_on).chain(other.also.iter().copied()).flatten() {
+            match self.failed_on {
+                None => self.failed_on = Some(r),
+                Some(f) if f == r => {}
+                Some(_) => {
+                    if !self.also.contains(&Some(r)) {
+                        match self.also.iter_mut().find(|x| x.is_none()) {
+                            Some(slot) => *slot = Some(r),
+                            None => self.overflow = true,
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl WarpState {
+    /// Hash of the state a loop iteration can depend on (registers and
+    /// masks); equal hashes at consecutive poll-only `LoopEnd`s mean the
+    /// next iteration repeats unless memory or sync state changes.
+    pub fn spin_hash(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ ((self.active.bits() as u64) << 32 | self.live.bits() as u64);
+        for r in &self.regs.regs {
+            for &v in r.iter() {
+                h = (h.rotate_left(5) ^ v).wrapping_mul(0x5851_f42d_4c95_7f2d);
+            }
+        }
+        h | 1
+    }
+
     pub fn new(id: WarpId, cta: CtaId, warp_in_cta: u32, nslots: usize, live: WarpMask) -> WarpState {
         WarpState {
             id,
@@ -352,6 +397,21 @@ pub struct Loaded {
     pub uses_setmaxnreg: bool,
     /// The program contains tcgen05 instructions (TMEM is allocated).
     pub uses_tmem: bool,
+    /// Engine-side effect of `Program::ops[i]` beyond its oplib function
+    /// (CONTRACT_REQUESTS W4-9).
+    pub op_effects: Vec<OpEffect>,
+}
+
+/// Engine state an otherwise register-only PTX op touches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpEffect {
+    None,
+    /// `prefetch.L1::32B.valid_addr`: the address must name addressable
+    /// global memory (legacy `validate_global_cache_hint_address`).
+    ValidGlobalAddr,
+    /// `applypriority.async.bulk*` (`completion=bulk_group`): an async
+    /// bulk operation of the issuing thread's bulk group.
+    BulkGroupOp,
 }
 
 impl Loaded {
@@ -428,6 +488,15 @@ impl Loaded {
                         | Instr::TcgenMma(_)
                 )
             }),
+            op_effects: program
+                .ops
+                .iter()
+                .map(|k| match k.name.as_str() {
+                    "tirx.ptx.prefetch_valid_addr" => OpEffect::ValidGlobalAddr,
+                    n if n.starts_with("tirx.ptx.applypriority_async_bulk") => OpEffect::BulkGroupOp,
+                    _ => OpEffect::None,
+                })
+                .collect(),
             slots,
             ops,
             op_errors,
@@ -657,6 +726,7 @@ pub fn divergent_switch(ctx: &mut ExecCtx<'_>, pc: Pc, r: ResourceId) -> Option<
                 frames: w.frames[i + 1..].to_vec(),
                 resume: w.resume.take(),
                 poll: std::mem::take(&mut w.poll),
+                res: r,
             };
             w.frames.truncate(i + 1);
             w.frames.extend(other.frames);
@@ -666,7 +736,8 @@ pub fn divergent_switch(ctx: &mut ExecCtx<'_>, pc: Pc, r: ResourceId) -> Option<
             w.poll = other.poll;
             w.pc = other.pc;
             w.suspended.push(mine);
-            return Some(StepResult::Blocked(r));
+            // The warp now sits at the other arm's blocking instruction.
+            return Some(StepResult::Blocked(other.res));
         }
         if f.kind == FrameKind::Then {
             let Some(Instr::If { else_pc, end_pc, .. }) = ctx.program.code.get(f.origin.0 as usize) else { continue };
@@ -692,6 +763,7 @@ pub fn divergent_switch(ctx: &mut ExecCtx<'_>, pc: Pc, r: ResourceId) -> Option<
                 frames: w.frames[i + 1..].to_vec(),
                 resume: w.resume.take(),
                 poll: std::mem::take(&mut w.poll),
+                res: r,
             };
             w.suspended.push(mine);
             w.frames.truncate(i + 1);

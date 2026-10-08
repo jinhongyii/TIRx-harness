@@ -300,6 +300,10 @@ pub fn ptx(ctx: &mut ExecCtx<'_>, op: OpId, dsts: &[Reg], srcs: &[Operand], pred
         Some(p) => super::control::cond_mask(ctx, p, active),
         None => active,
     };
+    match ctx.loaded.op_effects[op.0 as usize] {
+        crate::interp::OpEffect::None => {}
+        effect => op_effect(ctx, effect, srcs, exec)?,
+    }
     let f = ctx.loaded.ops[op.0 as usize];
     PTX_SCRATCH.with(|cell| {
         let mut sc = cell.borrow_mut();
@@ -393,4 +397,54 @@ pub fn store_reg_indexed(ctx: &mut ExecCtx<'_>, base: Reg, len: u32, idx: Operan
     }
     let _ = (extend, lane_val);
     Ok(Flow::Next)
+}
+
+/// Engine effects of hint ops (CONTRACT_REQUESTS W4-9).
+#[cold]
+fn op_effect(ctx: &mut ExecCtx<'_>, effect: crate::interp::OpEffect, srcs: &[Operand], exec: WarpMask) -> Result<(), crate::interp::ExecError> {
+    use crate::interp::OpEffect;
+    use crate::sync::async_group::{self, Domain};
+    use crate::sync::SyncCmd;
+    match effect {
+        OpEffect::None => Ok(()),
+        OpEffect::ValidGlobalAddr => {
+            let Some(&a) = srcs.first() else { return Ok(()) };
+            for l in exec.lanes() {
+                let v = support::lane_val(ctx, a, l);
+                support::resolve(ctx, crate::program::AddrSpace::Global, v, l, 1)?;
+            }
+            Ok(())
+        }
+        OpEffect::BulkGroupOp => {
+            let mut cmds = Vec::new();
+            for l in exec.lanes() {
+                let gres = super::async_copy::group_res(ctx, l, Domain::Bulk);
+                let c = SyncCmd::AsyncGroup(async_group::Cmd::Issue);
+                support::step(ctx, gres, c)?;
+                cmds.push((gres, c));
+                let op = super::async_copy::issue_async(
+                    ctx,
+                    WarpMask::lane(l),
+                    super::async_copy::Issue {
+                        kind: crate::sync::AsyncKind::Bulk,
+                        class: crate::observe::AsyncClass::Copy,
+                        proxy: crate::program::Proxy::Async,
+                        payload: crate::sync::Payload::None,
+                        signals: Vec::new(),
+                        after: Vec::new(),
+                        targets: Vec::new(),
+                        queue: true,
+                        fill_pattern: Vec::new(),
+                        tf32_round: false,
+                        report: None,
+                        lut_b: None,
+                        strong: None,
+                    },
+                );
+                ctx.aux.groups.issue(gres, op);
+            }
+            support::protocol(ctx, exec, cmds, support::ProtoExtra::default());
+            Ok(())
+        }
+    }
 }

@@ -1263,11 +1263,22 @@ pub const TCGEN_CP_SDESC: u64 = (8u64 << 16) | (16u64 << 32) | (1u64 << 46);
 /// reads its sub-partition back with `tcgen05.ld.32x32b.x8` into `out`
 /// (`out[tid * 8 + j]` = TMEM lane `tid`, column `j`).
 pub fn tcgen_cp_ld() -> Scenario {
+    tcgen_cp_ld_with(false)
+}
+
+/// [`tcgen_cp_ld`]; with `double_commit`, the copy is committed to `bar`
+/// and then AGAIN to `bar2` with nothing new issued in between, and the
+/// warps wait only on `bar2`: a commit tracks every prior in-flight
+/// tcgen05 op of the thread, not only those since its last commit, so
+/// `bar2` must not complete before the copy lands (seeded latency).
+pub fn tcgen_cp_ld_with(double_commit: bool) -> Scenario {
     let mut b = ProgramBuilder::new("tcgen_cp_ld", 128);
     let input = b.global("input", Dtype::U32);
     let out = b.global("out", Dtype::U32);
     let src = b.shared("src", Dtype::U32, 1024);
     let bar = b.shared("bar", Dtype::U64, 1);
+    let bar2 = b.shared("bar2", Dtype::U64, 1);
+    let barr2 = b.reg(Ty::U32);
     let slot = b.shared("taddr", Dtype::U32, 1);
     let tid = b.reg(Ty::U32);
     let w = b.reg(Ty::U32);
@@ -1307,8 +1318,10 @@ pub fn tcgen_cp_ld() -> Scenario {
     b.push(Instr::TcgenAlloc { dst: sa.into(), ncols: k32, cta_group: 1, exclusive: false });
     b.end_if();
     b.compare(CmpOp::Eq, Ty::U32, p, tid, k0);
+    b.smem_addr(barr2, bar2, k0);
     b.if_(p);
     b.mbar_init(barr, 1);
+    b.mbar_init(barr2, 1);
     b.end_if();
     b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
     b.fence(FenceKind::ProxyAsync(Some(AddrSpace::Shared)), Sem::Weak, Scope::Cta);
@@ -1331,9 +1344,13 @@ pub fn tcgen_cp_ld() -> Scenario {
         cta_group: 1,
     }));
     b.push(Instr::TcgenCommit { mbar: barr.into(), space: AddrSpace::Shared, cta_group: 1, multicast: None, sync_restrict: false, multicast_width: None });
+    if double_commit {
+        b.site("second_commit", 3);
+        b.push(Instr::TcgenCommit { mbar: barr2.into(), space: AddrSpace::Shared, cta_group: 1, multicast: None, sync_restrict: false, multicast_width: None });
+    }
     b.no_site();
     b.end_if();
-    b.mbar_wait_parity(barr, k0);
+    b.mbar_wait_parity(if double_commit { barr2 } else { barr }, k0);
     b.fence(FenceKind::Tcgen05After, Sem::Weak, Scope::Cta);
     b.mul(Ty::U32, lb, w, k32);
     b.binary(BinOp::Shl, Ty::U32, lb, lb, k16);
@@ -1368,7 +1385,7 @@ pub fn tcgen_cp_ld() -> Scenario {
     b.end_if();
     b.exit();
     scenario(
-        "tcgen_cp_ld",
+        if double_commit { "tcgen_cp_double_commit" } else { "tcgen_cp_ld" },
         b.build_module(),
         inputs(vec![("input", u32_buf((0..1024).map(|x| x * 3 + 7))), ("out", u32_buf(vec![0; 1024]))]),
     )
@@ -1597,6 +1614,934 @@ pub fn setmaxnreg_launch_bounds() -> Scenario {
     scenario("setmaxnreg_launch_bounds", Module::new(vec![prog]), inputs(vec![("out", u32_buf(vec![9; 256]))]))
 }
 
+// ---------------------------------------------------------------------------
+// Engine-review regressions (docs/development/engine-review.md)
+// ---------------------------------------------------------------------------
+
+fn test_wait(b: &mut ProgramBuilder, dst: Reg, barr: Reg, parity: Operand) {
+    b.push(Instr::MbarTestWait {
+        kind: WaitKind::Try,
+        mbar: barr.into(),
+        space: AddrSpace::Shared,
+        phase: PhaseArg::Parity(parity),
+        sem: Sem::Acquire,
+        scope: Scope::Cta,
+        dst: Some(dst),
+        report: None,
+        report_value: None,
+    });
+}
+
+fn ld_sem(b: &mut ProgramBuilder, dst: Reg, buf: Buf, idx: Operand, sem: Sem, scope: Scope) {
+    b.push(Instr::Load { ty: Ty::U32, dst, buf, offset: idx, sem, scope, mods: MemMods::default() });
+}
+
+fn st_sem(b: &mut ProgramBuilder, buf: Buf, idx: Operand, value: Operand, sem: Sem, scope: Scope) {
+    b.push(Instr::Store { ty: Ty::U32, buf, offset: idx, value, sem, scope, mods: MemMods::default() });
+}
+
+/// A register-only loop of `n` iterations (keeps a warp busy for a few
+/// rounds without touching memory or sync state).
+fn busy_loop(b: &mut ProgramBuilder, n: u32) {
+    let k = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let kn = b.k_u32(n);
+    b.mov(k, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, kn);
+    b.loop_if(p);
+    b.add_u32(k, k, k1);
+    b.loop_end();
+}
+
+/// H1 (G8): warp 1 exits, then warp 0 runs the count-less `bar.sync 0`.
+/// Exited warps leave the barrier's membership, so it completes. With
+/// `counted`, the barrier names an explicit count of 64 threads instead:
+/// release by exit is not modeled there, so the hang is `incomplete`.
+pub fn exit_then_barrier(counted: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("exit_then_barrier", 64);
+    let out = b.global("out", Dtype::U32);
+    let tid = b.reg(Ty::U32);
+    let w = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    b.thread_rank(tid);
+    b.warp_id(w);
+    let k1 = b.k_u32(1);
+    b.compare(CmpOp::Ge, Ty::U32, p, w, k1);
+    b.if_(p);
+    b.exit();
+    b.end_if();
+    b.site("bar_after_exit", 1);
+    if counted {
+        let k0 = b.k_u32(0);
+        let k64 = b.k_u32(64);
+        b.push(Instr::Barrier { kind: BarKind::Sync, id: k0, count: Some(k64), aligned: true });
+    } else {
+        b.bar_sync(0);
+    }
+    b.no_site();
+    let k7 = b.k_u32(7);
+    b.st_u32(out, tid, k7);
+    b.exit();
+    let name = if counted { "exit_then_counted_barrier" } else { "exit_then_barrier" };
+    scenario(name, b.build_module(), inputs(vec![("out", u32_buf([0; 64]))]))
+}
+
+/// H2: a bounded `for k < 3: test_wait(bar)` probe on a barrier nobody
+/// arrives on, then `out[lane] = k`. The loop's state advances, so it is
+/// never spin-parked: Completed with `out = 3`.
+pub fn bounded_probe_loop() -> Scenario {
+    let mut b = ProgramBuilder::new("bounded_probe_loop", 32);
+    let out = b.global("out", Dtype::U32);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let barr = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let k = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let ok = b.reg(Ty::PRED);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k3 = b.k_u32(3);
+    b.smem_addr(barr, bar, k0);
+    b.mbar_init(barr, 1);
+    b.mov(k, k0);
+    b.site("probe", 1);
+    b.loop_begin();
+    b.no_site();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, k3);
+    b.loop_if(p);
+    test_wait(&mut b, ok, barr, k0);
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.st_u32(out, lane, k);
+    b.exit();
+    scenario("bounded_probe_loop", b.build_module(), inputs(vec![("out", u32_buf([9; 32]))]))
+}
+
+/// M1: `while (true) { for s < 2 { if (!test_wait(bar[s])) break; } }` on
+/// barriers that never complete. The inner loop's failed poll reaches the
+/// outer iteration, which is a fixed point: Deadlock within a few rounds.
+pub fn nested_spin_break() -> Scenario {
+    let mut b = ProgramBuilder::new("nested_spin_break", 32);
+    let bars = b.shared("bars", Dtype::U64, 2);
+    let barr = b.reg(Ty::U32);
+    let s = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let ok = b.reg(Ty::PRED);
+    let bad = b.reg(Ty::PRED);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k2 = b.k_u32(2);
+    for i in [k0, k1] {
+        b.smem_addr(barr, bars, i);
+        b.mbar_init(barr, 1);
+    }
+    let t = b.konst(Ty::PRED, 1);
+    b.site("outer_spin", 1);
+    b.loop_begin();
+    b.no_site();
+    b.loop_if(t);
+    b.mov(s, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, s, k2);
+    b.loop_if(p);
+    b.smem_addr(barr, bars, s);
+    test_wait(&mut b, ok, barr, k0);
+    b.push(Instr::Unary { op: UnOp::Not, ty: Ty::PRED, dst: bad, a: ok.into() });
+    b.if_(bad);
+    b.break_();
+    b.end_if();
+    b.add_u32(s, s, k1);
+    b.loop_end();
+    b.loop_end();
+    b.exit();
+    let mut sc = scenario("nested_spin_break", b.build_module(), Inputs::default());
+    sc.config.loop_budget = 1 << 40;
+    sc
+}
+
+/// M2: warp 0 spins on `ld.acquire.gpu flag` until warp 1 (after a busy
+/// loop) stores `st.release.gpu flag = 1` and the data it guards. With
+/// `publish = false` warp 1 never stores: the spin parks and the launch is
+/// a Deadlock, not a loop-budget overrun.
+pub fn load_flag_spin(publish: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("load_flag_spin", 64);
+    let flag = b.global("flag", Dtype::U32);
+    let data = b.global("data", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let w = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    b.warp_id(w);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k1);
+    b.if_(p);
+    if publish {
+        busy_loop(&mut b, 600);
+        let k5 = b.k_u32(5);
+        b.st_u32(data, lane, k5);
+        let full = b.k_u32(u32::MAX);
+        b.push(Instr::WarpSync { membermask: full });
+        b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+        b.if_(p);
+        st_sem(&mut b, flag, k0, k1, Sem::Release, Scope::Gpu);
+        b.end_if();
+    }
+    b.else_();
+    b.mov(v, k0);
+    b.site("flag_spin", 1);
+    b.loop_begin();
+    b.no_site();
+    b.compare(CmpOp::Eq, Ty::U32, p, v, k0);
+    b.loop_if(p);
+    ld_sem(&mut b, v, flag, k0, Sem::Acquire, Scope::Gpu);
+    b.loop_end();
+    b.ld_u32(v, data, lane);
+    b.st_u32(out, lane, v);
+    b.end_if();
+    b.exit();
+    let mut sc = scenario(
+        if publish { "load_flag_spin" } else { "load_flag_spin_never" },
+        b.build_module(),
+        inputs(vec![("flag", u32_buf([0])), ("data", u32_buf([0; 32])), ("out", u32_buf([0; 32]))]),
+    );
+    sc.config.loop_budget = 1 << 40;
+    sc
+}
+
+/// M10: two single-CTA clusters (two partitions). In round 0, CTA 0 lane 0
+/// stores `data = 5` then `st.release.gpu flag = 1`; CTA 1 lane 0 reads
+/// `ld.acquire.gpu flag` ONCE (seeing the round-start 0) and then reads
+/// `data` regardless: a real race, which racecheck must see. With
+/// `guarded`, CTA 1 instead spins until the flag is 1 (race-free; also
+/// the cross-partition visibility check: one round late).
+pub fn cross_cluster_flag(guarded: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("cross_cluster_flag", 32);
+    b.grid(2, 1, 1);
+    let flag = b.global("flag", Dtype::U32);
+    let data = b.global("data", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let cta = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    let f = b.reg(Ty::U32);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.compare(CmpOp::Eq, Ty::U32, p, cta, k0);
+    b.if_(p);
+    let k5 = b.k_u32(5);
+    b.site("data_store", 1);
+    b.st_u32(data, k0, k5);
+    b.site("flag_release", 2);
+    st_sem(&mut b, flag, k0, k1, Sem::Release, Scope::Gpu);
+    b.no_site();
+    b.else_();
+    b.mov(f, k0);
+    if guarded {
+        b.loop_begin();
+        b.compare(CmpOp::Eq, Ty::U32, p, f, k0);
+        b.loop_if(p);
+        b.site("flag_acquire", 3);
+        ld_sem(&mut b, f, flag, k0, Sem::Acquire, Scope::Gpu);
+        b.no_site();
+        b.loop_end();
+    } else {
+        b.site("flag_acquire", 3);
+        ld_sem(&mut b, f, flag, k0, Sem::Acquire, Scope::Gpu);
+    }
+    b.site("data_load", 4);
+    b.ld_u32(v, data, k0);
+    b.no_site();
+    b.add_u32(v, v, f);
+    b.st_u32(out, k0, v);
+    b.end_if();
+    b.end_if();
+    b.exit();
+    scenario(
+        if guarded { "cross_cluster_flag" } else { "cross_cluster_flag_racy" },
+        b.build_module(),
+        inputs(vec![("flag", u32_buf([0])), ("data", u32_buf([0])), ("out", u32_buf([0]))]),
+    )
+}
+
+/// H6: lane 0 `cp.async`s 4 bytes global -> shared WITHOUT commit/wait, one
+/// register op, then a read of the destination: under `Seeded` completion
+/// some seeds read before the copy lands.
+pub fn cp_async_no_wait() -> Scenario {
+    let mut b = ProgramBuilder::new("cp_async_no_wait", 32);
+    let input = b.global("in", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let sm = b.shared("s", Dtype::U32, 32);
+    let lane = b.reg(Ty::U32);
+    let saddr = b.reg(Ty::U32);
+    let gaddr = b.reg(Ty::U64);
+    let v = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.smem_addr(saddr, sm, lane);
+    b.addr_of(gaddr, input, lane);
+    b.site("cp_async", 1);
+    b.push(Instr::CpAsync { dst: saddr.into(), src: gaddr.into(), cp_size: 4, src_size: None, ignore_src: None, mods: MemMods::default() });
+    b.no_site();
+    b.add_u32(v, lane, lane);
+    b.site("early_read", 2);
+    b.ld_u32(v, sm, lane);
+    b.no_site();
+    b.st_u32(out, lane, v);
+    b.cp_async_commit_wait_all();
+    b.end_if();
+    b.exit();
+    let mut sc = scenario("cp_async_no_wait", b.build_module(), inputs(vec![("in", u32_buf(0..32)), ("out", u32_buf([0; 32]))]));
+    sc.config.quantum = 1;
+    sc
+}
+
+/// H3: one thread issues two shared->global bulk copies, each its own bulk
+/// group, then `cp.async.bulk.wait_group.read 1` (only the OLDER group's
+/// reads are done) and finally `wait_group 0`.
+pub fn bulk_wait_read() -> Scenario {
+    let mut b = ProgramBuilder::new("bulk_wait_read", 32);
+    let out = b.global("out", Dtype::U32);
+    let blk = b.shared("blk", Dtype::U32, 32);
+    let lane = b.reg(Ty::U32);
+    let e = b.reg(Ty::PRED);
+    let sa = b.reg(Ty::U32);
+    let g = b.reg(Ty::U64);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k16 = b.k_u32(16);
+    let k64 = b.k_u32(64);
+    b.st_u32(blk, lane, lane);
+    b.fence(FenceKind::ProxyAsync(Some(AddrSpace::Shared)), Sem::Weak, Scope::Cta);
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::WarpSync { membermask: full });
+    elect_if(&mut b, e);
+    for half in [k0, k16] {
+        b.smem_addr(sa, blk, half);
+        b.addr_of(g, out, half);
+        b.site("bulk_store", 1);
+        b.push(Instr::BulkCopy(BulkCopyArgs {
+            dst: g.into(),
+            dst_space: AddrSpace::Global,
+            src: sa.into(),
+            src_space: AddrSpace::Shared,
+            size: k64,
+            completion: BulkCompletion::Group,
+            multicast: None,
+            reduce: None,
+            byte_mask: None,
+            ignore_oob: None,
+            report: None,
+            mods: MemMods::default(),
+        }));
+        b.push(Instr::AsyncCommit { domain: Domain::Bulk });
+    }
+    b.site("wait_read_1", 2);
+    b.push(Instr::AsyncWait { domain: Domain::Bulk, n: 1, read: true });
+    b.site("wait_all", 3);
+    b.push(Instr::AsyncWait { domain: Domain::Bulk, n: 0, read: false });
+    b.no_site();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    mark_elect(&mut prog, e);
+    scenario("bulk_wait_read", Module::new(vec![prog]), inputs(vec![("out", u32_buf([0; 32]))]))
+}
+
+/// H4 / M3: lanes 0..16 use `bars[0]`, lanes 16..32 `bars[1]` (count 16
+/// each) in one `arrive` and one `wait` instruction.
+pub fn lane_split_mbarrier() -> Scenario {
+    let mut b = ProgramBuilder::new("lane_split_mbarrier", 32);
+    let out = b.global("out", Dtype::U32);
+    let bars = b.shared("bars", Dtype::U64, 2);
+    let lane = b.reg(Ty::U32);
+    let i = b.reg(Ty::U32);
+    let m = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k4 = b.k_u32(4);
+    b.binary(BinOp::Shr, Ty::U32, i, lane, k4);
+    b.smem_addr(m, bars, i);
+    b.site("init", 1);
+    b.mbar_init(m, 16);
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    b.site("split_arrive", 2);
+    b.mbar_arrive(m, None);
+    b.site("split_wait", 3);
+    b.mbar_wait_parity(m, k0);
+    b.no_site();
+    b.st_u32(out, lane, i);
+    b.exit();
+    scenario("lane_split_mbarrier", b.build_module(), inputs(vec![("out", u32_buf([9; 32]))]))
+}
+
+/// M4: warp 0 waits in ONE instruction on `A` (lanes 0..16) and `B`
+/// (lanes 16..32), both count 1. Warp 1 lane 0 arrives on A, idles, arrives
+/// on A again (A has now advanced two phases: parity 0 is pending again),
+/// then arrives on B. Lanes that saw A complete left the wait (latched), so
+/// the launch completes. Under all schedules the second arrive on A may
+/// precede the first wait (nothing orders them), so synccheck rightly
+/// reports `ReuseBeforeConsumption`: this is an engine-semantics test, not
+/// part of [`all`].
+pub fn mbar_latch() -> Scenario {
+    let mut b = ProgramBuilder::new("mbar_latch", 64);
+    let out = b.global("out", Dtype::U32);
+    let bars = b.shared("bars", Dtype::U64, 2);
+    let tid = b.reg(Ty::U32);
+    let w = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let i = b.reg(Ty::U32);
+    let m = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    b.thread_rank(tid);
+    b.warp_id(w);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k4 = b.k_u32(4);
+    b.compare(CmpOp::Eq, Ty::U32, p, tid, k0);
+    b.if_(p);
+    for x in [k0, k1] {
+        b.smem_addr(m, bars, x);
+        b.mbar_init(m, 1);
+    }
+    b.end_if();
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    b.bar_sync(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b.if_(p);
+    b.binary(BinOp::Shr, Ty::U32, i, lane, k4);
+    b.smem_addr(m, bars, i);
+    b.site("latched_wait", 1);
+    b.mbar_wait_parity(m, k0);
+    b.no_site();
+    b.st_u32(out, lane, k1);
+    b.else_();
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.smem_addr(m, bars, k0);
+    b.mbar_arrive(m, None);
+    busy_loop(&mut b, 2000);
+    b.mbar_arrive(m, None);
+    b.smem_addr(m, bars, k1);
+    b.mbar_arrive(m, None);
+    b.end_if();
+    b.end_if();
+    b.exit();
+    scenario("mbar_latch", b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
+}
+
+/// H5: `atom.global.exch.b128` and `atom.global.cas.b128` by lane 0.
+/// `g` starts as words [1,2,3,4, 5,6,7,8]: exch writes [9,9,9,9] to the
+/// first element (old -> out[0..4]); cas on the second compares against
+/// [5,6,7,8] and swaps in [7,7,7,7] (old -> out[4..8]).
+pub fn atom_b128() -> Scenario {
+    let mut b = ProgramBuilder::new("atom_b128", 32);
+    let g = b.global("g", Dtype::U32);
+    let out = b.global("out", Dtype::B128);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let a = b.reg(Ty::U64);
+    let old = b.reg(Ty::B128);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k4 = b.k_u32(4);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    let nine = b.konst(Ty::B128, 0x0000_0009_0000_0009_0000_0009_0000_0009);
+    b.addr_of(a, g, k0);
+    b.site("atom_exch_b128", 1);
+    b.push(Instr::Atom { op: AtomOp::Exch, ty: Ty::B128, dst: Some(old), addr: a.into(), space: AddrSpace::Global, value: nine, cmp: None, sem: Sem::Relaxed, scope: Scope::Gpu, ftz: false });
+    b.no_site();
+    b.st(Ty::B128, out, k0, old);
+    let seven = b.konst(Ty::B128, 0x0000_0007_0000_0007_0000_0007_0000_0007);
+    let want = b.konst(Ty::B128, 0x0000_0008_0000_0007_0000_0006_0000_0005);
+    b.addr_of(a, g, k4);
+    b.site("atom_cas_b128", 2);
+    b.push(Instr::Atom { op: AtomOp::Cas, ty: Ty::B128, dst: Some(old), addr: a.into(), space: AddrSpace::Global, value: seven, cmp: Some(want), sem: Sem::Relaxed, scope: Scope::Gpu, ftz: false });
+    b.no_site();
+    b.st(Ty::B128, out, k1, old);
+    b.end_if();
+    b.exit();
+    scenario(
+        "atom_b128",
+        b.build_module(),
+        inputs(vec![
+            ("g", u32_buf(1..=8)),
+            ("out", ArgValue::Buffer { bytes: vec![0; 32], valid: None }),
+        ]),
+    )
+}
+
+/// M5 / W5-8: in a one-CTA cluster every lane `st.async`s its word into
+/// shared memory, completing on an mbarrier armed with
+/// `arrive.expect_tx(128)`; the warp waits and copies the words out.
+pub fn st_async_copy() -> Scenario {
+    let mut b = ProgramBuilder::new("st_async_copy", 32);
+    b.cluster(1, 1, 1);
+    let out = b.global("out", Dtype::U32);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let sm = b.shared("s", Dtype::U32, 32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let barr = b.reg(Ty::U32);
+    let da = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k100 = b.k_u32(100);
+    let k128 = b.k_u32(128);
+    b.smem_addr(barr, bar, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.mbar_init(barr, 1);
+    b.end_if();
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::WarpSync { membermask: full });
+    b.if_(p);
+    b.push(Instr::MbarArrive(MbarArriveArgs {
+        mbar: barr.into(),
+        space: AddrSpace::Shared,
+        count: None,
+        expect_tx: Some(k128),
+        drop: false,
+        no_complete: false,
+        sem: Sem::Release,
+        scope: Scope::Cta,
+        multicast: None,
+        state: None,
+    }));
+    b.end_if();
+    b.push(Instr::WarpSync { membermask: full });
+    b.add_u32(v, lane, k100);
+    b.smem_addr(da, sm, lane);
+    b.site("st_async", 1);
+    b.push(Instr::StAsync(StAsyncArgs { ty: Ty::U32, value: v.into(), addr: da.into(), mbar: Some(barr.into()), red: None, sem: Sem::Release, scope: Scope::Cluster }));
+    b.no_site();
+    b.mbar_wait_parity(barr, k0);
+    b.ld_u32(v, sm, lane);
+    b.st_u32(out, lane, v);
+    b.exit();
+    scenario("st_async_copy", b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
+}
+
+/// M7: `tcgen05.st` to columns after they were deallocated: BadAddress.
+pub fn tcgen_after_dealloc() -> Scenario {
+    let mut b = ProgramBuilder::new("tcgen_after_dealloc", 32);
+    let slot = b.shared("taddr", Dtype::U32, 1);
+    let sa = b.reg(Ty::U32);
+    let t = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k32 = b.k_u32(32);
+    b.smem_addr(sa, slot, k0);
+    b.push(Instr::TcgenAlloc { dst: sa.into(), ncols: k32, cta_group: 1, exclusive: false });
+    b.bar_sync(0);
+    b.ld_u32(t, slot, k0);
+    b.push(Instr::TcgenDealloc { taddr: t.into(), ncols: k32, cta_group: 1, exclusive: false });
+    b.push(Instr::TcgenRelinquish { cta_group: 1 });
+    b.site("st_after_dealloc", 1);
+    b.push(Instr::TcgenSt(Box::new(TcgenStArgs {
+        srcs: vec![lane.into()],
+        taddr: t.into(),
+        row: k0,
+        col: k0,
+        shape: TcShape::S32x32b,
+        num: 1,
+        unpack: false,
+    })));
+    b.push(Instr::TcgenWait { st: true });
+    b.no_site();
+    b.exit();
+    scenario("tcgen_after_dealloc", b.build_module(), Inputs::default())
+}
+
+/// M11: warp 1 lane 0 writes a declared word `writes` times (values >= 2),
+/// then `flag = 1` (release); warp 0 `wait_until(flag == 1)`. Past
+/// `MAX_WORD_HISTORY` writes the verdict cannot be computed: incomplete
+/// (with a history-consuming observer).
+pub fn word_history_overflow(writes: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("word_history_overflow", 64);
+    let flag = b.global("flag", Dtype::U32);
+    b.declare_sync_words(flag);
+    let w = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let k = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    let fa = b.reg(Ty::U64);
+    let got = b.reg(Ty::U32);
+    let arg = b.reg(Ty::U32);
+    let res = b.reg(Ty::PRED);
+    b.warp_id(w);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k2 = b.k_u32(2);
+    let kn = b.k_u32(writes);
+    b.addr_of(fa, flag, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k1);
+    b.if_(p);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.mov(k, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, kn);
+    b.loop_if(p);
+    b.add_u32(v, k, k2);
+    st_sem(&mut b, flag, k0, v.into(), Sem::Relaxed, Scope::Gpu);
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    st_sem(&mut b, flag, k0, k1, Sem::Release, Scope::Gpu);
+    b.end_if();
+    b.else_();
+    b.site("wait_until", 1);
+    let placeholder = b.push(Instr::Nop);
+    b.no_site();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    let start = Pc(prog.code.len() as u32);
+    let k1c = match k1 {
+        Operand::Const(c) => c,
+        _ => unreachable!(),
+    };
+    prog.code.push(Instr::Compare { op: CmpOp::Eq, ty: Ty::U32, dst: res, a: arg.into(), b: Operand::Const(k1c) });
+    prog.code_sites.push(crate::site::SiteId::NONE);
+    prog.preds.push(PredProgram { arg, start, end: Pc(start.0 + 1), result: res, reads_memory: false });
+    prog.code[placeholder.0 as usize] = Instr::WaitUntil {
+        dst: got,
+        addr: fa.into(),
+        ty: Ty::U32,
+        space: AddrSpace::Generic,
+        sem: Sem::Acquire,
+        scope: Scope::Gpu,
+        pred: PredId(0),
+        captures: vec![],
+    };
+    prog.validate().expect("valid");
+    let mut sc = scenario("word_history_overflow", Module::new(vec![prog]), inputs(vec![("flag", u32_buf([0]))]));
+    sc.config.loop_budget = 1 << 40;
+    sc
+}
+
+/// M6: `wait_until(flag >= limit[0])` whose predicate reads the bound
+/// buffer `limit`: the read must be recorded in the verdict's
+/// `pred_reads` (the load fast path must not skip the capture).
+pub fn wait_until_pred_reads() -> Scenario {
+    let mut b = ProgramBuilder::new("wait_until_pred_reads", 64);
+    let flag = b.global("flag", Dtype::U32);
+    let limit = b.global("limit", Dtype::U32);
+    b.declare_sync_words(flag);
+    let w = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let fa = b.reg(Ty::U64);
+    let got = b.reg(Ty::U32);
+    let arg = b.reg(Ty::U32);
+    let lim = b.reg(Ty::U32);
+    let res = b.reg(Ty::PRED);
+    b.warp_id(w);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k3 = b.k_u32(3);
+    b.addr_of(fa, flag, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k1);
+    b.if_(p);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    st_sem(&mut b, flag, k0, k3, Sem::Release, Scope::Gpu);
+    b.end_if();
+    b.else_();
+    b.site("wait_until", 1);
+    let placeholder = b.push(Instr::Nop);
+    b.no_site();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    let start = Pc(prog.code.len() as u32);
+    let k0c = match k0 {
+        Operand::Const(c) => c,
+        _ => unreachable!(),
+    };
+    prog.code.push(Instr::Load { ty: Ty::U32, dst: lim, buf: limit, offset: Operand::Const(k0c), sem: Sem::Weak, scope: Scope::Cta, mods: MemMods::default() });
+    prog.code.push(Instr::Compare { op: CmpOp::Ge, ty: Ty::U32, dst: res, a: arg.into(), b: lim.into() });
+    prog.code_sites.push(crate::site::SiteId::NONE);
+    prog.code_sites.push(crate::site::SiteId::NONE);
+    prog.preds.push(PredProgram { arg, start, end: Pc(start.0 + 2), result: res, reads_memory: true });
+    prog.code[placeholder.0 as usize] = Instr::WaitUntil {
+        dst: got,
+        addr: fa.into(),
+        ty: Ty::U32,
+        space: AddrSpace::Generic,
+        sem: Sem::Acquire,
+        scope: Scope::Gpu,
+        pred: PredId(0),
+        captures: vec![],
+    };
+    prog.validate().expect("valid");
+    scenario("wait_until_pred_reads", Module::new(vec![prog]), inputs(vec![("flag", u32_buf([0])), ("limit", u32_buf([2]))]))
+}
+
+/// M9 / review scenario 8: a three-way divergent hand-off inside a loop
+/// with `continue` in one arm:
+/// `if lane < 8 { wait A; arrive B } else if lane < 16 { arrive A; wait C;
+/// continue } else { arrive A; arrive C; wait B }`, A/B/C with counts 24/8/16 (re-armed each
+/// iteration), two iterations; each arm appends its iteration's tag to
+/// `out[lane]` exactly once per iteration.
+pub fn divergent_nesting() -> Scenario {
+    let mut b = ProgramBuilder::new("divergent_nesting", 32);
+    let out = b.global("out", Dtype::U32);
+    let bars = b.shared("bars", Dtype::U64, 3);
+    let lane = b.reg(Ty::U32);
+    let it = b.reg(Ty::U32);
+    let acc = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let q = b.reg(Ty::PRED);
+    let ma = b.reg(Ty::U32);
+    let mb = b.reg(Ty::U32);
+    let mc = b.reg(Ty::U32);
+    let par = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k2 = b.k_u32(2);
+    let k8 = b.k_u32(8);
+    let k16 = b.k_u32(16);
+    let k10 = b.k_u32(10);
+    b.smem_addr(ma, bars, k0);
+    b.smem_addr(mb, bars, k1);
+    b.smem_addr(mc, bars, k2);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.mbar_init(ma, 24);
+    b.mbar_init(mb, 8);
+    b.mbar_init(mc, 16);
+    b.end_if();
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::WarpSync { membermask: full });
+    b.mov(acc, k0);
+    b.mov(it, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, it, k2);
+    b.loop_if(p);
+    b.binary(BinOp::And, Ty::U32, par, it, k1);
+    b.mul(Ty::U32, acc, acc, k10);
+    b.add_u32(acc, acc, k1);
+    b.add_u32(it, it, k1);
+    b.compare(CmpOp::Lt, Ty::U32, p, lane, k8);
+    b.if_(p);
+    b.site("arm0_wait_a", 1);
+    b.mbar_wait_parity(ma, par);
+    b.mbar_arrive(mb, None);
+    b.no_site();
+    b.else_();
+    b.compare(CmpOp::Lt, Ty::U32, q, lane, k16);
+    b.if_(q);
+    b.mbar_arrive(ma, None);
+    b.site("arm1_wait_c", 2);
+    b.mbar_wait_parity(mc, par);
+    b.no_site();
+    b.continue_();
+    b.else_();
+    b.mbar_arrive(ma, None);
+    b.mbar_arrive(mc, None);
+    b.site("arm2_wait_b", 3);
+    b.mbar_wait_parity(mb, par);
+    b.no_site();
+    b.end_if();
+    b.end_if();
+    b.add_u32(acc, acc, k1);
+    b.loop_end();
+    b.st_u32(out, lane, acc);
+    b.exit();
+    scenario("divergent_nesting", b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
+}
+
+/// M10 cycle: two single-CTA clusters each `st.release` their own flag and
+/// then `ld.acquire` the other's in the same round. Both read the
+/// round-start 0 (store buffering); no sequential event stream represents
+/// that, so an observed run carries an `incomplete` diagnostic.
+pub fn cross_cluster_sb() -> Scenario {
+    let mut b = ProgramBuilder::new("cross_cluster_sb", 32);
+    b.grid(2, 1, 1);
+    let flags = b.global("flags", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let cta = b.reg(Ty::U32);
+    let other = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    b.binary(BinOp::Xor, Ty::U32, other, cta, k1);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    st_sem(&mut b, flags, cta.into(), k1, Sem::Release, Scope::Gpu);
+    ld_sem(&mut b, v, flags, other.into(), Sem::Acquire, Scope::Gpu);
+    b.st_u32(out, cta, v);
+    b.end_if();
+    b.exit();
+    scenario("cross_cluster_sb", b.build_module(), inputs(vec![("flags", u32_buf([0, 0])), ("out", u32_buf([9, 9]))]))
+}
+
+// ---------------------------------------------------------------------------
+// Conformance-sweep regressions (CONTRACT_REQUESTS "v2 conformance")
+// ---------------------------------------------------------------------------
+
+/// V2C-9: `ld.global` of a kernel-parameter generic address (the address
+/// of a parameter, as kernels take for `__grid_constant__` tensor maps)
+/// reads the parameter. With `store`, lane 0 then stores there: an error
+/// finding (parameters are read-only), never a crash.
+pub fn param_aperture(store: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("param_aperture", 32);
+    let _x = b.scalar_param("x", Dtype::U64);
+    let out = b.global("out", Dtype::U64);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U64);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let pa = b.konst(Ty::U64, crate::arena::addr::GENERIC_PARAM_BASE as u128);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.site("param_ld_global", 1);
+    b.push(Instr::LoadAddr { ty: Ty::U64, dst: v, addr: pa, space: AddrSpace::Global, sem: Sem::Weak, scope: Scope::Cta, mods: MemMods::default() });
+    b.no_site();
+    b.st(Ty::U64, out, k0, v);
+    if store {
+        b.site("param_st_global", 2);
+        b.push(Instr::StoreAddr { ty: Ty::U64, addr: pa, space: AddrSpace::Global, value: v.into(), sem: Sem::Weak, scope: Scope::Cta, mods: MemMods::default() });
+        b.no_site();
+    }
+    b.end_if();
+    b.exit();
+    scenario(
+        if store { "param_aperture_store" } else { "param_aperture" },
+        b.build_module(),
+        inputs(vec![("x", ArgValue::Scalar(0x1234_5678_9abc)), ("out", ArgValue::Buffer { bytes: vec![0; 8], valid: None })]),
+    )
+}
+
+/// V2C-14 family: one warpgroup, no launch-bounds `regs_per_thread`,
+/// `setmaxnreg.inc 256`. The initial budget is the legacy caller base
+/// (min of the even 512 split, the largest inc target and the launch
+/// bounds) = 256, so the increase is legal.
+pub fn setmaxnreg_default_budget() -> Scenario {
+    let mut b = ProgramBuilder::new("setmaxnreg_default_budget", 128);
+    let out = b.global("out", Dtype::U32);
+    let tid = b.reg(Ty::U32);
+    b.thread_rank(tid);
+    b.site("setmaxnreg_inc", 1);
+    b.push(Instr::SetMaxNReg { inc: true, count: 256 });
+    b.no_site();
+    b.st_u32(out, tid, tid);
+    b.exit();
+    scenario("setmaxnreg_default_budget", b.build_module(), inputs(vec![("out", u32_buf(vec![0; 128]))]))
+}
+
+/// W8-6: parameters `x` (words 0..4) and `z` (words 2..6) are views of ONE
+/// host array `mem`: lane i < 4 writes `x[i] = 10 + i`, then (after a warp
+/// sync) lane i < 4 copies `z[i]` to `out[i]`: z[0], z[1] alias x[2], x[3].
+pub fn aliased_views() -> Scenario {
+    let mut b = ProgramBuilder::new("aliased_views", 32);
+    let x = b.global("x", Dtype::U32);
+    let z = b.global("z", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k4 = b.k_u32(4);
+    let k10 = b.k_u32(10);
+    b.compare(CmpOp::Lt, Ty::U32, p, lane, k4);
+    b.if_(p);
+    b.add_u32(v, lane, k10);
+    b.st_u32(x, lane, v);
+    b.end_if();
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::WarpSync { membermask: full });
+    b.if_(p);
+    b.ld_u32(v, z, lane);
+    b.st_u32(out, lane, v);
+    b.end_if();
+    b.exit();
+    scenario(
+        "aliased_views",
+        b.build_module(),
+        inputs(vec![
+            ("mem", u32_buf([100, 101, 102, 103, 104, 105])),
+            ("x", ArgValue::View { target: "mem".into(), offset: 0, len: 16 }),
+            ("z", ArgValue::View { target: "mem".into(), offset: 8, len: 16 }),
+            ("out", u32_buf([0; 4])),
+        ]),
+    )
+}
+
+/// W4-9: `prefetch.L1::32B.valid_addr` needs an addressable global byte
+/// (`valid = false`: an unmapped address -> BadAddress), and
+/// `applypriority.async.bulk` joins the issuing thread's bulk group, which
+/// a later commit / wait_group counts.
+pub fn hint_ops(valid: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("hint_ops", 32);
+    let out = b.global("out", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let a = b.reg(Ty::U64);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k64 = b.k_u32(64);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    if valid {
+        b.addr_of(a, out, k0);
+    } else {
+        let bad = b.konst(Ty::U64, 0x40);
+        b.mov(a, bad);
+    }
+    b.site("prefetch_valid_addr", 1);
+    b.ptx("tirx.ptx.prefetch_valid_addr", &["global", "L1::32B", "valid_addr"], &[], &[a.into()]);
+    b.site("applypriority_bulk", 2);
+    b.ptx("tirx.ptx.applypriority_async_bulk", &["async", "bulk", "global", "bulk_group", "L2::evict_normal"], &[], &[a.into(), k64]);
+    b.push(Instr::AsyncCommit { domain: Domain::Bulk });
+    b.push(Instr::AsyncWait { domain: Domain::Bulk, n: 0, read: false });
+    b.no_site();
+    b.end_if();
+    b.st_u32(out, lane, lane);
+    b.exit();
+    scenario(if valid { "hint_ops" } else { "hint_ops_bad_addr" }, b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
+}
+
+/// Scenarios that are deliberately racy or only meaningful with a specific
+/// configuration (each test states its expectation): not in [`all`].
+pub fn special() -> Vec<Scenario> {
+    vec![mbar_latch(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE)]
+}
+
+/// Writes in [`word_history_overflow`] past `MAX_WORD_HISTORY`.
+pub const MAX_HISTORY_PROBE: u32 = (crate::interp::aux::MAX_WORD_HISTORY as u32) + 8;
+
 /// Every scenario (for differential runs across backends).
 pub fn all() -> Vec<Scenario> {
     vec![
@@ -1627,5 +2572,26 @@ pub fn all() -> Vec<Scenario> {
         bulk_reduce(6),
         break_then_barrier(),
         setmaxnreg_launch_bounds(),
+        exit_then_barrier(false),
+        exit_then_barrier(true),
+        bounded_probe_loop(),
+        nested_spin_break(),
+        load_flag_spin(true),
+        load_flag_spin(false),
+        cross_cluster_flag(true),
+        bulk_wait_read(),
+        lane_split_mbarrier(),
+        atom_b128(),
+        st_async_copy(),
+        tcgen_after_dealloc(),
+        wait_until_pred_reads(),
+        divergent_nesting(),
+        param_aperture(false),
+        param_aperture(true),
+        setmaxnreg_default_budget(),
+        aliased_views(),
+        hint_ops(true),
+        hint_ops(false),
+        tcgen_cp_ld_with(true),
     ]
 }

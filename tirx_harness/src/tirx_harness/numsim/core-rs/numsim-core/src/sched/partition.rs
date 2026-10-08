@@ -169,6 +169,9 @@ pub struct Partition {
     pub(crate) serial: Vec<(usize, usize)>,
     /// Warp ends of this round, in order (merged into the scheduler).
     pub(crate) ends: Vec<(WarpId, WarpEnd)>,
+    /// Async ops selected to land this round whose landing is a global
+    /// read-modify-write inside a shard: landed by the serial phase.
+    pub(crate) deferred: Vec<crate::sync::AsyncId>,
 }
 
 impl Partition {
@@ -185,6 +188,7 @@ impl Partition {
             events: EventBuffer { enabled: observing, history, events: Vec::new() },
             serial: Vec::new(),
             ends: Vec::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -321,8 +325,11 @@ impl Partition {
 
     /// Serial phase (main arena): execute every parked serial point (one
     /// instruction each, in order) and land deferred global reductions.
+    ///
+    /// Only the deferred reductions land here: every other async op keeps
+    /// the completion policy's (seeded) latency.
     pub(crate) fn run_serial(&mut self, env: &Env<'_>, arena: &mut Arena) -> Result<bool, ExecError> {
-        if self.serial.is_empty() && self.sync.async_ops.is_empty() && self.sync.completions.is_empty() {
+        if self.serial.is_empty() && self.deferred.is_empty() {
             return Ok(false);
         }
         let mut progress = false;
@@ -331,7 +338,12 @@ impl Partition {
             self.settle(ci, w, r, progressed)?;
             progress = true;
         }
-        progress |= self.land(None, env, arena, true)?;
+        for id in std::mem::take(&mut self.deferred) {
+            if let Some(i) = self.sync.async_ops.iter().position(|o| o.id == id) {
+                self.fire_op(i, env, arena)?;
+                progress = true;
+            }
+        }
         progress |= self.apply_completions(env)?;
         Ok(progress)
     }
@@ -428,11 +440,15 @@ impl Partition {
                 let op = &self.sync.async_ops[i];
                 let mine = cta.is_none_or(|c| op.source.cta == c);
                 let ready = op.after.iter().all(|d| !self.sync.async_ops.iter().any(|o| o.id == *d));
-                if mine && ready && !Self::is_global_reduce(op, arena) && (all || self.rng.below(2) == 0) {
-                    self.fire_op(i, env, arena)?;
-                    landed_one = true;
-                    any = true;
-                    continue;
+                if mine && ready && !self.deferred.contains(&op.id) && (all || self.rng.below(2) == 0) {
+                    if Self::is_global_reduce(op, arena) {
+                        self.deferred.push(op.id);
+                    } else {
+                        self.fire_op(i, env, arena)?;
+                        landed_one = true;
+                        any = true;
+                        continue;
+                    }
                 }
                 i += 1;
             }
@@ -489,7 +505,9 @@ impl Partition {
             return Err(sched_error(ExecErrorKind::Internal, kernel, WarpId(u32::MAX), SiteId::NONE, "no such async op".into()));
         };
         let meta = self.aux.async_meta.remove(&op.id);
-        let proxy = meta.as_ref().map(|m| m.proxy).unwrap_or_default();
+        // st.async / red.async: performed in the generic proxy (W5-8).
+        let strong = meta.as_ref().and_then(|m| m.strong);
+        let proxy = if strong.is_some() { Proxy::Generic } else { meta.as_ref().map(|m| m.proxy).unwrap_or_default() };
         let lane = meta.as_ref().map(|m| m.lane).unwrap_or(ALL_LANES);
         let src_err = |e: String| sched_error(ExecErrorKind::OutOfBounds, kernel, op.source.warp, op.source.site, e);
         let mut reads: Vec<(AllocId, ByteSpan)> = Vec::new();
@@ -613,12 +631,24 @@ impl Partition {
                     sp.atomic = true;
                     sp.sem = Sem::Relaxed;
                     sp.scope = Scope::Gpu;
+                    if let Some(scope) = strong {
+                        sp.sem = Sem::Release;
+                        sp.scope = scope;
+                    }
                     support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, sp, &mut acc);
                 }
                 None => {
                     acc.items = writes.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
                     let wk = if rmw { AccessKind::Rmw } else { AccessKind::Write };
-                    support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, mk(Side::Write, wk), &mut acc);
+                    let mut sp = mk(Side::Write, wk);
+                    if let Some(scope) = strong {
+                        // A strong release write at the instruction's scope,
+                        // with or without a completion mbarrier.
+                        sp.atomic = true;
+                        sp.sem = Sem::Release;
+                        sp.scope = scope;
+                    }
+                    support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, sp, &mut acc);
                 }
             }
             for c in &op.signals {

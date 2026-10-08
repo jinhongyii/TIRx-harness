@@ -35,6 +35,10 @@ pub struct AsyncMeta {
     pub report: Option<crate::program::ReportMode>,
     /// tcgen05.mma `.lut_b`: TMEM address of the lookup table.
     pub lut_b: Option<u32>,
+    /// `st.async` / `red.async` (PTX §9.7.10.12, §9.7.15.7): the landing
+    /// is performed in the generic proxy as a strong release write at this
+    /// scope (CONTRACT_REQUESTS W5-8).
+    pub strong: Option<crate::program::Scope>,
 }
 
 /// Per-lane async-group membership of in-flight async ops.
@@ -125,10 +129,14 @@ pub struct WordRegion {
     /// Post-image of the region after each write `Access` overlapping it,
     /// with the allocation-relative spans that access wrote.
     pub log: Vec<(Vec<ByteSpan>, Vec<u8>)>,
+    /// More than [`MAX_WORD_HISTORY`] writes arrived: later ones were not
+    /// logged, so verdicts over this region are `incomplete`.
+    pub overflow: bool,
 }
 
-/// History entries beyond this make verdicts truncated (the oldest entries
-/// are kept; `observed` saturates).
+/// Declared-word writes logged per region; a region that receives more is
+/// marked `overflow` and its `wait_until` verdicts fail closed
+/// (`Unsupported` -> `incomplete`), never computed on a truncated history.
 pub const MAX_WORD_HISTORY: usize = 1 << 16;
 
 /// Declared words (`BufferDecl::sync_words`, or declared at first wait).
@@ -160,7 +168,7 @@ impl WordTable {
     /// Declare `span` of `alloc` with its current bytes as history index 0.
     pub fn declare(&mut self, arena: &Arena, alloc: AllocId, span: ByteSpan) {
         let init = snapshot(arena, alloc, span);
-        self.regions.entry(alloc).or_default().push(WordRegion { span, init, log: Vec::new() });
+        self.regions.entry(alloc).or_default().push(WordRegion { span, init, log: Vec::new(), overflow: false });
     }
 
     /// Append one history entry per declared region overlapping a lane's
@@ -170,7 +178,11 @@ impl WordTable {
     pub fn log_lane(&mut self, alloc: AllocId, span: ByteSpan, bytes: &[u8]) {
         let Some(rs) = self.regions.get_mut(&alloc) else { return };
         for r in rs.iter_mut() {
-            if !span.overlaps(r.span) || r.log.len() >= MAX_WORD_HISTORY {
+            if !span.overlaps(r.span) {
+                continue;
+            }
+            if r.log.len() >= MAX_WORD_HISTORY {
+                r.overflow = true;
                 continue;
             }
             let mut img = r.log.last().map(|e| e.1.clone()).unwrap_or_else(|| r.init.clone());
@@ -191,6 +203,11 @@ impl WordTable {
         }
         let bytes = snapshot(arena, alloc, span);
         self.log_lane(alloc, span, &bytes);
+    }
+
+    /// Did the region covering `span` overflow its history?
+    pub fn overflowed(&self, alloc: AllocId, span: ByteSpan) -> bool {
+        self.region(alloc, span).is_some_and(|r| r.overflow)
     }
 
     /// Values of the word `span` (<= 8 bytes, little-endian) over its history:
@@ -297,7 +314,8 @@ pub struct LaunchAux {
     pub tcgen_pairs: HashMap<(CtaId, u8), PairRendezvous>,
     /// Last tcgen05 pipelined op issued by each CTA (pipeline order).
     pub tcgen_last: HashMap<CtaId, AsyncId>,
-    /// Uncommitted tcgen05 mma/cp ops per issuing thread.
+    /// tcgen05 mma/cp ops per issuing thread that may still be in flight
+    /// (a commit tracks every one of them that has not landed).
     pub tcgen_uncommitted: HashMap<(WarpId, u8), Vec<AsyncId>>,
     /// tcgen05.ld/st ops not yet waited, per warp: (op, lanes, is_store).
     pub tcgen_ldst: HashMap<WarpId, Vec<(AsyncId, WarpMask, bool)>>,
@@ -310,6 +328,21 @@ pub struct LaunchAux {
     pub warp_sync: HashMap<WarpId, (WarpMask, u64)>,
     /// Warps whose every lane exited.
     pub exited_warps: u32,
+    /// Lane-varying `mbarrier.wait` targets that already completed while
+    /// another target of the same instruction blocks, per (warp, pc):
+    /// (target, command, lanes, observed generation). Those lanes left the
+    /// wait (per-lane latching, as for `wait_until`).
+    pub mbar_latch: HashMap<(WarpId, crate::program::Pc), Vec<(ResourceId, crate::sync::SyncCmd, WarpMask, Option<u64>)>>,
+    /// Exited warps per CTA (bit = warp in CTA): they leave the membership
+    /// of count-less named barriers (sync-isa-answers Q3/Q4, PTX §9.7.14.7).
+    pub cta_exited: HashMap<CtaId, u64>,
+    /// Named-barrier generations opened by the count-less (whole-CTA) form,
+    /// per `(cta, id)`: only those shrink when a member warp exits.
+    pub named_implicit: HashMap<(CtaId, u8), u64>,
+    /// Thread count a blocked `bar.sync`/`bar.red` registered with (its
+    /// Protocol event, logged at completion, carries that contribution even
+    /// if exits shrank the count-less barrier meanwhile).
+    pub named_registered: HashMap<WarpId, u64>,
     /// Next collective instance id.
     pub next_collective: u64,
     /// Next async op id (partition-scoped: high bits name the partition).

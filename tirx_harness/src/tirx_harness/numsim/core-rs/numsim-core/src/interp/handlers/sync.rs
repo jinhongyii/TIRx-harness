@@ -75,9 +75,21 @@ pub fn barrier(ctx: &mut ExecCtx<'_>, kind: BarKind, id: Operand, count: Option<
     }
     let idb = idv as u8;
     let res = ResourceId::Named { cta: ctx.cta.id, id: idb };
+    // The count-less form waits for every non-exited thread of the CTA.
     let b = match count {
         Some(c) => uniform_over(ctx, c, active)?,
-        None => ctx.launch.warps_per_cta() as u64 * 32,
+        None => {
+            let gone = ctx.aux.cta_exited.get(&ctx.cta.id).map_or(0, |m| m.count_ones());
+            (ctx.launch.warps_per_cta() - gone) as u64 * 32
+        }
+    };
+    let b = match ctx.warp.resume {
+        Some(_) => ctx.aux.named_registered.get(&ctx.warp.id).copied().unwrap_or(b),
+        None => b,
+    };
+    let extra = || ProtoExtra {
+        counts: Counts { expected_threads: Some(b), contributed_threads: Some(named::WARP_SIZE), ..Default::default() },
+        ..Default::default()
     };
     let contribution = named::Contribution { warp: ctx.warp.warp_in_cta, mask: active.bits(), live: ctx.warp.live.bits(), count: b, aligned };
     let cmd = SyncCmd::Named(match kind {
@@ -85,10 +97,6 @@ pub fn barrier(ctx: &mut ExecCtx<'_>, kind: BarKind, id: Operand, count: Option<
         BarKind::Arrive => named::Cmd::Arrive(contribution),
         BarKind::Red { .. } => named::Cmd::Red(contribution),
     });
-    let extra = || ProtoExtra {
-        counts: Counts { expected_threads: Some(b), contributed_threads: Some(named::WARP_SIZE), ..Default::default() },
-        ..Default::default()
-    };
     if let Some(gen) = ctx.warp.resume {
         // Retry of a registered Sync/Red. The instruction's one Protocol
         // event (its contribution) is logged when it completes.
@@ -97,6 +105,7 @@ pub fn barrier(ctx: &mut ExecCtx<'_>, kind: BarKind, id: Operand, count: Option<
             Step::Blocked(r) => Ok(Flow::Blocked(r)),
             Step::Done(_) => {
                 ctx.warp.resume = None;
+                ctx.aux.named_registered.remove(&ctx.warp.id);
                 support::protocol(ctx, active, vec![(res, cmd)], extra());
                 bar_ready(ctx, kind, res, idb, gen, aligned)?;
                 Ok(Flow::Next)
@@ -109,6 +118,14 @@ pub fn barrier(ctx: &mut ExecCtx<'_>, kind: BarKind, id: Operand, count: Option<
         named::Outcome::Arrived { gen, .. } | named::Outcome::Registered { gen } | named::Outcome::Ready { gen } => gen,
         named::Outcome::Blocked => return Err(internal(ctx, "named barrier", o)),
     };
+    match count {
+        None => {
+            ctx.aux.named_implicit.insert((ctx.cta.id, idb), gen);
+        }
+        Some(_) => {
+            ctx.aux.named_implicit.remove(&(ctx.cta.id, idb));
+        }
+    }
     if let BarKind::Red { pred, .. } = kind {
         let yes = super::control::cond_mask(ctx, pred, active);
         let a = ctx.aux.bar_red.entry((ctx.cta.id, idb, gen)).or_default();
@@ -133,6 +150,7 @@ pub fn barrier(ctx: &mut ExecCtx<'_>, kind: BarKind, id: Operand, count: Option<
         }
         named::Outcome::Registered { gen } => {
             ctx.warp.resume = Some(gen);
+            ctx.aux.named_registered.insert(ctx.warp.id, b);
             Ok(Flow::Blocked(res))
         }
         named::Outcome::Blocked => unreachable!(),
@@ -330,7 +348,9 @@ pub fn mbar_arrive(ctx: &mut ExecCtx<'_>, args: MbarArriveArgs) -> HResult {
         let Outcome::Mbarrier(mbarrier::Outcome::Arrived { gen, pending_before, .. }) = *out else {
             return Err(internal(ctx, "mbarrier arrive", out));
         };
-        support::sync_event(ctx, active, SyncKind::Arrive { obj: *res, phase: gen, release: Some(release), scope: Some(args.scope) });
+        // Each target's Arrive carries only the lanes that arrived on it.
+        let mine = lanes.iter().filter(|(_, r, _)| r == res).fold(WarpMask::NONE, |m, &(l, _, _)| m.or(WarpMask::lane(l)));
+        support::sync_event(ctx, mine, SyncKind::Arrive { obj: *res, phase: gen, release: Some(release), scope: Some(args.scope) });
         if let Some(dst) = args.state {
             // Lane k sees pending_before minus the counts of lower lanes.
             let mut pending = pending_before;
@@ -405,13 +425,26 @@ fn phase_cmd(ctx: &ExecCtx<'_>, phase: PhaseArg, l: usize, blocking: bool) -> Sy
     })
 }
 
-/// A successful wait/test: protocol + HB events.
-fn mbar_observed(ctx: &mut ExecCtx<'_>, lanes: WarpMask, res: ResourceId, cmd: SyncCmd, gen: Option<u64>, sem: Sem, scope: Scope) {
-    let parity = Some(gen.map_or(1, |g| (g & 1) as u8));
-    let extra = ProtoExtra { observed_parity: parity, ..Default::default() };
-    support::protocol(ctx, lanes, vec![(res, cmd)], extra);
-    if let Some(g) = gen {
-        support::sync_event(ctx, lanes, SyncKind::Wait { obj: res, phase: g, acquire: Some(sem != Sem::Relaxed), scope: Some(scope) });
+/// Successful waits/tests of one instruction: ONE protocol event (per-target
+/// observed parity), then one HB `Wait` per target with its own lanes.
+fn mbar_observed(ctx: &mut ExecCtx<'_>, lanes: WarpMask, done: &[(ResourceId, SyncCmd, WarpMask, Option<u64>)], sem: Sem, scope: Scope) {
+    if done.is_empty() {
+        return;
+    }
+    let pcmds = done
+        .iter()
+        .map(|&(res, cmd, _, gen)| crate::observe::ProtocolCmd {
+            res,
+            cmd,
+            counts: Counts::default(),
+            observed_parity: Some(gen.map_or(1, |g| (g & 1) as u8)),
+        })
+        .collect();
+    support::protocol_cmds(ctx, lanes, pcmds, None, Vec::new());
+    for &(res, _, m, gen) in done {
+        if let Some(g) = gen {
+            support::sync_event(ctx, m, SyncKind::Wait { obj: res, phase: g, acquire: Some(sem != Sem::Relaxed), scope: Some(scope) });
+        }
     }
 }
 
@@ -466,12 +499,18 @@ pub fn mbar_test_wait(
             write_lane(ctx, r, l, 0);
         }
     }
+    let mut done = Vec::new();
+    let mut ok_lanes = WarpMask::NONE;
     for (res, cmd, ready, lanes) in seen {
         match ready {
-            Some(gen) => mbar_observed(ctx, lanes, res, cmd, gen, sem, scope),
+            Some(gen) => {
+                ok_lanes = ok_lanes.or(lanes);
+                done.push((res, cmd, lanes, gen));
+            }
             None => ctx.note_failed_poll(res),
         }
     }
+    mbar_observed(ctx, ok_lanes, &done, sem, scope);
     Ok(Flow::Next)
 }
 
@@ -479,10 +518,16 @@ pub fn mbar_test_wait(
 pub fn mbar_wait(ctx: &mut ExecCtx<'_>, mbar: Operand, space: AddrSpace, phase: PhaseArg, sem: Sem, scope: Scope) -> HResult {
     active_or_next!(ctx);
     let active = ctx.warp.active;
-    // Lane-varying waits go through `step` one target at a time (a blocked
-    // command inside `step_all` would drop the `armed` registration).
+    // Lanes whose target completed on an earlier attempt already left the
+    // wait (latched); only the others are retried. Lane-varying waits go
+    // through `step` one target at a time (a blocked command inside
+    // `step_all` would drop the `armed` registration).
+    let key = (ctx.warp.id, ctx.warp.pc);
+    let earlier = ctx.aux.mbar_latch.remove(&key).unwrap_or_default();
+    let latched = earlier.iter().fold(WarpMask::NONE, |m, d| m.or(d.2));
+    let mut done = Vec::new();
     let mut seen: Vec<(ResourceId, SyncCmd, WarpMask)> = Vec::new();
-    for l in active.lanes() {
+    for l in active.and_not(latched).lanes() {
         let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
         let cmd = phase_cmd(ctx, phase, l, true);
         match seen.iter_mut().find(|(r, c, _)| *r == res && *c == cmd) {
@@ -490,16 +535,29 @@ pub fn mbar_wait(ctx: &mut ExecCtx<'_>, mbar: Operand, space: AddrSpace, phase: 
             None => seen.push((res, cmd, WarpMask::lane(l))),
         }
     }
-    let mut done = Vec::new();
+    let mut blocked = None;
     for &(res, cmd, lanes) in &seen {
-        match support::step(ctx, res, cmd)? {
-            Step::Done(Outcome::Mbarrier(mbarrier::Outcome::Ready { gen })) => done.push((res, cmd, lanes, gen)),
-            Step::Done(Outcome::Mbarrier(mbarrier::Outcome::NotReady)) | Step::Blocked(_) => return Ok(Flow::Blocked(res)),
-            other => return Err(internal(ctx, "mbarrier wait", other)),
+        match support::step(ctx, res, cmd) {
+            Ok(Step::Done(Outcome::Mbarrier(mbarrier::Outcome::Ready { gen }))) => done.push((res, cmd, lanes, gen)),
+            Ok(Step::Done(Outcome::Mbarrier(mbarrier::Outcome::NotReady)) | Step::Blocked(_)) => {
+                blocked.get_or_insert(res);
+            }
+            Ok(other) => return Err(internal(ctx, "mbarrier wait", other)),
+            Err(e) => return Err(e),
         }
     }
-    for (res, cmd, lanes, gen) in done {
-        mbar_observed(ctx, lanes, res, cmd, gen, sem, scope);
+    // Targets that completed now are observed now (their lanes leave the
+    // wait at this point, and the observed phase is consumed): one
+    // Protocol event per attempt that completes something.
+    let now = done.iter().fold(WarpMask::NONE, |m, d| m.or(d.2));
+    mbar_observed(ctx, now, &done, sem, scope);
+    if let Some(r) = blocked {
+        let mut all = earlier;
+        all.extend(done);
+        if !all.is_empty() {
+            ctx.aux.mbar_latch.insert(key, all);
+        }
+        return Ok(Flow::Blocked(r));
     }
     Ok(Flow::Next)
 }
@@ -780,6 +838,15 @@ fn emit_verdicts(
         }
     }
     for (alloc, span, lanes) in words {
+        if ctx.aux.words.overflowed(alloc, span) {
+            return Err(ctx.error(
+                ExecErrorKind::Unsupported,
+                format!(
+                    "declared-word history exceeded {} writes; wait_until verdicts over it would be computed on a truncated history",
+                    crate::interp::aux::MAX_WORD_HISTORY
+                ),
+            ));
+        }
         let hist = ctx.aux.words.history(alloc, span).unwrap_or_default();
         let key = (ctx.warp.id, ctx.warp.pc, alloc, span.start);
         let mut cache = ctx.aux.verdicts.remove(&key).unwrap_or_default();
@@ -895,6 +962,7 @@ pub fn clc_try_cancel(ctx: &mut ExecCtx<'_>, resp: Operand, mbar: Operand, multi
                 tf32_round: false,
                 report: None,
                 lut_b: None,
+                strong: None,
             },
         );
     }

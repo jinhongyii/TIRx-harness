@@ -1,76 +1,98 @@
-//! Scheduler: CTA-lockstep execution, seeded warp rotation, per-CTA inbox,
-//! completion firing, deadlock and budget detection.
+//! Scheduler: rounds over scheduling partitions, seeded warp rotation,
+//! async landing, serial points, deadlock and budget detection.
 //!
-//! # Contract
+//! # Rounds
 //!
 //! * A *round* visits every resident CTA; within a CTA every runnable warp
 //!   gets one slice of at most `RunConfig::quantum` instructions, starting
 //!   at a seeded rotation offset (`seed`, round, CTA), in ascending warp
 //!   order from there. Blocked warps are retried every round (a blocking
 //!   handler re-checks its resource and returns `Blocked` again).
-//! * After a CTA's slices, in-flight `AsyncOp`s issued by that CTA land
-//!   (`CompletionPolicy::Eager`: all ready ones; `Seeded`: a seeded subset;
-//!   `after` dependencies respected) and enabled sync `Completion`s are
-//!   applied (`SyncTable::enabled`/`apply_completion`).
-//! * Cross-CTA effects produced during a round (`ExecCtx::outbox`: remote
-//!   shared stores, remote mbarrier arrive / expect_tx / complete_tx) are
-//!   delivered at the target CTA's next inbox drain (start of its turn in
-//!   the next round); each drain emits `Observer::inbox_drain`.
+//! * After a CTA's slices, its ready `AsyncOp`s land (`CompletionPolicy::
+//!   Eager`: all of them; `Seeded`, the default: a seeded random subset, so
+//!   an op may stay in flight for several rounds; `after` dependencies are
+//!   respected) and enabled sync `Completion`s are applied.
+//! * Cross-CTA effects inside a cluster (remote shared stores, remote
+//!   mbarrier commands) apply synchronously; inbox drains at the start of
+//!   the target CTA's turn are wake-up points, each observable as
+//!   `Observer::inbox_drain`.
 //! * Residency: clusters are admitted in linear cluster order while at most
 //!   `RunConfig::max_resident_ctas` CTAs are resident (all of them for
-//!   cooperative launches and programs using `grid.sync`); a cluster's
-//!   CTAs are always co-resident. A retired cluster's shared/TMEM/local
-//!   allocations are reset and reused (`AllocEnd` + `AllocBegin`).
-//! * Termination: all warps exited, no cluster left to admit and the async
-//!   queues drained -> Completed. A round in which no warp made progress,
-//!   no async op landed, no completion applied, no inbox message was
-//!   delivered and no cluster was admitted (after force-landing every ready
-//!   async op) -> Deadlock (with the blocked resources). Round budget ->
-//!   Incomplete. Any `ExecError` -> Error, except Budget / Unsupported /
-//!   `Op(Unsupported)` -> Incomplete.
-//! * Fully deterministic for a fixed (module, inputs, config, seed).
+//!   cooperative launches and `grid.sync`); a cluster's CTAs are always
+//!   co-resident. A retired cluster's shared/TMEM/local allocations are
+//!   reset and reused (`AllocEnd` + `AllocBegin`).
 //!
-//! # Progress
+//! # Partitions and parallelism
+//!
+//! The unit of ownership is the cluster: each resident cluster is a
+//! [`Partition`] with its own CTAs, `SyncTable`, `LaunchAux`, event buffer
+//! and RNG. One partition holds every CTA instead when the program has
+//! launch-wide state (grid sync / cooperative launch, declared sync words
+//! or `wait_until`, mixed tcgen05 `cta_group`s) or `RunConfig::
+//! single_partition` is set. The rule depends only on the program and the
+//! config, never on the observer or the worker count.
+//!
+//! A round has three phases:
+//!
+//! 1. **Parallel phase.** With one partition it runs directly on the arena
+//!    (sequential semantics). With several, each runs against its own arena
+//!    shard (`Arena::make_shard`): private allocations in place, global and
+//!    param allocations through a copy-on-write 4 KiB stripe overlay over
+//!    the round-start state, so a cluster sees other clusters' global writes
+//!    of this round only from the next round on. Partitions run on up to
+//!    `RunConfig::workers` threads (a launch-lifetime pool); the result
+//!    does not depend on which thread ran what.
+//! 2. **Merge.** Shards merge in partition order (the later partition wins
+//!    a byte both wrote). Partitions after the first failing one are
+//!    discarded. Buffered events replay in an order consistent with what
+//!    each partition observed (`Arena::shard_replay_order`: a partition
+//!    that read global bytes another wrote this round goes first; same-byte
+//!    writers keep partition order); `Access::seq` is assigned at replay.
+//!    When no such order exists (each read what the other wrote: a
+//!    store-buffering outcome), partition order is used and an
+//!    `incomplete` diagnostic says the stream is not faithful. Only the
+//!    replay order (never results) depends on whether anyone observes.
+//! 3. **Serial phase** (main arena, partition order): global
+//!    read-modify-writes inside shards are serial points (atom/red re-run as
+//!    one instruction; bulk/tensor/async reductions into global memory land
+//!    here), so no update is lost.
+//!
+//! Results and observer streams are identical for any worker count.
+//!
+//! # Progress, deadlock, termination
 //!
 //! A slice made progress if it ended other than `Blocked` or completed an
 //! instruction with `Instr::is_progress` (a write, a committed sync
-//! transition, an async issue). A spin loop
-//! whose iteration consists of failed polls is parked by `LoopEnd`
-//! (`Blocked` at the same pc, no progress instruction), so a launch whose
-//! only activity is such spinning is a deadlock, not a budget overrun.
+//! transition, an async issue). A loop iteration whose only effects were
+//! failed polls (`test_wait` false, a non-weak load) is spin-parked at its
+//! `LoopEnd` only when the warp's registers and masks are exactly those of
+//! the previous such iteration (a fixed point: the next iteration repeats
+//! unless another actor or an async op changes what it polls). A loop whose
+//! state advances (a bounded probe, a retry counter) is never parked.
 //!
-//! # CTA parallelism (design; `RunConfig::workers > 1`)
+//! * All warps exited, no cluster left and the async queues drained ->
+//!   Completed.
+//! * A round with no progress anywhere (no slice progress, landing,
+//!   completion, inbox delivery or admission, after force-landing every
+//!   ready op) -> Deadlock with the blocked resources, except:
+//!   a blocked warp with a divergent mask -> Incomplete (`divergent_block`:
+//!   structured SIMT cannot interleave its arms further); a warp blocked on
+//!   an explicit-count named barrier of a CTA with exited warps ->
+//!   Incomplete (G8). Count-less named barriers are exit-aware (exited
+//!   warps leave their membership; PTX §9.7.14.7).
+//! * Round budget -> Incomplete. Any `ExecError` -> Error, except Budget /
+//!   Unsupported / `Op(Unsupported)` -> Incomplete.
+//! * Fully deterministic for a fixed (module, inputs, config, seed).
 //!
-//! Not implemented yet: `workers > 1` currently runs the single-threaded
-//! path (results are identical by construction, since the parallel design
-//! must reproduce this schedule). The design:
+//! # Divergent scheduling limits
 //!
-//! * **Unit of ownership = cluster.** A worker thread owns a cluster for a
-//!   round: its CTAs' `WarpState`s, shared windows, TMEM, local and
-//!   register allocations, and the cluster's `SyncTable` partition (every
-//!   `ResourceId` except `Grid` and global `Word`s is cluster-local:
-//!   mbarriers, named barriers, cluster barrier, async groups, tcgen,
-//!   reg pool). DSMEM and remote-mbarrier effects stay inside the worker.
-//!   This needs the `Arena` split into a shared global arena plus one
-//!   private arena per cluster (`AllocId` high bits = arena shard), and
-//!   `ExecCtx` holding `&mut` to the private shard and `&` to the global
-//!   one.
-//! * **Global memory** within a round: each worker reads a snapshot of the
-//!   global arena taken at the round start overlaid with its own writes
-//!   (write log per worker, keyed by stripe of 4 KiB); atomics and
-//!   `wait_until` on global memory are executed against the snapshot and
-//!   *re-validated* at the merge: if two clusters touched the same stripe
-//!   with at least one write in the round, the round is re-executed
-//!   sequentially for those clusters (deterministic fallback). At the round
-//!   barrier the write logs are merged in cluster order, which is exactly
-//!   the single-threaded order (cluster i's round slice precedes cluster
-//!   i+1's), and `inbox_drain` is the cross-CTA acquire point checkers
-//!   already use.
-//! * **Observer stream**: each worker buffers its events per cluster; the
-//!   coordinator replays them in cluster order after the merge, so the
-//!   observer sees the single-threaded order (contract: observers never
-//!   change behaviour, so buffering is invisible).
-//! * **Grid barrier / cooperative launches** stay single-threaded.
+//! A warp blocked inside one arm of a divergent `If` with an `Else` runs
+//! the other arm (`interp::divergent_switch`), swapping between suspended
+//! arms; a swapped warp reports the resumed arm's resource as blocked.
+//! Not covered (reported `divergent_block` incomplete, never Deadlock): an
+//! `If` without an `Else` whose skipped lanes would produce what the
+//! blocked lanes wait for (`if lane != 0 { wait } ; if lane == 0 { arrive }`)
+//! and loop-exit divergence (`for i < lane { wait }`).
 
 mod partition;
 mod pool;
@@ -132,10 +154,13 @@ pub struct RunConfig {
     pub completions: CompletionPolicy,
     /// Register budget per CTA for setmaxnreg accounting.
     pub reg_pool: u32,
-    /// Worker threads (CTA/cluster parallelism). `<= 1` = single-threaded;
-    /// see the module docs for the parallel design (not yet implemented;
-    /// larger values currently run single-threaded with identical results).
+    /// Worker threads (CTA/cluster parallelism). `<= 1` = single-threaded.
+    /// Results and observer streams do not depend on it (module docs).
     pub workers: usize,
+    /// Run every resident CTA in one partition (one arena, no shards, no
+    /// round-snapshot isolation between clusters): the sequential reference
+    /// the partitioned scheduler is tested against. Default `false`.
+    pub single_partition: bool,
     /// Max co-resident CTAs (0 = all). Clusters are admitted whole.
     pub max_resident_ctas: u32,
     /// Resident cluster ids (W8-4): only these clusters run; `None` = all.
@@ -153,6 +178,7 @@ impl Default for RunConfig {
             completions: CompletionPolicy::Seeded,
             reg_pool: 65536,
             workers: 1,
+            single_partition: false,
             max_resident_ctas: 1024,
             subset: None,
         }
@@ -173,6 +199,13 @@ pub enum ArgValue {
     TensorMapOf { base: String, offset: u64, desc: crate::oplib::TensorMapDesc },
     /// Pointer to byte `offset` of another (buffer) argument.
     Pointer { target: String, offset: u64 },
+    /// Bytes `[offset, offset + len)` of the `Buffer` argument `target`
+    /// (CONTRACT_REQUESTS W8-6): parameters bound to overlapping host memory
+    /// share ONE allocation, so writes through one name are visible through
+    /// the other and checkers see the aliasing. Accepted for `Buffer`
+    /// slots, as a `Pointer`/`TensorMapOf` target, and read back in
+    /// `Outputs` as that slice of the target.
+    View { target: String, offset: u64, len: u64 },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -333,6 +366,8 @@ pub struct Scheduler<'p> {
     next_seq: u64,
     /// Exit-check violations of retired partitions.
     leftovers: Vec<(ResourceId, SyncError)>,
+    /// A round's replay order was not faithful (see `stream_cycle`).
+    stream_cycle_reported: bool,
     /// Review diagnostics (uninitialized reads), in partition order.
     pub diagnostics: Vec<Finding>,
     /// Instructions of retired partitions.
@@ -401,7 +436,7 @@ impl<'p> Scheduler<'p> {
                 write_param(arena, params, loaded.param_offsets[i], &va.to_le_bytes());
             }
         }
-        Self::with_params(program, kernel_index, shape, arena, globals, params, loaded, config)
+        Self::with_params(program, kernel_index, shape, arena, globals, &BTreeMap::new(), params, loaded, config)
     }
 
     fn with_params(
@@ -410,6 +445,7 @@ impl<'p> Scheduler<'p> {
         shape: LaunchShape,
         arena: &mut Arena,
         globals: &BTreeMap<String, AllocId>,
+        view_lens: &BTreeMap<String, u64>,
         params: AllocId,
         loaded: Loaded,
         config: RunConfig,
@@ -448,6 +484,7 @@ impl<'p> Scheduler<'p> {
             program: &Program,
             arena: &mut Arena,
             globals: &BTreeMap<String, AllocId>,
+            view_lens: &BTreeMap<String, u64>,
             loaded: &Loaded,
             params: AllocId,
             local_offsets: &[u64],
@@ -464,7 +501,7 @@ impl<'p> Scheduler<'p> {
             let d = &program.buffers[i];
             let len = d.byte_len.as_ref().and_then(|e| e.eval(&|p| scalar(arena, p))).map(|v| v.max(0) as u64);
             let b = if let Some(parent) = d.view_of {
-                let pb = bind(parent.0 as usize, program, arena, globals, loaded, params, local_offsets, out, depth + 1, scalar)?;
+                let pb = bind(parent.0 as usize, program, arena, globals, view_lens, loaded, params, local_offsets, out, depth + 1, scalar)?;
                 match pb {
                     BufBinding::View(v) => {
                         let len = len.unwrap_or(v.len.saturating_sub(d.base));
@@ -499,7 +536,8 @@ impl<'p> Scheduler<'p> {
                                     match arena.resolve_global(va, 0) {
                                         Ok((alloc, off)) => {
                                             let size = arena.get(alloc).size;
-                                            let avail = size.saturating_sub(off);
+                                            // A view-bound slot ends where its view ends.
+                                            let avail = size.saturating_sub(off).min(view_lens.get(&ps.name).copied().unwrap_or(u64::MAX));
                                             BufBinding::View(View { alloc, offset: off, len: len.unwrap_or(avail).min(avail) })
                                         }
                                         Err(_) => match globals.get(&ps.name) {
@@ -533,7 +571,7 @@ impl<'p> Scheduler<'p> {
             Ok(b)
         }
         for i in 0..n {
-            bind(i, program, arena, globals, &loaded, params, &local_offsets, &mut bindings, 0, &scalar)?;
+            bind(i, program, arena, globals, view_lens, &loaded, params, &local_offsets, &mut bindings, 0, &scalar)?;
         }
         let bindings: Vec<BufBinding> = bindings.into_iter().map(|b| b.unwrap_or(BufBinding::Unbound)).collect();
 
@@ -561,6 +599,7 @@ impl<'p> Scheduler<'p> {
             single: false,
             next_seq: 0,
             leftovers: Vec::new(),
+            stream_cycle_reported: false,
             diagnostics: Vec::new(),
             retired_instrs: 0,
             retired_completions: 0,
@@ -585,6 +624,49 @@ impl<'p> Scheduler<'p> {
     /// `wait_until` (a word's history is one stream), and kernels mixing
     /// `cta_group` values (the kernel-wide tcgen05 rule). Independent of the
     /// worker count and of the observer.
+    /// The per-thread register count every warpgroup starts with
+    /// (setmaxnreg `Configure`), or `None` when the program has no
+    /// setmaxnreg. `Launch::regs_per_thread` when lowering set it; otherwise
+    /// the legacy caller base (`frontend-rs emit/sync.rs`
+    /// `calling_initial_count`): the even split of the 512-register
+    /// per-thread pool over the CTA's warpgroups, capped by the largest
+    /// `setmaxnreg.inc` target (the compiler's register cap, default 256)
+    /// and by the launch bounds (`min_blocks_per_sm` CTAs resident).
+    fn initial_regs_per_thread(&self) -> Result<Option<u32>, ExecError> {
+        let t = &self.program.topology;
+        if t.regs_per_thread != 0 {
+            return Ok(Some(t.regs_per_thread));
+        }
+        if !self.loaded.uses_setmaxnreg {
+            return Ok(None);
+        }
+        let wg = self.shape.warps_per_cta().div_ceil(setmaxnreg::WARPS_PER_GROUP).max(1);
+        let g = setmaxnreg::GRANULARITY;
+        let default = setmaxnreg::CTA_REGISTER_POOL / wg / g * g;
+        let cap = self
+            .program
+            .code
+            .iter()
+            .filter_map(|i| match *i {
+                Instr::SetMaxNReg { inc: true, count } if (setmaxnreg::MIN_COUNT..=setmaxnreg::MAX_COUNT).contains(&count) && count % g == 0 => Some(count),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(setmaxnreg::MAX_COUNT);
+        let min_blocks = t.min_blocks_per_sm.unwrap_or(1).max(1);
+        let resident = setmaxnreg::CTA_REGISTER_POOL / (wg * min_blocks) / g * g;
+        if resident < setmaxnreg::MIN_COUNT {
+            return Err(sched_error(
+                ExecErrorKind::Unsupported,
+                self.kernel_index,
+                WarpId(u32::MAX),
+                SiteId::NONE,
+                "launch bounds cannot provide the minimum 24 registers per thread required by setmaxnreg".into(),
+            ));
+        }
+        Ok(Some(default.min(cap).min(resident)))
+    }
+
     fn single_partition(&self) -> bool {
         let p = self.program;
         let mut groups = std::collections::BTreeSet::new();
@@ -605,7 +687,8 @@ impl<'p> Scheduler<'p> {
         // Never depends on the observer: observers must not change
         // program-visible behaviour (and partitioning changes when other
         // partitions' global writes become visible).
-        self.all_resident()
+        self.config.single_partition
+            || self.all_resident()
             || groups.len() > 1
             || p.buffers.iter().any(|b| b.sync_words)
             || p.code.iter().any(|i| matches!(i, Instr::WaitUntil { .. }))
@@ -726,10 +809,11 @@ impl<'p> Scheduler<'p> {
                     }
                 }
             }
+            let regs = self.initial_regs_per_thread()?;
             let part = &mut self.partitions[pi];
-            if self.program.topology.regs_per_thread != 0 {
+            if let Some(count) = regs {
                 let res = ResourceId::RegPool { cta: cid };
-                let cmd = SyncCmd::RegPool(setmaxnreg::Cmd::Configure { count: self.program.topology.regs_per_thread });
+                let cmd = SyncCmd::RegPool(setmaxnreg::Cmd::Configure { count });
                 part.sync.step(res, cmd).map_err(|e| {
                     sched_error(ExecErrorKind::Protocol(e.clone()), self.kernel_index, WarpId(cid.0 * wpc), SiteId::NONE, format!("{e:?}"))
                 })?;
@@ -892,9 +976,10 @@ impl<'p> Scheduler<'p> {
                 for _ in 0..workers - 1 {
                     scope.spawn(|| pool.worker());
                 }
-                let r = self.run_loop(arena, observer, step_fn, Some(&pool));
-                pool.shutdown();
-                r
+                // Stop the workers however the loop ends (a panic on this
+                // thread must not leave the scope joining blocked workers).
+                let _stop = pool::ShutdownGuard(&pool);
+                self.run_loop(arena, observer, step_fn, Some(&pool))
             })
         } else {
             self.run_loop(arena, observer, step_fn, None)
@@ -909,8 +994,13 @@ impl<'p> Scheduler<'p> {
 
     /// Replay partition `pi`'s buffered events and absorb its round results.
     fn absorb(&mut self, pi: usize, observer: &mut dyn Observer) {
+        self.partitions[pi].events.replay(observer, &mut self.next_seq);
+        self.absorb_state(pi);
+    }
+
+    /// Absorb partition `pi`'s warp ends and diagnostics (no events).
+    fn absorb_state(&mut self, pi: usize) {
         let p = &mut self.partitions[pi];
-        p.events.replay(observer, &mut self.next_seq);
         for (w, e) in p.ends.drain(..) {
             self.ends.insert(w, e);
         }
@@ -952,7 +1042,12 @@ impl<'p> Scheduler<'p> {
         for p in &self.partitions {
             // The ownership list only feeds a debug assertion.
             let private = if cfg!(debug_assertions) { p.private_allocs() } else { Vec::new() };
-            shards.push(arena.make_shard(&private));
+            let mut sh = arena.make_shard(&private);
+            if self.observing {
+                // Replay order must follow what each partition observed.
+                sh.track_shard_reads();
+            }
+            shards.push(sh);
         }
         let mut results: Vec<Option<Result<bool, ExecError>>> = (0..n).map(|_| None).collect();
         {
@@ -1004,19 +1099,45 @@ impl<'p> Scheduler<'p> {
                 None => (0..n).for_each(run_one),
             }
         }
-        // Merge in partition order; stop at the first error (later
-        // partitions' effects are discarded, as if never run).
+        // Partitions after the first failing one are discarded, as if never
+        // run. The rest merge in partition order (the last writer of a byte
+        // in partition order wins).
+        let kept = (0..n).find(|&k| matches!(results[k], Some(Err(_)))).map_or(n, |e| e + 1);
+        for k in kept..n {
+            self.partitions[k].events.clear();
+            self.partitions[k].ends.clear();
+        }
+        // Event replay follows observation: a partition that read global
+        // bytes another one wrote this round saw the round-start value, so
+        // its events go first (Arena::shard_replay_order). Without such
+        // conflicts this is partition order. A cycle (each read what the
+        // other wrote) has no faithful sequential stream: partition order is
+        // used and an `incomplete` diagnostic says so.
+        let order = if self.observing {
+            match Arena::shard_replay_order(&shards[..kept]) {
+                Ok(o) => o,
+                Err((a, b)) => {
+                    self.stream_cycle(a, b);
+                    (0..kept).collect()
+                }
+            }
+        } else {
+            (0..kept).collect()
+        };
+        for (k, shard) in shards.into_iter().enumerate() {
+            if k < kept {
+                arena.merge_shard(shard);
+            } else {
+                arena.discard_shard(shard);
+            }
+        }
+        for &k in &order {
+            self.partitions[k].events.replay(observer, &mut self.next_seq);
+        }
         let mut progress = false;
         let mut first_err = None;
-        for (k, shard) in shards.into_iter().enumerate() {
-            if first_err.is_some() {
-                arena.discard_shard(shard);
-                self.partitions[k].events.clear();
-                self.partitions[k].ends.clear();
-                continue;
-            }
-            arena.merge_shard(shard);
-            self.absorb(k, observer);
+        for k in 0..kept {
+            self.absorb_state(k);
             match results[k].take().expect("ran") {
                 Ok(p) => progress |= p,
                 Err(e) => first_err = Some(e),
@@ -1026,6 +1147,32 @@ impl<'p> Scheduler<'p> {
             Some(e) => Err(e),
             None => Ok(progress),
         }
+    }
+
+    /// Record (once per launch) that a round's event stream could not be
+    /// ordered consistently with what partitions `a` and `b` observed.
+    fn stream_cycle(&mut self, a: usize, b: usize) {
+        if self.stream_cycle_reported {
+            return;
+        }
+        self.stream_cycle_reported = true;
+        let cl = |k: usize| self.partitions[k].clusters.first().copied().unwrap_or(0);
+        let mut attrs = BTreeMap::new();
+        attrs.insert("reason".to_string(), serde_json::Value::from("cross_cluster_same_round_cycle"));
+        attrs.insert("round".to_string(), serde_json::Value::from(self.round));
+        self.diagnostics.push(Finding {
+            kind: crate::report::FindingKind::Unsupported,
+            status: crate::report::Status::Incomplete,
+            message: format!(
+                "clusters {} and {} each read global bytes the other wrote in round {} (a non-sequentially-consistent outcome); the observer stream cannot order them faithfully, so checker verdicts over this launch are incomplete",
+                cl(a),
+                cl(b),
+                self.round
+            ),
+            attrs,
+            sites: Vec::new(),
+            evidence: Vec::new(),
+        });
     }
 
     /// The serial phase of a round (main arena): parked global RMWs and
@@ -1102,15 +1249,34 @@ impl<'p> Scheduler<'p> {
                 }
                 let mut blocked = Vec::new();
                 let mut divergent = None;
-                for c in self.partitions.iter().flat_map(|p| p.ctas.iter()) {
-                    for w in &c.warps {
-                        if let WarpStatus::Blocked(r) = w.status {
-                            blocked.push((w.id, r));
-                            if divergent.is_none() && crate::interp::is_divergent(w) {
-                                divergent = Some((w.id, self.program.site_of(w.pc)));
+                let mut after_exit = None;
+                for p in &self.partitions {
+                    for c in &p.ctas {
+                        for w in &c.warps {
+                            if let WarpStatus::Blocked(r) = w.status {
+                                blocked.push((w.id, r));
+                                if divergent.is_none() && crate::interp::is_divergent(w) {
+                                    divergent = Some((w.id, self.program.site_of(w.pc)));
+                                }
+                                // G8: a named barrier with an explicit count may
+                                // be waiting only on warps that exited.
+                                if let ResourceId::Named { cta, .. } = r {
+                                    if after_exit.is_none() && p.aux.cta_exited.get(&cta).is_some_and(|m| *m != 0) {
+                                        after_exit = Some((w.id, self.program.site_of(w.pc)));
+                                    }
+                                }
                             }
                         }
                     }
+                }
+                if let Some((w, site)) = after_exit {
+                    return Ok(RunStatus::Incomplete {
+                        reason: format!(
+                            "named_barrier_after_exit (G8): no progress while warp {} waits on a named barrier of a CTA with exited warps; release of explicit-count barriers by exit is not modeled",
+                            w.0
+                        ),
+                        site: Some(site),
+                    });
                 }
                 // A divergent warp's lanes may be waiting on each other in a
                 // way structured SIMT cannot interleave: not a proof.
@@ -1286,10 +1452,14 @@ fn scalar_param(program: &Program, inputs: &Inputs, p: crate::program::ParamId) 
     }
     let ParamKind::ImplicitShape { buffer, axis } = slot.kind else { return None };
     let b = program.host_abi.get(buffer.0 as usize)?;
-    let Some(ArgValue::Buffer { bytes, .. }) = lookup(inputs, b) else { return None };
+    let nbytes = match lookup(inputs, b) {
+        Some(ArgValue::Buffer { bytes, .. }) => bytes.len(),
+        Some(ArgValue::View { len, .. }) => *len as usize,
+        _ => return None,
+    };
     let elem = b.dtype.map(|t| t.mem_bytes() as usize).unwrap_or(1).max(1);
     if b.shape.len() <= 1 && axis == 0 {
-        return Some((bytes.len() / elem) as i64);
+        return Some((nbytes / elem) as i64);
     }
     // Multi-dimensional: the other extents must be constants.
     let mut other = 1i64;
@@ -1302,7 +1472,7 @@ fn scalar_param(program: &Program, inputs: &Inputs, p: crate::program::ParamId) 
     if other <= 0 {
         return None;
     }
-    Some((bytes.len() / elem) as i64 / other)
+    Some((nbytes / elem) as i64 / other)
 }
 
 /// Argument bound to a parameter slot (by name, then aliases).
@@ -1323,6 +1493,32 @@ pub fn run(
 }
 
 /// Allocate (once per module run) the global allocation of buffer argument `name`.
+/// The allocation and byte range argument `name` names: a `Buffer` (its
+/// whole allocation) or a `View` into one.
+fn host_region(
+    arena: &mut Arena,
+    globals: &mut BTreeMap<String, AllocId>,
+    inputs: &Inputs,
+    name: &str,
+) -> Result<(AllocId, u64, u64), RunError> {
+    if let Some(ArgValue::View { target, offset, len }) = inputs.args.get(name) {
+        if matches!(inputs.args.get(target), Some(ArgValue::View { .. })) {
+            return Err(RunError::BadArg { name: name.into(), message: format!("view target {target} must be a buffer, not a view") });
+        }
+        let a = host_buffer(arena, globals, inputs, target)?;
+        let size = arena.get(a).size;
+        if offset.checked_add(*len).is_none_or(|e| e > size) {
+            return Err(RunError::BadArg {
+                name: name.into(),
+                message: format!("view [{offset}, {offset}+{len}) exceeds {target} ({size} bytes)"),
+            });
+        }
+        return Ok((a, *offset, *len));
+    }
+    let a = host_buffer(arena, globals, inputs, name)?;
+    Ok((a, 0, arena.get(a).size))
+}
+
 fn host_buffer(
     arena: &mut Arena,
     globals: &mut BTreeMap<String, AllocId>,
@@ -1360,6 +1556,33 @@ fn encode_spec(spec: &crate::program::TensorMapSpec, va: u64, scalar: &dyn Fn(cr
     d.global_address = va.wrapping_add(ev(&spec.base_offset)? as u64);
     d.rank = spec.rank;
     d.elem = Some(spec.dtype);
+    // The host's raw CUtensorMapDataType, when it says more than `dtype`.
+    use crate::dtype::Dtype as D;
+    let canonical: Option<u8> = match spec.dtype {
+        D::U8 => Some(0),
+        D::U16 => Some(1),
+        D::U32 => Some(2),
+        D::S32 => Some(3),
+        D::U64 => Some(4),
+        D::S64 => Some(5),
+        D::F16 => Some(6),
+        D::F32 => Some(7),
+        D::F64 => Some(8),
+        D::BF16 => Some(9),
+        _ => None,
+    };
+    match spec.force_cu_dtype {
+        None => {}
+        Some(c) if Some(c) == canonical => {}
+        Some(11) => d.elem = Some(D::TF32),
+        Some(13) => d.elem = Some(D::E2M1),
+        Some(14) => {
+            d.elem = Some(D::E2M1);
+            d.fp4_padded = true;
+        }
+        Some(15) => d.elem = Some(D::U6),
+        Some(c) => return Err(format!("CUtensorMapDataType {c} for a {:?} tensor map is not modeled", spec.dtype)),
+    }
     for (i, e) in spec.global_dim.iter().enumerate().take(5) {
         d.global_dim[i] = ev(e)? as u64;
     }
@@ -1396,6 +1619,9 @@ pub fn run_with_config(
     }
     let mut arena = Arena::new(config.validity);
     let mut globals: BTreeMap<String, AllocId> = BTreeMap::new();
+    // Buffer slots bound to an `ArgValue::View`: (offset, len) in the
+    // target's allocation.
+    let mut views: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut outcome = RunOutcome {
         status: RunStatus::Completed,
         failed_kernel: None,
@@ -1417,8 +1643,11 @@ pub fn run_with_config(
                 } else {
                     slot.aliases.iter().find(|a| inputs.args.contains_key(*a)).cloned().unwrap_or(slot.name.clone())
                 };
-                let a = host_buffer(&mut arena, &mut globals, inputs, &name)?;
+                let (a, off, len) = host_region(&mut arena, &mut globals, inputs, &name)?;
                 globals.entry(slot.name.clone()).or_insert(a);
+                if matches!(inputs.args.get(&name), Some(ArgValue::View { .. })) {
+                    views.insert(slot.name.clone(), (off, len));
+                }
             }
         }
         prepared.push(shape);
@@ -1432,7 +1661,10 @@ pub fn run_with_config(
             let off = loaded.param_offsets[i];
             let arg = lookup(inputs, slot);
             let bytes: Vec<u8> = match (slot.kind, arg) {
-                (ParamKind::Buffer, _) => arena.get(globals[&slot.name]).base.to_le_bytes().to_vec(),
+                (ParamKind::Buffer, _) => {
+                    let off = views.get(&slot.name).map_or(0, |v| v.0);
+                    (arena.get(globals[&slot.name]).base + off).to_le_bytes().to_vec()
+                }
                 (ParamKind::Scalar, Some(ArgValue::Scalar(v))) => v.to_le_bytes().to_vec(),
                 (ParamKind::Scalar, None) => return Err(RunError::MissingArg(slot.name.clone())),
                 (ParamKind::ImplicitShape { .. }, _) => match scalar_param(program, inputs, crate::program::ParamId(i as u32)) {
@@ -1445,6 +1677,10 @@ pub fn run_with_config(
                     }
                 },
                 (ParamKind::Pointer, Some(ArgValue::Pointer { target, offset })) => {
+                    let (a, base_off, _) = host_region(&mut arena, &mut globals, inputs, target)?;
+                    (arena.get(a).base + base_off + offset).to_le_bytes().to_vec()
+                }
+                (ParamKind::Pointer, Some(ArgValue::View { target, offset, .. })) => {
                     let a = host_buffer(&mut arena, &mut globals, inputs, target)?;
                     (arena.get(a).base + offset).to_le_bytes().to_vec()
                 }
@@ -1461,9 +1697,9 @@ pub fn run_with_config(
                     b.clone()
                 }
                 (ParamKind::TensorMap, Some(ArgValue::TensorMapOf { base, offset, desc })) => {
-                    let a = host_buffer(&mut arena, &mut globals, inputs, base)?;
+                    let (a, base_off, _) = host_region(&mut arena, &mut globals, inputs, base)?;
                     let mut d = desc.clone();
-                    d.global_address = arena.get(a).base + offset;
+                    d.global_address = arena.get(a).base + base_off + offset;
                     d.encode().to_vec()
                 }
                 (ParamKind::TensorMap, None) => {
@@ -1472,7 +1708,7 @@ pub fn run_with_config(
                     };
                     let bname = &program.host_abi[base.0 as usize].name;
                     let a = *globals.get(bname).ok_or_else(|| RunError::MissingArg(bname.clone()))?;
-                    let va = arena.get(a).base;
+                    let va = arena.get(a).base + views.get(bname).map_or(0, |v| v.0);
                     encode_spec(spec, va, &scalar).map_err(|m| RunError::BadArg { name: slot.name.clone(), message: m })?
                 }
                 (_, Some(_)) => {
@@ -1481,7 +1717,8 @@ pub fn run_with_config(
             };
             write_param(&mut arena, params, off, &bytes);
         }
-        let mut sched = Scheduler::with_params(program, k as u32, shape, &mut arena, &globals, params, loaded, config.clone())?;
+        let view_lens: BTreeMap<String, u64> = views.iter().map(|(k, v)| (k.clone(), v.1)).collect();
+        let mut sched = Scheduler::with_params(program, k as u32, shape, &mut arena, &globals, &view_lens, params, loaded, config.clone())?;
         let status = sched.run(&mut arena, observer, backend);
         outcome.stats.instrs += sched.stats.instrs;
         outcome.stats.rounds += sched.stats.rounds;
@@ -1508,9 +1745,27 @@ pub fn run_with_config(
         }
     }
     for (name, arg) in &inputs.args {
-        if let (ArgValue::Buffer { .. }, Some(&a)) = (arg, globals.get(name)) {
-            let al = arena.get(a);
-            outcome.outputs.buffers.insert(name.clone(), (al.bytes.clone(), al.valid.clone()));
+        match arg {
+            ArgValue::Buffer { .. } => {
+                if let Some(&a) = globals.get(name) {
+                    let al = arena.get(a);
+                    outcome.outputs.buffers.insert(name.clone(), (al.bytes.clone(), al.valid.clone()));
+                }
+            }
+            ArgValue::View { target, offset, len } => {
+                if let Some(&a) = globals.get(target) {
+                    let al = arena.get(a);
+                    let (lo, hi) = (*offset as usize, (*offset + *len) as usize);
+                    let mut valid = BitSet::new(*len, false);
+                    for i in 0..*len {
+                        if al.valid.get(*offset + i) {
+                            valid.set_range(i, 1, true);
+                        }
+                    }
+                    outcome.outputs.buffers.insert(name.clone(), (al.bytes[lo..hi].to_vec(), valid));
+                }
+            }
+            _ => {}
         }
     }
     Ok(outcome)

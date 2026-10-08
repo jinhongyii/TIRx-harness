@@ -267,6 +267,12 @@ pub fn resolve(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, len: u6
     let lanes = WarpMask::lane(lane);
     match space {
         AddrSpace::Global => {
+            // `ld.global` of a kernel-parameter generic address (e.g. the
+            // address of a `__grid_constant__` tensor map) reads the param
+            // buffer (legal on hardware; stores there fail in `mem_write`).
+            if let addr::Generic::Param(off) = addr::classify_generic(a) {
+                return resolve(ctx, AddrSpace::Param, off as u64, lane, len);
+            }
             let (alloc, offset) = ctx.arena.resolve_global(a, len).map_err(|e| arena_err(ctx, e, lanes))?;
             Ok(Loc { alloc, offset, window: Some(Window::Global), remote: None })
         }
@@ -557,6 +563,14 @@ pub fn uninit_finding(
 #[inline]
 pub fn mem_write(ctx: &mut ExecCtx<'_>, loc: Loc, lane: usize, src: &[u8]) -> Result<(), ExecError> {
     let span = loc.span(src.len() as u64);
+    if ctx.arena.get(loc.alloc).space == Space::Param {
+        return Err(err(
+            ctx,
+            ExecErrorKind::BadAddress,
+            WarpMask::lane(lane),
+            format!("store to byte {} of the kernel parameter space, which is read-only", loc.offset),
+        ));
+    }
     let v = whole(ctx.arena, loc.alloc);
     if let Err(e) = ctx.arena.write(v, &[span], src) {
         return Err(arena_err(ctx, e, WarpMask::lane(lane)));

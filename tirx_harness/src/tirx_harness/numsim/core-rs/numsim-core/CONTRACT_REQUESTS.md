@@ -1410,3 +1410,106 @@ advisory. No racecheck change is needed once lowering carries the names.
   after a completed launch, stays a deadlock finding. Synccheck will use the
   field as soon as it exists. Without it, the log alone cannot tell a budget
   stop from a real hang.
+
+## W2 phase 3 (2026-10-08): engine review + conformance sweep
+
+### W2-13: exit-released named barriers (sync model / synccheck)
+
+Count-less named barriers are exit-aware (ruling H1, PTX §9.7.14.7). When a
+warp's last lanes exit, each open count-less generation it has not arrived
+at receives an exit-time `Named` command through `SyncTable::step`, logged as
+one committed `Protocol` event of that warp: `Arrive` (or `Red` when the
+generation is a `.red` one), with `mask = live = the exiting lanes` and the
+generation's `count`. Later count-less contributions use `b = 32 * (warps
+in CTA - exited warps)`. No type changes; synccheck replays the event like
+any other arrival. Explicit-count barriers are not released by exit: a hang
+there ends as `Incomplete` ("named_barrier_after_exit (G8)"), never
+Deadlock. A blocked `bar.sync`/`bar.red` logs the count it registered with.
+
+### W2-14: replay order and the stream-cycle diagnostic (W5, W6, W8)
+
+Sharded rounds replay partitions in an order consistent with what they
+observed (`Arena::shard_replay_order`, ruling M10): a partition that read
+global bytes another wrote in the same round replays first. When no such
+order exists (store buffering: each read what the other wrote), partition
+order is used and `RunOutcome::diagnostics` carries one
+`Finding { kind: Unsupported, status: Incomplete, attrs.reason:
+"cross_cluster_same_round_cycle" }` (only when observing; outputs are
+unchanged). **Request:** checker drivers (numsim-py `execute`, W5/W6
+reports) must treat that diagnostic as making the checker verdict
+`incomplete`. Read tracking costs nothing when no observer is attached.
+
+### W2-15: done in phase 3 (no contract change)
+
+- W5-8 / review M5: `st.async` / `red.async` landings are `Proxy::Generic`,
+  `sem: Release`, `atomic: true`, `scope` = the instruction's, on
+  `Actor::Async{op, Write}` with the issuing lane (with or without an
+  mbarrier; the mbarrier `complete_tx` stays the async completion).
+  `AsyncIssue.proxy` is `Generic` too.
+- W8-6: `ArgValue::View { target, offset, len }` (sched): one allocation per
+  `Buffer` target, views bind `Buffer` slots at `offset` (length capped at
+  `len`), work as `Pointer`/`TensorMapOf` targets, and come back in
+  `Outputs` as their slice. **W8:** add the `("view", target, offset, len)`
+  tuple to numsim-py `arg_value` (your file) and drop the fail-closed
+  binder path.
+- W4-9: `prefetch.L1::32B.valid_addr` checks one addressable global byte per
+  executing lane (BadAddress otherwise); `applypriority.async.bulk*` issues a
+  `Payload::None` bulk op into the thread's bulk group (commit / wait_group
+  count it). Host tensor maps from a spec honour `force_cu_dtype`
+  (11 TF32, 13 E2M1 packed, 14 E2M1 `fp4_padded`, 15 U6; any other value
+  that is not the dtype's canonical code fails closed).
+- V2C-9 / W1 ruling: `ld.global` (or a generic load) of a parameter-aperture
+  address reads the param block; any store into param space is a
+  `BadAddress` finding. `tests/numsim/v2/checkers/test_global_write_seed.py`
+  `tensor_map_initial_and_replaced_bases...` now XPASS (V2C-25): **W8**, drop
+  the xfail.
+- V2C-14 ruling: without `Launch::regs_per_thread`, the initial setmaxnreg
+  budget is the legacy caller base (min of 512/warpgroups, the largest
+  `setmaxnreg.inc` target or 256, and 512/(warpgroups*min_blocks_per_sm)),
+  configured per CTA and logged as the host `Configure` event.
+- Found by gdn_prefill_sm100 once Seeded latency was restored (H6):
+  `tcgen05.commit` now tracks EVERY prior in-flight tcgen05 op of the thread,
+  not only those since its previous commit (a second commit with nothing new
+  issued completed immediately). gdn_prefill_sm100 / gdn_cp_prefill_sm100
+  numsim conformance pass.
+- TMA with `.cta_group::2`: the mbarrier operand is a shared::cluster address;
+  each destination's signal goes to CTA `(dst & !1) | (mbar_rank & 1)` (the
+  pair CTA the address's bit 24 names). fastcu_nvfp4_gemm_gb300 now runs to
+  completion (outputs identical across seeds/partitioning).
+
+### W2-16: rulings needed (coordinator)
+
+- **Remote mbarrier arrives through a shared::cta operand.** nvfp4_gemm:841,
+  deepgemm fp8_fp4_gemm_1d1d:1434, sm100_fp8_fp4_mega_moe:1999,
+  flash_attention_backward:1277 pass a `mapa.shared::cluster` result to
+  `mbarrier.arrive{.expect_tx}.b64 _, [addr]` with NO state space. PTX says
+  generic addressing then, but W1 lowers it `AddrSpace::Shared`, and the
+  engine's shared::cta rank check (earlier ruling) rejects the remote rank
+  (`bad_address: shared::cta address 0x380c0 names CTA rank 0, not the
+  executing CTA (rank 1)`). Legacy accepted it. Either W1 lowers the
+  sink-form (`_`) arrive without space as `SharedCluster` (the only space
+  the sink form has besides generic), or the engine treats a rank-tagged
+  address in a shared-space mbarrier operand as cluster-addressed.
+- **V2C-19/20 (register-space uninitialized reads).** W1 scalarizes
+  register buffers into registers, which carry no validity, so nothing is
+  reported. Proposal: W1 lowers buffers legacy reported as `register` space
+  as `Space::Reg` `BufferDecl`s accessed by `Load`/`Store`; the engine binds
+  them like `Local` (per-lane, `Init::Uninit`, findings with `space:
+  register`). Needs W1 + a small sched change; not done.
+
+### W2-17: conformance failures that are not engine bugs (for owners)
+
+- W4: `Op(Unsupported): unary BitNot on u64/u32` (deepgemm fp8_bmm,
+  fp4_paged_mqa_logits, flash_mla_sparse_fwd, sparse_flashmla_prefill_*,
+  msa_prefill_multishape); `tirx.ptx.cp_async_bulk_prefetch` has no oplib
+  entry (alphamoe_fp8_blockscale_qwen3next); deepgemm mqa_logits_fp4:661 TMA
+  writes past the shared window (`[376832, ..)` of 213844 bytes), likely the
+  `sf_q` map's plan.
+- W3: `tcgen05.alloc.exclusive` of 576 columns is rejected
+  (`Tcgen(InvalidColumns{576})`; dense_blockscaled_gemm_sm107:1331,
+  grouped_gemm_masked_rubin:1749).
+- W8: cudnn_sm100_kda_bprop_f16 (V2C-22) outputs are byte-identical to legacy;
+  only `dgate`'s dtype/shape view differs (uint8[512] vs float32[128]).
+  flash_attention4 returns `O` in the base array's shape (1,256,32,128) while
+  legacy returns the tensor-map view (64,256,64); the reference compares the
+  latter. sparse_flashmla_decode_head64: missing binding `q_tail_tensormap`.

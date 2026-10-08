@@ -271,7 +271,18 @@ pub fn tcgen_commit(
         ];
         support::step_all(ctx, &batch)?;
         all.extend(batch);
-        let tracked = ctx.aux.tcgen_uncommitted.remove(&(ctx.warp.id, l as u8)).unwrap_or_default();
+        // PTX: the mbarrier tracks completion of ALL prior async tcgen05
+        // operations of this thread, not only those since its last commit:
+        // every one still in flight (a second commit right after a first
+        // must not complete before the mma ops the first one tracks).
+        let tracked: Vec<AsyncId> = match ctx.aux.tcgen_uncommitted.get_mut(&(ctx.warp.id, l as u8)) {
+            Some(v) => {
+                let live = &ctx.sync.async_ops;
+                v.retain(|id| live.iter().any(|o| o.id == *id));
+                v.clone()
+            }
+            None => Vec::new(),
+        };
         let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
         if sync_restrict && multicast.is_none() {
             if let ResourceId::Mbarrier { cta, .. } = res {
@@ -314,6 +325,7 @@ pub fn tcgen_commit(
                 tf32_round: false,
                 report: None,
                 lut_b: None,
+                strong: None,
             },
         );
     }
@@ -381,8 +393,23 @@ fn ldst_op(ctx: &mut ExecCtx<'_>, class: AsyncClass) -> AsyncId {
             tf32_round: false,
             report: None,
             lut_b: None,
+            strong: None,
         },
     )
+}
+
+/// A tcgen05.ld/st piece must address a column of a live allocation
+/// (PTX: TMEM outside `tcgen05.alloc` results is not addressable).
+fn check_piece_live(ctx: &ExecCtx<'_>, p: &oplib::TcgenLdstPiece, t: usize, what: &str) -> Result<(), crate::interp::ExecError> {
+    if support::tmem_live(ctx, p.column, 1) {
+        return Ok(());
+    }
+    Err(support::err(
+        ctx,
+        ExecErrorKind::BadAddress,
+        WarpMask::lane(t),
+        format!("{what}: tmem column {} (lane {}) is not in a live tcgen05 allocation", p.column, p.tmem_lane),
+    ))
 }
 
 /// Byte offset in the CTA's TMEM allocation of a plan piece.
@@ -418,6 +445,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
         let mut bytes = vec![0u8; nregs * 4];
         for r in 0..nregs {
             for p in map.pieces(r, t) {
+                check_piece_live(ctx, p, t, "tcgen05.ld")?;
                 let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
                 let at = 4 * r + p.reg_byte as usize;
                 support::mem_read(ctx, loc, t, &mut bytes[at..at + p.len as usize])?;
@@ -480,6 +508,7 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
         bytes.resize(nregs * 4, 0);
         for r in 0..nregs {
             for p in map.pieces(r, t) {
+                check_piece_live(ctx, p, t, "tcgen05.st")?;
                 let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
                 let at = 4 * r + p.reg_byte as usize;
                 support::mem_write(ctx, loc, t, &bytes[at..at + p.len as usize])?;
@@ -588,6 +617,7 @@ pub fn tcgen_cp(ctx: &mut ExecCtx<'_>, args: TcgenCpArgs) -> HResult {
                 tf32_round: false,
                 report: None,
                 lut_b: None,
+                strong: None,
             },
         );
         ctx.aux.tcgen_last.insert(ctx.cta.id, op);
@@ -669,6 +699,7 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
                 tf32_round: false,
                 report: None,
                 lut_b,
+                strong: None,
             },
         );
         ctx.aux.tcgen_last.insert(ctx.cta.id, op);

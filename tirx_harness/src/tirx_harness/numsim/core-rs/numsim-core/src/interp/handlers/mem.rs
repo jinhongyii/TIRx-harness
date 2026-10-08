@@ -32,6 +32,16 @@ pub fn check_align(ctx: &ExecCtx<'_>, loc: Loc, n: u64, lane: usize) -> Result<(
     Ok(())
 }
 
+/// A non-weak load inside a loop polls memory another actor may change
+/// (`while (ld.acquire(flag) == 0)`): record it for spin parking, which
+/// still requires the loop to reach a register fixed point (control.rs).
+#[inline]
+fn note_load_poll(ctx: &mut ExecCtx<'_>, sem: Sem, alloc: crate::arena::AllocId, offset: u64) {
+    if sem != Sem::Weak && ctx.warp.frames.iter().any(|f| matches!(f.kind, crate::interp::FrameKind::Loop { .. })) {
+        ctx.note_failed_poll(crate::sync::ResourceId::Word { alloc, offset });
+    }
+}
+
 #[inline]
 fn load_proxy(mods: &MemMods) -> Proxy {
     if mods.nc {
@@ -55,11 +65,13 @@ fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<(crate::arena::AllocId, u6
         BufBinding::SharedWindow { offset, len } => (ctx.cta.smem, offset as u64, len),
         _ => return None,
     };
-    if ctx.arena.is_overlaid(alloc) {
+    // Overlaid allocations and wait_until predicate evaluation (which
+    // records the bytes it read) take the general path.
+    if ctx.arena.is_overlaid(alloc) || ctx.aux.capture_reads.is_some() {
         return None;
     }
     let a = ctx.arena.get(alloc);
-    if a.metadata_only || base.checked_add(len).is_none_or(|e| e > a.size) {
+    if a.metadata_only || a.space == crate::arena::Space::Param || base.checked_add(len).is_none_or(|e| e > a.size) {
         return None;
     }
     let window = match a.space {
@@ -114,6 +126,11 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
             if ok {
                 let s = ctx.slot(dst);
                 support::write_masked(ctx.warp.regs.get_mut(s), &vals, active);
+                if sem != Sem::Weak {
+                    let l0 = active.lanes().next().expect("active");
+                    let off = fast_offset(ctx, buf, lane_int(ctx, offset, l0), n, len, base).expect("checked");
+                    note_load_poll(ctx, sem, alloc, off);
+                }
                 if ctx.observing {
                     let mut acc = Accesses::default();
                     for l in active.lanes() {
@@ -132,15 +149,20 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
     let n = ty.mem_bytes() as u64;
     let mut acc = Accesses::default();
     let mut bytes = [0u8; 32];
+    let mut first = None;
     for l in ctx.warp.active.lanes() {
         let idx = lane_int(ctx, offset, l);
         let loc = support::resolve_buf(ctx, buf, idx, l, n)?;
         check_align(ctx, loc, n, l)?;
         support::mem_read(ctx, loc, l, &mut bytes[..n as usize])?;
         write_lane_bytes(ctx, dst, l, &bytes[..n as usize]);
+        first.get_or_insert(loc);
         if ctx.observing {
             acc.push(loc, l as u8, n);
         }
+    }
+    if let Some(loc) = first {
+        note_load_poll(ctx, sem, loc.alloc, loc.offset);
     }
     let proxy = if matches!(ctx.buffers[buf.0 as usize], crate::interp::BufBinding::Tmem { .. }) { Proxy::Tcgen } else { load_proxy(&mods) };
     let sp = support::spec(ctx, AccessKind::Read, sem, scope, proxy);
@@ -215,15 +237,20 @@ pub fn load_addr(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, a: Operand, space: Add
     let n = ty.mem_bytes() as u64;
     let mut acc = Accesses::default();
     let mut bytes = [0u8; 32];
+    let mut first = None;
     for l in ctx.warp.active.lanes() {
         let v = lane_val(ctx, a, l);
         let loc = support::resolve(ctx, space, v, l, n)?;
         check_align(ctx, loc, n, l)?;
         support::mem_read(ctx, loc, l, &mut bytes[..n as usize])?;
         write_lane_bytes(ctx, dst, l, &bytes[..n as usize]);
+        first.get_or_insert(loc);
         if ctx.observing {
             acc.push(loc, l as u8, n);
         }
+    }
+    if let Some(loc) = first {
+        note_load_poll(ctx, sem, loc.alloc, loc.offset);
     }
     let sp = support::spec(ctx, AccessKind::Read, sem, scope, load_proxy(&mods));
     support::emit(ctx, sp, &mut acc);
@@ -328,6 +355,24 @@ pub fn rmw_elem(op: AtomOp, elem: Dtype, old: u64, val: u64, cmp: u64, ftz: bool
 /// Apply `op` element-wise over little-endian byte buffers (`dst = op(dst, src)`).
 pub fn rmw_bytes(op: AtomOp, elem: Dtype, dst: &mut [u8], src: &[u8], cmp: &[u8], ftz: bool) -> oplib::OpResult {
     let eb = elem.mem_bytes() as usize;
+    if eb > 8 {
+        // `.b128` atomics (PTX §9.7.13.5): only exch and cas exist; both
+        // are bytewise on whole 16-byte elements.
+        let mut i = 0;
+        while i + eb <= dst.len() {
+            match op {
+                AtomOp::Exch => dst[i..i + eb].copy_from_slice(&src[i..i + eb]),
+                AtomOp::Cas => {
+                    if cmp.len() >= i + eb && dst[i..i + eb] == cmp[i..i + eb] {
+                        dst[i..i + eb].copy_from_slice(&src[i..i + eb]);
+                    }
+                }
+                _ => return Err(oplib::OpError::unsupported(format!("atom.{op:?} on a {eb}-byte element (only exch/cas have .b128 forms)"))),
+            }
+            i += eb;
+        }
+        return Ok(());
+    }
     let get = |b: &[u8], i: usize| {
         let mut w = [0u8; 8];
         w[..eb].copy_from_slice(&b[i..i + eb]);

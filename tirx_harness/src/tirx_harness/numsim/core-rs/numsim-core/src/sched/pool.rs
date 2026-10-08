@@ -54,9 +54,9 @@ impl Pool {
         let mut seen = 0u64;
         loop {
             let task = {
-                let mut st = self.state.lock().expect("pool");
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 while st.gen == seen && !st.quit {
-                    st = self.work.wait(st).expect("pool");
+                    st = self.work.wait(st).unwrap_or_else(|e| e.into_inner());
                 }
                 if st.quit {
                     return;
@@ -65,7 +65,7 @@ impl Pool {
                 st.task.expect("published with the generation")
             };
             run(task);
-            let mut st = self.state.lock().expect("pool");
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.busy -= 1;
             if st.busy == 0 {
                 self.done.notify_all();
@@ -82,25 +82,35 @@ impl Pool {
         let f: *const (dyn Fn(usize) + Sync + 'static) = unsafe { std::mem::transmute(f as *const (dyn Fn(usize) + Sync)) };
         let task = Task { f, n, next: &next };
         {
-            let mut st = self.state.lock().expect("pool");
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.task = Some(task);
             st.gen += 1;
             st.busy = self.workers;
             self.work.notify_all();
         }
         run(task);
-        let mut st = self.state.lock().expect("pool");
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while st.busy > 0 {
-            st = self.done.wait(st).expect("pool");
+            st = self.done.wait(st).unwrap_or_else(|e| e.into_inner());
         }
         st.task = None;
     }
 
     /// Stop the pool threads (call before the scope ends).
     pub(crate) fn shutdown(&self) {
-        let mut st = self.state.lock().expect("pool");
+        // Tolerate a poisoned lock: this also runs while unwinding.
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.quit = true;
         self.work.notify_all();
+    }
+}
+
+/// Calls [`Pool::shutdown`] when dropped (including during unwinding).
+pub(crate) struct ShutdownGuard<'a>(pub &'a Pool);
+
+impl Drop for ShutdownGuard<'_> {
+    fn drop(&mut self) {
+        self.0.shutdown();
     }
 }
 
