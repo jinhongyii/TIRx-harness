@@ -764,3 +764,26 @@ fn launches_are_checked_separately() {
     assert_eq!(mixed.verdict, Verdict::Incomplete);
     assert_eq!(payload(&mixed, Status::Incomplete)["reason"], "fixed_sync_program_build");
 }
+
+/// V2C-15 (`fast_topk_clusters`): every warp exits after its last cluster
+/// wait (`Cluster::Exit`, delta C1). The certificate accepts exits that are
+/// a warp's last cluster command; the launch is certified, not searched.
+#[test]
+fn cluster_exit_after_last_wait_is_certified() {
+    let warps: Vec<u32> = (0..8).collect();
+    let mut log = LogBuilder::new();
+    for _ in 0..3 {
+        for &w in &warps {
+            log.cmd(w, 1, cluster_bar(0), cl_arrive(w));
+        }
+        for &w in &warps {
+            log.cmd(w, 2, cluster_bar(0), cl_wait(w));
+        }
+    }
+    for &w in &warps {
+        log.cmd(w, 3, cluster_bar(0), SyncCmd::Cluster(numsim_core::sync::cluster::Cmd::Exit { warp: w, lanes: FULL_MASK }));
+    }
+    let init = ResourceInit { cluster_warps: 8, ..cta(4) };
+    let r = run_all(&log.build(), init, Verdict::Clean);
+    assert_eq!(stat(&r[0].1, "certified_program_count"), 1, "{:?}", r[0].1.coverage);
+}

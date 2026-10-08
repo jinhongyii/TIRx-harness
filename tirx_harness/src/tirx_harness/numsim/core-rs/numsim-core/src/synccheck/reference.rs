@@ -70,21 +70,10 @@ pub fn run(program: &Program, init: &ResourceInit) -> Result<ReferenceRun, Strin
     let mut state = ts.initial();
     let mut rr = 0usize;
     loop {
-        let enabled = ts.enabled(&state);
-        let warp_of = |t: &Transition| -> Option<usize> {
-            match *t {
-                Transition::Issue(c) => Some(*ts.cmds[c as usize].participants.iter().min().expect("participants")),
-                Transition::Resume(w) => Some(w as usize),
-                _ => None,
-            }
-        };
         let local_warps = ts.warps.len().max(1);
-        let pick = enabled
-            .iter()
-            .filter(|t| warp_of(t).is_some())
-            .min_by_key(|t| (warp_of(t).unwrap() + local_warps - rr % local_warps) % local_warps)
-            .or_else(|| enabled.first())
-            .copied();
+        let pick = ts
+            .first_warp_transition(&state, rr % local_warps)
+            .or_else(|| ts.enabled(&state).first().copied());
         let Some(t) = pick else {
             run.outcome = if state.exited { RunOutcome::Complete } else { RunOutcome::Deadlock(ts.describe_deadlock(&state)) };
             return Ok(run);

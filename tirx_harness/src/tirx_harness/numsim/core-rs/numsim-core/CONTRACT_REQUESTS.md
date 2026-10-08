@@ -1376,3 +1376,37 @@ advisory. No racecheck change is needed once lowering carries the names.
 - V2C-10: `tcgen05_encode_matrix_descriptor` no longer validates its address:
   a generic shared pointer contributes its window offset, anything else (0
   included) its own bits, encoded as `(addr & 0x3FFFF) >> 4`.
+
+## W6-3 (2026-10-08): v2 conformance V2C-14 / V2C-15 / V2C-23
+
+- **V2C-14 and V2C-15 have one root cause: the launch shape never reaches
+  synccheck in numsim-py (W8).** `PerLaunchRecorder` (numsim-py
+  `src/lib.rs`) forwards `access`/`sync`/`warp_done`/`inbox_drain` to its
+  per-launch `RecordingObserver` but not `begin_launch`. As a result
+  `RecordingObserver::launches` is empty, and synccheck had built
+  setmaxnreg pools with 0 warps (`IncompleteWarpgroup`, V2C-14) and the
+  cluster barrier with 0 participants (`UnexpectedParticipant`, V2C-15).
+  Since W2-10, synccheck fails closed (`incomplete`, "launch shape unknown").
+  **Fix (W8):** call `self.current.begin_launch(info)` in
+  `PerLaunchRecorder::begin_launch` after resetting `current`.
+  I verified this by replaying both kernels' captured v2 modules and inputs
+  through `sched` with a plain `RecordingObserver`, which records the shape:
+  - `fast_topk_clusters`: Clean in 0.9 s (8 CTAs × 32 warps, cluster 8,
+    27k events).
+  - `cudnn_sm100_kda_bprop_f16`: phase 0 and phase 1 both Clean (four
+    setmaxnreg warpgroups, the `inc 144/168/144` and `dec 56` collectives).
+  The cluster replay also showed that the certificate rejected every
+  `Cluster::Exit`. Exits that are a warp's last cluster command are now
+  accepted (regression `cluster_exit_after_last_wait_is_certified`), and the
+  reference run picks transitions round-robin instead of recomputing every
+  enabled transition. Before these two changes, checking this launch did not
+  finish in 20 minutes.
+- **V2C-23 (truncated log). Request:** `RecordingObserver` should record
+  `warp_done` (`warp_ends: Vec<(WarpId, WarpEnd)>`) and whether `end_launch`
+  was reached. A launch that stopped early (`WarpEnd::Budget`/`Error`/`Trapped`,
+  or a warp with no end) would then be `incomplete` (`truncated_launch`)
+  instead of Phase A's "executor deadlock" from `BlockedAtExit` or a Phase B
+  deadlock on missing events. Only a `Deadlocked` end, or `BlockedAtExit`
+  after a completed launch, stays a deadlock finding. Synccheck will use the
+  field as soon as it exists. Without it, the log alone cannot tell a budget
+  stop from a real hang.

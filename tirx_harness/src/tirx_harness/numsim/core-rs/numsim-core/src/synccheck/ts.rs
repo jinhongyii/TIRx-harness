@@ -231,12 +231,14 @@ impl<'p> Ts<'p> {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        let mut at = HashMap::<(usize, usize), usize>::new();
+        for (w, list) in programs.iter().enumerate() {
+            for (pos, &c) in list.iter().enumerate() {
+                at.insert((w, c), pos);
+            }
+        }
         for (local, cmd) in cmds.iter_mut().enumerate() {
-            cmd.positions = cmd
-                .participants
-                .iter()
-                .map(|&w| programs[w].iter().position(|&c| c == local).expect("participant holds command"))
-                .collect();
+            cmd.positions = cmd.participants.iter().map(|&w| at[&(w, local)]).collect();
         }
         let mut initial_res = Vec::new();
         for &r in &resources {
@@ -594,6 +596,32 @@ impl<'p> Ts<'p> {
                 Tried::Error(self.err(p.cmd as usize, e))
             }
         }
+    }
+
+    /// The first warp transition in round-robin order from `start` that is
+    /// not disabled (reference run fast path; avoids computing every
+    /// enabled transition at each step).
+    pub fn first_warp_transition(&self, s: &State, start: usize) -> Option<Transition> {
+        let n = self.warps.len();
+        for k in 0..n {
+            let w = (start + k) % n;
+            if s.retry[w].is_some() {
+                if !matches!(self.try_resume(s, w), Tried::Disabled) {
+                    return Some(Transition::Resume(w as u32));
+                }
+                continue;
+            }
+            let Some(c) = self.head(s, w) else { continue };
+            if self.cmds[c].participants.iter().min() != Some(&w) || !self.issue_ready(s, c) {
+                continue;
+            }
+            match self.try_issue(s, c) {
+                Tried::Disabled => {}
+                Tried::Armed(_) => return Some(Transition::Arm(self.cmds[c].cmds[0].0 as u32)),
+                _ => return Some(Transition::Issue(c as u32)),
+            }
+        }
+        None
     }
 
     pub fn enabled(&self, s: &State) -> Vec<Transition> {

@@ -162,7 +162,22 @@ fn cluster_cert(items: &[Item<'_>], participants: u32) -> Option<Result<(), Cert
     const P: &str = "ClusterBarrier";
     let mut arrivals = BTreeMap::<u64, BTreeMap<u32, usize>>::new();
     let mut waits = BTreeMap::<u64, BTreeMap<u32, usize>>::new();
+    let mut last = BTreeMap::<usize, usize>::new();
+    for it in items {
+        let p = last.entry(it.warp).or_insert(it.position);
+        *p = (*p).max(it.position);
+    }
     for (i, it) in items.iter().enumerate() {
+        // A warp's exit after its last arrival/wait (delta C1) is a no-op in
+        // every schedule when every generation below has all participants:
+        // the warp's generations already completed, and an exit with nothing
+        // arrived completes nothing. Any other exit needs the state machine.
+        if let SyncCmd::Cluster(cluster::Cmd::Exit { .. }) = it.cmd {
+            if last.get(&it.warp) == Some(&it.position) {
+                continue;
+            }
+            return None;
+        }
         let gen = it.gen?;
         match it.cmd {
             SyncCmd::Cluster(cluster::Cmd::Arrive { warp, .. }) => {

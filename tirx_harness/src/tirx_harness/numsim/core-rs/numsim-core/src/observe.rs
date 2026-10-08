@@ -400,6 +400,13 @@ pub struct RecordingObserver {
     /// `(kernel_index, shape)` of every launch observed, in order (W6-2), so
     /// consumers can rebuild per-CTA resources without re-supplying the shape.
     pub launches: Vec<(u32, LaunchShape)>,
+    /// How each warp ended (W6-3): `(warp, end)` in delivery order. A warp
+    /// with no entry, or a `Budget`/`Error`/`Trapped` end, marks a truncated
+    /// log that checkers report as `incomplete`, never as deadlock.
+    pub warp_ends: Vec<(WarpId, WarpEnd)>,
+    /// Number of `end_launch` calls seen; a recording with fewer ends than
+    /// `launches` is truncated.
+    pub launches_ended: u32,
 }
 
 impl RecordingObserver {
@@ -414,6 +421,12 @@ impl RecordingObserver {
 impl Observer for RecordingObserver {
     fn begin_launch(&mut self, info: &LaunchInfo<'_>) {
         self.launches.push((info.kernel_index, info.shape));
+    }
+    fn end_launch(&mut self, _info: &LaunchInfo<'_>) {
+        self.launches_ended += 1;
+    }
+    fn warp_done(&mut self, warp: WarpId, end: WarpEnd) {
+        self.warp_ends.push((warp, end));
     }
     fn sync(&mut self, e: &SyncEvent) {
         match e.actor {
