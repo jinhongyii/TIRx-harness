@@ -17,7 +17,7 @@ Homepage = "https://tirxharness.mlc.ai"
 Repository = "https://github.com/mlc-ai/TIRx-harness"
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-xdist>=3", "setuptools>=64", "pip>=25.1", "ml-dtypes"]
+test = ["pytest>=8", "pytest-xdist>=3", "setuptools>=64", "pip>=25.1", "ml-dtypes", "jsonschema>=4"]
 
 [dependency-groups]
 # Shared compiler/runtime requirements. Keep both installation groups standalone.
