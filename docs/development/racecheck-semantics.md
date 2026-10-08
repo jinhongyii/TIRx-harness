@@ -900,6 +900,28 @@ knowledge Arcs are already persistent, so a round snapshot is pointer copies).
 Either way, the per-access test (`ordered`) must only read HB state, which
 holds today.
 
+**Why the async actor population is live (probe, e24).** Four levers that
+shrink the actor space or the join cost were measured and rejected (< 1.5x):
+bridge-view sharing (4%), a repeat-acquire cache (0%), eager reclaim of copies
+and phase actors for single-phase TMA copies plus early-freed tcgen ops (~1.0x
+together; findings bit-identical). They fail because the witnesses that pin
+the actors are legitimately live, not because a pruning rule misses them:
+- TMA loads: their global-source read witnesses sit on read-shared input
+  cells. Thousands of unordered readers from 148 CTAs read them, so no later
+  access is ordered after them until a GC proves them dead.
+- MMAs: their shared-operand read witnesses (Async proxy, SharedCta) are
+  evicted correctly when the next TMA load overwrites the stage. Over the run,
+  1.02M such encounters were all same-view-class and ordered, so all were
+  evicted. But at a mid-run GC, 858K of 960K recorded MMA operand reads were
+  still on stages that had not been rewritten yet; their cells held only the
+  TMA write the MMA had consumed.
+- tcgen05.ld: their TMEM read witnesses are never overwritten during the run.
+  No write encountered them, because each accumulator region is read by the
+  epilogue after its last MMA.
+
+Shrinking the actor space therefore needs either a different async-knowledge
+representation or the parallel checker (`racecheck-parallel-design.md`).
+
 ### View-aware GC (`Checker::gc`, every `gc_every` events and at drains)
 
 1. Compute the meet, per view, of what every live actor knows:
