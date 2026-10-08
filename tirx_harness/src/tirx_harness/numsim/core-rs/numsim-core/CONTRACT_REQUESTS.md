@@ -559,6 +559,15 @@ All of these are JSON-visible. `FORMAT_VERSION` is now **2**.
     set iff `lut_b`. The engine fails closed if the address is outside a
     live allocation.
 
+27. **tcgen05 row/column offsets** (W4-7). `TcgenLdArgs`, `TcgenStArgs`
+    and `TcgenCpArgs` each gain two required operands, `row: Operand` and
+    `col: Operand`. Emit const 0 when the source has none.
+    - Effective lane = `((taddr >> 16) + row)` mod 2^16; effective column =
+      `((taddr & 0xffff) + col)` mod 2^16. This is legacy
+      `raw_tcgen05_address`.
+    - `ld`/`st` require both operands to be warp-uniform. `cp` reads them
+      in the issuing lane.
+
 **C.3 acks.**
 - **Accepted:** 1 (`numsim.pack`/`unpack`, W4), 2 (`<name>.value`, W4),
   5, 6, 7, 8, 9 and 10.

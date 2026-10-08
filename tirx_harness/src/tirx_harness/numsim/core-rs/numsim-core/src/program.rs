@@ -828,6 +828,12 @@ pub enum TcShape {
 pub struct TcgenLdArgs {
     pub dsts: Vec<Reg>,
     pub taddr: Operand,
+    /// Warp-uniform. Row (TMEM lane) offset added to `taddr`'s lane field, signed; the
+    /// effective lane is `(taddr >> 16) + row` mod 2^16 (legacy
+    /// `raw_tcgen05_address`). Emit const 0 when the source has none.
+    pub row: Operand,
+    /// Column offset added to `taddr`'s column field, same rules.
+    pub col: Operand,
     pub shape: TcShape,
     pub num: u16,
     pub pack: bool,
@@ -847,6 +853,12 @@ pub struct TcgenLdArgs {
 pub struct TcgenStArgs {
     pub srcs: Vec<Operand>,
     pub taddr: Operand,
+    /// Warp-uniform. Row (TMEM lane) offset added to `taddr`'s lane field, signed; the
+    /// effective lane is `(taddr >> 16) + row` mod 2^16 (legacy
+    /// `raw_tcgen05_address`). Emit const 0 when the source has none.
+    pub row: Operand,
+    /// Column offset added to `taddr`'s column field, same rules.
+    pub col: Operand,
     pub shape: TcShape,
     pub num: u16,
     pub unpack: bool,
@@ -856,6 +868,12 @@ pub struct TcgenStArgs {
 #[serde(deny_unknown_fields)]
 pub struct TcgenCpArgs {
     pub taddr: Operand,
+    /// Read in the issuing lane. Row (TMEM lane) offset added to `taddr`'s lane field, signed; the
+    /// effective lane is `(taddr >> 16) + row` mod 2^16 (legacy
+    /// `raw_tcgen05_address`). Emit const 0 when the source has none.
+    pub row: Operand,
+    /// Column offset added to `taddr`'s column field, same rules.
+    pub col: Operand,
     pub sdesc: Operand,
     /// Shape as (rows, bits): `.128x256b` = (128, 256), `.4x256b`, ...
     pub rows: u16,
@@ -2929,6 +2947,8 @@ impl Instr {
             TcgenLd(a) => {
                 a.dsts.iter().for_each(|d| f(Def(*d, None)));
                 f(Use(a.taddr));
+                f(Use(a.row));
+                f(Use(a.col));
                 if let Some((_, regs)) = &a.red {
                     regs.iter().for_each(|d| f(Def(*d, None)));
                 }
@@ -2936,9 +2956,13 @@ impl Instr {
             TcgenSt(a) => {
                 a.srcs.iter().for_each(|s| f(Use(*s)));
                 f(Use(a.taddr));
+                f(Use(a.row));
+                f(Use(a.col));
             }
             TcgenCp(a) => {
                 f(Use(a.taddr));
+                f(Use(a.row));
+                f(Use(a.col));
                 f(Use(a.sdesc));
             }
             TcgenMma(a) => {
