@@ -862,15 +862,43 @@ From `RaceCheckIncompleteReason` (RC:71-140) and RCP:592-735:
   work becomes `AsyncNeverCompleted`.
 - Events outside a launch become `EventOutsideLaunch`.
 
-### Merge design
+### Merge design and the serial-checker limit
 
-The scheduler is single-threaded, so there is one shadow and it is always
-merged; `round_boundary` (formerly `inbox_drain`) is only a GC safe point. When CTA parallelism lands:
-- shared memory and TMEM stay CTA-private;
-- the global shadow is partitioned by stripe;
-- a round's global accesses are applied at the receiving CTA's next drain, in
-  `(round, cta, seq)` order;
-- `end_launch` drains every buffer before finalising.
+**Architectural limit (measured).** The engine runs CTA partitions in
+parallel, but each partition buffers its events (`sched::partition::EventBuffer`)
+and the scheduler replays them into the one `RaceObserver` serially, in
+deterministic order, after each round (`EventBuffer::replay`). The checker
+therefore runs on one thread: racecheck wall time ≈ engine time (which scales
+with workers) + checker time (which does not). mega_moe e24
+(`t8_h1024_i512_e24_k2_g1`, 148 SMs), recorded stream, current tree:
+
+| workers | engine alone (NoopObserver) | racecheck run | checker callbacks (access + sync) |
+| --- | --- | --- | --- |
+| 1 | 2.3 s | 27.8 s | 17.9 s |
+| 16 | 0.5 s | 19.8 s | 16.8 s |
+| 32 | 0.6 s | 21.1 s | 18.4 s |
+
+The rest of the racecheck run (about 3 s at 16 workers, 10 s at 1) is the
+engine with declared-word history and event buffering. Legacy scales with
+workers (e24 12.8 s → 2.5 s) because its checker state is sharded. Read
+racecheck perf-gate baselines with this in mind: a v2 racecheck row cannot
+improve with `--workers` until the checker is parallel.
+
+**What a parallel checker needs (not implemented).** Shard the shadow by
+allocation, or by address stripe for large global allocations: shared memory
+and TMEM are CTA-private, so they shard by CTA naturally. Each shard processes
+its accesses in the delivered `(round, cta, seq)` order, and findings merge
+deterministically (sorted by first `seq`, occurrence counts summed). The
+obstacle is the happens-before state, which is not per shard: warp and async
+knowledge (`Warp`, `AsyncActor.k`, `Phase` payloads, release heads on
+declared words) is read by every shard's ordering test and written by sync
+events from any CTA. A design must either replicate the sync stream to every
+shard (each shard keeps its own copy of the HB state; sync events are a few
+percent of accesses but the joins are the dominant cost today), or
+snapshot the HB state per round and let shards read it immutably (the
+knowledge Arcs are already persistent, so a round snapshot is pointer copies).
+Either way, the per-access test (`ordered`) must only read HB state, which
+holds today.
 
 ### View-aware GC (`Checker::gc`, every `gc_every` events and at drains)
 
