@@ -172,12 +172,39 @@ pub const MAX_WORD_HISTORY: usize = 1 << 16;
 /// Declared words (`BufferDecl::sync_words`, or declared at first wait).
 #[derive(Clone, Debug, Default)]
 pub struct WordTable {
+    /// Declared regions per allocation, sorted by `(span.start, span.len)`
+    /// (lookups are binary searches: kernels declare 10^5+ words).
     pub regions: HashMap<AllocId, Vec<WordRegion>>,
+    /// Longest region per allocation (bounds overlap searches).
+    max_len: HashMap<AllocId, u64>,
+    /// Regions declared or logged since the last [`Self::clear_dirty`]
+    /// (the scheduler merges only these), with a dedupe set.
+    dirty: Vec<(AllocId, ByteSpan)>,
+    dirty_set: HashSet<(AllocId, u64, u64)>,
 }
 
 impl WordTable {
     pub fn is_empty(&self) -> bool {
         self.regions.is_empty()
+    }
+
+    fn mark(&mut self, alloc: AllocId, span: ByteSpan) {
+        if self.dirty_set.insert((alloc, span.start, span.len)) {
+            self.dirty.push((alloc, span));
+        }
+    }
+
+    /// Regions declared or logged since the last [`Self::clear_dirty`], in
+    /// span order per allocation (deterministic).
+    pub fn dirty(&self) -> Vec<(AllocId, ByteSpan)> {
+        let mut v = self.dirty.clone();
+        v.sort_by_key(|&(a, s)| (a, s.start, s.len));
+        v
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.dirty.clear();
+        self.dirty_set.clear();
     }
 
     /// Does `alloc` hold any declared region? (Writes to other allocations
@@ -186,25 +213,76 @@ impl WordTable {
         self.regions.get(&alloc).is_some_and(|rs| !rs.is_empty())
     }
 
+    /// Index range of `alloc`'s regions that may overlap `span` (each one
+    /// still needs an overlap test).
+    fn window(&self, alloc: AllocId, span: ByteSpan) -> std::ops::Range<usize> {
+        let Some(rs) = self.regions.get(&alloc) else { return 0..0 };
+        let ml = self.max_len.get(&alloc).copied().unwrap_or(0);
+        let lo_start = span.start.saturating_sub(ml);
+        let lo = rs.partition_point(|r| r.span.start < lo_start);
+        let hi = rs.partition_point(|r| r.span.start < span.end().max(span.start + 1));
+        lo..hi.max(lo)
+    }
+
+    /// Index of the region of `alloc` with exactly `span`.
+    pub fn position(&self, alloc: AllocId, span: ByteSpan) -> Option<usize> {
+        self.regions.get(&alloc)?.binary_search_by_key(&(span.start, span.len), |r| (r.span.start, r.span.len)).ok()
+    }
+
+    /// The region of `alloc` with exactly `span`.
+    pub fn exact(&self, alloc: AllocId, span: ByteSpan) -> Option<&WordRegion> {
+        let i = self.position(alloc, span)?;
+        self.regions.get(&alloc).map(|rs| &rs[i])
+    }
+
+    /// Mutable [`Self::exact`].
+    pub fn exact_mut(&mut self, alloc: AllocId, span: ByteSpan) -> Option<&mut WordRegion> {
+        let i = self.position(alloc, span)?;
+        self.regions.get_mut(&alloc).map(|rs| &mut rs[i])
+    }
+
+    /// Insert `r` in sorted position unless a region with its span exists;
+    /// returns the region's index.
+    pub fn insert(&mut self, alloc: AllocId, r: WordRegion) -> usize {
+        let ml = self.max_len.entry(alloc).or_insert(0);
+        *ml = (*ml).max(r.span.len);
+        let rs = self.regions.entry(alloc).or_default();
+        match rs.binary_search_by_key(&(r.span.start, r.span.len), |t| (t.span.start, t.span.len)) {
+            Ok(i) => i,
+            Err(i) => {
+                rs.insert(i, r);
+                i
+            }
+        }
+    }
+
     /// Does any span overlap a declared region of `alloc`?
     pub fn overlaps(&self, alloc: AllocId, spans: &[ByteSpan]) -> bool {
-        self.regions
-            .get(&alloc)
-            .is_some_and(|rs| rs.iter().any(|r| spans.iter().any(|s| s.overlaps(r.span))))
+        let Some(rs) = self.regions.get(&alloc) else { return false };
+        spans.iter().any(|s| rs[self.window(alloc, *s)].iter().any(|r| s.overlaps(r.span)))
     }
 
-    /// Region of `alloc` covering `span`, if declared.
+    /// Region of `alloc` covering `span`, if declared (the first in span
+    /// order when declared regions overlap).
     pub fn region(&self, alloc: AllocId, span: ByteSpan) -> Option<&WordRegion> {
-        self.regions
-            .get(&alloc)?
-            .iter()
-            .find(|r| r.span.start <= span.start && span.end() <= r.span.end())
+        let rs = self.regions.get(&alloc)?;
+        rs[self.window(alloc, span)].iter().find(|r| r.span.start <= span.start && span.end() <= r.span.end())
     }
 
-    /// Declare `span` of `alloc` with its current bytes as history index 0.
+    /// Region of `alloc` containing byte `at`, if any (first in span order).
+    pub fn region_at(&self, alloc: AllocId, at: u64) -> Option<&WordRegion> {
+        self.region(alloc, ByteSpan::new(at, 1))
+    }
+
+    /// Declare `span` of `alloc` with its current bytes as history index 0
+    /// (no-op if exactly `span` is already declared).
     pub fn declare(&mut self, arena: &Arena, alloc: AllocId, span: ByteSpan) {
+        if self.position(alloc, span).is_some() {
+            return;
+        }
         let init = snapshot(arena, alloc, span);
-        self.regions.entry(alloc).or_default().push(WordRegion { span, init, log: Vec::new(), overflow: false });
+        self.insert(alloc, WordRegion { span, init, log: Vec::new(), overflow: false });
+        self.mark(alloc, span);
     }
 
     /// Append one history entry per declared region overlapping a lane's
@@ -212,11 +290,14 @@ impl WordTable {
     /// image with this lane's bytes merged in (README decision 14: entries
     /// are (write Access, lane) pairs in delivery order, lanes ascending).
     pub fn log_lane(&mut self, alloc: AllocId, span: ByteSpan, bytes: &[u8]) {
+        let w = self.window(alloc, span);
         let Some(rs) = self.regions.get_mut(&alloc) else { return };
-        for r in rs.iter_mut() {
+        let mut touched: Vec<ByteSpan> = Vec::new();
+        for r in rs[w].iter_mut() {
             if !span.overlaps(r.span) {
                 continue;
             }
+            touched.push(r.span);
             if r.log.len() >= MAX_WORD_HISTORY {
                 r.overflow = true;
                 continue;
@@ -229,12 +310,15 @@ impl WordTable {
             }
             r.log.push((vec![span], img));
         }
+        for t in touched {
+            self.mark(alloc, t);
+        }
     }
 
     /// [`Self::log_lane`] with the bytes currently in the arena (single
     /// writer of `span`, e.g. an async landing).
     pub fn log_from_arena(&mut self, arena: &Arena, alloc: AllocId, span: ByteSpan) {
-        if !self.regions.get(&alloc).is_some_and(|rs| rs.iter().any(|r| r.span.overlaps(span))) {
+        if !self.overlaps(alloc, &[span]) {
             return;
         }
         let bytes = snapshot(arena, alloc, span);

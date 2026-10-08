@@ -3197,3 +3197,12 @@ Review of 934f2b3 (partitioned declared words), invariant I10: verdict indices m
 - **Oplib decode.** `is_canceled = low32 != 0xFFFF_FFFF`. Before, it was `!= 0 && != MAX`; that assumed cluster 0 always resident, but under a subset base CTA 0 can be claimed.
 - **Scenario and test.** Scenario `clc_task_steal`: grid 4, subset {0, 1}; it is in `all()` and run by the checker smoke tests. Test `clc_claims_non_resident_tasks_under_a_subset` covers workers 1/4/16, with and without an observer, single-partition mode, and no subset.
 - **Port.** `test_flashmla_small_topk_task_steal_matches_independent_numerical_oracle` now matches the independent oracle numerically. Its remaining `verdict == "clean"` / `diagnostics == []` asserts collide with the W8-4 `subset_execution` incomplete record, which every subset run carries. Other ports filter that record.
+
+## W2 (2026-10-08): indexed WordTable and dirty-only merge (radix_topk racecheck hang)
+
+- **Cause.** `radix_topk_multi_cta` declares about 262K words. The `merge_words` lookups and the per-partition refresh did linear `find`s per region, and pass 1 walked every region of each partition's table on each merge (a full table after refresh). Under word history the cost was quadratic and looked like a hang.
+- **Fix.**
+  - `WordTable.regions` per allocation is now sorted by `(span.start, span.len)`, with a per-allocation maximum region length. Lookups use binary searches over a bounded window: `position`, `exact`, `exact_mut`, `insert`, `region`, `region_at`, `overlaps` and `log_lane`.
+  - `declare` and `log_lane` mark regions dirty. `merge_words` merges only the dirty regions (sorted), and its verdict remap treats untouched regions as identity, since their log is the launch log's prefix. Dirty lists are cleared after each merge and on the `new_partition` copy.
+  - When declared regions overlap, a lookup returns the first in span order (before: declaration order).
+- **Numbers.** `interp/recorded_word_history` radix rows: engine 55 ms, observing 85 ms, word history 244 ms (it hung before). mega_moe e24 findings and WaitVerdicts streams are hash-identical to the pre-change engine at workers 1 and 16.

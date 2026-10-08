@@ -9,7 +9,7 @@
 //! twenty_four_experts racecheck stream (148 SMs, 16 workers) under an
 //! observer that only asks for declared-word history, i.e. engine plus the
 //! partition word-history merge/refresh (`Scheduler::merge_words`). Needs the
-//! fixture (`examples/record_race_fixtures.py OUT mega_moe:t8_h1024_i512_e24_k2_g1`
+//! fixtures (`examples/record_race_fixtures.py OUT mega_moe:t8_h1024_i512_e24_k2_g1 radix_topk_multi_cta`
 //! into `$RACE_FIXTURES` or `core-rs/target/race-fixtures`); skipped otherwise.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
@@ -56,17 +56,20 @@ impl Observer for WordsOnly {
 
 fn recorded_word_history(c: &mut Criterion) {
     let dir = fixtures::dir();
-    let case = "mega_moe_t8_h1024_i512_e24_k2_g1";
-    if !fixtures::exists(&dir, case) {
-        eprintln!("recorded_word_history: fixture {dir}/{case}.* missing, skipped");
-        return;
-    }
-    let (m, i, cfg) = fixtures::load(&dir, case);
     let mut g = c.benchmark_group("recorded_word_history");
     g.sample_size(10);
-    g.bench_function("mega_moe_e24_noop", |b| b.iter(|| sched::run_with_config(&m, &i, &mut NoopObserver, &cfg).unwrap()));
-    g.bench_function("mega_moe_e24_observing", |b| b.iter(|| sched::run_with_config(&m, &i, &mut Observing, &cfg).unwrap()));
-    g.bench_function("mega_moe_e24_word_history", |b| b.iter(|| sched::run_with_config(&m, &i, &mut WordsOnly, &cfg).unwrap()));
+    // (fixture, row prefix): mega_moe e24 (word-history merge volume) and
+    // radix_topk_multi_cta (~262K declared words: indexed region lookups).
+    for (case, name) in [("mega_moe_t8_h1024_i512_e24_k2_g1", "mega_moe_e24"), ("radix_topk_multi_cta", "radix_topk")] {
+        if !fixtures::exists(&dir, case) {
+            eprintln!("recorded_word_history: fixture {dir}/{case}.* missing, skipped");
+            continue;
+        }
+        let (m, i, cfg) = fixtures::load(&dir, case);
+        g.bench_function(format!("{name}_noop"), |b| b.iter(|| sched::run_with_config(&m, &i, &mut NoopObserver, &cfg).unwrap()));
+        g.bench_function(format!("{name}_observing"), |b| b.iter(|| sched::run_with_config(&m, &i, &mut Observing, &cfg).unwrap()));
+        g.bench_function(format!("{name}_word_history"), |b| b.iter(|| sched::run_with_config(&m, &i, &mut WordsOnly, &cfg).unwrap()));
+    }
     g.finish();
 }
 

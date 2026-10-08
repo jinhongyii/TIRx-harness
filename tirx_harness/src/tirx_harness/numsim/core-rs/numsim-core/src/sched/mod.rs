@@ -696,6 +696,7 @@ impl<'p> Scheduler<'p> {
         let init = ResourceInit { policy: Policy::Numeric, cluster_warps: self.shape.ctas_per_cluster() * wpc, warps_per_cta: wpc };
         let mut aux = LaunchAux { kernel: self.kernel_index, wants_history: self.wants_history, ..LaunchAux::default() };
         aux.words = self.launch_words.clone();
+        aux.words.clear_dirty();
         aux.clc = self.clc.clone();
         // Async op ids are partition-scoped so they do not depend on the
         // order partitions run in.
@@ -933,13 +934,16 @@ impl<'p> Scheduler<'p> {
         }
         let cap = if self.all_resident() { u32::MAX } else { self.config.max_resident_ctas };
         let per = self.shape.ctas_per_cluster().max(1);
+        // `admit` adds exactly `per` CTAs (W13: counted, not re-summed per
+        // admission, which was quadratic in the cluster count).
+        let mut resident: u32 = self.partitions.iter().map(|p| p.ctas.len() as u32).sum();
         while let Some(&id) = self.pending.front() {
-            let resident: u32 = self.partitions.iter().map(|p| p.ctas.len() as u32).sum();
             if resident > 0 && resident + per > cap {
                 break;
             }
             self.pending.pop_front();
             self.admit(id, arena, observer)?;
+            resident += per;
             changed = true;
         }
         Ok(changed)
@@ -1267,11 +1271,16 @@ impl<'p> Scheduler<'p> {
             let local = &self.partitions[k].aux.words;
             let global = &mut self.launch_words;
             let mut map: PositionMap = HashMap::new();
-            for (alloc, regions) in &local.regions {
-                for r in regions {
+            // Only regions this partition declared or logged since the last
+            // merge can differ from the launch table (the others equal its
+            // prefix: identity positions, see `hist_map`).
+            for (alloc, span) in local.dirty() {
+                let Some(r) = local.exact(alloc, span) else { continue };
+                let alloc = &alloc;
+                {
                     let start = match touched_ix.get(&(*alloc, r.span.start)) {
                         Some(&t) => touched[t].1,
-                        None => global.regions.get(alloc).and_then(|rs| rs.iter().find(|t| t.span == r.span)).map(|t| t.log.len()),
+                        None => global.exact(*alloc, r.span).map(|t| t.log.len()),
                     };
                     let mut m: Vec<Option<usize>> = (0..start.unwrap_or(0).min(r.log.len())).map(Some).collect();
                     if start == Some(r.log.len()) && !r.overflow {
@@ -1282,15 +1291,10 @@ impl<'p> Scheduler<'p> {
                         touched.push(((*alloc, r.span), start));
                         touched.len() - 1
                     });
-                    let target = global.regions.entry(*alloc).or_default();
-                    let ti = match target.iter().position(|t| t.span == r.span) {
-                        Some(i) => i,
-                        None => {
-                            target.push(WordRegion { span: r.span, init: r.init.clone(), log: Vec::new(), overflow: false });
-                            target.len() - 1
-                        }
-                    };
-                    let t = &mut target[ti];
+                    if global.position(*alloc, r.span).is_none() {
+                        global.insert(*alloc, WordRegion { span: r.span, init: r.init.clone(), log: Vec::new(), overflow: false });
+                    }
+                    let t = global.exact_mut(*alloc, r.span).expect("region just inserted");
                     for (spans, img) in r.log.iter().skip(start.unwrap_or(0)) {
                         if t.log.len() >= MAX_WORD_HISTORY {
                             t.overflow = true;
@@ -1314,6 +1318,9 @@ impl<'p> Scheduler<'p> {
             }
             maps.push(map);
         }
+        for &k in order {
+            self.partitions[k].aux.words.clear_dirty();
+        }
         if touched.is_empty() {
             return;
         }
@@ -1335,7 +1342,11 @@ impl<'p> Scheduler<'p> {
                 }
                 let lr = local.region(alloc, span)?;
                 let gr = global.region(alloc, span)?;
-                let m = map.get(&(alloc, lr.span.start))?;
+                let Some(m) = map.get(&(alloc, lr.span.start)) else {
+                    // A region this partition did not touch: its log is the
+                    // launch log's prefix, positions unchanged.
+                    return Some(h);
+                };
                 let lp = lr.log.iter().enumerate().filter(|(_, e)| e.0.iter().any(|s| s.overlaps(span))).nth(h as usize - 1)?.0;
                 let gp = (*m.get(lp)?)?;
                 Some(1 + gr.log[..gp].iter().filter(|e| e.0.iter().any(|s| s.overlaps(span))).count() as u32)
@@ -1352,7 +1363,7 @@ impl<'p> Scheduler<'p> {
             }
             let words = &aux.words;
             for ((_, _, alloc, start), cache) in aux.verdicts.iter_mut() {
-                let Some(r) = words.regions.get(alloc).and_then(|rs| rs.iter().find(|r| r.span.start <= *start && *start < r.span.end())) else { continue };
+                let Some(r) = words.region_at(*alloc, *start) else { continue };
                 let Some(&f) = first_foreign.get(&(*alloc, r.span.start)) else { continue };
                 for l in 0..32 {
                     if cache.evaluated[l] > f {
@@ -1375,9 +1386,8 @@ impl<'p> Scheduler<'p> {
         let global = &self.launch_words;
         for p in &mut self.partitions {
             for &((alloc, span), start) in &touched {
-                let Some(g) = global.regions.get(&alloc).and_then(|rs| rs.iter().find(|t| t.span == span)) else { continue };
-                let rs = p.aux.words.regions.entry(alloc).or_default();
-                match rs.iter_mut().find(|t| t.span == span) {
+                let Some(g) = global.exact(alloc, span) else { continue };
+                match p.aux.words.exact_mut(alloc, span) {
                     Some(l) => {
                         let keep = start.unwrap_or(0).min(l.log.len());
                         if start.is_none() {
@@ -1387,7 +1397,9 @@ impl<'p> Scheduler<'p> {
                         l.log.extend_from_slice(&g.log[keep..]);
                         l.overflow = g.overflow;
                     }
-                    None => rs.push(g.clone()),
+                    None => {
+                        p.aux.words.insert(alloc, g.clone());
+                    }
                 }
             }
         }
