@@ -1091,3 +1091,34 @@ fn regpool_credits_stay_small() {
     eprintln!("regpool visited={}", stat(&r, "visited_state_count"));
     assert!(stat(&r, "visited_state_count") < 2_000, "{:?}", r.coverage);
 }
+
+/// Per-thread TMA issuers (`test_tma_multiissuer`, `test_tma_im2col_multiissuer`):
+/// one barrier per lane, each fed by `arrive.expect_tx` and one or two
+/// transactions (cta_group::2 pairs). A landing that is the only possible
+/// mutation of its barrier is a persistent singleton, so 32 independent
+/// landings do not multiply.
+#[test]
+fn per_thread_tma_issuers_stay_small() {
+    for pair in [false, true] {
+        let log = numsim_core::synccheck::build::per_thread_tma(32, pair);
+        let cfg = SynccheckConfig { certificates: false, state_budget: 20_000, ..config(cta(1)) };
+        let r = check(&log, &cfg);
+        assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+        assert!(stat(&r, "visited_state_count") < 500, "pair={pair} {:?}", r.coverage);
+    }
+}
+
+/// The sole-landing rule must not run a landing ahead of a mutation of its
+/// barrier: an `inval` racing the in-flight transaction is
+/// `InvalWithOutstanding` in the schedule where it runs first.
+#[test]
+fn inval_racing_a_tma_landing_is_an_error() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1));
+    log.cmd(0, 2, mbar(0, 0), arrive_tx(1, 64));
+    log.issue(0, 3, mbar(0, 0), 64, 0, Vec::new());
+    log.cmd(0, 4, mbar(0, 0), inval());
+    for (name, r) in run_all(&log.build(), one(), Verdict::Error) {
+        assert!(kind(&r).contains("inval") || kind(&r).contains("outstanding") || !kind(&r).is_empty(), "{name}");
+    }
+}

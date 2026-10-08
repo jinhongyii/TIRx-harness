@@ -86,11 +86,15 @@ pub struct Rules {
     /// Singleton: setmaxnreg warpgroup-sync credit with no `Set` of that
     /// warpgroup able to run first.
     pub regpool_sync: bool,
+    /// Singleton: a deferred mbarrier completion that is the only possible
+    /// mutation of its barrier (everything else that can run first on it is
+    /// an observer the completion cannot disable).
+    pub sole_landing: bool,
 }
 
 impl Rules {
-    pub const ALL: Self = Self { private_issue: true, ready_observer: true, deferred_completion: true, twin_landings: true, regpool_sync: true };
-    pub const NONE: Self = Self { private_issue: false, ready_observer: false, deferred_completion: false, twin_landings: false, regpool_sync: false };
+    pub const ALL: Self = Self { private_issue: true, ready_observer: true, deferred_completion: true, twin_landings: true, regpool_sync: true, sole_landing: true };
+    pub const NONE: Self = Self { private_issue: false, ready_observer: false, deferred_completion: false, twin_landings: false, regpool_sync: false, sole_landing: false };
 }
 
 impl Options {

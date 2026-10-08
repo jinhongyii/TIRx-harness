@@ -21,7 +21,7 @@ use criterion::{black_box, Criterion};
 use numsim_core::observe::RecordingObserver;
 use numsim_core::report::Report;
 use numsim_core::sync::ResourceInit;
-use numsim_core::synccheck::build::{per_lane_arrivals, pipeline, regpool_credits, tma_many_waiters, umma_ring};
+use numsim_core::synccheck::build::{per_lane_arrivals, per_thread_tma, pipeline, regpool_credits, tma_many_waiters, umma_ring};
 use numsim_core::synccheck::explore::{Options, Rules};
 use numsim_core::synccheck::{check, ProjectionMode, SynccheckConfig};
 
@@ -84,6 +84,8 @@ fn rows() -> Vec<Row> {
     rows.push(Row { technique: "sleep sets (in combination)", scenario: "per_lane_arrivals(4,2,2,1)", log: per_lane_arrivals(4, 2, 2, 1), on: sl.clone(), off: SynccheckConfig { explore: Options { sleep_sets: false, ..Options::ALL }, ..sl.clone() } });
     let rp = base(12);
     rows.push(Row { technique: "singleton: setmaxnreg credit / Poll resume", scenario: "regpool_credits(3,2)", log: regpool_credits(3, 2), on: rp.clone(), off: rules_off(&rp, |r| r.regpool_sync = false) });
+    let pt = base(1);
+    rows.push(Row { technique: "singleton: sole landing", scenario: "per_thread_tma(32, pair)", log: per_thread_tma(32, true), on: pt.clone(), off: rules_off(&pt, |r| r.sole_landing = false) });
     let land = base(6);
     rows.push(Row { technique: "singleton: deferred completion", scenario: "per_lane_arrivals(4,2,2,1)", log: per_lane_arrivals(4, 2, 2, 1), on: land.clone(), off: rules_off(&land, |r| r.deferred_completion = false) });
     rows

@@ -575,6 +575,53 @@ PTX §9.7.15.16.19, *mbarrier.test_wait / mbarrier.try_wait*:
 
 ---
 
+## Q8. Who may `tcgen05.dealloc`, and TMEM access after a dealloc (test-migration no-spec item 16)
+
+**ANSWER (ruling 2026-10-08).**
+- **Who deallocates.** Any single, fully active warp of the CTA may deallocate. The ISA requires *one warp of the CTA* for both alloc and dealloc, not the allocating warp. `cta_group::2` needs one warp in each peer CTA.
+  - The sync model (`tcgen::Cmd::Dealloc`) checks no warp identity, and that stays.
+  - CUTLASS's own allocator preconditions (`cute/arch/tmem_allocator_sm100.hpp`) agree. `free` requires "a single fully active warp of the CTA" and "never … more than one warp at the same time". Only repeated *allocations* must use the same warp, which is a library convention, not an ISA rule.
+- **Access after dealloc.** A `tcgen05.ld/st/mma/cp` touching TMEM columns that are not in a live allocation of the CTA is an error.
+  - "The operand taddr must point to a previous Tensor Memory allocation", and Tensor Memory "must be allocated … using the Tensor Memory Allocation and Management Instructions".
+  - Accessing unallocated or freed columns is outside the model, so it fails closed.
+  - v2 reports it from the engine, in every mode, as `bad_address` ("tcgen05.ld: tmem column 0 (lane 32) is not in a live tcgen05 allocation"). Legacy synccheck called it `synchronization_collective_publication`. See delta T9.
+
+**QUOTE** (PTX §9.7.18.7.1):
+
+> "When .cta_group::1 is specified, one warp from the CTA must perform the
+> allocation and de-allocation. When .cta_group::2 is specified, one warp from
+> each of the peer CTAs must collectively perform the allocation and
+> de-allocation."
+
+> "The operand taddr must point to a previous Tensor Memory allocation."
+
+(PTX §9.7.18.2, Tensor Memory) "The Tensor Memory must be allocated by a single
+warp in a CTA using the Tensor Memory Allocation and Management Instructions."
+
+---
+
+## Q9. A multicast `ctaMask` bit naming a rank outside the cluster
+
+**ANSWER (ruling 2026-10-08).** This is a kernel error (fail closed), not ignored.
+- **ISA basis.** Each `ctaMask` bit "corresponds to the %cluster_ctarank of the destination CTA". A bit at or above the cluster size names no CTA. The ISA states no consequence, and there is no object to apply the operation to.
+- **Scope.** This covers `cp.async.bulk{.tensor}` `.multicast::cluster` and `mbarrier.{arrive,arrive_drop,expect_tx,complete_tx}` `.multicast::cluster::32b`.
+- **v2 behaviour.** The engine rejects the instruction before any target is touched, as `bad_address` with message "multicast CTA mask {mask:#x} names ranks outside the {n}-CTA cluster" (`interp::handlers::async_copy::ranks_of`, shared by the TMA, mbarrier and `tcgen05.commit` multicast paths).
+- **This is a kernel finding.** It is the instruction's own invalid operand; the engine does not stop with an internal fault.
+- **Earlier inventory note.** The xfail inventory said v2 "drops" the bit and ends `incomplete divergent_block`. It no longer does: both checkers now report `error`.
+- **Delta.** Legacy's wording was "outside the cluster" (delta M16).
+
+**QUOTE** (PTX §9.7.9.25.4.1 `cp.async.bulk.tensor`; §9.7.15.16.16 `mbarrier.arrive`):
+
+> "Operand ctaMask specifies the destination CTAs in the cluster such that each
+> bit position in the 16-bit or otherwise 32-bit ctaMask operand corresponds to
+> the %cluster_ctarank of the destination CTA."
+
+> "Operand ctaMask specifies the intended target CTAs in the cluster; each bit
+> position in the 32-bit ctaMask operand corresponds to the %cluster_ctarank of
+> the target CTA."
+
+---
+
 ## Additional limits and forms
 
 ### Expected-arrival, pending and tx-count ranges

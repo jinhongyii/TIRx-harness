@@ -892,6 +892,7 @@ Release build, one run (after the tx-terminal removal below):
 | sleep sets (in combination with the singletons) | per_lane_arrivals(4,2,2,1) | 2,805 / 14,275 | 2,804 / 14,626 | 740 ms / 2.1 s | 2.8x | Clean / Clean |
 | singleton: deferred completion | per_lane_arrivals(4,2,2,1) | 2,805 / 200,000 (budget) | 2,804 / 200,511 | 726 ms / 58.0 s | 80x | Clean / Incomplete |
 | singleton: setmaxnreg credit / `Poll` resume (`Rules::regpool_sync`) | regpool_credits(3,2) | 104 / 200,000 (budget) | 114 / 200,000 | 0.9 ms / 3.5 s | 3740x | Clean / Incomplete |
+| singleton: sole landing (`Rules::sole_landing`) | per_thread_tma(32, pair) | 72 / 200,000 (budget) | 71 / 200,000 | 6.7 ms / 15.0 s | 2248x | Clean / Incomplete |
 
 **Removed: tx-terminal persistent rule.** This was the terminal transaction-completion rule (`persistent_transition`). Measured with everything else on, it never mattered across eight scenarios, and it is subsumed by the observer and deferred-completion singletons:
 
@@ -932,3 +933,17 @@ On the other shapes they cost 0.8-0.9x. Their guard row is "sleep sets (in combi
   - New equivalence generator `regpool_log`: 2 warpgroups, 1-2 `Set`s each with valid and invalid directions and counts, 0-2 credits per warp around them. Over 400 cases the oracle agrees (47 Clean, 353 Error).
   - Under the engine contract (a credit comes from a warp of its own warpgroup), every conflicting `Set` is a collective that includes the crediting warp. The conflict check is therefore defensive, and a mutation that removes it is not observable.
   - Scenario `regpool_credits_stay_small`: 104 states; it fails with the rule off.
+
+**Per-thread TMA issuers: `test_tma_multiissuer` (7 items) and `test_tma_im2col_multiissuer` (3 items).**
+- **Before:** `incomplete` at the 1M-state limit.
+- **Shape:** one barrier per lane. Each barrier gets `arrive.expect_tx` and one transaction, or two for cta_group::2 pairs. The 32 independent landings were explored in every order.
+- **Why no existing rule fired:** the S8 contributor proof (deferred-completion singleton) declines a transaction landing that completes its phase, because `remaining` counts arrivals and is already 0.
+- **New rule, a sixth `singleton_persistent` rule (`Rules::sole_landing`):** a pending mbarrier completion is explored first, on its own, when it is the only possible mutation of its barrier. Conditions:
+  - No other pending completion is on the barrier, except transaction landings on the same phase. Those add up in any order, and over-delivery fails in every order.
+  - Every command or retry that can still run first on the barrier is a parity observer that the completion cannot disable.
+- **Result:** all 16 captured variants (the 7 + 3 test items, including the `sparse` sub-cases) replay Clean in at most 11 ms. The pair route went from 1M+ states to Clean.
+- **Checks:**
+  - New equivalence generator `tma_issuers_log`: 2 warps, 1-2 barriers each, 1-2 transactions per barrier with mostly exact and sometimes under- or over-delivery, waits and tests (some on the peer's barrier or with a wrong parity), and racing peer arrives and inval/re-init. Over 300 cases the oracle agrees (49 Clean, 251 Error).
+  - Scenarios: `per_thread_tma_issuers_stay_small` (72 states; it fails with the rule off) and `inval_racing_a_tma_landing_is_an_error`.
+  - Neither the generator nor the inval scenario catches a mutation that treats every command as harmless: the racing mutations here reach an error in both orders. Soundness rests on the conservative conditions above. Every non-observer command on the barrier blocks the rule, including the synthesized `Issue`.
+- **Bench note:** the fingerprint row's time ratio was noisy in this run (0.4x, 218 vs 1,569 states). Its state ratio (7x) is the guard.

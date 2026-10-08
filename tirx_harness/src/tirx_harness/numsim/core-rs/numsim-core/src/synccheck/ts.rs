@@ -699,6 +699,57 @@ impl<'p> Ts<'p> {
         true
     }
 
+    /// See the `sole_landing` rule in `singleton_persistent`.
+    fn sole_landing(&self, s: &State, t: &Transition) -> bool {
+        let Transition::Complete(c, o) = *t else {
+            return false;
+        };
+        let Some(p) = s.pending.iter().find(|p| (p.cmd, p.ord) == (c, o)) else {
+            return false;
+        };
+        let r = p.res as usize;
+        let res = &s.res[r];
+        // Other pending completions on the barrier are allowed only when
+        // both are transaction landings on the same phase: byte counts add
+        // up in any order, the phase completes at the last one, and an
+        // over-delivery fails in every order.
+        let same_phase_tx = |q: &Pending| match (p.kind, q.kind) {
+            (PendingKind::Tx { gen: a, .. }, PendingKind::Tx { gen: b, .. }) => a == b,
+            _ => false,
+        };
+        if !matches!(res, Res::Mbarrier(_))
+            || s.pending
+                .iter()
+                .any(|q| q.res as usize == r && (q.cmd, q.ord) != (c, o) && !same_phase_tx(q))
+        {
+            return false;
+        }
+        let harmless = |cmd: &SyncCmd| {
+            backend::classify(cmd) == backend::Class::Observer
+                && !backend::observer_disabled_by_completion(res, cmd)
+        };
+        for w in 0..self.warps.len() {
+            if let Some((rr, ref cmd)) = s.retry[w] {
+                if rr as usize == r && !harmless(cmd) {
+                    return false;
+                }
+            }
+            let start = s.cursors[w] as usize + usize::from(s.retry[w].is_some());
+            for &oc in self.programs[w].iter().skip(start) {
+                let lc = &self.cmds[oc];
+                if lc.issued.iter().any(|&(ir, _, _)| ir == r)
+                    || lc
+                        .cmds
+                        .iter()
+                        .any(|&(cr, ref cmd)| cr == r && !harmless(cmd))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Symmetry reduction (V2C-31): enabled pendings that differ only in
     /// their issuing command and ordinal (per-lane
     /// `cp.async.mbarrier.arrive`, multicast transactions, the same arrival
@@ -1149,6 +1200,23 @@ impl TransitionSystem for Ts<'_> {
         // which mutates nothing (no-oracle `kda_forward_portfolio_multishape`:
         // 5 warpgroups, ~30 credits from 20 warps on one register pool).
         if let Some(t) = enabled.iter().copied().find(|t| self.rules.regpool_sync && self.regpool_sync_first(s, t)) {
+            if self.step(s, &t).is_ok() {
+                return Some(t);
+            }
+        }
+        // A deferred mbarrier completion that is the only thing able to
+        // mutate its barrier before it runs: no other pending completion on
+        // it, and every command or retry that can still run first on it is a
+        // parity observer the completion cannot disable (it waits for the
+        // open phase). It commutes with everything and stays enabled, so it is
+        // a persistent singleton even when it completes the phase, which the
+        // S8 contributor proof below declines (per-thread TMA issuers, one
+        // barrier per lane: `test_tma_multiissuer`, `test_tma_im2col_multiissuer`).
+        if let Some(t) = enabled
+            .iter()
+            .copied()
+            .find(|t| self.rules.sole_landing && self.sole_landing(s, t))
+        {
             if self.step(s, &t).is_ok() {
                 return Some(t);
             }

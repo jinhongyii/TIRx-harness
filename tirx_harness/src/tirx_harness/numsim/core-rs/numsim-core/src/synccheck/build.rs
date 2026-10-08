@@ -384,3 +384,26 @@ pub fn regpool_credits(wgs: u32, credits: u32) -> RecordingObserver {
     }
     log.build()
 }
+
+/// One warp, `lanes` per-lane barriers (count 1): `arrive.expect_tx` on all
+/// of them, then one TMA event with one transaction per barrier (two when
+/// `pair`, as a cta_group::2 pair delivers halves), then successful tests in
+/// a few groups. Shape of `test_tma_multiissuer` / `test_tma_im2col_multiissuer`.
+pub fn per_thread_tma(lanes: u32, pair: bool) -> RecordingObserver {
+    let bar = |l: u32| mbar(0, 8 * l);
+    let mut log = LogBuilder::new();
+    log.cmds(0, 1, (0..lanes).map(|l| (bar(l), init(1))).collect());
+    log.cmds(0, 2, (0..lanes).map(|l| (bar(l), arrive_tx(1, 64))).collect());
+    let targets = (0..lanes)
+        .flat_map(|l| {
+            let halves = if pair { vec![32u64, 32] } else { vec![64u64] };
+            halves.into_iter().map(move |bytes| AsyncTarget { res: bar(l), bytes, arrivals: 0 })
+        })
+        .collect();
+    log.event(0, 3, Vec::new(), targets, None, None, ProtocolStatus::Committed);
+    for group in [0..lanes / 2, lanes / 2..lanes - 1, lanes - 1..lanes] {
+        let cmds = group.map(|l| (bar(l), test_parity(0))).collect::<Vec<_>>();
+        log.event(0, 4, cmds, Vec::new(), Some(0), None, ProtocolStatus::Committed);
+    }
+    log.build()
+}

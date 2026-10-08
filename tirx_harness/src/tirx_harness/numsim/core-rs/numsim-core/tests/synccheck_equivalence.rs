@@ -298,7 +298,11 @@ fn compare_full(seed: u64, cases: u32, gen: fn(&mut Rng, u32) -> RecordingObserv
             state_budget: 200_000,
             ..config(init)
         };
+        let t0 = std::time::Instant::now();
         let truth = check(&log, &oracle);
+        if std::env::var("EQ_TRACE").is_ok() {
+            eprintln!("case {case}: oracle {:?} {:?} states {:?}", truth.verdict, t0.elapsed(), truth.coverage.iter().find(|(k, _)| k == "visited_state_count"));
+        }
         if truth.verdict == Verdict::Incomplete {
             continue;
         }
@@ -393,4 +397,102 @@ fn regpool_log(rng: &mut Rng, _warps: u32) -> RecordingObserver {
 #[test]
 fn reductions_preserve_results_on_regpool_logs() {
     compare_full(0x7f4a_7c15_9e37_79b9, 400, regpool_log, 20, Some(8));
+}
+
+/// Per-thread TMA issuers (2 warps): each warp owns 1-2 barriers (count 1-2), does
+/// `arrive.expect_tx` on them (sometimes twice, sometimes plain arrivals)
+/// and one TMA event with 1-2 transactions per barrier whose bytes may
+/// under- or over-deliver, then waits or tests some barriers (parity 0, or
+/// a wrong parity), sometimes a peer warp's barrier; optional inval/re-init
+/// and a second lap. Guards the sole-landing singleton.
+fn tma_issuers_log(rng: &mut Rng, warps: u32) -> RecordingObserver {
+    let mut log = LogBuilder::new();
+    let per = 1 + rng.below(2);
+    let m = |w: u32, b: u32| mbar(0, 8 * (w * 4 + b));
+    let counts = (0..warps * 4)
+        .map(|_| 1 + u64::from(rng.chance(1, 4)))
+        .collect::<Vec<_>>();
+    for w in 0..warps {
+        for b in 0..per {
+            log.cmd(w, 1, m(w, b), init(counts[(w * 4 + b) as usize]));
+        }
+    }
+    if rng.chance(4, 5) {
+        cta_sync(&mut log, 0, &(0..warps).collect::<Vec<_>>(), warps);
+    }
+    for w in 0..warps {
+        let laps = 1 + u32::from(rng.chance(1, 4));
+        for lap in 0..laps {
+            let mut targets = Vec::new();
+            for b in 0..per {
+                let c = counts[(w * 4 + b) as usize];
+                for _ in 0..c {
+                    if rng.chance(11, 12) {
+                        log.cmd(w, 10, m(w, b), arrive_tx(1, 64));
+                    } else {
+                        log.cmd(w, 11, m(w, b), arrive(1));
+                    }
+                }
+                // Mostly exact delivery (64 bytes per arrive.expect_tx, split
+                // over 1-2 transactions), sometimes under or over.
+                let expected = 64 * c;
+                let n = 1 + u64::from(rng.below(2));
+                for k in 0..n {
+                    let exact = expected / n + if k == 0 { expected % n } else { 0 };
+                    let bytes = if rng.chance(7, 8) { exact } else { [16u64, 32, 64][rng.below(3) as usize] };
+                    targets.push(AsyncTarget {
+                        res: m(w, b),
+                        bytes,
+                        arrivals: 0,
+                    });
+                }
+            }
+            log.event(
+                w,
+                12,
+                Vec::new(),
+                targets,
+                None,
+                None,
+                ProtocolStatus::Committed,
+            );
+            // Mutations racing the in-flight transactions: a peer warp's
+            // plain arrive on this warp's barrier, or this warp's
+            // inval/re-init before any wait.
+            if rng.chance(1, 8) {
+                log.cmd((w + 1) % warps, 17, m(w, 0), arrive(1));
+            }
+            if rng.chance(1, 10) {
+                log.cmd(w, 18, m(w, 0), inval());
+                log.cmd(w, 19, m(w, 0), init(1));
+            }
+            let parity = u64::from(lap & 1);
+            for b in 0..per {
+                let (ow, wrong) = (
+                    if rng.chance(1, 8) { (w + 1) % warps } else { w },
+                    rng.chance(1, 16),
+                );
+                let p = parity ^ u64::from(wrong);
+                match rng.below(3) {
+                    0 => {
+                        log.cmd(w, 13, m(ow, b.min(per - 1)), wait(p));
+                    }
+                    1 => {
+                        log.test_ok(w, 14, m(ow, b.min(per - 1)), p as u8);
+                    }
+                    _ => {}
+                }
+            }
+            if rng.chance(1, 8) {
+                log.cmd(w, 15, m(w, 0), inval());
+                log.cmd(w, 16, m(w, 0), init(1));
+            }
+        }
+    }
+    log.build()
+}
+
+#[test]
+fn reductions_preserve_results_on_tma_issuer_logs() {
+    compare_full(0x3c6e_f372_fe94_f82b, 300, tma_issuers_log, 20, Some(2));
 }
