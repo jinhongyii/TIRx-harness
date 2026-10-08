@@ -142,31 +142,98 @@ impl JoinMemo {
     }
 }
 
-/// Scalar components in shared immutable chunks. `None` chunk = zeros.
+/// Chunks per group: the second level of [`Epochs`].
+pub const GROUP: usize = 16;
+
+/// `GROUP` chunk slots (`None` = zeros), shared between clocks like chunks.
+pub type Group = [Option<Arc<Chunk>>; GROUP];
+
+/// Scalar components in shared immutable chunks, two levels deep: a slice of
+/// shared groups of shared chunks. `None` group or chunk = zeros. With ~10K
+/// actors (persistent kernels over 148 CTAs with many async ops) a flat
+/// chunk slice made every join and every copy-on-change O(all chunks); with
+/// groups both skip pointer-equal groups and copy one group plus the top
+/// slice (O(chunks / GROUP + GROUP)).
 #[derive(Clone, Debug, Default)]
 pub struct Epochs {
-    pub(crate) chunks: Option<Arc<[Option<Arc<Chunk>>]>>,
+    pub(crate) groups: Option<Arc<[Option<Arc<Group>>]>>,
+}
+
+const EMPTY_GROUP: Group = [const { None }; GROUP];
+
+fn group_dominates(i: &Group, c: &Group) -> bool {
+    c.iter().zip(i.iter()).all(|(c, i)| match (c, i) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(c), Some(i)) => Arc::ptr_eq(c, i) || i.dominates(c),
+    })
+}
+
+fn opt_arc_eq<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// `c ⊔ i` for one group; `None` = `c` unchanged.
+fn join_group(c: &Arc<Group>, i: &Arc<Group>, memo: &JoinMemo) -> Option<Arc<Group>> {
+    let mut out: Option<Group> = None;
+    for s in 0..GROUP {
+        let replacement = match (&c[s], &i[s]) {
+            (_, None) => None,
+            (None, Some(i)) => Some(i.clone()),
+            (Some(c), Some(i)) => match memo.join(c, i) {
+                ChunkJoin::Current => None,
+                ChunkJoin::Incoming => Some(i.clone()),
+                ChunkJoin::New(n) => Some(n),
+            },
+        };
+        if let Some(r) = replacement {
+            out.get_or_insert_with(|| (**c).clone())[s] = Some(r);
+        }
+    }
+    let g = out?;
+    if g.iter().zip(i.iter()).all(|(a, b)| opt_arc_eq(a, b)) {
+        Some(i.clone())
+    } else {
+        Some(Arc::new(g))
+    }
 }
 
 impl Epochs {
     #[inline(always)]
     pub fn get(&self, actor: ActorId) -> Epoch {
         let i = actor as usize;
-        match &self.chunks {
-            Some(c) => c
-                .get(i / CHUNK)
-                .and_then(|c| c.as_ref())
+        let ci = i / CHUNK;
+        match &self.groups {
+            Some(g) => g
+                .get(ci / GROUP)
+                .and_then(|g| g.as_ref())
+                .and_then(|g| g[ci % GROUP].as_ref())
                 .map_or(0, |c| c.e[i % CHUNK]),
             None => 0,
         }
     }
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        match (&self.chunks, &other.chunks) {
+        match (&self.groups, &other.groups) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             (None, None) => true,
             _ => false,
         }
+    }
+
+    /// Every chunk slot in flat order: `(chunk index, chunk)`.
+    fn chunk_slots(&self) -> impl Iterator<Item = (usize, &Option<Arc<Chunk>>)> + '_ {
+        self.groups.iter().flat_map(|t| t.iter().enumerate()).flat_map(|(gi, g)| {
+            g.iter().flat_map(|g| g.iter()).enumerate().map(move |(s, c)| (gi * GROUP + s, c))
+        })
+    }
+
+    fn chunk(&self, ci: usize) -> Option<&Arc<Chunk>> {
+        self.groups.as_ref()?.get(ci / GROUP)?.as_ref()?[ci % GROUP].as_ref()
     }
 
     pub fn raise(&mut self, actor: ActorId, epoch: Epoch) {
@@ -175,14 +242,17 @@ impl Epochs {
         }
         let i = actor as usize;
         let ci = i / CHUNK;
-        let mut v: Vec<Option<Arc<Chunk>>> = self.chunks.as_deref().map(<[_]>::to_vec).unwrap_or_default();
-        if v.len() <= ci {
-            v.resize(ci + 1, None);
+        let gi = ci / GROUP;
+        let mut top: Vec<Option<Arc<Group>>> = self.groups.as_deref().map(<[_]>::to_vec).unwrap_or_default();
+        if top.len() <= gi {
+            top.resize(gi + 1, None);
         }
-        let mut e = v[ci].as_ref().map_or([0; CHUNK], |c| c.e);
+        let mut g: Group = top[gi].as_deref().cloned().unwrap_or(EMPTY_GROUP);
+        let mut e = g[ci % GROUP].as_ref().map_or([0; CHUNK], |c| c.e);
         e[i % CHUNK] = epoch;
-        v[ci] = Some(Chunk::new(e));
-        self.chunks = Some(v.into());
+        g[ci % GROUP] = Some(Chunk::new(e));
+        top[gi] = Some(Arc::new(g));
+        self.groups = Some(top.into());
     }
 
     /// `self ⊔= other`. Returns whether `self` changed.
@@ -190,12 +260,12 @@ impl Epochs {
         if self.ptr_eq(other) {
             return false;
         }
-        let Some(inc) = &other.chunks else { return false };
-        let Some(cur) = &self.chunks else {
-            self.chunks = Some(inc.clone());
+        let Some(inc) = &other.groups else { return false };
+        let Some(cur) = &self.groups else {
+            self.groups = Some(inc.clone());
             return true;
         };
-        // Fast path: the incoming side dominates chunk-wise (the barrier
+        // Fast path: the incoming side dominates group-wise (the barrier
         // fan-in steady state). Adopt its slice outright, so synchronised
         // clocks converge on one storage and later joins are pointer-equal.
         if super::tuning::on(&super::tuning::JOIN_MEMO)
@@ -203,25 +273,22 @@ impl Epochs {
             && cur.iter().zip(inc.iter()).all(|(c, i)| match (c, i) {
                 (None, _) => true,
                 (Some(_), None) => false,
-                (Some(c), Some(i)) => Arc::ptr_eq(c, i) || i.dominates(c),
+                (Some(c), Some(i)) => Arc::ptr_eq(c, i) || group_dominates(i, c),
             })
         {
-            self.chunks = Some(inc.clone());
+            self.groups = Some(inc.clone());
             return true;
         }
-        let mut out: Option<Vec<Option<Arc<Chunk>>>> = None;
+        let mut out: Option<Vec<Option<Arc<Group>>>> = None;
         let n = cur.len().max(inc.len());
-        for ci in 0..n {
-            let c = cur.get(ci).and_then(|c| c.as_ref());
-            let i = inc.get(ci).and_then(|c| c.as_ref());
+        for gi in 0..n {
+            let c = cur.get(gi).and_then(|c| c.as_ref());
+            let i = inc.get(gi).and_then(|c| c.as_ref());
             let replacement = match (c, i) {
                 (_, None) => None,
                 (None, Some(i)) => Some(i.clone()),
-                (Some(c), Some(i)) => match memo.join(c, i) {
-                    ChunkJoin::Current => None,
-                    ChunkJoin::Incoming => Some(i.clone()),
-                    ChunkJoin::New(n) => Some(n),
-                },
+                (Some(c), Some(i)) if Arc::ptr_eq(c, i) => None,
+                (Some(c), Some(i)) => join_group(c, i, memo),
             };
             if let Some(r) = replacement {
                 let v = out.get_or_insert_with(|| {
@@ -229,22 +296,22 @@ impl Epochs {
                     v.resize(n, None);
                     v
                 });
-                v[ci] = Some(r);
+                v[gi] = Some(r);
             }
         }
         if let Some(v) = out {
-            if inc.len() >= cur.len() && v.iter().zip(inc.iter()).all(|(a, b)| opt_ptr_eq(a, b)) {
+            if inc.len() >= cur.len() && v.iter().zip(inc.iter()).all(|(a, b)| opt_arc_eq(a, b)) {
                 // Fully adopted the incoming storage: share its slice too.
-                self.chunks = Some(inc.clone());
+                self.groups = Some(inc.clone());
             } else {
-                self.chunks = Some(v.into());
+                self.groups = Some(v.into());
             }
             true
         } else {
             if inc.len() > cur.len() {
                 let mut v = cur.to_vec();
                 v.resize(inc.len(), None);
-                self.chunks = Some(v.into());
+                self.groups = Some(v.into());
             }
             false
         }
@@ -253,52 +320,77 @@ impl Epochs {
     /// Chunk-wise rebuild: `f(actor, epoch)` per slot, one allocation per
     /// touched chunk (O(chunks · CHUNK), never per-component `raise`).
     pub fn map_chunks(&self, mut f: impl FnMut(ActorId, Epoch) -> Epoch) -> Epochs {
-        let Some(cur) = &self.chunks else { return Epochs::default() };
-        let v: Vec<Option<Arc<Chunk>>> = cur
+        let Some(top) = &self.groups else { return Epochs::default() };
+        let v: Vec<Option<Arc<Group>>> = top
             .iter()
             .enumerate()
-            .map(|(ci, c)| {
-                let c = c.as_ref()?;
-                let mut e = c.e;
-                let mut any = false;
-                for (s, x) in e.iter_mut().enumerate() {
-                    if *x != 0 {
-                        *x = f((ci * CHUNK + s) as ActorId, *x);
-                        any |= *x != 0;
-                    }
+            .map(|(gi, g)| {
+                let g = g.as_ref()?;
+                let mut out = EMPTY_GROUP;
+                let mut same = true;
+                for (s, c) in g.iter().enumerate() {
+                    let ci = gi * GROUP + s;
+                    out[s] = c.as_ref().and_then(|c| {
+                        let mut e = c.e;
+                        let mut any = false;
+                        for (k, x) in e.iter_mut().enumerate() {
+                            if *x != 0 {
+                                *x = f((ci * CHUNK + k) as ActorId, *x);
+                                any |= *x != 0;
+                            }
+                        }
+                        if e == c.e {
+                            Some(c.clone())
+                        } else if any {
+                            Some(Chunk::new(e))
+                        } else {
+                            None
+                        }
+                    });
+                    same &= opt_arc_eq(&out[s], c);
                 }
-                if e == c.e {
-                    Some(c.clone())
-                } else if any {
-                    Some(Chunk::new(e))
+                if same {
+                    Some(g.clone())
+                } else if out.iter().any(|c| c.is_some()) {
+                    Some(Arc::new(out))
                 } else {
                     None
                 }
             })
             .collect();
-        Epochs { chunks: Some(v.into()) }
+        Epochs { groups: Some(v.into()) }
     }
 
     /// Component-wise minimum, chunk by chunk.
     pub fn meet(&self, other: &Epochs) -> Epochs {
-        let (Some(a), Some(b)) = (&self.chunks, &other.chunks) else { return Epochs::default() };
-        let v: Vec<Option<Arc<Chunk>>> = a
+        let (Some(a), Some(b)) = (&self.groups, &other.groups) else { return Epochs::default() };
+        let v: Vec<Option<Arc<Group>>> = a
             .iter()
             .zip(b.iter())
-            .map(|(x, y)| match (x, y) {
-                (Some(x), Some(y)) if Arc::ptr_eq(x, y) || y.dominates(x) => Some(x.clone()),
-                (Some(x), Some(y)) if x.dominates(y) => Some(y.clone()),
-                (Some(x), Some(y)) => {
-                    let mut e = x.e;
-                    for (s, o) in e.iter_mut().zip(y.e.iter()) {
-                        *s = (*s).min(*o);
+            .map(|(gx, gy)| match (gx, gy) {
+                (Some(gx), Some(gy)) if Arc::ptr_eq(gx, gy) => Some(gx.clone()),
+                (Some(gx), Some(gy)) => {
+                    let mut out = EMPTY_GROUP;
+                    for s in 0..GROUP {
+                        out[s] = match (&gx[s], &gy[s]) {
+                            (Some(x), Some(y)) if Arc::ptr_eq(x, y) || y.dominates(x) => Some(x.clone()),
+                            (Some(x), Some(y)) if x.dominates(y) => Some(y.clone()),
+                            (Some(x), Some(y)) => {
+                                let mut e = x.e;
+                                for (s, o) in e.iter_mut().zip(y.e.iter()) {
+                                    *s = (*s).min(*o);
+                                }
+                                Some(Chunk::new(e))
+                            }
+                            _ => None,
+                        };
                     }
-                    Some(Chunk::new(e))
+                    Some(Arc::new(out))
                 }
                 _ => None,
             })
             .collect();
-        Epochs { chunks: Some(v.into()) }
+        Epochs { groups: Some(v.into()) }
     }
 
     /// `self ⊑ other` (every component covered).
@@ -306,43 +398,44 @@ impl Epochs {
         if self.ptr_eq(other) {
             return true;
         }
-        let Some(cur) = &self.chunks else { return true };
-        cur.iter().enumerate().all(|(ci, own)| {
-            let Some(own) = own else { return true };
+        let _ = memo;
+        let Some(cur) = &self.groups else { return true };
+        cur.iter().enumerate().all(|(gi, g)| {
+            let Some(g) = g else { return true };
+            if let Some(Some(theirs)) = other.groups.as_ref().and_then(|o| o.get(gi)) {
+                if Arc::ptr_eq(theirs, g) {
+                    return true;
+                }
+            }
             // Pointer equality, then a direct dominance test: a comparison
             // never allocates or touches the memo.
-            let _ = memo;
-            match other.chunks.as_ref().and_then(|o| o.get(ci)).and_then(|c| c.as_ref()) {
-                Some(theirs) => Arc::ptr_eq(theirs, own) || theirs.dominates(own),
-                None => own.e.iter().all(|e| *e == 0),
-            }
+            g.iter().enumerate().all(|(s, own)| {
+                let Some(own) = own else { return true };
+                match other.chunk(gi * GROUP + s) {
+                    Some(theirs) => Arc::ptr_eq(theirs, own) || theirs.dominates(own),
+                    None => own.e.iter().all(|e| *e == 0),
+                }
+            })
         })
     }
 
     pub fn nonzero(&self) -> impl Iterator<Item = (ActorId, Epoch)> + '_ {
-        self.chunks.iter().flat_map(|c| c.iter().enumerate()).filter_map(|(ci, c)| c.as_ref().map(|c| (ci, c))).flat_map(
-            |(ci, c)| {
-                c.e.iter()
-                    .enumerate()
-                    .filter(|(_, e)| **e != 0)
-                    .map(move |(s, e)| ((ci * CHUNK + s) as ActorId, *e))
-            },
-        )
-    }
-}
-
-fn opt_ptr_eq(a: &Option<Arc<Chunk>>, b: &Option<Arc<Chunk>>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-        (None, None) => true,
-        _ => false,
+        self.chunk_slots().filter_map(|(ci, c)| c.as_ref().map(|c| (ci, c))).flat_map(|(ci, c)| {
+            c.e.iter()
+                .enumerate()
+                .filter(|(_, e)| **e != 0)
+                .map(move |(s, e)| ((ci * CHUNK + s) as ActorId, *e))
+        })
     }
 }
 
 /// Sparse per-lane components for warps that released from a lane subset.
 /// Sorted by actor; an entry dominated by the scalar component is dropped.
 pub type LaneVec = [Epoch; 32];
-pub type LaneEntries = Vec<(ActorId, LaneVec)>;
+/// Each lane vector is shared (`Arc`): clocks that learned the same warp's
+/// lanes from the same release share it, so joins compare pointers and
+/// rebuilding an entry list copies 16 bytes per entry, not 132.
+pub type LaneEntries = Vec<(ActorId, Arc<LaneVec>)>;
 
 /// A vector clock: scalar components plus sparse lane-precise warp entries.
 #[derive(Clone, Debug, Default)]
@@ -355,7 +448,7 @@ impl Clock {
     /// No component at all (never joined or raised).
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.epochs.chunks.is_none() && self.lanes.is_none()
+        self.epochs.groups.is_none() && self.lanes.is_none()
     }
 
     #[inline(always)]
@@ -399,11 +492,11 @@ impl Clock {
         let entries = Arc::make_mut(self.lanes.get_or_insert_with(Default::default));
         match entries.binary_search_by_key(&actor, |(x, _)| *x) {
             Ok(i) => {
-                for (s, n) in entries[i].1.iter_mut().zip(v.iter()) {
+                for (s, n) in Arc::make_mut(&mut entries[i].1).iter_mut().zip(v.iter()) {
                     *s = (*s).max(*n);
                 }
             }
-            Err(i) => entries.insert(i, (actor, *v)),
+            Err(i) => entries.insert(i, (actor, Arc::new(*v))),
         }
         self.normalize_actor(actor);
     }
@@ -425,23 +518,79 @@ impl Clock {
     }
 
     pub fn join(&mut self, other: &Clock, memo: &JoinMemo) -> bool {
-        let mut changed = self.epochs.join(&other.epochs, memo);
+        let scalar_changed = self.epochs.join(&other.epochs, memo);
+        let mut changed = scalar_changed;
         if let Some(ol) = &other.lanes {
             let same = matches!(&self.lanes, Some(sl) if Arc::ptr_eq(sl, ol));
             if !same {
-                for (a, v) in ol.iter() {
-                    // Compare before raising instead of snapshotting the
-                    // entry list (a clone would force `make_mut` to copy).
-                    let lane_known = |lane: usize, e: Epoch| e == 0 || self.observes(Stamp::new(*a, e), lane as u8);
-                    if !v.iter().enumerate().all(|(lane, e)| lane_known(lane, *e)) {
-                        self.raise_lanes(*a, v);
-                        changed = true;
+                // Both entry lists are sorted by actor: find the incoming
+                // entries this clock does not already cover in one merge
+                // walk (one scalar lookup per actor, no per-lane search),
+                // then raise them. Compare before raising instead of
+                // snapshotting (a clone would force `make_mut` to copy).
+                let mut todo: Vec<usize> = Vec::new();
+                {
+                    let mine: &[(ActorId, Arc<LaneVec>)] = self.lanes.as_deref().map_or(&[], |l| l.as_slice());
+                    let mut j = 0;
+                    for (k, (a, v)) in ol.iter().enumerate() {
+                        while j < mine.len() && mine[j].0 < *a {
+                            j += 1;
+                        }
+                        let scalar = self.epochs.get(*a);
+                        let own = (j < mine.len() && mine[j].0 == *a).then(|| &mine[j].1);
+                        let known = match own {
+                            Some(o) if Arc::ptr_eq(o, v) => true,
+                            Some(o) => v.iter().zip(o.iter()).all(|(e, m)| *e <= scalar || *e <= *m),
+                            None => v.iter().all(|e| *e <= scalar),
+                        };
+                        if !known {
+                            todo.push(k);
+                        }
                     }
+                }
+                if !todo.is_empty() {
+                    // One merged rebuild instead of a `raise_lanes` (binary
+                    // search, mid-vector insert, maybe a full copy) each.
+                    changed = true;
+                    let mine: &[(ActorId, Arc<LaneVec>)] = self.lanes.as_deref().map_or(&[], |l| l.as_slice());
+                    let mut out: LaneEntries = Vec::with_capacity(mine.len() + todo.len());
+                    let mut j = 0;
+                    for k in todo {
+                        let (a, v) = &ol[k];
+                        while j < mine.len() && mine[j].0 < *a {
+                            out.push(mine[j].clone());
+                            j += 1;
+                        }
+                        // The incoming vector is shared as is unless this
+                        // clock had lanes of the same warp to merge.
+                        let mut merged = v.clone();
+                        if j < mine.len() && mine[j].0 == *a {
+                            if !v.iter().zip(mine[j].1.iter()).all(|(n, o)| n >= o) {
+                                let m = Arc::make_mut(&mut merged);
+                                for (m, o) in m.iter_mut().zip(mine[j].1.iter()) {
+                                    *m = (*m).max(*o);
+                                }
+                            }
+                            j += 1;
+                        }
+                        // As `raise_lanes`: the scalar takes the lane minimum.
+                        let min = *v.iter().min().unwrap();
+                        if min > 0 {
+                            self.epochs.raise(*a, min);
+                        }
+                        let scalar = self.epochs.get(*a);
+                        if !merged.iter().all(|e| *e <= scalar) {
+                            out.push((*a, merged));
+                        }
+                    }
+                    out.extend_from_slice(&mine[j..]);
+                    self.lanes = if out.is_empty() { None } else { Some(Arc::new(out)) };
                 }
             }
         }
-        if changed {
-            // Scalar growth can dominate lane entries.
+        if scalar_changed {
+            // Scalar growth can dominate lane entries (a lane-only change
+            // was normalised by `raise_lanes` itself).
             let epochs = &self.epochs;
             if let Some(l) = &mut self.lanes {
                 if l.iter().any(|(a, v)| v.iter().all(|e| *e <= epochs.get(*a))) {
@@ -489,4 +638,5 @@ impl Clock {
         }
     }
 }
+
 

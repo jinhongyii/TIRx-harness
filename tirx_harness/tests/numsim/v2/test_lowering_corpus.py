@@ -1,19 +1,15 @@
 """Corpus sweep: every canonical and wiki kernel lowers strictly and validates in Rust.
 
-Acceptance check (coordinator): ``numsim_core::program::Module::from_json`` +
-``Program::validate()`` + postcard round trip, via
-``core-rs/tools/validate-program`` built by ``scripts/numsim-v2/validate.sh``.
-The Rust half is skipped when cargo is unavailable; the strict lowering half
+Acceptance check (coordinator): ``Module::from_json`` + ``Program::validate()``
+through the engine's own decoder (``numsim_core_py.load_module``), so the check
+needs no external tool and survives the legacy deletion. The Rust half is
+skipped when the engine extension is not built; the strict lowering half
 always runs.
 """
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
 import warnings
-from pathlib import Path
 
 import pytest
 
@@ -24,38 +20,32 @@ from tirx_harness.numsim.v2.lowering import lower_module
 
 pytestmark = pytest.mark.slow
 
-_REPO = Path(__file__).resolve().parents[4]
-_VALIDATE = _REPO / "scripts" / "numsim-v2" / "validate.sh"
-
 
 @pytest.fixture(scope="session")
-def validator(tmp_path_factory):
-    if shutil.which("cargo") is None:
+def validator():
+    """``numsim_core_py.load_module`` (decode + ``Program::validate``), or None."""
+    try:
+        from tirx_harness.numsim.v2.compile import native
+
+        return native().load_module
+    except Exception:  # noqa: BLE001 - extension not built: lowering half only
         return None
-    work = tmp_path_factory.mktemp("validate-program")
-    env = dict(os.environ, VALIDATE_WORK=str(work))
-    subprocess.run([str(_VALIDATE)], check=True, env=env, capture_output=True, text=True)
-    return work / "target" / "release" / "validate-program"
 
 
-def _check(kernel, tmp_path, validator):
+def _check(kernel, validator):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         module = lower_module(kernel, strict=True)
     assert all(not program.unsupported for program in module.kernels)
-    if validator is None:
-        return
-    path = tmp_path / "module.json"
-    path.write_text(module.to_json())
-    result = subprocess.run([str(validator), str(path)], capture_output=True, text=True)
-    assert result.returncode == 0 and result.stdout.startswith("OK"), result.stdout + result.stderr
+    if validator is not None:
+        validator(module.to_json())  # raises ValueError on a decode or validate error
 
 
 @pytest.mark.parametrize("case", CANONICAL_KERNEL_CASES, ids=lambda case: case.name)
-def test_canonical_kernel_lowers_and_validates(case, tmp_path, validator):
-    _check(case.prepare().kernel, tmp_path, validator)
+def test_canonical_kernel_lowers_and_validates(case, validator):
+    _check(case.prepare().kernel, validator)
 
 
 @pytest.mark.parametrize("spec", WIKI_RACECHECK_SPECS, ids=lambda spec: spec.case_id)
-def test_wiki_kernel_lowers_and_validates(spec, tmp_path, validator):
-    _check(prepare_wiki_racecheck_case(spec).kernel, tmp_path, validator)
+def test_wiki_kernel_lowers_and_validates(spec, validator):
+    _check(prepare_wiki_racecheck_case(spec).kernel, validator)

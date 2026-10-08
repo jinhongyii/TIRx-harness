@@ -59,7 +59,7 @@ use crate::arena::{AllocId, Arena, View};
 use crate::observe::{AccessSeq, Actor, CtaId, LoopFrame, Observer, WarpId};
 use crate::oplib::{OpErrorKind, PtxFn};
 use crate::program::{LaunchShape, Operand, Pc, Program, Reg};
-use crate::sched::{InboxMsg, RunConfig};
+use crate::sched::RunConfig;
 use crate::site::SiteId;
 use crate::sync::{ResourceId, SyncError, SyncTable};
 use crate::value::{RegFile, WarpMask, WarpValue};
@@ -150,6 +150,40 @@ pub struct WarpState {
     /// the complementary arm runs (structured-SIMT scheduling rule, see
     /// [`divergent_switch`]).
     pub suspended: Vec<Suspension>,
+    /// Exact memo of [`WarpState::spin_hash`] (W13): the last hashed state.
+    pub spin_memo: Option<Box<SpinMemo>>,
+}
+
+/// The last state [`WarpState::spin_hash`] hashed, with its hash. A spin
+/// loop's poll-only iterations usually leave the state unchanged, so the
+/// next call compares (memcmp) instead of re-hashing every register.
+#[derive(Clone, Debug, Default)]
+pub struct SpinMemo {
+    masks: u64,
+    hash: u64,
+    regs: Vec<WarpValue<u64>>,
+}
+
+/// A zeroed register file of `n` slots from one zeroed allocation (W13).
+/// `RegFile::new` builds it slot by slot (`vec!` only uses a zeroed
+/// allocation for arrays of at most 16 elements), and a corpus kernel's
+/// file is hundreds of KiB per warp; `calloc` maps fresh zero pages
+/// instead, so slots a warp never writes cost nothing.
+fn zeroed_regs(n: usize) -> RegFile {
+    if n == 0 {
+        return RegFile { regs: Vec::new() };
+    }
+    let layout = std::alloc::Layout::array::<WarpValue<u64>>(n).expect("register file size");
+    // SAFETY: `layout` is the layout of `[WarpValue<u64>; n]` (n > 0); the
+    // memory comes from the global allocator, all-zero bytes are a valid
+    // `[u64; 32]`, and length == capacity == n.
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout) as *mut WarpValue<u64>;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        RegFile { regs: Vec::from_raw_parts(p, n, n) }
+    }
 }
 
 /// One suspended arm of a divergent `If`.
@@ -195,8 +229,32 @@ impl WarpState {
     /// Hash of the state a loop iteration can depend on (registers and
     /// masks); equal hashes at consecutive poll-only `LoopEnd`s mean the
     /// next iteration repeats unless memory or sync state changes.
-    pub fn spin_hash(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ ((self.active.bits() as u64) << 32 | self.live.bits() as u64);
+    ///
+    /// Memoized exactly: when the registers and masks are bit-identical to
+    /// the last hashed state the cached hash is returned, so the value is
+    /// always [`WarpState::spin_hash_uncached`] of the current state.
+    pub fn spin_hash(&mut self) -> u64 {
+        let masks = self.spin_masks();
+        if let Some(m) = &self.spin_memo {
+            if m.masks == masks && m.regs.as_flattened() == self.regs.regs.as_flattened() {
+                return m.hash;
+            }
+        }
+        let h = self.spin_hash_uncached();
+        let m = self.spin_memo.get_or_insert_with(Default::default);
+        m.masks = masks;
+        m.hash = h;
+        m.regs.clone_from(&self.regs.regs);
+        h
+    }
+
+    fn spin_masks(&self) -> u64 {
+        (self.active.bits() as u64) << 32 | self.live.bits() as u64
+    }
+
+    /// The spin-parking state hash, computed from scratch.
+    pub fn spin_hash_uncached(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ self.spin_masks();
         for r in &self.regs.regs {
             for &v in r.iter() {
                 h = (h.rotate_left(5) ^ v).wrapping_mul(0x5851_f42d_4c95_7f2d);
@@ -211,7 +269,7 @@ impl WarpState {
             cta,
             warp_in_cta,
             pc: Pc(0),
-            regs: RegFile::new(nslots),
+            regs: zeroed_regs(nslots),
             active: live,
             live,
             frames: Vec::new(),
@@ -224,6 +282,7 @@ impl WarpState {
             local: None,
             regbuf: None,
             suspended: Vec::new(),
+            spin_memo: None,
         }
     }
 
@@ -572,9 +631,6 @@ pub struct ExecCtx<'a> {
     pub buffers: &'a [BufBinding],
     pub arena: &'a mut Arena,
     pub sync: &'a mut SyncTable,
-    /// Effects on *other* CTAs (remote smem stores, remote mbarrier
-    /// arrivals, multicast): delivered at the next inbox drain.
-    pub outbox: &'a mut Vec<InboxMsg>,
     pub observer: &'a mut dyn Observer,
     /// Cached `observer.enabled()`.
     pub observing: bool,
@@ -681,6 +737,28 @@ impl<'a> ExecCtx<'a> {
 /// The signature of one warp slice; the interpreter's is [`step_warp`],
 /// the codegen backend exports one per kernel with the same type.
 pub type WarpStepFn = for<'a, 'b> fn(&'b mut ExecCtx<'a>, u32) -> StepResult;
+
+/// Run one warp slice with `step`, turning a panic into
+/// `ExecErrorKind::Internal` at the current pc: a panic must not unwind into
+/// the scheduler's worker threads or the host.
+#[inline(always)]
+pub fn guard_step(ctx: &mut ExecCtx<'_>, quantum: u32, step: WarpStepFn) -> StepResult {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(&mut *ctx, quantum))) {
+        Ok(r) => r,
+        Err(payload) => StepResult::Error(ctx.error(ExecErrorKind::Internal, format!("panic: {}", panic_message(&*payload)))),
+    }
+}
+
+/// The text of a caught panic payload.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
 
 /// Shared per-instruction prologue (both backends): bump counters and the
 /// observer epoch. Call with `ctx.warp.pc` already at the instruction.

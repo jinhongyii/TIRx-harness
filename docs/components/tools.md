@@ -82,12 +82,8 @@ GPU to validate selected candidates and measure performance.
 NumSim returns output arrays and diagnostics. Comparing them with an
 independent reference identifies numerical mismatches.
 
-By default, the engine interprets the program directly, so no Rust compiler
-is involved at run time. An optional codegen backend prints the same program
-as Rust, where every instruction is a call to the interpreter's own handler,
-and compiles it once per module (pending: backend decision; after the
-performance comparison one of the two backends is removed). Both backends
-produce identical results.
+The engine interprets the program directly, so no Rust compiler is involved
+at run time. The interpreter is the only executor.
 
 **Runnable example.** Save this kernel as `vector_add.py`:
 
@@ -142,7 +138,7 @@ before comparing their numerical contents.
 | Interface | Main parameters | Result |
 | --- | --- | --- |
 | `numsim.transpile(func, *, cache_dir=None)` | `func`: specialized TIRx function, or a sequence of them for a multi-kernel launch. `cache_dir`: optional module-cache root; the default is `NUMSIM_CACHE_DIR`. | `CompiledModule` |
-| `numsim.Engine(max_workers=1, *, backend=None, seed=None)` | `max_workers`: threads that run independent clusters in parallel; results do not depend on it. `backend`: `"interp"` (default) or `"codegen"`. `seed`: scheduler seed. | Execution engine |
+| `numsim.Engine(max_workers=1, *, seed=None)` | `max_workers`: threads that run independent clusters in parallel; results do not depend on it. `seed`: scheduler seed. | Execution engine |
 | `engine.run(module, inputs, *, outputs=None)` | `module`: transpiled module. `inputs`: concrete binding dictionary. `outputs`: buffer names or a mapping from result names to buffer names; `None` selects bound output buffers. | `NumSimResult` |
 
 `NumSimResult` exposes `.outputs`, `.diagnostics`, `.stats`, and `.timing`

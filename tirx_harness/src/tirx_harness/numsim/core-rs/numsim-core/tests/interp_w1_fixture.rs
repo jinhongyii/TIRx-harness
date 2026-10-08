@@ -3,7 +3,7 @@
 //! `program.to_json()` wrapped as `{"format_version", "kernels": [..]}`).
 
 use numsim_core::observe::RecordingObserver;
-use numsim_core::sched::{self, ArgValue, Backend, Inputs, RunConfig, RunStatus};
+use numsim_core::sched::{self, ArgValue, Inputs, RunConfig, RunStatus};
 use numsim_core::Module;
 
 const FIXTURE: &str = include_str!("fixtures/vadd_w1.json");
@@ -28,7 +28,7 @@ fn w1_vector_add_json_runs() {
     };
     for seed in [0, 3] {
         let mut obs = RecordingObserver::new();
-        let o = sched::run_with_config(&module, &inputs, &mut obs, &Backend::Interp, &RunConfig { seed, ..RunConfig::default() })
+        let o = sched::run_with_config(&module, &inputs, &mut obs, &RunConfig { seed, ..RunConfig::default() })
             .expect("run starts");
         assert_eq!(o.status, RunStatus::Completed);
         let c: Vec<f32> = o.outputs.buffers["c"].0.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();

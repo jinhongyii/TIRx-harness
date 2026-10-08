@@ -46,14 +46,14 @@ def k(source: T.Buffer((32,), "float8_e4m3fn"), output: T.Buffer((32,), "float8_
 
 
 def test_unknown_tile_config_key_fails_closed():
-    from tests.numsim.runtime.test_tile_unary_codegen import tile_unary_unknown_config
+    from tests.numsim.v2._kernels import tile_unary_unknown_config
 
     with pytest.raises(LoweringUnsupported, match="unsupported config keys"):
         _lower(tile_unary_unknown_config)
 
 
 def test_warp_gemm_fragment_layout_off_the_mma_abi_fails_closed():
-    from tests.numsim.integration.test_warp_gemm_artifact import _warp_gemm_wrong_a_fragment_layout
+    from tests.numsim.v2._kernels import _warp_gemm_wrong_a_fragment_layout
 
     with pytest.raises(LoweringUnsupported, match=r"A fragment layout does not match fixed mma\.sync\.m16n8k16 ABI"):
         _lower(_warp_gemm_wrong_a_fragment_layout)
@@ -61,7 +61,7 @@ def test_warp_gemm_fragment_layout_off_the_mma_abi_fails_closed():
 
 def test_tvm_pair_cast_helper_lowers_to_round_to_nearest_casts():
     """W4-14: `tvm_builtin_cast_float32x2_float16x2(dst, src)` -> 2 loads, 2 Rn casts, 2 stores."""
-    from tests.numsim.runtime.test_tile_general_semantics import right_aligned_elementwise_broadcast
+    from tests.numsim.v2._kernels import right_aligned_elementwise_broadcast
 
     program = _lower(right_aligned_elementwise_broadcast)
     casts = [i for i in program.code if i.variant == "Cast" and i.fields["from"].elem == "F16"]
@@ -71,7 +71,7 @@ def test_tvm_pair_cast_helper_lowers_to_round_to_nearest_casts():
 
 def test_smem_desc_make_lo_uniform_is_a_lane_zero_shuffle():
     """W4-14: the reviewed broadcast lowers to Shfl(Idx, lane 0) of the low word."""
-    from tests.numsim.integration.test_opaque_helper_artifact import smem_descriptor_make_lo_uniform_helper
+    from tests.numsim.v2._kernels import smem_descriptor_make_lo_uniform_helper
 
     program = _lower(smem_descriptor_make_lo_uniform_helper)
     shfl = [i for i in program.code if i.variant == "Shfl"]
@@ -98,7 +98,7 @@ def test_spdecompress_register_disjointness_from_bounds_and_memory_operands():
     """Global operands are not physical registers (legacy
     ``test_ptx_spdecompress_matches_low_bit_first_sparse_scatter``); local
     operands whose index bounds keep them apart need no check."""
-    from tests.numsim.runtime.test_ptx_spdecompress import ptx_spdecompress_b8_b4_2_4_x2
+    from tests.numsim.v2._kernels import ptx_spdecompress_b8_b4_2_4_x2
     from tvm.script import tirx as T
 
     @T.prim_func

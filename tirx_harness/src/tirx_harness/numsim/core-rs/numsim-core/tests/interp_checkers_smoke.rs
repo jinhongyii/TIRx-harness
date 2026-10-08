@@ -5,7 +5,7 @@
 use numsim_core::observe::RecordingObserver;
 use numsim_core::racecheck::observer::{RaceObserver, RacecheckConfig};
 use numsim_core::report::{FindingKind, Status};
-use numsim_core::sched::{self, Backend, RunStatus};
+use numsim_core::sched::{self, RunStatus};
 use numsim_core::synccheck::{self, SynccheckConfig};
 use numsim_core::testutil::scenarios;
 
@@ -18,7 +18,7 @@ fn checkers_consume_interp_events() {
         }
         eprintln!("== {}", s.name);
         let mut obs = (RaceObserver::new(RacecheckConfig::default()), RecordingObserver::new());
-        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).unwrap();
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).unwrap();
         let (race, log) = obs;
         let report = race.finish();
         if o.status == RunStatus::Completed {
@@ -44,7 +44,7 @@ fn checkers_on_special_scenarios() {
     for s in scenarios::special() {
         eprintln!("== {}", s.name);
         let mut obs = (RaceObserver::new(RacecheckConfig::default()), RecordingObserver::new());
-        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).unwrap();
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).unwrap();
         let (race, log) = obs;
         let report = race.finish();
         let cfg = SynccheckConfig { state_budget: 20_000, transition_budget: 200_000, ..SynccheckConfig::default() };

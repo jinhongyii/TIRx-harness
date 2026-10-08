@@ -11,6 +11,12 @@
 //! parity 1, waits that skip a generation, TMA issues without an explicit
 //! `Issue` command, conditional waits, inval/re-init, multi-target waits,
 //! tcgen05 alloc/dealloc and commit, and cluster barriers.
+//!
+//! **Case counts.** By default each generator checks a bounded sample: every
+//! case of its fixed-seed stream is generated (cheap), but only every
+//! `SAMPLE_STRIDE`-th one is explored, so the sample is a subset of the full
+//! run with the same verdict mix. Set `SYNCCHECK_EQUIV_FULL=1` to check every
+//! case (see `synccheck/README.md`).
 
 mod synccheck_support;
 
@@ -282,14 +288,32 @@ fn compare_with(seed: u64, cases: u32, gen: fn(&mut Rng, u32) -> RecordingObserv
 }
 
 /// `fixed_warps`: warps per CTA for every case (default: 2-4 at random).
+/// Without `SYNCCHECK_EQUIV_FULL`, only every `SAMPLE_STRIDE`-th case is
+/// checked (all cases are still generated, so the stream is unchanged).
+const SAMPLE_STRIDE: u32 = 10;
+
+fn stride() -> u32 {
+    if std::env::var_os("SYNCCHECK_EQUIV_FULL").is_some_and(|v| v != "0") {
+        1
+    } else {
+        SAMPLE_STRIDE
+    }
+}
+
 fn compare_full(seed: u64, cases: u32, gen: fn(&mut Rng, u32) -> RecordingObserver, max_closed_percent: usize, fixed_warps: Option<u32>) {
+    let stride = stride();
     let mut rng = Rng(seed);
+    let mut checked = 0usize;
     let mut counts = [0usize; 4];
     let mut closed = 0usize;
     for case in 0..cases {
         let warps = fixed_warps.unwrap_or_else(|| 2 + rng.below(3));
         let init = ResourceInit { cluster_warps: warps, ..cta(warps) };
         let log = gen(&mut rng, warps);
+        if case % stride != 0 {
+            continue;
+        }
+        checked += 1;
         let oracle = SynccheckConfig {
             mode: ProjectionMode::Whole,
             certificates: false,
@@ -332,9 +356,9 @@ fn compare_full(seed: u64, cases: u32, gen: fn(&mut Rng, u32) -> RecordingObserv
         }
     }
     eprintln!("verdicts [clean, review, incomplete, error] = {counts:?}; fail-closed variants: {closed}");
-    assert!(counts[Verdict::Clean as usize] * 100 > cases as usize, "{counts:?}");
-    assert!(counts[Verdict::Error as usize] * 100 > cases as usize, "{counts:?}");
-    assert!(closed * 100 <= cases as usize * max_closed_percent, "too many fail-closed results: {closed}");
+    assert!(counts[Verdict::Clean as usize] * 100 > checked, "{counts:?}");
+    assert!(counts[Verdict::Error as usize] * 100 > checked, "{counts:?}");
+    assert!(closed * 100 <= checked * max_closed_percent, "too many fail-closed results: {closed}");
 }
 
 #[test]

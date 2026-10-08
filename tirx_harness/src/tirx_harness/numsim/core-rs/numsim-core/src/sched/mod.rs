@@ -13,9 +13,8 @@
 //!   an op may stay in flight for several rounds; `after` dependencies are
 //!   respected) and enabled sync `Completion`s are applied.
 //! * Cross-CTA effects inside a cluster (remote shared stores, remote
-//!   mbarrier commands) apply synchronously; inbox drains at the start of
-//!   the target CTA's turn are wake-up points, each observable as
-//!   `Observer::inbox_drain`.
+//!   mbarrier commands) apply synchronously at issue; the start of each
+//!   CTA's turn in a round is observable as `Observer::round_boundary`.
 //! * Residency: clusters are admitted in linear cluster order while at most
 //!   `RunConfig::max_resident_ctas` CTAs are resident (all of them for
 //!   cooperative launches and `grid.sync`); a cluster's CTAs are always
@@ -73,7 +72,7 @@
 //! * All warps exited, no cluster left and the async queues drained ->
 //!   Completed.
 //! * A round with no progress anywhere (no slice progress, landing,
-//!   completion, inbox delivery or admission, after force-landing every
+//!   completion or admission, after force-landing every
 //!   ready op) -> Deadlock with the blocked resources, except:
 //!   a blocked warp with a divergent mask -> Incomplete (`divergent_block`:
 //!   structured SIMT cannot interleave its arms further); a warp blocked on
@@ -258,40 +257,11 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-/// A cross-CTA effect awaiting delivery.
-#[derive(Clone, Debug, PartialEq)]
-pub enum InboxMsg {
-    /// Bytes for a remote CTA's shared window (st to shared::cluster,
-    /// multicast copies are delivered by completions instead).
-    Write { alloc: AllocId, offset: u64, bytes: Vec<u8>, actor: Actor, site: SiteId },
-    /// A sync command against a remote resource (remote mbarrier arrive,
-    /// multicast arrive/expect_tx, cta_group::2 tcgen peer).
-    Sync { resource: ResourceId, cmd: SyncCmd, actor: Actor, site: SiteId },
-}
-
-impl InboxMsg {
-    /// Which CTA's inbox receives it (W2 maps allocs/resources to CTAs).
-    pub fn target_hint(&self) -> Option<AllocId> {
-        match self {
-            InboxMsg::Write { alloc, .. } => Some(*alloc),
-            InboxMsg::Sync { resource: ResourceId::Mbarrier { alloc, .. }, .. } => Some(*alloc),
-            _ => None,
-        }
-    }
-}
-
-/// Per-CTA queue of incoming cross-CTA effects.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Inbox {
-    pub msgs: Vec<InboxMsg>,
-}
-
-/// One CTA: its facts, its warps and its inbox.
+/// One CTA: its facts and its warps.
 #[derive(Clone, Debug)]
 pub struct CtaState {
     pub ctx: CtaCtx,
     pub warps: Vec<WarpState>,
-    pub inbox: Inbox,
     /// Buffer bindings for this CTA (shared-window buffers differ per CTA).
     pub buffers: Vec<BufBinding>,
 }
@@ -772,9 +742,6 @@ impl<'p> Scheduler<'p> {
                     arena.alloc(Space::Tmem, Owner::Cta(cid.0), &format!("tmem[cta{}]", cid.0), tmem_bytes, Init::Uninit),
                 ),
             };
-            let part = &mut self.partitions[pi];
-            part.aux.owner_cta.insert(smem, cid);
-            part.aux.owner_cta.insert(tmem, cid);
             ctas.push(CtaCtx {
                 id: cid,
                 ctaid: c,
@@ -898,7 +865,7 @@ impl<'p> Scheduler<'p> {
                     }
                 }
             }
-            part.ctas.push(CtaState { ctx, warps, inbox: Inbox::default(), buffers: self.bindings.clone() });
+            part.ctas.push(CtaState { ctx, warps, buffers: self.bindings.clone() });
         }
         Ok(())
     }
@@ -917,7 +884,7 @@ impl<'p> Scheduler<'p> {
                     while j < part.ctas.len() && part.ctas[j].ctx.cluster == cl {
                         j += 1;
                     }
-                    let done = part.ctas[i..j].iter().all(|c| c.finished() && c.inbox.msgs.is_empty());
+                    let done = part.ctas[i..j].iter().all(|c| c.finished());
                     // Async ops still writing into the cluster keep it resident.
                     let busy = part.sync.async_ops.iter().any(|op| part.ctas[i..j].iter().any(|c| c.ctx.id == op.source.cta));
                     if done && !busy {
@@ -1278,29 +1245,38 @@ impl<'p> Scheduler<'p> {
         if !self.wants_history {
             return;
         }
-        let base = self.launch_words.clone();
-        // Per partition (index into `order`): its table before the merge and
-        // the merged log position of each of its log entries, per region.
-        let mut locals: Vec<crate::interp::aux::WordTable> = Vec::with_capacity(order.len());
+        // Launch-wide log length of each region before this merge, recorded
+        // when the merge first touches it (`None`: created by this merge).
+        // Every partition's log of a region agrees with the launch-wide log
+        // on that prefix; only the suffix past it is partition-local. The
+        // table is therefore never cloned: the merge appends the partitions'
+        // suffixes and the refresh rewrites only the suffixes of the
+        // regions it touched (cost O(touched regions + new entries)).
+        let mut touched: Vec<((AllocId, ByteSpan), Option<usize>)> = Vec::new();
+        let mut touched_ix: HashMap<(AllocId, u64), usize> = HashMap::new();
+        // Per partition (index into `order`): the merged log position of each
+        // of its log entries, per region.
         let mut maps: Vec<PositionMap> = Vec::with_capacity(order.len());
-        let base_len = |alloc: &AllocId, span: ByteSpan| {
-            base.regions.get(alloc).and_then(|rs| rs.iter().find(|r| r.span == span)).map(|r| r.log.len())
-        };
-        let mut changed = false;
         for &k in order {
             let local = &self.partitions[k].aux.words;
-            locals.push(local.clone());
+            let global = &mut self.launch_words;
             let mut map: PositionMap = HashMap::new();
             for (alloc, regions) in &local.regions {
                 for r in regions {
-                    let start = base_len(alloc, r.span);
+                    let start = match touched_ix.get(&(*alloc, r.span.start)) {
+                        Some(&t) => touched[t].1,
+                        None => global.regions.get(alloc).and_then(|rs| rs.iter().find(|t| t.span == r.span)).map(|t| t.log.len()),
+                    };
                     let mut m: Vec<Option<usize>> = (0..start.unwrap_or(0).min(r.log.len())).map(Some).collect();
                     if start == Some(r.log.len()) && !r.overflow {
                         map.insert((*alloc, r.span.start), m);
                         continue;
                     }
-                    changed = true;
-                    let target = self.launch_words.regions.entry(*alloc).or_default();
+                    touched_ix.entry((*alloc, r.span.start)).or_insert_with(|| {
+                        touched.push(((*alloc, r.span), start));
+                        touched.len() - 1
+                    });
+                    let target = global.regions.entry(*alloc).or_default();
                     let ti = match target.iter().position(|t| t.span == r.span) {
                         Some(i) => i,
                         None => {
@@ -1332,59 +1308,81 @@ impl<'p> Scheduler<'p> {
             }
             maps.push(map);
         }
-        if changed {
-            // Renumber each partition's buffered verdicts and rebase its
-            // verdict cache wherever the merged history interleaves other
-            // partitions' entries before its own.
-            for (oi, &k) in order.iter().enumerate() {
-                let (local, map) = (&locals[oi], &maps[oi]);
-                let shifted = map.values().any(|m| m.iter().enumerate().any(|(i, g)| *g != Some(i)));
-                if !shifted {
-                    continue;
+        if touched.is_empty() {
+            return;
+        }
+        // Renumber each partition's buffered verdicts and rebase its verdict
+        // cache wherever the merged history interleaves other partitions'
+        // entries before its own (reads the partition's pre-refresh table).
+        for (oi, &k) in order.iter().enumerate() {
+            let map = &maps[oi];
+            let shifted = map.values().any(|m| m.iter().enumerate().any(|(i, g)| *g != Some(i)));
+            if !shifted {
+                continue;
+            }
+            let global = &self.launch_words;
+            let Partition { aux, events, .. } = &mut self.partitions[k];
+            let local = &aux.words;
+            let hist_map = |alloc: AllocId, span: ByteSpan, h: u32| -> Option<u32> {
+                if h == 0 {
+                    return Some(0);
                 }
-                let global = &self.launch_words;
-                let hist_map = |alloc: AllocId, span: ByteSpan, h: u32| -> Option<u32> {
-                    if h == 0 {
-                        return Some(0);
+                let lr = local.region(alloc, span)?;
+                let gr = global.region(alloc, span)?;
+                let m = map.get(&(alloc, lr.span.start))?;
+                let lp = lr.log.iter().enumerate().filter(|(_, e)| e.0.iter().any(|s| s.overlaps(span))).nth(h as usize - 1)?.0;
+                let gp = (*m.get(lp)?)?;
+                Some(1 + gr.log[..gp].iter().filter(|e| e.0.iter().any(|s| s.overlaps(span))).count() as u32)
+            };
+            events.remap_verdicts(hist_map);
+            // Cached evaluations at or past the first foreign entry are
+            // dropped: the next poll evaluates the merged history there.
+            let mut first_foreign: HashMap<(AllocId, u64), usize> = HashMap::new();
+            for ((alloc, rs), m) in map {
+                let mut images: Vec<usize> = m.iter().flatten().copied().collect();
+                images.sort_unstable();
+                let f = images.iter().enumerate().find(|(i, g)| *i != **g).map(|(i, _)| i).unwrap_or(images.len());
+                first_foreign.insert((*alloc, *rs), f + 1);
+            }
+            let words = &aux.words;
+            for ((_, _, alloc, start), cache) in aux.verdicts.iter_mut() {
+                let Some(r) = words.regions.get(alloc).and_then(|rs| rs.iter().find(|r| r.span.start <= *start && *start < r.span.end())) else { continue };
+                let Some(&f) = first_foreign.get(&(*alloc, r.span.start)) else { continue };
+                for l in 0..32 {
+                    if cache.evaluated[l] > f {
+                        cache.evaluated[l] = f;
                     }
-                    let lr = local.region(alloc, span)?;
-                    let gr = global.region(alloc, span)?;
-                    let m = map.get(&(alloc, lr.span.start))?;
-                    let lp = lr.log.iter().enumerate().filter(|(_, e)| e.0.iter().any(|s| s.overlaps(span))).nth(h as usize - 1)?.0;
-                    let gp = (*m.get(lp)?)?;
-                    Some(1 + gr.log[..gp].iter().filter(|e| e.0.iter().any(|s| s.overlaps(span))).count() as u32)
-                };
-                self.partitions[k].events.remap_verdicts(hist_map);
-                // Cached evaluations at or past the first foreign entry are
-                // dropped: the next poll evaluates the merged history there.
-                let mut first_foreign: HashMap<(AllocId, u64), usize> = HashMap::new();
-                for ((alloc, rs), m) in map {
-                    let mut images: Vec<usize> = m.iter().flatten().copied().collect();
-                    images.sort_unstable();
-                    let f = images.iter().enumerate().find(|(i, g)| *i != **g).map(|(i, _)| i).unwrap_or(images.len());
-                    first_foreign.insert((*alloc, *rs), f + 1);
-                }
-                for ((_, _, alloc, start), cache) in self.partitions[k].aux.verdicts.iter_mut() {
-                    let Some(r) = local.regions.get(alloc).and_then(|rs| rs.iter().find(|r| r.span.start <= *start && *start < r.span.end())) else { continue };
-                    let Some(&f) = first_foreign.get(&(*alloc, r.span.start)) else { continue };
-                    for l in 0..32 {
-                        if cache.evaluated[l] > f {
-                            cache.evaluated[l] = f;
-                        }
-                        if let Some(b) = cache.bits.get_mut(l) {
-                            for (wi, w) in b.iter_mut().enumerate() {
-                                for bit in 0..64 {
-                                    if wi * 64 + bit >= f {
-                                        *w &= !(1u64 << bit);
-                                    }
+                    if let Some(b) = cache.bits.get_mut(l) {
+                        for (wi, w) in b.iter_mut().enumerate() {
+                            for bit in 0..64 {
+                                if wi * 64 + bit >= f {
+                                    *w &= !(1u64 << bit);
                                 }
                             }
                         }
                     }
                 }
             }
-            for p in &mut self.partitions {
-                p.aux.words = self.launch_words.clone();
+        }
+        // Refresh: every partition's copy of each touched region becomes the
+        // launch-wide one (shared prefix kept, suffix rewritten).
+        let global = &self.launch_words;
+        for p in &mut self.partitions {
+            for &((alloc, span), start) in &touched {
+                let Some(g) = global.regions.get(&alloc).and_then(|rs| rs.iter().find(|t| t.span == span)) else { continue };
+                let rs = p.aux.words.regions.entry(alloc).or_default();
+                match rs.iter_mut().find(|t| t.span == span) {
+                    Some(l) => {
+                        let keep = start.unwrap_or(0).min(l.log.len());
+                        if start.is_none() {
+                            l.init.clone_from(&g.init);
+                        }
+                        l.log.truncate(keep);
+                        l.log.extend_from_slice(&g.log[keep..]);
+                        l.overflow = g.overflow;
+                    }
+                    None => rs.push(g.clone()),
+                }
             }
         }
     }

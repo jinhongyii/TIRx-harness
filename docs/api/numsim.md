@@ -44,11 +44,9 @@ or loading took.
 | Parameter | Meaning |
 | --- | --- |
 | `max_workers=1` | Threads that run independent clusters in parallel. Results and checker findings do not depend on it. `"auto"` currently selects one thread (pending: `"auto"` should use the detected CPU count). |
-| `backend=None` | `"interp"` interprets the program; `"codegen"` compiles it to a native library once per module. `None` reads `NUMSIM_V2_BACKEND`, default `"interp"` (pending: backend decision). |
 | `seed=None` | Scheduler seed for warp rotation and asynchronous-completion timing. `None` reads `NUMSIM_V2_SEED`, default `0`. A fixed module, inputs, and seed always give the same result. |
 | `native_loop_iteration_budget=None` | Maximum iterations of one loop instance per warp before the run stops as `incomplete`. `None` uses the engine default, 2^24. |
 | `native_loop_reschedule_quantum=None` | Maximum instructions a warp runs before the scheduler moves to the next warp. `None` uses the engine default, 256. |
-| `opt_level=1` | Rust optimization level for the codegen backend. |
 
 For `run`, `inputs` maps kernel parameter names to concrete scalars and CPU
 NumPy buffers, including output storage. Shape parameters that a bound
@@ -81,9 +79,8 @@ reference to check numerical correctness. `assert_close` performs that
 comparison and raises on a mismatch.
 
 `timing` holds wall-clock milliseconds for each stage: `lower` (transpile or
-cache load), `bind` (input canonicalization), `build` (codegen build and
-load; 0 for `interp`), `run` (engine execution), `check` (0 for NumSim), and
-`report`. Simulation time does not measure GPU latency.
+cache load), `bind` (input canonicalization), `run` (engine execution),
+`check` (0 for NumSim), and `report`. Simulation time does not measure GPU latency.
 
 ## Compare outputs
 
@@ -126,8 +123,7 @@ precedence.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `NUMSIM_CACHE_DIR` | Cache root. Lowered modules are stored under `v2-modules/`, codegen builds under `v2-codegen/`. Delete the directory to force re-lowering. | `~/.cache/tirx-harness/numsim` |
-| `NUMSIM_V2_BACKEND` | Default backend: `interp` or `codegen`. | `interp` |
+| `NUMSIM_CACHE_DIR` | Cache root. Lowered modules are stored under `v2-modules/`. Delete the directory to force re-lowering. | `~/.cache/tirx-harness/numsim` |
 | `NUMSIM_V2_SEED` | Default scheduler seed. | `0` |
 | `NUMSIM_V2_NO_CACHE` | `1` disables the module cache. | unset |
 
@@ -159,6 +155,4 @@ model; its `unsupported` attribute lists the reasons.
 ```
 
 `InputError` (a binding problem, also a `ValueError`) and `ExecutionError` (the
-launch stopped) both derive from `NumSimExecutionError`. With the codegen
-backend, a failed native build currently raises `ValueError` (pending: raise
-`NumSimBuildError`, as the legacy engine did).
+launch stopped) both derive from `NumSimExecutionError`.

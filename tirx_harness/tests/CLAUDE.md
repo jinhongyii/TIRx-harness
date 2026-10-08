@@ -28,6 +28,31 @@ argument. To drop them from a full run, deselect by marker instead:
 python -m pytest -q -n 16 --dist=worksteal -m "not numsim_gpu"
 ```
 
+## Where Tests Live
+
+- `src/tirx_harness/numsim/core-rs/numsim-core/tests/` (Rust): scenarios from hand-built `Program`s
+  and contract events, including the Racecheck/Synccheck legacy ports.
+- `tests/numsim/v2/`: lowering tests that assert `Program` contents
+  (`test_lowering_*.py`), plus
+  - `checkers/`: kernel-level Racecheck/Synccheck tests that contract events
+    cannot express;
+  - `ports/`: v2 copies of legacy public-API tests, each docstring citing its
+    legacy test and any delta row;
+  - `tile_forms/`: tile-op kernels that TVM's dispatch rejects.
+- `tests/conformance/`: every canonical corpus case in three modes against
+  `snapshots/` (plus hand-edited `*.delta.json` for ruled deltas).
+- `tests/perf/`: relative performance baselines (`performance` marker).
+
+The retirement ledger is `scripts/numsim-v2/coverage/`:
+- `test_classification.csv` with `category_overrides.tsv` gives each legacy
+  test's category;
+- `v2_ports_*.tsv` maps a legacy test to the v2 tests that replace it;
+- `v2_xfail_inventory.tsv` lists the `v2_gap` marks still holding a
+  replacement back.
+
+`scripts/numsim-v2/retire_tests.py` deletes a legacy test once every listed
+replacement passes.
+
 ## Judging a Full-Suite Run
 
 Wiki cases can fail on a clean checkout. A failure count proves nothing on its

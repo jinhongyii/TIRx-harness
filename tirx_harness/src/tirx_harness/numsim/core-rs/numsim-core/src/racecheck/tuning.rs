@@ -1,6 +1,7 @@
 //! Switches for the racecheck pruning techniques, so each one's benefit can
-//! be measured on corpus-shaped workloads (`numsim-race-core` example
-//! `tuning_table`; table in racecheck-semantics.md "Pruning techniques").
+//! be measured on corpus-shaped workloads (`numsim-core` example
+//! `racecheck_tuning_table`; criterion guards in `benches/racecheck.rs`;
+//! table in racecheck-semantics.md "Benchmarks").
 //!
 //! All switches default to on. They change cost only, never verdicts —
 //! except `frontier_eviction`, whose "off" keeps witnesses a later access
@@ -21,7 +22,7 @@ macro_rules! switches {
 switches! {
     EXACT_HIT: "IntervalShadow exact-hit fast path (an access exactly matching one cell skips split/merge).",
     JOIN_MEMO: "Memoized clock-chunk joins (JoinMemo) and dominating-chunk adoption.",
-    FRONTIER_EVICTION: "Single witness per actor: a frontier entry the new witness subsumes is evicted.",
+    FRONTIER_EVICTION: "Single witness per actor: a recent frontier entry (newest EVICT_WINDOW) the new witness subsumes and observes is evicted.",
     ASYNC_SPAN_MERGE: "Coalesce touching weak spans of one async lane before the checker.",
     ADAPTIVE_GC: "GC period scaled to twice the live shadow cells.",
 }

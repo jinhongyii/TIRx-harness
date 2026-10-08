@@ -18,7 +18,7 @@ repository root.
 - `lowering_ops.py`: keep (input to the oplib `SUPPORTED_OPS.md` generator).
 - `make_contract_shim.py`: delete at step 5 (ruled). The Rust `validate` API stays; this shim and its shell wrapper go.
 - `perf_gate.py`: keep.
-- `record_race_fixtures.py`: moves into `numsim-core` with the racecheck tuning harness (ruled; W5 does the move). It is the script the request called `record_observer_stream`.
+- `record_race_fixtures.py`: moved (W5) to `tirx_harness/src/tirx_harness/numsim/core-rs/numsim-core/examples/record_race_fixtures.py`, beside the racecheck tuning harness that calls it. Kept there; `numsim-race-core` is deleted.
 - `retire_legacy.py`: delete.
 - `retire_tests.py`: delete.
 - `status.py`: keep (one-command conformance status). Its legacy-comparison columns go with the legacy engine.

@@ -48,6 +48,7 @@ pub fn f32_to_fp16_bits(value: f32) -> u16 {
 }
 
 /// Decode one IEEE 754 binary16 payload into `f32`.
+#[inline]
 pub fn fp16_bits_to_f32(bits: u16) -> f32 {
     let sign = ((bits as u32) & 0x8000) << 16;
     let exponent = ((bits >> 10) & 0x1f) as u32;
@@ -101,11 +102,13 @@ pub fn f32_to_bf16_bits(value: f32) -> u16 {
 }
 
 /// Decode one bfloat16 payload into `f32`.
+#[inline]
 pub fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
 /// Recover the exact bfloat16 storage payload from its decoded `f32` value.
+#[inline]
 pub fn decoded_bf16_to_bits(value: f32) -> u16 {
     (value.to_bits() >> 16) as u16
 }
@@ -469,6 +472,7 @@ pub fn float8_e8m0fnu_bits_to_f32(bits: u8) -> f32 {
 }
 
 /// Decode one E2M1 nibble into `f32`.
+#[inline]
 pub fn float4_e2m1fn_bits_to_f32(bits: u8) -> f32 {
     const VALUES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let bits = bits & 0x0f;

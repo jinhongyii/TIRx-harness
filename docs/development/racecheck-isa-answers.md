@@ -19,7 +19,7 @@ Quotes are verbatim, except that footnote markers are dropped. Where the ISA is
 silent, the answer says so and recommends a fail-closed behaviour.
 
 **Verdict labels.** *Legacy* = the current checker (RS = shared/TMEM shadow,
-G = global shadow). *Prototype* = `numsim-race-core`.
+G = global shadow). *Prototype* = the v2 core, `numsim-core/src/racecheck/`.
 
 ---
 

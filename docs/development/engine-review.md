@@ -138,7 +138,7 @@ Each finding is labelled as follows:
 - **Same-stripe writes:** sound. `written` is a per-byte bitset; for the same bytes the later partition wins, per W2-11. Validity is merged per byte (`arena.rs:813-837`).
 - **RMW routing:** `atom` / `red` / `cas` (one handler), bulk and tensor reductions (`is_global_reduce`, `partition.rs:412`) are all serial points. `red.async` targets DSMEM and stays private. `multimem` is rejected by lowering. No bypass found.
 - **Replay determinism:** deterministic and independent of the worker count. It is *not* single-partition order; see M10.
-- **Fallback:** a cluster is a whole partition, so cluster barriers, DSMEM, remote arrives, `inbox_drain` and `cta_group::2` pairs stay inside one partition. Nothing else needs single mode. `route_outbox` silently drops unroutable messages (`partition.rs:403`); this predates fff0479.
+- **Fallback:** a cluster is a whole partition, so cluster barriers, DSMEM, remote arrives and `cta_group::2` pairs stay inside one partition. Nothing else needs single mode. (The inbox/outbox routing and its silent drop of unroutable messages are deleted; cross-CTA effects apply at issue.)
 - **Pool:** the rotation is seeded by (seed, round, CTA); there is no dependence on thread identity.
 
 ## Test gaps: the 10 most valuable scenarios
@@ -232,3 +232,13 @@ Every launch runs as CTA-lockstep partitions, one per resident cluster. Each par
 | `RunConfig::max_resident_ctas == 0` | every CTA resident at once (cooperative launches) |
 | kernels mixing `tcgen05` `cta_group::1` and `::2` | the kernel-wide tcgen05 `cta_group` rule is checked across all CTAs |
 | `RunConfig::single_partition` | explicit request (tests, debugging) |
+
+**Decision: CTA-level (intra-cluster) partitioning is cancelled (2026-10-08, coordinator).** The design existed: peer shared memory as copy-on-write shared state, remote mbarrier ops applied in (sender rank, issue seq) order, and `shared::cluster` atomics as serial points. It is not implemented, because HEAD is already faster than legacy on the headline kernel. `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in`, NumSim `Engine.run`, interp backend; host load 67–131, so absolute times are noisy:
+
+| workers | v2 (HEAD e6dafca + worktree) | legacy |
+| --- | --- | --- |
+| 32 | 4.79 s | 12.63 s |
+| 8 | 9.31 s | 17.80 s |
+| 1 | 53.4 s | 73.2 s |
+
+W10's earlier 73 s at 32 workers came from an engine 84 commits older. Large single-cluster kernels therefore keep the cluster-level partition.

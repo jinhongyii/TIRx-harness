@@ -107,8 +107,13 @@ def findings_of(checker: str, payload: Mapping[str, Any]) -> list[Finding]:
             out.setdefault(finding.id, finding)
     error = payload.get("execution_error")
     if isinstance(error, Mapping) and not any(f.status == "error" for f in out.values()):
-        finding = Finding(_finding_id(checker, error), "error", str(error.get("kind", "execution_error")),
-                          str(error.get("message", "")), dict(error))
+        finding = Finding(
+            _finding_id(checker, error),
+            "error",
+            str(error.get("kind", "execution_error")),
+            str(error.get("message", "")),
+            dict(error),
+        )
         out.setdefault(finding.id, finding)
     order = {"error": 0, "incomplete": 1, "review": 2}
     return sorted(out.values(), key=lambda f: (order.get(f.status, 3), f.kind, f.id))
@@ -127,7 +132,10 @@ def _overlap(evidence: Sequence[Mapping[str, Any]]) -> list[dict[str, int]]:
         return []
     if len(spans) >= 2:
         start = max(int(spans[0]["start"]), int(spans[1]["start"]))
-        end = min(int(spans[0]["start"]) + int(spans[0]["len"]), int(spans[1]["start"]) + int(spans[1]["len"]))
+        end = min(
+            int(spans[0]["start"]) + int(spans[0]["len"]),
+            int(spans[1]["start"]) + int(spans[1]["len"]),
+        )
         if end > start:
             return [{"byte_offset": start, "byte_len": end - start, "byte_end": end}]
     start, length = int(spans[0]["start"]), int(spans[0]["len"])
@@ -156,7 +164,9 @@ def record_from_core(raw: Mapping[str, Any], span_of: SpanOf) -> dict[str, Any]:
         "kind": kind,
         "status": status_name(raw.get("status", "error")),
         "message": raw.get("message", ""),
-        "sources": [{"site": site, "source_span": span_of(site)} for site in raw.get("sites") or ()],
+        "sources": [
+            {"site": site, "source_span": span_of(site)} for site in raw.get("sites") or ()
+        ],
         "evidence": evidence,
     }
     if (space := raw.get("space")) is not None:
@@ -224,7 +234,9 @@ def phase_payload(
     }
 
 
-def attach_sources(value: Any, span_of_kernel: Callable[[int, int | None], Any], kernel: int) -> Any:
+def attach_sources(
+    value: Any, span_of_kernel: Callable[[int, int | None], Any], kernel: int
+) -> Any:
     """Add ``source_span`` next to every ``site`` (and ``sources`` next to
     every ``sites`` list) of a checker payload, in place."""
 
@@ -237,7 +249,9 @@ def attach_sources(value: Any, span_of_kernel: Callable[[int, int | None], Any],
         sites = value.get("sites")
         if isinstance(sites, list) and "sources" not in value:
             value["sources"] = [
-                {"site": s, "source_span": span_of_kernel(kernel, s)} for s in sites if isinstance(s, int)
+                {"site": s, "source_span": span_of_kernel(kernel, s)}
+                for s in sites
+                if isinstance(s, int)
             ]
         for key, child in list(value.items()):
             if key not in {"source_span", "sources"}:
@@ -248,8 +262,9 @@ def attach_sources(value: Any, span_of_kernel: Callable[[int, int | None], Any],
     return value
 
 
-def operation_of(site_info: Mapping[str, Any] | None, *, kernel: int, site: int,
-                 span: Mapping[str, Any] | None) -> dict[str, Any]:
+def operation_of(
+    site_info: Mapping[str, Any] | None, *, kernel: int, site: int, span: Mapping[str, Any] | None
+) -> dict[str, Any]:
     """Legacy-shaped ``operation`` of a record's primary site: the faulting
     instruction's id, op name, text and span (``details["operation"]``)."""
 
@@ -265,8 +280,12 @@ def operation_of(site_info: Mapping[str, Any] | None, *, kernel: int, site: int,
     return {"kernel_index": kernel, "source_op_id": site, "source": source}
 
 
-def attach_operations(records: Iterable[dict[str, Any]], kernel: int,
-                      site_info_of: Callable[[int, int], Any], span_of_kernel: Callable[[int, int | None], Any]) -> None:
+def attach_operations(
+    records: Iterable[dict[str, Any]],
+    kernel: int,
+    site_info_of: Callable[[int, int], Any],
+    span_of_kernel: Callable[[int, int | None], Any],
+) -> None:
     """Give every record with a primary site a legacy ``operation`` field."""
 
     for record in records:
@@ -284,11 +303,14 @@ def attach_operations(records: Iterable[dict[str, Any]], kernel: int,
             # Engine stop attr (W2: the faulting op, e.g. "tirx.ptx.div.s32");
             # `operation` itself is the legacy-shaped source-op record.
             record.setdefault("operation_name", record["operation"])
-        record["operation"] = operation_of(site_info_of(k, site), kernel=k, site=site, span=span_of_kernel(k, site))
+        record["operation"] = operation_of(
+            site_info_of(k, site), kernel=k, site=site, span=span_of_kernel(k, site)
+        )
 
 
-def attach_access_sources(records: Iterable[dict[str, Any]], kernel: int,
-                          site_info_of: Callable[[int, int], Any]) -> None:
+def attach_access_sources(
+    records: Iterable[dict[str, Any]], kernel: int, site_info_of: Callable[[int, int], Any]
+) -> None:
     """Name the source op of each side of a race (``prior`` / ``current``
     accesses): ``operation.source_op_id`` and ``operation.source`` (kind and
     text), so the report can print both conflicting operations."""
@@ -304,7 +326,9 @@ def attach_access_sources(records: Iterable[dict[str, Any]], kernel: int,
                 continue
             k = operation.get("kernel_index", kernel)
             k = k if isinstance(k, int) and not isinstance(k, bool) else kernel
-            built = operation_of(site_info_of(k, site), kernel=k, site=site, span=operation.get("source_span"))
+            built = operation_of(
+                site_info_of(k, site), kernel=k, site=site, span=operation.get("source_span")
+            )
             operation["source_op_id"] = built["source_op_id"]
             operation["source"] = built["source"]
 
@@ -363,22 +387,30 @@ def checker_phase_payload(
         # The checker's own "launch did not run to completion" incomplete
         # repeats the engine's stop, which is already reported.
         notes += [i for i in payload["incomplete"] if i.get("reason") == "truncated_launch"]
-        payload["incomplete"] = [i for i in payload["incomplete"] if i.get("reason") != "truncated_launch"]
+        payload["incomplete"] = [
+            i for i in payload["incomplete"] if i.get("reason") != "truncated_launch"
+        ]
         if notes:
             payload["checker_on_truncated_log"] = notes
         payload["execution_error"] = runtime_error
     # On a truncated log the checker's overall verdict is void; recompute it
     # from what remains (engine stop + findings proven before the stop).
-    verdicts = ["clean" if "checker_on_truncated_log" in payload else str(payload.get("verdict") or "clean")]
+    verdicts = [
+        "clean" if "checker_on_truncated_log" in payload else str(payload.get("verdict") or "clean")
+    ]
     verdicts += [r.get("status", "error") for r in payload["findings"]]
-    verdicts += ["review"] * bool(payload["advisories"]) + ["incomplete"] * bool(payload["incomplete"])
+    verdicts += ["review"] * bool(payload["advisories"]) + ["incomplete"] * bool(
+        payload["incomplete"]
+    )
     verdicts += ["error"] * (payload["execution_error"] is not None)
     if site_info_of is not None:
         for key in ("findings", "advisories", "incomplete"):
             attach_operations(payload[key], phase_index, site_info_of, span_of_kernel)
         attach_access_sources(payload["findings"], phase_index, site_info_of)
         if isinstance(payload["execution_error"], dict):
-            attach_operations([payload["execution_error"]], phase_index, site_info_of, span_of_kernel)
+            attach_operations(
+                [payload["execution_error"]], phase_index, site_info_of, span_of_kernel
+            )
     payload.update(
         schema_version=SCHEMA_VERSION,
         checker=checker,
@@ -433,7 +465,7 @@ class NumSimResult:
     stats: dict[str, Any] = field(default_factory=dict)
     status: dict[str, Any] = field(default_factory=dict)
     # Milliseconds: lower (transpile or cache load), bind (Python input
-    # canonicalization), build (codegen backend; 0 for interp), run (engine,
+    # canonicalization), run (engine,
     # including arena binding), check (checker; 0 for NumSim), report
     # (Python result construction).
     timing: dict[str, float] = field(default_factory=dict)
@@ -445,7 +477,9 @@ class NumSimResult:
             for d in self.diagnostics
         )
 
-    def assert_close(self, expected: dict[str, Any], tolerances: dict[str, Any] | None = None) -> None:
+    def assert_close(
+        self, expected: dict[str, Any], tolerances: dict[str, Any] | None = None
+    ) -> None:
         compare(self, expected, tolerances=tolerances).require_ok()
 
 
@@ -510,32 +544,48 @@ class SyncCheckReport(RaceReport):
 class NumSimReport(_Report):
     checker_name = "numsim"
 
-    def __init__(self, ok: bool, mismatches: Sequence[Any] = (), diagnostics: Sequence[dict[str, Any]] = ()):
+    def __init__(
+        self, ok: bool, mismatches: Sequence[Any] = (), diagnostics: Sequence[dict[str, Any]] = ()
+    ):
         self.ok = bool(ok)
         self.mismatches = list(mismatches)
         self.diagnostics = list(diagnostics)
 
     def payloads(self) -> list[dict[str, Any]]:
-        verdict = "error" if not self.ok else worst(
-            d.get("status", "error") if d.get("status") in _VERDICT_RANK else "error"
-            for d in self.diagnostics
+        verdict = (
+            "error"
+            if not self.ok
+            else worst(
+                d.get("status", "error") if d.get("status") in _VERDICT_RANK else "error"
+                for d in self.diagnostics
+            )
         )
-        return [{
-            "schema_version": SCHEMA_VERSION,
-            "checker": "numsim",
-            "verdict": verdict,
-            "diagnostics": self.diagnostics,
-            "mismatches": [m.render() if hasattr(m, "render") else str(m) for m in self.mismatches],
-        }]
+        return [
+            {
+                "schema_version": SCHEMA_VERSION,
+                "checker": "numsim",
+                "verdict": verdict,
+                "diagnostics": self.diagnostics,
+                "mismatches": [
+                    m.render() if hasattr(m, "render") else str(m) for m in self.mismatches
+                ],
+            }
+        ]
 
     def require_ok(self) -> None:
         if not self.ok:
             first = self.mismatches[0] if self.mismatches else None
-            detail = "<missing>" if first is None else (first.render() if hasattr(first, "render") else str(first))
+            detail = (
+                "<missing>"
+                if first is None
+                else (first.render() if hasattr(first, "render") else str(first))
+            )
             raise AssertionError(f"NumSim comparison failed; first mismatch: {detail}")
 
 
-def compare(result: Any, expected: dict[str, Any], *, tolerances: dict[str, Any] | None = None) -> NumSimReport:
+def compare(
+    result: Any, expected: dict[str, Any], *, tolerances: dict[str, Any] | None = None
+) -> NumSimReport:
     """Compare outputs with a reference.
 
     The tolerance/region/encoding logic is shared with the legacy package
@@ -587,7 +637,10 @@ def stop_facts(stop: Mapping[str, Any]) -> str:
     if isinstance(operands, list) and operands:
         parts.append(f"operands {', '.join(str(x) for x in operands)}")
     if is_int(stop.get("budget")):
-        parts.append(f"loop budget {stop['budget']}" + (f" at iteration {stop['iteration']}" if is_int(stop.get("iteration")) else ""))
+        parts.append(
+            f"loop budget {stop['budget']}"
+            + (f" at iteration {stop['iteration']}" if is_int(stop.get("iteration")) else "")
+        )
     if is_int(stop.get("max_rounds")):
         parts.append(f"round budget {stop['max_rounds']}")
     return ", ".join(parts)
@@ -651,7 +704,11 @@ def render(report: _Report) -> str:
         lines.append(f"  [{finding.status.upper()}] {finding.kind}: {finding.message}".rstrip())
         # Same order as legacy checker_render: classification lines, the
         # evidence (location, bytes), then the hint.
-        for key, label in (("access_pair", "Access pair"), ("reason", "Reason"), ("cause", "Cause")):
+        for key, label in (
+            ("access_pair", "Access pair"),
+            ("reason", "Reason"),
+            ("cause", "Cause"),
+        ):
             value = finding.details.get(key)
             if isinstance(value, (str, int)) and value != "":
                 lines.append(f"    {label}: {value}")
@@ -701,15 +758,23 @@ def payload_json_schema() -> dict[str, Any]:
             "status": {"enum": ["error", "review", "incomplete"]},
             "message": {"type": "string"},
             "space": {"type": "string"},
-            "sources": {"type": "array", "items": {
-                "type": "object",
-                "properties": {"site": {"type": ["integer", "null"]}, "source_span": span},
-            }},
-            "overlaps": {"type": "array", "items": {
-                "type": "object",
-                "properties": {k: {"type": "integer"} for k in ("byte_offset", "byte_len", "byte_end")},
-                "required": ["byte_offset", "byte_len", "byte_end"],
-            }},
+            "sources": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"site": {"type": ["integer", "null"]}, "source_span": span},
+                },
+            },
+            "overlaps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        k: {"type": "integer"} for k in ("byte_offset", "byte_len", "byte_end")
+                    },
+                    "required": ["byte_offset", "byte_len", "byte_end"],
+                },
+            },
             "evidence": {"type": "array"},
         },
         "required": ["kind", "status"],
@@ -723,7 +788,10 @@ def payload_json_schema() -> dict[str, Any]:
             "schema_version": {"const": SCHEMA_VERSION},
             "checker": {"enum": ["racecheck", "synccheck"]},
             "engine": {"type": "string"},
-            "phase": {"type": "object", "properties": {"index": {"type": "integer"}, "name": {"type": "string"}}},
+            "phase": {
+                "type": "object",
+                "properties": {"index": {"type": "integer"}, "name": {"type": "string"}},
+            },
             "verdict": {"enum": list(VERDICTS)},
             "findings": {"type": "array", "items": record},
             "advisories": {"type": "array", "items": record},
@@ -733,7 +801,15 @@ def payload_json_schema() -> dict[str, Any]:
             "coverage": {"type": "object"},
             "stats": {"type": "object"},
         },
-        "required": ["schema_version", "checker", "verdict", "findings", "advisories", "incomplete", "execution_error"],
+        "required": [
+            "schema_version",
+            "checker",
+            "verdict",
+            "findings",
+            "advisories",
+            "incomplete",
+            "execution_error",
+        ],
     }
 
 

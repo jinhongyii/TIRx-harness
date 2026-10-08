@@ -11,7 +11,6 @@ from tests.numsim.corpus.canonical_cases import CANONICAL_KERNEL_CASES
 from tests.numsim.corpus.kernels.deepgemm import prepare_mega_moe_case
 from tests.numsim.support._tirx_kernels import load_tirx_kernel
 from tirx_harness import numsim
-from tirx_harness.numsim.api import ExecutionSubset
 
 
 # Keep the full persistent grid fixed across hosts, including CPU-only runs.
@@ -214,7 +213,7 @@ def test_native_racecheck_validates_flashmla_small_topk_task_steal(
         if item.name == "sparse_flashmla_prefill_head128_small_topk_phase1"
     )
     case = entry.prepare()
-    subset = ExecutionSubset(cluster_ids=[0])
+    subset = numsim.ExecutionSubset(cluster_ids=[0])
     module = numsim.transpile(
         case.kernel,
         cache_dir=tmp_path_factory.getbasetemp() / "flashmla-task-steal-racecheck-cache",

@@ -21,10 +21,9 @@ from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import Any
 
-from .options import options
-
-
 from tirx_harness.numsim.errors import NumSimError, UnsupportedTIRxError
+
+from .options import options
 
 
 class ModuleContractError(NumSimError, ValueError):
@@ -189,7 +188,7 @@ def _source_text(func: Any) -> str:
 
     try:
         return tvm.ir.save_json(func)
-    except Exception:  # noqa: BLE001 - some nodes do not serialize; fall back
+    except Exception:
         return func.script(show_meta=True)
 
 
@@ -219,7 +218,9 @@ def lower_module(funcs: tuple[Any, ...]) -> dict[str, Any]:
     return {"format_version": format_version(), "kernels": kernels}
 
 
-def from_document(document: dict[str, Any] | str | bytes, *, cache_key: str | None = None) -> CompiledModule:
+def from_document(
+    document: dict[str, Any] | str | bytes, *, cache_key: str | None = None
+) -> CompiledModule:
     """Wrap an already-lowered Module document (tests, fixtures)."""
 
     if isinstance(document, dict):
@@ -258,7 +259,12 @@ def transpile(
     if opts.use_cache and path.exists():
         try:
             cached = from_document(path.read_bytes(), cache_key=key)
-            return replace(cached, cache_path=path, lower_ms=(time.perf_counter() - started) * 1e3, cache_hit=True)
+            return replace(
+                cached,
+                cache_path=path,
+                lower_ms=(time.perf_counter() - started) * 1e3,
+                cache_hit=True,
+            )
         except ModuleContractError:
             # The contract changed without a format-version bump: the cached
             # module no longer decodes. Re-lower instead of failing.
@@ -277,8 +283,12 @@ def transpile(
         tmp = path.with_suffix(f".tmp{os.getpid()}")
         tmp.write_bytes(module.data)
         tmp.replace(path)
-    return CompiledModule(data=module.data, cache_key=key, cache_path=path if opts.use_cache else None,
-                          lower_ms=(time.perf_counter() - started) * 1e3)
+    return CompiledModule(
+        data=module.data,
+        cache_key=key,
+        cache_path=path if opts.use_cache else None,
+        lower_ms=(time.perf_counter() - started) * 1e3,
+    )
 
 
 __all__ = [

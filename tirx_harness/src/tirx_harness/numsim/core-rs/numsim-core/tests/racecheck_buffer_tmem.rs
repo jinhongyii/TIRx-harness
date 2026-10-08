@@ -2,7 +2,7 @@
 //! `Proxy::Tcgen`, synchronous in the engine) are ordered by hb.
 use numsim_core::racecheck::observer::{RaceObserver, RacecheckConfig};
 use numsim_core::report::Status;
-use numsim_core::sched::{self, Backend, RunStatus};
+use numsim_core::sched::{self, RunStatus};
 use numsim_core::testutil::scenarios;
 
 #[test]
@@ -14,7 +14,7 @@ fn buffer_form_tmem_scenarios_are_race_free() {
         }
         seen += 1;
         let mut obs = RaceObserver::new(RacecheckConfig::default());
-        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).unwrap();
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).unwrap();
         assert_eq!(o.status, RunStatus::Completed, "{}", s.name);
         let report = obs.finish();
         let errors: Vec<_> = report.findings.iter().filter(|f| f.status == Status::Error).collect();

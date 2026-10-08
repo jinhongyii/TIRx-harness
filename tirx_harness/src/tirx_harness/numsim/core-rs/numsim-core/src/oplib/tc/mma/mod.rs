@@ -253,6 +253,13 @@ fn check_cell(io: &Io<'_>, lane: usize, column: usize) -> LibResult<(u32, u32)> 
     Ok((lane, column))
 }
 
+/// `first..first + len` when `indices` is that consecutive range.
+fn contiguous(indices: &[usize]) -> Option<std::ops::Range<usize>> {
+    let (&first, _) = indices.split_first()?;
+    let end = first.checked_add(indices.len())?;
+    (indices.iter().enumerate().all(|(i, &index)| index == first + i)).then_some(first..end)
+}
+
 /// Read one run of cells (`indices` = value slots of `column..`).
 fn read_run<T>(
     io: &Io<'_>,
@@ -267,8 +274,16 @@ fn read_run<T>(
     buf.clear();
     buf.resize(indices.len() * 4, 0);
     (io.tmem_read)(cta as u32, lane, column, buf).map_err(|error| io.fail(error))?;
-    for (&index, bytes) in indices.iter().zip(buf.as_chunks::<4>().0) {
-        values[index] = decode(*bytes);
+    let cells = buf.as_chunks::<4>().0;
+    if let Some(slots) = contiguous(indices).and_then(|r| values.get_mut(r)) {
+        // Every streamed run is a contiguous index range: no per-cell indirection.
+        for (slot, bytes) in slots.iter_mut().zip(cells) {
+            *slot = decode(*bytes);
+        }
+    } else {
+        for (&index, bytes) in indices.iter().zip(cells) {
+            values[index] = decode(*bytes);
+        }
     }
     Ok(())
 }
@@ -286,8 +301,16 @@ fn write_run<T: Copy>(
     check_cell(io, lane, column + indices.len() - 1)?;
     let (lane, column) = check_cell(io, lane, column)?;
     buf.clear();
-    for &index in indices {
-        buf.extend_from_slice(&encode(values[index]));
+    buf.resize(indices.len() * 4, 0);
+    let cells = buf.as_chunks_mut::<4>().0;
+    if let Some(slots) = contiguous(indices).and_then(|r| values.get(r)) {
+        for (cell, &value) in cells.iter_mut().zip(slots) {
+            *cell = encode(value);
+        }
+    } else {
+        for (&index, cell) in indices.iter().zip(cells) {
+            *cell = encode(values[index]);
+        }
     }
     tmem_write(cta as u32, lane, column, buf).map_err(|error| io.fail(error))
 }

@@ -176,6 +176,24 @@ pub fn write_lane(ctx: &mut ExecCtx<'_>, r: Reg, lane: usize, v: u64) {
     }
 }
 
+/// [`write_lane`] for every lane of `mask` at once (W13): one register-type
+/// lookup instead of one per lane; same per-lane effect.
+#[inline]
+pub fn write_lanes(ctx: &mut ExecCtx<'_>, r: Reg, v: &WarpValue<u64>, mask: WarpMask) {
+    let ty = reg_ty(ctx, r);
+    let base = ctx.slot(r);
+    let bits = ty.bits();
+    let m = if bits < 64 { (1u64 << bits) - 1 } else { u64::MAX };
+    let mut w = *v;
+    for x in w.iter_mut() {
+        *x &= m;
+    }
+    write_masked(ctx.warp.regs.get_mut(base), &w, mask);
+    for s in 1..ty.slots() {
+        write_masked(ctx.warp.regs.get_mut(base + s), &[0u64; 32], mask);
+    }
+}
+
 /// Gather all slots of an operand (`n` slots) into `out`.
 #[inline]
 pub fn gather(ctx: &ExecCtx<'_>, o: Operand, n: u32, out: &mut [WarpValue<u64>; 4]) {

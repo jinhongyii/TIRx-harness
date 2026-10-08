@@ -4,7 +4,7 @@
 //! accesses are collected per lane and emitted as one `Access` per
 //! allocation after the memory effect (racecheck-semantics §3 rows 1-2,
 //! 24-26: plain accesses carry their `sem`/`scope`; atomics are `Rmw`).
-//! Remote shared::cluster stores are delivered through the outbox.
+//! Remote shared::cluster stores apply at issue.
 
 use super::HResult;
 use crate::arena::{addr, Space};
@@ -199,8 +199,10 @@ pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Op
     active_or_next!(ctx);
     let _ = mods;
     let n = ty.mem_bytes() as u64;
-    if n <= 8 && ty.slots() == 1 && !(ctx.aux.wants_history && !ctx.aux.words.is_empty()) && !ctx.arena.readonly_tracking() {
-        if let Some((alloc, base, len, window)) = fast_target(ctx, buf) {
+    if n <= 8 && ty.slots() == 1 && !ctx.arena.readonly_tracking() {
+        // A store into an allocation holding declared words logs per lane
+        // (`mem_write`); other allocations log nothing and stay fast.
+        if let Some((alloc, base, len, window)) = fast_target(ctx, buf).filter(|t| !(ctx.aux.wants_history && ctx.aux.words.has(t.0))) {
             let active = ctx.warp.active;
             let mut offs = [0u64; 32];
             let mut ok = true;

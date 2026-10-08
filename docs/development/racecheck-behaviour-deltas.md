@@ -5,7 +5,7 @@ orphan: true
 # Racecheck behaviour deltas vs. legacy
 
 Use this list to review finding-snapshot diffs. The new behaviour is defined by
-`core-rs/numsim-race-core/`, and the full specification is
+`core-rs/numsim-core/src/racecheck/`, and the full specification is
 `racecheck-semantics.md`. A snapshot diff that matches no row here is a
 regression.
 
@@ -18,8 +18,8 @@ regression.
 that a future change is caught.
 
 **ISA cites.** They use PTX 9.4 section numbers. Quotes and reasoning are in
-`racecheck-isa-answers.md` (R1–R9). Test names refer to
-`numsim-race-core/tests/`.
+`racecheck-isa-answers.md` (R1–R10). Test names refer to
+`numsim-core/tests/racecheck_*.rs`.
 
 ## Conflict rule and moral strength
 

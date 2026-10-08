@@ -16,12 +16,11 @@ pub use numsim_core;
 
 use numsim_core::arena::{BitSet, ValidityPolicy};
 use numsim_core::interp::ExecError;
-use numsim_core::codegen::{self, BuildOptions, OptLevel};
 use numsim_core::observe::{Access, CtaId, LaunchInfo, NoopObserver, Observer, RecordingObserver, SyncEvent, WarpEnd, WarpId};
 use numsim_core::program::{Module, ProgramError};
 use numsim_core::racecheck::{self, RaceObserver, RacecheckConfig};
 use numsim_core::report::Report;
-use numsim_core::sched::{self, ArgValue, Backend, Inputs, RunConfig, RunError, RunOutcome, RunStatus};
+use numsim_core::sched::{self, ArgValue, Inputs, RunConfig, RunError, RunOutcome, RunStatus};
 use numsim_core::synccheck::{self, SynccheckConfig};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -61,27 +60,10 @@ impl Mode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackendKind {
-    Interp,
-    Codegen,
-}
-
-impl BackendKind {
-    pub fn parse(s: &str) -> Option<BackendKind> {
-        match s {
-            "interp" => Some(BackendKind::Interp),
-            "codegen" => Some(BackendKind::Codegen),
-            _ => None,
-        }
-    }
-}
-
 /// Everything `run` needs besides the module and inputs.
 #[derive(Clone, Debug)]
 pub struct RunRequest {
     pub mode: Mode,
-    pub backend: BackendKind,
     pub config: RunConfig,
     /// Synccheck state / transition budgets per projection.
     pub state_budget: Option<u64>,
@@ -93,25 +75,18 @@ pub struct RunRequest {
     pub max_findings: usize,
     /// Scheduler worker threads (also copied into `RunConfig::workers`).
     pub workers: u32,
-    /// Codegen optimization level (0..=3).
-    pub opt_level: u32,
-    /// Codegen build cache (default: `$TMPDIR/numsim-codegen`).
-    pub codegen_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl RunRequest {
     pub fn new(mode: Mode) -> RunRequest {
         RunRequest {
             mode,
-            backend: BackendKind::Interp,
             config: RunConfig::default(),
             state_budget: None,
             transition_budget: None,
             synccheck_limits: BTreeMap::new(),
             max_findings: 0,
             workers: 1,
-            opt_level: 1,
-            codegen_cache_dir: None,
         }
     }
 }
@@ -136,9 +111,8 @@ pub struct ExecuteResult {
     /// Checker modes: the checker's own legacy-shaped payload per launch
     /// (`racecheck::serialize` / `synccheck::serialize`).
     pub payloads: Vec<Value>,
-    /// Wall-clock milliseconds: `build` (backend: codegen print/build/load,
-    /// 0 for interp), `run` (`sched::run_with_config`, including arena
-    /// binding), `check` (checker finish / offline exploration + serialize).
+    /// Wall-clock milliseconds: `run` (`sched::run_with_config`, including
+    /// arena binding), `check` (checker finish / offline exploration + serialize).
     pub timing: Value,
 }
 
@@ -167,7 +141,6 @@ fn run_error(e: RunError) -> ExecuteError {
         RunError::InvalidProgram(m) => format!("invalid program: {m}"),
         RunError::MissingArg(n) => format!("missing argument {n:?}"),
         RunError::BadArg { name, message } => format!("bad argument {name:?}: {message}"),
-        RunError::Backend(m) => format!("backend error: {m}"),
     })
 }
 
@@ -186,26 +159,6 @@ pub fn guarded<T>(f: impl FnOnce() -> Result<T, ExecuteError>) -> Result<T, Exec
             } else {
                 Err(ExecuteError::Panic(message))
             }
-        }
-    }
-}
-
-fn backend_for(module: &Module, request: &RunRequest) -> Result<Backend, ExecuteError> {
-    match request.backend {
-        BackendKind::Interp => Ok(Backend::Interp),
-        BackendKind::Codegen => {
-            let cache = request
-                .codegen_cache_dir
-                .clone()
-                .unwrap_or_else(|| std::env::temp_dir().join("numsim-codegen"));
-            let mut opts = BuildOptions::new(cache.clone());
-            opts.opt_level = match request.opt_level {
-                0 => OptLevel::O0,
-                1 => OptLevel::O1,
-                2 => OptLevel::O2,
-                _ => OptLevel::O3,
-            };
-            codegen::backend_for(module, &opts, &cache).map_err(|e| ExecuteError::Run(format!("codegen backend: {e:?}")))
         }
     }
 }
@@ -570,30 +523,27 @@ impl Observer for PerLaunchRecorder {
     fn warp_done(&mut self, w: WarpId, end: WarpEnd) {
         self.current.warp_done(w, end);
     }
-    fn inbox_drain(&mut self, c: CtaId, r: u64) {
-        self.current.inbox_drain(c, r);
+    fn round_boundary(&mut self, c: CtaId, r: u64) {
+        self.current.round_boundary(c, r);
     }
 }
 
 /// Run `module` in one mode. Never panics: engine panics become errors.
 pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result<ExecuteResult, ExecuteError> {
     guarded(|| {
-        let started = std::time::Instant::now();
-        let backend = backend_for(module, request)?;
-        let build_ms = ms(started);
         let config = &request.config;
         let run_started = std::time::Instant::now();
         let run_ms;
         let result: Result<(ExecuteResult, std::time::Instant), ExecuteError> = match request.mode {
             Mode::Numsim => {
                 let mut observer = NoopObserver;
-                let outcome = sched::run_with_config(module, inputs, &mut observer, &backend, config).map_err(run_error)?;
+                let outcome = sched::run_with_config(module, inputs, &mut observer, config).map_err(run_error)?;
                 run_ms = ms(run_started);
                 Ok((outcome_result(outcome, Vec::new(), Vec::new()), std::time::Instant::now()))
             }
             Mode::Racecheck => {
                 let mut observer = RaceObserver::new(RacecheckConfig { max_findings: request.max_findings });
-                let outcome = sched::run_with_config(module, inputs, &mut observer, &backend, config).map_err(run_error)?;
+                let outcome = sched::run_with_config(module, inputs, &mut observer, config).map_err(run_error)?;
                 run_ms = ms(run_started);
                 let check_started = std::time::Instant::now();
                 observer.finish_launch(); // no-op when end_launch already finalized it
@@ -603,7 +553,7 @@ pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result
             }
             Mode::Synccheck => {
                 let mut recorder = PerLaunchRecorder::default();
-                let outcome = sched::run_with_config(module, inputs, &mut recorder, &backend, config).map_err(run_error)?;
+                let outcome = sched::run_with_config(module, inputs, &mut recorder, config).map_err(run_error)?;
                 run_ms = ms(run_started);
                 let check_started = std::time::Instant::now();
                 let mut reports = Vec::new();
@@ -642,7 +592,7 @@ pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result
             }
         };
         let (mut result, check_started) = result?;
-        result.timing = json!({"build": build_ms, "run": run_ms, "check": ms(check_started)});
+        result.timing = json!({"run": run_ms, "check": ms(check_started)});
         Ok(result)
     })
 }
@@ -826,33 +776,29 @@ mod py {
     /// `reports` (one `report::Report` JSON str per launch) and `payloads`
     /// (the checker's legacy-shaped payload dict per launch).
     #[pyfunction]
-    #[pyo3(signature = (module, inputs, *, mode="numsim", backend="interp", workers=1, seed=0,
-                        loop_budget=None, quantum=None, max_rounds=None, opt_level=1,
+    #[pyo3(signature = (module, inputs, *, mode="numsim", workers=1, seed=0,
+                        loop_budget=None, quantum=None, max_rounds=None,
                         validity=None, state_budget=None, transition_budget=None, max_findings=0,
-                        codegen_cache_dir=None, subset=None, synccheck_limits=None, host_addrs=None))]
+                        subset=None, synccheck_limits=None, host_addrs=None))]
     fn run<'py>(
         py: Python<'py>,
         module: &PyModuleHandle,
         inputs: &Bound<'py, PyDict>,
         mode: &str,
-        backend: &str,
         workers: u32,
         seed: u64,
         loop_budget: Option<u64>,
         quantum: Option<u32>,
         max_rounds: Option<u64>,
-        opt_level: u32,
         validity: Option<&str>,
         state_budget: Option<u64>,
         transition_budget: Option<u64>,
         max_findings: usize,
-        codegen_cache_dir: Option<std::path::PathBuf>,
         subset: Option<Vec<u32>>,
         synccheck_limits: Option<BTreeMap<String, u64>>,
         host_addrs: Option<BTreeMap<String, u64>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let mode = Mode::parse(mode).ok_or_else(|| PyValueError::new_err(format!("unknown mode {mode:?}")))?;
-        let backend = BackendKind::parse(backend).ok_or_else(|| PyValueError::new_err(format!("unknown backend {backend:?}")))?;
         let mut args = BTreeMap::new();
         for (key, value) in inputs.iter() {
             let name: String = key.extract()?;
@@ -863,14 +809,11 @@ mod py {
         // their low 8 bits (`arena::addr` ruling).
         let inputs = Inputs { args, host_addrs: host_addrs.unwrap_or_default() };
         let mut request = RunRequest::new(mode);
-        request.backend = backend;
         request.workers = workers;
         request.config.workers = workers.max(1) as usize;
-        request.opt_level = opt_level;
         request.state_budget = state_budget;
         request.transition_budget = transition_budget;
         request.max_findings = max_findings;
-        request.codegen_cache_dir = codegen_cache_dir;
         request.config.seed = seed;
         request.config.subset = subset;
         if let Some(limits) = synccheck_limits {

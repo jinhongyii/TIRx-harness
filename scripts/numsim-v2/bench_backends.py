@@ -1,9 +1,9 @@
-"""Backend performance comparison: legacy vs v2 interp vs v2 codegen (plan 2.3).
+"""Performance comparison: legacy vs the v2 interpreter.
 
 Usage (from ``tirx_harness/``, after ``source ../scripts/dev-env.sh``)::
 
     $PY ../scripts/numsim-v2/bench_backends.py run   [--cases REGEX] [--modes numsim,racecheck,synccheck]
-        [--workers 1,8,32] [--repeats 3] [--max-load 40] [--v2-package DIR] [--codegen-cache DIR]
+        [--workers 1,8,32] [--repeats 3] [--max-load 40] [--v2-package DIR]
         [--results DIR] [--case-timeout S] [--force]
     $PY ../scripts/numsim-v2/bench_backends.py render [--results DIR] [--json OUT] [--md OUT]
         [--criterion FILE ...] [--legacy-perf FILE]
@@ -12,9 +12,12 @@ Usage (from ``tirx_harness/``, after ``source ../scripts/dev-env.sh``)::
 in each mode whose v2 result matches the frozen legacy conformance snapshot
 (``tests/conformance/snapshots``), for the variants
 
-    legacy | v2-interp | v2-codegen O1 | v2-codegen O3   x   max_workers in --workers
+    legacy | v2-interp   x   max_workers in --workers
 
-Each case runs in its own child process (a codegen abort or an OOM loses one
+The v2 codegen backend was measured with this script (plan 2.3), lost, and
+was deleted; docs/development/backend-comparison.md keeps that measurement.
+
+Each case runs in its own child process (an abort or an OOM loses one
 case, not the sweep) and writes ``<results>/<case>.json``; rows already present
 are skipped unless ``--force``. Before every case the host load is checked: the
 run waits while the 1-minute load average exceeds ``--max-load`` and records the
@@ -23,13 +26,10 @@ CPU count, load average and instantaneous idle (tests/CLAUDE.md preflight).
 Per run the timed phases are
 
 * v2: ``transpile`` (module cache hit), ``bind`` (``canonicalize_inputs``),
-  ``build`` / ``run`` / ``check`` from ``numsim_core_py.run(...)["timing"]``
-  (``build`` = codegen emit + cargo freshness check + rustc on a miss + dlopen;
-  ~0 for interp), ``report`` (the rest of the Python wall: output decoding,
+  ``run`` / ``check`` from ``numsim_core_py.run(...)["timing"]``, ``report`` (the rest of the Python wall: output decoding,
   payload rendering), and ``engine`` = the whole ``Engine.run`` /
   phase-loop wall clock (bind + native + report). Cold lowering
-  (``NUMSIM_V2_NO_CACHE=1``) and a cold codegen build (``gen-*`` cache entries
-  removed; the numsim-core rlib stays cached) are measured once per case.
+  (``NUMSIM_V2_NO_CACHE=1``) is measured once per case.
 * legacy: ``transpile`` (artifact cache hit) and ``engine`` = ``Engine.run`` /
   phase-loop wall clock (legacy has no per-phase timing).
 
@@ -53,7 +53,6 @@ import json
 import math
 import os
 import re
-import shutil
 import statistics
 import subprocess
 import sys
@@ -64,7 +63,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[2]
 HARNESS = REPO / "tirx_harness"
 MODES = ("numsim", "racecheck", "synccheck")
-VARIANTS = ("legacy", "interp", "codegen-O1", "codegen-O3")
+VARIANTS = ("legacy", "interp")
 LONG_RUN_S = 60.0  # one repetition only for configurations slower than this
 
 # Instr families (numsim-core/src/program.rs `enum Instr`).
@@ -232,8 +231,7 @@ def run_legacy(entry: Any, mode: str, workers: int, expected: Any) -> tuple[dict
     return norm, {"transpile": t_tr.t, "engine": t_eng.t}
 
 
-def run_v2(v2: Any, entry: Any, mode: str, variant: str, workers: int, expected: Any,
-           codegen_cache: Path) -> tuple[dict, dict]:
+def run_v2(v2: Any, entry: Any, mode: str, workers: int, expected: Any) -> tuple[dict, dict]:
     from tests.conformance import snapshot as snap
 
     run_mod = sys.modules[v2.Engine.__module__]
@@ -241,29 +239,16 @@ def run_v2(v2: Any, entry: Any, mode: str, variant: str, workers: int, expected:
     t_tr = Timer()
     with t_tr():
         module = v2.transpile(case.kernel)
-    backend, opt = ("interp", 1) if variant == "interp" else ("codegen", int(variant[-1]))
-    engine = v2.Engine(max_workers=workers, backend=backend, opt_level=opt)
-    native = run_mod.native()
+    engine = v2.Engine(max_workers=workers)
     t_bind, t_native = Timer(), Timer()
-    timing = {"build": 0.0, "run": 0.0, "check": 0.0}
+    timing = {"run": 0.0, "check": 0.0}
     stats: dict[str, Any] = {}
 
-    def native_run(module_, bound, mode_, **extra):
-        if "synccheck_limits" in extra:
-            extra = {**extra, "synccheck_limits": dict(extra["synccheck_limits"])}
-        with t_native():
-            raw = native.run(
-                module_.handle, {name: b.native for name, b in bound.items()}, mode=mode_,
-                backend=engine.backend, workers=engine.max_workers, seed=engine.seed,
-                loop_budget=engine.loop_budget, quantum=engine.quantum, opt_level=engine.opt_level,
-                codegen_cache_dir=str(codegen_cache), **extra,
-            )
+    def on_raw(raw: dict) -> None:
         for key in timing:
             timing[key] += float((raw.get("timing") or {}).get(key, 0.0)) / 1e3
         stats.update({k: v for k, v in (raw.get("stats") or {}).items() if isinstance(v, (int, float))})
-        return raw
 
-    engine._native_run = native_run
     original_bind = run_mod.canonicalize_inputs
 
     def timed_bind(*a, **k):
@@ -271,6 +256,7 @@ def run_v2(v2: Any, entry: Any, mode: str, variant: str, workers: int, expected:
             return original_bind(*a, **k)
 
     run_mod.canonicalize_inputs = timed_bind
+    restore_native = patch_native(run_mod, t_native, on_raw)
     resolver = snap.SourceResolver(module)
     t_eng = Timer()
     try:
@@ -280,31 +266,51 @@ def run_v2(v2: Any, entry: Any, mode: str, variant: str, workers: int, expected:
                                     outputs=case.outputs)
             ok = bool(v2.compare(result, expected, tolerances=case.comparisons).ok)
             norm = snap.normalize_numsim(result.outputs, result.diagnostics, reference_ok=ok, resolver=resolver)
+            engine_timing = dict(getattr(result, "timing", None) or {})
         else:
             with t_eng():
                 payloads = _phases(v2, engine, module, case, entry, mode)
             norm = {"phases": [snap.normalize_analysis_phase(p, resolver) for p in payloads]}
+            engine_timing = dict(payloads[0].get("timing") or {}) if payloads else {}
     finally:
         run_mod.canonicalize_inputs = original_bind
+        restore_native()
     times = {
         "transpile": t_tr.t,
         "engine": t_eng.t,
         "bind": t_bind.t,
         "native": t_native.t,
-        "build": timing["build"],
         "run": timing["run"],
         "check": timing["check"],
         "report": max(0.0, t_eng.t - t_bind.t - t_native.t),
     }
-    return norm, {"times": times, "stats": stats}
+    return norm, {"times": times, "stats": stats, "engine_timing_ms": engine_timing}
 
 
-def clear_codegen_libs(cache: Path) -> int:
-    removed = 0
-    for path in cache.glob("gen-*"):
-        shutil.rmtree(path, ignore_errors=True)
-        removed += 1
-    return removed
+def patch_native(run_mod: Any, timer: Timer, on_raw) -> Any:
+    """Route ``numsim_core_py.run`` through a proxy that times it and reports
+    its raw result; returns the undo."""
+
+    original = run_mod.native
+    real = original()
+
+    class Proxy:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def run(self, *a, **k):
+            with timer():
+                raw = real.run(*a, **k)
+            on_raw(raw)
+            return raw
+
+    proxy = Proxy()
+    run_mod.native = lambda: proxy
+
+    def restore():
+        run_mod.native = original
+
+    return restore
 
 
 def bench_case(args: argparse.Namespace) -> dict[str, Any]:
@@ -315,24 +321,7 @@ def bench_case(args: argparse.Namespace) -> dict[str, Any]:
     from tests.numsim.corpus.canonical_cases import CANONICAL_KERNEL_CASES
 
     entry = next(e for e in CANONICAL_KERNEL_CASES if e.name == args.case)
-    codegen_cache = Path(args.codegen_cache)
-    codegen_cache.mkdir(parents=True, exist_ok=True)
     out: dict[str, Any] = {"case": entry.name, "modes": {}, "preflight": [wait_for_quiet(args.max_load)]}
-    args.prebuilt = None
-    if args.prebuild_dir:
-        record = Path(args.prebuild_dir) / f"{entry.name}.json"
-        args.prebuilt = json.loads(record.read_text()) if record.exists() else {"builds": {}}
-        out["codegen_cold"] = {}
-        for variant in ("codegen-O1", "codegen-O3"):
-            build = args.prebuilt.get("builds", {}).get(variant, {})
-            if "build_s" in build:
-                out["codegen_cold"][variant] = {"build_s": build["build_s"], "prebuilt": True,
-                                                "source_bytes": (args.prebuilt.get("source_bytes") or [None])[0]}
-            elif variant in args.variants:
-                # No cached library: a timed run would include a cold build.
-                args.variants = [v for v in args.variants if v != variant]
-                out.setdefault("codegen_dropped", {})[variant] = build.get("error") or args.prebuilt.get(
-                    "error", "no prebuild record")[-500:]
 
     # Static facts and one-off costs (module shared by every v2 mode).
     case = entry.prepare()
@@ -354,7 +343,6 @@ def bench_case(args: argparse.Namespace) -> dict[str, Any]:
     out["instr_mix"] = instr_mix(module)
     del case, module
 
-    cold_done: set[str] = set()
     workers = [int(w) for w in args.workers.split(",")]
     for mode in args.modes.split(","):
         stored = snap.load_snapshot(entry.name, mode)
@@ -364,6 +352,14 @@ def bench_case(args: argparse.Namespace) -> dict[str, Any]:
             row["status"] = "skipped: no legacy oracle"
             continue
         stored = {k: v for k, v in stored.items() if k not in ("schema", "case", "mode")}
+        # v2's oracle: ``<mode>.delta.json`` (the legacy snapshot corrected by a
+        # behaviour-delta row) when present, else the legacy snapshot.
+        delta_path = snap.delta_snapshot_path(entry.name, mode) if hasattr(snap, "delta_snapshot_path") else None
+        v2_oracle = stored
+        if delta_path is not None and delta_path.exists():
+            delta = json.loads(delta_path.read_text())
+            row["oracle"] = f"delta {delta.get('delta')}"
+            v2_oracle = {k: v for k, v in delta.items() if k not in ("schema", "case", "mode", "delta")}
         row["preflight"] = wait_for_quiet(args.max_load)
         try:
             expected = copy.deepcopy(entry.prepare().reference()) if mode == "numsim" else None
@@ -377,9 +373,10 @@ def bench_case(args: argparse.Namespace) -> dict[str, Any]:
             if variant == "legacy":
                 return None if norm == stored else (
                     "legacy result differs from its own snapshot:\n" + snap.diff_snapshots(stored, norm)[:4000])
-            relaxed = snap.relax_unanchored(stored, norm)
-            if relaxed != stored:
-                return f"{variant} does not match the legacy snapshot:\n" + snap.diff_snapshots(stored, relaxed)[:4000]
+            relaxed = snap.relax_unanchored(v2_oracle, norm)
+            if relaxed != v2_oracle:
+                return (f"{variant} does not match its oracle ({row.get('oracle', 'legacy snapshot')}):\n"
+                        + snap.diff_snapshots(v2_oracle, relaxed)[:4000])
             if reference_norm is None:
                 reference_norm = norm
             elif norm != reference_norm:
@@ -391,7 +388,7 @@ def bench_case(args: argparse.Namespace) -> dict[str, Any]:
                 norm, rec = run_legacy(entry, mode, w, expected)
                 rec = {"times": rec}
             else:
-                norm, rec = run_v2(v2, entry, mode, variant, w, expected, codegen_cache)
+                norm, rec = run_v2(v2, entry, mode, w, expected)
             problem = check(variant, norm)
             if problem:
                 raise RowAbort(problem, norm)
@@ -402,20 +399,6 @@ def bench_case(args: argparse.Namespace) -> dict[str, Any]:
             # Eligibility: v2-interp must match the legacy snapshot.
             first = one("interp", workers[0])
             row["eligibility_run"] = first
-            # Cold codegen builds (once per case and opt level; the module is
-            # mode independent). With a prebuild record (``prebuild``
-            # subcommand) the cold times come from there and the cache is
-            # already warm; otherwise build inline here. Clear once: O1 and O3
-            # libraries have distinct keys and must both stay cached.
-            cold_todo = [v for v in ("codegen-O1", "codegen-O3") if v in args.variants and v not in cold_done]
-            if cold_todo and args.prebuilt is not None:
-                cold_todo = []
-            elif cold_todo:
-                clear_codegen_libs(codegen_cache)
-            for variant in cold_todo:
-                rec = one(variant, workers[0])
-                out.setdefault("codegen_cold", {})[variant] = {"build_s": rec["times"]["build"], "mode": mode, "run": rec}
-                cold_done.add(variant)
             for w in workers:
                 samples: dict[str, list[dict]] = {v: [] for v in args.variants}
                 reps = args.repeats
@@ -452,102 +435,6 @@ class RowAbort(Exception):
         self.reason = reason
         self.norm = norm
 
-
-
-# --------------------------------------------------------------------------
-# Codegen prebuild (cold build times; parallel, before the timed sweep)
-
-
-def build_case(args: argparse.Namespace) -> dict[str, Any]:
-    """Child: build the codegen library of one case at each opt level.
-
-    A ``max_rounds=1`` NumSim run triggers ``backend_for`` (emit + rustc +
-    dlopen) and stops right after; ``timing.build`` is the cold build time
-    (the numsim-core rlib must already be cached). ``NUMSIM_CODEGEN_LOG=1``
-    makes the engine print the cache key, from which the generated source
-    size is read.
-    """
-
-    os.chdir(HARNESS)
-    sys.path.insert(0, str(HARNESS))
-    v2 = import_v2(args.v2_package)
-    from tests.numsim.corpus.canonical_cases import CANONICAL_KERNEL_CASES
-
-    run_mod = sys.modules[v2.Engine.__module__]
-    entry = next(e for e in CANONICAL_KERNEL_CASES if e.name == args.case)
-    case = entry.prepare()
-    module = v2.transpile(case.kernel)
-    bound = run_mod.canonicalize_inputs(module, case.args)
-    out: dict[str, Any] = {"case": entry.name, "builds": {}}
-    for opt in (1, 3):
-        started = time.perf_counter()
-        try:
-            raw = run_mod.native().run(
-                module.handle, {name: b.native for name, b in bound.items()}, mode="numsim",
-                backend="codegen", workers=1, max_rounds=1, opt_level=opt,
-                codegen_cache_dir=str(args.codegen_cache),
-            )
-            out["builds"][f"codegen-O{opt}"] = {"build_s": float(raw["timing"]["build"]) / 1e3,
-                                                 "wall_s": time.perf_counter() - started}
-        except Exception as error:  # noqa: BLE001
-            out["builds"][f"codegen-O{opt}"] = {"error": f"{type(error).__name__}: {str(error)[:1500]}",
-                                                 "wall_s": time.perf_counter() - started}
-    return out
-
-
-def cmd_prebuild(args: argparse.Namespace) -> int:
-    from concurrent.futures import ThreadPoolExecutor
-
-    names = selected_cases(args)
-    target = Path(args.results) / "prebuild"
-    target.mkdir(parents=True, exist_ok=True)
-    cache = Path(args.codegen_cache)
-    if args.clear:
-        print(f"cleared {clear_codegen_libs(cache)} cached libraries", flush=True)
-
-    def one(name: str) -> None:
-        path = target / f"{name}.json"
-        if path.exists() and not args.force:
-            return
-        cmd = [sys.executable, __file__, "case-build", name, "--codegen-cache", args.codegen_cache]
-        if args.v2_package:
-            cmd += ["--v2-package", args.v2_package]
-        env = {**os.environ, "NUMSIM_CODEGEN_LOG": "1"}
-        started = time.perf_counter()
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.build_timeout, env=env)
-            stdout, stderr = proc.stdout, proc.stderr
-        except subprocess.TimeoutExpired as error:
-            stdout = ""
-            stderr = (error.stderr.decode() if isinstance(error.stderr, bytes) else (error.stderr or ""))
-            stderr += f"\ntimeout after {args.build_timeout}s"
-        if "@@RESULT@@" in stdout:
-            data = json.loads(stdout.split("@@RESULT@@", 1)[1])
-        else:
-            data = {"case": name, "error": stderr[-3000:], "builds": {}}
-        keys = re.findall(r"key (\w+) emit ([0-9.]+)ms core \S+ rustc (\S+)", stderr)
-        data["keys"] = [k for k, _, _ in keys]
-        sizes = []
-        for key in data["keys"]:
-            src = cache / f"gen-{key}" / "lib.rs"
-            sizes.append(src.stat().st_size if src.exists() else None)
-        data["source_bytes"] = sizes
-        data["prebuild_wall_s"] = time.perf_counter() - started
-        data["preflight"] = preflight(0.2)
-        path.write_text(json.dumps(data, indent=1, sort_keys=True))
-        builds = {k: (round(v["build_s"], 1) if "build_s" in v else "ERR") for k, v in data.get("builds", {}).items()}
-        print(f"[{time.strftime('%H:%M:%S')}] {name}: {builds} src={sizes} {data.get('error', '')[-200:]}", flush=True)
-
-    with ThreadPoolExecutor(args.jobs) as pool:
-        list(pool.map(one, names))
-    return 0
-
-
-def cmd_case_build(args: argparse.Namespace) -> int:
-    data = build_case(args)
-    sys.stdout.write("@@RESULT@@" + json.dumps(data, default=str))
-    sys.stdout.flush()
-    return 0
 
 
 def selected_cases(args: argparse.Namespace) -> list[str]:
@@ -592,10 +479,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             modes = ",".join(m for m in args.modes.split(",") if status.get(name, {}).get(m) == "match")
         cmd = [sys.executable, __file__, "case", name, "--modes", modes, "--workers", args.workers,
                "--repeats", str(args.repeats), "--max-load", str(args.max_load),
-               "--codegen-cache", args.codegen_cache, "--variants", ",".join(args.variants)]
-        prebuild_dir = results / "prebuild"
-        if prebuild_dir.exists() and not args.inline_cold_builds:
-            cmd += ["--prebuild-dir", str(prebuild_dir)]
+               "--variants", ",".join(args.variants)]
         if args.v2_package:
             cmd += ["--v2-package", args.v2_package]
         print(f"[{time.strftime('%H:%M:%S')}] {name} ({modes})", flush=True)
@@ -680,6 +564,22 @@ def _core(row: dict, variant: str, w: str) -> float | None:
     return run["min"]["run"] + run["min"]["check"]
 
 
+def _pct(values: list[float], q: float) -> float | None:
+    """Nearest-rank percentile."""
+
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, max(0, math.ceil(q / 100 * len(ordered)) - 1))]
+
+
+def _loaded(row: dict, limit: float = 40.0) -> bool:
+    """Any sample of the row taken while the 1-minute load average exceeded ``limit``."""
+
+    return any(x > limit for runs in row.get("runs", {}).values() for run in runs.values()
+               for x in run.get("load1", ()))
+
+
 def _ns_per_instr(row: dict, w: str) -> float | None:
     """Interp native run time per executed warp instruction (``stats.instrs``)."""
 
@@ -697,13 +597,15 @@ def cmd_render(args: argparse.Namespace) -> int:
     legacy_perf = json.loads(Path(args.legacy_perf).read_text()) if args.legacy_perf else None
     workers = sorted({w for c in cases for row in c.get("modes", {}).values()
                       for runs in row.get("runs", {}).values() for w in runs}, key=int)
+    present = [v for v in VARIANTS if any(v in row.get("runs", {}) for c in cases
+                                          for row in c.get("modes", {}).values())]
     doc = {"meta": meta, "cases": cases, "legacy_perf_tests": legacy_perf}
     Path(args.json).write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
 
     md: list[str] = []
     add = md.append
     add("---\norphan: true\n---\n")
-    add("# NumSim backend comparison (legacy vs v2 interp vs v2 codegen)\n")
+    add("# NumSim backend comparison (" + " vs ".join(present) + ")\n")
     add("Generated by `scripts/numsim-v2/bench_backends.py`; raw data in `backend-comparison.json`. "
         "Plan section 2.3: two backends behind one switch, compare on the corpus per mode, delete the loser.\n")
     if meta:
@@ -713,103 +615,72 @@ def cmd_render(args: argparse.Namespace) -> int:
         add("")
     add("Times are the minimum over the repetitions of the engine wall clock: legacy `Engine.run` / the "
         "phase loop (artifact already compiled); v2 the same public calls (input binding + native run + "
-        "report rendering), with the codegen library **cached** (cold build listed separately). "
-        "`core` columns are the v2 native `run + check` only (from `numsim_core_py.run()['timing']`). "
-        "Speedup = legacy / variant (> 1 means faster than legacy); `cg/int` = interp / codegen-O1 engine "
-        "time (> 1 means codegen faster).\n")
+        "report rendering). `core` columns are the v2 native `run + check` only (from `numsim_core_py.run()['timing']`). "
+        "Speedup = legacy / variant (> 1 means faster than legacy).\n")
 
+    if args.recommendation and Path(args.recommendation).exists():
+        add(Path(args.recommendation).read_text())
     # Summary.
     add("## Summary\n")
     add("Geometric means over rows measured in every variant (speedup vs legacy, engine wall clock).\n")
-    add("| mode | workers | rows | legacy | interp | codegen O1 | codegen O3 | interp vs legacy | O1 vs legacy | O3 vs legacy | O1 vs interp (engine) | O1 vs interp (core) | O3 vs interp (core) |")
-    add("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    others = [v for v in present if v != "legacy"]
+    head = ["mode", "workers", "rows", *present, *(f"{v} vs legacy" for v in others)]
+    add("| " + " | ".join(head) + " |")
+    add("|" + " --- |" * len(head))
     summary: dict[str, Any] = {}
     for mode in MODES:
         for w in workers:
             rows = [c["modes"][mode] for c in cases if c.get("modes", {}).get(mode, {}).get("status") == "ok"]
-            rows = [r for r in rows if all(_engine(r, v, w) for v in VARIANTS)]
+            rows = [r for r in rows if all(_engine(r, v, w) for v in present)]
             if not rows:
                 continue
-            g = {v: geomean([_engine(r, v, w) for r in rows]) for v in VARIANTS}
-            sp = {v: geomean([_engine(r, "legacy", w) / _engine(r, v, w) for r in rows]) for v in VARIANTS}
-            cg_eng = geomean([_engine(r, "interp", w) / _engine(r, "codegen-O1", w) for r in rows])
-            cg_core = geomean([(_core(r, "interp", w) or 0) / max(1e-9, _core(r, "codegen-O1", w) or 0) for r in rows
-                               if _core(r, "interp", w) and _core(r, "codegen-O1", w)])
-            o3_core = geomean([(_core(r, "interp", w) or 0) / max(1e-9, _core(r, "codegen-O3", w) or 0) for r in rows
-                               if _core(r, "interp", w) and _core(r, "codegen-O3", w)])
-            summary[f"{mode}/{w}"] = {"rows": len(rows), "geomean_s": g, "speedup_vs_legacy": sp,
-                                      "codegen_o1_vs_interp_engine": cg_eng, "codegen_o1_vs_interp_core": cg_core,
-                                      "codegen_o3_vs_interp_core": o3_core}
-            add(f"| {mode} | {w} | {len(rows)} | {fmt_s(g['legacy'])} | {fmt_s(g['interp'])} | "
-                f"{fmt_s(g['codegen-O1'])} | {fmt_s(g['codegen-O3'])} | {fmt_x(sp['interp'])} | "
-                f"{fmt_x(sp['codegen-O1'])} | {fmt_x(sp['codegen-O3'])} | {fmt_x(cg_eng)} | {fmt_x(cg_core)} | {fmt_x(o3_core)} |")
-    add("")
-
-    # Codegen build cost.
-    cold = [(c["case"], c["codegen_cold"]) for c in cases if c.get("codegen_cold")]
-    if cold:
-        add("## Codegen build cost\n")
-        b1 = [x["codegen-O1"]["build_s"] for _, x in cold if "codegen-O1" in x]
-        b3 = [x["codegen-O3"]["build_s"] for _, x in cold if "codegen-O3" in x]
-        warm = [c["modes"][m]["runs"][v][w]["min"]["build"] for c in cases for m in c.get("modes", {})
-                for v in ("codegen-O1", "codegen-O3") for w in c["modes"][m].get("runs", {}).get(v, {})]
-        lower = [c["lower_cold_s"] for c in cases if "lower_cold_s" in c]
-        add("| quantity | n | median | max |")
-        add("| --- | --- | --- | --- |")
-        for label, xs in (("cold codegen build O1 (rustc miss)", b1), ("cold codegen build O3 (rustc miss)", b3),
-                          ("cached codegen build (hit: cargo freshness + dlopen)", warm),
-                          ("cold v2 lowering (no module cache)", lower)):
-            if xs:
-                add(f"| {label} | {len(xs)} | {fmt_s(statistics.median(xs))} | {fmt_s(max(xs))} |")
-        add("")
-
-    # Win/loss lists.
-    add("## Where each backend wins\n")
-    for mode in MODES:
-        for w in workers:
-            rows = [(c["case"], c["modes"][mode], c.get("instr_mix", {})) for c in cases
-                    if c.get("modes", {}).get(mode, {}).get("status") == "ok"]
-            pairs = [(n, (_core(r, "interp", w) or 0) / max(1e-9, _core(r, "codegen-O1", w) or 0), mix)
-                     for n, r, mix in rows if _core(r, "interp", w) and _core(r, "codegen-O1", w)]
-            if not pairs:
-                continue
-            wins = sorted([p for p in pairs if p[1] > 1.05], key=lambda p: -p[1])
-            losses = sorted([p for p in pairs if p[1] < 0.95], key=lambda p: p[1])
-            add(f"- **{mode}, {w} workers** (core time, codegen O1 vs interp): codegen faster by >5% on "
-                f"{len(wins)}/{len(pairs)}, interp faster by >5% on {len(losses)}/{len(pairs)}. "
-                + ("Best codegen: " + ", ".join(f"`{n}` {x:.2f}x (heavy {m.get('heavy_pct', 0):.0f}%)" for n, x, m in wins[:5]) + ". " if wins else "")
-                + ("Best interp: " + ", ".join(f"`{n}` {1 / x:.2f}x (heavy {m.get('heavy_pct', 0):.0f}%)" for n, x, m in losses[:5]) + "." if losses else ""))
+            g = {v: geomean([_engine(r, v, w) for r in rows]) for v in present}
+            sp = {v: geomean([_engine(r, "legacy", w) / _engine(r, v, w) for r in rows]) for v in others}
+            cells = [mode, w, str(len(rows)), *(fmt_s(g[v]) for v in present), *(fmt_x(sp[v]) for v in others)]
+            summary[f"{mode}/{w}"] = {"rows": len(rows), "geomean_s": g, "speedup_vs_legacy": sp}
+            add("| " + " | ".join(cells) + " |")
     add("")
 
     # Instruction mix correlation.
+    _render_mix(add, cases, workers)
+
+    # Per-case tables.
+    _render_cases(add, cases, workers)
+
+    _render_tail(add, cases, legacy_perf, criterion)
+    Path(args.md).write_text("\n".join(md) + "\n")
+    print(f"wrote {args.json} and {args.md}")
+    return 0
+
+
+def _render_mix(add, cases, workers) -> None:
     add("## Instruction mix\n")
     add("Static `Instr` counts of the lowered module (`numsim_core_py.Module.to_json`), per family. "
         "`heavy` = tile / TMA / bulk copy / tcgen05 / ldmatrix instructions whose single dispatch does a "
-        "whole tile of work; the rest are per-lane scalar, control, warp and memory instructions where "
-        "dispatch overhead is what codegen removes. Rows bucketed by heavy share, codegen O1 vs interp "
-        "core-time geomean at the largest worker count measured:\n")
+        "whole tile of work; the rest are per-lane scalar, control, warp and memory instructions. Rows bucketed by heavy share; geomeans at the largest "
+        "worker count measured:\n")
     w = workers[-1] if workers else None
-    add("| mode | bucket | rows | interp ns per warp instr (median) | O1 vs interp (core) | O3 vs interp (core) | interp vs legacy (engine) |")
-    add("| --- | --- | --- | --- | --- | --- | --- |")
+    add("| mode | bucket | rows | interp ns per warp instr (median) | interp vs legacy (engine) |")
+    add("| --- | --- | --- | --- | --- |")
     buckets = (("pure scalar (no heavy instrs)", 0, 1e-9), ("scalar-dominated (heavy < 1.5%)", 1e-9, 1.5),
                ("tile/TMA/MMA-rich (heavy >= 1.5%)", 1.5, 101))
     for mode in MODES:
         for label, lo, hi in buckets:
             rows = [c["modes"][mode] for c in cases if c.get("modes", {}).get(mode, {}).get("status") == "ok"
                     and lo <= c.get("instr_mix", {}).get("heavy_pct", 0) < hi]
-            rows = [r for r in rows if _core(r, "interp", w) and _core(r, "codegen-O1", w)]
+            rows = [r for r in rows if _core(r, "interp", w)]
             if not rows:
                 continue
-            o1 = geomean([_core(r, "interp", w) / _core(r, "codegen-O1", w) for r in rows])
-            o3 = geomean([_core(r, "interp", w) / _core(r, "codegen-O3", w) for r in rows if _core(r, "codegen-O3", w)])
             il = geomean([_engine(r, "legacy", w) / _engine(r, "interp", w) for r in rows if _engine(r, "legacy", w)])
             nspi = [_ns_per_instr(r, w) for r in rows]
             nspi = [x for x in nspi if x]
-            add(f"| {mode} | {label} | {len(rows)} | {statistics.median(nspi):.0f} | {fmt_x(o1)} | {fmt_x(o3)} | {fmt_x(il)} |"
-                if nspi else f"| {mode} | {label} | {len(rows)} | - | {fmt_x(o1)} | {fmt_x(o3)} | {fmt_x(il)} |")
+            add(f"| {mode} | {label} | {len(rows)} | {statistics.median(nspi):.0f} | {fmt_x(il)} |"
+                if nspi else f"| {mode} | {label} | {len(rows)} | - | {fmt_x(il)} |")
     add("")
 
-    # Per-case tables.
+
+
+def _render_cases(add, cases, workers) -> None:
     for mode in MODES:
         for w in workers:
             rows = [(c, c["modes"][mode]) for c in cases if mode in c.get("modes", {})
@@ -817,22 +688,24 @@ def cmd_render(args: argparse.Namespace) -> int:
             if not rows:
                 continue
             add(f"## {mode}, max_workers={w}\n")
-            add("| case | heavy% | dyn instrs | ns/instr | legacy | interp | O1 | O1 cold build | O3 | O3 cold build | interp/legacy | O1/legacy | O3/legacy | core interp | core O1 | core O3 | cg/int core |")
-            add("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+            add("`(L)` = measured under load: some repetition ran while the 1-minute load average exceeded 40.\n")
+            head = ["case", "heavy%", "dyn instrs", "ns/instr", "legacy", "interp", "interp/legacy", "core interp"]
+            add("| " + " | ".join(head) + " |")
+            add("|" + " --- |" * len(head))
             for c, r in sorted(rows, key=lambda cr: cr[0]["case"]):
-                leg, it, o1, o3 = (_engine(r, v, str(w)) for v in VARIANTS)
-                cold_ = c.get("codegen_cold", {})
+                leg, it = (_engine(r, v, str(w)) for v in VARIANTS)
                 instrs = r["runs"]["interp"][str(w)].get("stats", {}).get("instrs")
-                ci, c1, c3 = (_core(r, v, str(w)) for v in ("interp", "codegen-O1", "codegen-O3"))
-                add(f"| `{c['case']}` | {c.get('instr_mix', {}).get('heavy_pct', 0):.1f} | {instrs if instrs is not None else '-'} | "
-                    f"{(f'{_ns_per_instr(r, str(w)):.0f}' if _ns_per_instr(r, str(w)) else '-')} | "
-                    f"{fmt_s(leg)} | {fmt_s(it)} | {fmt_s(o1)} | {fmt_s(cold_.get('codegen-O1', {}).get('build_s'))} | "
-                    f"{fmt_s(o3)} | {fmt_s(cold_.get('codegen-O3', {}).get('build_s'))} | "
-                    f"{fmt_x(leg / it if leg and it else None)} | {fmt_x(leg / o1 if leg and o1 else None)} | "
-                    f"{fmt_x(leg / o3 if leg and o3 else None)} | {fmt_s(ci)} | {fmt_s(c1)} | {fmt_s(c3)} | "
-                    f"{fmt_x(ci / c1 if ci and c1 else None)} |")
+                ci = _core(r, "interp", str(w))
+                nspi = _ns_per_instr(r, str(w))
+                cells = [f"`{c['case']}`{' (L)' if _loaded(r) else ''}", f"{c.get('instr_mix', {}).get('heavy_pct', 0):.1f}",
+                         str(instrs) if instrs is not None else "-", f"{nspi:.0f}" if nspi else "-", fmt_s(leg), fmt_s(it)]
+                cells.append(fmt_x(leg / it if leg and it else None))
+                cells.append(fmt_s(ci))
+                add("| " + " | ".join(cells) + " |")
             add("")
 
+
+def _render_tail(add, cases, legacy_perf, criterion) -> None:
     # Rows not measured.
     add("## Rows not measured\n")
     add("| case | mode | status |")
@@ -852,17 +725,214 @@ def cmd_render(args: argparse.Namespace) -> int:
     for name, text in criterion.items():
         add(f"## Criterion: `{name}`\n")
         add("```text\n" + text.strip() + "\n```\n")
-    if args.recommendation and Path(args.recommendation).exists():
-        add(Path(args.recommendation).read_text())
-    Path(args.md).write_text("\n".join(md) + "\n")
-    print(f"wrote {args.json} and {args.md}")
+
+
+# --------------------------------------------------------------------------
+# Mega-MoE perf-budget workloads (not in the corpus sweep: too large)
+
+MEGA_CONFIGS = {
+    # alias: (registry label, derived-from label or None, overrides)
+    "small": ("p1_tok2_h1024_i512_e2_k1_bm16", None, {}),
+    "twenty_four_experts": ("t8_h1024_i512_e24_k2_g1", None, {}),
+    "medium": ("t64_h2048_i1536_e96_k4_g1", "t64_h4096_i1536_e96_k4_g1", {"hidden": 2048}),
+    "large": ("t64_h4096_i1536_e96_k4_g1", None, {}),
+}
+MEGA_NUM_SMS = 148  # as the legacy racecheck perf test
+
+
+def mega_one(args: argparse.Namespace) -> dict[str, Any]:
+    """Child: one (config, mode, impl, workers) Mega-MoE run, timed like the
+    legacy perf tests (transpile outside the timed region)."""
+
+    os.chdir(HARNESS)
+    sys.path.insert(0, str(HARNESS))
+    os.environ["TIRX_DEEPGEMM_NUM_SMS_OVERRIDE"] = str(MEGA_NUM_SMS)
+    os.environ.pop("NUMSIM_PROFILE", None)
+    from tests.numsim.corpus.kernels.deepgemm import prepare_mega_moe_case
+    from tests.numsim.support._tirx_kernels import load_tirx_kernel
+
+    label, base, overrides = MEGA_CONFIGS[args.config]
+    configs = {c["label"]: c for c in load_tirx_kernel("sm100_fp8_fp4_mega_moe").CONFIGS}
+    config = {**configs[base or label], **overrides, "label": label}
+    if args.impl == "legacy":
+        from tirx_harness import numsim as impl
+    else:
+        impl = import_v2(args.v2_package)
+    case = prepare_mega_moe_case(config)
+    out: dict[str, Any] = {"config": args.config, "label": label, "mode": args.mode, "impl": args.impl,
+                           "workers": args.workers_one, "preflight": preflight(0.5)}
+    cache = Path(os.environ.get("NUMSIM_CACHE_DIR", Path.home() / ".cache/tirx-harness/numsim")) / "bench-mega-moe"
+    engine = impl.Engine(max_workers=args.workers_one, native_loop_iteration_budget=10_000_000)
+    if args.mode == "numsim":
+        module = impl.transpile(case.kernel)
+        expected = case.reference()
+        started = time.perf_counter()
+        result = engine.run(module, case.args, subset=case.subset, assumptions=case.assumptions, outputs=case.outputs)
+        out["elapsed_s"] = time.perf_counter() - started
+        out["reference_ok"] = bool(impl.compare(result, expected, tolerances=case.comparisons).ok)
+        out["verdict"] = str(getattr(result, "verdict", None))
+        out["diagnostics"] = len(result.diagnostics)
+    else:
+        module = impl.transpile(case.kernel, cache_dir=cache, _analysis_capable=True, _analysis_checker="racecheck")
+        started = time.perf_counter()
+        result = engine.run_racecheck_phase(module, case.args, phase_index=0, subset=case.subset)
+        out["elapsed_s"] = time.perf_counter() - started
+        payload = result.to_dict()
+        out["verdict"] = result.verdict
+        out["findings"] = len(result.findings)
+        out["advisory_kinds"] = sorted(str(a.get("kind")) for a in result.advisories)
+        out["incomplete"] = len(payload.get("incomplete") or [])
+    out["load1_after"] = round(os.getloadavg()[0], 2)
+    return out
+
+
+def cmd_mega(args: argparse.Namespace) -> int:
+    target = Path(args.results) / "mega"
+    target.mkdir(parents=True, exist_ok=True)
+    for config in args.configs.split(","):
+        for mode in args.mega_modes.split(","):
+            for w in [int(x) for x in args.mega_workers.split(",")]:
+                for impl in args.impls.split(","):
+                    path = target / f"{config}.{mode}.{impl}.{w}.json"
+                    if path.exists() and not args.force:
+                        continue
+                    state = wait_for_quiet(args.max_load)
+                    cmd = [sys.executable, __file__, "mega-one", config, mode, impl, str(w)]
+                    if args.v2_package:
+                        cmd += ["--v2-package", args.v2_package]
+                    started = time.perf_counter()
+                    try:
+                        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.run_timeout)
+                        stdout, stderr, code = proc.stdout, proc.stderr, proc.returncode
+                    except subprocess.TimeoutExpired:
+                        stdout, stderr, code = "", f"timeout after {args.run_timeout:.0f}s", -1
+                    if "@@RESULT@@" in stdout:
+                        data = json.loads(stdout.split("@@RESULT@@", 1)[1])
+                    else:
+                        data = {"config": config, "mode": mode, "impl": impl, "workers": w,
+                                "error": stderr[-2000:] or f"exit {code}",
+                                "timeout": code == -1, "preflight": state}
+                    data["wall_s"] = time.perf_counter() - started
+                    path.write_text(json.dumps(data, indent=1, sort_keys=True))
+                    shown = f"{data['elapsed_s']:.2f}s" if "elapsed_s" in data else (
+                        "TIMEOUT" if data.get("timeout") else "ERROR " + data.get("error", "")[-200:])
+                    print(f"[{time.strftime('%H:%M:%S')}] mega {config} {mode} {impl} w={w}: {shown} "
+                          f"verdict={data.get('verdict')} load={state['loadavg']}", flush=True)
+    return 0
+
+
+def cmd_mega_one(args: argparse.Namespace) -> int:
+    try:
+        data = mega_one(args)
+    except Exception as error:  # noqa: BLE001
+        data = {"config": args.config, "mode": args.mode, "impl": args.impl, "workers": args.workers_one,
+                "error": f"{type(error).__name__}: {str(error)[:1500]}"}
+    sys.stdout.write("@@RESULT@@" + json.dumps(data, default=str))
+    sys.stdout.flush()
+    return 0
+
+
+def mega_rows(results: Path) -> list[dict[str, Any]]:
+    return [json.loads(p.read_text()) for p in sorted((results / "mega").glob("*.json"))]
+
+
+# --------------------------------------------------------------------------
+# Regression list (interp slower than legacy)
+
+
+def owner_guess(case: dict, mode: str, w: str) -> str:
+    """Heuristic owner of an interp-slower-than-legacy row.
+
+    * ``scheduler/W2``: at more than one worker, legacy gets >= 1.5x faster
+      from 1 worker to the largest count while interp gets < 1.2x faster.
+    * ``racecheck/W5`` / ``synccheck/W6``: the checker mode is slower than
+      legacy at 1 worker while NumSim of the same case is not.
+    * ``numsim/W2`` otherwise.
+    """
+
+    row = case["modes"][mode]
+    ws = sorted(row["runs"]["interp"], key=int)
+    lo, hi = ws[0], ws[-1]
+    leg_scale = _engine(row, "legacy", lo) / _engine(row, "legacy", hi)
+    int_scale = _engine(row, "interp", lo) / _engine(row, "interp", hi)
+    if w != lo and leg_scale >= 1.5 and int_scale < 1.2:
+        return "scheduler/W2"
+    if mode in ("racecheck", "synccheck") and _engine(row, "interp", lo) > _engine(row, "legacy", lo):
+        numsim = case["modes"].get("numsim", {})
+        numsim_slow = (numsim.get("status") == "ok" and lo in numsim["runs"].get("interp", {})
+                       and _engine(numsim, "interp", lo) > _engine(numsim, "legacy", lo))
+        if not numsim_slow:
+            return "racecheck/W5" if mode == "racecheck" else "synccheck/W6"
+    return "numsim/W2"
+
+
+def _mega_regressions(results: Path) -> list[tuple]:
+    """Mega-MoE rows where interp is slower than legacy (a timeout counts,
+    with the cap as a lower bound on interp). Owner: racecheck/W5 when the
+    racecheck slowdown is more than 1.5x the NumSim slowdown of the same
+    config and workers; scheduler/W2 when legacy scales with workers and
+    interp does not; numsim/W2 otherwise."""
+
+    data = mega_rows(results)
+    index = {(d["config"], d["mode"], d["impl"], int(d["workers"])): d for d in data}
+
+    def t(config, mode, impl, w):
+        d = index.get((config, mode, impl, w))
+        if d is None:
+            return None
+        if "elapsed_s" in d:
+            return float(d["elapsed_s"])
+        return float(d["wall_s"]) if d.get("timeout") else None
+
+    out = []
+    ws = sorted({k[3] for k in index})
+    for (config, mode, impl, w), d in sorted(index.items()):
+        if impl != "interp":
+            continue
+        leg, it = t(config, mode, "legacy", w), t(config, mode, "interp", w)
+        if not leg or not it or it <= leg:
+            continue
+        ratio = it / leg
+        owner = "numsim/W2"
+        if ws and w != ws[0]:
+            l1, i1 = t(config, mode, "legacy", ws[0]), t(config, mode, "interp", ws[0])
+            if l1 and i1 and l1 / leg >= 1.5 and i1 / it < 1.2 and not d.get("timeout"):
+                owner = "scheduler/W2"
+        if mode == "racecheck":
+            nl, ni = t(config, "numsim", "legacy", w), t(config, "numsim", "interp", w)
+            if not (nl and ni) or ratio > 1.5 * (ni / nl):
+                owner = "racecheck/W5"
+        verdict = "" if d.get("verdict") == index.get((config, mode, "legacy", w), {}).get("verdict") else " (verdict differs)"
+        name = f"mega_moe:{config}" + (" (timeout)" if d.get("timeout") else "") + verdict
+        out.append((ratio, name, mode, str(w), leg, it, owner, (d.get("preflight") or {}).get("loadavg", [0])[0] > 40))
+    return out
+
+
+def cmd_regressions(args: argparse.Namespace) -> int:
+    cases = [json.loads(p.read_text()) for p in sorted(Path(args.results).glob("*.json"))]
+    lines = ["case\tmode\tworkers\tlegacy_s\tinterp_s\tratio\towner_guess\tunder_load\tengine"]
+    rows = []
+    for c in cases:
+        for mode, row in c.get("modes", {}).items():
+            if row.get("status") != "ok":
+                continue
+            for w in sorted(row["runs"].get("interp", {}), key=int):
+                leg, it = _engine(row, "legacy", w), _engine(row, "interp", w)
+                if leg and it and it > leg:
+                    rows.append((it / leg, c["case"], mode, w, leg, it, owner_guess(c, mode, w), _loaded(row)))
+    rows += _mega_regressions(Path(args.results))
+    for ratio, case, mode, w, leg, it, owner, loaded in sorted(rows, key=lambda r: -r[0]):
+        shown = f"{it:.4f}" + ("+" if "(timeout)" in case else "")
+        lines.append(f"{case}\t{mode}\t{w}\t{leg:.4f}\t{shown}\t{ratio:.2f}\t{owner}\t{'yes' if loaded else 'no'}\t{args.engine}")
+    Path(args.out).write_text("\n".join(lines) + "\n")
+    print(f"wrote {len(rows)} rows to {args.out}")
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
-    default_cache = Path(os.environ.get("NUMSIM_CACHE_DIR", Path.home() / ".cache/tirx-harness/numsim")) / "bench-codegen"
+    default_root = Path(os.environ.get("NUMSIM_CACHE_DIR", Path.home() / ".cache/tirx-harness/numsim"))
 
     def common(p):
         p.add_argument("--modes", default=",".join(MODES))
@@ -870,52 +940,59 @@ def main() -> int:
         p.add_argument("--repeats", type=int, default=3)
         p.add_argument("--max-load", type=float, default=40.0)
         p.add_argument("--v2-package", default=None, help="frozen copy of the v2 package (with its .so)")
-        p.add_argument("--codegen-cache", default=str(default_cache))
-        p.add_argument("--variants", type=lambda s: s.split(","), default=list(VARIANTS))
+        p.add_argument("--variants", type=lambda s: s.split(","), default=list(VARIANTS),
+                       help=f"comma list of {','.join(VARIANTS)} (default: both)")
 
     run = sub.add_parser("run")
     common(run)
     run.add_argument("--cases", default=".")
-    run.add_argument("--results", default=str(default_cache.parent / "bench-backends"))
+    run.add_argument("--results", default=str(default_root / "bench-backends"))
     run.add_argument("--status-md", default=str(REPO / "docs/development/v2-conformance-status.md"),
                      help="only modes listed as 'match' here ('' = all modes; rows are re-verified anyway)")
     run.add_argument("--case-timeout", type=float, default=3 * 3600)
     run.add_argument("--force", action="store_true")
-    run.add_argument("--inline-cold-builds", action="store_true",
-                     help="measure cold codegen builds inside the sweep even when <results>/prebuild exists")
     case = sub.add_parser("case")
     case.add_argument("case")
-    case.add_argument("--prebuild-dir", default=None)
     common(case)
-    pre = sub.add_parser("prebuild", help="build every case's codegen libraries in parallel (cold build times)")
-    common(pre)
-    pre.add_argument("--cases", default=".")
-    pre.add_argument("--results", default=str(default_cache.parent / "bench-backends"))
-    pre.add_argument("--status-md", default=str(REPO / "docs/development/v2-conformance-status.md"))
-    pre.add_argument("--jobs", type=int, default=12)
-    pre.add_argument("--build-timeout", type=float, default=2 * 3600)
-    pre.add_argument("--clear", action="store_true", help="remove cached gen-* libraries first")
-    pre.add_argument("--force", action="store_true")
-    cb = sub.add_parser("case-build")
-    cb.add_argument("case")
-    common(cb)
     render = sub.add_parser("render")
-    render.add_argument("--results", default=str(default_cache.parent / "bench-backends"))
+    render.add_argument("--results", default=str(default_root / "bench-backends"))
     render.add_argument("--json", default=str(REPO / "docs/development/backend-comparison.json"))
     render.add_argument("--md", default=str(REPO / "docs/development/backend-comparison.md"))
     render.add_argument("--meta", default=None, help="JSON object of setup facts for the header")
     render.add_argument("--criterion", nargs="*", help="criterion output text files (one section each)")
     render.add_argument("--legacy-perf", default=None, help="JSON with a 'markdown' key")
     render.add_argument("--recommendation", default=None, help="markdown appended verbatim")
+    reg = sub.add_parser("regressions", help="every (case, mode, workers) row where interp is slower than legacy")
+    reg.add_argument("--results", default=str(default_root / "bench-backends"))
+    reg.add_argument("--out", default=str(REPO / "scripts/numsim-v2/coverage/perf_regressions.tsv"))
+    reg.add_argument("--engine", default="", help="engine commit label written into every row")
+    mega = sub.add_parser("mega", help="Mega-MoE perf-budget workloads, legacy vs interp")
+    mega.add_argument("--configs", default=",".join(MEGA_CONFIGS))
+    mega.add_argument("--mega-modes", default="numsim,racecheck")
+    mega.add_argument("--mega-workers", default="1,16,32")
+    mega.add_argument("--impls", default="legacy,interp")
+    mega.add_argument("--run-timeout", type=float, default=900.0)
+    mega.add_argument("--max-load", type=float, default=40.0)
+    mega.add_argument("--v2-package", default=None)
+    mega.add_argument("--results", default=str(default_root / "bench-backends"))
+    mega.add_argument("--force", action="store_true")
+    m1 = sub.add_parser("mega-one")
+    m1.add_argument("config", choices=list(MEGA_CONFIGS))
+    m1.add_argument("mode", choices=["numsim", "racecheck"])
+    m1.add_argument("impl", choices=["legacy", "interp"])
+    m1.add_argument("workers_one", type=int)
+    m1.add_argument("--v2-package", default=None)
     args = parser.parse_args()
+    if args.cmd == "mega":
+        return cmd_mega(args)
+    if args.cmd == "mega-one":
+        return cmd_mega_one(args)
+    if args.cmd == "regressions":
+        return cmd_regressions(args)
     if args.cmd == "run":
         return cmd_run(args)
     if args.cmd == "case":
         return cmd_case(args)
-    if args.cmd == "prebuild":
-        return cmd_prebuild(args)
-    if args.cmd == "case-build":
-        return cmd_case_build(args)
     return cmd_render(args)
 
 

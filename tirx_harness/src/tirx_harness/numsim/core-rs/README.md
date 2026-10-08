@@ -10,8 +10,9 @@ Workspace members (`Cargo.toml`): `numsim-types` (shared plain types),
 `numsim-core` (everything below), `numsim-oplib` (bit-exact numerics),
 `numsim-py` (pyo3 bindings, feature `python`), `numsim-sync-ref` (the
 independent sync reference state machine, compared by
-`numsim-core/tests/sync_differential.rs`), and `numsim-race-core` (the
-racecheck prototype; no crate depends on it).
+`numsim-core/tests/sync_differential.rs`). Racecheck's pruning-technique
+guards are `numsim-core/benches/racecheck.rs` and the corpus on/off table
+`numsim-core/examples/racecheck_tuning_table.rs`.
 
 ```
 cargo build && cargo test && cargo doc --no-deps
@@ -29,10 +30,10 @@ PYO3_PYTHON=python3 cargo check -p numsim-py --features python
 | `observe` | `Observer`, `Access` (hot), `SyncEvent{actor, seq, site, frames, lanes, kind: SyncKind}` (cold), `NoopObserver`, `RecordingObserver` | complete |
 | `sync` | `SyncTable`, `ResourceId`, `Completion`, `AsyncOp`, `Payload`, per-protocol `State/Cmd/Outcome/Error` copied from `numsim-sync-ref` | implemented (W3/W6) |
 | `interp` | `WarpState`, `MaskFrame`, `ExecCtx`, `Flow`, `StepResult`, `ExecError`, `step_warp`, **`interp::handlers`** (one fn per family + `dispatch`) | implemented (W2) |
-| `sched` | `Scheduler`, `CtaState`, `Inbox`, `RunConfig`, `Inputs`/`Outputs`, `Backend`, `run`, `resolve_launch` | implemented (W2) |
+| `sched` | `Scheduler`, `CtaState`, `Inbox`, `RunConfig`, `Inputs`/`Outputs`, `run`, `resolve_launch` | implemented (W2) |
 | `oplib` | `Scalar`/`FloatScalar`, TIR ALU entry points, `PtxIo`/`PtxFn`/`resolve_ptx`, TMA/descriptor/MMA, op registry -> SUPPORTED_OPS.md | implemented (W4) |
 | `report` | `Finding`, `FindingKind`, `Status`, `Verdict`, `Evidence`, `Report` | complete |
-| `racecheck`, `synccheck`, `codegen` | online race checker, offline sync explorer, `Program` printer | implemented (W5, W6, W7); `codegen` is slated for deletion (`docs/development/backend-comparison.md`) |
+| `racecheck`, `synccheck` | online race checker, offline sync explorer | implemented (W5, W6) |
 | `testutil` | `ProgramBuilder` for handwritten tests | implemented |
 
 ## Ownership
@@ -50,7 +51,6 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
 | W4 oplib | `numsim-core/src/oplib/` |
 | W5 racecheck | `numsim-core/src/racecheck/` |
 | W6 synccheck | `numsim-core/src/synccheck/` |
-| W7 codegen | `numsim-core/src/codegen/` |
 | W8 python + test infra | `numsim-py/`, `numsim/v2/*.py`, snapshot infra, CI |
 
 ## Contract decisions
@@ -70,8 +70,8 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
 3. **Operands** are `Reg | Const(ConstId)` (no immediates); constants are
    interned `Const{ty, bits: u128}`.
 4. **Sites** live in the parallel array `Program::code_sites` instead of a
-   `site` field per variant (same information, one rule for handlers and
-   codegen: `ctx.site()`).
+   `site` field per variant (same information; handlers read it with
+   `ctx.site()`).
 5. **Control flow**: `If{elect}/Else/EndIf`, `LoopBegin/LoopIf/LoopEnd`,
    `Break/Continue`, per-lane `Exit`. Loops carry no id: the iteration
    counter lives in the mask frame; the `LoopBegin` site identifies the
@@ -137,5 +137,3 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
       - `tcgen05.mma`: D (TMEM) 0, A 1 (the shared-A read op), B 2.
       - `tcgen05.cp`: TMEM 0, shared source 1.
       - `tcgen05.ld/st` TMEM and register spans: 0.
-    - The codegen backend runs the same handlers and carries no access
-      semantics of its own.

@@ -5,10 +5,10 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use numsim_race_core::clock::{Clock, JoinMemo, Stamp};
-use numsim_race_core::input::*;
-use numsim_race_core::shadow::IntervalShadow;
-use numsim_race_core::Checker;
+use numsim_core::racecheck::clock::{Clock, JoinMemo, Stamp};
+use numsim_core::racecheck::input::*;
+use numsim_core::racecheck::shadow::IntervalShadow;
+use numsim_core::racecheck::Checker;
 use numsim_core::observe::CtaId;
 
 const BAR: SyncObjId = SyncObjId::Named { cta: CtaId(0), id: 0 };
@@ -268,5 +268,77 @@ fn checker_readers(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers);
+fn acc(warp: u32, lane: u8, epoch: u32, kind: AccessKind, range: std::ops::Range<u64>, site: u32) -> Event {
+    Event::Access(Access {
+        seq: 0,
+        who: Who::Lane { warp, lane, epoch },
+        alloc: AllocId(1),
+        range,
+        kind,
+        order: MemOrder::Weak,
+        scope: None,
+        atomic: false,
+        proxy: Proxy::Generic,
+        domain: Some(Domain::SharedCta),
+        site: SiteId(site),
+        returns_value: false,
+        operand: 0,
+    })
+}
+
+/// Frontier eviction (`tuning::FRONTIER_EVICTION`, window `cell::EVICT_WINDOW`).
+/// `same_lane_loop`: one lane rewrites a cell that 32 lanes read each
+/// iteration (warp-synchronised); an idle second warp keeps GC from dropping
+/// anything, so without eviction the write frontier grows by one per
+/// iteration and every write rescans it. `read_shared`: 512 unordered
+/// warps x 32 lanes read one word repeatedly, the shape that made the old
+/// full-frontier eviction scan quadratic (recurrent_kda_decode_one_warp).
+fn frontier_eviction(c: &mut Criterion) {
+    use numsim_core::racecheck::tuning::FRONTIER_EVICTION;
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut loop_ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: 1 << 16, cta: 0 })];
+    let mut e = 0u32;
+    for _ in 0..4096 {
+        e += 1;
+        for l in 0..32u8 {
+            loop_ev.push(acc(0, l, e, AccessKind::Read, 0..4, 1));
+        }
+        e += 1;
+        loop_ev.push(Event::Sync(SyncEvent::WarpSync { warp: 0, mask: LaneMask::ALL, epoch: e }));
+        e += 1;
+        loop_ev.push(acc(0, 0, e, AccessKind::Write, 0..4, 2));
+        e += 1;
+        loop_ev.push(Event::Sync(SyncEvent::WarpSync { warp: 0, mask: LaneMask::ALL, epoch: e }));
+    }
+    let loop_topo = Topology { warps_per_cta: 2, ctas_per_cluster: 1, num_ctas: 1 };
+    let shared_topo = Topology { warps_per_cta: 1, ctas_per_cluster: 1, num_ctas: 512 };
+    let mut shared_ev: Vec<Event> = Vec::new();
+    for it in 1..=4u32 {
+        for w in 0..512u32 {
+            for l in 0..32u8 {
+                if it == 1 && w == 0 && l == 0 {
+                    shared_ev.push(Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Global, size: 1 << 16, cta: 0 }));
+                }
+                if let Event::Access(mut a) = acc(w, l, it, AccessKind::Read, 0..4, 3) {
+                    a.domain = Some(Domain::Global);
+                    shared_ev.push(Event::Access(a));
+                }
+            }
+        }
+    }
+    let mut g = c.benchmark_group("frontier_eviction");
+    g.sample_size(10);
+    for (name, topo, ev) in [("same_lane_loop", loop_topo, &loop_ev), ("read_shared", shared_topo, &shared_ev)] {
+        for on in [true, false] {
+            g.bench_function(BenchmarkId::new(name, if on { "on" } else { "off" }), |b| {
+                FRONTIER_EVICTION.store(on, Relaxed);
+                b.iter(|| black_box(Checker::run(topo, ev.iter().cloned())));
+                FRONTIER_EVICTION.store(true, Relaxed);
+            });
+        }
+    }
+    g.finish();
+}
+
+criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction);
 criterion_main!(benches);

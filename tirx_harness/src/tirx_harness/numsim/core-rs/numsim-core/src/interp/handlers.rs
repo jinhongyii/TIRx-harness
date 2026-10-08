@@ -229,7 +229,7 @@ pub fn load_addr(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, addr: Operand, space: 
     mem::load_addr(ctx, ty, dst, addr, space, sem, scope, mods)
 }
 
-/// As `store` but through an address value; remote shared::cluster stores go to the outbox.
+/// As `store` but through an address value (remote shared::cluster stores apply at issue).
 #[inline(always)]
 pub fn store_addr(ctx: &mut ExecCtx<'_>, ty: Ty, addr: Operand, space: AddrSpace, value: Operand, sem: Sem, scope: Scope, mods: MemMods) -> HResult {
     mem::store_addr(ctx, ty, addr, space, value, sem, scope, mods)
@@ -355,7 +355,7 @@ pub fn mbar_inval(ctx: &mut ExecCtx<'_>, mbar: Operand, space: AddrSpace) -> HRe
     sync::mbar_inval(ctx, mbar, space)
 }
 
-/// mbarrier `Arrive` (local) or outbox message (remote / multicast, all-or-nothing).
+/// mbarrier `Arrive` (local, remote or multicast: applied at issue, all-or-nothing).
 #[inline(always)]
 pub fn mbar_arrive(ctx: &mut ExecCtx<'_>, args: MbarArriveArgs) -> HResult {
     sync::mbar_arrive(ctx, args)

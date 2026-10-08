@@ -68,8 +68,9 @@ the numerical-change rule in `CLAUDE.md`.
 
 Two crates are test oracles and benchmarks, not production code:
 `numsim-sync-ref` (one small, obviously correct reference state machine per
-protocol) and `numsim-race-core` (criterion benchmarks for racecheck's
-pruning techniques; synccheck's are `numsim-core/benches/synccheck.rs`).
+protocol). The pruning-technique guards are criterion benches in
+`numsim-core/benches/` (`racecheck.rs`, `synccheck.rs`); racecheck's corpus
+on/off table is `numsim-core/examples/racecheck_tuning_table.rs`.
 
 ## Data flow
 

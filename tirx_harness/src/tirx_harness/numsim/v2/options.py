@@ -3,7 +3,6 @@
 | variable | meaning | default |
 | --- | --- | --- |
 | ``NUMSIM_CACHE_DIR`` | cache root; v2 modules live under ``<root>/v2-modules`` | ``~/.cache/tirx-harness/numsim`` |
-| ``NUMSIM_V2_BACKEND`` | ``interp`` or ``codegen`` | ``interp`` |
 | ``NUMSIM_V2_SEED`` | scheduler seed | ``0`` |
 | ``NUMSIM_V2_NO_CACHE`` | ``1`` disables the module cache | unset |
 """
@@ -14,13 +13,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-BACKENDS = ("interp", "codegen")
-
 
 @dataclass(frozen=True)
 class Options:
     cache_root: Path
-    backend: str
     seed: int
     use_cache: bool
 
@@ -34,12 +30,9 @@ def options() -> Options:
 
     root = os.environ.get("NUMSIM_CACHE_DIR")
     cache_root = Path(root) if root else Path.home() / ".cache" / "tirx-harness" / "numsim"
-    backend = os.environ.get("NUMSIM_V2_BACKEND", "interp").strip() or "interp"
-    if backend not in BACKENDS:
-        raise ValueError(f"NUMSIM_V2_BACKEND must be one of {BACKENDS}, got {backend!r}")
     seed = int(os.environ.get("NUMSIM_V2_SEED", "0") or 0)
     use_cache = os.environ.get("NUMSIM_V2_NO_CACHE", "") not in {"1", "true", "yes"}
-    return Options(cache_root=cache_root, backend=backend, seed=seed, use_cache=use_cache)
+    return Options(cache_root=cache_root, seed=seed, use_cache=use_cache)
 
 
-__all__ = ["BACKENDS", "Options", "options"]
+__all__ = ["Options", "options"]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["numsim-types", "numsim-core", "numsim-py", "numsim-oplib", "numsim-sync-ref", "numsim-race-core"]
+members = ["numsim-types", "numsim-core", "numsim-py", "numsim-oplib", "numsim-sync-ref"]
 
 [workspace.package]
 version = "0.1.0"

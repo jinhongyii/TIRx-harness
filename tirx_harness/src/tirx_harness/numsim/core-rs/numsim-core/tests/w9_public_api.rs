@@ -4,12 +4,12 @@
 
 use numsim_core::interp::ExecErrorKind;
 use numsim_core::observe::RecordingObserver;
-use numsim_core::sched::{self, Backend, RunOutcome, RunStatus};
+use numsim_core::sched::{self, RunOutcome, RunStatus};
 use numsim_core::testutil::scenarios::{self, Scenario};
 
 fn run(s: &Scenario) -> RunOutcome {
     let mut obs = RecordingObserver::new();
-    sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).expect("run starts")
+    sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).expect("run starts")
 }
 
 fn error(o: &RunOutcome) -> (ExecErrorKind, String) {

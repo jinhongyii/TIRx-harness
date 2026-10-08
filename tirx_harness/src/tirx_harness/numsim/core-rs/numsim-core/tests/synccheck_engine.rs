@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use numsim_core::observe::RecordingObserver;
 use numsim_core::report::Verdict;
-use numsim_core::sched::{self, Backend, RunStatus};
+use numsim_core::sched::{self, RunStatus};
 use numsim_core::synccheck::{check, resource_init, serialize, SynccheckConfig};
 use numsim_core::testutil::scenarios;
 
@@ -16,7 +16,7 @@ fn coverage(r: &numsim_core::report::Report, key: &str) -> u64 {
 
 fn run(s: &scenarios::Scenario) -> (RunStatus, RecordingObserver) {
     let mut log = RecordingObserver::new();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &s.config).unwrap();
     (o.status, log)
 }
 

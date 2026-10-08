@@ -271,6 +271,9 @@ pub enum Frontier {
     Many(Vec<Entry>),
 }
 
+/// How many of a frontier's newest entries a record tries to evict.
+pub const EVICT_WINDOW: usize = 8;
+
 impl Frontier {
     pub fn as_slice(&self) -> &[Entry] {
         match self {
@@ -288,7 +291,7 @@ impl Frontier {
         matches!(self, Frontier::Empty)
     }
 
-    /// Insert `new`, evicting priors it observes and subsumes.
+    /// Insert `new`, evicting recent priors it observes and subsumes.
     #[inline]
     pub fn record(&mut self, new: Entry, wide: &WideSpans, mut observed: impl FnMut(&Witness) -> bool) {
         let nw = new.w;
@@ -305,7 +308,23 @@ impl Frontier {
                 }
             }
             Frontier::Many(v) => {
-                v.retain(|p| !evict(&p.w));
+                // Only the newest EVICT_WINDOW entries are candidates: a
+                // full scan made every record O(frontier) and read-shared
+                // cells (thousands of unordered readers) quadratic. The
+                // candidates that matter (the same lane's previous access
+                // in a loop, siblings of the same instruction) are recent;
+                // older dominated entries are left to GC. Evicting a subset
+                // is always sound (an evicted entry is subsumed and
+                // observed by `new`).
+                let start = v.len().saturating_sub(EVICT_WINDOW);
+                let mut keep = start;
+                for r in start..v.len() {
+                    if !evict(&v[r].w) {
+                        v.swap(keep, r);
+                        keep += 1;
+                    }
+                }
+                v.truncate(keep);
                 v.push(new);
                 if v.len() == 1 {
                     let e = v.pop().unwrap();

@@ -87,6 +87,7 @@ impl NarrowFormat {
 
     /// Exact decode of one narrow code (low `width` bits, sign included) to f32; subnormals
     /// and E5M2 infinities exact. Any NaN code gives `f32::NAN` (`0x7fc0_0000`, sign dropped).
+    #[inline]
     pub fn decode_value(self, bits: u8) -> f32 {
         // Table lookup (perf, W4 profile: the per-element decode was ~7% of
         // `deepgemm_sm100_fp8_gemm_1d1d`): the table holds exactly the bits
@@ -112,7 +113,11 @@ impl NarrowFormat {
         let width = self.format().width_bits;
         let packed = u128::from_le_bytes(bytes);
         let mask = (1_u128 << width) - 1;
-        std::array::from_fn(|i| self.decode_value(((packed >> (i as u32 * width)) & mask) as u8))
+        // One table fetch per atom (the `OnceLock` load showed in the profile).
+        let table = &narrow_decode_table()[self as usize];
+        std::array::from_fn(|i| {
+            f32::from_bits(table[((packed >> (i as u32 * width)) & mask) as usize])
+        })
     }
 
     /// Decode one K=32 TMEM A word to four values (byte 0 first): FP4 in bits 2..5, FP6 in
@@ -195,6 +200,7 @@ impl CellDtype {
 
     /// Read a TMEM cell as f32: F32 bit-exact, F16 exact widening of the low half (NaN
     /// payload kept); the high half is ignored.
+    #[inline]
     pub fn decode(self, bytes: [u8; 4]) -> f32 {
         match self {
             Self::F32 => f32::from_le_bytes(bytes),
@@ -204,6 +210,7 @@ impl CellDtype {
 
     /// Write an accumulator value to a TMEM cell: F32 bit-exact; F16 RN-even to binary16
     /// (overflow to inf, NaN quieted keeping its high payload) with the high half zeroed.
+    #[inline]
     pub fn encode(self, value: f32) -> [u8; 4] {
         match self {
             Self::F32 => value.to_le_bytes(),
@@ -216,6 +223,7 @@ impl CellDtype {
 }
 
 /// Decode one 16-bit F16/BF16 operand (and optionally negate).
+#[inline]
 pub fn decode_b16(bits: u16, bf16: bool, negate: bool) -> f32 {
     let value = if bf16 {
         crate::cvt::bf16_bits_to_f32(bits)
@@ -230,6 +238,7 @@ pub fn decode_b16(bits: u16, bf16: bool, negate: bool) -> f32 {
 }
 
 /// Decode a packed TMEM A word of two F16/BF16 halves.
+#[inline]
 pub fn decode_b16_word(word: u32, bf16: bool, negate: bool) -> [f32; 2] {
     [word as u16, (word >> 16) as u16].map(|bits| decode_b16(bits, bf16, negate))
 }

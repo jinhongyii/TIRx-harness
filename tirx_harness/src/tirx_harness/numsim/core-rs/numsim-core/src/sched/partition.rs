@@ -9,7 +9,7 @@
 //! requests in partition order, so the result does not depend on how many
 //! threads executed the partitions.
 
-use super::{CompletionPolicy, CtaState, InboxMsg, Rng};
+use super::{CompletionPolicy, CtaState, Rng};
 use crate::arena::{addr, AllocId, Arena, ByteSpan, Space};
 use crate::interp::support::{self, AccessSpec, Accesses};
 use crate::interp::{ExecCtx, ExecError, ExecErrorKind, LaunchAux, LaunchCounters, Loaded, StepResult, WarpStatus, WarpStepFn};
@@ -20,7 +20,7 @@ use crate::observe::{
 use crate::program::{LaunchShape, Pc, Program, Proxy, Scope, Sem};
 use crate::site::SiteId;
 use crate::sync::completion::Payload;
-use crate::sync::{async_group, mbarrier, Completion, Outcome, Step, SyncTable};
+use crate::sync::{async_group, Completion, Outcome, Step, SyncTable};
 use crate::value::WarpMask;
 
 /// Read-only launch facts shared by every partition of a round.
@@ -63,7 +63,7 @@ enum Event {
     Access(OwnedAccess),
     Sync(SyncEvent),
     WarpDone(WarpId, WarpEnd),
-    InboxDrain(CtaId, u64),
+    RoundBoundary(CtaId, u64),
 }
 
 /// Observer that records a partition's callbacks for ordered replay.
@@ -140,7 +140,7 @@ impl EventBuffer {
                 }
                 Event::Sync(s) => observer.sync(&s),
                 Event::WarpDone(w, end) => observer.warp_done(w, end),
-                Event::InboxDrain(c, r) => observer.inbox_drain(c, r),
+                Event::RoundBoundary(c, r) => observer.round_boundary(c, r),
             }
         }
     }
@@ -186,8 +186,8 @@ impl Observer for EventBuffer {
     fn warp_done(&mut self, w: WarpId, end: WarpEnd) {
         self.events.push(Event::WarpDone(w, end));
     }
-    fn inbox_drain(&mut self, c: CtaId, r: u64) {
-        self.events.push(Event::InboxDrain(c, r));
+    fn round_boundary(&mut self, c: CtaId, r: u64) {
+        self.events.push(Event::RoundBoundary(c, r));
     }
 }
 
@@ -201,7 +201,6 @@ pub struct Partition {
     pub aux: LaunchAux,
     pub counters: LaunchCounters,
     pub completions: u64,
-    pub(crate) outbox: Vec<InboxMsg>,
     pub(crate) rng: Rng,
     pub(crate) events: EventBuffer,
     /// `(cta index, warp index)` of warps parked at a serial point
@@ -223,7 +222,6 @@ impl Partition {
             aux,
             counters: LaunchCounters::default(),
             completions: 0,
-            outbox: Vec::new(),
             rng: Rng::new(seed ^ ((first_cluster as u64 + 1) << 32)),
             events: EventBuffer { enabled: observing, history, events: Vec::new() },
             serial: Vec::new(),
@@ -254,28 +252,27 @@ impl Partition {
     }
 
     pub(crate) fn finished(&self) -> bool {
-        self.ctas.iter().all(|c| c.finished() && c.inbox.msgs.is_empty())
+        self.ctas.iter().all(|c| c.finished())
     }
 
-    /// One round of this partition: per CTA, drain its inbox, run one slice
-    /// per runnable warp, land async ops and apply enabled completions.
+    /// One round of this partition: per CTA, mark the round boundary, run one
+    /// slice per runnable warp, land async ops and apply enabled completions.
     pub(crate) fn run_round(&mut self, env: &Env<'_>, arena: &mut Arena) -> Result<bool, ExecError> {
         let mut progress = false;
         for ci in 0..self.ctas.len() {
-            progress |= self.drain_inbox(ci, env, arena)?;
+            self.events.round_boundary(self.ctas[ci].ctx.id, env.round);
             progress |= self.run_cta(ci, env, arena)?;
             let cta = self.ctas[ci].ctx.id;
             progress |= self.land(Some(cta), env, arena, env.config.completions == CompletionPolicy::Eager)?;
             progress |= self.apply_completions(env)?;
         }
-        progress |= self.route_outbox();
         Ok(progress)
     }
 
     /// Run one warp for at most `quantum` instructions; returns the result
     /// and whether a progress instruction completed.
     fn slice(&mut self, ci: usize, w: usize, env: &Env<'_>, arena: &mut Arena, quantum: u32) -> (StepResult, bool) {
-        let Partition { ctas, sync, outbox, counters, aux, events, .. } = self;
+        let Partition { ctas, sync, counters, aux, events, .. } = self;
         let CtaState { ctx: cctx, warps, buffers, .. } = &mut ctas[ci];
         let prog0 = counters.progress;
         let mut ctx = ExecCtx {
@@ -288,7 +285,6 @@ impl Partition {
             buffers,
             arena,
             sync,
-            outbox,
             observer: events,
             observing: env.observing,
             counters,
@@ -389,77 +385,7 @@ impl Partition {
         Ok(progress)
     }
 
-    /// Deliver CTA `ci`'s inbox (cross-CTA effects apply synchronously, so
-    /// this is a wake-up point; the drain is still observable).
-    fn drain_inbox(&mut self, ci: usize, env: &Env<'_>, arena: &mut Arena) -> Result<bool, ExecError> {
-        let msgs = std::mem::take(&mut self.ctas[ci].inbox.msgs);
-        let cta = self.ctas[ci].ctx.id;
-        let any = !msgs.is_empty();
-        for m in msgs {
-            match m {
-                InboxMsg::Write { alloc, offset, bytes, actor, site } => {
-                    let span = ByteSpan::new(offset, bytes.len() as u64);
-                    arena
-                        .write(support::whole(arena, alloc), &[span], &bytes)
-                        .map_err(|e| sched_error(ExecErrorKind::OutOfBounds, env.kernel, actor_warp(actor), site, e.to_string()))?;
-                    if env.observing {
-                        let mut acc = Accesses::default();
-                        acc.items.push((alloc, Some(Window::SharedCluster), LaneSpan { lane: ALL_LANES, span }));
-                        let spec = AccessSpec {
-                            actor,
-                            site,
-                            kind: AccessKind::Write,
-                            sem: Sem::Weak,
-                            scope: Scope::Cluster,
-                            atomic: false,
-                            returns_value: false,
-                            proxy: Proxy::Generic,
-                            operand: 0,
-                        };
-                        support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, spec, &mut acc);
-                    }
-                }
-                InboxMsg::Sync { resource, cmd, actor, site } => {
-                    let out = self.sync.step(resource, cmd).map_err(|e| {
-                        sched_error(ExecErrorKind::Protocol(e.clone()), env.kernel, actor_warp(actor), site, format!("{e:?}"))
-                    })?;
-                    if let Step::Done(Outcome::Mbarrier(mbarrier::Outcome::Arrived { gen, .. })) = out {
-                        if env.observing {
-                            self.events.sync(&SyncEvent {
-                                kernel: env.kernel,
-                                actor,
-                                seq: 0,
-                                site,
-                                frames: Vec::new(),
-                                lanes: WarpMask::NONE,
-                                kind: SyncKind::Arrive { obj: resource, phase: gen, release: None, scope: None },
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        self.events.inbox_drain(cta, env.round);
-        Ok(any)
-    }
 
-    /// Move outbox messages to their target CTAs' inboxes (within the
-    /// partition; cross-CTA effects of a cluster never leave it).
-    fn route_outbox(&mut self) -> bool {
-        if self.outbox.is_empty() {
-            return false;
-        }
-        for m in std::mem::take(&mut self.outbox) {
-            let target = match &m {
-                InboxMsg::Sync { resource: crate::sync::ResourceId::Mbarrier { cta, .. }, .. } => Some(*cta),
-                _ => m.target_hint().and_then(|a| self.aux.owner_cta.get(&a).copied()),
-            };
-            if let Some(c) = target.and_then(|t| self.ctas.iter_mut().find(|c| c.ctx.id == t)) {
-                c.inbox.msgs.push(m);
-            }
-        }
-        true
-    }
 
     /// Does landing `op` read-modify-write a shared (global) allocation
     /// through this shard? Such landings are serial points.
@@ -916,13 +842,6 @@ fn subtract_spans(spans: &[(AllocId, ByteSpan)], minus: &[(AllocId, ByteSpan)]) 
         out.extend(pieces.into_iter().map(|p| (a, p)));
     }
     out
-}
-
-fn actor_warp(a: Actor) -> WarpId {
-    match a {
-        Actor::Warp { warp, .. } => warp,
-        _ => WarpId(u32::MAX),
-    }
 }
 
 /// `.per_16bytes` copy report (W2-8): in each 16-byte chunk of the source

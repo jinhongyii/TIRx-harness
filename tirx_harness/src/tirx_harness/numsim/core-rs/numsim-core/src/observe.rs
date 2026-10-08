@@ -385,8 +385,9 @@ pub trait Observer {
     fn access(&mut self, _a: &Access<'_>) {}
     fn sync(&mut self, _e: &SyncEvent) {}
     fn warp_done(&mut self, _warp: WarpId, _end: WarpEnd) {}
-    /// Cross-CTA effects became visible to `cta` (inbox drained).
-    fn inbox_drain(&mut self, _cta: CtaId, _round: u64) {}
+    /// CTA `cta` starts its turn in scheduler round `round` (a natural pause
+    /// point, e.g. for checker garbage collection).
+    fn round_boundary(&mut self, _cta: CtaId, _round: u64) {}
 }
 
 /// NumSim's observer.
@@ -484,8 +485,8 @@ impl<A: Observer, B: Observer> Observer for (A, B) {
         self.0.warp_done(w, end);
         self.1.warp_done(w, end);
     }
-    fn inbox_drain(&mut self, c: CtaId, r: u64) {
-        self.0.inbox_drain(c, r);
-        self.1.inbox_drain(c, r);
+    fn round_boundary(&mut self, c: CtaId, r: u64) {
+        self.0.round_boundary(c, r);
+        self.1.round_boundary(c, r);
     }
 }

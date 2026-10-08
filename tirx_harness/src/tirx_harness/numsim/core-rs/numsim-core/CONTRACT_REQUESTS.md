@@ -3158,3 +3158,21 @@ Review of 934f2b3 (partitioned declared words), invariant I10: verdict indices m
   - (b) Compute verdicts after the merge. Buffer the predicate inputs and evaluate the bitset on the merged history at replay.
   - Either way, `observed` must count the merged entries delivered before the verdict.
 - **Not affected.** Serial-phase writers (`wait_satisfied_by_serial_phase_writes_numbers_like_the_delivery`) and a third partition reading round-start bytes (`two_writers_and_a_poller_number_like_the_delivery`) pass.
+
+## W2: inbox/outbox machinery deleted; `Observer::inbox_drain` renamed `round_boundary` (coordinator-directed, after 71cabbd)
+
+- Deleted: `sched::{InboxMsg, Inbox}`, `CtaState.inbox`, `ExecCtx.outbox`, `Partition::{outbox, drain_inbox, route_outbox}`, `Aux.owner_cta`. No producer existed (remote mbarrier ops, remote DSMEM stores and multicast apply at issue), so program-visible behaviour is unchanged. The silent drop of unroutable messages goes with it.
+- Observer API rename: `Observer::inbox_drain(cta, round)` is now `Observer::round_boundary(cta, round)`, with the same signature. The partition emits it once at the start of each CTA's turn in every round, which was already the case when the inbox was empty. Racecheck uses it only as a GC pause point. Renamed in observe.rs, racecheck/observer.rs, numsim-py/src/lib.rs and tests.
+
+## W2: W12-gaps 7–9 and the incremental WordTable merge (2026-10-08; no contract change)
+
+- **Gap 7.** `mbarrier.init` with active lanes naming neither one barrier nor one barrier per lane is a `Divergence` error. The `lane_split_mbarrier` scenario now initializes from lanes 0 and 16 only.
+- **Gap 8.** `oplib/ptx/hints.rs`, non-tensor `applypriority.async.bulk`: the size must be a multiple of 16 and the address 128-byte aligned (legacy `validate_bulk_cache_hint_range(..,128,..)`).
+- **Gap 9.** `Aux.tcgen_collectors`, per issuing thread. `tcgen_mma` runs `oplib::tc_collector_transition` at issue and commits the new state only when the issue succeeds. A missing `.collector_usage` counts as `::discard` (A and B0; for `.ws`, B0 only).
+- **WordTable.** `Scheduler::merge_words` no longer clones the table.
+  - Pre-merge log lengths are recorded per touched region.
+  - The verdict remap reads the partition's own table through a split borrow.
+  - The refresh rewrites only the log suffixes of touched regions in every partition. This is exact because each partition's log equals the launch-wide log up to the pre-merge length.
+  - Store and `tcgen.st` fast paths are now gated on whether *this* allocation holds declared words (`WordTable::has`), not on the table being non-empty.
+  - Fixture loader moved to `testutil::fixtures`.
+  - Criterion group `interp/recorded_word_history` added.

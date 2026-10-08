@@ -1516,11 +1516,7 @@ def _mark_tile_ops(func: Any) -> Any:
         if op in ("tirx.tile.gemm", "tirx.tile.gemm_async"):
             # Bits 1-9 / 10-18: the typed MMA shape (`mma_m`, `mma_n`) the kernel
             # declared, carried to each tcgen05.mma it dispatches to (W4-W11-7).
-            config = node.config
-            try:
-                m, n = int(config["mma_m"]), int(config["mma_n"])
-            except (KeyError, TypeError, ValueError):
-                m = n = 0
+            m, n = _declared_mma_tile(node)
             if 0 < m < 512 and 0 < n < 512:
                 value |= (m << 1) | (n << 10)
         return tirx.AttrStmt(
@@ -1528,6 +1524,32 @@ def _mark_tile_ops(func: Any) -> Any:
         )
 
     return func.with_body(structural_mutate(func.body, [(tirx.TilePrimitiveCall, on_call)]))
+
+
+def _declared_mma_tile(call: Any) -> tuple[int, int]:
+    """(M, N) of one tcgen05 instruction of a typed gemm, else (0, 0).
+
+    The explicit ``mma_m``/``mma_n`` config when given; otherwise TVM's own
+    choice from the accumulator region (``gemm_async/tcgen05._choose_mma_tile``
+    over per-CTA M = C rows, N = C columns; the batched ``.ws`` C[2, M, N/2]
+    form doubles N). M is the descriptor M (cluster-wide for cta_group 2).
+    """
+    config = call.config
+    try:
+        if "mma_m" in config and "mma_n" in config:
+            return int(config["mma_m"]), int(config["mma_n"])
+        from tvm.backend.cuda.tile_primitive.gemm_async.tcgen05 import _choose_mma_tile
+
+        cta_group = int(config["cta_group"]) if "cta_group" in config else 1
+        extents = [int(r.extent) for r in call.args[0].region]
+        if len(extents) == 3 and extents[0] == 2:
+            m, n = extents[1], extents[2] * 2
+        else:
+            m, n = extents[-2], extents[-1]
+        m_mma, n_mma = _choose_mma_tile(m, n, cta_group, 8 if cta_group == 1 else 16)
+        return int(m_mma) * cta_group, int(n_mma)
+    except Exception:
+        return 0, 0
 
 
 def _swap_out_these_calls(func: Any, calls: list[Any], reason: str) -> Any:

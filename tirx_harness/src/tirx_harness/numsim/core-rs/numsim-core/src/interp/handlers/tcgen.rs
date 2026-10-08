@@ -651,7 +651,7 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
     // W4-16: live, fully valid cell runs are patched in `image` and written
     // back once (validity is unchanged: already valid); other pieces take
     // the per-piece path. The images are flushed before any error returns.
-    let fast = !(ctx.aux.wants_history && !ctx.aux.words.is_empty());
+    let fast = !(ctx.aux.wants_history && ctx.aux.words.has(tmem));
     let mut runs = RunImages::load(ctx, tmem, map.cell_runs(), fast)?;
     let mut bytes = Vec::with_capacity(nregs * 4);
     let res = (|| -> Result<(), crate::interp::ExecError> {
@@ -835,6 +835,28 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
         None => None,
     };
     let active = ctx.warp.active;
+    // Collector buffers (W12-gaps 9): an absent `.collector_usage` is
+    // `::discard` (PTX default), so any MMA that does not fill/use/lastuse
+    // a buffer invalidates it — including the typed `gemm`/`gemm_async`
+    // dispatch (legacy `discard_mma_collectors`). `.ws` has no A collector.
+    let collectors = match active.first() {
+        Some(l) => {
+            let key = (ctx.warp.id, l as u8);
+            let ca = match args.collector_a {
+                CollectorOp::None if !args.ws => CollectorOp::Discard,
+                c => c,
+            };
+            let cb = match args.collector_b {
+                CollectorOp::None => CollectorOp::Discard,
+                c => c,
+            };
+            let state = ctx.aux.tcgen_collectors.get(&key).copied().unwrap_or(0);
+            let next = crate::oplib::tc_collector_transition(state, ca, cb, args.ws_b_buffer)
+                .map_err(|e| support::op_err(ctx, e))?;
+            Some((key, next))
+        }
+        None => None,
+    };
     let g = group(args.cta_group);
     let mut all = Vec::new();
     for l in active.lanes() {
@@ -925,6 +947,9 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
         if let (TcA::Smem(_), Some(p)) = (args.a, mma_payload) {
             shared_a_read(ctx, l, op, &p)?;
         }
+    }
+    if let Some((key, next)) = collectors {
+        ctx.aux.tcgen_collectors.insert(key, next);
     }
     support::protocol(ctx, active, all, ProtoExtra::default());
     Ok(Flow::Next)

@@ -1446,6 +1446,9 @@ pub struct MmaSpec {
     /// Lanes 0 and 1 both execute the MMA site (a kernel error: the MMA has
     /// a single issuing thread, W12-gaps 3).
     pub two_issuers: bool,
+    /// Issue one MMA per entry with that `collector::a` usage (later MMAs
+    /// accumulate); empty = one MMA without a collector qualifier.
+    pub collectors: &'static [CollectorOp],
 }
 
 /// M x N x K of [`tcgen_mma_f16`] (`kind::f16`, cta_group::1, f32 D).
@@ -1611,27 +1614,31 @@ pub fn tcgen_mma_f16(spec: MmaSpec, a: &[u16], b: &[u16]) -> Scenario {
     let ki = b_.k_u32(idesc);
     let ke = b_.k_u32(spec.accumulate as u32);
     b_.site("tcgen_mma", 2);
-    b_.push(Instr::TcgenMma(Box::new(TcgenMmaArgs {
-        kind: TcMmaKind::F16,
-        cta_group: 1,
-        d: t.into(),
-        a: TcA::Smem(da.into()),
-        b_desc: db.into(),
-        idesc: ki,
-        enable_input_d: ke,
-        ws: false,
-        ws_b_buffer: 0,
-        block_scale: None,
-        scale_input_d: None,
-        sparse_meta: None,
-        disable_output_lane: Vec::new(),
-        collector_a: CollectorOp::None,
-        collector_b: CollectorOp::None,
-        ashift: false,
-        lut_b: false,
-        lut_b_addr: None,
-        declared: None,
-    })));
+    let k1 = b_.k_u32(1);
+    let seq: &[CollectorOp] = if spec.collectors.is_empty() { &[CollectorOp::None] } else { spec.collectors };
+    for (i, &collector) in seq.iter().enumerate() {
+        b_.push(Instr::TcgenMma(Box::new(TcgenMmaArgs {
+            kind: TcMmaKind::F16,
+            cta_group: 1,
+            d: t.into(),
+            a: TcA::Smem(da.into()),
+            b_desc: db.into(),
+            idesc: ki,
+            enable_input_d: if i == 0 { ke } else { k1 },
+            ws: false,
+            ws_b_buffer: 0,
+            block_scale: None,
+            scale_input_d: None,
+            sparse_meta: None,
+            disable_output_lane: Vec::new(),
+            collector_a: collector,
+            collector_b: CollectorOp::None,
+            ashift: false,
+            lut_b: false,
+            lut_b_addr: None,
+            declared: None,
+        })));
+    }
     b_.push(Instr::TcgenCommit {
         mbar: ba.into(),
         space: AddrSpace::Shared,
@@ -1724,10 +1731,29 @@ pub fn tcgen_mma_f16_default() -> Scenario {
             accumulate: true,
             init_d: Some(1.0),
             two_issuers: false,
+            collectors: &[],
         },
         &a,
         &b,
     )
+}
+
+/// W12-gaps 9: [`tcgen_mma_f16`] issuing `collector::a::fill`, then an MMA
+/// without a collector qualifier (`valid = false`, PTX default `::discard`:
+/// the later `use` is an error) or `collector::a::use` (`valid = true`),
+/// then `collector::a::lastuse`.
+pub fn tcgen_mma_collectors(valid: bool) -> Scenario {
+    let f16 = numsim_oplib::arith::half::encode_f16;
+    let a: Vec<u16> = (0..MMA_M * MMA_K).map(|i| f16((i % 3) as f32 - 1.0)).collect();
+    let b: Vec<u16> = (0..MMA_N * MMA_K).map(|i| f16((i % 5) as f32 - 2.0)).collect();
+    let collectors: &'static [CollectorOp] = if valid {
+        &[CollectorOp::Fill, CollectorOp::Use, CollectorOp::LastUse]
+    } else {
+        &[CollectorOp::Fill, CollectorOp::None, CollectorOp::LastUse]
+    };
+    let mut s = tcgen_mma_f16(MmaSpec { accumulate: false, init_d: None, two_issuers: false, collectors }, &a, &b);
+    s.name = if valid { "tcgen_mma_collectors" } else { "tcgen_mma_collectors_discarded" };
+    s
 }
 
 /// W12-tile-forms 1: `AddrOf` on a vector-typed (`u32x4`) buffer uses the
@@ -3070,11 +3096,23 @@ pub fn lane_split_mbarrier() -> Scenario {
     b.lane_id(lane);
     let k0 = b.k_u32(0);
     let k4 = b.k_u32(4);
+    let k15 = b.k_u32(15);
+    let lo = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
     b.binary(BinOp::Shr, Ty::U32, i, lane, k4);
     b.smem_addr(m, bars, i);
+    // Lanes 0 and 16 initialize (one-to-one: W12-gaps 7 rejects 16 lanes
+    // initializing each barrier in one instruction).
+    b.binary(BinOp::And, Ty::U32, lo, lane, k15);
+    b.compare(CmpOp::Eq, Ty::U32, p, lo, k0);
+    b.if_(p);
     b.site("init", 1);
     b.mbar_init(m, 16);
+    b.no_site();
+    b.end_if();
     b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::WarpSync { membermask: full });
     b.site("split_arrive", 2);
     b.mbar_arrive(m, None);
     b.site("split_wait", 3);
@@ -3083,6 +3121,28 @@ pub fn lane_split_mbarrier() -> Scenario {
     b.st_u32(out, lane, i);
     b.exit();
     scenario("lane_split_mbarrier", b.build_module(), inputs(vec![("out", u32_buf([9; 32]))]))
+}
+
+/// W12-gaps 7: `mbarrier.init` through `bars[lane / 2]`: two lanes
+/// initialize each barrier in one instruction while other lanes name other
+/// barriers (neither warp-uniform nor one-to-one) — an error.
+pub fn mbar_init_partial_alias() -> Scenario {
+    let mut b = ProgramBuilder::new("mbar_init_partial_alias", 32);
+    let out = b.global("out", Dtype::U32);
+    let bars = b.shared("bars", Dtype::U64, 16);
+    let lane = b.reg(Ty::U32);
+    let i = b.reg(Ty::U32);
+    let m = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k1 = b.k_u32(1);
+    b.binary(BinOp::Shr, Ty::U32, i, lane, k1);
+    b.smem_addr(m, bars, i);
+    b.site("init", 1);
+    b.mbar_init(m, 1);
+    b.no_site();
+    b.st_u32(out, lane, i);
+    b.exit();
+    scenario("mbar_init_partial_alias", b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
 }
 
 /// M4: warp 0 waits in ONE instruction on `A` (lanes 0..16) and `B`
@@ -3627,6 +3687,33 @@ pub fn hint_ops(valid: bool) -> Scenario {
     b.st_u32(out, lane, lane);
     b.exit();
     scenario(if valid { "hint_ops" } else { "hint_ops_bad_addr" }, b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
+}
+
+/// W12-gaps 8: `applypriority.async.bulk` at a global address that is
+/// not 128-byte aligned (`out + 16`) is an invalid operand (legacy
+/// `validate_bulk_cache_hint_range(.., 128, ..)`).
+pub fn bulk_applypriority_misaligned() -> Scenario {
+    let mut b = ProgramBuilder::new("bulk_applypriority_misaligned", 32);
+    let out = b.global("out", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let a = b.reg(Ty::U64);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k4 = b.k_u32(4);
+    let k16 = b.k_u32(16);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.addr_of(a, out, k4);
+    b.site("applypriority_bulk", 1);
+    b.ptx("tirx.ptx.applypriority_async_bulk", &["async", "bulk", "global", "bulk_group", "L2::evict_normal"], &[], &[a.into(), k16]);
+    b.push(Instr::AsyncCommit { domain: Domain::Bulk });
+    b.push(Instr::AsyncWait { domain: Domain::Bulk, n: 0, read: false });
+    b.no_site();
+    b.end_if();
+    b.st_u32(out, lane, lane);
+    b.exit();
+    scenario("bulk_applypriority_misaligned", b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
 }
 
 /// `tcgen05.alloc.exclusive` of 576 columns, then dealloc: legal on
@@ -4189,6 +4276,8 @@ pub fn all() -> Vec<Scenario> {
         wait_until_chain(6),
         addr_of_vector_buffer(),
         tcgen_mma_f16_default(),
+        tcgen_mma_collectors(true),
+        tcgen_mma_collectors(false),
         cas128(),
         tmap_replace_generic_shared(),
         ptx_op_per_signature(),
@@ -4238,6 +4327,7 @@ pub fn all() -> Vec<Scenario> {
         cross_cluster_flag(true),
         bulk_wait_read(),
         lane_split_mbarrier(),
+        mbar_init_partial_alias(),
         atom_b128(),
         st_async_copy(),
         tcgen_after_dealloc(),
@@ -4249,6 +4339,7 @@ pub fn all() -> Vec<Scenario> {
         aliased_views(),
         hint_ops(true),
         hint_ops(false),
+        bulk_applypriority_misaligned(),
         tcgen_cp_ld_with(true),
         tcgen_exclusive_576("sm_100a"),
         reg_buffer_uninit(),

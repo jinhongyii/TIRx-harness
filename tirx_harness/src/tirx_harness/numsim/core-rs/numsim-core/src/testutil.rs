@@ -16,6 +16,7 @@
 //! assert!(p.validate().is_ok());
 //! ```
 
+pub mod fixtures;
 pub mod scenarios;
 
 use crate::arena::Space;

@@ -816,7 +816,7 @@ impl Checker {
         Some(self.report.findings.len() - 1)
     }
 
-    /// A natural pause (inbox drain): collect if a quarter period elapsed.
+    /// A natural pause (round boundary): collect if a quarter period elapsed.
     pub fn safe_point(&mut self) {
         if self.gc_every != 0 && self.since_gc >= self.gc_every.max(self.gc_period) / 4 {
             self.gc();
@@ -1330,7 +1330,11 @@ impl Checker {
         {
             let this = &*self;
             let wide = &self.wide;
+            // `ordered` of each prior this segment's check computed, reused
+            // by the record step's eviction (it asks the same question).
+            let mut judged: Vec<(Witness, bool)> = Vec::new();
             shadow.update(a.range.clone(), |seg, cell| {
+                judged.clear();
                 // 1. check
                 let mut check = |p: &Witness| {
                     // Sibling lanes of ONE warp instruction storing to the
@@ -1342,6 +1346,7 @@ impl Checker {
                         return;
                     }
                     let ordered = this.ordered(cur, p, a.proxy);
+                    judged.push((*p, ordered));
                     let ms = this.morally_strong(p, &w);
                     if !ordered && !ms {
                         races.push((overlap(p.span(wide), &seg), *p));
@@ -1407,7 +1412,11 @@ impl Checker {
                             word_rels.push((*i, rel.clone(), !*exact));
                         }
                     }
-                    cell.writes.record(Entry { w, rel, base }, wide, |p| this.ordered(cur, p, a.proxy));
+                    let judged = &judged;
+                    cell.writes.record(Entry { w, rel, base }, wide, |p| match judged.iter().find(|(q, _)| q == p) {
+                        Some(&(_, o)) => o,
+                        None => this.ordered(cur, p, a.proxy),
+                    });
                     if !strong {
                         // A plain write supersedes the readers it is ordered
                         // after; a strong write keeps them (a later access
@@ -2019,6 +2028,19 @@ impl Checker {
         slot.g2t_ranges = g2t_ranges;
         slot.completed_ctas.clear();
         slot.preds = pred_idx;
+        // Only the first range per allocation is ever read (the AllocEnd
+        // lifetime check); keep one entry per allocation so that check is
+        // O(allocations touched), not O(boxes) per in-flight op.
+        let mut footprint = footprint;
+        let mut seen_allocs: Vec<AllocId> = Vec::new();
+        footprint.retain(|(al, _)| {
+            if seen_allocs.contains(al) {
+                false
+            } else {
+                seen_allocs.push(*al);
+                true
+            }
+        });
         slot.footprint = footprint;
         slot.done = 0;
         slot.drained = false;

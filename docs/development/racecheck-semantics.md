@@ -841,7 +841,7 @@ From `RaceCheckIncompleteReason` (RC:71-140) and RCP:592-735:
 | Path | What it is |
 | --- | --- |
 | `numsim-core/src/racecheck/` | the core: `clock`, `knowledge`, `shadow`, `cell`, `checker`; an alias layer `input`; the adapter `observer`; and `payload` |
-| `numsim-race-core/` | re-exports the core and keeps the criterion benches |
+| `numsim-core/benches/racecheck.rs`, `numsim-core/examples/racecheck_tuning_table.rs` | criterion guards of the pruning techniques; corpus on/off table (fixtures recorded by `numsim-core/examples/record_race_fixtures.py` into `core-rs/target/race-fixtures`, never committed) |
 | `numsim-core/tests/racecheck_*.rs` | 80 scenario tests that drive `RaceObserver` through contract `Access`/`SyncEvent` values |
 
 ### Adapter (`observer.rs`)
@@ -865,7 +865,7 @@ From `RaceCheckIncompleteReason` (RC:71-140) and RCP:592-735:
 ### Merge design
 
 The scheduler is single-threaded, so there is one shadow and it is always
-merged; `inbox_drain` is only a GC safe point. When CTA parallelism lands:
+merged; `round_boundary` (formerly `inbox_drain`) is only a GC safe point. When CTA parallelism lands:
 - shared memory and TMEM stay CTA-private;
 - the global shadow is partitioned by stripe;
 - a round's global accesses are applied at the receiving CTA's next drain, in

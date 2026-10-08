@@ -508,6 +508,18 @@ pub fn mbar_init(ctx: &mut ExecCtx<'_>, mbar: Operand, space: AddrSpace, count: 
     active_or_next!(ctx);
     let active = ctx.warp.active;
     let t = mbar_collapse(ctx, mbar, space, Some(count))?;
+    // Two lanes initializing one barrier in one instruction while other
+    // lanes name other barriers is a concurrent non-atomic init (legacy
+    // rule, W12-gaps 7): the pointer must be warp-uniform or one-to-one.
+    let n = active.count() as usize;
+    if t.len() != 1 && t.len() != n {
+        return Err(support::err(
+            ctx,
+            ExecErrorKind::Divergence,
+            active,
+            format!("mbarrier.init pointer must be warp-uniform or one-to-one across active lanes ({} lanes name {} barriers)", n, t.len()),
+        ));
+    }
     let cmds: Vec<(ResourceId, SyncCmd)> =
         t.iter().map(|&(r, c)| (r, SyncCmd::Mbarrier(mbarrier::Cmd::Init { count: c, layout_v1 }))).collect();
     support::step_all(ctx, &cmds)?;

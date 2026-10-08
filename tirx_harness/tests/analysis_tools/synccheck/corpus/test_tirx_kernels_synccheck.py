@@ -6,7 +6,6 @@ import pytest
 
 from tests.numsim.corpus.canonical_cases import CANONICAL_KERNEL_CASES
 from tirx_harness import numsim
-from tirx_harness.numsim.api import ExecutionSubset
 
 
 def _resource_limits(*, max_diagnostic_bytes: int = 16 * 1024 * 1024) -> numsim.ResourceLimits:
@@ -84,7 +83,7 @@ def test_native_synccheck_validates_flashmla_small_topk_task_steal(
         if item.name == "sparse_flashmla_prefill_head128_small_topk_phase1"
     )
     case = entry.prepare()
-    subset = ExecutionSubset(cluster_ids=[0])
+    subset = numsim.ExecutionSubset(cluster_ids=[0])
     module = numsim.transpile(
         case.kernel,
         cache_dir=tmp_path_factory.getbasetemp() / "flashmla-task-steal-synccheck-cache",

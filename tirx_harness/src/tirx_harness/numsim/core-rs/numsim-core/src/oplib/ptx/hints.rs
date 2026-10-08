@@ -61,15 +61,26 @@ fn applypriority(io: &mut PtxIo<'_>) -> OpResult {
 /// `validate_bulk_cache_hint_range(.., 16, ..)` — size a multiple of 16 and
 /// a 16-byte aligned address.
 fn bulk_prefetch(io: &mut PtxIo<'_>) -> OpResult {
+    bulk_range(io, 16, "cp.async.bulk.prefetch")
+}
+
+/// `applypriority.async.bulk.bulk_group [a], size` (non-tensor): legacy
+/// `validate_bulk_cache_hint_range(.., 128, ..)` — size a multiple of 16
+/// and a 128-byte aligned address (W12-gaps 8).
+fn bulk_applypriority(io: &mut PtxIo<'_>) -> OpResult {
+    bulk_range(io, 128, "applypriority.async.bulk")
+}
+
+/// Legacy `validate_bulk_cache_hint_range`: the size is a multiple of 16 and
+/// the address `alignment`-byte aligned (the window itself is not checked).
+fn bulk_range(io: &PtxIo<'_>, alignment: u64, label: &str) -> OpResult {
     for lane in io.mask.lanes() {
         let size = io.srcs[1][lane] as u32;
         if !size.is_multiple_of(16) {
-            return Err(OpError::invalid(format!(
-                "cp.async.bulk.prefetch size {size} must be a multiple of 16 on lane {lane}"
-            )));
+            return Err(OpError::invalid(format!("{label} size {size} must be a multiple of 16 on lane {lane}")));
         }
     }
-    aligned(io, 16, "cp.async.bulk.prefetch")
+    aligned(io, alignment, label)
 }
 
 pub(in crate::oplib) fn resolve(name: &str, mods: &Mods, ops: &Operands) -> OpResult<Option<Resolved>> {
@@ -87,6 +98,12 @@ pub(in crate::oplib) fn resolve(name: &str, mods: &Mods, ops: &Operands) -> OpRe
                 return Err(OpError::unsupported(format!("{name}: expected address and size operands")));
             }
             bulk_prefetch
+        }
+        "tirx.ptx.applypriority_async_bulk" => {
+            if ops.src_tys.len() < 2 {
+                return Err(OpError::unsupported(format!("{name}: expected address and size operands")));
+            }
+            bulk_applypriority
         }
         _ => no_op,
     })))
@@ -135,6 +152,22 @@ mod tests {
             f.call(&mut io)
         };
         assert!(run(0x1000, 256).is_ok());
+        // applypriority.async.bulk: 128-byte aligned, size a multiple of 16.
+        let g = resolve_ptx(
+            &key("tirx.ptx.applypriority_async_bulk", &["api=async", "kind=bulk", "completion=bulk_group", "priority=L2::evict_normal"]),
+            &[],
+            &[Ty::U64, Ty::U32],
+        )
+        .unwrap();
+        let run_g = |addr: u64, size: u64| {
+            let srcs = vec![[addr; 32], [size; 32]];
+            let mut dsts = vec![];
+            let mut io = PtxIo { dsts: &mut dsts, dst_tys: &[], srcs: &srcs, src_tys: &[Ty::U64, Ty::U32], mask: WarpMask(1) };
+            g.call(&mut io)
+        };
+        assert!(run_g(0x1080, 16).is_ok());
+        assert!(run_g(0x1010, 16).unwrap_err().message.contains("128-byte aligned"));
+        assert!(run_g(0x1080, 12).unwrap_err().message.contains("multiple of 16"));
         assert_eq!(run(0x1000, 24).unwrap_err().kind, OpErrorKind::Invalid);
         assert_eq!(run(0x1008, 32).unwrap_err().kind, OpErrorKind::Invalid);
         let bad = resolve_ptx(&key("tirx.ptx.prefetch", &["L3"]), &[], &[Ty::U64]).unwrap_err();

@@ -3,7 +3,7 @@
 
 use super::HResult;
 use crate::dtype::Ty;
-use crate::interp::support::{self, extend, lane_int, lane_val, operand_ty, reg_ty, write_lane};
+use crate::interp::support::{self, extend, lane_int, lane_val, operand_ty, reg_ty};
 use crate::interp::{ExecCtx, ExecErrorKind, Flow};
 use crate::oplib::{self, PtxIo};
 use crate::program::*;
@@ -121,11 +121,54 @@ const NUM_SMS: u64 = 148;
 #[inline]
 pub fn read_special(ctx: &mut ExecCtx<'_>, dst: Reg, sreg: SpecialReg) -> HResult {
     active_or_next!(ctx);
-    for l in ctx.warp.active.lanes() {
-        let v = special(ctx, sreg, l);
-        write_lane(ctx, dst, l, v);
-    }
+    let mut v = [0u64; 32];
+    special_lanes(ctx, sreg, &mut v);
+    let mask = ctx.warp.active;
+    support::write_lanes(ctx, dst, &v, mask);
     Ok(Flow::Next)
+}
+
+/// [`special`] for all 32 lanes at once (W13): lane-independent registers
+/// are computed once, `%tid` is stepped lane by lane instead of divided.
+fn special_lanes(ctx: &ExecCtx<'_>, sreg: SpecialReg, out: &mut WarpValue<u64>) {
+    let t0 = ctx.warp.warp_in_cta as u64 * 32;
+    match sreg {
+        SpecialReg::LaneId => *out = std::array::from_fn(|l| l as u64),
+        SpecialReg::ThreadInCta => *out = std::array::from_fn(|l| t0 + l as u64),
+        SpecialReg::Tid(a) => {
+            let [bx, by, _] = ctx.launch.block;
+            let (bx, by) = (bx as u64, by as u64);
+            if bx == 0 || by == 0 {
+                *out = std::array::from_fn(|l| special(ctx, sreg, l));
+                return;
+            }
+            let q = t0 / bx;
+            let (mut x, mut y, mut z) = (t0 % bx, q % by, q / by);
+            for o in out.iter_mut() {
+                *o = match a {
+                    Axis::X => x,
+                    Axis::Y => y,
+                    Axis::Z => z,
+                };
+                x += 1;
+                if x == bx {
+                    x = 0;
+                    y += 1;
+                    if y == by {
+                        y = 0;
+                        z += 1;
+                    }
+                }
+            }
+        }
+        SpecialReg::LaneMaskEq => *out = std::array::from_fn(|l| 1u64 << l),
+        SpecialReg::LaneMaskLt => *out = std::array::from_fn(|l| (1u64 << l) - 1),
+        SpecialReg::LaneMaskLe => *out = std::array::from_fn(|l| (1u64 << (l + 1)) - 1),
+        SpecialReg::LaneMaskGt => *out = std::array::from_fn(|l| !((1u64 << (l + 1)) - 1) & 0xffff_ffff),
+        SpecialReg::LaneMaskGe => *out = std::array::from_fn(|l| !((1u64 << l) - 1) & 0xffff_ffff),
+        // Every other special register is lane-independent.
+        _ => *out = [special(ctx, sreg, 0); 32],
+    }
 }
 
 #[inline]
@@ -138,9 +181,8 @@ pub fn read_param(ctx: &mut ExecCtx<'_>, dst: Reg, slot: ParamId) -> HResult {
     let mut b = [0u8; 8];
     b[..n].copy_from_slice(&raw);
     let v = u64::from_le_bytes(b);
-    for l in ctx.warp.active.lanes() {
-        write_lane(ctx, dst, l, v);
-    }
+    let mask = ctx.warp.active;
+    support::write_lanes(ctx, dst, &[v; 32], mask);
     Ok(Flow::Next)
 }
 

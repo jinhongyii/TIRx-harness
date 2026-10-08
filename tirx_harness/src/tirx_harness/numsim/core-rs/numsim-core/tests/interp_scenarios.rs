@@ -3,6 +3,7 @@
 
 use numsim_core::arena::ValidityPolicy;
 use numsim_core::interp::ExecErrorKind;
+use numsim_core::oplib::OpErrorKind;
 use numsim_core::observe::{Observer, RecordingObserver, SyncEvent, SyncKind};
 use numsim_core::report::{FindingKind, Status};
 use numsim_core::sched::{self, CompletionPolicy, RunConfig, RunOutcome, RunStatus};
@@ -274,7 +275,7 @@ impl numsim_core::observe::Observer for Trace {
     fn warp_done(&mut self, w: numsim_core::observe::WarpId, end: numsim_core::observe::WarpEnd) {
         self.0.push(format!("done {w:?} {end:?}"));
     }
-    fn inbox_drain(&mut self, c: numsim_core::observe::CtaId, r: u64) {
+    fn round_boundary(&mut self, c: numsim_core::observe::CtaId, r: u64) {
         self.0.push(format!("drain {c:?} {r}"));
     }
 }
@@ -886,6 +887,33 @@ fn hint_ops_engine_effects() {
     }
 }
 
+/// W12-gaps 7: `mbarrier.init` pointer neither warp-uniform nor one-to-one.
+#[test]
+fn mbar_init_partial_lane_aliasing_is_an_error() {
+    let o = run(&scenarios::mbar_init_partial_alias());
+    match &o.status {
+        RunStatus::Error(e) => {
+            assert_eq!(e.kind, ExecErrorKind::Divergence, "{e:?}");
+            assert!(e.message.contains("mbarrier.init pointer must be warp-uniform or one-to-one across active lanes"), "{}", e.message);
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+    completed(&run(&scenarios::lane_split_mbarrier()));
+}
+
+/// W12-gaps 8: a bulk `applypriority` needs a 128-byte aligned address.
+#[test]
+fn bulk_applypriority_requires_128_byte_alignment() {
+    let o = run(&scenarios::bulk_applypriority_misaligned());
+    match &o.status {
+        RunStatus::Error(e) => {
+            assert_eq!(e.kind, ExecErrorKind::Op(OpErrorKind::Invalid), "{e:?}");
+            assert!(e.message.contains("128-byte aligned"), "{}", e.message);
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
 /// `.exclusive` TMEM allocation limit follows `Program::arch`.
 #[test]
 fn exclusive_tmem_limit_follows_arch() {
@@ -1481,6 +1509,7 @@ fn tcgen_mma_f16_program_matches_the_reference() {
             accumulate: false,
             init_d: None,
             two_issuers: false,
+            collectors: &[],
         },
         &a,
         &b,
@@ -1492,6 +1521,7 @@ fn tcgen_mma_f16_program_matches_the_reference() {
             accumulate: true,
             init_d: Some(1.0),
             two_issuers: false,
+            collectors: &[],
         },
         &a,
         &b,
@@ -1521,6 +1551,7 @@ fn tcgen_mma_into_never_written_tmem_reports_uninit_read() {
             accumulate: true,
             init_d: None,
             two_issuers: false,
+            collectors: &[],
         },
         &a,
         &b,
@@ -1679,7 +1710,7 @@ fn unbound_integer_address_is_incomplete() {
 #[test]
 fn tcgen_mma_from_two_lanes_is_an_error() {
     let (a, b, _) = mma_operands();
-    let o = run(&scenarios::tcgen_mma_f16(scenarios::MmaSpec { accumulate: false, init_d: None, two_issuers: true }, &a, &b));
+    let o = run(&scenarios::tcgen_mma_f16(scenarios::MmaSpec { accumulate: false, init_d: None, two_issuers: true, collectors: &[] }, &a, &b));
     let RunStatus::Error(e) = &o.status else { panic!("{:?}", o.status) };
     assert!(e.message.contains("single thread"), "{e:?}");
     assert_eq!(e.lanes.0, 0b11);
@@ -1741,4 +1772,24 @@ fn cluster_barrier_gathers_partial_warp_arrivals() {
         matches!(e.kind, ExecErrorKind::Protocol(numsim_core::sync::SyncError::Cluster(numsim_core::sync::cluster::Error::PartialWarp { .. }))),
         "{e:?}"
     );
+}
+
+/// W12-gaps 9: collector A usage across MMAs. fill -> use -> lastuse is
+/// legal and each MMA still reads its operands (3 x A·B); an intervening
+/// MMA without a collector qualifier (PTX default `::discard`, as a typed
+/// gemm dispatch emits) invalidates the fill, so a later `use` is an error.
+#[test]
+fn tcgen_collector_use_requires_a_live_fill() {
+    use numsim_core::program::CollectorOp as C;
+    let (a, b, want) = mma_operands();
+    let spec = |collectors| scenarios::MmaSpec { accumulate: false, init_d: None, two_issuers: false, collectors };
+    let o = run(&scenarios::tcgen_mma_f16(spec(&[C::Fill, C::Use, C::LastUse]), &a, &b));
+    completed(&o);
+    assert_eq!(f32s(&o, "out"), want.iter().map(|x| 3.0 * x).collect::<Vec<_>>());
+    for seq in [&[C::Fill, C::None, C::Use][..], &[C::Use][..], &[C::Fill, C::LastUse, C::Use][..], &[C::Fill, C::Discard, C::Use][..]] {
+        let o = run(&scenarios::tcgen_mma_f16(spec(seq), &a, &b));
+        let RunStatus::Error(e) = &o.status else { panic!("{seq:?}: {:?}", o.status) };
+        assert_eq!(e.kind, ExecErrorKind::Op(OpErrorKind::Invalid), "{e:?}");
+        assert!(e.message.contains("requires a valid previous fill"), "{seq:?}: {}", e.message);
+    }
 }

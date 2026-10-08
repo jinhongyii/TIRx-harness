@@ -180,6 +180,12 @@ impl WordTable {
         self.regions.is_empty()
     }
 
+    /// Does `alloc` hold any declared region? (Writes to other allocations
+    /// log nothing, so they may take paths that skip the history.)
+    pub fn has(&self, alloc: AllocId) -> bool {
+        self.regions.get(&alloc).is_some_and(|rs| !rs.is_empty())
+    }
+
     /// Does any span overlap a declared region of `alloc`?
     pub fn overlaps(&self, alloc: AllocId, spans: &[ByteSpan]) -> bool {
         self.regions
@@ -372,8 +378,6 @@ pub struct LaunchAux {
     pub uninit_seen: HashSet<(crate::site::SiteId, AllocId, ByteSpan)>,
     /// Metadata-only register allocation per launch warp (`Space::Reg`).
     pub reg_allocs: Vec<AllocId>,
-    /// Owning CTA of every CTA-private allocation (inbox routing).
-    pub owner_cta: HashMap<AllocId, CtaId>,
     pub groups: GroupTracker,
     pub async_meta: HashMap<AsyncId, AsyncMeta>,
     pub words: WordTable,
@@ -395,6 +399,9 @@ pub struct LaunchAux {
     pub tcgen_last: HashMap<CtaId, AsyncId>,
     /// Last pipelined tcgen05 op per issuing thread (`AsyncIssue.preds`).
     pub tcgen_last_thread: HashMap<(WarpId, u8), AsyncId>,
+    /// tcgen05.mma collector buffer state per issuing thread (bit 0 = A,
+    /// bits 1..5 = B buffers b0..b3; `oplib::tc_collector_transition`).
+    pub tcgen_collectors: HashMap<(WarpId, u8), u8>,
     /// tcgen05 mma/cp ops per issuing thread issued since its last
     /// unrestricted commit.
     pub tcgen_uncommitted: HashMap<(WarpId, u8), Vec<AsyncId>>,

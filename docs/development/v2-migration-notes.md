@@ -74,8 +74,7 @@ Each bullet reads: change: before → now. Why.
 
 | Variable / argument | Meaning | Default |
 | --- | --- | --- |
-| `NUMSIM_CACHE_DIR` | Cache root: lowered modules in `v2-modules/`, codegen builds in `v2-codegen/`. Delete the directory to force re-lowering. | `~/.cache/tirx-harness/numsim` |
-| `NUMSIM_V2_BACKEND` / `Engine(backend=...)` | `interp` (default) or `codegen` (generated Rust, same handlers, same results). | `interp` |
+| `NUMSIM_CACHE_DIR` | Cache root: lowered modules in `v2-modules/`. Delete the directory to force re-lowering. | `~/.cache/tirx-harness/numsim` |
 | `NUMSIM_V2_SEED` / `Engine(seed=...)` | Scheduler seed. Results are reproducible for a fixed module, inputs and seed. | `0` |
 | `NUMSIM_V2_NO_CACHE` | `1` disables the module cache. | unset |
 | `Engine(max_workers=...)` | Scheduler threads (`"auto"` = CPU count). Results do not depend on it. | `8` |

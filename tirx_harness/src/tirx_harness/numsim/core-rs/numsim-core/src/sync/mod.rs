@@ -431,7 +431,7 @@ impl SyncTable {
 
     /// Deadlock diagnosis for the scheduler's no-progress check
     /// (sync-semantics §2.9). Call it only when the whole launch is
-    /// quiescent: no warp, completion, landing or inbox delivery can make
+    /// quiescent: no warp, completion or landing can make
     /// progress and the async queues are drained. Returns, for each of the
     /// `blocked` resources, the protocol error that proves its wait can
     /// never be satisfied (today: mbarrier `TxUnderDelivered`). Resources

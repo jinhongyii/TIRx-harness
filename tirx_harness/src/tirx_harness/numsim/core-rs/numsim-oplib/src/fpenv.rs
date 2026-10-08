@@ -154,6 +154,11 @@ fn repin_nan_outputs<T: PinnedFma>(
     initial: &[T],
     output: &mut [T],
 ) {
+    // Branch-free NaN scan first (perf): the common all-finite output skips
+    // the indexed walk entirely.
+    if !output.iter().fold(false, |any, value| any | value.nan()) {
+        return;
+    }
     for (index, value) in output.iter_mut().enumerate() {
         if !value.nan() {
             continue;
@@ -352,6 +357,59 @@ unsafe fn fma_f32_abt_increasing_k_avx512(
     }
 }
 
+/// AVX2 register tile: `R` rows x `C` 8-lane vectors of accumulators held in
+/// registers across the whole K loop (as [`fma_tile_avx512`]): each output
+/// element's increasing-K FMA chain is unchanged, only the memory round trips
+/// of the intermediate sums go away (perf, W4 profile).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn fma_tile_avx2<const R: usize, const C: usize>(
+    n: usize,
+    k: usize,
+    a_values: &[f32],
+    b_transposed: &[f32],
+    output: &mut [f32],
+    row: usize,
+    column: usize,
+) {
+    use std::arch::x86_64::{
+        _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+
+    const LANES: usize = 8;
+    // SAFETY: the caller guarantees `row + R <= m` and `column + C * 8 <= n`
+    // over shape-validated slices.
+    unsafe {
+        let mut accumulators = [[_mm256_setzero_ps(); C]; R];
+        for (r, row_accumulators) in accumulators.iter_mut().enumerate() {
+            for (c, accumulator) in row_accumulators.iter_mut().enumerate() {
+                *accumulator =
+                    _mm256_loadu_ps(output.as_ptr().add((row + r) * n + column + c * LANES));
+            }
+        }
+        for inner in 0..k {
+            let mut b_lanes = [_mm256_setzero_ps(); C];
+            for (c, lanes) in b_lanes.iter_mut().enumerate() {
+                *lanes = _mm256_loadu_ps(b_transposed.as_ptr().add(inner * n + column + c * LANES));
+            }
+            for (r, row_accumulators) in accumulators.iter_mut().enumerate() {
+                let a_lanes = _mm256_set1_ps(*a_values.get_unchecked((row + r) * k + inner));
+                for (accumulator, &b) in row_accumulators.iter_mut().zip(&b_lanes) {
+                    *accumulator = _mm256_fmadd_ps(a_lanes, b, *accumulator);
+                }
+            }
+        }
+        for (r, row_accumulators) in accumulators.iter().enumerate() {
+            for (c, &accumulator) in row_accumulators.iter().enumerate() {
+                _mm256_storeu_ps(
+                    output.as_mut_ptr().add((row + r) * n + column + c * LANES),
+                    accumulator,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn fma_f32_abt_increasing_k_avx2(
@@ -362,31 +420,62 @@ unsafe fn fma_f32_abt_increasing_k_avx2(
     b_transposed: &[f32],
     output: &mut [f32],
 ) {
-    use std::arch::x86_64::{_mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_storeu_ps};
+    const LANES: usize = 8;
+    const ROW_TILE: usize = 4;
+    const COL_VECTORS: usize = 2;
+    const COL_TILE: usize = COL_VECTORS * LANES;
 
-    for row in 0..m {
-        let a_row = &a_values[row * k..(row + 1) * k];
-        let output_row = &mut output[row * n..(row + 1) * n];
-        for (inner, &a) in a_row.iter().enumerate() {
-            let b_row = &b_transposed[inner * n..(inner + 1) * n];
+    // SAFETY: shape validation proves the slice extents; every tile call stays
+    // inside `row + rows <= m` and `column + width <= n`.
+    unsafe {
+        let mut row = 0;
+        while row < m {
+            let rows = if row + ROW_TILE <= m { ROW_TILE } else { 1 };
             let mut column = 0;
-            // SAFETY: shape validation proves both row slices have n elements,
-            // and the loop admits only complete 8-element vectors.
-            unsafe {
-                let a_lanes = _mm256_set1_ps(a);
-                while column + 8 <= n {
-                    let b_lanes = _mm256_loadu_ps(b_row.as_ptr().add(column));
-                    let accumulators = _mm256_loadu_ps(output_row.as_ptr().add(column));
-                    _mm256_storeu_ps(
-                        output_row.as_mut_ptr().add(column),
-                        _mm256_fmadd_ps(a_lanes, b_lanes, accumulators),
+            while column + COL_TILE <= n {
+                if rows == ROW_TILE {
+                    fma_tile_avx2::<ROW_TILE, COL_VECTORS>(
+                        n,
+                        k,
+                        a_values,
+                        b_transposed,
+                        output,
+                        row,
+                        column,
                     );
-                    column += 8;
+                } else {
+                    fma_tile_avx2::<1, COL_VECTORS>(
+                        n,
+                        k,
+                        a_values,
+                        b_transposed,
+                        output,
+                        row,
+                        column,
+                    );
                 }
+                column += COL_TILE;
             }
-            for (accumulator, &b) in output_row[column..].iter_mut().zip(&b_row[column..]) {
-                *accumulator = a.mul_add(b, *accumulator);
+            while column + LANES <= n {
+                if rows == ROW_TILE {
+                    fma_tile_avx2::<ROW_TILE, 1>(n, k, a_values, b_transposed, output, row, column);
+                } else {
+                    fma_tile_avx2::<1, 1>(n, k, a_values, b_transposed, output, row, column);
+                }
+                column += LANES;
             }
+            if column < n {
+                fma_scalar_columns(
+                    n,
+                    k,
+                    a_values,
+                    b_transposed,
+                    output,
+                    row..row + rows,
+                    column..n,
+                );
+            }
+            row += rows;
         }
     }
 }
@@ -763,6 +852,55 @@ mod tests {
                             .collect::<Vec<_>>(),
                         "bitwise mismatch at m={m} n={n} k={k}",
                     );
+                }
+            }
+        }
+    }
+
+    /// The register-tiled AVX2 kernel, called directly (so it is covered on
+    /// AVX-512 hosts too), equals the scalar chains bit for bit over every
+    /// tile path: 4-row and single-row tiles, 16- and 8-column vectors, and
+    /// scalar tails; NaN/inf/subnormal inputs included.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_register_tile_matches_scalar_bitwise() {
+        if !(std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma"))
+        {
+            return;
+        }
+        let special = [
+            f32::NAN,
+            f32::INFINITY,
+            -0.0,
+            f32::from_bits(1),
+            f32::MAX,
+            -f32::MIN_POSITIVE,
+        ];
+        for &m in &[1_usize, 3, 4, 5, 8, 9, 128] {
+            for &n in &[1_usize, 7, 8, 15, 16, 17, 24, 33, 256] {
+                for &k in &[1_usize, 2, 7, 16, 32] {
+                    let pick = |i: usize, s: f32| {
+                        if i % 97 == 5 {
+                            special[i % special.len()]
+                        } else {
+                            ((i as f32 - 11.0) * s).sin() * 3.0
+                        }
+                    };
+                    let a_values = (0..m * k).map(|i| pick(i, 0.317)).collect::<Vec<_>>();
+                    let b_transposed = (0..n * k).map(|i| pick(i + 3, -0.213)).collect::<Vec<_>>();
+                    let initial = (0..m * n)
+                        .map(|i| (i as f32 - 6.0) * -0.047)
+                        .collect::<Vec<_>>();
+                    let mut simd = initial.clone();
+                    let mut scalar = initial;
+                    // SAFETY: AVX2/FMA detected above; shapes are consistent.
+                    unsafe {
+                        fma_f32_abt_increasing_k_avx2(m, n, k, &a_values, &b_transposed, &mut simd)
+                    };
+                    fma_f32_abt_increasing_k_scalar(m, n, k, &a_values, &b_transposed, &mut scalar);
+                    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&simd), bits(&scalar), "m={m} n={n} k={k}");
                 }
             }
         }

@@ -13,7 +13,6 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod arena;
-pub mod codegen;
 pub mod dtype;
 pub mod interp;
 pub mod observe;

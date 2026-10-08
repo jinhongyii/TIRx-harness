@@ -6,4 +6,4 @@ legacy entry points. Conformance runs select it with ``NUMSIM_IMPL=v2``.
 """
 
 from .api import *  # noqa: F403
-from .api import __all__  # noqa: F401
+from .api import __all__

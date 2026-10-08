@@ -2,11 +2,11 @@
 //! and `observe::SyncEvent`s into the core's per-lane events and runs the
 //! [`Checker`] online, inside the engine callbacks (on the CTA thread).
 //!
-//! # Merge design (`inbox_drain`)
+//! # Merge design (`round_boundary`)
 //!
 //! The scheduler is single-threaded (`sched` module doc): one observer sees
 //! one total event order for the whole launch. The checker therefore keeps
-//! a single global shadow, which is always merged, and `inbox_drain` is only
+//! a single global shadow, which is always merged, and `round_boundary` is only
 //! a GC safe point. When CTA parallelism lands (plan 2.4), each CTA thread
 //! gets its own `Checker` view of shared memory and TMEM (CTA-private)
 //! plus a per-stripe global shadow owned by the stripe's thread. The global
@@ -502,7 +502,7 @@ impl Observer for RaceObserver {
         }
     }
 
-    fn inbox_drain(&mut self, _cta: CtaId, _round: u64) {
+    fn round_boundary(&mut self, _cta: CtaId, _round: u64) {
         // Single-threaded scheduler: the global shadow is always merged
         // (module doc). The drain is a safe point for the collectors.
         if let Some(c) = &mut self.checker {
