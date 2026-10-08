@@ -167,8 +167,8 @@ pub struct SpinMemo {
 /// A zeroed register file of `n` slots from one zeroed allocation (W13).
 /// `RegFile::new` builds it slot by slot (`vec!` only uses a zeroed
 /// allocation for arrays of at most 16 elements), and a corpus kernel's
-/// file is hundreds of KiB per warp; `calloc` maps fresh zero pages
-/// instead, so slots a warp never writes cost nothing.
+/// file is tens to hundreds of KiB per warp; `calloc` zeroes it in bulk
+/// (or maps fresh zero pages for large files).
 fn zeroed_regs(n: usize) -> RegFile {
     if n == 0 {
         return RegFile { regs: Vec::new() };
@@ -252,13 +252,25 @@ impl WarpState {
         (self.active.bits() as u64) << 32 | self.live.bits() as u64
     }
 
-    /// The spin-parking state hash, computed from scratch.
+    /// The spin-parking state hash, computed from scratch: eight
+    /// independent multiply-rotate chains over interleaved register words
+    /// (instruction-level parallelism; one serial chain cost ~5 cycles per
+    /// word), folded together at the end. Only equality of two hashes is
+    /// ever used (a fixed point of the same loop frame), never the value.
     pub fn spin_hash_uncached(&self) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ self.spin_masks();
-        for r in &self.regs.regs {
-            for &v in r.iter() {
-                h = (h.rotate_left(5) ^ v).wrapping_mul(0x5851_f42d_4c95_7f2d);
+        const K: u64 = 0x5851_f42d_4c95_7f2d;
+        let mix = |h: u64, v: u64| (h.rotate_left(5) ^ v).wrapping_mul(K);
+        let seed = 0xcbf2_9ce4_8422_2325 ^ self.spin_masks();
+        let mut acc: [u64; 8] = std::array::from_fn(|i| seed.wrapping_add(i as u64));
+        // A slot is 32 words, a multiple of the eight chains.
+        for chunk in self.regs.regs.as_flattened().as_chunks::<8>().0 {
+            for (a, &v) in acc.iter_mut().zip(chunk) {
+                *a = mix(*a, v);
             }
+        }
+        let mut h = mix(seed, self.regs.regs.len() as u64);
+        for a in acc {
+            h = mix(h, a);
         }
         h | 1
     }

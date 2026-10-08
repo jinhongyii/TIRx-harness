@@ -1,6 +1,6 @@
 //! Interpreter hot-path guards (W13): one row per engine-side hot spot found
-//! by profiling corpus kernels (CONTRACT_REQUESTS "W4 (2026-10-08)" and the
-//! W13 section). `cargo bench -p numsim-core --bench interp_hot`.
+//! by profiling corpus kernels. `cargo bench -p numsim-core --bench
+//! interp_hot` (with a private `CARGO_TARGET_DIR`).
 //!
 //! Throughput is per executed warp instruction (`RunStats::instrs` of one
 //! run), so `time/elem` is the cost of one warp instruction including its
@@ -13,6 +13,15 @@
 //!   (register-file zero-fill at admission).
 //! * `read_special` — a loop of special-register reads (`tid`, `ntid`,
 //!   `ctaid`, lane masks): `alu::read_special`.
+//! * `tcgen_ld` — `tcgen05.ld.32x32b.x64` into 64 registers (a GEMM
+//!   epilogue's accumulator drain), 4 warps: `tcgen::tcgen_ld`.
+//! * `reg_indexed` — a loop reading and writing a 64-element register array
+//!   at a warp-uniform index (unrolled-accumulator access):
+//!   `alu::load_reg_indexed` / `store_reg_indexed`.
+//! * `corpus_numsim` — whole corpus kernels (NumSim mode, 1 worker) from the
+//!   recorded fixtures: `examples/record_race_fixtures.py OUT rmsnorm
+//!   deepgemm_sm100_fp8_gemm_1d1d fp16_bf16_gemm` into `$RACE_FIXTURES` or
+//!   `core-rs/target/race-fixtures`; skipped when missing.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use numsim_core::dtype::{Dtype, Ty};
@@ -20,7 +29,7 @@ use numsim_core::observe::NoopObserver;
 use numsim_core::program::*;
 use numsim_core::sched::{self, CompletionPolicy};
 use numsim_core::testutil::scenarios::{inputs, u32_buf, Scenario};
-use numsim_core::testutil::ProgramBuilder;
+use numsim_core::testutil::{fixtures, ProgramBuilder};
 
 fn group(c: &mut Criterion, name: &str, row: &str, s: &Scenario) {
     let probe = sched::run_with_config(&s.module, &s.inputs, &mut NoopObserver, &s.config).unwrap();
@@ -197,11 +206,143 @@ pub fn read_special(iters: u32) -> Scenario {
     s
 }
 
+/// 4 warps; each stores `tid` into its 32 lanes x 64 columns of TMEM once,
+/// then loads them back `iters` times with `tcgen05.ld.32x32b.x64` and
+/// stores one register.
+pub fn tcgen_ld(iters: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("tcgen_ld_x64", 128);
+    let out = b.global("out", Dtype::U32);
+    let slot = b.shared("taddr", Dtype::U32, 1);
+    let tid = b.reg(Ty::U32);
+    let w = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let sa = b.reg(Ty::U32);
+    let t = b.reg(Ty::U32);
+    let t2 = b.reg(Ty::U32);
+    let lanebits = b.reg(Ty::U32);
+    let k = b.reg(Ty::U32);
+    let v: Vec<Reg> = (0..64).map(|_| b.reg(Ty::U32)).collect();
+    b.thread_rank(tid);
+    b.warp_id(w);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k32 = b.k_u32(32);
+    let k64 = b.k_u32(64);
+    let k16 = b.k_u32(16);
+    let kn = b.k_u32(iters);
+    b.smem_addr(sa, slot, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b.if_(p);
+    b.push(Instr::TcgenAlloc { dst: sa.into(), ncols: k64, cta_group: 1, exclusive: false });
+    b.end_if();
+    b.bar_sync(0);
+    b.ld_u32(t, slot, k0);
+    b.mul(Ty::U32, lanebits, w, k32);
+    b.binary(BinOp::Shl, Ty::U32, lanebits, lanebits, k16);
+    b.add_u32(t2, t, lanebits);
+    b.push(Instr::TcgenSt(Box::new(TcgenStArgs {
+        srcs: vec![tid.into(); 64],
+        taddr: t2.into(),
+        row: k0,
+        col: k0,
+        shape: TcShape::S32x32b,
+        num: 64,
+        unpack: false,
+    })));
+    b.push(Instr::TcgenWait { st: true });
+    b.mov(k, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, kn);
+    b.loop_if(p);
+    b.push(Instr::TcgenLd(Box::new(TcgenLdArgs {
+        dsts: v.clone(),
+        taddr: t2.into(),
+        row: k0,
+        col: k0,
+        shape: TcShape::S32x32b,
+        num: 64,
+        pack: false,
+        red: None,
+        red_abs: false,
+        red_nan: false,
+        spcompress: false,
+    })));
+    b.push(Instr::TcgenWait { st: false });
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.st_u32(out, tid, v[63]);
+    b.bar_sync(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b.if_(p);
+    b.push(Instr::TcgenDealloc { taddr: t.into(), ncols: k64, cta_group: 1, exclusive: false });
+    b.push(Instr::TcgenRelinquish { cta_group: 1 });
+    b.end_if();
+    b.exit();
+    Scenario { name: "tcgen_ld_x64", module: b.build_module(), inputs: inputs(vec![("out", u32_buf([0; 128]))]), config: Default::default() }
+}
+
+/// 4 warps, `iters` iterations of `a[k % 64] += a[(k + 1) % 64]` over a
+/// 64-register array.
+pub fn reg_indexed(iters: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("reg_indexed", 128);
+    let out = b.global("out", Dtype::U32);
+    let tid = b.reg(Ty::U32);
+    let k = b.reg(Ty::U32);
+    let i = b.reg(Ty::U32);
+    let j = b.reg(Ty::U32);
+    let x = b.reg(Ty::U32);
+    let y = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let arr: Vec<Reg> = (0..64).map(|_| b.reg(Ty::U32)).collect();
+    b.thread_rank(tid);
+    for &r in &arr {
+        b.mov(r, tid);
+    }
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k63 = b.k_u32(63);
+    let kn = b.k_u32(iters);
+    b.mov(k, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, kn);
+    b.loop_if(p);
+    b.binary(BinOp::And, Ty::U32, i, k, k63);
+    b.add_u32(j, k, k1);
+    b.binary(BinOp::And, Ty::U32, j, j, k63);
+    b.push(Instr::LoadRegIndexed { dst: x, base: arr[0], len: 64, idx: i.into() });
+    b.push(Instr::LoadRegIndexed { dst: y, base: arr[0], len: 64, idx: j.into() });
+    b.add_u32(x, x, y);
+    b.push(Instr::StoreRegIndexed { base: arr[0], len: 64, idx: i.into(), value: x.into() });
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.st_u32(out, tid, arr[5]);
+    b.exit();
+    let mut s = Scenario { name: "reg_indexed", module: b.build_module(), inputs: inputs(vec![("out", u32_buf([0; 128]))]), config: Default::default() };
+    s.config.completions = CompletionPolicy::Eager;
+    s
+}
+
 fn bench(c: &mut Criterion) {
     group(c, "spin_wait_regs", "pad768_iters4096", &spin_wait(768, 4096));
     group(c, "admit_regs", "ctas64_pad256", &admit(64, 256));
     group(c, "read_special", "iters256", &read_special(256));
+    group(c, "tcgen_ld", "x64_iters64", &tcgen_ld(64));
+    group(c, "reg_indexed", "iters2048", &reg_indexed(2048));
 }
 
-criterion_group!(benches, bench);
+fn corpus(c: &mut Criterion) {
+    let dir = fixtures::dir();
+    for case in ["rmsnorm", "deepgemm_sm100_fp8_gemm_1d1d", "fp16_bf16_gemm"] {
+        if !fixtures::exists(&dir, case) {
+            eprintln!("corpus_numsim: fixture {dir}/{case}.* missing, skipped");
+            continue;
+        }
+        let (module, inputs, mut config) = fixtures::load(&dir, case);
+        config.workers = 1;
+        let s = Scenario { name: "corpus", module, inputs, config };
+        group(c, "corpus_numsim", case, &s);
+    }
+}
+
+criterion_group!(benches, bench, corpus);
 criterion_main!(benches);

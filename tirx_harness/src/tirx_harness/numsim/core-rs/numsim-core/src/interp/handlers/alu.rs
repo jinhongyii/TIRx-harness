@@ -468,10 +468,38 @@ fn reg_index(ctx: &ExecCtx<'_>, base: Reg, len: u32, idx: Operand, lane: usize) 
     Ok(Reg(base.0 + i as u32))
 }
 
+/// First active lane when the register-array index has the same bits in
+/// every active lane.
+#[inline]
+fn uniform_index_lane(ctx: &ExecCtx<'_>, idx: Operand) -> Option<usize> {
+    let mask = ctx.warp.active;
+    let first = mask.lanes().next()?;
+    match idx {
+        Operand::Const(_) => Some(first),
+        Operand::Reg(_) => {
+            let v = ctx.read_slot(idx, 0);
+            mask.lanes().all(|l| v[l] == v[first]).then_some(first)
+        }
+    }
+}
+
 #[inline]
 pub fn load_reg_indexed(ctx: &mut ExecCtx<'_>, dst: Reg, base: Reg, len: u32, idx: Operand) -> HResult {
     active_or_next!(ctx);
     let n = reg_ty(ctx, dst).slots();
+    if let Some(lane) = uniform_index_lane(ctx, idx) {
+        // W13: one index for every active lane: the same per-lane copies
+        // as whole masked slots (an out-of-bounds index fails at the first
+        // active lane, before any write, exactly as the per-lane loop).
+        let mask = ctx.warp.active;
+        let r = reg_index(ctx, base, len, idx, lane)?;
+        for i in 0..n.min(reg_ty(ctx, r).slots()) {
+            let v = *ctx.reg_slot(r, i);
+            let s = ctx.slot(dst) + i;
+            support::write_masked(ctx.warp.regs.get_mut(s), &v, mask);
+        }
+        return Ok(Flow::Next);
+    }
     for l in ctx.warp.active.lanes() {
         let r = reg_index(ctx, base, len, idx, l)?;
         for i in 0..n.min(reg_ty(ctx, r).slots()) {
@@ -486,6 +514,24 @@ pub fn load_reg_indexed(ctx: &mut ExecCtx<'_>, dst: Reg, base: Reg, len: u32, id
 #[inline]
 pub fn store_reg_indexed(ctx: &mut ExecCtx<'_>, base: Reg, len: u32, idx: Operand, value: Operand) -> HResult {
     active_or_next!(ctx);
+    if let Some(lane) = uniform_index_lane(ctx, idx) {
+        // W13: uniform index, see `load_reg_indexed`.
+        let mask = ctx.warp.active;
+        let r = reg_index(ctx, base, len, idx, lane)?;
+        let ty = reg_ty(ctx, r);
+        let s = ctx.slot(r);
+        for i in 0..ty.slots() {
+            let mut v = ctx.read_slot(value, i);
+            let rem = ty.bits().saturating_sub(i * 64);
+            if rem < 64 {
+                for x in v.iter_mut() {
+                    *x &= (1u64 << rem) - 1;
+                }
+            }
+            support::write_masked(ctx.warp.regs.get_mut(s + i), &v, mask);
+        }
+        return Ok(Flow::Next);
+    }
     for l in ctx.warp.active.lanes() {
         let r = reg_index(ctx, base, len, idx, l)?;
         let ty = reg_ty(ctx, r);

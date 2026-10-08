@@ -572,57 +572,189 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
     // W4-16: each live, fully valid cell run is read once into `image`;
     // pieces of other runs take the per-piece path (same errors / findings).
     let runs = RunImages::load(ctx, tmem, map.cell_runs(), ctx.aux.capture_reads.is_none())?;
-    for t in active.lanes() {
-        bytes.fill(0);
-        let mut hint = 0usize;
-        for r in 0..nregs {
-            for p in map.pieces(r, t) {
-                let at = 4 * r + p.reg_byte as usize;
-                let n = p.len as usize;
-                if let Some(k) = runs.locate(p, &mut hint) {
-                    bytes[at..at + n].copy_from_slice(&runs.image[k..k + n]);
-                } else {
-                    check_piece_live(ctx, p, t, "tcgen05.ld")?;
-                    let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
-                    support::mem_read(ctx, loc, t, &mut bytes[at..at + n])?;
+    if compress.is_none() && red.is_none() && !ctx.observing && runs.at.iter().all(Option::is_some) {
+        let key = (args.shape, args.num, args.pack, ctx.warp.warp_in_cta, taddr);
+        if let Some(offs) = word_offsets(key, &map, &runs) {
+            if args.dsts.len() == nregs && args.dsts.iter().all(|&d| support::reg_ty(ctx, d).mem_bytes() == 4) {
+                // W13: every register is one 4-byte piece of a live, valid
+                // run and nothing observes the read: copy register-major
+                // straight from the run images (same values as the per-lane
+                // path, which is taken whenever any of this does not hold).
+                for (r, &d) in args.dsts.iter().enumerate() {
+                    let ty = support::reg_ty(ctx, d);
+                    let m = if ty.bits() < 64 { (1u64 << ty.bits()) - 1 } else { u64::MAX };
+                    let base = ctx.slot(d);
+                    let row = &offs[r * 32..r * 32 + 32];
+                    let dst = ctx.warp.regs.get_mut(base);
+                    for t in active.lanes() {
+                        let k = row[t] as usize;
+                        dst[t] = u32::from_le_bytes(runs.image[k..k + 4].try_into().unwrap()) as u64 & m;
+                    }
+                    for s in 1..ty.slots() {
+                        support::write_masked(ctx.warp.regs.get_mut(base + s), &[0u64; 32], active);
+                    }
                 }
-                if ctx.observing {
-                    tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
-                }
-            }
-        }
-        let compressed: Vec<u8>;
-        let out: &[u8] = match compress {
-            Some((max, abs)) => {
-                let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
-                // Unreadable (invalid) words already failed or reported at the read.
-                let valid = vec![true; words.len()];
-                let (kept, _) = oplib::tcgen_ld_spcompress(&words, &valid, max, abs).map_err(|e| support::op_err(ctx, e))?;
-                compressed = kept.iter().flat_map(|w| w.to_le_bytes()).collect();
-                &compressed
-            }
-            None => &bytes,
-        };
-        let mut pos = 0usize;
-        for &d in &args.dsts {
-            let n = support::reg_ty(ctx, d).mem_bytes() as usize;
-            let end = (pos + n).min(out.len());
-            if pos < end {
-                write_lane_bytes(ctx, d, t, &out[pos..end]);
-            }
-            pos += n;
-        }
-        if let Some((red, regs)) = &red {
-            let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
-            let v = oplib::tcgen_ld_reduce(*red, &words).map_err(|e| support::op_err(ctx, e))?;
-            if let Some(&rr) = regs.first() {
-                write_lane_bytes(ctx, rr, t, &v.to_le_bytes());
+                return finish_ld(ctx, args, op, tmem, tspans, &red, active);
             }
         }
     }
+    if compress.is_none() && red.is_none() {
+        // W13: gather every lane's register image first, then write the
+        // registers one register at a time (one type lookup per register,
+        // not per lane). A failing piece returns the same error after
+        // writing the lanes before it, exactly as the per-lane order did.
+        let stride = nregs * 4;
+        let mut all = vec![0u8; active.count() as usize * stride];
+        let mut row = [0usize; 32];
+        let mut done = 0u32;
+        let mut failed = None;
+        'lanes: for (li, t) in active.lanes().enumerate() {
+            row[t] = li;
+            let bytes = &mut all[li * stride..(li + 1) * stride];
+            let mut hint = 0usize;
+            for r in 0..nregs {
+                for p in map.pieces(r, t) {
+                    let at = 4 * r + p.reg_byte as usize;
+                    let n = p.len as usize;
+                    if let Some(k) = runs.locate(p, &mut hint) {
+                        if n == 4 {
+                            let w: [u8; 4] = runs.image[k..k + 4].try_into().unwrap();
+                            bytes[at..at + 4].copy_from_slice(&w);
+                        } else {
+                            bytes[at..at + n].copy_from_slice(&runs.image[k..k + n]);
+                        }
+                    } else {
+                        let read = check_piece_live(ctx, p, t, "tcgen05.ld").and_then(|_| {
+                            let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
+                            support::mem_read(ctx, loc, t, &mut bytes[at..at + n])
+                        });
+                        if let Err(e) = read {
+                            failed = Some(e);
+                            break 'lanes;
+                        }
+                    }
+                    if ctx.observing {
+                        tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
+                    }
+                }
+            }
+            done |= 1 << t;
+        }
+        let mut pos = 0usize;
+        for &d in &args.dsts {
+            let n = support::reg_ty(ctx, d).mem_bytes() as usize;
+            let end = (pos + n).min(stride);
+            if pos < end {
+                support::write_lanes_bytes(ctx, d, WarpMask(done), &all, stride, &row, pos, end);
+            }
+            pos += n;
+        }
+        if let Some(e) = failed {
+            return Err(e);
+        }
+    } else {
+        for t in active.lanes() {
+            bytes.fill(0);
+            let mut hint = 0usize;
+            for r in 0..nregs {
+                for p in map.pieces(r, t) {
+                    let at = 4 * r + p.reg_byte as usize;
+                    let n = p.len as usize;
+                    if let Some(k) = runs.locate(p, &mut hint) {
+                        bytes[at..at + n].copy_from_slice(&runs.image[k..k + n]);
+                    } else {
+                        check_piece_live(ctx, p, t, "tcgen05.ld")?;
+                        let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
+                        support::mem_read(ctx, loc, t, &mut bytes[at..at + n])?;
+                    }
+                    if ctx.observing {
+                        tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
+                    }
+                }
+            }
+            let compressed: Vec<u8>;
+            let out: &[u8] = match compress {
+                Some((max, abs)) => {
+                    let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+                    // Unreadable (invalid) words already failed or reported at the read.
+                    let valid = vec![true; words.len()];
+                    let (kept, _) = oplib::tcgen_ld_spcompress(&words, &valid, max, abs).map_err(|e| support::op_err(ctx, e))?;
+                    compressed = kept.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    &compressed
+                }
+                None => &bytes,
+            };
+            let mut pos = 0usize;
+            for &d in &args.dsts {
+                let n = support::reg_ty(ctx, d).mem_bytes() as usize;
+                let end = (pos + n).min(out.len());
+                if pos < end {
+                    write_lane_bytes(ctx, d, t, &out[pos..end]);
+                }
+                pos += n;
+            }
+            if let Some((red, regs)) = &red {
+                let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+                let v = oplib::tcgen_ld_reduce(*red, &words).map_err(|e| support::op_err(ctx, e))?;
+                if let Some(&rr) = regs.first() {
+                    write_lane_bytes(ctx, rr, t, &v.to_le_bytes());
+                }
+            }
+        }
+    }
+    finish_ld(ctx, args, op, tmem, tspans, &red, active)
+}
+
+/// Image offset of every piece of `map` (register-major, then lane) when
+/// each register is one 4-byte piece and every run is in the image (`None`
+/// otherwise). Pure in the map, so cached by the map's own key.
+fn word_offsets(key: (TcShape, u16, bool, u32, u32), map: &oplib::TcgenLdstMap, runs: &RunImages<'_>) -> Option<std::rc::Rc<[u32]>> {
+    type Key = (TcShape, u16, bool, u32, u32);
+    thread_local! {
+        static OFFS: std::cell::RefCell<std::collections::HashMap<Key, Option<std::rc::Rc<[u32]>>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(v) = OFFS.with(|m| m.borrow().get(&key).cloned()) {
+        return v;
+    }
+    let v = (|| {
+        if map.pieces_per_register != 1 {
+            return None;
+        }
+        let mut offs = Vec::with_capacity(map.all().len());
+        let mut hint = 0usize;
+        for p in map.all() {
+            if p.len != 4 || p.reg_byte != 0 {
+                return None;
+            }
+            offs.push(u32::try_from(runs.locate(p, &mut hint)?).ok()?);
+        }
+        (offs.len() == map.registers * 32).then(|| std::rc::Rc::from(offs))
+    })();
+    OFFS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 1024 {
+            m.clear();
+        }
+        m.insert(key, v.clone());
+    });
+    v
+}
+
+/// Common tail of `tcgen05.ld`: access events, register spans, the
+/// per-lane work commands and their protocol event.
+fn finish_ld(
+    ctx: &mut ExecCtx<'_>,
+    args: &TcgenLdArgs,
+    op: AsyncId,
+    tmem: crate::arena::AllocId,
+    tspans: Vec<LaneSpan>,
+    red: &Option<(oplib::TcgenLdRed, Vec<Reg>)>,
+    active: WarpMask,
+) -> HResult {
     emit_async_spans(ctx, op, Side::Read, AccessKind::Read, tmem, tspans);
     let mut written: Vec<Reg> = args.dsts.clone();
-    if let Some((_, regs)) = &red {
+    if let Some((_, regs)) = red {
         written.extend(regs.iter().copied());
     }
     let rs = if ctx.observing { reg_spans(ctx, &written, active) } else { Vec::new() };

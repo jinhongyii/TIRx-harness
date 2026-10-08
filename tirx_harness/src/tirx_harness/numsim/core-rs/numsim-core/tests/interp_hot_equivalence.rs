@@ -111,7 +111,7 @@ fn run_shape(block: [u32; 3]) {
     let warps = threads.div_ceil(32);
     for t in 0..threads as u64 {
         let warp = t / 32;
-        let live = if warp + 1 == warps as u64 && threads % 32 != 0 { (1u64 << (threads % 32)) - 1 } else { 0xffff_ffff };
+        let live = if warp + 1 == warps as u64 && !threads.is_multiple_of(32) { (1u64 << (threads % 32)) - 1 } else { 0xffff_ffff };
         let odd_lanes = live & 0xaaaa_aaaa;
         for (k, &s) in regs.iter().enumerate() {
             let (full, half) = match s {
@@ -182,5 +182,208 @@ fn register_file_starts_zeroed() {
         let w = WarpState::new(WarpId(1), CtaId(0), 1, n, WarpMask::ALL);
         assert_eq!(w.regs.regs.len(), n);
         assert!(w.regs.regs.iter().all(|s| s.iter().all(|&v| v == 0)));
+    }
+}
+
+/// `tcgen05.ld.32x32b.x64` with a distinct value per (thread, column),
+/// loaded back twice (into fresh and into overwritten registers): the
+/// register-major fast path (no observer) and the per-lane path (recording
+/// observer) produce the same registers, equal to what was stored.
+#[test]
+fn tcgen_ld_fast_path_matches_per_lane_path() {
+    use numsim_core::observe::RecordingObserver;
+    let mut b = ProgramBuilder::new("tcgen_ld_equiv", 128);
+    let out = b.global("out", Dtype::U32);
+    let slot = b.shared("taddr", Dtype::U32, 1);
+    let tid = b.reg(Ty::U32);
+    let w = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let sa = b.reg(Ty::U32);
+    let t = b.reg(Ty::U32);
+    let t2 = b.reg(Ty::U32);
+    let lanebits = b.reg(Ty::U32);
+    let idx = b.reg(Ty::U32);
+    let src: Vec<Reg> = (0..64).map(|_| b.reg(Ty::U32)).collect();
+    let v: Vec<Reg> = (0..64).map(|_| b.reg(Ty::U32)).collect();
+    let v2: Vec<Reg> = (0..64).map(|_| b.reg(Ty::U32)).collect();
+    b.thread_rank(tid);
+    b.warp_id(w);
+    let k0 = b.k_u32(0);
+    let k32 = b.k_u32(32);
+    let k64 = b.k_u32(64);
+    let k16 = b.k_u32(16);
+    let k128 = b.k_u32(128);
+    for (j, &r) in src.iter().enumerate() {
+        let kj = b.k_u32(j as u32 * 7919 + 1);
+        b.mul(Ty::U32, r, tid, k64);
+        b.add_u32(r, r, kj);
+    }
+    let sentinel = b.k_u32(0xdead_beef);
+    for &r in &v2 {
+        b.mov(r, sentinel);
+    }
+    b.smem_addr(sa, slot, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b.if_(p);
+    b.push(Instr::TcgenAlloc { dst: sa.into(), ncols: k64, cta_group: 1, exclusive: false });
+    b.end_if();
+    b.bar_sync(0);
+    b.ld_u32(t, slot, k0);
+    b.mul(Ty::U32, lanebits, w, k32);
+    b.binary(BinOp::Shl, Ty::U32, lanebits, lanebits, k16);
+    b.add_u32(t2, t, lanebits);
+    b.push(Instr::TcgenSt(Box::new(TcgenStArgs {
+        srcs: src.iter().map(|&r| r.into()).collect(),
+        taddr: t2.into(),
+        row: k0,
+        col: k0,
+        shape: TcShape::S32x32b,
+        num: 64,
+        unpack: false,
+    })));
+    b.push(Instr::TcgenWait { st: true });
+    let ld = |b: &mut ProgramBuilder, dsts: &[Reg]| {
+        b.push(Instr::TcgenLd(Box::new(TcgenLdArgs {
+            dsts: dsts.to_vec(),
+            taddr: t2.into(),
+            row: k0,
+            col: k0,
+            shape: TcShape::S32x32b,
+            num: 64,
+            pack: false,
+            red: None,
+            red_abs: false,
+            red_nan: false,
+            spcompress: false,
+        })));
+        b.push(Instr::TcgenWait { st: false });
+    };
+    ld(&mut b, &v);
+    ld(&mut b, &v2);
+    for (j, (&a, &c)) in v.iter().zip(&v2).enumerate() {
+        let kj = b.k_u32(j as u32);
+        let kj2 = b.k_u32(64 + j as u32);
+        b.mul(Ty::U32, idx, tid, k128);
+        b.add_u32(idx, idx, kj);
+        b.st_u32(out, idx, a);
+        b.mul(Ty::U32, idx, tid, k128);
+        b.add_u32(idx, idx, kj2);
+        b.st_u32(out, idx, c);
+    }
+    b.bar_sync(0);
+    b.if_(p);
+    b.push(Instr::TcgenDealloc { taddr: t.into(), ncols: k64, cta_group: 1, exclusive: false });
+    b.push(Instr::TcgenRelinquish { cta_group: 1 });
+    b.end_if();
+    b.exit();
+    let m = b.build_module();
+    let inp = inputs(vec![("out", u32_buf(vec![0; 128 * 128]))]);
+    let fast = sched::run_with_config(&m, &inp, &mut NoopObserver, &Default::default()).unwrap();
+    let slow = sched::run_with_config(&m, &inp, &mut RecordingObserver::new(), &Default::default()).unwrap();
+    assert_eq!(fast.status, RunStatus::Completed, "{:?}", fast.status);
+    assert_eq!(fast.status, slow.status);
+    assert_eq!(fast.outputs, slow.outputs);
+    let got: Vec<u32> = fast.outputs.buffers["out"].0.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for tid in 0..128u32 {
+        for j in 0..64u32 {
+            let want = tid * 64 + j * 7919 + 1;
+            assert_eq!(got[(tid * 128 + j) as usize], want, "thread {tid} column {j}");
+            assert_eq!(got[(tid * 128 + 64 + j) as usize], want, "thread {tid} column {j} second load");
+        }
+    }
+}
+
+/// Register-array indexing with a warp-uniform index (whole-slot fast path)
+/// and a per-lane index agree with the per-element definition, for 32- and
+/// 64-bit elements; a uniform out-of-bounds index fails at the first active
+/// lane.
+#[test]
+fn reg_indexed_uniform_and_per_lane() {
+    for (ty, dt) in [(Ty::U32, Dtype::U32), (Ty::U64, Dtype::U64)] {
+        let mut b = ProgramBuilder::new("reg_indexed", 64);
+        let out = b.global("out", dt);
+        let lane = b.reg(Ty::U32);
+        let tid = b.reg(Ty::U32);
+        let q = b.reg(Ty::U32);
+        let wide = b.reg(ty);
+        let v = b.reg(ty);
+        let idx = b.reg(Ty::U32);
+        let arr: Vec<Reg> = (0..4).map(|_| b.reg(ty)).collect();
+        let base = arr[0];
+        b.lane_id(lane);
+        b.thread_rank(tid);
+        let k3 = b.k_u32(3);
+        let k8 = b.k_u32(8);
+        b.cast(Ty::U32, ty, wide, tid);
+        for (j, &r) in arr.iter().enumerate() {
+            let kj = b.k_u32(1000 * (j as u32 + 1));
+            b.add_u32(q, tid, kj);
+            b.cast(Ty::U32, ty, r, q);
+        }
+        // Uniform store (element 2 := tid), then uniform and per-lane loads.
+        let k2 = b.k_u32(2);
+        b.push(Instr::StoreRegIndexed { base, len: 4, idx: k2, value: wide.into() });
+        b.mov(idx, k3);
+        b.push(Instr::LoadRegIndexed { dst: v, base, len: 4, idx: idx.into() });
+        b.mul(Ty::U32, q, tid, k8);
+        b.st(ty, out, q, v);
+        b.binary(BinOp::And, Ty::U32, idx, lane, k3);
+        b.push(Instr::LoadRegIndexed { dst: v, base, len: 4, idx: idx.into() });
+        let k1 = b.k_u32(1);
+        b.add_u32(q, q, k1);
+        b.st(ty, out, q, v);
+        // Per-lane store (element lane&3 := tid + 7), read back uniformly.
+        let k7 = b.k_u32(7);
+        b.add_u32(q, tid, k7);
+        b.cast(Ty::U32, ty, wide, q);
+        b.push(Instr::StoreRegIndexed { base, len: 4, idx: idx.into(), value: wide.into() });
+        for j in 0..4u32 {
+            let kj = b.k_u32(j);
+            b.push(Instr::LoadRegIndexed { dst: v, base, len: 4, idx: kj });
+            b.mul(Ty::U32, q, tid, k8);
+            let o = b.k_u32(2 + j);
+            b.add_u32(q, q, o);
+            b.st(ty, out, q, v);
+        }
+        b.exit();
+        let n = 64 * 8;
+        let bytes = dt.mem_bytes() as usize;
+        let o = sched::run_with_config(
+            &b.build_module(),
+            &inputs(vec![("out", numsim_core::sched::ArgValue::Buffer { bytes: vec![0; n * bytes], valid: None })]),
+            &mut NoopObserver,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(o.status, RunStatus::Completed, "{ty:?}: {:?}", o.status);
+        let raw = &o.outputs.buffers["out"].0;
+        let got = |i: usize| -> u64 {
+            let mut w = [0u8; 8];
+            w[..bytes].copy_from_slice(&raw[i * bytes..(i + 1) * bytes]);
+            u64::from_le_bytes(w)
+        };
+        for t in 0..64u64 {
+            let l = t % 32;
+            let init = |j: u64| t + 1000 * (j + 1);
+            let after_store = |j: u64| if j == 2 { t } else { init(j) };
+            assert_eq!(got((t * 8) as usize), after_store(3), "{ty:?} t{t} uniform load");
+            assert_eq!(got((t * 8 + 1) as usize), after_store(l & 3), "{ty:?} t{t} per-lane load");
+            for j in 0..4u64 {
+                let want = if j == (l & 3) { t + 7 } else { after_store(j) };
+                assert_eq!(got((t * 8 + 2 + j) as usize), want, "{ty:?} t{t} element {j}");
+            }
+        }
+    }
+    // Uniform out-of-bounds index: error names the first active lane.
+    let mut b = ProgramBuilder::new("reg_indexed_oob", 32);
+    let v = b.reg(Ty::U32);
+    let arr: Vec<Reg> = (0..4).map(|_| b.reg(Ty::U32)).collect();
+    let k9 = b.k_u32(9);
+    b.push(Instr::LoadRegIndexed { dst: v, base: arr[0], len: 4, idx: k9 });
+    b.exit();
+    let o = sched::run_with_config(&b.build_module(), &Default::default(), &mut NoopObserver, &Default::default()).unwrap();
+    match o.status {
+        RunStatus::Error(e) => assert_eq!(e.lanes, WarpMask::lane(0), "{e:?}"),
+        other => panic!("expected an out-of-bounds error, got {other:?}"),
     }
 }

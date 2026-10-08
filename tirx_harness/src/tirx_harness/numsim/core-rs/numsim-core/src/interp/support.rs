@@ -163,6 +163,40 @@ pub fn write_lane_bytes(ctx: &mut ExecCtx<'_>, r: Reg, lane: usize, src: &[u8]) 
     }
 }
 
+/// [`write_lane_bytes`] for every lane of `mask` at once (W13): lane `l`'s
+/// bytes are `rows[row[l] * stride + lo..row[l] * stride + hi]`. One
+/// register-type lookup per register instead of one per lane; same
+/// per-lane effect.
+#[allow(clippy::too_many_arguments)]
+pub fn write_lanes_bytes(ctx: &mut ExecCtx<'_>, r: Reg, mask: WarpMask, rows: &[u8], stride: usize, row: &[usize; 32], lo: usize, hi: usize) {
+    let ty = reg_ty(ctx, r);
+    let base = ctx.slot(r);
+    let bits = ty.bits();
+    let len = hi - lo;
+    for s in 0..ty.slots() {
+        let off = (s * 8) as usize;
+        let rem = bits.saturating_sub(s * 64);
+        let m = if rem < 64 { (1u64 << rem) - 1 } else { u64::MAX };
+        let dst = ctx.warp.regs.get_mut(base + s);
+        let k = len.saturating_sub(off).min(8);
+        let word = |at: usize| -> u64 {
+            match k {
+                0 => 0,
+                4 => u32::from_le_bytes(rows[at..at + 4].try_into().unwrap()) as u64,
+                8 => u64::from_le_bytes(rows[at..at + 8].try_into().unwrap()),
+                _ => {
+                    let mut w = [0u8; 8];
+                    w[..k].copy_from_slice(&rows[at..at + k]);
+                    u64::from_le_bytes(w)
+                }
+            }
+        };
+        for l in mask.lanes() {
+            dst[l] = word(row[l] * stride + lo + off) & m;
+        }
+    }
+}
+
 /// Write a <= 64-bit raw value to `r` in one lane (other slots cleared).
 #[inline]
 pub fn write_lane(ctx: &mut ExecCtx<'_>, r: Reg, lane: usize, v: u64) {
