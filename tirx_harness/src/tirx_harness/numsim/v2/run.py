@@ -118,6 +118,25 @@ def _scalar_bits(name: str, value: Any, ty: Mapping[str, Any] | None) -> int:
     return int.from_bytes(packed, "little")
 
 
+# ml_dtypes types that store one sub-byte value per byte.
+_UNPACKED_SUB_BYTE = frozenset({"float4_e2m1fn", "int4", "uint4", "int2", "uint2",
+                                "float6_e2m3fn", "float6_e3m2fn"})
+_SUB_BYTE_ELEMS = frozenset({"E2M1", "U4", "S4", "E2M3", "E3M2", "S2F6"})
+
+
+def _reject_unpacked_sub_byte(name: str, array: np.ndarray, slot: Mapping[str, Any]) -> None:
+    """Sub-byte buffers must be bound packed (legacy: a contiguous uint8
+    array); a one-value-per-byte ml_dtypes array would silently be read as
+    packed bytes."""
+
+    elem = str((slot.get("dtype") or {}).get("elem", "")).upper()
+    if array.dtype.name in _UNPACKED_SUB_BYTE or (elem in _SUB_BYTE_ELEMS and array.dtype.itemsize != 1):
+        raise InputError(
+            f"buffer argument {name!r} holds sub-byte {elem or array.dtype.name} values one per byte "
+            f"({array.dtype}); bind the packed bytes as a contiguous uint8 array"
+        )
+
+
 def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> dict[str, BoundInput]:
     """Bind user inputs to the module's host ABI (all kernels, by name).
 
@@ -207,6 +226,7 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
             array = np.ascontiguousarray(np.asarray(value))
             if array.dtype == object:
                 raise InputError(f"buffer argument {canonical!r} is not a numeric array")
+            _reject_unpacked_sub_byte(canonical, array, slot)
             bound[canonical] = BoundInput(
                 canonical, "buffer", ("buffer", array.view(np.uint8).reshape(-1).tobytes(), None),
                 dtype=array.dtype, shape=tuple(array.shape),

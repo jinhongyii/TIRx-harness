@@ -290,12 +290,6 @@ def four_float4_module():
     return v2.transpile(read_four_float4)
 
 
-@v2_gap(
-    "canonicalize_inputs binds a one-byte-per-value ml_dtypes float4 array as raw bytes "
-    "instead of rejecting it (legacy: 'contiguous uint8 array' input error); the run then "
-    "stops with an unrelated misaligned 'source[1]: sub-byte element is not byte-aligned', "
-    "which the packed-uint8 input hits too"
-)
 def test_direct_one_byte_per_value_float4_array_is_rejected(four_float4_module):
     """Replaces ``tests/numsim/runtime/test_packed_float4_global_views.py::test_direct_one_byte_per_value_float4_array_is_rejected``.
 

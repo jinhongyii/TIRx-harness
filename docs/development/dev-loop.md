@@ -108,6 +108,9 @@ treat that as a skip, never as a pass.
   selector name (two kernels may bind one buffer name with different
   dtypes); an output selected through a host tensor map is returned as the
   map's logical tensor (dims outermost first, map strides, base dtype).
+- Sub-byte buffers (E2M1, U4/S4, FP6) must be bound packed as a contiguous
+  uint8 array; a one-value-per-byte `ml_dtypes` array (e.g.
+  `float4_e2m1fn`) raises `InputError`, as legacy did.
 - A tensor-map parameter with neither a host value nor an engine-encodable
   spec is bound to an all-zero image, which the descriptor decoder rejects:
   legacy kernels that never use it run, any use fails closed.
