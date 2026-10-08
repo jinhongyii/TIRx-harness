@@ -13,7 +13,7 @@ import pytest
 import tvm
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import TensorMap, v2
 
 pytestmark = requires_v2_engine
@@ -154,19 +154,13 @@ def override_inputs(form):
 
 
 
-_ACCEPTED_BY_V2 = (
-    "v2 accepts a legacy rejection: synccheck/racecheck verdict clean and Engine.run completes "
-    "(legacy: invalid-operand error '{}'); CONTRACT_REQUESTS W12-gaps 2 (W4)"
-)
-
-
 @pytest.mark.parametrize(
     "kwargs",
     [
         pytest.param({"offset": 1}, id="unaligned_address"),
-        pytest.param({"offset": 8}, id="address_window", marks=v2_gap(_ACCEPTED_BY_V2.format("128 KiB"))),
+        pytest.param({"offset": 8}, id="address_window"),
         pytest.param(
-            {"coordinate": 1}, id="nonzero_coordinate", marks=v2_gap(_ACCEPTED_BY_V2.format("zero coordinates"))
+            {"coordinate": 1}, id="nonzero_coordinate"
         ),
         pytest.param({"dimension": 256}, id="dimension_8bit"),
         pytest.param({"upper": 16}, id="upper_stride_bits"),

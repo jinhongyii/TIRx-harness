@@ -146,7 +146,7 @@ tests/numsim/runtime/test_discard.py::test_discard_range_and_predication	pass	pa
 tests/numsim/runtime/test_discard.py::test_discard_indeterminate_read_and_alignment	pass	pass=1
 tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_complete_integer_bitwise_and_shift_domain_executes	pass	pass=1
 tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_complete_if_then_else_domain_executes_both_branches	pass	pass=1
-tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_if_then_else_mixed_pointer_spaces_fail_closed	pin-message	pin-message=1
+tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_if_then_else_mixed_pointer_spaces_fail_closed	pin-message(error->incomplete)	pin-message(error->incomplete)=1
 tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_complete_tvm_shuffle_payload_domain_executes	pass	pass=1
 tests/numsim/runtime/test_fetch_register_domain_oracle.py::test_every_fetch_register_form_matches_the_logical_topology	pin-internals	pin-internals=1
 tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helpers_have_reviewed_observable_semantics	pass	pass=1
@@ -417,11 +417,11 @@ tests/numsim/runtime/test_tma_dtype_runtime_domain.py::test_typed_tma_supported_
 tests/numsim/runtime/test_tma_im2col.py::test_im2col_interleaved	pass	pass=3
 tests/numsim/runtime/test_tma_im2col.py::test_im2col_spatial	pass	pass=3
 tests/numsim/runtime/test_tma_im2col.py::test_im2col_store_and_reduce	pass	pass=4
-tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_im2col_per_thread_coordinates_and_offsets	synccheck-verdict	synccheck-verdict=3
+tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_im2col_per_thread_coordinates_and_offsets	pass	pass=3
 tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_wide_im2col_per_thread_halo_offset_and_completion	pass	pass=2
 tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_prefetch_preserves_memory	pass	pass=2
 tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_transfer_rejects_only_when_issued	pass	pass=3
-tests/numsim/runtime/test_tma_multiissuer.py::test_tma_multiissuer_coordinates_and_target_completion	synccheck-verdict	synccheck-verdict=7
+tests/numsim/runtime/test_tma_multiissuer.py::test_tma_multiissuer_coordinates_and_target_completion	pass	pass=7
 tests/numsim/runtime/test_tma_swizzle96.py::test_swizzle96_documented_layout	pass	pass=2
 tests/numsim/runtime/test_tma_u6.py::test_tma_u6_layout_and_checkers	pass	pass=1
 tests/numsim/runtime/test_variable_identity.py::test_distinct_tir_vars_with_the_same_name_do_not_alias	pass	pass=1
