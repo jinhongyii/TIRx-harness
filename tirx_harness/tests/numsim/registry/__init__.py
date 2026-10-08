@@ -1,1 +1,0 @@
-"""NumSim operation registry tests."""
