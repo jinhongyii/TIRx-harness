@@ -13,6 +13,8 @@
 //!   g3: proxy_async_fence, global_scoped_hb_matrix, async_lifetime_contracts, shared_publication
 //!   g4: exact_oob, global_write_seed, alias_advisory, lane_order, exact_control, global_scoped_hb
 //!   g5: the remaining small files (atomic_semantics, arrive_snapshot, vector loads, ...)
+//!   g6: checker verdicts asserted outside analysis_tools/racecheck (numsim/runtime,
+//!       numsim/integration, analysis_tools/shared); map: coverage/other_b.tsv
 #![allow(dead_code, unused_imports, clippy::too_many_arguments)]
 #[path = "racecheck_common/mod.rs"]
 mod common;
@@ -1446,7 +1448,8 @@ fn g6_lanes(n: u8) -> Vec<u8> {
 /// cluster sync; CTA0 warp 0 lane 0 issues one `cta_group::2` MMA that reads
 /// both CTAs' smem and writes both CTAs' TMEM accumulators; with
 /// `with_commit` it commits to its barrier and warp 0 waits; cluster sync;
-/// warp 1 of each CTA reads its CTA's accumulator.
+/// warp 1 of each CTA reads its CTA's accumulator (a plain TMEM read as in
+/// the legacy kernel, or `fence::after_thread_sync` + `tcgen05.ld`).
 fn g6_dense_cta2(with_commit: bool, reader_tcgen: bool) -> Report {
     let mut k = K::new(2, 2, 2);
     k.alloc_cta(SMEM1, 1);
@@ -1473,6 +1476,7 @@ fn g6_dense_cta2(with_commit: bool, reader_tcgen: bool) -> Report {
     k.cluster_bar(&[0, 1, 2, 3]);
     for (w, t) in [(1u32, TMEM), (3, G6_TMEM1)] {
         if reader_tcgen {
+            k.fence(w, G6_ALL, FenceKind::TcgenAfter);
             let ld = k.issue(w, 0, AsyncKind::TcgenLd, Proxy::Tcgen, &[], &[(t, 0..8192)]);
             k.aacc(ld, Milestone::Read, AccessKind::Read, Proxy::Tcgen, t, 0..8192).done_warp(ld, Milestone::Write, w, 1);
         } else {
@@ -1513,13 +1517,25 @@ fn g6_uncommitted_dense_cta2_mma_pipeline_is_flagged() {
 
 // ------------------------------------------ integration/test_fp8_tmem_a_effects.py --
 
+/// How the TMEM-A stores are published before the `cta_sync`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum G6Publish {
+    /// No `wait::st` for the A stores (legacy `publish=False`); the tcgen05
+    /// fence pair is kept so the missing wait is the only defect.
+    None,
+    /// The legacy kernel: `wait::st` + `fence::after_thread_sync`, then `cta_sync`.
+    LegacyAfterFence,
+    /// `wait::st` + `fence::before_thread_sync`, `cta_sync`, `fence::after_thread_sync`.
+    FencePair,
+}
+
 /// Warpgroup (4 warps); TMEM cell (warp w's lanes, column c) at
 /// `w*4096 + 4c`. Every warp `tcgen05.st` x16 at col 0 + wait::st, then x8
-/// (the TMEM A operand) at col 16, waited + `fence::after_thread_sync` only
-/// when `publish`; `cta_sync`; two phases of warp 0 lane 0 MMA (reads A cols
-/// 16..24 and, in phase 1, D; writes D cols 0..16 of rows 0..m) + commit +
-/// warp-0 wait + `cta_sync`; every warp loads D.
-fn g6_fp8_tmem_a(m: u32, publish: bool) -> Report {
+/// (the TMEM A operand) at col 16, published per `publish`; `cta_sync`; two
+/// phases of warp 0 lane 0 MMA (reads A cols 16..24 and, in phase 1, D;
+/// writes D cols 0..16 of rows 0..m) + commit + warp-0 wait + `cta_sync`;
+/// every warp loads D.
+fn g6_fp8_tmem_a(m: u32, publish: G6Publish) -> Report {
     let mut k = K::new(4, 1, 1);
     let cell = |w: u32, c: std::ops::Range<u64>| u64::from(w) * 4096 + c.start * 4..u64::from(w) * 4096 + c.end * 4;
     k.st(0, 0, SMEM, 0..512).fence(0, G6_ALL, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
@@ -1530,13 +1546,26 @@ fn g6_fp8_tmem_a(m: u32, publish: bool) -> Report {
         k.aacc(st1, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, cell(w, 0..16)).done_warp(st1, Milestone::Write, w, G6_ALL);
         let st2 = k.issue(w, 0, AsyncKind::TcgenSt, Proxy::Tcgen, &[], &[(TMEM, cell(w, 16..24))]);
         k.aacc(st2, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, cell(w, 16..24));
-        if publish {
-            k.done_warp(st2, Milestone::Write, w, G6_ALL).fence(w, G6_ALL, FenceKind::TcgenAfter);
-        } else {
-            late.push((w, st2));
+        match publish {
+            G6Publish::None => {
+                k.fence(w, G6_ALL, FenceKind::TcgenBefore);
+                late.push((w, st2));
+            }
+            G6Publish::LegacyAfterFence => {
+                k.done_warp(st2, Milestone::Write, w, G6_ALL).fence(w, G6_ALL, FenceKind::TcgenAfter);
+            }
+            G6Publish::FencePair => {
+                k.done_warp(st2, Milestone::Write, w, G6_ALL).fence(w, G6_ALL, FenceKind::TcgenBefore);
+            }
         }
     }
     k.bar(0, &[0, 1, 2, 3]);
+    let fenced = publish != G6Publish::LegacyAfterFence;
+    if fenced {
+        for w in 0..4u32 {
+            k.fence(w, G6_ALL, FenceKind::TcgenAfter);
+        }
+    }
     let rows = m / 32;
     for phase in 0..2u64 {
         let mma = k.issue(0, 0, AsyncKind::TcgenPipelined, Proxy::Tcgen, &[], &[(TMEM, 0..16384)]);
@@ -1553,6 +1582,9 @@ fn g6_fp8_tmem_a(m: u32, publish: bool) -> Report {
         k.bar(0, &[0, 1, 2, 3]);
     }
     for w in 0..4u32 {
+        if fenced {
+            k.fence(w, G6_ALL, FenceKind::TcgenAfter);
+        }
         let ld = k.issue(w, 0, AsyncKind::TcgenLd, Proxy::Tcgen, &[], &[(TMEM, cell(w, 0..16))]);
         k.aacc(ld, Milestone::Read, AccessKind::Read, Proxy::Tcgen, TMEM, cell(w, 0..16)).done_warp(ld, Milestone::Write, w, G6_ALL);
     }
@@ -1564,15 +1596,16 @@ fn g6_fp8_tmem_a(m: u32, publish: bool) -> Report {
 }
 
 /// integration/test_fp8_tmem_a_effects.py::test_fp8_tmem_a_requires_published_stores[64-False|128-True]
-/// Published TMEM-A stores are clean; without `wait::st` the MMA's TMEM-A
+/// (racecheck half, `publish=False`): without `wait::st` the MMA's TMEM-A
 /// read races the store (`write_read`, `async_lifetime_not_drained`, TMEM,
-/// overlap = the 8 A columns at byte 64 of the warp's row block).
+/// overlap = the 8 A columns at byte 64 of the warp's row block). With the
+/// full `before_thread_sync` / `after_thread_sync` pair it is clean.
 #[test]
 fn g6_fp8_tmem_a_requires_published_stores() {
     for m in [64u32, 128] {
-        let r = g6_fp8_tmem_a(m, true);
+        let r = g6_fp8_tmem_a(m, G6Publish::FencePair);
         assert!(clean(&r) && r.findings.is_empty(), "m={m}: {:?} {:?}", r.findings, r.incomplete);
-        let r = g6_fp8_tmem_a(m, false);
+        let r = g6_fp8_tmem_a(m, G6Publish::None);
         let errors: Vec<_> = r.errors().collect();
         assert!(!errors.is_empty(), "m={m}: {r:?}");
         for f in &errors {
@@ -1584,4 +1617,887 @@ fn g6_fp8_tmem_a_requires_published_stores() {
             assert_eq!((f.bytes.start % 4096, f.bytes.end - f.bytes.start), (64, 32), "m={m}: {f:?}");
         }
     }
+}
+
+/// integration/test_fp8_tmem_a_effects.py::test_fp8_tmem_a_requires_published_stores[64-False|128-True]
+/// (the `publish=True` kernel, which both checkers must call clean): the
+/// stores are waited and followed by `fence::after_thread_sync` *before*
+/// the `cta_sync`; there is no `before_thread_sync`, and no
+/// `after_thread_sync` after any `cta_sync` (neither before the MMA nor
+/// before the final `tcgen05.ld` of D). Legacy: clean. New: waited tcgen05
+/// stores and committed MMA results reach another warp's tcgen05 op only
+/// through the fence pair (racecheck-semantics §3 rows 19-23), so both
+/// hand-offs race.
+#[test]
+#[ignore = "undocumented divergence: legacy accepts tcgen05.wait::st + fence::after_thread_sync + cta_sync as publishing TMEM stores to another warp's MMA; the new core requires before_thread_sync/after_thread_sync and reports write_read/write_write async_lifetime_not_drained (no delta row)"]
+fn g6_fp8_tmem_a_legacy_publication_is_clean() {
+    for m in [64u32, 128] {
+        let r = g6_fp8_tmem_a(m, G6Publish::LegacyAfterFence);
+        assert!(clean(&r) && r.findings.is_empty(), "m={m}: {:?} {:?}", r.findings, r.incomplete);
+    }
+}
+
+// ------------------------------------------------- runtime/test_async_release.py --
+
+/// One `st.async.release.gpu.global` (or `red.async.release.gpu.global.add`)
+/// write by warp `w` lane `lane` to `alloc[r]`.
+fn g6_async_release(k: &mut K, w: WarpId, lane: u8, reduction: bool, alloc: AllocId, r: std::ops::Range<u64>) -> AsyncId {
+    let op = k.issue(w, lane, AsyncKind::Copy, Proxy::Generic, &[], &[(alloc, r.clone())]);
+    let kind = if reduction { AccessKind::Rmw } else { AccessKind::Write };
+    g6_acc(k, op, Milestone::Write, kind, Sem::Release, Scope::Gpu, Proxy::Generic, alloc, Space::Global, Some(Window::Global), &[(lane, r)]);
+    // Completes with no observer (no mbarrier, not in a bulk group).
+    k.done_warp(op, Milestone::Write, w, 0);
+    op
+}
+
+/// runtime/test_async_release.py::test_bulk_wait_does_not_acquire_async_release[False|True]
+/// Lanes 0..16 each issue an async release store/reduction to `data[lane]`;
+/// `cp.async.bulk.commit_group` + `wait_group 0` do not cover it, so every
+/// lane's read of `data[lane]` races it.
+#[test]
+fn g6_bulk_wait_does_not_acquire_async_release() {
+    for reduction in [false, true] {
+        let mut k = K::one_warp();
+        for l in 0..16u8 {
+            g6_async_release(&mut k, 0, l, reduction, GMEM, u64::from(l) * 4..u64::from(l) * 4 + 4);
+        }
+        k.inst(0, &G5_ALL, PLAIN_LD, |l| (GMEM, u64::from(l) * 4..u64::from(l) * 4 + 4));
+        let r = k.run();
+        assert!(has_class(&r, RaceClass::WriteRead) || has_class(&r, RaceClass::ReadWrite), "red={reduction}: {r:?}");
+    }
+}
+
+/// Warp 0 lane 0 writes `data` (global, or `scratch` in smem) before or
+/// after an async release store/reduction to the declared `flag`; warp 1
+/// lane 0 `wait_until`s the flag (accepting that write) and reads the data.
+fn g6_async_release_publication(after: bool, shared: bool, reduction: bool) -> Report {
+    let mut k = K::new(2, 1, 1);
+    k.declare(GMEM2, 0..4);
+    let data = if shared { SMEM } else { GMEM };
+    if !after {
+        k.st(0, 0, data, 0..4);
+    }
+    g6_async_release(&mut k, 0, 0, reduction, GMEM2, 0..4);
+    if after {
+        k.st(0, 0, data, 0..4);
+    }
+    k.a(1, 0, ld(MemOrder::Acquire, Scope::Gpu), GMEM2, 0..4).wait_until(1, 0, GMEM2, 0..4, Scope::Gpu, 0b10, 1);
+    k.ld(1, 0, data, 0..4).st(1, 0, GMEM, 64..68);
+    k.run()
+}
+
+/// runtime/test_async_release.py::test_async_release_publishes_only_pre_issue_work
+/// [shared,reduction = F,F | T,F | F,T] (the `after=True` half): data
+/// written after the release is not published.
+#[test]
+fn g6_async_release_does_not_publish_post_issue_work() {
+    for (shared, reduction) in [(false, false), (true, false), (false, true)] {
+        let r = g6_async_release_publication(true, shared, reduction);
+        assert!(has_class(&r, RaceClass::WriteRead) || has_class(&r, RaceClass::ReadWrite), "{shared} {reduction}: {r:?}");
+    }
+}
+
+/// runtime/test_async_release.py::test_async_release_publishes_only_pre_issue_work
+/// (the `after=False` half, which `run_checked` requires clean in both
+/// checkers): an async `.release` publication orders the issuer's earlier
+/// writes before a waiter that accepts it. The new core gives async-actor
+/// writes no release head (`own_rel` only for warp lanes), so the wait owes
+/// no edge and the read races, although racecheck-semantics §5 treats async
+/// publications as edge sources (the observed-version fallback).
+#[test]
+#[ignore = "undocumented divergence: st.async/red.async .release (global, no mbarrier) carries no release head in the new core, so a wait_until accepting it gives no edge and the pre-issue payload read races; legacy clean"]
+fn g6_async_release_publishes_pre_issue_work() {
+    for (shared, reduction) in [(false, false), (true, false), (false, true)] {
+        let r = g6_async_release_publication(false, shared, reduction);
+        assert!(clean(&r), "{shared} {reduction}: {:?} {:?}", r.findings, r.incomplete);
+    }
+}
+
+// -------------------------------- runtime/test_bulk_copy_scopes.py, test_bulk_g2s_scopes.py --
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum G6Rel {
+    /// Two warps of one CTA.
+    Cta,
+    /// Two CTAs of one cluster.
+    Cluster,
+    /// Two clusters.
+    Gpu,
+}
+
+fn g6_rel_k(rel: G6Rel) -> K {
+    let mut k = match rel {
+        G6Rel::Cta => K::new(2, 1, 1),
+        G6Rel::Cluster => K::new(1, 2, 2),
+        G6Rel::Gpu => K::new(1, 1, 2),
+    };
+    if rel != G6Rel::Cta {
+        k.alloc_cta(SMEM1, 1);
+    }
+    k
+}
+
+/// `None` = weak copy; `Some(s)` = `.relaxed.s ... .b128` (strong, atomic
+/// per 16-byte element).
+fn g6_copy_dst(k: &mut K, op: AsyncId, lane: u8, scope: Option<Scope>, alloc: AllocId, space: Space, window: Window, r: std::ops::Range<u64>) {
+    let spans = match scope {
+        Some(_) => g6_elems(lane, r, 16),
+        None => vec![(lane, r)],
+    };
+    let sem = if scope.is_some() { Sem::Relaxed } else { Sem::Weak };
+    g6_acc(k, op, Milestone::Write, AccessKind::Write, sem, scope.unwrap_or(Scope::Gpu), Proxy::Async, alloc, space, Some(window), &spans);
+}
+
+/// test_bulk_copy_scopes.py `copy_case`: actor a (warp a) stages 8 words in
+/// its smem, `fence.proxy.async`, lane 0 bulk-copies `32 - 16a` bytes to
+/// `destination[4a..]` (actor 0 bytes 0..32, actor 1 bytes 16..32), waits
+/// `.read`, rewrites the staging words, then waits the full group.
+fn g6_bulk_copy(scope: Option<Scope>, rel: G6Rel, enabled: bool) -> Report {
+    let mut k = g6_rel_k(rel);
+    for a in 0..2u32 {
+        let (smem, off) = match rel {
+            G6Rel::Cta => (SMEM, u64::from(a) * 32),
+            _ => (if a == 0 { SMEM } else { SMEM1 }, 0),
+        };
+        let lanes = g6_lanes(8);
+        k.inst(a, &lanes, PLAIN_ST, |l| (smem, off + u64::from(l) * 4..off + u64::from(l) * 4 + 4));
+        k.syncwarp(a, G6_ALL).fence(a, G6_ALL, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+        let op = enabled.then(|| {
+            let dst = u64::from(a) * 16..32;
+            let op = k.issue(a, 0, AsyncKind::Copy, Proxy::Async, &[], &[(GMEM, dst.clone())]);
+            k.ar(op, Proxy::Async, smem, off..off + dst.end - dst.start);
+            g6_copy_dst(&mut k, op, 0, scope, GMEM, Space::Global, Window::Global, dst);
+            k.done_warp(op, Milestone::Read, a, 1);
+            op
+        });
+        k.syncwarp(a, G6_ALL);
+        k.inst(a, &lanes, PLAIN_ST, |l| (smem, off + u64::from(l) * 4..off + u64::from(l) * 4 + 4));
+        k.syncwarp(a, G6_ALL);
+        if let Some(op) = op {
+            k.done_warp(op, Milestone::Write, a, 1);
+        }
+    }
+    k.run()
+}
+
+/// runtime/test_bulk_copy_scopes.py::test_bulk_copy_scope_and_elements[cta|cluster|gpu|sys]
+/// (x relation cta|cluster|gpu x enabled 0|1): overlapping strong `.b128`
+/// bulk copies are morally strong (clean) when the scopes cover both
+/// issuers; otherwise legacy reported `scope_mismatch`. delta R4: an
+/// unordered strong pair that fails only on scope is now a data race with
+/// `missing_release_acquire` (no `ScopeMismatch`, which is reserved for a
+/// release/acquire edge).
+#[test]
+fn g6_bulk_copy_scope_and_elements() {
+    for scope in [Scope::Cta, Scope::Cluster, Scope::Gpu, Scope::Sys] {
+        for rel in [G6Rel::Cta, G6Rel::Cluster, G6Rel::Gpu] {
+            for enabled in [false, true] {
+                let r = g6_bulk_copy(Some(scope), rel, enabled);
+                let mismatch = enabled && ((scope == Scope::Cta && rel != G6Rel::Cta) || (scope == Scope::Cluster && rel == G6Rel::Gpu));
+                if mismatch {
+                    // delta R4: legacy `scope_mismatch`.
+                    assert!(has_failure(&r, |f| f == OrderingFailure::MissingReleaseAcquire), "{scope:?} {rel:?}: {r:?}");
+                    assert!(has_class(&r, RaceClass::WriteWrite), "{scope:?} {rel:?}: {r:?}");
+                    assert!(r.incomplete.is_empty());
+                } else {
+                    assert!(clean(&r) && r.findings.is_empty(), "{scope:?} {rel:?} {enabled}: {:?} {:?}", r.findings, r.incomplete);
+                }
+            }
+        }
+    }
+}
+
+/// runtime/test_bulk_copy_scopes.py::test_bulk_copy_weak_overlap_still_races
+#[test]
+fn g6_bulk_copy_weak_overlap_still_races() {
+    let r = g6_bulk_copy(None, G6Rel::Cta, true);
+    assert!(has_class(&r, RaceClass::WriteWrite), "{r:?}");
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum G6Writers {
+    Warps,
+    Lanes,
+    /// Two CTAs of one cluster, both writing CTA 0's smem through `mapa`.
+    Ctas,
+}
+
+/// test_bulk_g2s_scopes.py `g2s_case`: CTA0 warp 0 zeroes the 8-word
+/// destination, inits the barrier and arms `expect_tx(48)`; cluster sync;
+/// actor a copies `32 - 16a` bytes of `source[8a..]` into `shared[4a..]`
+/// completing on CTA 0's barrier; CTA0 warp 0 lane 0 waits; cluster sync;
+/// lanes 0..8 read the destination.
+fn g6_g2s(scope: Option<Scope>, writers: G6Writers, enabled: bool) -> Report {
+    let mut k = match writers {
+        G6Writers::Warps => K::new(2, 1, 1),
+        G6Writers::Lanes => K::one_warp(),
+        G6Writers::Ctas => K::new(1, 2, 2),
+    };
+    let all: Vec<WarpId> = if writers == G6Writers::Lanes { vec![0] } else { vec![0, 1] };
+    let lanes = g6_lanes(8);
+    k.inst(0, &lanes, PLAIN_ST, |l| (SMEM, u64::from(l) * 4..u64::from(l) * 4 + 4));
+    k.arrive(0, 1, 0, 0, true);
+    for &w in &all {
+        k.fence(w, G6_ALL, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+    }
+    k.cluster_bar(&all);
+    let window = if writers == G6Writers::Ctas { Window::SharedCluster } else { Window::SharedCta };
+    if enabled {
+        for a in 0..2u32 {
+            let (w, lane) = if writers == G6Writers::Lanes { (0, a as u8) } else { (a, 0) };
+            let dst = u64::from(a) * 16..32;
+            let op = k.issue(w, lane, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, dst.clone())]);
+            let src = u64::from(a) * 32..u64::from(a) * 32 + (dst.end - dst.start);
+            k.ar(op, Proxy::Async, GMEM, src);
+            g6_copy_dst(&mut k, op, lane, scope, SMEM, Space::Shared, window, dst);
+            k.done_phase(op, Milestone::Write, 0, 0);
+        }
+    }
+    k.wait(0, 1, 0, 0, true);
+    k.cluster_bar(&all);
+    k.inst(0, &lanes, PLAIN_LD, |l| (SMEM, u64::from(l) * 4..u64::from(l) * 4 + 4));
+    k.run()
+}
+
+/// runtime/test_bulk_g2s_scopes.py::test_strong_g2s_scope_elements_and_predication[cta|cluster|gpu|sys]
+/// (x writers warps|lanes|ctas x enabled 0|1): overlapping strong G2S copies
+/// are clean unless the issuers are in different CTAs and the scope is
+/// `.cta` (`write_write`; delta R4 adds `missing_release_acquire`).
+#[test]
+fn g6_strong_g2s_scope_elements_and_predication() {
+    for scope in [Scope::Cta, Scope::Cluster, Scope::Gpu, Scope::Sys] {
+        for writers in [G6Writers::Warps, G6Writers::Lanes, G6Writers::Ctas] {
+            for enabled in [false, true] {
+                let r = g6_g2s(Some(scope), writers, enabled);
+                if enabled && writers == G6Writers::Ctas && scope == Scope::Cta {
+                    assert!(has_class(&r, RaceClass::WriteWrite), "{scope:?} {writers:?}: {r:?}");
+                    assert!(has_failure(&r, |f| f == OrderingFailure::MissingReleaseAcquire), "{r:?}");
+                } else {
+                    assert!(clean(&r) && r.findings.is_empty(), "{scope:?} {writers:?} {enabled}: {:?} {:?}", r.findings, r.incomplete);
+                }
+            }
+        }
+    }
+}
+
+/// runtime/test_bulk_g2s_scopes.py::test_weak_g2s_overlapping_writes_still_race
+#[test]
+fn g6_weak_g2s_overlapping_writes_still_race() {
+    let r = g6_g2s(None, G6Writers::Warps, true);
+    assert!(has_class(&r, RaceClass::WriteWrite), "{r:?}");
+}
+
+// ---------------------------------------------- runtime/test_bulk_reduce_s2g_f32.py --
+
+/// runtime/test_bulk_reduce_s2g_f32.py::test_bulk_reduce_partial_overlap_is_elementwise_atomic:
+/// two CTAs (two clusters) `cp.reduce.async.bulk.global.shared::cta.add.f32`
+/// into `destination[4c..]` (CTA 0: 32 bytes, CTA 1: 16 bytes): the partial
+/// overlap is elementwise atomic, clean.
+#[test]
+fn g6_bulk_reduce_partial_overlap_is_elementwise_atomic() {
+    let mut k = K::new(1, 1, 2);
+    k.alloc_cta(SMEM1, 1);
+    for c in 0..2u32 {
+        let smem = if c == 0 { SMEM } else { SMEM1 };
+        let len = if c == 0 { 32 } else { 16 };
+        k.st(c, 0, smem, 0..32).fence(c, 1, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+        let dst = u64::from(c) * 16..u64::from(c) * 16 + len;
+        let op = k.issue(c, 0, AsyncKind::Copy, Proxy::Async, &[], &[(GMEM, dst.clone())]);
+        k.ar(op, Proxy::Async, smem, 0..len);
+        g6_acc(&mut k, op, Milestone::Write, AccessKind::Rmw, Sem::Relaxed, Scope::Gpu, Proxy::Async, GMEM, Space::Global, Some(Window::Global), &g6_elems(0, dst, 4));
+        k.done_warp(op, Milestone::Read, c, 1).done_warp(op, Milestone::Write, c, 1);
+    }
+    let r = k.run();
+    assert!(clean(&r) && r.findings.is_empty(), "{:?} {:?}", r.findings, r.incomplete);
+}
+
+// -------------------------------------------- runtime/test_mbarrier_lane_semantics.py --
+
+/// runtime/test_mbarrier_lane_semantics.py::test_checkers_group_pending_blocking_waits_on_distinct_barriers[racecheck]
+/// (`checker_lane_varying_pending_wait`): warp 1 lanes 0..4 arrive on and
+/// wait `barriers[lane]` (phase 0); `cta_sync`; warp 0 lanes 0..4 arrive
+/// (phase 1) while warp 1's one lane-varying wait keeps all four requests
+/// pending; warp 1 then writes `output[lane]`. Clean.
+#[test]
+fn g6_lane_varying_pending_waits_on_distinct_barriers_are_clean() {
+    let mut k = K::new(2, 1, 1);
+    k.bar(0, &[0, 1]);
+    for l in 0..4u32 {
+        k.arrive(1, 1 << l, l, 0, true);
+    }
+    for l in 0..4u32 {
+        k.wait(1, 1 << l, l, 0, true);
+    }
+    k.bar(0, &[0, 1]);
+    for l in 0..4u32 {
+        k.arrive(0, 1 << l, l, 1, true);
+    }
+    for l in 0..4u32 {
+        k.wait(1, 1 << l, l, 1, true);
+    }
+    let lanes = g6_lanes(4);
+    k.inst(1, &lanes, PLAIN_ST, |l| (GMEM, u64::from(l) * 4..u64::from(l) * 4 + 4));
+    let r = k.run();
+    assert!(clean(&r) && r.findings.is_empty(), "{:?} {:?}", r.findings, r.incomplete);
+}
+
+/// runtime/test_mbarrier_lane_semantics.py::test_checkers_allow_distinct_barrier_waits[racecheck]
+/// (`lane_varying_expect_tx`): every lane zeroes `shared[lane]` and
+/// `shared[lane+32]`; `fence.proxy.async`; `cta_sync`; lane 0 and lane 1
+/// each arm their own barrier and bulk-copy 16 bytes into `shared[0..16]` /
+/// `shared[32..48]`; lanes 0 and 1 wait their own barrier; `__syncwarp`;
+/// every lane reads `shared[lane]` and `shared[lane+32]`. Clean.
+#[test]
+fn g6_lane_varying_expect_tx_waits_are_clean() {
+    let mut k = K::one_warp();
+    for base in [0u64, 32] {
+        k.inst(0, &G5_ALL, PLAIN_ST, |l| (SMEM, base + u64::from(l)..base + u64::from(l) + 1));
+    }
+    k.fence(0, G6_ALL, FenceKind::ProxyAsync(Some(Domain::SharedCta))).bar(0, &[0]);
+    for l in 0..2u8 {
+        let dst = u64::from(l) * 32..u64::from(l) * 32 + 16;
+        k.arrive(0, 1 << l, u32::from(l), 0, true);
+        let op = k.issue(0, l, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, dst.clone())]);
+        k.ar(op, Proxy::Async, GMEM, dst.clone()).aw(op, Proxy::Async, SMEM, dst).done_phase(op, Milestone::Write, u32::from(l), 0);
+    }
+    for l in 0..2u32 {
+        k.wait(0, 1 << l, l, 0, true);
+    }
+    k.syncwarp(0, G6_ALL);
+    for base in [0u64, 32] {
+        k.inst(0, &G5_ALL, PLAIN_LD, |l| (SMEM, base + u64::from(l)..base + u64::from(l) + 1));
+    }
+    let r = k.run();
+    assert!(clean(&r) && r.findings.is_empty(), "{:?} {:?}", r.findings, r.incomplete);
+}
+
+/// runtime/test_mbarrier_lane_semantics.py::test_relaxed_query_does_not_acquire_arriving_threads_memory
+/// Warp 0 lane 0 writes `data` (global) and `shared[0]`, then arrives
+/// (default `.release.cta`); warp 1 lane 0 polls with
+/// `mbarrier.test_wait.parity.relaxed.cta` and reads both: two `write_read`
+/// races (sync delta B2 agrees: a relaxed wait synchronises nothing).
+#[test]
+fn g6_relaxed_query_does_not_acquire_arriving_threads_memory() {
+    let mut k = K::new(2, 1, 1);
+    k.bar(0, &[0, 1]);
+    k.st(0, 0, GMEM, 0..4).st(0, 0, SMEM, 0..4).arrive(0, 1, 0, 0, true);
+    k.wait(1, 1, 0, 0, false);
+    k.ld(1, 0, GMEM, 0..4).ld(1, 0, SMEM, 0..4);
+    let r = k.run();
+    let errs: Vec<_> = r.errors().filter(|f| matches!(f.kind, FindingKind::DataRace { class: RaceClass::WriteRead, .. })).collect();
+    assert_eq!(errs.len(), 2, "{r:?}");
+    assert!(errs.iter().any(|f| f.alloc == GMEM) && errs.iter().any(|f| f.alloc == SMEM));
+}
+
+// ----------------------------------------------------- runtime/test_memory_ops.py --
+
+/// runtime/test_memory_ops.py::test_bulk_g2s_cta_has_exact_racecheck_payload_accesses
+/// (`bulk_g2s_cta`): lane 0 issues a 16-byte G2S copy *before* its
+/// `arrive.expect_tx`, waits; `__syncwarp`; lanes 0..16 read one byte each.
+/// The waiting lane hands the completed copy to its siblings: clean.
+#[test]
+fn g6_bulk_g2s_cta_waiter_hands_payload_to_the_warp() {
+    let mut k = K::one_warp();
+    k.bar(0, &[0]);
+    let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16)]);
+    k.ar(op, Proxy::Async, GMEM, 0..16).aw(op, Proxy::Async, SMEM, 0..16).done_phase(op, Milestone::Write, 0, 0);
+    k.arrive(0, 1, 0, 0, true).wait(0, 1, 0, 0, true).syncwarp(0, G6_ALL);
+    let lanes = g6_lanes(16);
+    k.inst(0, &lanes, PLAIN_LD, |l| (SMEM, u64::from(l)..u64::from(l) + 1));
+    k.inst(0, &lanes, PLAIN_ST, |l| (GMEM2, u64::from(l)..u64::from(l) + 1));
+    let r = k.run();
+    assert!(clean(&r) && r.findings.is_empty(), "{:?} {:?}", r.findings, r.incomplete);
+}
+
+// ----------------------------------------------- runtime/test_mixed_version_reads.py --
+
+/// runtime/test_mixed_version_reads.py::test_mixed_version_does_not_publish_later_data
+/// [volatile|acquire|relaxed|cas] (`late_data=True`): warps 0 and 1 each
+/// `fence.release.gpu` and `.cp_mask` bulk-copy half of the 16-byte flag
+/// (`relaxed.gpu .b128`), wait, `cta_sync`; *then* write `data[warp]`.
+/// Warp 2 spins on the flag (`fence.proxy.async.global` + a b128 read in
+/// `mode`) and reads both data words: neither the release heads nor the
+/// barrier publish the later stores, so the reads race; no incomplete.
+#[test]
+fn g6_mixed_version_does_not_publish_later_data() {
+    for mode in ["volatile", "acquire", "relaxed", "cas"] {
+        let mut k = K::new(3, 1, 1);
+        for w in 0..2u32 {
+            let lanes = g6_lanes(16);
+            k.inst(w, &lanes, PLAIN_ST, |l| (SMEM, u64::from(w) * 16 + u64::from(l)..u64::from(w) * 16 + u64::from(l) + 1));
+            k.syncwarp(w, G6_ALL).fence(w, G6_ALL, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+            k.fence(w, 1, FenceKind::AcqRel(Scope::Gpu));
+            let half = u64::from(w) * 8..u64::from(w) * 8 + 8;
+            let op = k.issue(w, 0, AsyncKind::Copy, Proxy::Async, &[], &[(GMEM2, half.clone())]);
+            k.ar(op, Proxy::Async, SMEM, u64::from(w) * 16..u64::from(w) * 16 + 16);
+            g6_acc(&mut k, op, Milestone::Write, AccessKind::Write, Sem::Relaxed, Scope::Gpu, Proxy::Async, GMEM2, Space::Global, Some(Window::Global), &[(0, half)]);
+            k.done_warp(op, Milestone::Read, w, 1).done_warp(op, Milestone::Write, w, 1);
+        }
+        k.bar(0, &[0, 1, 2]);
+        for w in 0..2u32 {
+            k.st(w, 0, GMEM, u64::from(w) * 4..u64::from(w) * 4 + 4);
+        }
+        for _ in 0..2 {
+            k.fence(2, 1, FenceKind::ProxyAsync(Some(Domain::Global)));
+            match mode {
+                "volatile" => k.a(2, 0, ld(MemOrder::Relaxed, Scope::Sys), GMEM2, 0..16),
+                "acquire" => k.a(2, 0, ld(MemOrder::Acquire, Scope::Gpu), GMEM2, 0..16),
+                "relaxed" => k.a(2, 0, ld(MemOrder::Relaxed, Scope::Gpu), GMEM2, 0..16).fence(2, 1, FenceKind::AcqRel(Scope::Gpu)),
+                _ => k.a(2, 0, atom(MemOrder::Acquire, Scope::Gpu), GMEM2, 0..16),
+            };
+        }
+        k.ld(2, 0, GMEM, 0..4).ld(2, 0, GMEM, 4..8).st(2, 0, GMEM, 64..72);
+        let r = k.run();
+        assert!(r.incomplete.is_empty(), "{mode}: {:?}", r.incomplete);
+        assert!(
+            races(&r).iter().any(|f| f.alloc == GMEM && matches!(f.kind, FindingKind::DataRace { class: RaceClass::WriteRead | RaceClass::ReadWrite, .. })),
+            "{mode}: {r:?}"
+        );
+    }
+}
+
+// ------------------------------------------------------- runtime/test_red_async.py --
+
+/// `reduction_kernel`: CTA 1 lane 0 initialises `destination` (and each
+/// CTA its `source`), inits its barrier for `lanes` arrivals; cluster sync;
+/// CTA 0 lanes 0..lanes arm CTA 1's barrier (`arrive.expect_tx.shared::cluster`,
+/// default `.release.cta`) and issue `red.async.relaxed.cluster` (4-byte,
+/// generic proxy) or one 16-byte `cp.reduce.async.bulk.shared::cluster`
+/// (async proxy, after `fence.proxy.async`) into CTA 1's destination,
+/// completing on CTA 1's barrier; CTA 1 lane 0 (optionally) waits and reads
+/// the destination; cluster sync.
+fn g6_red_async(bulk: bool, wait: bool) -> Report {
+    let lanes: u8 = if bulk { 1 } else { 4 };
+    let mut k = K::new(1, 2, 2);
+    k.alloc_cta(SMEM1, 1);
+    k.st(0, 0, SMEM, 16..32).st(1, 0, SMEM1, 0..32);
+    if bulk {
+        for w in 0..2 {
+            k.fence(w, G6_ALL, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+        }
+    }
+    k.cluster_bar(&[0, 1]);
+    let barrier = mbar_in(1, 0);
+    for l in 0..lanes {
+        k.arrive_q(0, 1 << l, barrier, 0, Some(true), Some(Scope::Cta));
+    }
+    for l in 0..lanes {
+        let op = k.issue(0, l, AsyncKind::Copy, if bulk { Proxy::Async } else { Proxy::Generic }, &[], &[(SMEM1, 0..16)]);
+        if bulk {
+            k.ar(op, Proxy::Async, SMEM, 16..32);
+            g6_acc(&mut k, op, Milestone::Write, AccessKind::Rmw, Sem::Relaxed, Scope::Cluster, Proxy::Async, SMEM1, Space::Shared, Some(Window::SharedCluster), &g6_elems(l, 0..16, 4));
+        } else {
+            g6_acc(&mut k, op, Milestone::Write, AccessKind::Rmw, Sem::Relaxed, Scope::Cluster, Proxy::Generic, SMEM1, Space::Shared, Some(Window::SharedCluster), &[(l, 0..4)]);
+        }
+        k.done_phase_r(op, Milestone::Write, barrier, 0);
+    }
+    if wait {
+        k.wait_q(1, 1, barrier, 0, Some(true), Some(Scope::Cta));
+    }
+    k.ld(1, 0, SMEM1, 0..if bulk { 16 } else { 4 });
+    k.cluster_bar(&[0, 1]);
+    k.run()
+}
+
+/// runtime/test_red_async.py::test_shared_async_reduction_completion
+/// [F-u32-add | T-u32-add | T-s32-min | T-b32-xor | T-u64-add] (the op and
+/// type only change values): the unwaited read races the remote reduction.
+/// The waited kernel (which legacy `run_checked` requires clean) has no data
+/// race; delta B1/V5: the qualifier-less remote `arrive.expect_tx` is
+/// `.release.cta`, so CTA 1's `.cta` wait reports `ScopeMismatch` on that
+/// arrival edge (legacy: clean).
+#[test]
+fn g6_shared_async_reduction_completion() {
+    for bulk in [false, true] {
+        let r = g6_red_async(bulk, true);
+        assert!(!has_race(&r) && r.incomplete.is_empty(), "bulk={bulk}: {:?} {:?}", r.findings, r.incomplete);
+        assert!(r.errors().all(|f| matches!(f.kind, FindingKind::ScopeMismatch { .. })), "bulk={bulk}: {r:?}");
+        let r = g6_red_async(bulk, false);
+        assert!(has_class(&r, RaceClass::WriteRead) || has_class(&r, RaceClass::ReadWrite), "bulk={bulk}: {r:?}");
+        assert!(races(&r).iter().all(|f| f.alloc == SMEM1));
+    }
+}
+
+// ------------------------------------------------------ runtime/test_store_sinks.py --
+
+/// One warp instruction whose lanes each touch several spans (a vector
+/// access: one span per element).
+fn g6_vec_store(k: &mut K, w: WarpId, op: Op, alloc: AllocId, spans: &[(u8, std::ops::Range<u64>)]) {
+    let epoch = k.tick(w);
+    let space = if alloc == GMEM || alloc == GMEM2 { Space::Global } else { Space::Shared };
+    let window = if space == Space::Global { Window::Global } else { Window::SharedCta };
+    k.ev.push(Ev::Access {
+        actor: Actor::Warp { warp: numsim_core::observe::WarpId(w), epoch: u64::from(epoch) },
+        site: SiteId(w * 1000 + epoch),
+        alloc,
+        space,
+        kind: op.kind,
+        sem: match op.order {
+            MemOrder::Weak => Sem::Weak,
+            MemOrder::Relaxed => Sem::Relaxed,
+            MemOrder::Acquire => Sem::Acquire,
+            MemOrder::Release => Sem::Release,
+            MemOrder::AcqRel => Sem::AcqRel,
+        },
+        scope: op.scope.unwrap_or(Scope::Gpu),
+        atomic: op.atomic,
+        returns_value: op.atomic,
+        proxy: Proxy::Generic,
+        window: Some(window),
+        spans: spans.iter().map(|(l, r)| LaneSpan { lane: *l, span: ByteSpan::new(r.start, r.end - r.start) }).collect(),
+    });
+}
+
+/// `sink_release_kernel`: warp 0 lane 0 writes `data`, then one
+/// `st.{release|relaxed}.{gpu|cta}.v<width>.u<bits>` to the flag (with
+/// `sinks`, only elements 0 and 1 are written); warp 1 lane 0 spins with
+/// `ld.acquire` on element 1 and reads `data`.
+fn g6_store_sinks(bits: u64, release: bool, sinks: bool, shared: bool) -> Report {
+    let e = bits / 8;
+    let width = if shared { 2 } else { 32 / e };
+    let written = if sinks { 2 } else { width };
+    let (flag, scope) = if shared { (SMEM, Scope::Cta) } else { (GMEM2, Scope::Gpu) };
+    let mut k = K::new(2, 1, 1);
+    if shared {
+        let lanes = g6_lanes(2);
+        k.inst(0, &lanes, PLAIN_ST, |l| (SMEM, u64::from(l) * e..u64::from(l) * e + e));
+        k.bar(0, &[0, 1]);
+    }
+    k.st(0, 0, GMEM, 0..4);
+    let order = if release { MemOrder::Release } else { MemOrder::Relaxed };
+    g6_vec_store(&mut k, 0, st(order, scope), flag, &g6_elems(0, 0..written * e, e));
+    for _ in 0..3 {
+        k.a(1, 0, ld(MemOrder::Acquire, scope), flag, e..2 * e);
+    }
+    k.ld(1, 0, GMEM, 0..4).st(1, 0, GMEM, 64..68);
+    k.run()
+}
+
+/// runtime/test_store_sinks.py::test_store_sinks_retain_per_element_release
+/// [bits 32|64 x (release, sinks, space) = (T,F,global) (T,T,global)
+/// (F,T,global) (T,F,shared)]: the release covers element 1, so the spin
+/// acquires `data` (no race); a relaxed vector store gives no edge (race).
+/// delta R3: the raw (undeclared) acquire spin over a morally strong store
+/// is a `review` `UndeclaredProtocolWord` advisory (legacy verdict clean).
+#[test]
+fn g6_store_sinks_retain_per_element_release() {
+    for bits in [32u64, 64] {
+        for (release, sinks, shared) in [(true, false, false), (true, true, false), (false, true, false), (true, false, true)] {
+            let r = g6_store_sinks(bits, release, sinks, shared);
+            let tag = format!("bits={bits} release={release} sinks={sinks} shared={shared}");
+            if release {
+                assert!(clean(&r), "{tag}: {:?} {:?}", r.findings, r.incomplete);
+                assert!(r.findings.iter().all(|f| f.kind == FindingKind::Advisory { kind: AdvisoryKind::UndeclaredProtocolWord }), "{tag}: {r:?}");
+            } else {
+                assert!(has_class(&r, RaceClass::WriteRead), "{tag}: {r:?}");
+                assert!(races(&r).iter().all(|f| f.alloc == GMEM), "{tag}: {r:?}");
+            }
+        }
+    }
+}
+
+// ------------------------------------------------ runtime/test_tensormap_publication.py --
+
+/// `tensor_map_publication_case`: lane 0 of warp 0 rewrites the 128-byte
+/// descriptor; lane 1 (of warp 0, or warp 1 when `cross_warp`)
+/// `fence.proxy.tensormap::generic.release.gpu`; lane 0 acquires and issues
+/// a TMA through it, then polls and reads the destination. `ordering`:
+/// "before" = update, sync, release, sync, acquire (the control);
+/// "after" = the release is not ordered after the update;
+/// "stale" = the acquire precedes the update.
+fn g6_tensormap(ordering: &str, cross_warp: bool) -> Report {
+    let mut k = if cross_warp { K::new(2, 1, 1) } else { K::one_warp() };
+    let sync = |k: &mut K| {
+        if cross_warp {
+            k.bar(0, &[0, 1]);
+        } else {
+            k.syncwarp(0, G6_ALL);
+        }
+    };
+    let acquire = FenceKind::TensormapAcquire { scope: Scope::Gpu, alloc: GMEM2, span: ByteSpan::new(0, 128) };
+    if ordering == "stale" {
+        k.fence(0, 1, acquire);
+    }
+    sync(&mut k);
+    k.st(0, 0, GMEM2, 0..128);
+    if ordering != "after" {
+        sync(&mut k);
+    }
+    let releaser = u32::from(cross_warp);
+    k.fence(releaser, 1 << 1, FenceKind::TensormapRelease { scope: Scope::Gpu });
+    sync(&mut k);
+    if ordering != "stale" {
+        k.fence(0, 1, acquire);
+    }
+    k.arrive(0, 1, 0, 0, true);
+    let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, 0..16)]);
+    k.ar(op, Proxy::TensorMap, GMEM2, 0..128).ar(op, Proxy::Async, GMEM, 0..16).aw(op, Proxy::Async, SMEM, 0..16);
+    k.done_phase(op, Milestone::Write, 0, 0).wait(0, 1, 0, 0, true);
+    k.ld(0, 0, SMEM, 0..16).st(0, 0, GMEM, 64..80);
+    k.run()
+}
+
+/// runtime/test_tensormap_publication.py::test_descriptor_publication_does_not_capture_future_writes
+/// [replace|bytes|helper x (after, same warp) (after, cross warp) (stale)]:
+/// the three update spellings are the same generic descriptor writes at
+/// the contract. A release not ordered after the update, or an acquire that
+/// precedes it, leaves the TMA's tensormap-proxy read unbridged
+/// (`missing_proxy_bridge`); legacy "not acquired"/"dirty". The ordered
+/// control is clean.
+#[test]
+fn g6_descriptor_publication_does_not_capture_future_writes() {
+    for cross_warp in [false, true] {
+        let r = g6_tensormap("before", cross_warp);
+        assert!(clean(&r) && r.findings.is_empty(), "before cross={cross_warp}: {:?} {:?}", r.findings, r.incomplete);
+    }
+    for (ordering, cross_warp) in [("after", false), ("after", true), ("stale", false)] {
+        let r = g6_tensormap(ordering, cross_warp);
+        assert!(
+            has_failure(&r, |f| matches!(f, OrderingFailure::MissingProxyBridge { current: Proxy::TensorMap, .. })),
+            "{ordering} cross={cross_warp}: {r:?}"
+        );
+    }
+}
+
+// --------------------------- runtime/test_tma_multiissuer.py, test_tma_im2col_multiissuer.py --
+
+/// Every lane fills its 128-byte smem row, `fence.proxy.async`, sync, arms
+/// `barriers[lane]`, sync; every lane issues its own 32-byte TMA into its
+/// row (or, with `overlap`, into row 0), completing on `barriers[lane]`;
+/// with `wait` every lane polls its own barrier; sync; every lane reads its
+/// row.
+fn g6_tma_multiissuer(wait: bool, overlap: bool) -> Report {
+    let mut k = K::one_warp();
+    let row = |l: u8| (SMEM, u64::from(l) * 128..u64::from(l) * 128 + 128);
+    k.inst(0, &G5_ALL, PLAIN_ST, row);
+    k.fence(0, G6_ALL, FenceKind::ProxyAsync(Some(Domain::SharedCta))).bar(0, &[0]);
+    for l in 0..32u32 {
+        k.arrive(0, 1 << l, l, 0, true);
+    }
+    k.bar(0, &[0]);
+    for l in 0..32u8 {
+        let dst = if overlap { 0..32 } else { u64::from(l) * 128..u64::from(l) * 128 + 32 };
+        let op = k.issue(0, l, AsyncKind::Copy, Proxy::Async, &[], &[(SMEM, dst.clone())]);
+        k.ar(op, Proxy::Async, GMEM, u64::from(l) * 32..u64::from(l) * 32 + 32).aw(op, Proxy::Async, SMEM, dst);
+        k.done_phase(op, Milestone::Write, u32::from(l), 0);
+    }
+    if wait {
+        for l in 0..32u32 {
+            k.wait(0, 1 << l, l, 0, true);
+        }
+    }
+    k.bar(0, &[0]);
+    k.inst(0, &G5_ALL, PLAIN_LD, row);
+    k.run()
+}
+
+/// runtime/test_tma_multiissuer.py::test_tma_multiissuer_requires_wait_and_disjoint_destinations
+/// [(wait=False, overlap=False) -> read_write/write_read,
+///  (wait=True, overlap=True) -> write_write]; the waited, disjoint control
+/// is clean.
+#[test]
+fn g6_tma_multiissuer_requires_wait_and_disjoint_destinations() {
+    let r = g6_tma_multiissuer(true, false);
+    assert!(clean(&r) && r.findings.is_empty(), "{:?} {:?}", r.findings, r.incomplete);
+    let r = g6_tma_multiissuer(false, false);
+    assert!(has_class(&r, RaceClass::WriteRead) || has_class(&r, RaceClass::ReadWrite), "{r:?}");
+    let r = g6_tma_multiissuer(true, true);
+    assert!(has_class(&r, RaceClass::WriteWrite), "{r:?}");
+}
+
+/// runtime/test_tma_im2col_multiissuer.py::test_im2col_multiissuer_requires_completion_wait
+/// (rank 3, `wait=False`): per-lane im2col TMAs into disjoint rows, read
+/// without waiting: `write_read`/`read_write`. (The im2col coordinates and
+/// offsets only select the source bytes.)
+#[test]
+fn g6_im2col_multiissuer_requires_completion_wait() {
+    let r = g6_tma_multiissuer(false, false);
+    assert!(has_class(&r, RaceClass::WriteRead) || has_class(&r, RaceClass::ReadWrite), "{r:?}");
+    assert!(races(&r).iter().all(|f| f.alloc == SMEM));
+}
+
+// ------------------------------------------------------- runtime/test_wait_until.py --
+
+/// The poll of a `wait_until`: a strong read of the word (modelled relaxed,
+/// so the only edge is the `WaitVerdicts` one) plus the verdicts.
+fn g6_wait_until(k: &mut K, w: WarpId, alloc: AllocId, r: std::ops::Range<u64>, accepted: u64, observed: u32) {
+    k.a(w, 0, ld(MemOrder::Relaxed, Scope::Gpu), alloc, r.clone()).wait_until(w, 0, alloc, r, Scope::Gpu, accepted, observed);
+}
+
+/// `wait_event`: `state` is a declared word whose launch value (7) already
+/// satisfies the waiter's predicate. The waiter (warp `waiter`, lane 0,
+/// optionally after an unrelated write) `wait_until`s it; the other warp
+/// reads `state` and plainly stores 7 into it. `ordering`: a `bar.sync`
+/// between the wait and the plain access (either order), only before both
+/// ("prefix_only"), or none.
+fn g6_wait_event(waiter: WarpId, prior_access: bool, ordering: &str) -> Report {
+    let mut k = K::new(2, 1, 1);
+    k.declare(GMEM2, 0..4);
+    let other = 1 - waiter;
+    if prior_access {
+        k.st(waiter, 0, GMEM, 0..4);
+    }
+    let wait = |k: &mut K| {
+        g6_wait_until(k, waiter, GMEM2, 0..4, 0b1, 0);
+    };
+    let plain = |k: &mut K| {
+        k.ld(other, 0, GMEM2, 0..4).st(other, 0, GMEM, 4..8).st(other, 0, GMEM2, 0..4);
+    };
+    match ordering {
+        "wait_then_plain" => {
+            wait(&mut k);
+            k.bar(0, &[0, 1]);
+            plain(&mut k);
+        }
+        "plain_then_wait" => {
+            plain(&mut k);
+            k.bar(0, &[0, 1]);
+            wait(&mut k);
+        }
+        "prefix_only" => {
+            k.bar(0, &[0, 1]);
+            wait(&mut k);
+            plain(&mut k);
+        }
+        _ => {
+            wait(&mut k);
+            plain(&mut k);
+        }
+    }
+    k.run()
+}
+
+/// runtime/test_wait_until.py::test_wait_has_its_own_hb_event
+/// [waiter 0|1 x prior_access F|T x ordering] (verdict half): only a
+/// rendezvous between the wait and the plain access orders the pair; the
+/// unordered plain store to the declared word is an error.
+#[test]
+fn g6_wait_has_its_own_hb_event() {
+    for waiter in [0, 1] {
+        for prior_access in [false, true] {
+            for ordering in ["wait_then_plain", "plain_then_wait", "prefix_only", "none"] {
+                let r = g6_wait_event(waiter, prior_access, ordering);
+                let tag = format!("waiter={waiter} prior={prior_access} {ordering}");
+                if matches!(ordering, "wait_then_plain" | "plain_then_wait") {
+                    assert!(clean(&r) && r.findings.is_empty(), "{tag}: {:?} {:?}", r.findings, r.incomplete);
+                } else {
+                    assert!(r.errors().next().is_some(), "{tag}: {r:?}");
+                    assert!(r.errors().all(|f| f.alloc == GMEM2), "{tag}: {r:?}");
+                }
+            }
+        }
+    }
+}
+
+/// runtime/test_wait_until.py::test_wait_has_its_own_hb_event (finding-kind
+/// half): legacy reported the unordered plain access to a declared word as
+/// exactly `{signal_protocol_error}` (a declared-word bypass), never a data
+/// race. The new core has no bypass kind: the plain store races the wait's
+/// strong read as an ordinary `data_race`.
+#[test]
+#[ignore = "undocumented divergence: legacy signal_protocol_error (declared-word bypass) for a plain access concurrent with a wait_until; the new core reports a data_race and has no bypass kind (no delta row)"]
+fn g6_wait_bypass_is_a_signal_protocol_error_not_a_race() {
+    for ordering in ["prefix_only", "none"] {
+        let r = g6_wait_event(0, false, ordering);
+        assert!(r.errors().next().is_some() && !has_race(&r), "{ordering}: {r:?}");
+    }
+}
+
+/// `two_arrivals`: warp 0 writes `first` and `red.release.gpu.add`s the
+/// declared counter; warp 1 writes `second` and adds; warp 2 waits for
+/// `state >= target` and reads `second`. History: entry 1 = warp 0's add,
+/// entry 2 = warp 1's add.
+fn g6_two_arrivals(target: u32, acquire_poll: bool) -> Report {
+    let mut k = K::new(3, 1, 1);
+    k.declare(GMEM2, 0..4);
+    k.st(0, 0, GMEM, 0..4).red(0, 0, MemOrder::Release, Scope::Gpu, GMEM2, 0..4);
+    k.st(1, 0, GMEM, 4..8).red(1, 0, MemOrder::Release, Scope::Gpu, GMEM2, 0..4);
+    let accepted = if target == 2 { 0b100 } else { 0b110 };
+    if acquire_poll {
+        k.a(2, 0, ld(MemOrder::Acquire, Scope::Gpu), GMEM2, 0..4).wait_until(2, 0, GMEM2, 0..4, Scope::Gpu, accepted, 2);
+    } else {
+        g6_wait_until(&mut k, 2, GMEM2, 0..4, accepted, 2);
+    }
+    k.ld(2, 0, GMEM, 4..8).st(2, 0, GMEM, 64..68);
+    k.run()
+}
+
+/// runtime/test_wait_until.py::test_a_wait_that_waits_for_both_arrivals_may_read_both
+#[test]
+fn g6_wait_for_both_arrivals_may_read_both() {
+    let r = g6_two_arrivals(2, false);
+    assert!(clean(&r) && r.findings.is_empty(), "{:?} {:?}", r.findings, r.incomplete);
+}
+
+/// runtime/test_wait_until.py::test_a_wait_that_waits_for_one_arrival_may_not_read_the_other
+/// The earliest accepted write (warp 0's) orders nothing warp 1 published:
+/// the read of `second` races warp 1's store.
+#[test]
+fn g6_wait_for_one_arrival_may_not_read_the_other() {
+    let r = g6_two_arrivals(1, false);
+    let f = races(&r);
+    assert!(!f.is_empty(), "{r:?}");
+    assert!(f.iter().all(|f| f.alloc == GMEM && f.bytes == (4..8)), "{r:?}");
+    assert!(f.iter().any(|f| f.prior.as_ref().unwrap().warp == 1 && f.current.as_ref().unwrap().warp == 2));
+}
+
+/// runtime/test_wait_until.py::test_a_wait_that_waits_for_one_arrival_may_not_read_the_other,
+/// with the poll as the interpreter emits it (`sync.rs::wait_until`: an
+/// `Access` read with the wait's `.acquire` sem before `WaitVerdicts`). The
+/// ordinary read-from rule (racecheck-semantics §3 row 24) then hands the
+/// waiter the latest morally strong write (warp 1's), so the race on
+/// `second` disappears on this schedule: exactly the run-dependent edge
+/// W1 / §5 ("earliest accepted, schedule independent") rule out.
+#[test]
+#[ignore = "undocumented divergence: the interpreter's acquiring wait_until poll Access gives a read-from edge to the latest write, overriding the earliest-accepted WaitVerdicts edge (W1); legacy reports the race"]
+fn g6_wait_for_one_arrival_with_acquiring_poll_still_races() {
+    let r = g6_two_arrivals(1, true);
+    assert!(races(&r).iter().any(|f| f.alloc == GMEM && f.bytes == (4..8)), "{r:?}");
+}
+
+/// `woken_by_a_bypass`: warp 0 plainly stores 7 into the declared word;
+/// warp 1's `wait_until(!= 0)` exits on that write and stores what it saw.
+fn g6_woken_by_plain_write() -> Report {
+    let mut k = K::new(2, 1, 1);
+    k.declare(GMEM2, 0..4);
+    k.st(0, 0, GMEM2, 0..4);
+    g6_wait_until(&mut k, 1, GMEM2, 0..4, 0b10, 1);
+    k.st(1, 0, GMEM, 0..4);
+    k.run()
+}
+
+/// runtime/test_wait_until.py::test_a_wait_woken_by_a_plain_write_reports_the_missing_edge
+/// The plain store races the wait's strong read; the wait itself builds no
+/// edge from a plain write.
+#[test]
+fn g6_wait_woken_by_a_plain_write_is_an_error() {
+    let r = g6_woken_by_plain_write();
+    assert!(has_class(&r, RaceClass::WriteRead), "{r:?}");
+}
+
+/// runtime/test_wait_until.py::test_a_wait_woken_by_a_plain_write_reports_the_missing_edge
+/// (incomplete half): legacy reported `analysis_incomplete` for the wait
+/// exit explained only by a plain write; delta W2 also says such an exit is
+/// `WaitExitUnproven` incomplete. The core instead accepts the plain
+/// history entry with no edge and reports no incomplete.
+#[test]
+#[ignore = "undocumented divergence: W2 says an exit explained only by a plain write is WaitExitUnproven incomplete (legacy analysis_incomplete); checker.rs wait_verdicts treats it as a plain publication with no edge and reports no incomplete"]
+fn g6_wait_woken_by_a_plain_write_is_incomplete() {
+    let r = g6_woken_by_plain_write();
+    assert!(r.incomplete.iter().any(|i| matches!(i, Incomplete::WaitExitUnproven { .. })), "{r:?}");
+}
+
+/// runtime/test_wait_until.py::test_a_wait_on_a_word_that_carries_its_own_payload_is_clean
+/// (`_packed_payload(retry=True)`): CTA 0 `st.release.gpu.u64` the declared
+/// slot; CTA 1 (another cluster) `wait_until`s it and stores the payload
+/// half. Clean.
+#[test]
+fn g6_wait_on_a_word_that_carries_its_own_payload_is_clean() {
+    let mut k = K::new(1, 1, 2);
+    k.declare(GMEM2, 0..8);
+    k.a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, 0..8);
+    g6_wait_until(&mut k, 1, GMEM2, 0..8, 0b10, 1);
+    k.st(1, 0, GMEM, 0..8);
+    let r = k.run();
+    assert!(clean(&r) && r.findings.is_empty(), "{:?} {:?}", r.findings, r.incomplete);
 }

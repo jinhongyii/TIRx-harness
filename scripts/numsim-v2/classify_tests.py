@@ -14,8 +14,9 @@ Categories (``docs/development/test-migration.md``):
   or a ``tests/numsim/v2`` kernel test run through the v2 API).
 * **B** checker-semantics unit test with a small kernel → a Rust scenario test
   built from contract events (``numsim-core/tests/{racecheck,synccheck}_*.rs``).
-  ``status`` says ``covered`` / ``ported`` / ``gap_unportable`` (from the
-  reviewed maps in ``coverage/{racecheck,synccheck}.tsv``) or ``unreviewed``.
+  ``status`` says ``covered`` / ``ported`` / ``v2_kernel_test`` /
+  ``needs_kernel`` (from the reviewed maps
+  ``coverage/{other_b,racecheck,synccheck}.tsv``) or ``unreviewed``.
 * **C** pins the implementation: generated Rust text, ``v2::`` paths, poll /
   transition counts, raw payload field shapes, legacy-private APIs, legacy
   Python internals (transpiler, registry, ABI) → delete with the legacy code.
@@ -114,14 +115,21 @@ SEMANTIC_WORDS = re.compile(r"\b(verdict|findings?|kind|status|incomplete|adviso
 C_NAMES = {
     "emit_rust_module", "rust_source", "_emitted_heads", "artifact_template", "decode_ptx_call", "to_manifest",
     "load_cached_generated_artifact", "render_rust", "emit_rust", "generated_source", "support_matrix",
-    "abi_version", "ENGINE_ABI_VERSION", "instruction_profile",
+    "abi_version", "ENGINE_ABI_VERSION", "instruction_profile", "native_calls", "post_order_nodes",
+    "resolved_kernel", "evaluated_kernel", "_lines_with", "native_loop_iteration_budget",
+    "ExecutionSubset", "_shared_backing_sizes", "_resolved_ptx_raw_tcgen_calls",
 }
-C_STRINGS = re.compile(r"v2::|\bfn [a-z_]+\(|let mut |\bpoll(s|_count)?\b|transition(s|_count)\b|cargo|rustc|\.rs\b")
+# Identifiers whose presence makes a test C even when it also runs a kernel:
+# the run only feeds an inspection of legacy internals.
+STRONG_C = {"ExecutionSubset", "_shared_backing_sizes", "_resolved_ptx_raw_tcgen_calls", "native_calls", "post_order_nodes", "resolved_kernel", "evaluated_kernel", "_lines_with", "decode_ptx_call", "_emitted_heads"}
+C_STRINGS = re.compile(
+    r"v2::|\bfn [a-z_]+\(|let mut |WarpValue|\bpoll(s|_count|_order)?\b|transition(s|_count)\b|task_count|cargo|rustc|\.rs\b"
+)
 # Test-function names that describe the legacy implementation (Rust codegen
 # slicing / splitting, compile caches, manifests, worker plumbing, profiling).
 C_FUNC_NAME = re.compile(
-    r"codegen_slice|native_codegen|_splits?_|^test_split|_split$|splits_|cache|manifest|compile|rust|lazy|"
-    r"import|worker_configuration|loop_policy|instruction_profile|emission|precompile|_abi_|engine_phase"
+    r"codegen_slice|native_codegen|_splits?_|^test_split|_split$|splits_|cache(?!_hint)|manifest|compile|rust|lazy|"
+    r"import|worker_configuration|loop_policy|instruction_profile|emission|precompile|engine_phase"
 )
 CHECKER_TOPIC = re.compile(
     r"race|sync|hb|happens|publi|order|visib|wait|fence|mbarrier|release|acquire|proxy|deadlock|hang|lifetime|reuse|overlap|scope"
@@ -303,7 +311,7 @@ def classify(row: Row, f: Features, module_src: str, rel: str, maps, tile) -> No
         row.reason = "test name describes the legacy implementation (" + C_FUNC_NAME.search(name).group(0) + ")"
         return
     if c_hits or c_str:
-        if runs and semantic:
+        if runs and semantic and (corpus or not set(c_hits) & STRONG_C):
             row.category, row.rule = ("B" if checker and "analysis_tools" in rel else "A"), "signals:mixed"
             row.target = "unreviewed" if row.category == "B" else ("conformance" if corpus else "v2-kernel-case")
             row.reason = "semantic asserts plus implementation pins (" + ",".join(c_hits + c_str)[:60] + "); port the semantic part only"
@@ -457,7 +465,8 @@ def main() -> int:
     parser.add_argument("--summary", type=Path)
     parser.add_argument("--check-goldens", action="store_true")
     args = parser.parse_args()
-    maps = {k: load_tsv(COVERAGE / f"{k}.tsv") for k in ("racecheck", "synccheck")}
+    # ``other_b`` (reviewed B rows outside the two checker directories) first.
+    maps = {k: load_tsv(COVERAGE / f"{k}.tsv") for k in ("other_b", "racecheck", "synccheck")}
     tile = load_tile_rejections(COVERAGE / "tile_dispatch_rejections.txt")
     RUNNERS.update(discover_runners(args.tests))
     rows = walk(args.tests, maps, tile)

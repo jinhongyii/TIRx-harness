@@ -820,3 +820,272 @@ fn drain_tail_ping_pong_is_clean() {
         run_all(&pipeline(2, 1, work_total, 0), cta(2), Verdict::Clean);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unreviewed-B batch: synccheck verdicts asserted outside
+// tests/analysis_tools/synccheck (racecheck/test_native_raw_async_copy_footprints.py,
+// shared/, numsim/runtime/). Coverage map: scripts/numsim-v2/coverage/other_b.tsv.
+// ---------------------------------------------------------------------------
+
+/// One event of `warp` that delivers `bytes` to every barrier in `targets`
+/// (a multicast copy).
+fn issue_multi(log: &mut LogBuilder, warp: u32, site: u32, targets: &[numsim_core::sync::ResourceId], bytes: u64) {
+    let issued = targets.iter().map(|&res| numsim_core::observe::AsyncTarget { res, bytes, arrivals: 0 }).collect();
+    log.event(warp, site, Vec::new(), issued, None, None, numsim_core::observe::ProtocolStatus::Committed);
+}
+
+/// One cluster of `ctas` CTAs with `warps` warps each.
+fn cluster_of(ctas: u32, warps: u32) -> ResourceInit {
+    ResourceInit { warps_per_cta: warps, cluster_warps: ctas * warps, ..ResourceInit::default() }
+}
+
+/// `test_native_raw_async_copy_footprints.py::test_cp_async_mbarrier_arrive_synccheck_is_unchanged[ordered|unwaited]`
+/// (both kernels have the same protocol trace): barrier inited for two
+/// arrivals; warp 0 lane 0 issues a `cp.async`, `cp.async.mbarrier.arrive`
+/// (no `.noinc`: +1 pending, deferred arrival) and a plain arrive; warp 1
+/// lane 0 arrives and waits phase 0. Clean (the `cp.async.mbarrier.arrive`
+/// tracks the uncommitted `cp.async`, so no `UncommittedAtExit` lint).
+#[test]
+fn cp_async_mbarrier_arrive_pending_count_protocol() {
+    let g = async_group_res(0, 0, async_group::Domain::CpAsync);
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(2));
+    cta_sync(&mut log, 0, &[0, 1], 2);
+    log.cmd(0, 2, g, group(async_group::Cmd::Issue));
+    log.issue(0, 3, mbar(0, 0), 0, 1, vec![(mbar(0, 0), inc_pending(1)), (g, group(async_group::Cmd::ArriveOn))]);
+    log.cmd(0, 4, mbar(0, 0), arrive(1));
+    log.cmd(1, 5, mbar(0, 0), arrive(1)).cmd(1, 6, mbar(0, 0), wait(0));
+    run_all(&log.build(), cta(2), Verdict::Clean);
+}
+
+/// `test_native_raw_async_copy_footprints.py::test_bulk_g2s_cta_synccheck_reports_no_finding[plain|ignore_oob|unwaited]`
+/// and `::test_bulk_g2s_cta_ignore_oob_short_source_synccheck_reports_no_finding`:
+/// init(1), `cta_sync`, `arrive.expect_tx(16)`, one 16-byte G2S copy
+/// (`.ignore_oob` still completes the full 16 bytes), wait. The unwaited
+/// kernel only moves a data read, so the trace is the same.
+#[test]
+fn bulk_g2s_cta_protocol_is_clean() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1));
+    cta_sync(&mut log, 0, &[0], 1);
+    log.cmd(0, 2, mbar(0, 0), arrive_tx(1, 16));
+    log.issue(0, 3, mbar(0, 0), 16, 0, Vec::new());
+    log.cmd(0, 4, mbar(0, 0), wait(0));
+    run_all(&log.build(), one(), Verdict::Clean);
+}
+
+/// `test_native_raw_async_copy_footprints.py::test_bulk_g2s_multicast_synccheck_reports_no_finding[ordered|unwaited|unselected]`:
+/// two CTAs init their barrier, cluster sync; `ordered`/`unwaited`: both
+/// arm 16 bytes and CTA 0 multicasts to both barriers (mask 3), both wait;
+/// `unselected`: only CTA 0 arms, the copy targets only CTA 0 (mask 1),
+/// CTA 0 waits, cluster sync.
+#[test]
+fn bulk_g2s_multicast_protocol_is_clean() {
+    for selected_both in [true, false] {
+        let mut log = LogBuilder::new();
+        log.cmd(0, 1, mbar(0, 0), init(1)).cmd(1, 1, mbar(1, 0), init(1));
+        cluster_sync(&mut log, &[0, 1]);
+        let ctas: &[u32] = if selected_both { &[0, 1] } else { &[0] };
+        for &c in ctas {
+            log.cmd(c, 2, mbar(c, 0), arrive_tx(1, 16));
+        }
+        let targets: Vec<_> = ctas.iter().map(|&c| mbar(c, 0)).collect();
+        issue_multi(&mut log, 0, 3, &targets, 16);
+        for &c in ctas {
+            log.cmd(c, 4, mbar(c, 0), wait(0));
+        }
+        if !selected_both {
+            cluster_sync(&mut log, &[0, 1]);
+        }
+        run_all(&log.build(), cluster_of(2, 1), Verdict::Clean);
+    }
+}
+
+/// `test_native_raw_async_copy_footprints.py::test_bulk_s2s_cluster_synccheck_reports_no_finding[ordered|unwaited]`:
+/// CTA 0 arms CTA 1's barrier through `mapa` (`arrive.expect_tx.shared::cluster`)
+/// and pushes 16 bytes into CTA 1 completing on it; CTA 1 waits.
+#[test]
+fn bulk_s2s_cluster_protocol_is_clean() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1)).cmd(1, 1, mbar(1, 0), init(1));
+    cluster_sync(&mut log, &[0, 1]);
+    log.cmd(0, 2, mbar(1, 0), arrive_tx(1, 16));
+    log.issue(0, 3, mbar(1, 0), 16, 0, Vec::new());
+    log.cmd(1, 4, mbar(1, 0), wait(0));
+    cluster_sync(&mut log, &[0, 1]);
+    run_all(&log.build(), cluster_of(2, 1), Verdict::Clean);
+}
+
+/// `test_native_raw_async_copy_footprints.py::test_bulk_s2g_masked_synccheck_reports_no_finding[ordered|unwaited]`
+/// (the bulk-group half of `runtime/test_bulk_copy_scopes.py::test_bulk_copy_scope_and_elements`
+/// too): lane 0 issues a bulk copy, commits, `wait_group.read 0` (scopes
+/// test only), `wait_group 0`.
+#[test]
+fn bulk_group_issue_commit_wait_is_clean() {
+    for read_first in [false, true] {
+        let g = async_group_res(0, 0, async_group::Domain::Bulk);
+        let mut log = LogBuilder::new();
+        log.cmd(0, 1, g, group(async_group::Cmd::Issue)).cmd(0, 2, g, group(async_group::Cmd::Commit));
+        if read_first {
+            log.cmd(0, 3, g, group(async_group::Cmd::Wait { n: 0, read: true }));
+        }
+        log.cmd(0, 4, g, group(async_group::Cmd::Wait { n: 0, read: false }));
+        run_all(&log.build(), one(), Verdict::Clean);
+    }
+}
+
+/// `test_native_raw_async_copy_footprints.py::test_tma_gather4_synccheck_reports_no_finding[ordered|unwaited]`:
+/// one 64-byte gather4 TMA against `arrive.expect_tx(64)`.
+#[test]
+fn tma_gather4_protocol_is_clean() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1));
+    cta_sync(&mut log, 0, &[0], 1);
+    log.cmd(0, 2, mbar(0, 0), arrive_tx(1, 64));
+    log.issue(0, 3, mbar(0, 0), 64, 0, Vec::new());
+    log.cmd(0, 4, mbar(0, 0), wait(0));
+    run_all(&log.build(), one(), Verdict::Clean);
+}
+
+/// `shared/test_native_dense_cta2_mma_ordering.py::test_committed_dense_cta2_mma_pipeline_passes_synccheck`:
+/// two CTAs x two warps; each CTA's warp 0 inits its barrier; cluster sync;
+/// CTA 0 warp 0 issues the `cta_group::2` MMA and commits it to its barrier
+/// (`tcgen05.commit.cta_group::2.mbarrier::arrive::one`), then waits;
+/// cluster sync.
+#[test]
+fn committed_dense_cta2_mma_protocol_is_clean() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1)).cmd(2, 1, mbar(1, 0), init(1));
+    cluster_sync(&mut log, &[0, 1, 2, 3]);
+    log.cmd(0, 2, tcgen_work(0, 0), work(tcgen::WorkCmd::Issue));
+    log.issue(0, 3, mbar(0, 0), 0, 1, vec![(tcgen_work(0, 0), work(tcgen::WorkCmd::Commit))]);
+    log.cmd(0, 4, mbar(0, 0), wait(0));
+    cluster_sync(&mut log, &[0, 1, 2, 3]);
+    run_all(&log.build(), cluster_of(2, 2), Verdict::Clean);
+}
+
+/// `runtime/test_bulk_g2s_scopes.py::test_strong_g2s_scope_elements_and_predication`
+/// (synccheck half; `scope` does not reach the protocol): CTA 0 warp 0 inits
+/// and arms `48 * enabled` bytes; cluster sync; the two writers (warps,
+/// lanes or CTAs) each deliver their copy (32 and 16 bytes) to CTA 0's
+/// barrier when enabled; CTA 0 waits; cluster sync.
+#[test]
+fn strong_g2s_two_writer_protocol_is_clean() {
+    for (ctas, warps, writers) in [(1u32, 2u32, [0u32, 1]), (1, 1, [0, 0]), (2, 1, [0, 1])] {
+        for enabled in [false, true] {
+            let all: Vec<u32> = (0..ctas * warps).collect();
+            let mut log = LogBuilder::new();
+            log.cmd(0, 1, mbar(0, 0), init(1)).cmd(0, 2, mbar(0, 0), arrive_tx(1, if enabled { 48 } else { 0 }));
+            cluster_sync(&mut log, &all);
+            if enabled {
+                for (a, &w) in writers.iter().enumerate() {
+                    log.issue(w, 3, mbar(0, 0), 32 - 16 * a as u64, 0, Vec::new());
+                }
+            }
+            log.cmd(0, 4, mbar(0, 0), wait(0));
+            cluster_sync(&mut log, &all);
+            run_all(&log.build(), cluster_of(ctas, warps), Verdict::Clean);
+        }
+    }
+}
+
+/// `runtime/test_mbarrier_drop.py::test_mbarrier_drop_invalid_count[count|no_complete]`
+/// (synccheck half): init(4), `cta_sync`, then `mbarrier.arrive_drop[.noComplete]`
+/// with count 5 > the 4 pending arrivals. Legacy: error whose kind names an
+/// arrival, or an untyped `engine_error`. sync delta M5: an `arrive_drop`
+/// that takes the expected count below zero is `DropUnderflow`; sync delta
+/// M6: a `.noComplete` arrive that would complete the phase is the typed
+/// `NoCompleteWouldComplete`.
+#[test]
+fn mbarrier_drop_invalid_count_is_an_error() {
+    for no_complete in [false, true] {
+        let mut log = LogBuilder::new();
+        log.cmd(0, 1, mbar(0, 0), init(4));
+        cta_sync(&mut log, 0, &[0], 1);
+        let drop = SyncCmd::Mbarrier(numsim_core::sync::mbarrier::Cmd::Arrive { count: 5, tx: None, drop: true, no_complete });
+        log.cmd(0, 2, mbar(0, 0), drop);
+        let r = run_all(&log.build(), one(), Verdict::Error);
+        for (name, rep) in &r {
+            let k = kind(rep);
+            let expected = if no_complete { "mbarrier_no_complete_violated" } else { "mbarrier_drop_underflow" };
+            assert_eq!(k, expected, "{name}");
+        }
+    }
+}
+
+/// `runtime/test_mbarrier_lane_semantics.py::test_checkers_group_pending_blocking_waits_on_distinct_barriers[synccheck]`
+/// and `::test_synccheck_keeps_one_projection_for_a_multi_barrier_wait`
+/// (`checker_lane_varying_pending_wait`): warp 0 lanes 0..4 init four
+/// barriers; `cta_sync`; warp 1 lanes 0..4 arrive on and wait their own
+/// barrier (one lane-varying instruction each); `cta_sync`; warp 1 waits
+/// parity 1 on all four while warp 0 arrives. Clean, and the four-barrier
+/// wait is one projection: the `cta_sync` program plus one mbarrier
+/// component (legacy `projections=2`).
+#[test]
+fn lane_varying_multi_barrier_wait_is_one_projection() {
+    let bars: Vec<_> = (0..4).map(|l| mbar(0, 8 * l)).collect();
+    let all = |cmd: SyncCmd| bars.iter().map(|&b| (b, cmd)).collect::<Vec<_>>();
+    let mut log = LogBuilder::new();
+    log.cmds(0, 1, all(init(1)));
+    cta_sync(&mut log, 0, &[0, 1], 2);
+    log.cmds(1, 2, all(arrive(1))).cmds(1, 3, all(wait(0)));
+    cta_sync(&mut log, 0, &[0, 1], 2);
+    log.cmds(1, 4, all(wait(1)));
+    log.cmds(0, 5, all(arrive(1)));
+    let r = run_all(&log.build(), cta(2), Verdict::Clean);
+    assert_eq!(stat(&r[0].1, "program_count"), 2);
+}
+
+/// `runtime/test_mbarrier_lane_semantics.py::test_checkers_allow_distinct_barrier_waits[synccheck]`
+/// (`lane_varying_expect_tx`): lanes 0 and 1 init their barrier; `cta_sync`;
+/// lane 0 arms barrier 0 and copies 16 bytes into it, then lane 1 the same
+/// on barrier 1; lanes 0 and 1 wait their own barrier in one instruction.
+#[test]
+fn lane_varying_expect_tx_waits_are_clean() {
+    let (b0, b1) = (mbar(0, 0), mbar(0, 8));
+    let mut log = LogBuilder::new();
+    log.cmds(0, 1, vec![(b0, init(1)), (b1, init(1))]);
+    cta_sync(&mut log, 0, &[0], 1);
+    for b in [b0, b1] {
+        log.cmd(0, 2, b, arrive_tx(1, 16));
+        log.issue(0, 3, b, 16, 0, Vec::new());
+    }
+    log.cmds(0, 4, vec![(b0, wait(0)), (b1, wait(0))]);
+    run_all(&log.build(), one(), Verdict::Clean);
+}
+
+/// `runtime/test_mbarrier_lane_semantics.py::test_relaxed_query_does_not_acquire_arriving_threads_memory`
+/// (synccheck half): warp 0 inits, `cta_sync`, warp 0 arrives, warp 1's
+/// relaxed `test_wait` loop succeeds. Clean.
+#[test]
+fn relaxed_test_wait_poll_is_clean() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1));
+    cta_sync(&mut log, 0, &[0, 1], 2);
+    log.cmd(0, 2, mbar(0, 0), arrive(1));
+    log.cmd(1, 3, mbar(0, 0), test_parity(0));
+    log.test_ok(1, 3, mbar(0, 0), 0);
+    run_all(&log.build(), cta(2), Verdict::Clean);
+}
+
+/// `runtime/test_red_async.py::test_shared_async_reduction_completion`
+/// (synccheck half of `run_checked` on the waited kernel): CTA 1 inits its
+/// barrier for `lanes` arrivals; cluster sync; CTA 0's `lanes` lanes each
+/// arm it remotely with their element size and issue a reduction completing
+/// there (4 x 4-byte `red.async`, or 1 x 16-byte bulk reduction); CTA 1
+/// waits; cluster sync.
+#[test]
+fn shared_async_reduction_protocol_is_clean() {
+    for (lanes, bytes) in [(4u64, 4u64), (1, 16)] {
+        let mut log = LogBuilder::new();
+        log.cmd(0, 1, mbar(0, 0), init(lanes)).cmd(1, 1, mbar(1, 0), init(lanes));
+        cluster_sync(&mut log, &[0, 1]);
+        log.cmd(0, 2, mbar(1, 0), arrive_tx(lanes, lanes * bytes));
+        for _ in 0..lanes {
+            log.issue(0, 3, mbar(1, 0), bytes, 0, Vec::new());
+        }
+        log.cmd(1, 4, mbar(1, 0), wait(0));
+        cluster_sync(&mut log, &[0, 1]);
+        run_all(&log.build(), cluster_of(2, 1), Verdict::Clean);
+    }
+}
