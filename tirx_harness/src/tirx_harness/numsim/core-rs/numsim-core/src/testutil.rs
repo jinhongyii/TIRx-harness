@@ -188,6 +188,25 @@ impl ProgramBuilder {
         })
     }
 
+    /// A per-lane array of `elems` elements in `space` (`Local` or `Reg`).
+    pub fn per_lane(&mut self, name: &str, space: Space, dtype: Dtype, elems: u64) -> Buf {
+        let bytes = elems * dtype.mem_bytes() as u64;
+        self.buffer(BufferDecl {
+            name: name.to_string(),
+            space,
+            dtype: dtype.into(),
+            shape: vec![DimExpr::Const(elems as i64)],
+            strides: Vec::new(),
+            param_slot: None,
+            base: 0,
+            byte_len: Some(DimExpr::Const(bytes as i64)),
+            align: 16,
+            view_of: None,
+            sync_words: false,
+            base_reg: None,
+        })
+    }
+
     pub fn declare_sync_words(&mut self, b: Buf) {
         self.p.buffers[b.0 as usize].sync_words = true;
     }

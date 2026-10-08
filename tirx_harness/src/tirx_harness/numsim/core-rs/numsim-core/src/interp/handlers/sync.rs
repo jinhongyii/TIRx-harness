@@ -296,7 +296,7 @@ fn lane_targets(ctx: &ExecCtx<'_>, mbar: Operand, space: AddrSpace, multicast: O
     let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
     Ok(match multicast {
         None => vec![res],
-        Some(m) => ranks_of(ctx, lane_val(ctx, m, l)).into_iter().filter_map(|r| mbar_in_rank(ctx, res, r)).collect(),
+        Some(m) => ranks_of(ctx, lane_val(ctx, m, l))?.into_iter().filter_map(|r| mbar_in_rank(ctx, res, r)).collect(),
     })
 }
 
@@ -608,7 +608,11 @@ pub fn fence(ctx: &mut ExecCtx<'_>, kind: FenceKind, sem: Sem, scope: Scope) -> 
             _ => None,
         }),
         FenceKind::ProxyAlias => FenceEvent::ProxyAlias,
-        FenceKind::TensormapRelease => FenceEvent::TensormapRelease { scope },
+        FenceKind::TensormapRelease => {
+            let w = ctx.warp.id;
+            ctx.aux.tmap_dirty.retain(|_, owner| *owner != w);
+            FenceEvent::TensormapRelease { scope }
+        }
         FenceKind::TensormapAcquire { addr, space } => {
             // One event per distinct tensor map named by the active lanes.
             let mut seen: Vec<(crate::arena::AllocId, ByteSpan, WarpMask)> = Vec::new();

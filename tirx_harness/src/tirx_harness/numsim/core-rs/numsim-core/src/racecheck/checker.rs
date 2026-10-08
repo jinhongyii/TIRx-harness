@@ -116,6 +116,13 @@ pub struct Finding {
     pub current: Option<WitnessInfo>,
     /// Occurrences folded into this finding.
     pub occurrences: u64,
+    /// For TMEM: the union of overlapped `(lanes, columns)` over all
+    /// occurrences (the byte hull spans rows, so it cannot be projected to
+    /// columns; TMEM byte = (lane * 512 + column) * 4).
+    pub tmem: Option<(Range<u32>, Range<u32>)>,
+    /// `AliasStaleRead` only: the merged byte spans of every occurrence
+    /// (legacy `overlaps`); empty for other kinds.
+    pub spans: Vec<Range<u64>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -359,7 +366,9 @@ struct AsyncActor {
     /// CTAs that observed this op's completion directly (its mbarrier's
     /// CTA, or the waiting warp's CTA).
     completed_ctas: Vec<u32>,
-    preds: Vec<usize>,
+    /// `(slot, generation)` of each predecessor (a reclaimed slot's new
+    /// generation is a different op).
+    preds: Vec<(usize, Epoch)>,
     footprint: Vec<(AllocId, Range<u64>)>,
     /// Highest milestone reached (0 none, 1 read, 2 write/full).
     done: u8,
@@ -515,6 +524,46 @@ pub struct Checker {
     pub stats: Stats,
 }
 
+/// Insert `r` into sorted, disjoint, non-adjacent `spans` (bounded: past
+/// 1024 spans the last one absorbs the rest).
+fn add_span(spans: &mut Vec<Range<u64>>, r: Range<u64>) {
+    if r.is_empty() {
+        return;
+    }
+    let i = spans.partition_point(|s| s.end < r.start);
+    let mut j = i;
+    let (mut lo, mut hi) = (r.start, r.end);
+    while j < spans.len() && spans[j].start <= hi {
+        lo = lo.min(spans[j].start);
+        hi = hi.max(spans[j].end);
+        j += 1;
+    }
+    spans.splice(i..j, std::iter::once(lo..hi));
+    if spans.len() > 1024 {
+        let last = spans.pop().unwrap();
+        let l = spans.last_mut().unwrap();
+        l.end = l.end.max(last.end);
+    }
+}
+
+/// `(lanes, columns)` of a TMEM byte range.
+fn tmem_rect(r: &Range<u64>) -> (Range<u32>, Range<u32>) {
+    let row = 512 * 4;
+    let (l0, l1) = ((r.start / row) as u32, ((r.end - 1) / row) as u32 + 1);
+    if l1 == l0 + 1 {
+        (l0..l1, ((r.start % row) / 4) as u32..(((r.end - 1) % row) / 4) as u32 + 1)
+    } else {
+        (l0..l1, 0..512)
+    }
+}
+
+fn union_rect(a: Option<(Range<u32>, Range<u32>)>, b: (Range<u32>, Range<u32>)) -> (Range<u32>, Range<u32>) {
+    match a {
+        None => b,
+        Some((l, c)) => (l.start.min(b.0.start)..l.end.max(b.0.end), c.start.min(b.1.start)..c.end.max(b.1.end)),
+    }
+}
+
 pub(crate) fn required_scope(t: &Topology, a: WarpId, b: WarpId) -> Scope {
     if t.cta_of(a) == t.cta_of(b) {
         Scope::Cta
@@ -614,7 +663,12 @@ impl Checker {
         let never: Vec<AsyncId> = self
             .asyncs
             .iter()
-            .filter(|a| a.in_use && a.done == 0 && a.kind != AsyncKind::TcgenCommit)
+            // tcgen05.ld / st are observer-only ops whose every access is
+            // delivered at issue: an op never waited (`tcgen05.wait::ld/st`)
+            // leaves no unobserved effect. Its accesses stay unordered with
+            // everything after them (races / TmemLifetimeReview still fire);
+            // the destination-register side belongs to Space::Reg.
+            .filter(|a| a.in_use && a.done == 0 && !matches!(a.kind, AsyncKind::TcgenCommit | AsyncKind::TcgenLd | AsyncKind::TcgenSt))
             .map(|a| a.op)
             .collect();
         for op in never {
@@ -667,10 +721,33 @@ impl Checker {
         r
     }
 
-    fn push_finding(&mut self, f: Finding) -> Option<usize> {
+    fn is_tmem(&self, alloc: AllocId) -> bool {
+        self.allocs.get(&alloc).is_some_and(|al| al.space == Space::Tmem)
+    }
+
+    /// Fold one more occurrence over `bytes` into finding `i`.
+    fn bump(&mut self, i: usize, bytes: &Range<u64>) {
+        let tmem = self.is_tmem(self.report.findings[i].alloc);
+        let f = &mut self.report.findings[i];
+        f.occurrences += 1;
+        if tmem && !bytes.is_empty() {
+            f.tmem = Some(union_rect(f.tmem.take(), tmem_rect(bytes)));
+        }
+        if matches!(f.kind, FindingKind::Advisory { kind: AdvisoryKind::AliasStaleRead }) {
+            add_span(&mut f.spans, bytes.clone());
+        }
+    }
+
+    fn push_finding(&mut self, mut f: Finding) -> Option<usize> {
         if self.max_findings != 0 && self.report.findings.len() >= self.max_findings {
             self.dropped_findings += 1;
             return None;
+        }
+        if matches!(f.kind, FindingKind::Advisory { kind: AdvisoryKind::AliasStaleRead }) && f.spans.is_empty() {
+            f.spans.push(f.bytes.clone());
+        }
+        if f.tmem.is_none() && !f.bytes.is_empty() && self.is_tmem(f.alloc) {
+            f.tmem = Some(tmem_rect(&f.bytes));
         }
         self.report.findings.push(f);
         Some(self.report.findings.len() - 1)
@@ -841,7 +918,7 @@ impl Checker {
         }
         let site = self.site_of(cw);
         if let Some(&i) = self.advisory_dedup.get(&(kind, alloc, site)) {
-            self.report.findings[i].occurrences += 1;
+            self.bump(i, &bytes);
             return;
         }
         let f = Finding {
@@ -852,7 +929,8 @@ impl Checker {
             prior: Some(self.info(prior)),
             current: Some(self.info(cw)),
             occurrences: 1,
-        };
+            tmem: None,
+            spans: Vec::new(),        };
         if let Some(i) = self.push_finding(f) {
             self.advisory_dedup.insert((kind, alloc, site), i);
         }
@@ -876,7 +954,7 @@ impl Checker {
         if let Some(&i) = self.dedup.get(&key) {
             let f = &mut self.report.findings[i];
             f.bytes = f.bytes.start.min(bytes.start)..f.bytes.end.max(bytes.end);
-            f.occurrences += 1;
+            self.bump(i, &bytes);
             return;
         }
         // A plain access racing on a declared word bypasses the wait_until
@@ -900,7 +978,8 @@ impl Checker {
             prior: Some(prior_info.unwrap_or_else(|| self.info(prior))),
             current: Some(self.info(cw)),
             occurrences: 1,
-        };
+            tmem: None,
+            spans: Vec::new(),        };
         if let Some(i) = self.push_finding(f) {
             self.dedup.insert(key, i);
         }
@@ -974,7 +1053,8 @@ impl Checker {
                 prior: None,
                 current,
                 occurrences: 1,
-            };
+                tmem: None,
+                spans: Vec::new(),            };
             self.push_finding(f);
             return;
         }
@@ -1100,8 +1180,10 @@ impl Checker {
                 // alias_stale_read: a read through one logical name of bytes
                 // last written (and ordered before it) through another name
                 // of the same pooled allocation.
-                if !writes && alias_space {
-                    if let Some(last) = cell.writes.last() {
+                // Legacy rule: thread (generic) reads against thread writes
+                // only; async copies carry no logical buffer of their own.
+                if !writes && alias_space && matches!(cur, Cur::Lane { .. }) {
+                    if let Some(last) = cell.writes.last().filter(|e| e.w.stamp.actor() < this.topo.num_warps()) {
                         if this.ordered(cur, &last.w, a.proxy) {
                             if let (Some(rb), Some(wb)) = (this.site_buffer.get(&a.site), this.site_buffer.get(&this.site_of(&last.w))) {
                                 // An unnamed buffer has no logical identity to compare.
@@ -1290,7 +1372,8 @@ impl Checker {
             prior: None,
             current: None,
             occurrences: 1,
-        };
+            tmem: None,
+            spans: Vec::new(),        };
         if let Some(i) = self.push_finding(f) {
             self.scope_dedup.insert(key, i);
         }
@@ -1345,7 +1428,8 @@ impl Checker {
                         prior: None,
                         current: None,
                         occurrences: 1,
-                    };
+                        tmem: None,
+                        spans: Vec::new(),                    };
                     self.push_finding(f);
                 }
                 self.allocs.remove(&alloc);
@@ -1394,7 +1478,7 @@ impl Checker {
                 a.done = a.done.max(m as u8);
                 let (actor, kind, gen_base) = (a.actor, a.kind, a.gen_base);
                 if kind == AsyncKind::TcgenCommit {
-                    for p in a.preds.clone() {
+                    for p in self.commit_closure(i) {
                         self.asyncs[p].done = 2;
                     }
                 }
@@ -1655,7 +1739,7 @@ impl Checker {
                 k.tcgen.join(&pa.k.tcgen, &self.memo);
                 k.tcgen.raise(pa.actor, pa.gen_base + 2);
             }
-            pred_idx.push(pi);
+            pred_idx.push((pi, pa.gen_base));
         }
         let lane = lanes.lanes8().next().unwrap_or(0);
         let nw = self.topo.num_warps();
@@ -1707,6 +1791,28 @@ impl Checker {
         self.async_index.insert(op, idx);
     }
 
+    /// The tcgen05 ops a commit's completion covers: its tracked ops and,
+    /// transitively, their architected-pipeline predecessors (a later op of
+    /// the thread's pipe completing implies the earlier ones did; PTX
+    /// §9.7.18: commit tracks *all* prior async tcgen05 operations).
+    fn commit_closure(&self, i: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack: Vec<(usize, Epoch)> = self.asyncs[i].preds.clone();
+        while let Some((p, g)) = stack.pop() {
+            let pa = &self.asyncs[p];
+            if pa.gen_base != g || !pa.in_use || !seen.insert(p) {
+                continue;
+            }
+            out.push(p);
+            // An op already completed had its chain completed with it.
+            if pa.done < 2 {
+                stack.extend(pa.preds.iter().copied());
+            }
+        }
+        out
+    }
+
     /// Knowledge an async milestone publishes.
     fn completion(&self, i: usize, m: u32) -> Knowledge {
         let a = &self.asyncs[i];
@@ -1717,8 +1823,13 @@ impl Checker {
             let mut c = a.k.propagating();
             c.tcgen_rel = Clock::default();
             c.hb.raise(a.actor, a.gen_base + m);
-            for &p in &a.preds {
+            // Direct preds; their tcgen views already carry the pipeline
+            // chain behind them.
+            for &(p, g) in &a.preds {
                 let pa = &self.asyncs[p];
+                if pa.gen_base != g {
+                    continue;
+                }
                 c.hb.raise(pa.actor, pa.gen_base + 2);
                 c.tcgen_rel.raise(pa.actor, pa.gen_base + 2);
                 c.tcgen_rel.join(&pa.k.tcgen, &self.memo);

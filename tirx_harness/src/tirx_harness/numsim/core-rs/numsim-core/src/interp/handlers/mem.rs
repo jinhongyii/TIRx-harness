@@ -436,6 +436,10 @@ pub fn atom(
             lane_bytes(ctx, cmp, ty, l, &mut c);
         }
         let mut new = old;
+        // Legacy `atomic_f32(.., space)` (W4): only global (incl. generic
+        // resolving to global) `.add.f32` without `.noftz` flushes subnormals;
+        // shared-memory float atomics keep them.
+        let ftz = ftz && ctx.arena.get(loc.alloc).space != crate::arena::Space::Shared;
         rmw_bytes(op, ty.elem, &mut new[..k], &val[..k], &c[..k], ftz).map_err(|e| support::op_err(ctx, e))?;
         support::mem_write(ctx, loc, l, &new[..k])?;
         if let Some(d) = dst {

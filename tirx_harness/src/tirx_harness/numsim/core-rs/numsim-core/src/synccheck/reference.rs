@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use super::clock::Clock;
 use super::program::Program;
-use super::projection::{ProjectionKey, ProjectionSpec};
+use super::projection::{project, ProjectionKey, ProjectionMode, ProjectionSpec};
 use super::ts::{Deadlock, Transition, Ts, TsError};
 use crate::sync::ResourceInit;
 
@@ -32,8 +32,13 @@ pub struct ReferenceRun {
     pub issued_gens: Vec<Vec<Option<u64>>>,
     pub schedule: Vec<Transition>,
     pub outcome: RunOutcome,
+    /// Landing clocks of commit-FIFO completions, by `(global command, ordinal)`.
+    pub landings: HashMap<(usize, u16), Clock>,
     /// Exit lints of the terminal state: `(global resource, kind, detail)`.
     pub lints: Vec<(usize, crate::report::FindingKind, String)>,
+    /// The system `schedule` indexes: the component that failed (whole
+    /// program when the run completed).
+    pub spec: ProjectionSpec,
 }
 
 impl ReferenceRun {
@@ -51,13 +56,22 @@ pub fn whole_spec(program: &Program) -> ProjectionSpec {
     }
 }
 
+pub enum RunError {
+    Build(String),
+    /// The wall-clock deadline passed (checked every 1024 steps).
+    WallTime,
+}
+
 /// Round-robin over warps; completions and grants only when no warp can move.
-pub fn run(program: &Program, init: &ResourceInit) -> Result<ReferenceRun, String> {
-    let ts = Ts::new(program, &whole_spec(program), init, None)?;
-    let warps = program.warp_ids.len();
+///
+/// Connected components (warps and resources linked by commands, see
+/// [`ProjectionMode::Components`]) never synchronize with each other, so each
+/// runs on its own with clocks over its own warps (V2C-31: a 128-CTA launch
+/// is 128 small runs, not one run whose every step clones 1792 warps and
+/// 2048 resources). Every clock comparison stays inside one component: each
+/// gated projection and certificate lies inside one.
+pub fn run(program: &Program, init: &ResourceInit, deadline: Option<std::time::Instant>) -> Result<ReferenceRun, RunError> {
     let n = program.commands.len();
-    let mut clocks = vec![Clock::zero(warps); warps];
-    let mut payload = HashMap::<(usize, u64), Clock>::new();
     let mut run = ReferenceRun {
         initial: vec![None; n],
         final_: vec![None; n],
@@ -66,30 +80,78 @@ pub fn run(program: &Program, init: &ResourceInit) -> Result<ReferenceRun, Strin
         schedule: Vec::new(),
         outcome: RunOutcome::Complete,
         lints: Vec::new(),
+        landings: HashMap::new(),
+        spec: whole_spec(program),
     };
+    let mut steps = 0u64;
+    for spec in project(program, ProjectionMode::Components) {
+        let ts = Ts::new(program, &spec, init, None).map_err(RunError::Build)?;
+        if !run_component(program, &ts, &mut run, &mut steps, deadline)? {
+            run.spec = spec;
+            return Ok(run);
+        }
+    }
+    Ok(run)
+}
+
+/// Run one component to its end; `false` = it stopped with an error or a
+/// deadlock (recorded in `run.outcome` / `run.schedule`).
+fn run_component(
+    program: &Program,
+    ts: &Ts<'_>,
+    run: &mut ReferenceRun,
+    steps: &mut u64,
+    deadline: Option<std::time::Instant>,
+) -> Result<bool, RunError> {
+    let warps = ts.warps.len();
+    // One extra clock component per tcgen05.commit FIFO (issuing warp): a
+    // commit's landing is an event of its own, ordered after the warp's
+    // earlier commits, so HB through one landing implies the earlier ones.
+    let mut fifo_index = HashMap::<usize, usize>::new();
+    for c in ts.cmds.iter().map(|lc| &program.commands[lc.global]).filter(|c| c.commit) {
+        let next = warps + fifo_index.len();
+        fifo_index.entry(c.participants[0]).or_insert(next);
+    }
+    let dims = warps + fifo_index.len();
+    let mut fifo_last = HashMap::<usize, Clock>::new();
+    let mut clocks = vec![Clock::zero(dims); warps];
+    let mut payload = HashMap::<(usize, u64), Clock>::new();
+    run.schedule.clear();
     let mut state = ts.initial();
     let mut rr = 0usize;
     loop {
+        *steps += 1;
+        if *steps % 1024 == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Err(RunError::WallTime);
+        }
         let local_warps = ts.warps.len().max(1);
         let pick = ts
             .first_warp_transition(&state, rr % local_warps)
             .or_else(|| ts.enabled(&state).first().copied());
         let Some(t) = pick else {
-            run.outcome = if state.exited { RunOutcome::Complete } else { RunOutcome::Deadlock(ts.describe_deadlock(&state)) };
-            return Ok(run);
+            if state.exited {
+                return Ok(true);
+            }
+            run.outcome = RunOutcome::Deadlock(ts.describe_deadlock(&state));
+            return Ok(false);
         };
         if t == Transition::Exit {
             if let Err(e) = ts.step_fx(&state, &t) {
                 run.schedule.push(t);
                 run.outcome = RunOutcome::Error(e);
+                return Ok(false);
             }
             for (r, res) in state.res.iter().enumerate() {
                 if let Some((kind, detail)) = super::backend::exit_lint(res) {
                     run.lints.push((ts.resources[r], kind, detail));
                 }
             }
-            return Ok(run);
+            return Ok(true);
         }
+        let landing_fifo = match t {
+            Transition::Complete(c, o) => state.pending.iter().find(|p| (p.cmd, p.ord) == (c, o)).and_then(|p| p.fifo),
+            _ => None,
+        };
         let head_of_resume = match t {
             Transition::Resume(w) => ts.head(&state, w as usize),
             _ => None,
@@ -99,7 +161,7 @@ pub fn run(program: &Program, init: &ResourceInit) -> Result<ReferenceRun, Strin
             Err(e) => {
                 run.schedule.push(t);
                 run.outcome = RunOutcome::Error(e);
-                return Ok(run);
+                return Ok(false);
             }
         };
         run.schedule.push(t);
@@ -108,10 +170,10 @@ pub fn run(program: &Program, init: &ResourceInit) -> Result<ReferenceRun, Strin
                 let lc = &ts.cmds[c as usize];
                 let g = lc.global;
                 rr = lc.participants.iter().min().copied().unwrap_or(0) + 1;
-                let dense = lc.participants.iter().map(|&w| ts.warps[w]).collect::<Vec<_>>();
+                let dense = lc.participants.clone();
                 // Arming a wait re-issues the same command later: keep the first issue clock.
                 if run.initial[g].is_none() {
-                    let mut joined = Clock::zero(warps);
+                    let mut joined = Clock::zero(dims);
                     for &w in &dense {
                         clocks[w].tick(w);
                         joined.join(&clocks[w]);
@@ -125,7 +187,7 @@ pub fn run(program: &Program, init: &ResourceInit) -> Result<ReferenceRun, Strin
                 }
                 let initial = run.initial[g].clone().expect("set above");
                 for &(r, gen) in &fx.release {
-                    payload.entry((r, gen)).or_insert_with(|| Clock::zero(warps)).join(&initial);
+                    payload.entry((r, gen)).or_insert_with(|| Clock::zero(dims)).join(&initial);
                 }
                 for &(r, gen) in &fx.acquire {
                     if let Some(p) = payload.get(&(r, gen)).cloned() {
@@ -145,7 +207,7 @@ pub fn run(program: &Program, init: &ResourceInit) -> Result<ReferenceRun, Strin
                     }
                 }
                 if fx.returned {
-                    let mut f = Clock::zero(warps);
+                    let mut f = Clock::zero(dims);
                     for &w in &dense {
                         f.join(&clocks[w]);
                     }
@@ -154,7 +216,7 @@ pub fn run(program: &Program, init: &ResourceInit) -> Result<ReferenceRun, Strin
             }
             Transition::Resume(w) => {
                 rr = w as usize + 1;
-                let dense = ts.warps[w as usize];
+                let dense = w as usize;
                 for &(r, gen) in &fx.acquire {
                     if let Some(p) = payload.get(&(r, gen)).cloned() {
                         clocks[dense].join(&p);
@@ -162,16 +224,25 @@ pub fn run(program: &Program, init: &ResourceInit) -> Result<ReferenceRun, Strin
                 }
                 if let Some(c) = head_of_resume {
                     let g = ts.cmds[c].global;
-                    let mut f = run.final_[g].clone().unwrap_or_else(|| Clock::zero(warps));
+                    let mut f = run.final_[g].clone().unwrap_or_else(|| Clock::zero(dims));
                     f.join(&clocks[dense]);
                     run.final_[g] = Some(f);
                 }
             }
-            Transition::Complete(c, _) => {
+            Transition::Complete(c, o) => {
                 let g = ts.cmds[c as usize].global;
                 if let Some(issuer) = run.initial[g].clone() {
+                    let mut released = issuer;
+                    if let Some(f) = landing_fifo.and_then(|w| fifo_index.get(&(w as usize)).copied()) {
+                        if let Some(prev) = fifo_last.get(&f) {
+                            released.join(prev);
+                        }
+                        released.tick(f);
+                        fifo_last.insert(f, released.clone());
+                        run.landings.insert((g, o), released.clone());
+                    }
                     for &(r, gen) in &fx.release {
-                        payload.entry((r, gen)).or_insert_with(|| Clock::zero(warps)).join(&issuer);
+                        payload.entry((r, gen)).or_insert_with(|| Clock::zero(dims)).join(&released);
                     }
                 }
             }

@@ -26,6 +26,9 @@ pub struct Command {
     pub conditional: bool,
     /// `.cta_group` values this instruction uses (kernel-wide rule).
     pub tcgen_groups: Vec<u8>,
+    /// A `tcgen05.commit`: its deferred arrivals land in issue order with the
+    /// issuing warp's other commits (tcgen05 pipeline order).
+    pub commit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +86,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
         conditional: bool,
         collective: Option<Collective>,
         tcgen_groups: Vec<u8>,
+        commit: bool,
     }
     let mut kernel = None::<u32>;
     let mut raws = Vec::<Raw>::new();
@@ -154,6 +158,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                 .iter()
                 .map(|t| (intern(t.res), t.bytes, t.arrivals))
                 .collect::<Vec<_>>();
+            let commit = cmds.iter().any(|pc| matches!(pc.cmd, SyncCmd::TcgenWork(tcgen::WorkCmd::Commit)));
             if kept.is_empty() && issued.is_empty() && tcgen_groups.is_empty() {
                 continue;
             }
@@ -168,6 +173,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                 conditional,
                 collective: collective.clone(),
                 tcgen_groups,
+                commit,
             });
         }
     }
@@ -188,6 +194,17 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
     let mut positions = vec![Vec::<(u32, usize)>::new(); warp_ids.len()];
     let mut commands = Vec::<Command>::new();
     let mut collectives = HashMap::<u64, (usize, Vec<usize>)>::new();
+    // A collective's participants are the union of what its records declare
+    // and the warps that recorded it: an engine may list only the recording
+    // warp in each record (W2 cta_group::2 tcgen05 pairs, V2C-4).
+    let mut members = HashMap::<u64, std::collections::BTreeSet<WarpId>>::new();
+    for raw in &raws {
+        if let Some(c) = &raw.collective {
+            let m = members.entry(c.id).or_default();
+            m.insert(raw.warp);
+            m.extend(c.participants.iter().copied());
+        }
+    }
     for raw in raws {
         let warp = dense(raw.warp);
         if let Some(c) = &raw.collective {
@@ -199,7 +216,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                 positions[warp].push((raw.seq, *command));
                 continue;
             }
-            let mut participants = c.participants.iter().map(|&w| dense(w)).collect::<Vec<_>>();
+            let mut participants = members[&c.id].iter().map(|&w| dense(w)).collect::<Vec<_>>();
             participants.retain(|&p| p != warp);
             participants.insert(0, warp);
             collectives.insert(c.id, (commands.len(), vec![warp]));
@@ -215,6 +232,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                 issued: raw.issued,
                 conditional: raw.conditional,
                 tcgen_groups: raw.tcgen_groups,
+                commit: raw.commit,
             });
             continue;
         }
@@ -230,6 +248,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
             issued: raw.issued,
             conditional: raw.conditional,
             tcgen_groups: raw.tcgen_groups,
+            commit: raw.commit,
         });
     }
     for (id, (command, seen)) in &collectives {
@@ -238,7 +257,8 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
         let mut want = commands[*command].participants.clone();
         want.sort_unstable();
         if seen != want {
-            return Err(format!("collective {id} is missing participant records"));
+            let missing = want.iter().filter(|w| !seen.contains(w)).map(|&w| warp_ids[w].0).collect::<Vec<_>>();
+            return Err(format!("collective {id} is missing the records of participant warps {missing:?}"));
         }
     }
     let mut warp_programs = Vec::with_capacity(warp_ids.len());

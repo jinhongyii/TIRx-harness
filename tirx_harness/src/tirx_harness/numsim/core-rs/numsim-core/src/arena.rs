@@ -390,10 +390,48 @@ impl Arena {
     }
 
     /// Create an allocation. Global allocations get a fresh VA range.
+    /// `Space::Reg` allocations are metadata only (register footprints);
+    /// see [`Arena::alloc_register_buffer`] for byte-backed ones.
     pub fn alloc(&mut self, space: Space, owner: Owner, name: &str, size: u64, init: Init) -> AllocId {
+        self.alloc_inner(space, owner, name, size, init, space == Space::Reg)
+    }
+
+    /// A global allocation whose base keeps `low` as its low 8 bits:
+    /// `base = aligned synthetic base | low` (host-pointer low bits ruling);
+    /// the guard gap before the next allocation is unchanged.
+    pub fn alloc_global_low_bits(&mut self, owner: Owner, name: &str, size: u64, init: Init, low: u8) -> AllocId {
+        let id = self.alloc_inner(Space::Global, owner, name, size + low as u64, init_shifted(init, low, size), false);
+        let a = &mut self.allocs[id.0 as usize];
+        if low != 0 {
+            // Re-express the allocation as starting `low` bytes in.
+            a.base += low as u64;
+            a.size = size;
+            a.bytes.drain(..low as usize);
+            let mut v = BitSet::new(size, false);
+            for i in 0..size {
+                if a.valid.get(i + low as u64) {
+                    v.set_range(i, 1, true);
+                }
+            }
+            a.valid = v;
+            if let Some(e) = self.global_index.last_mut() {
+                e.0 = a.base;
+                e.1 = a.base + size;
+            }
+        }
+        id
+    }
+
+    /// A byte-backed `Space::Reg` allocation: register-space buffers kept in
+    /// memory (per-lane arrays lowering did not scalarize), with validity,
+    /// so uninitialized reads report `space: register`.
+    pub fn alloc_register_buffer(&mut self, owner: Owner, name: &str, size: u64, init: Init) -> AllocId {
+        self.alloc_inner(Space::Reg, owner, name, size, init, false)
+    }
+
+    fn alloc_inner(&mut self, space: Space, owner: Owner, name: &str, size: u64, init: Init, metadata_only: bool) -> AllocId {
         assert!(self.shard.is_none(), "allocations cannot be created inside a shard");
         let id = AllocId(self.allocs.len() as u32);
-        let metadata_only = space == Space::Reg;
         let (bytes, valid) = if metadata_only {
             (Vec::new(), BitSet::new(0, false))
         } else {
@@ -540,6 +578,27 @@ impl Arena {
             let a = self.get(id);
             f(&a.bytes, &a.valid, abs.start, abs.start, abs.len);
         }
+    }
+
+    /// First VALID byte of `span` of `view` (allocation-relative result).
+    pub fn first_valid(&self, view: View, span: ByteSpan) -> Option<u64> {
+        let a = self.get(view.alloc);
+        if a.metadata_only {
+            return Some(view.absolute(span).start);
+        }
+        let abs = view.absolute(span);
+        if abs.end() > a.size {
+            return None;
+        }
+        let mut out = None;
+        self.pieces(view.alloc, abs, |_, valid, at, off, n| {
+            if out.is_none() {
+                if let Some(x) = valid.first_set(at, n) {
+                    out = Some(off + (x - at));
+                }
+            }
+        });
+        out
     }
 
     /// First invalid byte of `abs` of `id`.
@@ -925,6 +984,33 @@ impl Arena {
                     }
                 }
             }
+        }
+    }
+}
+
+/// `init` for an allocation of `low + size` bytes whose first `low` bytes
+/// are dropped afterwards.
+fn init_shifted(init: Init, low: u8, size: u64) -> Init {
+    if low == 0 {
+        return init;
+    }
+    let pad = low as usize;
+    match init {
+        Init::Uninit => Init::Uninit,
+        Init::Zeroed => Init::Zeroed,
+        Init::Bytes(b) => {
+            let mut v = vec![0u8; pad];
+            v.extend(b);
+            Init::Bytes(v)
+        }
+        Init::BytesWithValidity(b, valid) => {
+            let mut v = vec![0u8; pad];
+            v.extend(b);
+            let mut bits = BitSet::new(size + low as u64, true);
+            for i in 0..size {
+                bits.set_range(i + low as u64, 1, valid.get(i));
+            }
+            Init::BytesWithValidity(v, bits)
         }
     }
 }

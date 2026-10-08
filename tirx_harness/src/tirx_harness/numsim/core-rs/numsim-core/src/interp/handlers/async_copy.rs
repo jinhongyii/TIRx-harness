@@ -96,6 +96,8 @@ pub fn issue_async(ctx: &mut ExecCtx<'_>, lanes: WarpMask, is: Issue) -> AsyncId
             report: is.report,
             lut_b: is.lut_b,
             strong: is.strong,
+            bit_frags: Vec::new(),
+            dead: Vec::new(),
         },
     );
     if is.queue {
@@ -114,6 +116,20 @@ pub fn issue_async(ctx: &mut ExecCtx<'_>, lanes: WarpMask, is: Issue) -> AsyncId
 
 /// mbarrier resource named by an address (8-byte aligned shared word).
 pub fn mbar_res(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize) -> Result<ResourceId, ExecError> {
+    // sync-semantics §2.1: an EXPLICIT `.shared::cta` mbarrier operand must
+    // name the executing CTA; a remote-rank (`mapa`) address there is an
+    // error. Unqualified (generic) and `.shared::cluster` forms accept it.
+    if space == AddrSpace::Shared {
+        let (rank, _) = crate::arena::addr::decode_shared(a as u32);
+        if rank != ctx.cta.rank_in_cluster {
+            return Err(support::err(
+                ctx,
+                ExecErrorKind::BadAddress,
+                WarpMask::lane(lane),
+                format!("shared::cta mbarrier address {a:#x} names CTA rank {rank}, not the executing CTA (rank {})", ctx.cta.rank_in_cluster),
+            ));
+        }
+    }
     let loc = support::resolve(ctx, space, a, lane, 8)?;
     if ctx.arena.get(loc.alloc).space != crate::arena::Space::Shared {
         return Err(support::err(ctx, ExecErrorKind::BadAddress, WarpMask::lane(lane), "mbarrier not in shared memory"));
@@ -142,9 +158,18 @@ pub fn mbar_issue(ctx: &mut ExecCtx<'_>, res: ResourceId) -> Result<u64, ExecErr
 }
 
 /// Ranks named by a `.multicast::cluster` CTA mask.
-pub fn ranks_of(ctx: &ExecCtx<'_>, mask: u64) -> Vec<u32> {
-    let n = ctx.launch.ctas_per_cluster();
-    (0..n.min(64)).filter(|r| mask >> r & 1 == 1).collect()
+/// CTA ranks of a multicast mask. A bit naming a rank outside the cluster
+/// is a kernel bug (BadAddress), not a silently dropped target.
+pub fn ranks_of(ctx: &ExecCtx<'_>, mask: u64) -> Result<Vec<u32>, ExecError> {
+    let n = ctx.launch.ctas_per_cluster().min(64);
+    let outside = if n >= 64 { 0 } else { mask >> n };
+    if outside != 0 {
+        return Err(ctx.error(
+            ExecErrorKind::BadAddress,
+            format!("multicast CTA mask {mask:#x} names ranks outside the {n}-CTA cluster"),
+        ));
+    }
+    Ok((0..n).filter(|r| mask >> r & 1 == 1).collect())
 }
 
 /// Is `loc` a shared-window location (own or cluster peer)?
@@ -371,10 +396,22 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
         // not read and their destination bytes are left unchanged (tx still
         // counts `size`).
         let (left, right) = match args.ignore_oob {
-            Some(io) => (
-                io.ignore_bytes_left.map(|o| lane_val(ctx, o, l)).unwrap_or(0).min(size),
-                io.ignore_bytes_right.map(|o| lane_val(ctx, o, l)).unwrap_or(0),
-            ),
+            Some(io) => {
+                let left = io.ignore_bytes_left.map(|o| lane_val(ctx, o, l)).unwrap_or(0);
+                let right = io.ignore_bytes_right.map(|o| lane_val(ctx, o, l)).unwrap_or(0);
+                // PTX: each ignored-byte count must be in 0..=15.
+                for (what, v) in [("ignoreBytesLeft", left), ("ignoreBytesRight", right)] {
+                    if v > 15 {
+                        return Err(support::err(
+                            ctx,
+                            ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+                            WarpMask::lane(l),
+                            format!("cp.async.bulk .ignore_oob {what} = {v} must be in 0..=15"),
+                        ));
+                    }
+                }
+                (left.min(size), right)
+            }
             None => (0, 0),
         };
         let copy = size.saturating_sub(left).saturating_sub(right);
@@ -386,7 +423,7 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
         let mut ranks: Vec<Option<u32>> = Vec::new();
         match args.multicast {
             Some(m) => {
-                for r in ranks_of(ctx, lane_val(ctx, m, l)) {
+                for r in ranks_of(ctx, lane_val(ctx, m, l))? {
                     let (alloc, off) = smem_loc_in_rank(ctx, dl, r)
                         .ok_or_else(|| ctx.error(ExecErrorKind::BadAddress, "multicast rank out of range"))?;
                     dsts.push((alloc, ByteSpan::new(off, size)));
@@ -414,6 +451,20 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
             for &(o, n) in &runs {
                 srcs.push((sl.alloc, ByteSpan::new(sl.offset + (o - left), n)));
                 dsts2.push((*da, ByteSpan::new(ds.start + o, n)));
+            }
+        }
+        // `.ignore_oob` dead bytes (outside the copied middle, inside the
+        // byte mask): legacy writes them as zero with validity cleared.
+        let mut dead: Vec<(AllocId, ByteSpan)> = Vec::new();
+        if args.ignore_oob.is_some() && args.reduce.is_none() {
+            for (o, n) in byte_runs(size, mask) {
+                for (lo, hi) in [(o, (o + n).min(left)), (o.max(left + copy), o + n)] {
+                    if lo < hi {
+                        for (da, ds) in &dsts {
+                            dead.push((*da, ByteSpan::new(ds.start + lo, hi - lo)));
+                        }
+                    }
+                }
             }
         }
         let dsts = dsts2;
@@ -467,6 +518,11 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
                 strong: None,
             },
         );
+        if !dead.is_empty() {
+            if let Some(m) = ctx.aux.async_meta.get_mut(&op) {
+                m.dead = dead;
+            }
+        }
         if let Some(g) = group {
             ctx.aux.groups.issue(g, op);
         }
@@ -548,7 +604,18 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
     let mut issued = Vec::new();
     let mut acc = Accesses::default();
     for l in active.lanes() {
-        let (mut desc, _) = read_tmap(ctx, args.tmap, args.tmap_space, l, &mut acc)?;
+        let (mut desc, tloc) = read_tmap(ctx, args.tmap, args.tmap_space, l, &mut acc)?;
+        // A descriptor modified by tensormap.replace must be published by a
+        // fence.proxy.tensormap::generic.release before the tensormap proxy
+        // reads it (legacy rejected the unpublished use).
+        if ctx.aux.tmap_dirty.contains_key(&(tloc.alloc, tloc.offset)) {
+            return Err(support::err(
+                ctx,
+                ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+                WarpMask::lane(l),
+                "tensor map modified by tensormap.replace is used before a fence.proxy.tensormap::generic.release published it (dirty descriptor)",
+            ));
+        }
         if !args.overrides.is_empty() {
             let ov: Vec<_> = args.overrides.iter().map(|o| (o.field, o.ord, lane_val(ctx, o.value, l))).collect();
             desc.apply_overrides(&ov).map_err(|e| support::op_err(ctx, e))?;
@@ -566,6 +633,17 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
             continue;
         }
         let smem_alloc = sloc.alloc;
+        let mut bit_frags = Vec::with_capacity(plan.global_bits.len());
+        for f in &plan.global_bits {
+            let (alloc, off) = ctx.arena.resolve_global(f.global, 1).map_err(|e| support::arena_err(ctx, e, WarpMask::lane(l)))?;
+            bit_frags.push(crate::interp::aux::BitFrag {
+                global: (alloc, off),
+                smem: (smem_alloc, f.smem),
+                src_shift: f.source_shift,
+                tgt_shift: f.target_shift,
+                mask: f.mask,
+            });
+        }
         let mut global = Vec::with_capacity(plan.global.len());
         for s in &plan.global {
             let (alloc, off) = ctx
@@ -576,7 +654,7 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
         }
         // Destination CTAs for loads (multicast).
         let ranks: Vec<Option<u32>> = match (args.dir, args.multicast) {
-            (TmaDir::Load, Some(m)) => ranks_of(ctx, lane_val(ctx, m, l)).into_iter().map(Some).collect(),
+            (TmaDir::Load, Some(m)) => ranks_of(ctx, lane_val(ctx, m, l))?.into_iter().map(Some).collect(),
             _ => vec![None],
         };
         let smem_in = |ctx: &ExecCtx<'_>, r: Option<u32>| -> AllocId {
@@ -669,6 +747,11 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
                 strong: None,
             },
         );
+        if !bit_frags.is_empty() {
+            if let Some(m) = ctx.aux.async_meta.get_mut(&op) {
+                m.bit_frags = bit_frags;
+            }
+        }
         if let Some(g) = group {
             ctx.aux.groups.issue(g, op);
         }
@@ -742,6 +825,7 @@ pub fn tensormap_replace(ctx: &mut ExecCtx<'_>, tmap: Operand, space: AddrSpace,
     for l in ctx.warp.active.lanes() {
         let (mut d, loc) = read_tmap(ctx, tmap, space, l, &mut racc)?;
         d.replace(field, ord, lane_val(ctx, value, l)).map_err(|e| support::op_err(ctx, e))?;
+        ctx.aux.tmap_dirty.insert((loc.alloc, loc.offset), ctx.warp.id);
         let b = d.try_encode().map_err(|e| support::op_err(ctx, e))?;
         support::mem_write(ctx, loc, l, &b)?;
         if ctx.observing {
@@ -769,6 +853,8 @@ pub fn tensormap_cp_fence(ctx: &mut ExecCtx<'_>, dst: Operand, src: Operand, siz
         let mut b = vec![0u8; n as usize];
         support::mem_read(ctx, sl, l, &mut b)?;
         support::mem_write(ctx, dl, l, &b)?;
+        // `tensormap.cp_fenceproxy` publishes the copy (release).
+        ctx.aux.tmap_dirty.remove(&(dl.alloc, dl.offset));
         if ctx.observing {
             racc.push(sl, l as u8, n);
             wacc.push(dl, l as u8, n);

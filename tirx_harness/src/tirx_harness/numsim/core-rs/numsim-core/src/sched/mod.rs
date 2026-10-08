@@ -211,6 +211,11 @@ pub enum ArgValue {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inputs {
     pub args: BTreeMap<String, ArgValue>,
+    /// Host address of `Buffer` arguments (when the host array has one):
+    /// a buffer's synthetic global address keeps the host pointer's low 8
+    /// bits (`arena::addr` ruling), so kernel alignment arithmetic matches
+    /// the host's.
+    pub host_addrs: BTreeMap<String, u64>,
 }
 
 /// Final contents of every buffer argument after the module ran.
@@ -357,6 +362,7 @@ pub struct Scheduler<'p> {
     /// Reusable (smem, tmem) allocations of retired CTAs, and local ones.
     free_cta: Vec<(AllocId, AllocId)>,
     free_local: Vec<AllocId>,
+    free_regbuf: Vec<AllocId>,
     ends: BTreeMap<WarpId, WarpEnd>,
     observing: bool,
     wants_history: bool,
@@ -479,6 +485,18 @@ impl<'p> Scheduler<'p> {
                 local_off += len;
             }
         }
+        // Register-space buffers: their own per-lane layout (same rule as
+        // `Loaded::reg_per_lane`).
+        let mut reg_off = 0u64;
+        for (i, b) in program.buffers.iter().enumerate() {
+            if b.space == Space::Reg && b.view_of.is_none() {
+                let len = b.byte_len.as_ref().and_then(|e| e.eval(&|p| scalar(arena, p))).unwrap_or(0).max(0) as u64;
+                let align = (b.align as u64).max(1);
+                reg_off = reg_off.div_ceil(align) * align;
+                local_offsets[i] = reg_off;
+                reg_off += len;
+            }
+        }
         fn bind(
             i: usize,
             program: &Program,
@@ -513,6 +531,9 @@ impl<'p> Scheduler<'p> {
                     },
                     BufBinding::Local { offset, per_lane } => {
                         BufBinding::Local { offset: offset + d.base, per_lane: len.unwrap_or(per_lane.saturating_sub(d.base)) }
+                    }
+                    BufBinding::Reg { offset, per_lane } => {
+                        BufBinding::Reg { offset: offset + d.base, per_lane: len.unwrap_or(per_lane.saturating_sub(d.base)) }
                     }
                     BufBinding::Tmem { base_col, cols, base_reg } => {
                         BufBinding::Tmem { base_col: base_col + d.base as u32, cols, base_reg: d.base_reg.or(base_reg) }
@@ -564,7 +585,7 @@ impl<'p> Scheduler<'p> {
                             base_reg: d.base_reg,
                         }
                     }
-                    Space::Reg => BufBinding::Unbound,
+                    Space::Reg => BufBinding::Reg { offset: local_offsets[i], per_lane: len.unwrap_or(0) },
                 }
             };
             out[i] = Some(b);
@@ -593,6 +614,7 @@ impl<'p> Scheduler<'p> {
             pending,
             free_cta: Vec::new(),
             free_local: Vec::new(),
+            free_regbuf: Vec::new(),
             ends: BTreeMap::new(),
             observing: false,
             wants_history: false,
@@ -720,6 +742,17 @@ impl<'p> Scheduler<'p> {
             self.partitions.push(p);
             self.partitions.len() - 1
         };
+        // tcgen05 lifecycle state of each CTA pair, with the target's
+        // `.exclusive` allocation limit (PTX Table 58: 576 columns on
+        // sm_107f, 512 elsewhere; sync-isa-answers column rule).
+        if self.loaded.uses_tmem {
+            let limit = exclusive_tmem_columns(self.program.arch.as_deref());
+            let part = &mut self.partitions[pi];
+            for pair_rank in 0..n.div_ceil(2) {
+                let res = ResourceId::TcgenLifecycle { cluster: id, pair_rank: pair_rank as u8 };
+                part.sync.resources.insert(res, crate::sync::Resource::Tcgen(crate::sync::tcgen::State::new(limit)));
+            }
+        }
         let mut ctas: Vec<CtaCtx> = Vec::with_capacity(n as usize);
         for rank in 0..n {
             let c = cta_coords(&shape, id, rank);
@@ -785,6 +818,18 @@ impl<'p> Scheduler<'p> {
                     };
                     ws.local = Some(a);
                     self.host_event(observer, SyncKind::AllocBegin { alloc: a, space: Space::Local, size, cta: cid });
+                }
+                if self.loaded.reg_per_lane > 0 {
+                    let size = self.loaded.reg_per_lane * 32;
+                    let a = match self.free_regbuf.pop() {
+                        Some(a) => {
+                            arena.reset(a);
+                            a
+                        }
+                        None => arena.alloc_register_buffer(Owner::Warp(wid.0), &format!("regs[w{}]", wid.0), size, Init::Uninit),
+                    };
+                    ws.regbuf = Some(a);
+                    self.host_event(observer, SyncKind::AllocBegin { alloc: a, space: Space::Reg, size, cta: cid });
                 }
                 if self.observing {
                     let size = self.program.regs.len() as u64 * 32 * 8;
@@ -884,6 +929,10 @@ impl<'p> Scheduler<'p> {
                                 if let Some(a) = w.local {
                                     self.host_event(observer, SyncKind::AllocEnd { alloc: a });
                                     self.free_local.push(a);
+                                }
+                                if let Some(a) = w.regbuf {
+                                    self.host_event(observer, SyncKind::AllocEnd { alloc: a });
+                                    self.free_regbuf.push(a);
                                 }
                             }
                         }
@@ -1392,6 +1441,7 @@ impl<'p> Scheduler<'p> {
                 ends.push(c.ctx.smem);
                 ends.push(c.ctx.tmem);
                 ends.extend(c.warps.iter().filter_map(|w| w.local));
+                ends.extend(c.warps.iter().filter_map(|w| w.regbuf));
             }
             for a in ends {
                 self.host_event(observer, SyncKind::AllocEnd { alloc: a });
@@ -1540,12 +1590,100 @@ fn host_buffer(
                 }
                 None => Init::Bytes(bytes.clone()),
             };
-            let a = arena.alloc(Space::Global, Owner::Launch, name, size, init);
+            let low = inputs.host_addrs.get(name).map_or(0, |p| (*p & 0xff) as u8);
+            let a = arena.alloc_global_low_bits(Owner::Launch, name, size, init, low);
             globals.insert(name.to_string(), a);
             Ok(a)
         }
         Some(_) => Err(RunError::BadArg { name: name.into(), message: "expected a buffer argument".into() }),
         None => Err(RunError::MissingArg(name.into())),
+    }
+}
+
+/// Allocate every host buffer `module` binds, in one fixed order: per
+/// kernel, its `Buffer` slots (in signature order), then the targets of
+/// its `Pointer` / `TensorMapOf` arguments. `run_with_config` and
+/// [`plan_global_addresses`] share it, so planned addresses are the ones a
+/// run uses.
+fn allocate_host(
+    module: &Module,
+    inputs: &Inputs,
+    arena: &mut Arena,
+    globals: &mut BTreeMap<String, AllocId>,
+    views: &mut BTreeMap<String, (u64, u64)>,
+) -> Result<(), RunError> {
+    for program in &module.kernels {
+        for slot in &program.host_abi {
+            if slot.kind == ParamKind::Buffer {
+                let name = if inputs.args.contains_key(&slot.name) {
+                    slot.name.clone()
+                } else {
+                    slot.aliases.iter().find(|a| inputs.args.contains_key(*a)).cloned().unwrap_or(slot.name.clone())
+                };
+                let (a, off, len) = host_region(arena, globals, inputs, &name)?;
+                globals.entry(slot.name.clone()).or_insert(a);
+                if matches!(inputs.args.get(&name), Some(ArgValue::View { .. })) {
+                    views.insert(slot.name.clone(), (off, len));
+                }
+            }
+        }
+        for slot in &program.host_abi {
+            match (slot.kind, lookup(inputs, slot)) {
+                (ParamKind::Pointer, Some(ArgValue::Pointer { target, .. })) => {
+                    host_region(arena, globals, inputs, target)?;
+                }
+                (ParamKind::Pointer, Some(ArgValue::View { target, .. })) => {
+                    host_buffer(arena, globals, inputs, target)?;
+                }
+                (ParamKind::Pointer, Some(ArgValue::Buffer { .. })) => {
+                    host_buffer(arena, globals, inputs, &slot.name)?;
+                }
+                (ParamKind::TensorMap, Some(ArgValue::TensorMapOf { base, .. })) => {
+                    host_region(arena, globals, inputs, base)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The engine (synthetic global) address every `Buffer` / `View` argument
+/// of `inputs` will have when `module` runs with them (CONTRACT_REQUESTS
+/// W8-7), for raw-pointer inputs that must embed them. Arguments the module
+/// never binds are absent.
+pub fn plan_global_addresses(module: &Module, inputs: &Inputs) -> Result<BTreeMap<String, u64>, RunError> {
+    let mut arena = Arena::new(ValidityPolicy::Allow);
+    let mut globals = BTreeMap::new();
+    let mut views = BTreeMap::new();
+    for program in &module.kernels {
+        program.validate().map_err(|e| RunError::InvalidProgram(e.to_string()))?;
+    }
+    allocate_host(module, inputs, &mut arena, &mut globals, &mut views)?;
+    let mut out = BTreeMap::new();
+    for (name, arg) in &inputs.args {
+        match arg {
+            ArgValue::Buffer { .. } => {
+                if let Some(&a) = globals.get(name) {
+                    out.insert(name.clone(), arena.get(a).base);
+                }
+            }
+            ArgValue::View { target, offset, .. } => {
+                if let Some(&a) = globals.get(target) {
+                    out.insert(name.clone(), arena.get(a).base + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Largest `tcgen05.alloc.exclusive` column count on `arch` (PTX Table 58).
+pub fn exclusive_tmem_columns(arch: Option<&str>) -> u32 {
+    match arch {
+        Some(a) if a.starts_with("sm_107") => 576,
+        _ => crate::sync::tcgen::TMEM_COLUMNS,
     }
 }
 
@@ -1635,23 +1773,9 @@ pub fn run_with_config(
     let mut prepared = Vec::with_capacity(module.kernels.len());
     for program in &module.kernels {
         program.validate().map_err(|e| RunError::InvalidProgram(e.to_string()))?;
-        let shape = resolve_launch(program, inputs)?;
-        for slot in &program.host_abi {
-            if slot.kind == ParamKind::Buffer {
-                let name = if inputs.args.contains_key(&slot.name) {
-                    slot.name.clone()
-                } else {
-                    slot.aliases.iter().find(|a| inputs.args.contains_key(*a)).cloned().unwrap_or(slot.name.clone())
-                };
-                let (a, off, len) = host_region(&mut arena, &mut globals, inputs, &name)?;
-                globals.entry(slot.name.clone()).or_insert(a);
-                if matches!(inputs.args.get(&name), Some(ArgValue::View { .. })) {
-                    views.insert(slot.name.clone(), (off, len));
-                }
-            }
-        }
-        prepared.push(shape);
+        prepared.push(resolve_launch(program, inputs)?);
     }
+    allocate_host(module, inputs, &mut arena, &mut globals, &mut views)?;
     for (k, program) in module.kernels.iter().enumerate() {
         let shape = prepared[k];
         let loaded = Loaded::new(program);
@@ -1725,7 +1849,23 @@ pub fn run_with_config(
         outcome.stats.completions += sched.stats.completions;
         outcome.diagnostics.append(&mut sched.diagnostics);
         if status == RunStatus::Completed {
-            outcome.sync_leftovers.extend(sched.leftovers());
+            let left = sched.leftovers();
+            // A kernel that exits with live TMEM allocations is a protocol
+            // error (sync-semantics tcgen05 lifecycle; legacy rejected it).
+            if let Some((res, e)) = left.iter().find(|(_, e)| matches!(e, SyncError::Tcgen(crate::sync::tcgen::Error::LiveAllocationsAtExit { .. }))) {
+                let err = sched_error(
+                    ExecErrorKind::Protocol(e.clone()),
+                    k as u32,
+                    WarpId(u32::MAX),
+                    SiteId::NONE,
+                    format!("kernel exited with live TMEM allocations ({res:?})"),
+                );
+                outcome.sync_leftovers.extend(left);
+                outcome.status = RunStatus::Error(err);
+                outcome.failed_kernel = Some(k as u32);
+                break;
+            }
+            outcome.sync_leftovers.extend(left);
             if sched.pending_async_ops() != 0 {
                 let e = sched_error(
                     ExecErrorKind::Internal,

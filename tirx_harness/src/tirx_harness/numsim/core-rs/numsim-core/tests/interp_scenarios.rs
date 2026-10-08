@@ -466,8 +466,9 @@ fn bulk_copy_mask_and_ignore_oob_narrow_bytes_and_footprint() {
     let (o, ev) = run_events(&s);
     completed(&o);
     assert_eq!(o.outputs.buffers["out"].0, scenarios::bulk_masked_expected());
-    // The async write side covers exactly the transferred bytes.
-    let want: Vec<u64> = (0..64u64).filter(|i| i % 16 < 8 && (4..56).contains(i)).collect();
+    // The async write side covers exactly the masked-in bytes: transferred
+    // ones plus the zeroed `.ignore_oob` edges (legacy writes the window).
+    let want: Vec<u64> = (0..64u64).filter(|i| i % 16 < 8).collect();
     let mut got: Vec<u64> = ev
         .accesses
         .iter()
@@ -895,5 +896,173 @@ fn hint_ops_engine_effects() {
     match &o.status {
         RunStatus::Error(e) => assert_eq!(e.kind, ExecErrorKind::BadAddress, "{e:?}"),
         other => panic!("expected BadAddress, got {other:?}"),
+    }
+}
+
+/// `.exclusive` TMEM allocation limit follows `Program::arch`.
+#[test]
+fn exclusive_tmem_limit_follows_arch() {
+    let o = run(&scenarios::tcgen_exclusive_576("sm_107f"));
+    completed(&o);
+    assert!(o.sync_leftovers.is_empty(), "{:?}", o.sync_leftovers);
+    let o = run(&scenarios::tcgen_exclusive_576("sm_100a"));
+    match &o.status {
+        RunStatus::Error(e) => assert!(e.message.contains("InvalidColumns"), "{e:?}"),
+        other => panic!("expected InvalidColumns, got {other:?}"),
+    }
+}
+
+/// V2C-19/20: register-space buffers are memory-backed per lane and their
+/// uninitialized reads report `space: register`.
+#[test]
+fn register_buffer_uninit_reads_report_register_space() {
+    let o = run(&scenarios::reg_buffer_uninit());
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), (0..32).collect::<Vec<_>>(), "uninit element reads as zero");
+    let f: Vec<_> = o.diagnostics.iter().filter(|f| f.kind == FindingKind::UninitRead).collect();
+    // One finding per lane's read range (lane-major layout), all register space.
+    assert_eq!(f.len(), 32, "{:#?}", o.diagnostics);
+    assert!(f.iter().all(|x| x.evidence[0].space == Some(numsim_core::arena::Space::Reg)));
+}
+
+/// W1 ruling: a `mapa.shared::cluster` value works as a SharedCluster and as
+/// a Generic (zero-extended) mbarrier operand.
+#[test]
+fn mapa_value_as_cluster_and_generic_mbarrier_operand() {
+    for seed in 0..3 {
+        let s = scenarios::mapa_cluster_arrive();
+        let o = run_cfg(&s, &RunConfig { seed, ..s.config.clone() });
+        completed(&o);
+        assert_eq!(u32s(&o, "out"), vec![1, 1]);
+    }
+}
+
+/// V2C-24: implicit TMEM ownership without tcgen05.alloc.
+#[test]
+fn implicit_tmem_views_work_without_alloc() {
+    let o = run(&scenarios::implicit_tmem());
+    completed(&o);
+    let want: Vec<u32> = (0..128u32).map(|i| (i / 4) * 10 + i % 4).collect();
+    assert_eq!(u32s(&o, "out"), want);
+}
+
+/// W8-7: planned global addresses are the ones the run uses.
+#[test]
+fn planned_global_addresses_match_the_run() {
+    use numsim_core::dtype::{Dtype, Ty};
+    use numsim_core::testutil::ProgramBuilder;
+    let mut b = ProgramBuilder::new("addr_probe", 32);
+    let x = b.global("x", Dtype::U32);
+    let z = b.global("z", Dtype::U32);
+    let out = b.global("out", Dtype::U64);
+    let a = b.reg(Ty::U64);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    b.addr_of(a, x, k0);
+    b.st(Ty::U64, out, k0, a);
+    b.addr_of(a, z, k0);
+    b.st(Ty::U64, out, k1, a);
+    b.exit();
+    let module = b.build_module();
+    let s = scenarios::aliased_views();
+    let mut inputs = s.inputs.clone();
+    inputs.args.insert("out".into(), sched::ArgValue::Buffer { bytes: vec![0; 16], valid: None });
+    let plan = sched::plan_global_addresses(&module, &inputs).unwrap();
+    let o = sched::run_with_config(&module, &inputs, &mut numsim_core::observe::NoopObserver, &Backend::Interp, &RunConfig::default()).unwrap();
+    completed(&o);
+    let got: Vec<u64> = o.outputs.buffers["out"].0.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(got, vec![plan["x"], plan["z"]]);
+    assert_eq!(plan["z"] - plan["x"], 8);
+    assert_eq!(plan["x"], plan["mem"]);
+}
+
+/// W4-11: packed FP4 TMA store with masked sub-byte fragments, partly out
+/// of bounds: the engine applies byte spans then fragments exactly like the
+/// oplib plan says.
+#[test]
+fn fp4_tma_store_applies_bit_fragments() {
+    use numsim_core::oplib::{tma_plan_dir, TmaPlanDir};
+    use numsim_core::program::TmaMode;
+    let s = scenarios::fp4_tma_store();
+    let o = run(&s);
+    completed(&o);
+    let va = sched::plan_global_addresses(&s.module, &s.inputs).unwrap()["dst"];
+    let mut d = scenarios::fp4_store_desc();
+    d.global_address = va;
+    let plan = tma_plan_dir(&d, TmaPlanDir::Store, TmaMode::Tile, &[32, 0], &[], 0).unwrap();
+    assert!(!plan.global_bits.is_empty(), "expected sub-byte fragments");
+    let shared: Vec<u8> = (0..64u32).map(|i| ((i % 16) * 16 + i / 2 + 1) as u8).collect();
+    let mut want = vec![0xeeu8; 64];
+    let src: Vec<u8> = plan.smem.iter().flat_map(|s| shared[s.start as usize..s.end() as usize].to_vec()).collect();
+    let mut at = 0usize;
+    for g in &plan.global {
+        let off = (g.start - va) as usize;
+        want[off..off + g.len as usize].copy_from_slice(&src[at..at + g.len as usize]);
+        at += g.len as usize;
+    }
+    for f in &plan.global_bits {
+        let mask = f.mask << f.target_shift;
+        let sb = (shared[f.smem as usize] >> f.source_shift) & f.mask;
+        let g = &mut want[(f.global - va) as usize];
+        *g = (*g & !mask) | ((sb << f.target_shift) & mask);
+    }
+    assert_eq!(o.outputs.buffers["dst"].0, want);
+    assert_ne!(want, vec![0xeeu8; 64]);
+}
+
+/// Ruling: a buffer's synthetic global address keeps the host pointer's
+/// low 8 bits (and the run uses that address).
+#[test]
+fn global_addresses_keep_host_pointer_low_bits() {
+    let mut s = scenarios::aliased_views();
+    s.inputs.host_addrs.insert("mem".into(), 0x7f00_1234_5678_9a44);
+    s.inputs.host_addrs.insert("out".into(), 0x7f00_0000_0000_0010);
+    let plan = sched::plan_global_addresses(&s.module, &s.inputs).unwrap();
+    assert_eq!(plan["mem"] & 0xff, 0x44);
+    assert_eq!(plan["x"], plan["mem"]);
+    assert_eq!(plan["out"] & 0xff, 0x10);
+    let o = run(&s);
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![12, 13, 104, 105]);
+    assert_eq!(u32s(&o, "mem"), vec![10, 11, 12, 13, 104, 105]);
+}
+
+/// Ruling: physical special registers read 0.
+#[test]
+fn physical_special_registers_read_zero() {
+    let o = run(&scenarios::physical_sregs());
+    completed(&o);
+    assert_eq!(o.outputs.buffers["out"].0, vec![0u8; 15 * 8]);
+}
+
+/// Ruling: an out-of-cluster multicast mask is a BadAddress error.
+#[test]
+fn multicast_mask_outside_cluster_is_an_error() {
+    let o = run(&scenarios::multicast_outside_cluster());
+    match &o.status {
+        RunStatus::Error(e) => assert_eq!(e.kind, ExecErrorKind::BadAddress, "{e:?}"),
+        other => panic!("expected BadAddress, got {other:?}"),
+    }
+}
+
+/// W9: `.ignore_oob` counts above 15 are rejected; an explicit
+/// `.shared::cta` mbarrier operand naming another CTA is an error.
+#[test]
+fn ignore_oob_count_range_is_checked() {
+    let mut s = scenarios::bulk_masked_copy();
+    let k = &mut s.module.kernels[0];
+    let id = numsim_core::program::ConstId(k.consts.len() as u32);
+    k.consts.push(numsim_core::program::Const { ty: numsim_core::dtype::Ty::U32, bits: 16 });
+    for ins in &mut k.code {
+        if let numsim_core::program::Instr::BulkCopy(a) = ins {
+            if let Some(io) = &mut a.ignore_oob {
+                io.ignore_bytes_left = Some(numsim_core::program::Operand::Const(id));
+            }
+        }
+    }
+    let o = run(&s);
+    match &o.status {
+        RunStatus::Error(e) => assert!(e.message.contains("0..=15"), "{e:?}"),
+        other => panic!("expected an ignore_oob range error, got {other:?}"),
     }
 }

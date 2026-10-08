@@ -11,8 +11,10 @@
 //!   signed; `Min/Max` ordered by signedness.
 //! * f32/f64: host IEEE round-to-nearest operators and std math methods
 //!   (`.exp() .ln() .log2()`, `rsqrt = 1/sqrt`, `Round` = C `roundf`,
-//!   ties away). f32 `Min/Max` = `cuda_f32_min/max` (NaN-ignoring, -0 < +0);
-//!   f64 `Min/Max` = Rust `f64::min/max` (legacy).
+//!   ties away). `Min/Max` = `cuda_f32_min/max` / `cuda_f64_min/max`
+//!   (NaN-ignoring, -0 < +0: device `min.f32/.f64`, which is also what the
+//!   legacy tile reductions used; legacy scalar TIR f64 used Rust
+//!   `f64::min/max`, whose signed-zero result is unspecified).
 //! * f16/bf16: legacy carried them as f32: decode, compute in f32, round
 //!   back with the legacy codec (RNE; for `+ - * /` and `sqrt` this equals the
 //!   correctly rounded result since f32 has > 2p+2 bits). `Fma` is a single
@@ -201,8 +203,8 @@ fn f64_binary(op: BinOp, a: f64, b: f64) -> Option<f64> {
         BinOp::Sub => a - b,
         BinOp::Mul => a * b,
         BinOp::Div => a / b,
-        BinOp::Min => a.min(b),
-        BinOp::Max => a.max(b),
+        BinOp::Min => sc::cuda_f64_min(a, b),
+        BinOp::Max => sc::cuda_f64_max(a, b),
         BinOp::Pow => a.powf(b),
         BinOp::Atan2 => a.atan2(b),
         BinOp::Copysign => a.copysign(b),

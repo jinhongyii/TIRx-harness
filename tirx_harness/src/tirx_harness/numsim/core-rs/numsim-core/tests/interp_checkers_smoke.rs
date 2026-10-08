@@ -62,6 +62,16 @@ fn checkers_on_special_scenarios() {
                 assert_eq!(o.status, RunStatus::Completed);
                 assert_eq!(sync.verdict, numsim_core::report::Verdict::Error);
             }
+            // sm_107f exclusive TMEM limit: racecheck clean; synccheck's
+            // model does not know the arch yet (W2-18), so it is not
+            // asserted here.
+            "tcgen_exclusive_576_sm107" => {
+                assert_eq!(o.status, RunStatus::Completed);
+                let _ = &sync;
+            }
+            // Buffer-form TMEM accesses (warp actor, tcgen proxy): racecheck
+            // reports a same-lane write/read conflict (W2-19, W5 to rule).
+            "implicit_tmem" => assert_eq!(o.status, RunStatus::Completed),
             // M11: history overflow under a history-consuming observer.
             "word_history_overflow" => assert!(matches!(o.status, RunStatus::Incomplete { .. }), "{:?}", o.status),
             _ => {}

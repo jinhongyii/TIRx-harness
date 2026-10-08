@@ -45,6 +45,8 @@ pub struct Pending {
     pub ord: u16,
     pub res: u32,
     pub kind: PendingKind,
+    /// Commit FIFO (dense issuing warp): lands after that warp's earlier commits.
+    pub fifo: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -122,6 +124,10 @@ pub struct LocalCmd {
     /// Reference-run `tcgen05.alloc` bases per protocol command: the run
     /// fixed them, and the program's data flow may depend on them.
     pub ref_allocs: Option<Vec<Option<u64>>>,
+    /// Landing gate: completions `(issuing local command, ordinal)` that
+    /// happen-before this command in the reference run (through a commit
+    /// FIFO), so they must have landed before it issues.
+    pub landing_gate: Box<[(u32, u16)]>,
 }
 
 /// Reference generations of a command: per protocol command, per issued target.
@@ -141,6 +147,11 @@ pub struct Ts<'p> {
     initial_res: Vec<Res>,
     /// Commands per local resource (persistent-transition rule).
     resource_cmds: Vec<Vec<usize>>,
+    /// Global command -> local command.
+    global_local: HashMap<usize, usize>,
+    /// Local commands whose completions some landing gate names by ordinal
+    /// (their pendings are not interchangeable).
+    landing_gated: Vec<bool>,
 }
 
 enum Tried {
@@ -219,6 +230,7 @@ impl<'p> Ts<'p> {
                 gate: Box::new([]),
                 ref_gens: None,
                 ref_allocs: None,
+                landing_gate: Box::new([]),
             });
         }
         let programs = warps
@@ -260,7 +272,8 @@ impl<'p> Ts<'p> {
                     .map_err(|e| format!("initial {cmd:?} on {:?} failed: {e:?}", program.resources[r]))?;
             }
         }
-        let mut ts = Ts { program, key: spec.key, warps, programs, resources, cmds, initial_res, resource_cmds };
+        let landing_gated = vec![false; cmds.len()];
+        let mut ts = Ts { program, key: spec.key, warps, programs, resources, cmds, initial_res, resource_cmds, global_local, landing_gated };
         if let Some(reference) = reference {
             for c in &mut ts.cmds {
                 let g = c.global;
@@ -298,6 +311,19 @@ impl<'p> Ts<'p> {
                 }
             }
             self.cmds[c].gate = gate.into_boxed_slice();
+            let mut landing = Vec::new();
+            for (&(g, o), clock) in &reference.landings {
+                if let Some(&i) = self.global_local.get(&g) {
+                    if i != c && clock.leq(&initial) {
+                        landing.push((i as u32, o));
+                    }
+                }
+            }
+            landing.sort_unstable();
+            for &(i, _) in &landing {
+                self.landing_gated[i as usize] = true;
+            }
+            self.cmds[c].landing_gate = landing.into_boxed_slice();
             let g = self.cmds[c].global;
             self.cmds[c].ref_gens = Some((reference.gens[g].clone(), reference.issued_gens[g].clone()));
         }
@@ -331,6 +357,14 @@ impl<'p> Ts<'p> {
 
     fn gate_open(&self, s: &State, c: usize) -> bool {
         self.cmds[c].gate.iter().all(|&(w, n)| s.cursors[w as usize] >= n)
+            && self.cmds[c].landing_gate.iter().all(|&(i, o)| self.landed(s, i as usize, o))
+    }
+
+    /// Completion `(i, o)` was issued and has landed.
+    fn landed(&self, s: &State, i: usize, o: u16) -> bool {
+        let lc = &self.cmds[i];
+        let issued = lc.participants.iter().zip(&lc.positions).all(|(&w, &pos)| s.cursors[w] as usize > pos);
+        issued && !s.pending.iter().any(|p| (p.cmd as usize, p.ord) == (i, o))
     }
 
     fn issue_ready(&self, s: &State, c: usize) -> bool {
@@ -471,19 +505,21 @@ impl<'p> Ts<'p> {
         }
         let mut pending = next.pending.to_vec();
         let mut ord = 0u16;
+        let issuer = &self.program.commands[lc.global];
+        let fifo = issuer.commit.then(|| issuer.participants[0] as u32);
         for (i, &(r, bytes, arrivals)) in lc.issued.iter().enumerate() {
             let gens = issued_gens.entry(r).or_default();
             let mut take = || if gens.is_empty() { None } else { Some(gens.remove(0)) };
             if bytes > 0 {
                 let Some(gen) = take() else { return Tried::Error(self.internal(c, "issued target without token")) };
                 fx.issued_gens[i] = Some(gen);
-                pending.push(Pending { cmd: c as u32, ord, res: r as u32, kind: PendingKind::Tx { gen, bytes } });
+                pending.push(Pending { cmd: c as u32, ord, res: r as u32, kind: PendingKind::Tx { gen, bytes }, fifo: None });
                 ord += 1;
             }
             if arrivals > 0 {
                 let Some(gen) = take() else { return Tried::Error(self.internal(c, "issued target without token")) };
                 fx.issued_gens[i] = Some(gen);
-                pending.push(Pending { cmd: c as u32, ord, res: r as u32, kind: PendingKind::Arrive { gen, count: arrivals, after: arrive_on } });
+                pending.push(Pending { cmd: c as u32, ord, res: r as u32, kind: PendingKind::Arrive { gen, count: arrivals, after: arrive_on }, fifo });
                 ord += 1;
             }
         }
@@ -566,7 +602,36 @@ impl<'p> Ts<'p> {
         Tried::Next(next, fx)
     }
 
+    /// Symmetry reduction (V2C-31): enabled pendings of one command that
+    /// differ only in their ordinal (per-lane `cp.async.mbarrier.arrive`,
+    /// multicast transactions) are interchangeable once both are enabled -
+    /// their async-group condition only becomes more true, and no landing
+    /// gate names their ordinals - so only the lowest one is offered.
+    /// Landing any of them reaches the same state up to that renaming.
+    fn has_enabled_twin_below(&self, s: &State, p: &Pending) -> bool {
+        if self.landing_gated[p.cmd as usize] {
+            return false;
+        }
+        let same_kind = |a: PendingKind, b: PendingKind| match (a, b) {
+            (PendingKind::Tx { gen: g1, bytes: b1 }, PendingKind::Tx { gen: g2, bytes: b2 }) => (g1, b1) == (g2, b2),
+            (PendingKind::Arrive { gen: g1, count: c1, .. }, PendingKind::Arrive { gen: g2, count: c2, .. }) => (g1, c1) == (g2, c2),
+            _ => false,
+        };
+        s.pending.iter().any(|q| {
+            q.cmd == p.cmd
+                && q.ord < p.ord
+                && q.res == p.res
+                && q.fifo == p.fifo
+                && same_kind(q.kind, p.kind)
+                && self.pending_enabled(s, q)
+        })
+    }
+
     fn pending_enabled(&self, s: &State, p: &Pending) -> bool {
+        // tcgen05.commit arrivals of one warp land in issue order.
+        if p.fifo.is_some() && s.pending.iter().any(|q| q.fifo == p.fifo && (q.cmd, q.ord) < (p.cmd, p.ord)) {
+            return false;
+        }
         match p.kind {
             PendingKind::Arrive { after: Some((g, ordinal)), .. } => {
                 !backend::async_group_pending(&s.res[g as usize], ordinal)
@@ -654,7 +719,7 @@ impl<'p> Ts<'p> {
             }
         }
         for p in s.pending.iter() {
-            if self.pending_enabled(s, p) {
+            if self.pending_enabled(s, p) && !self.has_enabled_twin_below(s, p) {
                 out.push(Transition::Complete(p.cmd, p.ord));
             }
         }
@@ -823,8 +888,8 @@ impl Ts<'_> {
                 let p = s.pending.iter().find(|p| (p.cmd, p.ord) == (c, o))?;
                 let class = match p.kind {
                     PendingKind::Tx { .. } => backend::Class::Contributor(0),
-                    PendingKind::Arrive { count, after: None, .. } => backend::Class::Contributor(count),
-                    _ => backend::Class::Other,
+                    // A gated deferred arrival is still only a contributor once enabled.
+                    PendingKind::Arrive { count, .. } => backend::Class::Contributor(count),
                 };
                 Some((p.res as usize, class, Vec::new()))
             }

@@ -200,6 +200,7 @@ impl Partition {
             v.push(c.ctx.tmem);
             for w in &c.warps {
                 v.extend(w.local);
+                v.extend(w.regbuf);
                 if let Some(&ra) = self.aux.reg_allocs.get(w.id.0 as usize) {
                     if ra.0 != u32::MAX {
                         v.push(ra);
@@ -592,6 +593,41 @@ impl Partition {
                 rmw = true;
             }
         }
+        // `.ignore_oob` dead bytes: zero, then invalid (legacy validity
+        // `false`); they are part of the copy's write footprint.
+        if let Some(m) = meta.as_ref().filter(|m| !m.dead.is_empty()) {
+            for &(a, sp) in &m.dead {
+                let v = support::whole(arena, a);
+                arena.fill(v, &[sp], 0).map_err(|e| src_err(e.to_string()))?;
+                arena.invalidate(v, &[sp]).map_err(|e| src_err(e.to_string()))?;
+                writes.push((a, sp));
+            }
+        }
+        // Sub-byte TMA store fragments, after the byte spans (W4-11).
+        let mut frag_writes: Vec<(AllocId, ByteSpan)> = Vec::new();
+        if let Some(m) = meta.as_ref().filter(|m| !m.bit_frags.is_empty()) {
+            for f in &m.bit_frags {
+                let sspan = ByteSpan::new(f.smem.1, 1);
+                let gspan = ByteSpan::new(f.global.1, 1);
+                let mut sb = [0u8; 1];
+                let mut gb = [0u8; 1];
+                arena.read(support::whole(arena, f.smem.0), &[sspan], &mut sb).map_err(|e| src_err(e.to_string()))?;
+                arena.read(support::whole(arena, f.global.0), &[gspan], &mut gb).map_err(|e| src_err(e.to_string()))?;
+                let mask = f.mask << f.tgt_shift;
+                let g = (gb[0] & !mask) | (((sb[0] >> f.src_shift) & f.mask) << f.tgt_shift);
+                arena.write(support::whole(arena, f.global.0), &[gspan], &[g]).map_err(|e| src_err(e.to_string()))?;
+                reads.push((f.smem.0, sspan));
+                frag_writes.push((f.global.0, gspan));
+            }
+        }
+        // ZeroAndReport: an async op that reads uninitialized bytes is
+        // reported like a synchronous read (legacy reports it at the async
+        // read; the bytes' invalidity still propagates to the destination).
+        if arena.policy() == crate::arena::ValidityPolicy::ZeroAndReport {
+            for &(a, s) in &reads {
+                self.report_async_uninit(env, arena, op.id, op.source.site, lane, a, s);
+            }
+        }
         if env.observing {
             let site = op.source.site;
             let mk = |side, kind| AccessSpec {
@@ -651,6 +687,11 @@ impl Partition {
                     support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, sp, &mut acc);
                 }
             }
+            if !frag_writes.is_empty() {
+                // One 1-byte global read-modify-write per fragment.
+                acc.items = frag_writes.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
+                support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, mk(Side::Write, AccessKind::Rmw), &mut acc);
+            }
             for c in &op.signals {
                 if let Completion::MbarTx { res, gen, .. } | Completion::MbarArrive { res, gen, .. } = *c {
                     self.events.sync(&SyncEvent {
@@ -682,6 +723,27 @@ impl Partition {
         let due = self.aux.groups.landed(op.id, open);
         self.sync.completions.extend(due);
         Ok(())
+    }
+}
+
+impl Partition {
+    /// One `UninitRead` finding per maximal invalid range of `span` of
+    /// `alloc` read by async op `op` (deduplicated like synchronous reads).
+    fn report_async_uninit(&mut self, env: &Env<'_>, arena: &Arena, op: crate::sync::AsyncId, site: SiteId, lane: u8, alloc: AllocId, span: ByteSpan) {
+        let v = support::whole(arena, alloc);
+        let mut pos = span.start;
+        while pos < span.end() {
+            let Some(first) = arena.first_invalid(v, ByteSpan::new(pos, span.end() - pos)) else { break };
+            let end = arena.first_valid(v, ByteSpan::new(first, span.end() - first)).unwrap_or(span.end());
+            let bad = ByteSpan::new(first, end - first);
+            if self.aux.uninit_seen.insert((site, alloc, bad)) {
+                let a = arena.get(alloc);
+                let actor = Actor::Async { op, side: Side::Read };
+                let l = if lane == ALL_LANES { 0 } else { lane as usize };
+                self.aux.diagnostics.push(support::uninit_finding(env.kernel, site, Some(actor), a.space, alloc, &a.name, bad, l));
+            }
+            pos = end;
+        }
     }
 }
 

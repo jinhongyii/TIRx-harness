@@ -46,6 +46,8 @@ pub trait TransitionSystem {
 pub struct Limits {
     pub max_states: usize,
     pub max_transitions: usize,
+    /// Wall-clock deadline, checked every 256 states (review V2C-31).
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Default for Limits {
@@ -55,6 +57,7 @@ impl Default for Limits {
         Self {
             max_states: 1_000_000,
             max_transitions: 10_000_000,
+            deadline: None,
         }
     }
 }
@@ -94,6 +97,8 @@ pub enum Termination {
     FirstFailure,
     StateLimit(usize),
     TransitionLimit(usize),
+    /// The wall-clock deadline passed.
+    WallTime,
 }
 
 #[derive(Clone, Debug)]
@@ -192,7 +197,13 @@ pub fn explore<M: TransitionSystem>(
     };
     let mut complete = HashSet::<Arc<M::State>>::new();
 
+    let mut popped = 0u64;
     'search: while let Some(id) = stack.pop() {
+        popped += 1;
+        if popped % 256 == 0 && limits.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            result.termination = Termination::WallTime;
+            break;
+        }
         let state = Arc::clone(&nodes[id].state);
         if options.sleep_sets
             && !visited
@@ -467,9 +478,9 @@ mod tests {
     #[test]
     fn limits_stop_the_search() {
         let model = Actors { n: 12, overwrite: false };
-        let result = explore(&model, Limits { max_states: 100, max_transitions: usize::MAX }, Options::NONE);
+        let result = explore(&model, Limits { max_states: 100, max_transitions: usize::MAX, deadline: None }, Options::NONE);
         assert_eq!(result.termination, Termination::StateLimit(100));
-        let result = explore(&model, Limits { max_states: usize::MAX, max_transitions: 50 }, Options::NONE);
+        let result = explore(&model, Limits { max_states: usize::MAX, max_transitions: 50, deadline: None }, Options::NONE);
         assert_eq!(result.termination, Termination::TransitionLimit(50));
     }
 

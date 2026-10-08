@@ -144,6 +144,8 @@ pub struct WarpState {
     pub steps: u64,
     /// Local-memory allocation (lane-major), if any.
     pub local: Option<AllocId>,
+    /// Register-buffer allocation (lane-major, `Space::Reg`), if any.
+    pub regbuf: Option<AllocId>,
     /// Logical clock for `SpecialReg::Clock*`.
     pub clock: u64,
     /// Arms of divergent `If`s suspended at a blocking instruction while
@@ -222,6 +224,7 @@ impl WarpState {
             sync_seq: 0,
             steps: 0,
             local: None,
+            regbuf: None,
             clock: 0,
             suspended: Vec::new(),
         }
@@ -323,6 +326,9 @@ pub enum BufBinding {
     SharedWindow { offset: u32, len: u64 },
     /// Per-lane local array in the warp's local allocation.
     Local { offset: u64, per_lane: u64 },
+    /// Per-lane register-space array (`Space::Reg` buffer) in the warp's
+    /// register-buffer allocation (byte-backed, starts uninitialized).
+    Reg { offset: u64, per_lane: u64 },
     /// Tensor-memory view (`Space::Tmem` buffer, BufferDecl TMEM rule):
     /// 32-bit element `e` at TMEM lane `(e / cols) % 128`, column
     /// `base_col + e % cols`.
@@ -389,6 +395,9 @@ pub struct Loaded {
     /// Bytes of local memory per lane (lane stride of the warp's local
     /// allocation); `BufBinding::Local::offset` is relative to a lane's base.
     pub local_per_lane: u64,
+    /// Bytes of register-space buffers per lane (lane stride of the warp's
+    /// register-buffer allocation).
+    pub reg_per_lane: u64,
     /// The program contains cluster-barrier instructions (lane exits are
     /// then reported to the cluster barrier).
     pub uses_cluster_barrier: bool,
@@ -472,12 +481,23 @@ impl Loaded {
         }
         // Keep every lane's base 16-byte aligned.
         let local_per_lane = local_per_lane.div_ceil(16) * 16;
+        let mut reg_per_lane = 0u64;
+        for b in &program.buffers {
+            if b.space == crate::arena::Space::Reg && b.view_of.is_none() {
+                let len = b.byte_len.as_ref().and_then(|e| e.eval(&|_| None)).unwrap_or(0).max(0) as u64;
+                let align = (b.align as u64).max(1);
+                reg_per_lane = reg_per_lane.div_ceil(align) * align + len;
+            }
+        }
+        let reg_per_lane = reg_per_lane.div_ceil(16) * 16;
         let has = |f: fn(&Instr) -> bool| program.code.iter().any(f);
         Loaded {
             progress: program.code.iter().map(|i| i.is_progress()).collect(),
             uses_cluster_barrier: has(|i| matches!(i, Instr::ClusterArrive { .. } | Instr::ClusterWait { .. })),
             uses_setmaxnreg: has(|i| matches!(i, Instr::SetMaxNReg { .. })),
-            uses_tmem: has(|i| {
+            uses_tmem: program.requirements.implicit_tmem
+                || program.buffers.iter().any(|b| b.space == crate::arena::Space::Tmem)
+                || has(|i| {
                 matches!(
                     i,
                     Instr::TcgenAlloc { .. }
@@ -503,6 +523,7 @@ impl Loaded {
             param_offsets,
             param_bytes: off.div_ceil(8) * 8,
             local_per_lane,
+            reg_per_lane,
         }
     }
 }

@@ -51,11 +51,15 @@ fn f32_f64_arith_is_host_ieee() {
         assert_eq!(bin(BinOp::Div, Ty::F32, f(a), f(b)).unwrap(), f(a / b));
     }
     assert_eq!(bin(BinOp::Add, Ty::F64, d(0.1), d(0.2)).unwrap(), d(0.1 + 0.2));
-    // f32 min/max: cuda (NaN-ignoring, -0 < +0); f64: Rust min/max.
+    // f32/f64 min/max: cuda (NaN-ignoring, -0 < +0), as legacy tile reductions.
     assert_eq!(bin(BinOp::Min, Ty::F32, f(f32::NAN), f(2.0)).unwrap(), f(2.0));
     assert_eq!(bin(BinOp::Max, Ty::F32, f(-0.0), f(0.0)).unwrap(), f(0.0));
     assert_eq!(bin(BinOp::Min, Ty::F32, f(0.0), f(-0.0)).unwrap(), f(-0.0));
     assert_eq!(bin(BinOp::Max, Ty::F64, d(f64::NAN), d(-3.0)).unwrap(), d(-3.0));
+    assert_eq!(bin(BinOp::Min, Ty::F64, d(-0.0), d(0.0)).unwrap(), d(-0.0));
+    assert_eq!(bin(BinOp::Min, Ty::F64, d(0.0), d(-0.0)).unwrap(), d(-0.0));
+    assert_eq!(bin(BinOp::Max, Ty::F64, d(-0.0), d(0.0)).unwrap(), d(0.0));
+    assert_eq!(bin(BinOp::Max, Ty::F64, d(0.0), d(-0.0)).unwrap(), d(0.0));
     assert_eq!(bin(BinOp::Copysign, Ty::F32, f(2.0), f(-0.0)).unwrap(), f(-2.0));
     assert_eq!(kind(bin(BinOp::FloorMod, Ty::F32, f(1.0), f(2.0))), OpErrorKind::Unsupported);
     assert_eq!(kind(bin(BinOp::And, Ty::F32, f(1.0), f(2.0))), OpErrorKind::Unsupported);

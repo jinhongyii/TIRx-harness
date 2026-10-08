@@ -268,3 +268,63 @@ fn tcgen_commit_forwards_issuer_publication() {
     assert!(clean(&commit_publication(true)));
     assert!(has_class(&commit_publication(false), RaceClass::WriteRead));
 }
+
+/// `tcgen05.commit...sync_restrict::shared::read::mma::a` (contract shape of
+/// CONTRACT_REQUESTS W5-10): the mma's shared-A read is its own async op `ma`
+/// (preds `[]`), the restricted commit tracks only `ma`, and the mma itself
+/// stays tracked by the next unrestricted commit. Waiting on the restricted
+/// commit orders A's read, never B's (legacy `MmaSharedARead`).
+fn restricted_commit(reuse_b: bool, shape_ok: bool) -> Report {
+    const A: std::ops::Range<u64> = 512..1024;
+    const B: std::ops::Range<u64> = 1024..1536;
+    let mut k = K::one_warp();
+    let mma = k.issue(0, 0, AsyncKind::TcgenPipelined, Proxy::Tcgen, &[], &[(SMEM, 512..1536), (TMEM, 0..4096)]);
+    let ma = if shape_ok {
+        let ma = k.issue(0, 0, AsyncKind::TcgenPipelined, Proxy::Tcgen, &[], &[(SMEM, A)]);
+        k.aacc(ma, Milestone::Read, AccessKind::Read, Proxy::Async, SMEM, A);
+        k.aacc(mma, Milestone::Read, AccessKind::Read, Proxy::Async, SMEM, B);
+        ma
+    } else {
+        // Today's engine shape: one op reads A and B, the restricted commit
+        // tracks the whole mma (cannot tell A from B).
+        k.aacc(mma, Milestone::Read, AccessKind::Read, Proxy::Async, SMEM, A.start..B.end);
+        mma
+    };
+    k.aacc(mma, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, 0..64);
+    let c = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[ma], &[]);
+    k.done_phase(c, Milestone::Write, 1, 0).wait(0, 1, 1, 0, true);
+    k.fence(0, 1, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+    k.st(0, 0, SMEM, if reuse_b { B.start..B.start + 2 } else { A.start..A.start + 2 });
+    let tracked: Vec<AsyncId> = if shape_ok { vec![mma] } else { vec![] };
+    let c = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &tracked, &[]);
+    k.done_phase(c, Milestone::Write, 0, 0).wait(0, 1, 0, 0, true);
+    k.run()
+}
+
+#[test]
+fn restricted_commit_publishes_only_shared_a_read() {
+    assert!(clean(&restricted_commit(false, true)));
+    assert!(has_race(&restricted_commit(true, true)));
+    // Today's shape over-publishes: the false negative is in the events,
+    // not the checker (W5-10).
+    assert!(!has_race(&restricted_commit(true, false)));
+}
+
+/// V2C-5: a tcgen05.ld never followed by `tcgen05.wait::ld` (kernels that
+/// wait only on one subtile) is not `AsyncNeverCompleted`: its TMEM read was
+/// delivered at issue. It stays unordered: a later TMEM write races.
+#[test]
+fn unwaited_tcgen_ld_is_not_incomplete() {
+    let mut k = K::one_warp();
+    let ld = k.issue(0, 0, AsyncKind::TcgenLd, Proxy::Tcgen, &[], &[]);
+    k.aacc(ld, Milestone::Read, AccessKind::Read, Proxy::Tcgen, TMEM, 0..64);
+    let r = k.run();
+    assert!(r.incomplete.is_empty() && r.findings.is_empty(), "{r:?}");
+    let mut k = K::one_warp();
+    let ld = k.issue(0, 0, AsyncKind::TcgenLd, Proxy::Tcgen, &[], &[]);
+    k.aacc(ld, Milestone::Read, AccessKind::Read, Proxy::Tcgen, TMEM, 0..64);
+    let st = k.issue(0, 0, AsyncKind::TcgenSt, Proxy::Tcgen, &[], &[]);
+    k.aacc(st, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, 0..64);
+    let r = k.run();
+    assert!(!r.findings.is_empty(), "{r:?}");
+}

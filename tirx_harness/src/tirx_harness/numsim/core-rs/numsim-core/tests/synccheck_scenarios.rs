@@ -818,3 +818,84 @@ fn truncated_launch_is_incomplete_not_deadlock() {
     assert_eq!(r.verdict, Verdict::Error);
     assert_eq!(serialize(&r)["execution_error"]["kind"], "deadlock");
 }
+
+// ---- round-2 conformance (V2C-4 / V2C-28 / V2C-31) ----
+
+/// V2C-31: the wall-clock budget cuts the search (checked every 256 states)
+/// and reports `incomplete` with resource `wall_time`.
+#[test]
+fn wall_time_limit_is_incomplete() {
+    let log = pipeline(6, 2, 8, 0);
+    let cfg = SynccheckConfig {
+        mode: ProjectionMode::Whole,
+        certificates: false,
+        explore: Options::NONE,
+        limits: numsim_core::synccheck::EchoLimits { max_wall_time_ms: 0, ..Default::default() },
+        ..config(cta(6))
+    };
+    let r = check(&log, &cfg);
+    assert_eq!(r.verdict, Verdict::Incomplete, "{:#}", serialize(&r));
+    let p = payload(&r, Status::Incomplete);
+    assert_eq!(p["reason"], "resource_limit");
+    assert_eq!(p["resource"], "wall_time");
+}
+
+/// V2C-31: 32 per-lane `cp.async.mbarrier.arrive.noinc` arrivals of one
+/// instruction are interchangeable; landing them in every order is 2^32
+/// states, the symmetry reduction keeps it linear.
+#[test]
+fn per_lane_cp_async_arrivals_stay_small() {
+    let waiters = 8u32;
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(32));
+    cta_sync(&mut log, 0, &(0..=waiters).collect::<Vec<_>>(), waiters + 1);
+    let groups = (0..32u8).map(|l| async_group_res(0, l, async_group::Domain::CpAsync)).collect::<Vec<_>>();
+    log.cmds(0, 2, groups.iter().map(|&g| (g, group(async_group::Cmd::Issue))).collect());
+    let targets = (0..32).map(|_| AsyncTarget { res: mbar(0, 0), bytes: 0, arrivals: 1 }).collect();
+    log.event(0, 3, groups.iter().map(|&g| (g, group(async_group::Cmd::ArriveOn))).collect(), targets, None, None, numsim_core::observe::ProtocolStatus::Committed);
+    for w in 1..=waiters {
+        log.cmd(w, 4, mbar(0, 0), wait(0));
+    }
+    let cfg = SynccheckConfig { certificates: false, state_budget: 20_000, ..config(cta(waiters + 1)) };
+    let r = check(&log.build(), &cfg);
+    assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+    assert!(stat(&r, "visited_state_count") < 5_000, "{:?}", r.coverage);
+}
+
+/// V2C-4: an engine may list only the recording warp in each record of a
+/// collective (cta_group::2 tcgen05 pairs); the members are the union.
+#[test]
+fn collective_members_are_the_union_of_records() {
+    use numsim_core::observe::{Collective, ProtocolStatus, WarpId};
+    let mut log = LogBuilder::new();
+    // The collective's commands execute once, for all members.
+    log.cmd(0, 1, mbar(0, 0), init(1));
+    cta_sync(&mut log, 0, &[0, 1, 2], 3);
+    for w in [0u32, 1] {
+        let c = Collective { id: 9, participants: vec![WarpId(w)] };
+        log.event(w, 2, vec![(mbar(0, 0), arrive(1))], Vec::new(), None, Some(c), ProtocolStatus::Committed);
+    }
+    log.cmd(2, 3, mbar(0, 0), wait(0));
+    run_all(&log.build(), cta(3), Verdict::Clean);
+}
+
+/// V2C-28: tcgen05.commit arrivals of one warp land in issue order. After
+/// the wait on the later commit's barrier, the earlier commit's barrier has
+/// completed in every schedule, so the successful test is not
+/// schedule-dependent (no `generation_assignment_differs`).
+#[test]
+fn tcgen_commits_land_in_issue_order() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(1));
+    log.cmd(0, 1, mbar(0, 8), init(1));
+    cta_sync(&mut log, 0, &[0, 1], 2);
+    log.cmd(0, 2, tcgen_work(0, 0), work(tcgen::WorkCmd::Issue));
+    log.issue(0, 3, mbar(0, 0), 0, 1, vec![(tcgen_work(0, 0), work(tcgen::WorkCmd::Commit))]);
+    log.cmd(0, 4, tcgen_work(0, 0), work(tcgen::WorkCmd::Issue));
+    log.issue(0, 5, mbar(0, 8), 0, 1, vec![(tcgen_work(0, 0), work(tcgen::WorkCmd::Commit))]);
+    log.cmd(1, 6, mbar(0, 8), wait(0));
+    log.test_ok(1, 7, mbar(0, 0), 0);
+    let cfg = SynccheckConfig { certificates: false, ..config(cta(2)) };
+    let r = check(&log.build(), &cfg);
+    assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+}

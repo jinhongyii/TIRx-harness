@@ -39,6 +39,24 @@ pub struct AsyncMeta {
     /// is performed in the generic proxy as a strong release write at this
     /// scope (CONTRACT_REQUESTS W5-8).
     pub strong: Option<crate::program::Scope>,
+    /// Sub-byte TMA stores (FP4/U6 maps, oplib `TmaPlan::global_bits`):
+    /// masked partial-byte writes applied after the byte spans.
+    pub bit_frags: Vec<BitFrag>,
+    /// `cp.async.bulk .ignore_oob` dead destination bytes: written as zero
+    /// and left *uninitialized* (legacy `raw_bulk_copy_g2s_cta_ignore_oob`
+    /// writes `0` with validity `false`), so a later read reports.
+    pub dead: Vec<(AllocId, ByteSpan)>,
+}
+
+/// One masked partial-byte global write of a sub-byte TMA store:
+/// `g = (g & !(mask << tgt)) | (((s >> src) & mask) << tgt)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitFrag {
+    pub global: (AllocId, u64),
+    pub smem: (AllocId, u64),
+    pub src_shift: u8,
+    pub tgt_shift: u8,
+    pub mask: u8,
 }
 
 /// Per-lane async-group membership of in-flight async ops.
@@ -328,6 +346,10 @@ pub struct LaunchAux {
     pub warp_sync: HashMap<WarpId, (WarpMask, u64)>,
     /// Warps whose every lane exited.
     pub exited_warps: u32,
+    /// Tensor maps modified by `tensormap.replace` and not yet published by
+    /// a `fence.proxy.tensormap::generic.release` of the modifying warp,
+    /// keyed by (allocation, offset) -> modifying warp.
+    pub tmap_dirty: HashMap<(AllocId, u64), WarpId>,
     /// Lane-varying `mbarrier.wait` targets that already completed while
     /// another target of the same instruction blocks, per (warp, pc):
     /// (target, command, lanes, observed generation). Those lanes left the

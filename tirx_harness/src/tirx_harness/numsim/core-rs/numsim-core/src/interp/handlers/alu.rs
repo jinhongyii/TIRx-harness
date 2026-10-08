@@ -97,12 +97,15 @@ fn special(ctx: &ExecCtx<'_>, sreg: SpecialReg, lane: usize) -> u64 {
         SpecialReg::LaneMaskGe => lane_mask(|i, l| i >= l),
         SpecialReg::ActiveMask => ctx.warp.active.bits() as u64,
         // Deterministic representatives.
-        SpecialReg::SmId => ctx.cta.id.0 as u64 % NUM_SMS,
+        // Physical SM id, hardware clocks and grid-launch tokens read a
+        // deterministic representative zero (SUPPORTED_OPS.md `mov_sreg`,
+        // legacy behaviour).
+        SpecialReg::SmId => 0,
         SpecialReg::NSmId => NUM_SMS,
-        SpecialReg::GridId => ctx.aux.kernel as u64,
-        SpecialReg::Clock => ctx.warp.steps & 0xffff_ffff,
-        SpecialReg::Clock64 => ctx.warp.steps,
-        SpecialReg::GlobalTimer => ctx.warp.steps * 32,
+        SpecialReg::GridId => 0,
+        SpecialReg::Clock => 0,
+        SpecialReg::Clock64 => 0,
+        SpecialReg::GlobalTimer => 0,
         SpecialReg::DynamicSmemSize => {
             (sh.smem_bytes.saturating_sub(ctx.program.topology.static_smem_bytes)) as u64
         }

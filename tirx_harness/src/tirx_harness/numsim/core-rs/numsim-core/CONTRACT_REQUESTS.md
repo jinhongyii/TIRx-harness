@@ -1651,3 +1651,72 @@ a racecheck **false negative** in `test_tcgen05_restricted_commit` (racecheck);
 Ruling needed (coordinator, `arena::addr`): legacy kept the host pointer's
 low 8 bits in global VAs and exposed device-validated aperture bits through
 `mapa`/`cvta`; two tests assert them.
+
+## W4-12 (2026-10-08): W8 triage, oplib items (atomics, reductions, U6, ignore_oob)
+
+Changes to W2-owned files (call-site patches, review please):
+- `interp/handlers/mem.rs::atom`: `.add.f32` without `.noftz` flushes
+  subnormals only when the target is **not** shared memory (legacy
+  `atomic_f32(.., space)`: global/generic-to-global flush, shared keeps
+  denormals). Clears the width-1 numeric cases of
+  `test_atomic_f32_noftz`.
+- `.ignore_oob` dead bytes (`interp/aux.rs` `AsyncMeta.dead`,
+  `interp/handlers/async_copy.rs::bulk_copy`, `sched/partition.rs`): the
+  ignored left/right edges (inside the `.cp_mask`, if any) are written as
+  zero and then invalidated, as legacy `raw_bulk_copy_g2s_cta_ignore_oob`
+  does (bytes `0`, validity `false`). They are part of the async write
+  footprint. A later read reports `uninitialized_read` (verdict review).
+  `testutil::scenarios::bulk_masked_expected` and
+  `interp_scenarios::bulk_copy_mask_and_ignore_oob_narrow_bytes_and_footprint`
+  are updated to match.
+
+oplib: TIR `Min/Max` on f64 is now `cuda_f64_min/max` (NaN-ignoring,
+`-0 < +0`, the same as device `min.f64` and the legacy tile reductions).
+Before, it was Rust `f64::min/max`, which returned `+0` for `min(-0, +0)`.
+
+Not oplib (Decision 6, for the coordinator): v2 lowers `tirx.tile.*` through
+TVM dispatch. The emitted code reduces warp collectives with a `shfl.bfly`
+tree, and the `3input_maxmin` dispatch has no identity seed, so the result
+for all-NaN input is the canonical NaN. Legacy emitted its own sequential,
+identity-seeded reductions instead. `test_warp_collective_reduction_follows_physical_lane_ownership`,
+`test_local_collective_uses_lexicographic_order` and
+`test_maxmin_uses_canonical_lexicographic_nan_and_signed_zero_order` pin the
+legacy-frontend semantics, and the v2 results are what the dispatched code
+computes on hardware. These are expectation deltas, not oplib bugs.
+
+## W5-10 (for W2, 2026-10-08): restricted commit and tcgen smem operand proxy
+
+Found with `test_tcgen05_restricted_commit` (a racecheck false negative) and
+V2C-5.
+
+1. **`tcgen05.commit…sync_restrict::shared::read::mma::a`.** This commit
+   completes when the shared-memory **A** operand reads of the tracked MMAs
+   are done. It does not wait for the B reads or the D writes. Today
+   `tcgen_commit` ignores `sync_restrict`: `preds` and the arrival cover the
+   whole MMA, and the MMA is dropped from `tcgen_uncommitted`. As a result:
+   - the B overwrite in the test is not reported;
+   - the next unrestricted commit tracks nothing. In the trace, the commit at
+     barrier offset 64 has `preds: []`.
+
+   Requested shape (legacy `TcgenPipelineOperation::MmaSharedARead`):
+   - Issue the MMA's shared-A read as its own async op `ma`, with
+     `class: TcgenPipelined`, `preds: []` (never the MMA itself), and only the
+     A spans as its `Read` accesses. The MMA op keeps the B reads and the D
+     read/write.
+   - A restricted commit's `preds` = the uncommitted `ma` ops. Keep the MMA
+     ops in `tcgen_uncommitted` for the next unrestricted commit, which tracks
+     the MMA and `ma`.
+
+   The checker test `racecheck_tcgen::restricted_commit_publishes_only_shared_a_read`
+   pins this shape. No racecheck change is needed once the events have this
+   shape.
+2. **smem operand reads of `tcgen05.mma` / `tcgen05.cp` use `Proxy::Async`.**
+   They are emitted as `Proxy::Tcgen` today, for example op 780 in the
+   restricted-commit trace, which reads `alloc7 [512, 5120)`. The tensor core
+   reads shared memory through the async proxy (PTX ISA, tcgen05 memory consistency model). With the
+   wrong proxy, a generic overwrite after the wait loses the
+   `fence.proxy.async` requirement. Legacy reports that case as
+   `missing_proxy_bridge`. TMEM accesses stay `Proxy::Tcgen`.
+3. **Done, no action:** `tcgen_commit` now tracks all in-flight tcgen ops, so
+   the commit `preds` gap found on `nvfp4_gemm` is fixed. The checker's
+   transitive closure (delta T7) stays as a guard.

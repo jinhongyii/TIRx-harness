@@ -15,7 +15,7 @@ use super::certificate::CertError;
 use super::explore::{Failure, SearchResult, Termination};
 use super::kinds;
 use super::program::{PhaseAFailure, Program};
-use super::reference::{whole_spec, ReferenceRun, RunOutcome};
+use super::reference::{ReferenceRun, RunOutcome};
 use super::ts::{Deadlock, ErrKind, Transition, Ts, TsError};
 use super::SynccheckConfig;
 use crate::observe::Actor;
@@ -302,7 +302,7 @@ impl<'c> Builder<'c> {
     }
 
     pub fn reference_failure(&mut self, program: &Program, init: &crate::sync::ResourceInit, reference: &ReferenceRun) {
-        let ts = Ts::new(program, &whole_spec(program), init, None).expect("reference built the same system");
+        let ts = Ts::new(program, &reference.spec, init, None).expect("reference built the same system");
         match &reference.outcome {
             RunOutcome::Error(e) => {
                 let (last, prefix) = reference.schedule.split_last().map_or((None, &[][..]), |(l, p)| (Some(*l), p));
@@ -436,6 +436,18 @@ impl<'c> Builder<'c> {
                     "witnesses_evidence": rendered.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
                 });
                 self.push(FindingKind::NonConfluent, Status::Error, message, evidence, payload);
+                true
+            }
+            Termination::WallTime => {
+                // The elapsed time is in `coverage.resource_usage.wall_time_ms`.
+                let limit = self.config.limits.max_wall_time_ms;
+                self.incomplete(
+                    FindingKind::BudgetExhausted,
+                    "native fixed synchronization verification exceeded its wall_time resource limit".into(),
+                    Vec::new(),
+                    json!({"reason": "resource_limit", "resource": "wall_time", "operation": first_op,
+                           "limit": {"kind": "milliseconds", "value": limit}}),
+                );
                 true
             }
             Termination::FirstFailure => {

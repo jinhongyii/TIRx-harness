@@ -26,7 +26,7 @@ fn u32_buf(v: impl IntoIterator<Item = u32>) -> ArgValue {
 }
 
 fn inputs(args: Vec<(&str, ArgValue)>) -> Inputs {
-    Inputs { args: args.into_iter().map(|(k, v)| (k.to_string(), v)).collect() }
+    Inputs { args: args.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), ..Default::default() }
 }
 
 /// `i = ctaid * ntid + tid`.

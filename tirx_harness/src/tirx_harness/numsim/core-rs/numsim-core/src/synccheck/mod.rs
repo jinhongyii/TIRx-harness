@@ -237,10 +237,16 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
         );
         return out.finish(started);
     }
-    let reference = match reference::run(&program, &init) {
+    let deadline = (config.limits.max_wall_time_ms != u64::MAX)
+        .then(|| started + std::time::Duration::from_millis(config.limits.max_wall_time_ms));
+    let reference = match reference::run(&program, &init, deadline) {
         Ok(r) => r,
-        Err(detail) => {
+        Err(reference::RunError::Build(detail)) => {
             out.program_build(detail);
+            return out.finish(started);
+        }
+        Err(reference::RunError::WallTime) => {
+            out.wall_time_limit(started);
             return out.finish(started);
         }
     };
@@ -255,6 +261,7 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
     let limits = explore::Limits {
         max_states: usize::try_from(config.state_budget).unwrap_or(usize::MAX),
         max_transitions: usize::try_from(config.transition_budget).unwrap_or(usize::MAX),
+        deadline,
     };
     let mut clean_fingerprints = HashSet::<String>::new();
     for spec in projection::project(&program, config.mode) {

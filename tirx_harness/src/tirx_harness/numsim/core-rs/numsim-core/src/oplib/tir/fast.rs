@@ -252,8 +252,8 @@ pub(super) fn binary(op: BinOp, ty: Ty, a: &[W], b: &[W], out: &mut [W], mask: W
             BinOp::Sub => map2::<f64>(a, b, out, mask, |x, y| x - y),
             BinOp::Mul => map2::<f64>(a, b, out, mask, |x, y| x * y),
             BinOp::Div => map2::<f64>(a, b, out, mask, |x, y| x / y),
-            BinOp::Min => map2::<f64>(a, b, out, mask, f64::min),
-            BinOp::Max => map2::<f64>(a, b, out, mask, f64::max),
+            BinOp::Min => map2::<f64>(a, b, out, mask, sc::cuda_f64_min),
+            BinOp::Max => map2::<f64>(a, b, out, mask, sc::cuda_f64_max),
             _ => return None,
         },
         Dtype::F16 | Dtype::BF16 => match op {

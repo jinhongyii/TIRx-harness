@@ -297,7 +297,7 @@ pub fn tcgen_commit(
             }
         }
         let targets_res: Vec<ResourceId> = match multicast {
-            Some(m) => ranks_of(ctx, lane_val(ctx, m, l) & width_mask).into_iter().filter_map(|r| mbar_in_rank(ctx, res, r)).collect(),
+            Some(m) => ranks_of(ctx, lane_val(ctx, m, l) & width_mask)?.into_iter().filter_map(|r| mbar_in_rank(ctx, res, r)).collect(),
             None => vec![res],
         };
         let mut signals = Vec::new();

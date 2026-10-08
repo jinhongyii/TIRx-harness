@@ -24,6 +24,7 @@ fn w1_vector_add_json_runs() {
         ]
         .into_iter()
         .collect(),
+        ..Default::default()
     };
     for seed in [0, 3] {
         let mut obs = RecordingObserver::new();

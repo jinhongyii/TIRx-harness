@@ -35,7 +35,7 @@ pub fn uninit_buf(n: usize) -> ArgValue {
 }
 
 pub fn inputs(args: Vec<(&str, ArgValue)>) -> Inputs {
-    Inputs { args: args.into_iter().map(|(k, v)| (k.to_string(), v)).collect() }
+    Inputs { args: args.into_iter().map(|(k, v)| (k.to_string(), v)).collect(), ..Default::default() }
 }
 
 fn scenario(name: &'static str, module: Module, inputs: Inputs) -> Scenario {
@@ -1492,7 +1492,16 @@ pub fn bulk_masked_copy() -> Scenario {
 
 /// Expected `out` of [`bulk_masked_copy`].
 pub fn bulk_masked_expected() -> Vec<u8> {
-    (0..64usize).map(|i| if i % 16 < 8 && (4..56).contains(&i) { i as u8 + 1 } else { 0xee }).collect()
+    // Masked-in bytes: copied inside the `.ignore_oob` window, zero (and
+    // uninitialized, as legacy) on its ignored edges; masked-off bytes keep
+    // the prefill.
+    (0..64usize)
+        .map(|i| match (i % 16 < 8, (4..56).contains(&i)) {
+            (true, true) => i as u8 + 1,
+            (true, false) => 0,
+            (false, _) => 0xee,
+        })
+        .collect()
 }
 
 /// `ctas` CTAs each bulk-reduce (`cp.reduce.async.bulk .add.u32`, bulk
@@ -2533,10 +2542,355 @@ pub fn hint_ops(valid: bool) -> Scenario {
     scenario(if valid { "hint_ops" } else { "hint_ops_bad_addr" }, b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
 }
 
+/// `tcgen05.alloc.exclusive` of 576 columns, then dealloc: legal on
+/// sm_107f (PTX Table 58), an `InvalidColumns` error on sm_100a.
+pub fn tcgen_exclusive_576(arch: &str) -> Scenario {
+    let mut b = ProgramBuilder::new("tcgen_exclusive_576", 32);
+    let out = b.global("out", Dtype::U32);
+    let slot = b.shared("taddr", Dtype::U32, 1);
+    let sa = b.reg(Ty::U32);
+    let t = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k576 = b.k_u32(576);
+    b.smem_addr(sa, slot, k0);
+    b.site("alloc_exclusive_576", 1);
+    b.push(Instr::TcgenAlloc { dst: sa.into(), ncols: k576, cta_group: 1, exclusive: true });
+    b.no_site();
+    b.bar_sync(0);
+    b.ld_u32(t, slot, k0);
+    b.push(Instr::TcgenDealloc { taddr: t.into(), ncols: k576, cta_group: 1, exclusive: true });
+    b.push(Instr::TcgenRelinquish { cta_group: 1 });
+    b.st_u32(out, lane, t);
+    b.exit();
+    let mut prog = b.build();
+    prog.arch = Some(arch.to_string());
+    let name = if arch.starts_with("sm_107") { "tcgen_exclusive_576_sm107" } else { "tcgen_exclusive_576_sm100" };
+    scenario(name, Module::new(vec![prog]), inputs(vec![("out", u32_buf([9; 32]))]))
+}
+
+/// V2C-19/20: a per-lane register-space array (`Space::Reg` buffer) of 4
+/// words; each lane writes elements 0 and 1 and reads element 2, which was
+/// never written: one `UninitRead` in `space: register`, read as zero.
+pub fn reg_buffer_uninit() -> Scenario {
+    let mut b = ProgramBuilder::new("reg_buffer_uninit", 32);
+    let out = b.global("out", Dtype::U32);
+    let rb = b.per_lane("acc", crate::arena::Space::Reg, Dtype::U32, 4);
+    let lane = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k2 = b.k_u32(2);
+    b.st_u32(rb, k0, lane);
+    b.st_u32(rb, k1, lane);
+    b.site("reg_uninit_ld", 1);
+    b.ld_u32(v, rb, k2);
+    b.no_site();
+    b.ld_u32(lane, rb, k1);
+    b.add_u32(v, v, lane);
+    b.st_u32(out, lane, v);
+    b.exit();
+    scenario("reg_buffer_uninit", b.build_module(), inputs(vec![("out", u32_buf([9; 32]))]))
+}
+
+/// W1 ruling (`mapa.shared::cluster.u64`): in a 2-CTA cluster, CTA 1 lane 0
+/// maps CTA 0's mbarrier with `mapa.shared::cluster` and arrives on it
+/// through the u64 value, once as a `SharedCluster` operand and once as a
+/// `Generic` one (a rank-tagged 32-bit window address zero-extended); CTA 0
+/// (count 2) waits for the phase both arrivals complete.
+pub fn mapa_cluster_arrive() -> Scenario {
+    let mut b = ProgramBuilder::new("mapa_cluster_arrive", 32);
+    b.grid(2, 1, 1);
+    b.cluster(2, 1, 1);
+    let out = b.global("out", Dtype::U32);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let lane = b.reg(Ty::U32);
+    let rank = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let q = b.reg(Ty::PRED);
+    let m = b.reg(Ty::U32);
+    let rem = b.reg(Ty::U64);
+    let cta = b.reg(Ty::U32);
+    b.lane_id(lane);
+    b.read_special(rank, SpecialReg::ClusterCtaRank);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    b.smem_addr(m, bar, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.mbar_init(m, 2);
+    b.end_if();
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    b.push(Instr::ClusterArrive { sem: Sem::Release, aligned: true });
+    b.push(Instr::ClusterWait { acquire: true, aligned: true });
+    b.compare(CmpOp::Eq, Ty::U32, q, rank, k1);
+    b.if_(p);
+    b.if_(q);
+    b.site("mapa", 1);
+    b.push(Instr::Mapa { dst: rem, src: m.into(), rank: k0, space: AddrSpace::SharedCluster });
+    for (i, space) in [AddrSpace::SharedCluster, AddrSpace::Generic].into_iter().enumerate() {
+        b.site(if i == 0 { "arrive_cluster" } else { "arrive_generic" }, 2 + i as u32);
+        b.push(Instr::MbarArrive(MbarArriveArgs {
+            mbar: rem.into(),
+            space,
+            count: None,
+            expect_tx: None,
+            drop: false,
+            no_complete: false,
+            sem: Sem::Release,
+            scope: Scope::Cluster,
+            multicast: None,
+            state: None,
+        }));
+    }
+    b.no_site();
+    b.else_();
+    b.push(Instr::MbarWait { mbar: m.into(), space: AddrSpace::Shared, phase: PhaseArg::Parity(k0), sem: Sem::Acquire, scope: Scope::Cluster });
+    b.end_if();
+    b.st_u32(out, cta, k1);
+    b.end_if();
+    // Keep CTA 0's barrier alive until CTA 1 is done with it.
+    b.push(Instr::ClusterArrive { sem: Sem::Release, aligned: true });
+    b.push(Instr::ClusterWait { acquire: true, aligned: true });
+    b.exit();
+    scenario("mapa_cluster_arrive", b.build_module(), inputs(vec![("out", u32_buf([0, 0]))]))
+}
+
+/// V2C-24: a TMEM view (`Space::Tmem` buffer, 4 columns) used without any
+/// `tcgen05.alloc` under `Requirements::implicit_tmem`: lane l stores
+/// `l * 10 + j` to its row's columns j and reads them back.
+pub fn implicit_tmem() -> Scenario {
+    let mut b = ProgramBuilder::new("implicit_tmem", 32);
+    let out = b.global("out", Dtype::U32);
+    let tm = b.per_lane("acc_tmem", crate::arena::Space::Tmem, Dtype::U32, 128 * 4);
+    let lane = b.reg(Ty::U32);
+    let idx = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k4 = b.k_u32(4);
+    let k10 = b.k_u32(10);
+    for j in 0..4u32 {
+        let kj = b.k_u32(j);
+        b.mul(Ty::U32, idx, lane, k4);
+        b.add_u32(idx, idx, kj);
+        b.mul(Ty::U32, v, lane, k10);
+        b.add_u32(v, v, kj);
+        b.st_u32(tm, idx, v);
+    }
+    // TMEM stores are tcgen-proxy writes: order them before the loads.
+    b.push(Instr::TcgenWait { st: true });
+    for j in 0..4u32 {
+        let kj = b.k_u32(j);
+        b.mul(Ty::U32, idx, lane, k4);
+        b.add_u32(idx, idx, kj);
+        b.ld_u32(v, tm, idx);
+        b.st_u32(out, idx, v);
+    }
+    b.exit();
+    let mut prog = b.build();
+    {
+        let d = prog.buffers.iter_mut().find(|d| d.name == "acc_tmem").expect("tmem buffer");
+        d.shape = vec![DimExpr::Const(128), DimExpr::Const(4)];
+    }
+    prog.requirements.implicit_tmem = true;
+    scenario("implicit_tmem", Module::new(vec![prog]), inputs(vec![("out", u32_buf(vec![0; 128]))]))
+}
+
+/// Packed-FP4 TMA store tensor map of [`fp4_tma_store`] (dst `dst`: 40 x 2
+/// E2M1 elements, 32-byte rows; box 32 x 2 at column 32, so columns 40..64
+/// are out of bounds).
+pub fn fp4_store_desc() -> crate::oplib::TensorMapDesc {
+    crate::oplib::TensorMapDesc {
+        global_address: 0,
+        rank: 2,
+        elem: Some(Dtype::E2M1),
+        global_dim: [40, 2, 1, 1, 1],
+        global_stride: [32, 0, 0, 0, 0],
+        box_dim: [32, 2, 1, 1, 1],
+        element_stride: [1; 5],
+        ..Default::default()
+    }
+}
+
+/// W4-11: a packed FP4 TMA store, partly out of bounds, whose plan carries
+/// masked sub-byte fragments: shared byte i = 0x10 * (i % 16) + i / 2 + 1,
+/// `dst` pre-filled with 0xEE (bytes outside the written nibbles keep it).
+pub fn fp4_tma_store() -> Scenario {
+    let mut b = ProgramBuilder::new("fp4_tma_store", 32);
+    let _dst = b.global("dst", Dtype::U8);
+    let tile = b.shared("tile", Dtype::U8, 64);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    let w = b.reg(Ty::U8);
+    let sa = b.reg(Ty::U32);
+    let tmap = b.reg(Ty::U64);
+    let idx = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k2 = b.k_u32(2);
+    let k15 = b.k_u32(15);
+    let k16 = b.k_u32(16);
+    let k32 = b.k_u32(32);
+    let k1 = b.k_u32(1);
+    for half in [k0, k32] {
+        b.add_u32(idx, lane, half);
+        b.binary(BinOp::And, Ty::U32, v, idx, k15);
+        b.mul(Ty::U32, v, v, k16);
+        let t = b.reg(Ty::U32);
+        b.binary(BinOp::Div, Ty::U32, t, idx, k2);
+        b.add_u32(v, v, t);
+        b.add_u32(v, v, k1);
+        b.cast(Ty::U32, Ty::U8, w, v);
+        b.st(Ty::U8, tile, idx, w);
+    }
+    b.smem_addr(sa, tile, k0);
+    let tmap_pc = b.push(Instr::Nop);
+    b.fence(FenceKind::ProxyAsync(Some(AddrSpace::Shared)), Sem::Weak, Scope::Cta);
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::WarpSync { membermask: full });
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    let kc = b.k_i32(32);
+    let kr = b.k_i32(0);
+    b.site("fp4_tma_store", 1);
+    b.push(Instr::Tma(Box::new(TmaArgs {
+        dir: TmaDir::Store,
+        mode: TmaMode::Tile,
+        tmap: tmap.into(),
+        tmap_space: AddrSpace::Generic,
+        coords: vec![kc, kr],
+        im2col_offsets: vec![],
+        smem: sa.into(),
+        smem_space: AddrSpace::Shared,
+        completion: BulkCompletion::Group,
+        multicast: None,
+        cta_group: 0,
+        overrides: vec![],
+        report: None,
+        mods: MemMods::default(),
+    })));
+    b.push(Instr::AsyncCommit { domain: Domain::Bulk });
+    b.push(Instr::AsyncWait { domain: Domain::Bulk, n: 0, read: false });
+    b.no_site();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    let pid = ParamId(prog.host_abi.len() as u32);
+    let buf = Buf(prog.buffers.len() as u32);
+    prog.buffers.push(BufferDecl {
+        name: "tmap".into(),
+        space: crate::arena::Space::Param,
+        dtype: Ty::U8,
+        shape: vec![DimExpr::Const(128)],
+        strides: vec![],
+        param_slot: Some(pid),
+        base: 0,
+        byte_len: Some(DimExpr::Const(128)),
+        align: 64,
+        view_of: None,
+        sync_words: false,
+        base_reg: None,
+    });
+    prog.host_abi.push(ParamSlot {
+        name: "tmap".into(),
+        local_name: "tmap".into(),
+        aliases: vec![],
+        kind: ParamKind::TensorMap,
+        dtype: None,
+        shape: vec![],
+        tensor_map: None,
+        implicit_base: None,
+        buf: Some(buf),
+    });
+    let kz = match k0 {
+        Operand::Const(c) => c,
+        _ => unreachable!(),
+    };
+    prog.code[tmap_pc.0 as usize] = Instr::AddrOf { dst: tmap, buf, offset: Operand::Const(kz) };
+    prog.validate().expect("valid");
+    scenario(
+        "fp4_tma_store",
+        Module::new(vec![prog]),
+        inputs(vec![
+            ("dst", ArgValue::Buffer { bytes: vec![0xee; 64], valid: None }),
+            ("tmap", ArgValue::TensorMapOf { base: "dst".into(), offset: 0, desc: fp4_store_desc() }),
+        ]),
+    )
+}
+
+/// Ruling: `%smid`, `%clock`, `%clock64`, `%globaltimer`, `%gridid` read
+/// the representative 0 (legacy `mov_sreg`); `%nsmid` keeps its value.
+pub fn physical_sregs() -> Scenario {
+    let mut b = ProgramBuilder::new("physical_sregs", 32);
+    b.grid(3, 1, 1);
+    let out = b.global("out", Dtype::U64);
+    let cta = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let idx = b.reg(Ty::U32);
+    let v = b.reg(Ty::U64);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k5 = b.k_u32(5);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    for (i, r) in [SpecialReg::SmId, SpecialReg::Clock, SpecialReg::Clock64, SpecialReg::GlobalTimer, SpecialReg::GridId].into_iter().enumerate() {
+        let ki = b.k_u32(i as u32);
+        b.read_special(v, r);
+        b.mul(Ty::U32, idx, cta, k5);
+        b.add_u32(idx, idx, ki);
+        b.st(Ty::U64, out, idx, v);
+    }
+    b.end_if();
+    b.exit();
+    scenario("physical_sregs", b.build_module(), inputs(vec![("out", ArgValue::Buffer { bytes: vec![0xab; 15 * 8], valid: None })]))
+}
+
+/// Ruling: a multicast CTA mask naming a rank outside the cluster is an
+/// error (BadAddress), not incomplete: a 1-CTA cluster arrives with
+/// multicast mask 0b10.
+pub fn multicast_outside_cluster() -> Scenario {
+    let mut b = ProgramBuilder::new("multicast_outside_cluster", 32);
+    b.cluster(1, 1, 1);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let m = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k2 = b.k_u32(2);
+    b.smem_addr(m, bar, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.mbar_init(m, 1);
+    b.site("multicast_arrive", 1);
+    b.push(Instr::MbarArrive(MbarArriveArgs {
+        mbar: m.into(),
+        space: AddrSpace::SharedCluster,
+        count: None,
+        expect_tx: None,
+        drop: false,
+        no_complete: false,
+        sem: Sem::Release,
+        scope: Scope::Cluster,
+        multicast: Some(k2),
+        state: None,
+    }));
+    b.no_site();
+    b.end_if();
+    b.exit();
+    scenario("multicast_outside_cluster", b.build_module(), Inputs::default())
+}
+
 /// Scenarios that are deliberately racy or only meaningful with a specific
 /// configuration (each test states its expectation): not in [`all`].
 pub fn special() -> Vec<Scenario> {
-    vec![mbar_latch(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE)]
+    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE)]
 }
 
 /// Writes in [`word_history_overflow`] past `MAX_WORD_HISTORY`.
@@ -2593,5 +2947,11 @@ pub fn all() -> Vec<Scenario> {
         hint_ops(true),
         hint_ops(false),
         tcgen_cp_ld_with(true),
+        tcgen_exclusive_576("sm_100a"),
+        reg_buffer_uninit(),
+        mapa_cluster_arrive(),
+        fp4_tma_store(),
+        physical_sregs(),
+        multicast_outside_cluster(),
     ]
 }

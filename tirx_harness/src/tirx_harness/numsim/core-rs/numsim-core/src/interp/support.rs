@@ -277,16 +277,16 @@ pub fn resolve(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, len: u6
             Ok(Loc { alloc, offset, window: Some(Window::Global), remote: None })
         }
         AddrSpace::Shared => {
-            let (rank, off) = addr::decode_shared(a as u32);
-            if rank != ctx.cta.rank_in_cluster || a >> 32 != 0 {
-                return Err(err(
-                    ctx,
-                    ExecErrorKind::BadAddress,
-                    lanes,
-                    format!("shared::cta address {a:#x} names CTA rank {rank}, not the executing CTA (rank {})", ctx.cta.rank_in_cluster),
-                ));
+            if a >> 32 != 0 {
+                return Err(err(ctx, ExecErrorKind::BadAddress, lanes, format!("shared::cta address {a:#x} exceeds 32 bits")));
             }
-            shared_loc(ctx, rank, off, len, lane, Window::SharedCta)
+            // Every shared::cta address is a valid shared::cluster address:
+            // a value whose rank tag names another CTA of the cluster (a
+            // `mapa` result or cluster arithmetic reaching a shared::cta
+            // operand) is decoded as that shared::cluster location (V2C-30).
+            let (rank, off) = addr::decode_shared(a as u32);
+            let w = if rank == ctx.cta.rank_in_cluster { Window::SharedCta } else { Window::SharedCluster };
+            shared_loc(ctx, rank, off, len, lane, w)
         }
         AddrSpace::SharedCluster => {
             let (rank, off) = addr::decode_shared(a as u32);
@@ -302,6 +302,15 @@ pub fn resolve(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, len: u6
                 }
                 addr::Generic::Local(off) => resolve(ctx, AddrSpace::Local, off as u64, lane, len),
                 addr::Generic::Param(off) => resolve(ctx, AddrSpace::Param, off as u64, lane, len),
+                // A 32-bit shared::cluster window address (`rank << 24 |
+                // offset`, e.g. a `mapa.shared::cluster` result) zero-extended
+                // into a u64 and used where a generic pointer is expected:
+                // decoded as that shared::cluster location (W1 ruling).
+                addr::Generic::Unmapped(va) if va >> 32 == 0 => {
+                    let (rank, off) = addr::decode_shared(va as u32);
+                    let w = if rank == ctx.cta.rank_in_cluster { Window::SharedCta } else { Window::SharedCluster };
+                    shared_loc(ctx, rank, off, len, lane, w)
+                }
                 addr::Generic::Unmapped(va) => Err(arena_err(ctx, ArenaError::BadAddress { space: Space::Global, addr: va }, lanes)),
             }
         }
@@ -392,6 +401,16 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
             let off = lane as u64 * ctx.loaded.local_per_lane + offset + byte.unwrap() as u64;
             Ok(Loc { alloc, offset: off, window: None, remote: None })
         }
+        BufBinding::Reg { offset, per_lane } => {
+            let Some(alloc) = ctx.warp.regbuf else {
+                return Err(err(ctx, ExecErrorKind::Internal, lanes, "register buffer without its allocation"));
+            };
+            if !in_range(per_lane) {
+                return Err(oob(ctx, alloc, per_lane));
+            }
+            let off = lane as u64 * ctx.loaded.reg_per_lane + offset + byte.unwrap() as u64;
+            Ok(Loc { alloc, offset: off, window: None, remote: None })
+        }
         BufBinding::Tmem { base_col, cols, base_reg } => {
             let (base_lane, base_col) = match base_reg {
                 Some(r) => {
@@ -420,7 +439,14 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
                 )));
             }
             if !tmem_live(ctx, col as u32, ncols as u32) {
-                return Err(unsupported(ctx, &format!("{}[{idx}]: tmem column {col} is not in a live allocation", decl.name)));
+                // A TMEM access outside every live tcgen05 allocation is a
+                // kernel bug (allocation state is tracked exactly).
+                return Err(err(
+                    ctx,
+                    ExecErrorKind::BadAddress,
+                    lanes,
+                    format!("{}[{idx}]: tmem column {col} is not in a live tcgen05 allocation", decl.name),
+                ));
             }
             let off = addr::tmem_byte_offset(tl, col as u32);
             bounds(ctx, ctx.cta.tmem, off, len, lane)?;
@@ -436,7 +462,13 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
 }
 
 /// Columns `[col, col+n)` lie in a live tcgen05 allocation of this CTA.
+///
+/// With `Requirements::implicit_tmem` (TMEM views without any
+/// `tcgen05.alloc`, legacy semantics) the kernel owns the whole TMEM.
 pub fn tmem_live(ctx: &ExecCtx<'_>, col: u32, n: u32) -> bool {
+    if ctx.program.requirements.implicit_tmem {
+        return col.checked_add(n).is_some_and(|e| e <= addr::TMEM_COLS);
+    }
     let rank = ctx.cta.rank_in_cluster;
     let id = crate::sync::ResourceId::TcgenLifecycle { cluster: ctx.cta.cluster, pair_rank: (rank >> 1) as u8 };
     match ctx.sync.get(id) {
@@ -466,6 +498,7 @@ pub fn buf_generic_addr(ctx: &ExecCtx<'_>, buf: Buf, byte: i64) -> Result<u64, E
         }
         BufBinding::Local { offset, .. } => addr::GENERIC_LOCAL_BASE.wrapping_add(offset).wrapping_add(b),
         BufBinding::Tmem { .. } => return Err(unsupported(ctx, "address of a tensor-memory buffer")),
+        BufBinding::Reg { .. } => return Err(unsupported(ctx, "address of a register-space buffer")),
         BufBinding::Unbound => {
             let name = &ctx.program.buffers[buf.0 as usize].name;
             return Err(ctx.error(ExecErrorKind::BadAddress, format!("buffer {name} is not bound")));

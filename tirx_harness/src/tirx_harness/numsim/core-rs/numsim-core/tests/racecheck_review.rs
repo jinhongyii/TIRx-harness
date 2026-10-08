@@ -381,3 +381,46 @@ fn alias_stale_read_ignores_unnamed_buffers() {
     k.site_buffers = vec![(SiteId(1), String::new()), (SiteId(2), "A_shared".into())];
     assert!(!has_advisory(&k.run(), AdvisoryKind::AliasStaleRead));
 }
+
+/// V2C-34: TMEM findings carry explicit `tmem_lanes` / `tmem_columns`
+/// (`[lo, hi)`, union over occurrences); `Evidence.bytes` stays the
+/// taddr-encoded span (byte = (lane * 512 + column) * 4), whose hull spans
+/// whole rows and cannot be projected to columns.
+#[test]
+fn v2c34_tmem_lane_column_attrs() {
+    let col = |lane: u64, c: u64| (lane * 512 + c) * 4;
+    let mut k = K::new(2, 1, 1);
+    // Two unordered warps each write columns 10..12 of rows 3 and 5.
+    for w in 0..2 {
+        k.inst(w, &[3, 5], PLAIN_ST, |l| (TMEM, col(u64::from(l), 10)..col(u64::from(l), 12)));
+    }
+    let rep = report(&k.observe());
+    let race = rep.findings.iter().find(|f| f.kind == CK::DataRace).expect("tmem race");
+    assert_eq!(race.attrs["tmem_lanes"], serde_json::json!([3, 6]));
+    assert_eq!(race.attrs["tmem_columns"], serde_json::json!([10, 12]));
+    // Non-TMEM findings carry no tmem keys.
+    let mut k = K::new(2, 1, 1);
+    k.st(0, 0, SMEM, 0..4).st(1, 0, SMEM, 0..4);
+    let rep = report(&k.observe());
+    let race = rep.findings.iter().find(|f| f.kind == CK::DataRace).expect("smem race");
+    assert!(!race.attrs.contains_key("tmem_lanes"));
+}
+
+/// V2C-18: one alias advisory per reader site carries every occurrence's
+/// merged span in `overlaps` (legacy `merge_alias_spans`), not the first.
+#[test]
+fn alias_stale_read_overlaps_every_occurrence() {
+    use numsim_core::site::SiteId;
+    let mut k = K::one_warp();
+    // epoch 1: B writes lanes 0..4 at 4-byte strides; epoch 2: A reads.
+    let lanes: Vec<u8> = (0..4).collect();
+    k.inst(0, &lanes, PLAIN_ST, |l| (SMEM, u64::from(l) * 8..u64::from(l) * 8 + 2));
+    k.inst(0, &lanes, PLAIN_LD, |l| (SMEM, u64::from(l) * 8..u64::from(l) * 8 + 2));
+    k.site_buffers = vec![(SiteId(1), "B_shared".into()), (SiteId(2), "A_shared".into())];
+    let p = serialize(&report(&k.observe()));
+    let a = &p["advisories"][0];
+    assert_eq!(a["kind"], "alias_stale_read");
+    assert!(a.get("overlap").is_none());
+    let o: Vec<(u64, u64)> = a["overlaps"].as_array().unwrap().iter().map(|s| (s["byte_offset"].as_u64().unwrap(), s["byte_end"].as_u64().unwrap())).collect();
+    assert_eq!(o, vec![(0, 2), (8, 10), (16, 18), (24, 26)]);
+}

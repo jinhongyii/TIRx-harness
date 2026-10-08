@@ -263,10 +263,11 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
                 race.insert("writer_buffer".into(), json!(name(writer)));
                 race.insert("allocation_id".into(), json!(f.alloc.0));
                 race.insert("space".into(), json!(lr.buffers.get(&f.alloc).map(|(_, s)| space_name(*s))));
-                race.insert(
-                    "overlaps".into(),
-                    json!([{"allocation_id": f.alloc.0, "byte_offset": f.bytes.start, "byte_len": f.bytes.end - f.bytes.start, "byte_end": f.bytes.end}]),
-                );
+                let spans: Vec<Value> = if f.spans.is_empty() { std::slice::from_ref(&f.bytes) } else { &f.spans[..] }
+                    .iter()
+                    .map(|b| json!({"allocation_id": f.alloc.0, "byte_offset": b.start, "byte_len": b.end - b.start, "byte_end": b.end}))
+                    .collect();
+                race.insert("overlaps".into(), Value::Array(spans));
             }
             race.insert("legacy_kind".into(), json!(name));
             let msg = match kind {
@@ -292,6 +293,12 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
         }
     };
     race.insert("occurrences".into(), json!(f.occurrences));
+    // V2C-34: TMEM evidence as explicit [lo, hi) lane / column ranges
+    // (Evidence.bytes stays the taddr-encoded span).
+    if let Some((l, c)) = &f.tmem {
+        race.insert("tmem_lanes".into(), json!([l.start, l.end]));
+        race.insert("tmem_columns".into(), json!([c.start, c.end]));
+    }
     if f.severity == Severity::Review {
         debug_assert_eq!(status, Status::Review);
     }
@@ -451,7 +458,8 @@ pub fn serialize(r: &Report) -> Value {
         if let Some(c) = f.evidence.iter().find(|e| e.role == "current") {
             m.insert("current".into(), witness_json(c, d.get("current").unwrap_or(&Value::Null)));
         }
-        if let Some(o) = f.evidence.iter().find(|e| e.role == "overlap") {
+        // Legacy alias advisories carry only `overlaps` (every occurrence).
+        if let Some(o) = f.evidence.iter().find(|e| e.role == "overlap").filter(|_| legacy != "alias_stale_read") {
             m.insert("overlap".into(), span_json(o.alloc, o.bytes));
         }
         m.insert("message".into(), json!(f.message));
