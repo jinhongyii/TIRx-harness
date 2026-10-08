@@ -195,7 +195,8 @@ def test_host_prelude_truncdiv_truncates_toward_zero():
 
 
 def test_guarded_ptx_keeps_its_destination(lower_source):
-    """W2-20: a guarded pure-register PTX op leaves its destination unchanged when off."""
+    """W2-20 / W6: a guarded PTX op, operands included, runs inside `If(guard)`, so a
+    predicated-off lane neither evaluates its operands nor changes its destination."""
     program = lower_source('''
 @T.prim_func
 def k(out: T.Buffer((32,), "uint32")):
@@ -207,8 +208,11 @@ def k(out: T.Buffer((32,), "uint32")):
     T.ptx.add.u32(r, r, T.uint32(1), pred=lane < 4)
     out[lane] = r
 ''')
-    ptx = [i for i in all_of(program, "Ptx") if i.pred is not None]
-    assert ptx and all(i.keep_dst for i in ptx)
+    variants = [i.variant for i in program.code]
+    add = next(i for i, x in enumerate(program.code)
+               if x.variant == "Ptx" and program.ops[x.op].name.startswith("tirx.ptx.add"))
+    opened = max(i for i in range(add) if variants[i] == "If")
+    assert "EndIf" not in variants[opened:add]
 
 
 def test_ptx_call_sites_carry_their_source_text():
@@ -229,3 +233,22 @@ def test_site_text_reads_the_source_line_when_the_span_has_a_file():
     program = lower(packed_bf16_vector_reduction.func)
     site = next(s for s in program.sites if s.op_name.startswith("tirx.ptx.") and s.spans)
     assert "red.global.v2.bf16x2.add.noftz" in site.text
+
+
+def test_guarded_load_evaluates_its_address_only_under_the_guard(lower_source):
+    """W6: `@p ld [A + Select(p, i, size)]` must not read A[size] on off lanes."""
+    program = lower_source('''
+@T.prim_func
+def k(a: T.Buffer((32,), "float32"), out: T.Buffer((32,), "float32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    v: T.float32
+    v = T.float32(0)
+    T.ptx.ld.global_.f32(v, T.address_of(a[T.Select(lane % 2 == 0, lane, 32)]), pred=lane % 2 == 0)
+    out[lane] = v
+''')
+    variants = [i.variant for i in program.code]
+    load = next(i for i, x in enumerate(program.code) if x.variant == "Load" and program.buffers[x.buf].name == "a")
+    opened = max(i for i in range(load) if variants[i] == "If")
+    assert "EndIf" not in variants[opened:load]

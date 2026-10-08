@@ -107,6 +107,7 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         self.escaped: set[int] = set()
         self.uninit_locals: set[int] = set()
         self.tmem_views = False
+        self.tmem_runtime_views = False
         self.wide_params: set[int] = set()
 
     # ------------------------------------------------------------------ util
@@ -215,8 +216,12 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         program.topology.static_smem_bytes = static_smem
         program.topology.dyn_smem_bytes = pb.DimExpr.const(0)
         program.topology.min_blocks_per_sm = self.min_blocks_per_sm
-        if self.tmem_views and not any(i.variant == "TcgenAlloc" for i in program.code):
-            program.requirements.implicit_tmem = True   # views without tcgen05.alloc (legacy flag)
+        if self.tmem_views and not self.tmem_runtime_views \
+                and not any(i.variant == "TcgenAlloc" for i in program.code):
+            # Static-address views without tcgen05.alloc (legacy flag). A view
+            # whose address is read at run time must come from a live lease, so
+            # it never makes TMEM implicit (legacy rejects it otherwise).
+            program.requirements.implicit_tmem = True
         return program
 
     # ------------------------------------------------------------- topology

@@ -758,7 +758,12 @@ class ProgramBuilder:
             buffers = self.program.buffers
             if decl.view_of is not None:
                 ty = decl.dtype.elem.lower() + ("" if decl.dtype.lanes == 1 else f"x{decl.dtype.lanes}")
-                decl = dataclasses.replace(decl, name=f"{buffers[decl.view_of].name}+{decl.base}.{ty}")
+                name = f"{buffers[decl.view_of].name}+{decl.base}.{ty}"
+                if any(b.name == name for b in buffers):
+                    # Distinct unnamed DeclBuffers stay distinct identities
+                    # (legacy: one per view object; racecheck alias advisories).
+                    name = f"{name}#{len(buffers)}"
+                decl = dataclasses.replace(decl, name=name)
             else:
                 decl = dataclasses.replace(decl, name=f"{decl.space.lower()}{len(buffers)}")
         self.program.buffers.append(decl)

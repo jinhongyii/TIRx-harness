@@ -590,8 +590,11 @@ def lower_tma(c: PtxCtx) -> None:
     mode_token = c.mod("load_mode")
     mode = {"": "Tile", "tile": "Tile", "tile::gather4": "TileGather4", "tile::scatter4": "TileScatter4",
             "im2col": "Im2col", "im2col::w": "Im2colW", "im2col::w::128": "Im2colW128",
-            "im2col_no_offs": "Im2colNoOffs"}.get(mode_token)
-    if "no_offs_w" in name:
+            "im2col_no_offs": "Im2colNoOffs",
+            # W4-17: the wide no-offsets store/reduce plans as Im2colW (the
+            # wide layout; stores take no offsets either way).
+            "im2col_no_offs::w": "Im2colW"}.get(mode_token)
+    if mode is None and "no_offs_w" in name:
         mode = "Im2colNoOffs"
     if mode is None:
         raise _Unsupported(c.node, f"{c.d.op_name}: load mode {mode_token!r}")
@@ -896,6 +899,10 @@ def lower_tcgen05(c: PtxCtx) -> None:
         if "redval" in c.ops:
             red_regs = [d if d is not None else c.scratch(pb.Ty.from_ptx(c.mod("type"))) for d in c.dsts("redval")]
             red = [REDUX_OPS[c.mod("redop") or c.mod("rowop")], red_regs]
+        elif spcompress:
+            # W4-17: the compression's max/min selection rides in `red` with
+            # no reduction destinations (`.abs` in `red_abs`).
+            red = [REDUX_OPS[c.mod("rowop")], []]
         taddr = c.src("taddr")
         c.emit("TcgenLd", dsts=dsts, taddr=taddr, row=zero, col=zero, shape=shape, num=c.int_mod("num", "x"),
                pack=c.flag("pack"), red=red, red_abs=c.flag("abs"), red_nan=c.flag("nan"), spcompress=spcompress)
@@ -1037,10 +1044,30 @@ def lower_ptx(lw: "Lowerer", node: Any) -> None:
         handler = handler_for(decoded.table_name)
     except KeyError:
         raise _Unsupported(node, f"{decoded.op_name} is rejected (not modeled for the SM100 target)") from None
+    ctx = PtxCtx(lw, node, decoded)
+    b = lw.builder
+    if_pc = None
+    if ctx.pred is not None:
+        # The guard covers the whole instruction, operands included: a
+        # predicated-off lane evaluates no memory operand (legacy; e.g.
+        # `@p ld [A + Select(p, i, size)]` must not read A[size]). Inside the
+        # If the op runs unguarded, so its destinations keep their values off.
+        if_pc = b.emit("If", site=ctx.site(), cond=ctx.pred, else_pc=0, end_pc=0, elect=False)
+        guard, ctx.pred = ctx.pred, None
+    start = len(b.code)
     try:
-        handler(PtxCtx(lw, node, decoded))
-    except pb.UnrepresentableType as error:
+        handler(ctx)
+    except (pb.UnrepresentableType, _Unsupported) as error:
+        if if_pc is not None:
+            del b.code[if_pc:]
+            del b.code_sites[if_pc:]
+        if isinstance(error, _Unsupported):
+            raise
         raise _Unsupported(node, f"{decoded.op_name}: {error}") from error
+    if if_pc is not None:
+        end = b.emit("EndIf")
+        b.patch(if_pc, "If", cond=guard, else_pc=end, end_pc=end, elect=False)
+    del start
 
 
 __all__ = ["lower_ptx", "handler_for"]

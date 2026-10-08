@@ -2408,3 +2408,79 @@ word (`DeclareWord { span: 0..128 }`), but the verdicts name 4-byte elements. Ra
 accepts a launch-value exit inside a declared region (delta W8). Any other exit on such a
 span is still `WaitExitUnproven`, because the history numbering is per declared word.
 Request: one `DeclareWord` per element, matching the verdict spans.
+
+## W1 (2026-10-08): decode_head64 view offset, public-API triage, W6 guard rule, W5-14
+
+- **`sparse_flashmla_decode_head64`: fixed.**
+  - A view over a runtime-offset global view (`o_ptr.view("uint64")`) no
+    longer adds the parent's `elem_offset` a second time. TIR `elem_offset`
+    counts from the shared data pointer.
+  - Distinct unnamed DeclBuffers now keep distinct synthetic names
+    (`…#<index>` on a collision), so racecheck still sees the legacy
+    alias_stale_read pairs.
+  - numsim, racecheck and synccheck all pass. No conformance regressions
+    against HEAD.
+- **Public-API triage, `lowering-rejects` (6): out of scope (W9 E/delete
+  list).**
+  - 4 use direct access to replicated TMEM views, which fail closed by
+    contract item 29:
+    - `test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem`
+    - `test_tcgen_cp_cta_group2_reads_and_writes_each_cta_scale_backing`
+    - `test_tcgen_cp_cta_group2_routes_each_pair_in_four_cta_cluster`
+    - `test_mxfp4_uses_ue8m0_scales_over_32_element_vectors`
+  - 2 use `tirx.ptx_legacy`:
+    - `test_legacy_m16n8k32_int8_reuses_dense_form_and_engine`
+    - `test_legacy_ldmatrix_x1_domain_matches_independent_fragment_mapping`
+- **Public-API triage, `v2-accepts-legacy-rejection` (2): rejection
+  restored.**
+  - Lowering marked a kernel `implicit_tmem` whenever it had TMEM views and
+    no `tcgen05.alloc`. Now a view whose `allocated_addr` is a run-time
+    value (an alloc result) never makes TMEM implicit, so it needs a live
+    lease.
+  - Static-address views, including ones with a run-time layout offset, are
+    unchanged.
+  - `test_tmem_runtime_address_without_a_dynamic_lease_is_rejected` and
+    `dynamic_tmem_use_before_alloc` now raise.
+  - For W9: all 4 tmem-lease items fail only on message wording. Legacy says
+    "not covered by any live allocation"; the engine says "is not in a live
+    tcgen05 allocation". This is a pin-message port.
+- **W6 synccheck-verdict (23).**
+  - (1) A guarded PTX op is now lowered entirely inside `If(guard)`,
+    operands included (`lower_ptx`). A predicated-off lane evaluates no
+    memory operand.
+    - `register_extensions`, `logic_carriers`, `cvt_integer_sat` and
+      `scalar_f64_rounding` pass.
+    - `layout_lowering_contract::physical_buffers…` exposed a separate
+      sizing bug: the byte length of strided views now covers
+      `sum((e-1)*s)+1` elements, and ComposeLayout / `storage()`-offset
+      layouts are sized by their physical span. Synccheck is clean.
+    - That test's remaining racecheck expectation (an `alias_stale_read`
+      between a same-dtype strided alias and its root) conflicts with the
+      W5-9 identity rule: same-dtype views share the root. For W5.
+    - The layout fix also clears `test_compose_layout…` and
+      `test_local_view_exposes_raw_span…`.
+    - `raw_tcgen_mma_tf32_ts_predicated` stops on direct TMEM stores to
+      lanes outside the warp's sub-partition (`physical_lane` up to 111 from
+      warp 0). That is the TMEM ruling; legacy allowed it. Contract/delta,
+      not the guard.
+  - (2) `im2col_cache_hints` (4): these kernels contain no `st.async`. The
+    out-of-bounds read comes from `cp.async.bulk.prefetch.tensor`, lowered
+    as `Tma{dir: Prefetch}` with `smem = 0, smem_space = Shared`. The engine
+    resolves that 1-byte smem operand before the prefetch check, against a
+    kernel with 0 bytes of shared memory.
+    - W4-17 (in progress in `async_copy.rs`) skips the smem resolve for
+      prefetch. These 4 pass once that change is built. Engine-side.
+- **W5-14 (`sync_words` per element): contract needed.**
+  - `BufferDecl.sync_words` is a `bool`, and the engine emits one
+    `DeclareWord` spanning the whole buffer (sched/mod.rs 850/1013).
+    Lowering cannot express a word size.
+  - Request (pick one):
+    - (a) Contract: `BufferDecl.sync_word_bytes: u32` (0 = none). Lowering
+      fills it from the `WaitUntil` access width, and the engine emits one
+      `DeclareWord` per word.
+    - (b) No contract change: the engine splits the declared buffer into
+      `dtype.bits()/8`-byte words. Lowering already marks the polled buffer
+      itself (the view with the poll's element type), so its dtype is the
+      poll width.
+  - Lowering will add the field and a test as soon as (a) lands; (b) needs
+    nothing from W1.

@@ -287,3 +287,29 @@ def test_vector_red_packs_pieces_that_tile_the_access_type():
         return program.consts[operand.index][0] if isinstance(operand, pb.Const) else program.regs[operand.index].ty
 
     assert [ty(s) for s in pack.srcs] == [pb.Ty("BF16", 2), pb.Ty("BF16", 2)]
+
+
+def test_dtype_changing_view_over_offset_global_view_applies_the_offset_once():
+    """W2: `o.view("uint64")` of `o = decl_buffer(data=out.data, elem_offset=off)` addresses
+    root + off * 2 + index * 8 (elem_offset counts from the data pointer)."""
+    import numpy as np
+    import tvm
+    from tvm.script import tirx as T
+
+    from tirx_harness.numsim import v2
+
+    kernel = tvm.script.from_source('''
+@T.prim_func
+def k(out: T.Buffer((256,), "bfloat16"), off: T.int32):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    o = T.decl_buffer((64,), "bfloat16", data=out.data, elem_offset=off, scope="global")
+    w = T.decl_buffer((16,), "uint64", data=o.data, elem_offset=off // 4, scope="global")
+    if lane < 16:
+        w[lane] = T.uint64(0x0001000100010001) * T.Cast("uint64", lane + 1)
+''', {"T": T})
+    result = v2.Engine().run(v2.transpile(kernel), {"out": np.zeros(256, np.uint16), "off": 128})
+    out = result.outputs["out"].view(np.uint16)
+    assert np.nonzero(out)[0].tolist() == list(range(128, 192))
+    assert out[128] == 1 and out[191] == 16

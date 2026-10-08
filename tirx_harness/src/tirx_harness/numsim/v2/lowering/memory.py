@@ -226,7 +226,7 @@ class MemoryMixin:
             pb.BufferDecl(
                 name=name, space=space, dtype=elem_ty,
                 shape=tuple(pb.DimExpr.const(e) for e in static),
-                byte_len=pb.DimExpr.const((numel * dtypes.bits(info.dtype) + 7) // 8),
+                byte_len=pb.DimExpr.const((_layout_span(info.layout, numel) * dtypes.bits(info.dtype) + 7) // 8),
                 align=max(16, int(ty.data_alignment)),
             )
         )
@@ -265,8 +265,10 @@ class MemoryMixin:
             static = info.static_shape
             shape = tuple(pb.DimExpr.const(e) for e in static) if static is not None else \
                 tuple(self.dim_expr(e) for e in info.shape)
-            byte_len = pb.DimExpr.const((_numel(static) * dtypes.bits(info.dtype) + 7) // 8) \
-                if static is not None else None
+            span = _strided_span(static, info.strides) if static is not None else None
+            if span is not None and info.layout is not None:
+                span = _layout_span(info.layout, span)
+            byte_len = pb.DimExpr.const((span * dtypes.bits(info.dtype) + 7) // 8) if span is not None else None
             # `elem_offset` counts from the backing's *data pointer*, which a view
             # shares with its own view_of chain root; BufferDecl.base is relative
             # to view_of, so subtract the parent's offset within that chain.
@@ -291,9 +293,11 @@ class MemoryMixin:
         if isinstance(backing, RegArray):
             raise _Unsupported(node, "view of a register-promoted local (escape analysis gap)")
         if isinstance(backing, PtrRef):
-            extra = self.element_bytes(backing.info.dtype, self.expr(backing.elem_offset))
-            base = self.binary("Add", pb.Ty("U64"), backing.base, extra)
-            self.refs[handle(var)] = PtrRef(base=base, info=info, elem_offset=offset)
+            # `elem_offset` counts from the shared *data pointer* (the backing's
+            # base), not from the backing view's first element: adding the
+            # backing's own offset again would apply it twice (W2,
+            # sparse_flashmla_decode_head64 `o_ptr.view("uint64")`).
+            self.refs[handle(var)] = PtrRef(base=backing.base, info=info, elem_offset=offset)
             return
         base = self.as_address(self.expr(data))
         self.refs[handle(var)] = PtrRef(base=base, info=info, elem_offset=offset)
@@ -360,6 +364,11 @@ class MemoryMixin:
                 self.builder.emit("Mov", dst=base_reg, src=value)
 
             info.tmem_refresh = refresh
+            if type_key(start) != "ir.IntImm":
+                # The address itself comes from a register (an alloc result): it
+                # needs a live lease. A static address with a runtime layout
+                # offset stays implicit-TMEM eligible.
+                self.tmem_runtime_views = True
         if lane_off is not None or col_off is not None:
             info.tmem_origin = (lane_off, col_off)
         buf = self.builder.buffer(
@@ -760,6 +769,38 @@ def _tmem_spans(layout: Any) -> tuple[int, int, bool] | None:
             return None
         spans[axis] += (int(iterator.extent.value) - 1) * int(iterator.stride.value)
     return spans["TLane"] + 1, spans["TCol"] + 1, len(layout.replica) > 0
+
+
+def _layout_span(layout: Any, numel: int) -> int:
+    """Physical elements a memory layout covers (its largest ``m`` + 1): a padded,
+    swizzled or offset layout may reach past ``numel`` (ComposeLayout padding,
+    ``layout.storage()`` offsets). Non-memory or symbolic layouts keep ``numel``."""
+    if layout is None or numel <= 0 or numel > (1 << 16):
+        return numel
+    from tvm import tirx
+
+    top = numel - 1
+    try:
+        for index in range(numel):
+            mapped = {str(k): v for k, v in layout.apply(tirx.IntImm("int32", index)).items()}
+            value = mapped.get("m")
+            if set(mapped) - {"m"} or value is None or type_key(value) != "ir.IntImm":
+                return numel
+            top = max(top, int(value.value))
+    except Exception:  # noqa: BLE001 - layouts TVM cannot evaluate keep the logical size
+        return numel
+    return top + 1
+
+
+def _strided_span(static: tuple[int, ...], strides: tuple[Any, ...]) -> int | None:
+    """Elements a view covers: numel when dense, else ``sum((e - 1) * s) + 1``."""
+    if not strides:
+        return _numel(static)
+    if any(type_key(s) != "ir.IntImm" for s in strides) or len(strides) != len(static):
+        return None
+    if any(e == 0 for e in static):
+        return 0
+    return sum((e - 1) * int(s.value) for e, s in zip(static, strides)) + 1
 
 
 def _numel(shape: tuple[int, ...] | None) -> int:
