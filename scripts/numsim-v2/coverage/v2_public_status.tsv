@@ -3,14 +3,14 @@ tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_combine
 tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_shl_u32_clamp_is_bit_exact	engine-stops	engine-stops=1
 tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_gdn_lg2_approx_ftz_flushes_subnormal_input	engine-stops	engine-stops=1
 tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_fma_scale_sub_f32x2_computes_both_packed_lanes	engine-stops	engine-stops=1
-tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_modified_gdn_lg2_helper_remains_fail_closed	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
-tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_modified_known_helper_remains_fail_closed	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
-tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_modified_packed_fma_helper_remains_fail_closed	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
+tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_modified_gdn_lg2_helper_remains_fail_closed	pass	pass=1
+tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_modified_known_helper_remains_fail_closed	pass	pass=1
+tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_modified_packed_fma_helper_remains_fail_closed	pass	pass=1
 tests/analysis_tools/shared/test_native_dynamic_launch.py::test_checker_binds_runtime_scalar_launch_extent	pass	pass=2
 tests/analysis_tools/shared/test_native_dynamic_launch.py::test_checker_artifact_identity_tracks_launch_scalars_only	pass	pass=2
 tests/analysis_tools/shared/test_native_predicated_reduction.py::test_checker_models_predicated_global_reduction	pass	pass=2
 tests/analysis_tools/shared/test_native_shared_descriptor_table.py::test_checker_follows_matrix_descriptor_through_raw_shared_table	pass	pass=2
-tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime	other-assertion+pin-internals	other-assertion=15 pin-internals=26
+tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime	other-assertion+pin-internals	other-assertion=3 pin-internals=38
 tests/analysis_tools/synccheck/test_reported_tool_regressions.py::test_reported_instruction_support	other-assertion	other-assertion=1 pass=2
 tests/analysis_tools/synccheck/test_reported_tool_regressions.py::test_ws_instruction_predication_matches_branch_election	pass	pass=1
 tests/numsim/integration/test_deterministic_reexecution.py::test_repeated_full_launch_keeps_outputs_stats_and_poll_order_deterministic	pin-internals	pin-internals=1
@@ -26,14 +26,14 @@ tests/numsim/integration/test_gemm_async_artifact.py::test_cta_group2_banked_a_s
 tests/numsim/integration/test_global_alias_artifact.py::test_global_decl_buffer_alias_reuses_parameter_allocation_bytes	other-assertion	other-assertion=1
 tests/numsim/integration/test_global_alias_artifact.py::test_global_dynamic_subview_can_reach_full_parameter_allocation	pass	pass=1
 tests/numsim/integration/test_host_prelude.py::test_host_encoded_tensor_map_uses_its_typed_buffer_argument	pass	pass=1
-tests/numsim/integration/test_host_prelude.py::test_explicit_tensor_map_override_updates_its_distinct_backing	other-assertion	other-assertion=1
+tests/numsim/integration/test_host_prelude.py::test_explicit_tensor_map_override_updates_its_distinct_backing	pass	pass=1
 tests/numsim/integration/test_host_prelude.py::test_host_encoded_tensor_map_is_accepted_by_native_checkers	pass	pass=1
 tests/numsim/integration/test_host_prelude.py::test_host_encoded_tensor_map_can_reinterpret_byte_storage	pass	pass=1
 tests/numsim/integration/test_host_prelude.py::test_host_encoded_tensor_map_base_offset_selects_the_backing_suffix	pass	pass=1
 tests/numsim/integration/test_host_prelude.py::test_host_encoded_fp4_tensor_map_preserves_packed_bytes	pass	pass=1
 tests/numsim/integration/test_host_prelude.py::test_dynamic_tensor_map_expressions_run_in_the_loaded_artifact_prologue	lowering-rejects	lowering-rejects=1
 tests/numsim/integration/test_host_prelude.py::test_dynamic_tensor_map_prologue_is_shared_by_native_checkers	lowering-rejects	lowering-rejects=1
-tests/numsim/integration/test_host_prelude.py::test_host_tensor_map_integer_expressions_fail_closed_on_unregistered_nodes	pin-message	pin-message=1
+tests/numsim/integration/test_host_prelude.py::test_host_tensor_map_integer_expressions_fail_closed_on_unregistered_nodes	pass	pass=1
 tests/numsim/integration/test_host_prelude.py::test_direct_cuda_launch_coordinates_match_numsim_topology	pass	pass=1
 tests/numsim/integration/test_host_prelude.py::test_direct_cuda_launch_is_accepted_by_native_checkers	pass	pass=1
 tests/numsim/integration/test_large_buffer_artifact.py::test_large_register_buffer_table_is_heap_backed_and_executes	pin-internals	pin-internals=1
@@ -74,33 +74,33 @@ tests/numsim/integration/test_scheduler_polling_artifact.py::test_full_continue_
 tests/numsim/integration/test_scheduler_polling_artifact.py::test_initially_false_while_never_executes_body_or_suspends	pin-internals	pin-internals=1
 tests/numsim/integration/test_scheduler_polling_artifact.py::test_nested_while_inner_break_does_not_escape_time_sliced_outer_loop	pin-internals	pin-internals=1
 tests/numsim/integration/test_scheduler_polling_artifact.py::test_integer_while_conditions_use_nonzero_truth_semantics	pass	pass=1
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_tmem_to_wg_local_uses_layout_owners	engine-stops	engine-stops=1
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_large_f32_tmem_to_local_preserves_values	engine-stops	engine-stops=2
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_m128_f32_tmem_slice_to_local_uses_bulk_layout_transfer	engine-stops	engine-stops=1
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_same_width_tmem_dtype_view_preserves_physical_bits	engine-stops	engine-stops=1
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_dynamic_tmem_origin_can_be_reused_across_transfers	engine-stops	engine-stops=1
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_wg_local_to_tmem_uses_one_physical_writer	engine-stops	engine-stops=1
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_16xb_roundtrip_preserves_16bit_register_halves	engine-stops	engine-stops=3
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_expands_tlane_replicas	engine-stops	engine-stops=1
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_tmem_to_wg_local_uses_layout_owners	pass	pass=1
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_large_f32_tmem_to_local_preserves_values	pass	pass=2
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_m128_f32_tmem_slice_to_local_uses_bulk_layout_transfer	pass	pass=1
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_same_width_tmem_dtype_view_preserves_physical_bits	pass	pass=1
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_dynamic_tmem_origin_can_be_reused_across_transfers	pass	pass=1
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_wg_local_to_tmem_uses_one_physical_writer	pass	pass=1
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_16xb_roundtrip_preserves_16bit_register_halves	pass	pass=3
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_expands_tlane_replicas	other-assertion	other-assertion=1
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_supports_rank3_multi_instruction_layout	lowering-rejects	lowering-rejects=1
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem	lowering-rejects	lowering-rejects=1
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_reads_and_writes_each_cta_scale_backing	lowering-rejects	lowering-rejects=1
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_supports_float16_payloads	lowering-rejects	lowering-rejects=1
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_routes_each_pair_in_four_cta_cluster	lowering-rejects	lowering-rejects=1
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_all_inactive_tcgen_transfer_is_a_noop	engine-stops	engine-stops=1
-tests/numsim/integration/test_tmem_artifact.py::test_tmem_layout_d_aliases_and_isolates_ctas	engine-stops	engine-stops=1
+tests/numsim/integration/test_tmem_artifact.py::test_tmem_layout_d_aliases_and_isolates_ctas	pass	pass=1
 tests/numsim/integration/test_tmem_artifact.py::test_tmem_layout_f_maps_rows_to_half_slabs	engine-stops	engine-stops=1
 tests/numsim/integration/test_tmem_artifact.py::test_tmem_subword_views_alias_one_physical_cell	lowering-rejects	lowering-rejects=1
-tests/numsim/integration/test_tmem_artifact.py::test_tmem_runtime_address_without_a_dynamic_lease_is_rejected	pin-message(error->incomplete)	pin-message(error->incomplete)=1
+tests/numsim/integration/test_tmem_artifact.py::test_tmem_runtime_address_without_a_dynamic_lease_is_rejected	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
 tests/numsim/integration/test_tmem_artifact.py::test_tmem_runtime_address_uses_a_live_dynamic_lease	pass	pass=1
-tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges	pin-message(error->incomplete)	pin-message(error->incomplete)=3
+tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges	pin-message+v2-accepts-legacy-rejection	pin-message=2 v2-accepts-legacy-rejection=1
 tests/numsim/integration/test_tmem_artifact.py::test_tmem_allocator_returns_nonzero_bases_and_reuses_released_ranges	pass	pass=1
-tests/numsim/integration/test_tmem_artifact.py::test_tmem_live_allocation_at_kernel_exit_is_rejected	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
-tests/numsim/integration/test_tmem_artifact.py::test_tmem_uninitialized_reads_are_zero_filled_and_require_review	engine-stops	engine-stops=1
+tests/numsim/integration/test_tmem_artifact.py::test_tmem_live_allocation_at_kernel_exit_is_rejected	pass	pass=1
+tests/numsim/integration/test_tmem_artifact.py::test_tmem_uninitialized_reads_are_zero_filled_and_require_review	pass	pass=1
 tests/numsim/integration/test_warp_gemm_artifact.py::test_warp_gemm_gathers_and_scatters_register_fragments_by_layout	pass	pass=1
-tests/numsim/integration/test_warp_gemm_artifact.py::test_larger_exec_scopes_run_one_mma_fragment_per_warp	lowering-rejects	lowering-rejects=2
-tests/numsim/integration/test_warp_gemm_artifact.py::test_warp_gemm_rejects_layout_that_disagrees_with_instruction_abi	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
-tests/numsim/integration/test_warp_gemm_artifact.py::test_warp_gemm_supports_registered_m16n8_family	lowering-rejects	lowering-rejects=4
+tests/numsim/integration/test_warp_gemm_artifact.py::test_larger_exec_scopes_run_one_mma_fragment_per_warp	pass	pass=2
+tests/numsim/integration/test_warp_gemm_artifact.py::test_warp_gemm_rejects_layout_that_disagrees_with_instruction_abi	pass	pass=1
+tests/numsim/integration/test_warp_gemm_artifact.py::test_warp_gemm_supports_registered_m16n8_family	pass	pass=4
 tests/numsim/integration/test_warp_ops_artifact.py::test_warp_intrinsics_use_typed_engine_calls	pass	pass=1
 tests/numsim/integration/test_warp_ops_artifact.py::test_warp_collectives_reject_invalid_participant_contracts	pin-message	pin-message=1
 tests/numsim/runtime/test_approximate_f32_contract.py::test_tanh_approx_representative_executes	pass	pass=1
@@ -115,8 +115,8 @@ tests/numsim/runtime/test_approximate_f32_contract.py::test_output_comparison_do
 tests/numsim/runtime/test_async_group_domain_oracle.py::test_async_group_wait_counts_complete_on_an_empty_queue	pin-internals	pin-internals=1
 tests/numsim/runtime/test_async_release.py::test_async_release_payloads	synccheck-verdict	synccheck-verdict=10
 tests/numsim/runtime/test_atomic_domain_oracle.py::test_every_cuda_atomic_add_and_cas_form_executes_with_exact_bits	pin-internals	pin-internals=1
-tests/numsim/runtime/test_atomic_f32_noftz.py::test_atomic_f32_noftz	other-assertion+pin-internals	other-assertion=9 pin-internals=3
-tests/numsim/runtime/test_atomic_f32_noftz.py::test_bulk_f32_noftz	racecheck-verdict	racecheck-verdict=1
+tests/numsim/runtime/test_atomic_f32_noftz.py::test_atomic_f32_noftz	pin-internals	pin-internals=12
+tests/numsim/runtime/test_atomic_f32_noftz.py::test_bulk_f32_noftz	pass	pass=1
 tests/numsim/runtime/test_atomic_f32_noftz.py::test_noftz_keeps_atomic_memory_checks	pass	pass=2
 tests/numsim/runtime/test_bar_reduce.py::test_bar_reduce	pass	pass=12
 tests/numsim/runtime/test_bar_reduce.py::test_bar_reduce_invalid_controls	pass	pass=4
@@ -148,18 +148,18 @@ tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_complete_in
 tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_complete_if_then_else_domain_executes_both_branches	pass	pass=1
 tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_if_then_else_mixed_pointer_spaces_fail_closed	pin-message	pin-message=1
 tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_complete_tvm_shuffle_payload_domain_executes	pass	pass=1
-tests/numsim/runtime/test_fetch_register_domain_oracle.py::test_every_fetch_register_form_matches_the_logical_topology	other-assertion	other-assertion=1
+tests/numsim/runtime/test_fetch_register_domain_oracle.py::test_every_fetch_register_form_matches_the_logical_topology	pin-internals	pin-internals=1
 tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helpers_have_reviewed_observable_semantics	engine-stops	engine-stops=1
-tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helper_semantic_mutations_fail_closed	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=3
-tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helper_dtype_mismatch_fails_closed	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
+tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helper_semantic_mutations_fail_closed	pass	pass=3
+tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helper_dtype_mismatch_fails_closed	pass	pass=1
 tests/numsim/runtime/test_float8_address_shuffle.py::test_float8_address_uses_one_byte_physical_pointer	pin-internals	pin-internals=1
-tests/numsim/runtime/test_float8_address_shuffle.py::test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=2
+tests/numsim/runtime/test_float8_address_shuffle.py::test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip	pass	pass=2
 tests/numsim/runtime/test_float8_address_shuffle.py::test_cuda_four_argument_shfl_sync_uses_implicit_warp_size	pin-internals	pin-internals=1
 tests/numsim/runtime/test_ftz_rounding.py::test_ftz_rounding_boundary	pass	pass=1
 tests/numsim/runtime/test_ftz_rounding.py::test_ftz_rounding_boundary_gpu	skip	
 tests/numsim/runtime/test_gate_intrinsics.py::test_gate_intrinsics_match_float32_semantics	engine-stops	engine-stops=1
 tests/numsim/runtime/test_im2col_cache_hints.py::test_im2col_cache_hints	synccheck-verdict	synccheck-verdict=4
-tests/numsim/runtime/test_launch_resource_facts.py::test_smid_defaults_to_zero_in_execution_and_both_checkers	other-assertion	other-assertion=1
+tests/numsim/runtime/test_launch_resource_facts.py::test_smid_defaults_to_zero_in_execution_and_both_checkers	pass	pass=1
 tests/numsim/runtime/test_launch_resource_facts.py::test_pointer_bits_preserve_binding_address_and_subview_offset	other-assertion	other-assertion=1
 tests/numsim/runtime/test_launch_resource_facts.py::test_exclusive_tmem_uses_cta_local_lifecycle_without_placement	engine-stops	engine-stops=1
 tests/numsim/runtime/test_layout_lowering_contract.py::test_physical_buffers_preserve_coordinates_aliases_and_lane_private_storage	synccheck-verdict	synccheck-verdict=1
@@ -169,7 +169,7 @@ tests/numsim/runtime/test_layout_lowering_contract.py::test_overlapping_declared
 tests/numsim/runtime/test_layout_lowering_contract.py::test_runtime_shared_view_offset_selects_the_observable_backing_region	pass	pass=1
 tests/numsim/runtime/test_layout_lowering_contract.py::test_typed_tma_uses_the_transpiler_lowered_swizzle_and_exposes_alias_writes	pass	pass=1
 tests/numsim/runtime/test_layout_lowering_contract.py::test_tmem_tlane_tcol_coordinates_are_observable_through_a_physical_alias	engine-stops	engine-stops=1
-tests/numsim/runtime/test_layout_lowering_contract.py::test_runtime_tmem_layout_base_selects_physical_columns	engine-stops	engine-stops=1
+tests/numsim/runtime/test_layout_lowering_contract.py::test_runtime_tmem_layout_base_selects_physical_columns	pass	pass=1
 tests/numsim/runtime/test_layout_lowering_contract.py::test_local_view_exposes_raw_span_including_layout_gaps_and_offset	engine-stops	engine-stops=1
 tests/numsim/runtime/test_ldmatrix_b8.py::test_ldmatrix_b8_layouts	pass	pass=12
 tests/numsim/runtime/test_ldmatrix_b8.py::test_ldmatrix_s8_s4	pass	pass=3
@@ -208,9 +208,9 @@ tests/numsim/runtime/test_memory_coverage_next.py::test_next_memory_contracts	ra
 tests/numsim/runtime/test_memory_coverage_next.py::test_no_complete_rejects_exhausted_arrivals	other-assertion	other-assertion=2
 tests/numsim/runtime/test_memory_coverage_next.py::test_ldu_rejects_nonuniform_or_misaligned_vector	pin-message	pin-message=2
 tests/numsim/runtime/test_memory_coverage_next.py::test_tensor_map_ftz_types_preserve_copy_values	synccheck-verdict	synccheck-verdict=2
-tests/numsim/runtime/test_memory_coverage_next.py::test_tensor_map_update_requires_release	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
+tests/numsim/runtime/test_memory_coverage_next.py::test_tensor_map_update_requires_release	pass	pass=1
 tests/numsim/runtime/test_memory_sync_coverage.py::test_memory_sync_extensions	other-assertion+racecheck-verdict	other-assertion=1 pass=5 racecheck-verdict=1
-tests/numsim/runtime/test_memory_sync_coverage.py::test_half_vector_predicate_alias_is_captured_before_either_result_store	other-assertion	other-assertion=1
+tests/numsim/runtime/test_memory_sync_coverage.py::test_half_vector_predicate_alias_is_captured_before_either_result_store	pass	pass=1
 tests/numsim/runtime/test_memory_sync_coverage.py::test_half_atomic_old_value_preserves_signed_zero_subnormal_and_nan_bits	pass	pass=1
 tests/numsim/runtime/test_mov_forms.py::test_mov_aliased_sources_destinations_and_predicate	other-assertion	other-assertion=1
 tests/numsim/runtime/test_mov_forms.py::test_mov_pointer_identity_masks_and_nulls	synccheck-verdict	synccheck-verdict=1
@@ -223,8 +223,8 @@ tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_s2c_preserves_
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_st_async_preserves_mapped_expression_byte_offset	pass	pass=1
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_mapped_shared_address_rejects_invalid_consumed_bits	pass	pass=3
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_copies_only_the_valid_middle	pass	pass=3
-tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_dead_bytes_are_zero_filled_and_require_review_if_read	other-assertion	other-assertion=1
-tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_rejects_counts_outside_ptx_range	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=2
+tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_dead_bytes_are_zero_filled_and_require_review_if_read	pass	pass=1
+tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_rejects_counts_outside_ptx_range	pass	pass=2
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_allows_the_ignored_right_edge_outside_the_binding	pass	pass=1
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_st_bulk_size_is_evaluated_per_issuing_lane	other-assertion	other-assertion=1
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_s2g_size_and_byte_mask_are_evaluated_per_issuing_lane	pass	pass=1
@@ -246,7 +246,7 @@ tests/numsim/runtime/test_packed_f16x2_arithmetic.py::test_packed_bf16x2_subtrac
 tests/numsim/runtime/test_packed_f16x2_arithmetic.py::test_packed_f16x2_multiplies_both_halves_with_one_rounding_step	pass	pass=1
 tests/numsim/runtime/test_packed_f16x2_arithmetic.py::test_half_subtract_modifiers	pass	pass=3
 tests/numsim/runtime/test_packed_float4_global_views.py::test_explicit_uint8_backing_supplies_two_float4_values_per_byte	engine-stops	engine-stops=1
-tests/numsim/runtime/test_packed_float4_global_views.py::test_direct_one_byte_per_value_float4_array_is_rejected	pin-message	pin-message=1
+tests/numsim/runtime/test_packed_float4_global_views.py::test_direct_one_byte_per_value_float4_array_is_rejected	pass	pass=1
 tests/numsim/runtime/test_packed_float4_global_views.py::test_odd_float4_logical_count_uses_a_ceiling_byte_span	engine-stops	engine-stops=1
 tests/numsim/runtime/test_packed_float4_global_views.py::test_global_alias_view_uses_layout_physical_span	engine-stops	engine-stops=1
 tests/numsim/runtime/test_pointer_null.py::test_isnullptr_on_backed_pointers	pass	pass=1
@@ -316,10 +316,10 @@ tests/numsim/runtime/test_red_async.py::test_red_async	racecheck-verdict	raceche
 tests/numsim/runtime/test_register_extensions.py::test_register_extensions	synccheck-verdict	synccheck-verdict=4
 tests/numsim/runtime/test_register_extensions.py::test_register_extensions_gpu	skip	
 tests/numsim/runtime/test_scalar_control.py::test_directed_f64_rounding_preserves_the_predecessor_of_one	pass	pass=1
-tests/numsim/runtime/test_scalar_control.py::test_scalar_and_warp_intrinsics_execute_with_native_semantics	engine-stops	engine-stops=1
+tests/numsim/runtime/test_scalar_control.py::test_scalar_and_warp_intrinsics_execute_with_native_semantics	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_three_source_nan_minmax_propagates_any_nan	pass	pass=1
-tests/numsim/runtime/test_scalar_control.py::test_timer_finalize_is_a_numerical_noop	lowering-rejects	lowering-rejects=1
-tests/numsim/runtime/test_scalar_control.py::test_cuda_shuffle_rejects_invalid_width	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
+tests/numsim/runtime/test_scalar_control.py::test_timer_finalize_is_a_numerical_noop	pass	pass=1
+tests/numsim/runtime/test_scalar_control.py::test_cuda_shuffle_rejects_invalid_width	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_shuffle_xor_width_can_read_an_earlier_group	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_cuda_packed_ops_use_gpu_canonical_nan_encodings	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_cta_votes_grid_sync_and_ordering_markers	pass	pass=1
@@ -335,7 +335,7 @@ tests/numsim/runtime/test_scalar_control.py::test_public_cvta_shared_cluster_u64
 tests/numsim/runtime/test_scalar_control.py::test_mapa_and_cvta_expose_the_device_validated_integer_bits	other-assertion	other-assertion=1
 tests/numsim/runtime/test_scalar_control.py::test_mapped_addresses_survive_integer_storage_select_and_shuffle	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_mapa_u32_preserves_the_remote_cta_rank	pass	pass=1
-tests/numsim/runtime/test_scalar_control.py::test_fetch_register_models_logical_coordinates_and_uses_stable_time_tokens	other-assertion	other-assertion=1
+tests/numsim/runtime/test_scalar_control.py::test_fetch_register_models_logical_coordinates_and_uses_stable_time_tokens	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_fetch_register_separates_launched_warps_from_sm100_warp_identifier_capacity	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_integer_trap_predicate_uses_cpp_truth_conversion	pin-message	pin-message=1
 tests/numsim/runtime/test_scalar_control.py::test_floating_collective_predicates_use_cpp_truth_conversion	pass	pass=1
@@ -362,24 +362,24 @@ tests/numsim/runtime/test_sync_runtime_domain_oracle.py::test_cp_async_mbarrier_
 tests/numsim/runtime/test_sync_runtime_domain_oracle.py::test_cp_async_mbarrier_noinc_accepts_bound_raw_shared_offset	pass	pass=1
 tests/numsim/runtime/test_sync_runtime_domain_oracle.py::test_remote_expect_tx_completes_the_named_ctas_barrier	pass	pass=1
 tests/numsim/runtime/test_sync_runtime_domain_oracle.py::test_clc_no_work_completion_and_cluster_acquire_wait	other-assertion	other-assertion=1
-tests/numsim/runtime/test_sync_runtime_domain_oracle.py::test_sm100_pair_base_handle_form_routes_both_ctas	engine-stops	engine-stops=1
+tests/numsim/runtime/test_sync_runtime_domain_oracle.py::test_sm100_pair_base_handle_form_routes_both_ctas	pass	pass=1
 tests/numsim/runtime/test_tcgen05_ld_red.py::test_tcgen_load_reduction_matches_column_oracle	pass	pass=4
 tests/numsim/runtime/test_tcgen05_ld_spcompress.py::test_tcgen_load_compression	synccheck-verdict	synccheck-verdict=3
-tests/numsim/runtime/test_tcgen05_restricted_commit.py::test_restricted_commit_preserves_full_mma_completion	other-assertion+synccheck-verdict	other-assertion=2 synccheck-verdict=1
-tests/numsim/runtime/test_tcgen05_sparse_b16.py::test_sparse_b16_layouts_and_codecs	synccheck-verdict	pass=3 synccheck-verdict=3
+tests/numsim/runtime/test_tcgen05_restricted_commit.py::test_restricted_commit_preserves_full_mma_completion	other-assertion	other-assertion=3
+tests/numsim/runtime/test_tcgen05_sparse_b16.py::test_sparse_b16_layouts_and_codecs	pass	pass=6
 tests/numsim/runtime/test_tcgen05_sparse_b16.py::test_sparse_b16_invalid_metadata	pass	pass=1
-tests/numsim/runtime/test_tcgen05_sparse_block.py::test_sparse_block_scales_and_metadata	synccheck-verdict	pass=2 synccheck-verdict=3
+tests/numsim/runtime/test_tcgen05_sparse_block.py::test_sparse_block_scales_and_metadata	pass	pass=5
 tests/numsim/runtime/test_tcgen05_sparse_block.py::test_sparse_block_descriptor_boundaries	pass	pass=1
-tests/numsim/runtime/test_tcgen05_sparse_k128.py::test_sparse_k128_packing_scales_and_transpose	synccheck-verdict	pass=3 synccheck-verdict=3
-tests/numsim/runtime/test_tcgen05_sparse_narrow.py::test_sparse_narrow_layouts_and_codecs	synccheck-verdict	pass=4 synccheck-verdict=2
-tests/numsim/runtime/test_tcgen05_sparse_narrow.py::test_sparse_narrow_k128	synccheck-verdict	pass=4 synccheck-verdict=3
-tests/numsim/runtime/test_tcgen05_tf32.py::test_tf32_sparse_metadata	synccheck-verdict	pass=2 synccheck-verdict=2
-tests/numsim/runtime/test_tcgen05_ti16.py::test_ti16_exact_accumulation	synccheck-verdict	pass=4 synccheck-verdict=4
+tests/numsim/runtime/test_tcgen05_sparse_k128.py::test_sparse_k128_packing_scales_and_transpose	pass	pass=6
+tests/numsim/runtime/test_tcgen05_sparse_narrow.py::test_sparse_narrow_layouts_and_codecs	pass	pass=6
+tests/numsim/runtime/test_tcgen05_sparse_narrow.py::test_sparse_narrow_k128	pass	pass=7
+tests/numsim/runtime/test_tcgen05_tf32.py::test_tf32_sparse_metadata	pass	pass=4
+tests/numsim/runtime/test_tcgen05_ti16.py::test_ti16_exact_accumulation	pass	pass=8
 tests/numsim/runtime/test_tcgen05_ti16.py::test_ti16_ws_banks_and_column_mask	synccheck-verdict	synccheck-verdict=6
-tests/numsim/runtime/test_tcgen05_ti16.py::test_sparse_ti16_metadata	synccheck-verdict	pass=8 synccheck-verdict=4
+tests/numsim/runtime/test_tcgen05_ti16.py::test_sparse_ti16_metadata	pass	pass=12
 tests/numsim/runtime/test_tcgen_commit_predicates.py::test_tcgen_commit_predicates_gate_all_operands	synccheck-verdict	synccheck-verdict=2
-tests/numsim/runtime/test_tcgen_lut_b.py::test_dense_lut_b_segments_and_cta_partition	synccheck-verdict	pass=2 synccheck-verdict=2
-tests/numsim/runtime/test_tcgen_lut_b.py::test_block_lut_b_scales_and_packed_tmem	synccheck-verdict	pass=2 synccheck-verdict=2
+tests/numsim/runtime/test_tcgen_lut_b.py::test_dense_lut_b_segments_and_cta_partition	pass	pass=4
+tests/numsim/runtime/test_tcgen_lut_b.py::test_block_lut_b_scales_and_packed_tmem	pass	pass=4
 tests/numsim/runtime/test_tcgen_misc_runtime_domain.py::test_tcgen_matrix_descriptor_swizzle1_packs_reviewed_fields	pass	pass=1
 tests/numsim/runtime/test_tcgen_misc_runtime_domain.py::test_tcgen_matrix_descriptor_encodes_offset_without_cluster_rank	pass	pass=1
 tests/numsim/runtime/test_tcgen_misc_runtime_domain.py::test_tcgen_lifecycle_accepts_full_256_column_allocation	pass	pass=1
@@ -392,39 +392,39 @@ tests/numsim/runtime/test_tile_general_semantics.py::test_integer_add_sub_mul_us
 tests/numsim/runtime/test_tile_general_semantics.py::test_fdiv_rounding_config_matches_current_cuda_scalar_fallback	pass	pass=1
 tests/numsim/runtime/test_tile_general_semantics.py::test_elementwise_maximum_matches_pairwise_values	pass	pass=1
 tests/numsim/runtime/test_tile_general_semantics.py::test_float64_elementwise_forms_use_native_double_semantics	pass	pass=1
-tests/numsim/runtime/test_tile_general_semantics.py::test_float64_directed_rounding_fails_closed	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
+tests/numsim/runtime/test_tile_general_semantics.py::test_float64_directed_rounding_fails_closed	pass	pass=1
 tests/numsim/runtime/test_tile_general_semantics.py::test_cast_uses_general_scalar_conversion_without_dispatch_semantics	pass	pass=1
 tests/numsim/runtime/test_tile_general_semantics.py::test_mxfp4_uses_ue8m0_scales_over_32_element_vectors	lowering-rejects	lowering-rejects=1
-tests/numsim/runtime/test_tile_owner_transport.py::test_copy_transports_unique_owners_across_warps	lowering-rejects	lowering-rejects=1
+tests/numsim/runtime/test_tile_owner_transport.py::test_copy_transports_unique_owners_across_warps	engine-stops	engine-stops=1
 tests/numsim/runtime/test_tile_reduction_variants.py::test_local_reductions_round_each_bfloat16_sum_step	pass	pass=1
-tests/numsim/runtime/test_tile_reduction_variants.py::test_local_float64_reductions_match_b200_edge_bits	other-assertion	other-assertion=1
+tests/numsim/runtime/test_tile_reduction_variants.py::test_local_float64_reductions_match_b200_edge_bits	pass	pass=1
 tests/numsim/runtime/test_tile_reduction_variants.py::test_local_integer_reductions_wrap_and_preserve_order	pass	pass=8
 tests/numsim/runtime/test_tile_reduction_variants.py::test_warp_collective_reduction_follows_physical_lane_ownership	other-assertion	other-assertion=1
 tests/numsim/runtime/test_tile_reduction_variants.py::test_partial_warp_collective_reduction_preserves_lane_groups	pass	pass=1
 tests/numsim/runtime/test_tile_reduction_variants.py::test_local_collective_uses_lexicographic_order	other-assertion	other-assertion=1
 tests/numsim/runtime/test_tile_reduction_variants.py::test_maxmin_uses_canonical_lexicographic_nan_and_signed_zero_order	other-assertion	other-assertion=1
 tests/numsim/runtime/test_tile_unary_codegen.py::test_unary_tile_ops_run_through_local_reg_lowering	pass	pass=1
-tests/numsim/runtime/test_tile_unary_codegen.py::test_unary_tile_ops_run_through_two_warp_shared_cta_lowering	lowering-rejects	lowering-rejects=1
-tests/numsim/runtime/test_tile_unary_codegen.py::test_shared_cta_in_place_ops_have_single_writer_per_element	lowering-rejects	lowering-rejects=1
-tests/numsim/runtime/test_tile_unary_codegen.py::test_warp_shared_element_owner_selects_lane_varying_scalar	lowering-rejects	lowering-rejects=1
-tests/numsim/runtime/test_tile_unary_codegen.py::test_warpgroup_shared_in_place_op_writes_once_across_four_warps	lowering-rejects	lowering-rejects=1
+tests/numsim/runtime/test_tile_unary_codegen.py::test_unary_tile_ops_run_through_two_warp_shared_cta_lowering	pass	pass=1
+tests/numsim/runtime/test_tile_unary_codegen.py::test_shared_cta_in_place_ops_have_single_writer_per_element	pass	pass=1
+tests/numsim/runtime/test_tile_unary_codegen.py::test_warp_shared_element_owner_selects_lane_varying_scalar	pass	pass=1
+tests/numsim/runtime/test_tile_unary_codegen.py::test_warpgroup_shared_in_place_op_writes_once_across_four_warps	pass	pass=1
 tests/numsim/runtime/test_tile_unary_codegen.py::test_shared_cta_cast_uses_shared_ownership_and_completion	engine-stops	engine-stops=1
-tests/numsim/runtime/test_tile_unary_codegen.py::test_warpgroup_shared_owner_is_independent_of_vector_chunk	lowering-rejects	lowering-rejects=1
-tests/numsim/runtime/test_tile_unary_codegen.py::test_unary_tile_ops_fail_closed_on_unknown_config	v2-accepts-legacy-rejection	v2-accepts-legacy-rejection=1
+tests/numsim/runtime/test_tile_unary_codegen.py::test_warpgroup_shared_owner_is_independent_of_vector_chunk	other-assertion	other-assertion=1
+tests/numsim/runtime/test_tile_unary_codegen.py::test_unary_tile_ops_fail_closed_on_unknown_config	pass	pass=1
 tests/numsim/runtime/test_tile_unary_codegen.py::test_fill_accepts_e4m3_register_tile	pass	pass=1
 tests/numsim/runtime/test_tma_atomicity.py::test_tma_atomicity_layout_and_checkers	synccheck-verdict	synccheck-verdict=1
 tests/numsim/runtime/test_tma_atomicity.py::test_tma_atomicity_direction_restrictions	other-assertion	other-assertion=1
 tests/numsim/runtime/test_tma_dtype_runtime_domain.py::test_typed_tma_supported_dtype_domain_preserves_values_and_bytes	pass	pass=5
-tests/numsim/runtime/test_tma_im2col.py::test_im2col_interleaved	racecheck-verdict	racecheck-verdict=3
+tests/numsim/runtime/test_tma_im2col.py::test_im2col_interleaved	other-assertion	other-assertion=3
 tests/numsim/runtime/test_tma_im2col.py::test_im2col_spatial	pass	pass=3
-tests/numsim/runtime/test_tma_im2col.py::test_im2col_store_and_reduce	racecheck-verdict+synccheck-verdict	racecheck-verdict=2 synccheck-verdict=2
+tests/numsim/runtime/test_tma_im2col.py::test_im2col_store_and_reduce	other-assertion+synccheck-verdict	other-assertion=1 pass=1 synccheck-verdict=2
 tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_im2col_per_thread_coordinates_and_offsets	pass	pass=3
 tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_wide_im2col_per_thread_halo_offset_and_completion	pass	pass=2
 tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_prefetch_preserves_memory	synccheck-verdict	synccheck-verdict=2
 tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_transfer_rejects_only_when_issued	synccheck-verdict	synccheck-verdict=3
 tests/numsim/runtime/test_tma_multiissuer.py::test_tma_multiissuer_coordinates_and_target_completion	pass	pass=7
 tests/numsim/runtime/test_tma_swizzle96.py::test_swizzle96_documented_layout	synccheck-verdict	synccheck-verdict=2
-tests/numsim/runtime/test_tma_u6.py::test_tma_u6_layout_and_checkers	other-assertion	other-assertion=1
+tests/numsim/runtime/test_tma_u6.py::test_tma_u6_layout_and_checkers	pass	pass=1
 tests/numsim/runtime/test_variable_identity.py::test_distinct_tir_vars_with_the_same_name_do_not_alias	pass	pass=1
 tests/numsim/runtime/test_variable_identity.py::test_parameter_identity_is_not_replaced_by_an_inner_var_with_the_same_name	pass	pass=1
 tests/numsim/runtime/test_variable_identity.py::test_runtime_shape_uses_the_exact_shape_var_identity	pass	pass=1

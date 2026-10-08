@@ -1,0 +1,2 @@
+legacy_test	v2_tests	note
+tests/numsim/runtime/test_fetch_register_domain_oracle.py::test_every_fetch_register_form_matches_the_logical_topology	tests/numsim/v2/ports/test_stats_fetch_register_domain_oracle.py::test_every_fetch_register_form_matches_the_logical_topology	dropped stats task_count/completed_task_count == 8; completion via result.status; outputs unchanged

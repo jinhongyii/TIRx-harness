@@ -431,11 +431,12 @@ Wave sizes:
 - wave 2 (gated; dry run at 4d6b93f plus the working tree): 1 file (2 tests),
   plus 30 functions in 12 files. 20 rows are held because a replacement is
   still xfail.
-- wave 4 (gated; same dry run): 5 files (6 tests), plus 42 functions in
-  15 files. These are the 48 functions whose v2 copies pass. 6 ported
-  functions are held behind a `v2_gap`. 219 public functions `flip`
-  (unchanged, already pass under v2). 173 are held: they fail under v2 and
-  have no copy yet.
+- wave 4 (gated; dry run at 23b4364 plus the working tree): 5 files
+  (6 tests), plus 47 functions in 19 files. These are the 52 functions whose
+  v2 copies pass. 269 public functions `flip` (they already pass unchanged
+  under v2). 124 are held. `v2_public_status.tsv` was refreshed from the
+  23b4364 run: 449 of 762 items pass. Its pin and stats ports are mapped in
+  `v2_ports_{messages,internals,reductions,stats}.tsv`.
 - wave 5b: 43 files (192 tests), plus 197 functions in 51 files. Run
   `--wave 5b --markdown` for that list; it is long and changes as A-internal
   tests are ported.
