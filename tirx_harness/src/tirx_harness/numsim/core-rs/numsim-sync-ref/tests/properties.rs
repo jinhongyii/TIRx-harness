@@ -926,3 +926,72 @@ fn setmaxnreg_trailing_partial_warpgroup() {
     assert_eq!(step(&mut s, Cmd::Set { wg: 0, inc: false, count: 64 }), Ok(Outcome::Applied { count: 64 }));
     assert_eq!(step(&mut s, Cmd::WarpgroupSync { wg: 2 }), Ok(Outcome::Done));
 }
+
+/// Partial-warp ruling (sync-isa-answers Q3/Q5): non-aligned pieces of one
+/// warp gather into one full-mask arrival; `.aligned` stays immediate; the
+/// missing lanes exiting or reaching another barrier id is `PartialWarp`.
+#[test]
+fn named_partial_warp_gathers() {
+    use named::{gather, Contribution, Cmd, Error, Flavor, Gather, GatherCmd, GatherOutcome, Outcome, State};
+    let exec = |id, mask, aligned| GatherCmd::Execute { id, flavor: Flavor::Sync, count: 64, mask, live: FULL_MASK, aligned };
+    let mut g = Gather { warp: 0, pending: None };
+    assert_eq!(gather(&mut g, exec(1, 0x0000_ffff, false)), Ok(GatherOutcome::Wait));
+    assert_eq!(gather(&mut g, exec(1, 0xffff_0000, false)), Ok(GatherOutcome::Arrive { mask: FULL_MASK }));
+    // The one arrival the barrier sees is a full-warp contribution.
+    let mut s = State::default();
+    let full = |warp| Contribution { warp, mask: FULL_MASK, live: FULL_MASK, count: 64, aligned: false };
+    assert_eq!(named::step(&mut s, Cmd::Sync(full(0))), Ok(Outcome::Registered { gen: 0 }));
+    assert_eq!(named::step(&mut s, Cmd::Sync(full(1))), Ok(Outcome::Ready { gen: 0 }));
+    // `.aligned` partial warp: immediate error.
+    let mut g = Gather { warp: 0, pending: None };
+    assert_eq!(gather(&mut g, exec(1, 1, true)), Err(Error::PartialWarp { mask: 1, live: FULL_MASK }));
+    // Missing lanes reach another id, or exit.
+    assert_eq!(gather(&mut g, exec(1, 1, false)), Ok(GatherOutcome::Wait));
+    assert_eq!(gather(&mut g.clone(), exec(2, 0xfffe, false)), Err(Error::PartialWarp { mask: 1, live: FULL_MASK }));
+    assert_eq!(gather(&mut g, GatherCmd::Exit { live: 1 }), Err(Error::PartialWarp { mask: 1, live: 1 }));
+    assert_eq!(gather(&mut Gather::default(), GatherCmd::Exit { live: 0 }), Ok(GatherOutcome::Idle));
+}
+
+fn gather_cmd() -> impl Strategy<Value = named::GatherCmd> {
+    let mask = prop::sample::select(vec![FULL_MASK, 0x0000_ffff, 0xffff_0000, 0xff00_0000, 1, 0]);
+    prop_oneof![
+        8 => (0u32..3, 0u8..3, prop::sample::select(vec![32u64, 64]), mask.clone(),
+              prop::sample::select(vec![FULL_MASK, FULL_MASK, 0x0000_ffff]), any::<bool>())
+            .prop_map(|(id, f, count, mask, live, aligned)| named::GatherCmd::Execute {
+                id,
+                flavor: [named::Flavor::Arrive, named::Flavor::Sync, named::Flavor::Red][f as usize],
+                count,
+                mask,
+                live,
+                aligned,
+            }),
+        1 => mask.prop_map(|live| named::GatherCmd::Exit { live }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    #[test]
+    fn named_gather_properties(cmds in prop::collection::vec(gather_cmd(), 0..40)) {
+        let mut g = named::Gather::default();
+        for &cmd in &cmds {
+            let before = g.clone();
+            match named::gather(&mut g, cmd) {
+                Err(_) => prop_assert_eq!(&g, &before, "errors leave the gather unchanged"),
+                Ok(named::GatherOutcome::Arrive { mask }) => {
+                    let named::GatherCmd::Execute { live, .. } = cmd else { unreachable!() };
+                    prop_assert_eq!(mask, live);
+                    prop_assert!(g.pending.is_none());
+                }
+                Ok(named::GatherOutcome::Wait) => {
+                    let named::GatherCmd::Execute { aligned, live, .. } = cmd else { unreachable!() };
+                    prop_assert!(!aligned);
+                    let p = g.pending.expect("pending");
+                    prop_assert!(p.lanes != live && p.lanes & !live == 0 && p.lanes != 0);
+                }
+                Ok(named::GatherOutcome::Idle) => prop_assert!(before.pending.is_none()),
+            }
+        }
+    }
+}

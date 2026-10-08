@@ -692,9 +692,17 @@ fn launch_bounds_register_redistribution_is_clean() {
 
 /// `runtime/test_device_protocol_ops.py::test_divergent_unaligned_named_barrier_runtime`:
 /// lane 0 and lanes 1-31 reach two different `barrier.sync 5, 32`.
-// sync delta B2: legacy clean (unaligned recombination); new PartialWarp.
+// Partial-warp ruling (sync-isa-answers Q3/Q5, supersedes delta B2 for
+// non-aligned forms): the lanes gather (`named::gather`) and the warp
+// arrives once; the engine logs that one full-mask contribution. Legacy was
+// clean too. The `.aligned` split stays `PartialWarp`
+// (`named_sync_split_within_one_warp_is_partial_warp`).
 #[test]
-fn divergent_unaligned_named_barrier_is_partial_warp() {
+fn divergent_unaligned_named_barrier_gathers_into_one_arrival() {
+    let mut log = LogBuilder::new();
+    log.cmd(0, 2, named_bar(0, 5), bar(named::Cmd::Sync, 0, 32, FULL_MASK, false));
+    run_all(&log.build(), one(), Verdict::Clean);
+    // A log that still carries the pieces (pre-ruling engine) fails closed.
     let mut log = LogBuilder::new();
     log.cmd(0, 1, named_bar(0, 5), bar(named::Cmd::Sync, 0, 32, 0x0000_0001, false));
     log.cmd(0, 2, named_bar(0, 5), bar(named::Cmd::Sync, 0, 32, 0xffff_fffe, false));

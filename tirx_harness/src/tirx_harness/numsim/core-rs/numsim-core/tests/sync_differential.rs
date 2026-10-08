@@ -145,6 +145,44 @@ proptest! {
     }
 }
 
+// ---------------------------------------------------------------- named gather
+
+fn gather_op() -> impl Strategy<Value = (u8, u32, u8, u64, u32, u32, bool)> {
+    (
+        0u8..5,
+        0u32..3,
+        0u8..3,
+        prop::sample::select(vec![32u64, 64]),
+        prop::sample::select(vec![u32::MAX, 0xffff, 0xffff_0000, 0xff00_0000, 1, 0]),
+        prop::sample::select(vec![u32::MAX, u32::MAX, 0xffff]),
+        any::<bool>(),
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(CASES))]
+
+    #[test]
+    fn named_gather_matches_reference(ops in prop::collection::vec(gather_op(), 0..MAX_LEN)) {
+        let mut rg = spec::named::Gather { warp: 3, pending: None };
+        let mut cg = prod::named::Gather { warp: 3, pending: None };
+        for (i, &(kind, id, f, count, mask, live, aligned)) in ops.iter().enumerate() {
+            let (rc, cc) = if kind == 0 {
+                (spec::named::GatherCmd::Exit { live }, prod::named::GatherCmd::Exit { live })
+            } else {
+                (
+                    spec::named::GatherCmd::Execute { id, flavor: [spec::named::Flavor::Arrive, spec::named::Flavor::Sync, spec::named::Flavor::Red][f as usize], count, mask, live, aligned },
+                    prod::named::GatherCmd::Execute { id, flavor: [prod::named::Flavor::Arrive, prod::named::Flavor::Sync, prod::named::Flavor::Red][f as usize], count, mask, live, aligned },
+                )
+            };
+            let r = spec::named::gather(&mut rg, rc);
+            let c = prod::named::gather(&mut cg, cc);
+            prop_assert_eq!(dbg(&r), dbg(&c), "#{} outcome", i);
+            prop_assert_eq!(dbg(&rg), dbg(&cg), "#{} state", i);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- named
 
 fn named_op() -> impl Strategy<Value = ((u8, u32, u32, u32, u64, u64), bool)> {

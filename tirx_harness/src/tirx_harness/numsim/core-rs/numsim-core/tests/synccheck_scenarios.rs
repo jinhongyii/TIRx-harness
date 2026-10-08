@@ -1019,3 +1019,16 @@ fn exit_arrival_releases_count_less_named_barrier() {
     log.cmd(1, 2, named_bar(0, 1), exit_arrive);
     run_all(&log.build(), cta(3), Verdict::Clean);
 }
+
+/// Partial-warp ruling (`sparse_flashmla_decode_head64` line 1743): an
+/// elect-gated lane and the rest of its warp reach a non-aligned
+/// `bar.sync` in pieces; the engine gathers them (`named::gather`) and logs
+/// one full-mask arrival, which the explorer checks like any other.
+#[test]
+fn gathered_partial_warp_named_barrier_is_clean() {
+    let mut log = LogBuilder::new();
+    let gathered = named::Contribution { warp: 0, mask: FULL_MASK, live: FULL_MASK, count: 64, aligned: false };
+    log.cmd(0, 1, named_bar(0, 1), SyncCmd::Named(named::Cmd::Sync(gathered)));
+    log.cmd(1, 1, named_bar(0, 1), bar_sync(1, 64));
+    run_all(&log.build(), cta(2), Verdict::Clean);
+}

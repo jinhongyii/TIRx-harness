@@ -509,7 +509,7 @@ The engine's `register_contribution` (HB:2951-3070) and strict's `contribute` (S
 | Reference kind | Engine | Strict | PTX basis (ISA §9.7.15.1 unless noted) |
 | --- | --- | --- | --- |
 | `InvalidCount` | plan `"positive multiple of 32"`; hub `InvalidBarrierArrivalCount` | `InvalidExpectedArrivals` | "the value must be a multiple of the warp size" |
-| `PartialWarp{mask, live}` | `warp_collective_divergence`, waived under `elect.sync`; hub `InvalidBarrierArrivalCount{0}` for an empty mask | `ElectSyncParticipation` (elect entry mask); `InvalidArrivalCount` | "causes executing thread to wait for all non-exited threads from its warp and marks warps' arrival". A strict subset of the non-exited lanes is UB (`.aligned`) or a hang (unaligned). Lanes at different barrier instructions fail closed (sync-isa-answers Q3/Q5). |
+| `PartialWarp{mask, live}` | `warp_collective_divergence`, waived under `elect.sync`; hub `InvalidBarrierArrivalCount{0}` for an empty mask | `ElectSyncParticipation` (elect entry mask); `InvalidArrivalCount` | "causes executing thread to wait for all non-exited threads from its warp and marks warps' arrival". A strict subset of the non-exited lanes is UB for `.aligned` forms, so `PartialWarp` at once. Non-aligned lanes gather until the rest of the warp reaches the same id (§3.6, "Partial warps"). `PartialWarp` fires there only when the missing lanes exit or reach a different id (sync-isa-answers Q3/Q5). |
 | `ContractMismatch` | `ContractMismatch` | `ContractMismatch` | "using the same barrier name and thread count" |
 | `Duplicate` | `DuplicateArrival` (lane overlap) | `DuplicateContribution` | "keep a warp from executing more barrier instructions than intended … prior to the reset of the barrier" |
 | `RedMixed` | — | — | "barrier{.cta}.red should not be intermixed with barrier{.cta}.sync or barrier{.cta}.arrive using the same active barrier. Execution in this case is unpredictable." |
@@ -557,10 +557,16 @@ The strict kinds are 11 (SNB:136-206):
 
 ### 3.6 Reference (ISA-resolved)
 
-- **Unit.** A contribution must be executed by exactly the warp's non-exited lanes (`mask == live`). The warp's arrival then counts 32 threads toward `b`. There is no lane accumulation across contributions, so lanes reaching different barrier instructions fail closed as `PartialWarp`. The engine's unaligned full-CTA recombination (KE:4158-4176) is therefore not reproduced.
+- **Unit.** The barrier sees one contribution per warp arrival, executed by exactly the warp's non-exited lanes (`mask == live`). The warp's arrival then counts 32 threads toward `b`.
+- **Partial warps (ruling 2026-10-08, sync-isa-answers Q3/Q5).** A **non-aligned** `barrier.sync`/`bar.sync`/`barrier.arrive`/`barrier.red` reached by a strict subset of the non-exited lanes is not an immediate error. The executing lanes wait for the warp's remaining non-exited lanes to reach the same barrier id, at any instruction site, with the same flavor and `b`. When they all have, the warp arrives once with the full live mask. This is per-warp state in front of the per-id barrier (`named::Gather` / `named::gather`, `GatherOutcome::{Wait, Arrive, Idle}`).
+  - `PartialWarp` fires only when the missing lanes exit (`GatherCmd::Exit`) or reach a different barrier id or flavor.
+  - A different `b` from the missing lanes is `ContractMismatch`, and a lane executing twice is `Duplicate`.
+  - `.aligned` forms keep the immediate full-warp requirement.
+  - The engine gathers in `interp/handlers/sync.rs` (`barrier_partial`) and logs only the one full-mask arrival, so synccheck checks it like any other.
+  - This supersedes delta B2 for non-aligned forms, and B1 for an elect-gated lane of a non-aligned `bar.sync` (`sparse_flashmla_decode_head64:1743`).
 - **Flavors.** `Arrive`, `Sync` and `Red`. One warp may arrive and then sync in one generation; the CUTLASS producer/consumer idiom depends on this. The ISA warns against it ("care must be taken") without forbidding it. Mixing `Red` with the other two flavors is `RedMixed`.
 - **`.aligned`** carries no barrier state. `Contribution::aligned` is carried only for the checkers (the synccheck aligned-site rule, W6-1) and never changes a transition.
-- **Not modeled: whole-warp exit.** A barrier whose missing warps have all exited should be released (§9.7.14.7). With an explicit `b` this needs the scheduler to know which warps were expected. That is gap G8; the SyncTable's deadlock check must treat such a hang as `incomplete`, not as success.
+- **Whole-warp exit.** On count-less barriers, a warp that exits leaves the membership; an open generation it has not arrived at gets its arrival (sync-behaviour-deltas B7, §9.7.14.7). With an explicit `b`, the scheduler does not know which warps were expected (G8), so such a hang is `incomplete`, not success.
 
 ## 4. Cluster barrier
 

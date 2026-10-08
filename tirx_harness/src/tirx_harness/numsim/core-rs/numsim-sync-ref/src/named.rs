@@ -7,10 +7,12 @@
 //! A barrier instruction makes each executing thread wait for all non-exited
 //! threads of its warp, then marks the **warp's** arrival (PTX 9.4 §9.7.15.1).
 //! The model therefore requires each contribution's lane mask to equal the
-//! warp's non-exited lanes. A strict subset is an error. That covers the
-//! elect-gated single-lane case and lanes that reach different barrier
-//! instructions; the latter fail closed. A warp arrival counts 32 threads
-//! toward `b`, which must be a multiple of the warp size.
+//! warp's non-exited lanes. A non-aligned instruction reached by a partial
+//! warp first goes through the per-warp [`Gather`] (the lanes wait for the
+//! rest of the warp, which then arrives once). An `.aligned` partial warp,
+//! or missing lanes that exit or reach a different barrier id, are
+//! `PartialWarp`. A warp arrival counts 32 threads toward `b`, which must be
+//! a multiple of the warp size.
 //!
 //! `.aligned` is a convergence promise, not barrier state. Mixing aligned and
 //! unaligned forms on one barrier is legal. `Contribution::aligned` is carried
@@ -89,7 +91,10 @@ pub enum Error {
         count: u64,
     },
     /// Executed by no lane, or by a strict subset of the warp's non-exited
-    /// lanes (PTX §9.7.15.1, sync-isa-answers Q3/Q5).
+    /// lanes reaching this barrier as one contribution (PTX §9.7.15.1,
+    /// sync-isa-answers Q3/Q5). Non-aligned pieces are gathered first
+    /// ([`gather`]); there it means the missing lanes exited or reached a
+    /// different barrier id or flavor, or an `.aligned` form ran partial.
     PartialWarp {
         mask: LaneMask,
         live: LaneMask,
@@ -218,6 +223,104 @@ fn contribute(s: &mut State, c: Contribution, flavor: Flavor) -> Result<(u64, bo
     s.warps.insert((c.warp, flavor), ());
     s.complete = arrived == expected;
     Ok((s.gen, s.complete))
+}
+
+// ---------------------------------------------------------------- partial warps
+
+/// Lanes of one warp reaching a barrier instruction in pieces (coordinator
+/// ruling on sync-isa-answers Q3/Q5). A **non-aligned** `barrier.sync` /
+/// `bar.sync` / `barrier.arrive` / `barrier.red` executed by a strict subset
+/// of the warp's non-exited lanes is not an error. Those lanes wait for the
+/// warp's remaining non-exited lanes to reach the same barrier id, at any
+/// instruction site, with the same flavor and `b`. When they all have, the
+/// warp makes its single arrival ([`GatherOutcome::Arrive`] with the full
+/// `live` mask; that is the one [`Contribution`] the barrier sees).
+/// `PartialWarp` fires when the missing lanes exit or reach a different
+/// barrier id or flavor. `.aligned` forms keep the immediate full-warp
+/// requirement. This is per-warp state in front of the per-id [`State`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Gather {
+    pub warp: Warp,
+    pub pending: Option<Pending>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Pending {
+    pub id: u32,
+    pub flavor: Flavor,
+    pub count: u64,
+    /// Lanes that have executed the instruction so far.
+    pub lanes: LaneMask,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GatherCmd {
+    /// The active lanes `mask` execute a barrier instruction on `id`.
+    Execute {
+        id: u32,
+        flavor: Flavor,
+        count: u64,
+        mask: LaneMask,
+        live: LaneMask,
+        aligned: bool,
+    },
+    /// Lanes of the warp exited while others may be waiting.
+    Exit {
+        live: LaneMask,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GatherOutcome {
+    /// The lanes wait for the rest of their warp.
+    Wait,
+    /// Every non-exited lane is here: the warp arrives once with `mask`.
+    Arrive { mask: LaneMask },
+    /// Nothing pending (an exit with no gathering in progress).
+    Idle,
+}
+
+pub fn gather(g: &mut Gather, cmd: GatherCmd) -> Result<GatherOutcome, Error> {
+    match cmd {
+        GatherCmd::Exit { live } => match g.pending {
+            Some(p) => Err(Error::PartialWarp { mask: p.lanes, live }),
+            None => Ok(GatherOutcome::Idle),
+        },
+        GatherCmd::Execute { id, flavor, count, mask, live, aligned } => {
+            let so_far = g.pending.map_or(0, |p| p.lanes);
+            if mask == 0 || mask & !live != 0 {
+                return Err(Error::PartialWarp { mask: mask | so_far, live });
+            }
+            if aligned {
+                if g.pending.is_some() || mask != live {
+                    return Err(Error::PartialWarp { mask: mask | so_far, live });
+                }
+                return Ok(GatherOutcome::Arrive { mask: live });
+            }
+            if let Some(p) = g.pending {
+                if p.id != id || p.flavor != flavor {
+                    return Err(Error::PartialWarp { mask: p.lanes, live });
+                }
+                if p.count != count {
+                    return Err(Error::ContractMismatch { expected: p.count, observed: count });
+                }
+                if p.lanes & mask != 0 {
+                    return Err(Error::Duplicate { warp: g.warp });
+                }
+            }
+            let lanes = so_far | mask;
+            if lanes & !live != 0 {
+                return Err(Error::PartialWarp { mask: lanes, live });
+            }
+            if lanes == live {
+                g.pending = None;
+                Ok(GatherOutcome::Arrive { mask: live })
+            } else {
+                g.pending = Some(Pending { id, flavor, count, lanes });
+                Ok(GatherOutcome::Wait)
+            }
+        }
+    }
 }
 
 /// Exit check. An incomplete generation is never an error, only a lint.
