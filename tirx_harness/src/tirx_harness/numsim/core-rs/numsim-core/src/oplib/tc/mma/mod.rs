@@ -384,7 +384,7 @@ fn check_form(payload: &TcgenMmaPayload, options: &TcMmaOptions) -> OpResult<For
             "tcgen05.mma.ashift requires a non-block-scaled MMA with TMEM A",
         ));
     }
-    if options.ti16 && kind != TcMmaKind::I8 {
+    if options.ti16 && !matches!(kind, TcMmaKind::I8 | TcMmaKind::Ti16) {
         return Err(OpError::invalid(".ti16 is a kind::i8 operand spelling"));
     }
     if options.lut_b.is_some() && !matches!(kind, TcMmaKind::F8f6f4 | TcMmaKind::MxF8f6f4) {
@@ -524,7 +524,7 @@ pub(super) fn run(
             float_mma(&io, payload, options, &form, tmem_write)
         }
         TcMmaKind::F8f6f4 => f8f6f4_mma(&io, payload, options, &form, tmem_write),
-        TcMmaKind::I8 => integer_mma(&io, payload, options, &form, tmem_write),
+        TcMmaKind::I8 | TcMmaKind::Ti16 => integer_mma(&io, payload, options, &form, tmem_write),
         TcMmaKind::MxF4 | TcMmaKind::MxF4Nvf4 => mxf4_mma(&io, payload, options, &form, tmem_write),
         TcMmaKind::MxF8f6f4 => mxf8f6f4_mma(&io, payload, options, &form, tmem_write),
     }

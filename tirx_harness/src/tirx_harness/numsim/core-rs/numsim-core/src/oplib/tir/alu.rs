@@ -45,23 +45,9 @@ fn of64(x: f64) -> u128 {
     u128::from(x.to_bits())
 }
 
-/// Legacy f32 carrier for scalar TIR f16/bf16 values (see `tir.rs` docs):
-/// bit 16 set = bits 32..64 hold the unrounded f32 value; bits 0..16 always
-/// hold the f16/bf16 rounding of it (what stores and PTX ops read).
-pub(super) const CARRY_FLAG: u128 = 1 << 16;
-
-/// Carried f32 of a scalar half register, if any.
-#[inline]
-pub(super) fn half_carry(x: u128) -> Option<f32> {
-    (x & CARRY_FLAG != 0).then(|| f32::from_bits((x >> 32) as u32))
-}
-
-/// f16/bf16 <-> f32 with the legacy codecs (honouring a carried f32).
+/// f16/bf16 <-> f32 with the legacy codecs.
 #[inline]
 pub(super) fn half_dec(d: Dtype, x: u128) -> f32 {
-    if let Some(v) = half_carry(x) {
-        return v;
-    }
     if d == Dtype::F16 {
         cvt::fp16_bits_to_f32(x as u16)
     } else {
@@ -70,17 +56,11 @@ pub(super) fn half_dec(d: Dtype, x: u128) -> f32 {
 }
 #[inline]
 fn half_enc(d: Dtype, y: f32) -> u128 {
-    let bits = u128::from(if d == Dtype::F16 {
+    u128::from(if d == Dtype::F16 {
         cvt::f32_to_fp16_bits(y)
     } else {
         cvt::f32_to_bf16_bits(y)
-    });
-    // Exact results need no carrier (keeps the zero-extended encoding).
-    if half_dec(d, bits).to_bits() == y.to_bits() {
-        bits
-    } else {
-        bits | CARRY_FLAG | (u128::from(y.to_bits()) << 32)
-    }
+    })
 }
 
 fn unsupported_un(op: UnOp, d: Dtype) -> OpError {
@@ -183,9 +163,6 @@ pub(super) fn unary(op: UnOp, d: Dtype, x: u128) -> OpResult<u128> {
             UnOp::Neg => Ok((x ^ (1 << 63)) & m),
             _ => f64_unary(op, f64v(x)).map(of64).ok_or_else(|| unsupported_un(op, d)),
         },
-        Dtype::F16 | Dtype::BF16 if half_carry(x).is_some() => {
-            f32_unary(op, half_dec(d, x)).map(|y| half_enc(d, y)).ok_or_else(|| unsupported_un(op, d))
-        }
         Dtype::F16 | Dtype::BF16 => match op {
             UnOp::Neg => Ok((x ^ 0x8000) & m),
             UnOp::Abs => Ok(x & 0x7fff),
@@ -313,9 +290,6 @@ pub(super) fn ternary(op: TerOp, d: Dtype, x: u128, y: u128, z: u128) -> OpResul
         TerOp::Fma => match d {
             Dtype::F32 => Ok(of32(sc::fma_f32_rn(f32v(x), f32v(y), f32v(z)))),
             Dtype::F64 => Ok(of64(f64v(x).mul_add(f64v(y), f64v(z)))),
-            Dtype::F16 | Dtype::BF16 if [x, y, z].iter().any(|v| half_carry(*v).is_some()) => {
-                Ok(half_enc(d, sc::fma_f32_rn(half_dec(d, x), half_dec(d, y), half_dec(d, z))))
-            }
             Dtype::F16 => Ok(u128::from(sc::fma_f16_bits_rn(x as u16, y as u16, z as u16))),
             Dtype::BF16 => Ok(u128::from(sc::fma_bf16_bits_rn(x as u16, y as u16, z as u16))),
             _ if d.is_int() => {

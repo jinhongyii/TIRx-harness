@@ -828,3 +828,123 @@ W4 can drop the bit-16 hack.
     `override_global_dim_stride_*` lower/upper stride operands (15).
   - `tcgen05.ld` `.spcompress` / `.abs` / `.NaN` (5).
   - `%nwarpid` (2): there is no `SpecialReg`.
+
+## W4-7 (2026-10-08): tcgen ld/st/cp and ldmatrix APIs for W2
+
+New pure functions in `oplib/mem.rs` (+ `oplib/mem/{tcgen,matrix,tests}.rs`),
+re-exported from `oplib`. They delegate to `numsim_oplib::{tcgen05::{layouts,
+ld, smem_desc}, layout::matrix}` (the legacy layout code) and keep closure
+errors' kind. Engine checks (full warp, TMEM allocation/lifecycle, byte
+validity, memory resolution, footprints) stay with W2.
+
+**tcgen05.ld / tcgen05.st** (every shape `.32x32b/.16x64b/.16x128b/.16x256b/
+.16x32bx2`, `.num` x1..x128, `.pack::16b`/`.unpack::16b`):
+- `tcgen_ldst_registers(shape: TcShape, num: u16) -> OpResult<usize>` — data
+  registers (`registers_per_num * num`), validating the shape's `.num`.
+- `tcgen_ldst_map(shape: TcShape, num: u16, pack16: bool, warp_in_cta: u32,
+  taddr: u32) -> OpResult<TcgenLdstMap>` — legacy `raw_tcgen05_ldst_location`
+  for all 32 lanes. `TcShape::S16x32bx2 { split_off }` carries
+  immHalfSplitoff. A taddr lane < 32 is warp-relative, otherwise it must be in
+  the warp's subpartition `32 * (warp_in_cta % 4)` (both legacy conventions).
+  `map.pieces(register, lane) -> &[TcgenLdstPiece { tmem_lane, column,
+  cell_byte, reg_byte, len }]`: 1 piece (4 bytes) or, packed, 2 pieces (the low
+  2 bytes of columns c and c+1 <-> register bytes 0..2 / 2..4). `map.all()`
+  for footprints (TMEM byte offset = `addr::tmem_byte_offset(lane, col) +
+  cell_byte`).
+  - ld: for each register r (`args.dsts` in order, excluding the `.red`
+    register) and lane, read the pieces into the register's bytes.
+  - st: write the register's bytes into the pieces (`.unpack::16b` writes
+    only bytes 0..2 of each cell).
+- `tcgen_ld_dst_count(shape, num, pack16, red: bool, spcompress: Option<(max,
+  abs)>) -> OpResult<usize>` — destination count incl. the trailing `.red`
+  register; validates `.red` (unpacked 32x32b/16x32bx2, >= x2) and
+  `.spcompress` (unpacked 32x32b, >= x4).
+- `TcgenLdRed::new(op: ReduxOp /*Min|Max*/, ty: Dtype /*F32|U32|S32*/, abs,
+  nan) -> OpResult<TcgenLdRed>`; `tcgen_ld_reduce(red, values: &[u32]) ->
+  OpResult<u32>`: one lane's left fold over the loaded words in register
+  order (legacy reduces the values just loaded; the result validity is the AND
+  of the inputs'). `TcgenLdArgs.red` gives `op` and the reduction register's
+  type; `.abs`/`.NaN` are not in `TcgenLdArgs` (lowering rejects them), so
+  pass `false`.
+- `tcgen_ld_spcompress(values: &[u32], valid: &[bool], max, abs) ->
+  OpResult<(Vec<u32>, Vec<bool>)>` — one lane: `num.div_ceil(32)` metadata
+  words then `num / 2` kept values, with per-output validity (lowering does
+  not emit `.spcompress` yet; `TcgenLdArgs.spcompress` would also need
+  max/abs).
+
+**tcgen05.cp**:
+- `tcgen_cp_plan(rows: u16, bits: u16, multicast: u8, decompress_bits: u8,
+  sdesc: u64, taddr: u32, cta_group: u8, arch: TcArch) -> OpResult<TcgenCpPlan>`
+  — `TcgenCpArgs` fields as lowered (multicast 0/1=`warpx2::02_13`/
+  2=`warpx2::01_23`/3=`warpx4`; decompress 0/4/6). Legacy `raw_tcgen05_cp`:
+  `plan.words: Vec<TcgenCpWord { src: ByteSpan /*shared-window address, 4 or
+  2 (b4) / 3 (b6) bytes, swizzled per the descriptor*/, lanes, lane_count,
+  column }>` in legacy row/word order; `word.lanes()` are the destination
+  TMEM lanes (multicast replication); `plan.lane_end/column_end` bound the
+  destination rectangle. The plan is CTA-independent: for `cta_group::2`
+  apply it in this CTA and its peer (`rank ^ 1`), each reading its *own*
+  shared window and writing its own TMEM (legacy `target_views`).
+- `plan.pairs() -> (Vec<ByteSpan>, Vec<(lane, col)>)` — pairwise form for
+  `Payload::TcgenCp { src, dst, decompress_bits }`: `src[k]` (2/3/4 bytes,
+  offset relative to the shared window) lands decoded as the 4-byte cell
+  `dst[k]` (`addr::tmem_byte_offset(lane, col)`, len 4). This is pairwise,
+  NOT concatenated like `Payload::Copy`.
+- `tcgen_cp_decode(src: &[u8], decompress_bits: u8) -> OpResult<[u8; 4]>` —
+  decodes one source word at landing (b4: nibbles `<< 2`; b6: four 6-bit
+  codes).
+
+**ldmatrix / stmatrix** (all legacy forms: `m8n8.b16` x1/2/4 [.trans],
+`m16n16.b8.trans`, `m8n16.s8.s4`, `m8n16|m16n16 .b8x16.b6x16_p32|.b4x16_p64`,
+`stmatrix m8n8.b16` [.trans], `stmatrix m16n8.b8.trans`):
+- `ldmatrix_plan(shape: MatrixShape, num: u8, trans: bool, fmt: MatrixFmt) ->
+  OpResult<LdMatrixPlan { registers, transpose, source_bits, signed,
+  providers, row_bytes }>` — `registers` = destination count (`2 * num` for
+  m16n16); lanes `0..providers` supply row addresses; each provider row
+  contributes `row_bytes` (16/12/8).
+- `ldmatrix_fragments(&plan, row_address: Fn(provider) -> OpResult<u64>,
+  read: FnMut(provider, byte_delta, len) -> OpResult<Vec<u8>>) ->
+  OpResult<Vec<WarpValue<u32>>>` — `result[r][lane]` = destination register
+  r. `read` returns `len` bytes at `byte_delta` past the provider's row
+  pointer (resolve the provider lane's `addr` operand). b8 formats require
+  16-byte-aligned rows (via `row_address`). s4 sign-extends each nibble.
+  `plan.accesses(lane, row_address) -> OpResult<Vec<MatrixAccess>>` for
+  footprints.
+- `stmatrix_plan(shape, num, trans) -> OpResult<StMatrixPlan { registers,
+  providers, .. }>`; `stmatrix_writes(&plan, sources: &[WarpValue<u32>]
+  /*register-major*/, row_address) -> OpResult<Vec<(provider, byte_delta,
+  bytes)>>` — legacy `raw_stmatrix` order; rows must be 16-byte aligned.
+- These replace W2's hand-written `m8n8.b16` path in `handlers/warp.rs`
+  (same results for that form).
+
+## W4-8 (2026-10-08): phase 4 — ALU fast paths, contract batch 3, W2 call sites
+
+- **ALU performance (W2-6).** `tir::{unary,binary,ternary,compare,cast}`
+  now dispatch on `(op, Dtype)` once per call and run a branch-free
+  `[u64; 32]` loop on the native type + masked blend (`oplib/tir/fast.rs`);
+  everything else falls back to the generic path. Hardware FMA / F16C are
+  used with runtime detection where bit-identical (NaN lanes recomputed by
+  the scalar definition). Bit-exactness: `tir::tests::fast_paths_match_the_
+  generic_path` (random + special operands, partial masks, every fast
+  (op, dtype)), `simd` tests (FMA incl. NaNs, exhaustive f16 decode, f16
+  encode per exponent class), `ptx/cvt/hot.rs` tests (hot cvt forms vs the
+  spelling dispatch). Bench: `cargo bench -p numsim-core --bench oplib`
+  (numbers in the W4 report). No signature change.
+- **`TcMmaKind::Ti16`** is handled as the kind::i8 driver with the s1z4m11
+  operand spelling (`tc_mma_ctas` sets `options.ti16` from the kind).
+  `TcMmaOptions::ti16` stays for callers that pass it explicitly. W2:
+  `sched/mod.rs:1384` still reads the removed `args.ti16` — drop that field
+  from the options literal.
+- **`.lut_b`**: `TcMmaOptions::lut_b` is the TMEM taddr (`lane<<16|col`) of
+  the table, i.e. the value of `TcgenMmaArgs::lut_b_addr` (`addr@tmem`); the
+  table is read through `tmem_read` (never smem). W2: evaluate
+  `args.lut_b_addr` and pass it as `options.lut_b`, then remove the
+  `tcgen05.mma .lut_b` fail-closed in `handlers/tcgen.rs`.
+- **Split-stride overrides**: new `TensorMapDesc::apply_overrides(&[(field,
+  ord, value)])` combines the per-ord `GlobalStride` lower operands with the
+  shared `GlobalStrideUpper` exactly like legacy `override_tensor_map`
+  (`stride = (lower | nibble(ord) << 32) << 4`, full `GlobalDim`/stride sets,
+  dims in 1..=255). `replace(GlobalStrideUpper, ..)` alone is `Invalid`. W2:
+  replace the per-override `desc.replace` loop in
+  `handlers/async_copy.rs` (~547) with one `apply_overrides` call.
+- **`tcgen05.ld.red` modifiers**: pass `TcgenLdArgs::{red_abs, red_nan}` to
+  `TcgenLdRed::new(op, ty, abs, nan)` (W4-7).

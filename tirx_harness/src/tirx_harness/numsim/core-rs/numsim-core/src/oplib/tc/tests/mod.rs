@@ -186,7 +186,6 @@ fn payload(
             collector_a: CollectorOp::None,
             collector_b: CollectorOp::None,
             ashift: false,
-            ti16: false,
             lut_b: false,
             lut_b_addr: None,
         },

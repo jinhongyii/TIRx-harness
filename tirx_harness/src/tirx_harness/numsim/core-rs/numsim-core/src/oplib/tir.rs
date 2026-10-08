@@ -8,14 +8,11 @@
 //! touching lanes, so an unmodeled (op, dtype) is `Unsupported` even under an
 //! empty mask. Outputs are written only for lanes in `mask`.
 //!
-//! f16/bf16 TIR expressions (legacy f32 carrier): legacy evaluated TIR half
-//! arithmetic in f32 and rounded only at a cast to half or a memory store.
-//! A scalar F16/BF16 result that is not exactly representable is therefore
-//! written as its rounded bits (0..16, what stores/PTX ops read) plus the
-//! unrounded f32 in bits 32..64 and `alu::CARRY_FLAG` (bit 16); TIR ops,
-//! compares and casts reading a scalar half honour the carried f32, `Mov`
-//! copies it, stores drop it. Vector halves round per op (no room to carry).
-//! See docs/development/numsim-behaviour-deltas.md (D-1).
+//! f16/bf16: each op decodes, computes in f32 and rounds back (RNE), so a
+//! half register always holds plain zero-extended bits. Legacy's f32
+//! carrier across expression chains is reproduced by lowering, which
+//! evaluates half TIR chains in f32 with one Cast at the boundary
+//! (docs/development/numsim-behaviour-deltas.md, D1).
 //!
 //! Result types: `Unary` writes a value of `ty`, except `IsNan/IsInf/IsFinite`
 //! which write `Ty{Pred, ty.lanes}` (0/1 per element). `Binary`/`Ternary`
@@ -24,6 +21,7 @@
 mod alu;
 mod convert;
 mod elem;
+mod fast;
 #[cfg(test)]
 mod tests;
 
@@ -45,12 +43,6 @@ fn probe<T>(r: OpResult<T>) -> OpResult {
     }
 }
 
-/// Scalar F16/BF16: values may carry an f32 (see module docs).
-#[inline]
-fn scalar_half(ty: Ty) -> bool {
-    ty.lanes == 1 && matches!(ty.elem, Dtype::F16 | Dtype::BF16)
-}
-
 /// Map `f` over every element of every active lane: inputs of `in_ty`,
 /// output of `out_ty` (same lane count).
 #[inline]
@@ -63,26 +55,19 @@ fn map_elems<const N: usize>(
     mut f: impl FnMut([u128; N]) -> OpResult<u128>,
 ) -> OpResult {
     let (ib, ob) = (in_ty.elem.bits(), out_ty.elem.bits());
-    let (carry_in, carry_out) = (scalar_half(in_ty), scalar_half(out_ty));
     for lane in mask.lanes() {
         let vals: [Packed; N] = std::array::from_fn(|k| load(ins[k], in_ty, lane));
         let mut r: Packed = [0; 4];
         for e in 0..in_ty.lanes as usize {
-            let x: [u128; N] =
-                std::array::from_fn(|k| if carry_in { u128::from(vals[k][0]) } else { get(&vals[k], e, ib) });
-            let y = f(x)?;
-            if carry_out {
-                r[0] = y as u64;
-            } else {
-                put(&mut r, e, ob, y);
-            }
+            let x: [u128; N] = std::array::from_fn(|k| get(&vals[k], e, ib));
+            put(&mut r, e, ob, f(x)?);
         }
         store(out, out_ty, lane, &r);
     }
     Ok(())
 }
 
-pub(super) fn unary(op: UnOp, ty: Ty, a: &[WarpValue<u64>], out: &mut [WarpValue<u64>], mask: WarpMask) -> OpResult {
+pub(super) fn unary_generic(op: UnOp, ty: Ty, a: &[WarpValue<u64>], out: &mut [WarpValue<u64>], mask: WarpMask) -> OpResult {
     let out_ty = if alu::unary_yields_pred(op) { Ty::vector(Dtype::Pred, ty.lanes) } else { ty };
     check_slots(a.len(), ty, "unary operand")?;
     check_slots(out.len(), out_ty, "unary result")?;
@@ -90,7 +75,7 @@ pub(super) fn unary(op: UnOp, ty: Ty, a: &[WarpValue<u64>], out: &mut [WarpValue
     map_elems(ty, out_ty, [a], out, mask, |[x]| alu::unary(op, ty.elem, x))
 }
 
-pub(super) fn binary(
+pub(super) fn binary_generic(
     op: BinOp,
     ty: Ty,
     a: &[WarpValue<u64>],
@@ -105,7 +90,7 @@ pub(super) fn binary(
     map_elems(ty, ty, [a, b], out, mask, |[x, y]| alu::binary(op, ty.elem, x, y))
 }
 
-pub(super) fn ternary(
+pub(super) fn ternary_generic(
     op: TerOp,
     ty: Ty,
     a: &[WarpValue<u64>],
@@ -122,7 +107,7 @@ pub(super) fn ternary(
     map_elems(ty, ty, [a, b, c], out, mask, |[x, y, z]| alu::ternary(op, ty.elem, x, y, z))
 }
 
-pub(super) fn compare(op: CmpOp, ty: Ty, a: &[WarpValue<u64>], b: &[WarpValue<u64>], mask: WarpMask) -> OpResult<WarpMask> {
+pub(super) fn compare_generic(op: CmpOp, ty: Ty, a: &[WarpValue<u64>], b: &[WarpValue<u64>], mask: WarpMask) -> OpResult<WarpMask> {
     if !ty.is_scalar() {
         return Err(OpError::unsupported(format!("compare {op:?} on vector {ty}")));
     }
@@ -132,11 +117,8 @@ pub(super) fn compare(op: CmpOp, ty: Ty, a: &[WarpValue<u64>], b: &[WarpValue<u6
     let bits = ty.elem.bits();
     let mut result = 0u32;
     for lane in mask.lanes() {
-        let (x, y) = if scalar_half(ty) {
-            (u128::from(a[0][lane]), u128::from(b[0][lane]))
-        } else {
-            (get(&load(a, ty, lane), 0, bits), get(&load(b, ty, lane), 0, bits))
-        };
+        let x = get(&load(a, ty, lane), 0, bits);
+        let y = get(&load(b, ty, lane), 0, bits);
         if alu::compare(op, ty.elem, x, y)? {
             result |= 1 << lane;
         }
@@ -151,7 +133,7 @@ fn check_cast(from: Ty, to: Ty) -> OpResult {
     Ok(())
 }
 
-pub(super) fn cast(
+pub(super) fn cast_generic(
     from: Ty,
     to: Ty,
     rnd: Rounding,
@@ -165,6 +147,59 @@ pub(super) fn cast(
     check_slots(out.len(), to, "cast result")?;
     probe(convert::cast_elem(from.elem, to.elem, rnd, sat, 0))?;
     map_elems(from, to, [src], out, mask, |[x]| convert::cast_elem(from.elem, to.elem, rnd, sat, x))
+}
+
+/// `Instr::Unary`: monomorphic fast path (`fast.rs`) or the generic path.
+#[inline]
+pub(super) fn unary(op: UnOp, ty: Ty, a: &[WarpValue<u64>], out: &mut [WarpValue<u64>], mask: WarpMask) -> OpResult {
+    fast::unary(op, ty, a, out, mask).unwrap_or_else(|| unary_generic(op, ty, a, out, mask))
+}
+
+/// `Instr::Binary`.
+#[inline]
+pub(super) fn binary(
+    op: BinOp,
+    ty: Ty,
+    a: &[WarpValue<u64>],
+    b: &[WarpValue<u64>],
+    out: &mut [WarpValue<u64>],
+    mask: WarpMask,
+) -> OpResult {
+    fast::binary(op, ty, a, b, out, mask).unwrap_or_else(|| binary_generic(op, ty, a, b, out, mask))
+}
+
+/// `Instr::Ternary`.
+#[inline]
+pub(super) fn ternary(
+    op: TerOp,
+    ty: Ty,
+    a: &[WarpValue<u64>],
+    b: &[WarpValue<u64>],
+    c: &[WarpValue<u64>],
+    out: &mut [WarpValue<u64>],
+    mask: WarpMask,
+) -> OpResult {
+    fast::ternary(op, ty, a, b, c, out, mask).unwrap_or_else(|| ternary_generic(op, ty, a, b, c, out, mask))
+}
+
+/// `Instr::Compare`.
+#[inline]
+pub(super) fn compare(op: CmpOp, ty: Ty, a: &[WarpValue<u64>], b: &[WarpValue<u64>], mask: WarpMask) -> OpResult<WarpMask> {
+    fast::compare(op, ty, a, b, mask).unwrap_or_else(|| compare_generic(op, ty, a, b, mask))
+}
+
+/// `Instr::Cast`.
+#[inline]
+pub(super) fn cast(
+    from: Ty,
+    to: Ty,
+    rnd: Rounding,
+    sat: bool,
+    src: &[WarpValue<u64>],
+    out: &mut [WarpValue<u64>],
+    mask: WarpMask,
+) -> OpResult {
+    fast::cast(from, to, rnd, sat, src, out, mask).unwrap_or_else(|| cast_generic(from, to, rnd, sat, src, out, mask))
 }
 
 pub(super) fn convert_bits(from: Ty, to: Ty, rnd: Rounding, sat: bool, src: u128) -> OpResult<u128> {

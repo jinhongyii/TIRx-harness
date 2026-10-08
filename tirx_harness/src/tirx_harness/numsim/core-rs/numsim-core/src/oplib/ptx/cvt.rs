@@ -17,6 +17,7 @@ use super::{Mods, Operands, Resolved};
 use crate::oplib::{OpError, OpResult, PtxIo};
 use numsim_oplib::cvt::{CvtOperands, CvtSpelling, CvtType};
 
+mod hot;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -228,6 +229,9 @@ pub(in crate::oplib) fn resolve(
             "{name} ({text}): source carriers {:?} wider than 64 bits",
             ops.src_tys
         )));
+    }
+    if let Some(direct) = hot::select(&parsed, ops) {
+        return Ok(Some(Resolved::Direct(direct)));
     }
     let ops = ops.clone();
     Ok(Some(Resolved::Boxed(Box::new(

@@ -35,3 +35,8 @@ harness = false
 [[bench]]
 name = "interp"
 harness = false
+
+# W4: oplib ALU / PTX hot-form microbenches.
+[[bench]]
+name = "oplib"
+harness = false

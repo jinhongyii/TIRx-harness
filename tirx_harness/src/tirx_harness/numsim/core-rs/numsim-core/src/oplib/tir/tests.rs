@@ -67,9 +67,8 @@ fn half_arith_and_vectors() {
     let a = 0x4000_3c00u64;
     let b = 0x3c00_3c00u64;
     assert_eq!(bin(BinOp::Add, Ty::F16X2, a, b).unwrap(), 0x4200_4000);
-    // Scalar halves keep the legacy f32 carrier; the stored (low) bits round.
-    assert_eq!(bin(BinOp::Add, Ty::F16, 0x3c00, 0x1000).unwrap() & 0xffff, 0x3c00);
-    assert_eq!(bin(BinOp::Add, Ty::F16, 0x3c00, 0x1001).unwrap() & 0xffff, 0x3c01);
+    assert_eq!(bin(BinOp::Add, Ty::F16, 0x3c00, 0x1000).unwrap(), 0x3c00);
+    assert_eq!(bin(BinOp::Add, Ty::F16, 0x3c00, 0x1001).unwrap(), 0x3c01);
     // bf16x2 multiply: 1.5 * 2 = 3, -1 * 0.5 = -0.5.
     assert_eq!(bin(BinOp::Mul, Ty::BF16X2, 0xbf80_3fc0, 0x3f00_4000).unwrap(), 0xbf00_4040);
     assert_eq!(un(UnOp::Neg, Ty::F16, 0x3c00).unwrap(), 0xbc00);
@@ -370,22 +369,89 @@ fn convert_bits_single_values() {
 }
 
 #[test]
-fn half_chains_keep_the_legacy_f32_carrier_until_store() {
-    // 1 + 2^-11 is not an f16: legacy kept it in f32 across the chain.
-    let one = 0x3c00u64;
-    let tiny = 0x1000u64; // 2^-11
-    let sum = bin(BinOp::Add, Ty::F16, one, tiny).unwrap();
-    assert_eq!(sum & 0xffff, 0x3c00, "stores/PTX see the rounded value");
-    assert_ne!(sum & (1 << 16), 0, "inexact result carries its f32");
-    // (1 + 2^-11) + 2^-11 = 1 + 2^-10: exact in f16 only through the carrier
-    // (per-op rounding would give 1.0 twice).
-    let chained = bin(BinOp::Add, Ty::F16, sum, tiny).unwrap();
-    assert_eq!(chained, 0x3c01);
-    // Casting the carried value to f32 is exact; to f16 rounds it.
-    assert_eq!(cv(Ty::F16, Ty::F32, Rounding::Default, false, sum).unwrap(), f(1.0 + 2f32.powi(-11)));
-    assert_eq!(cv(Ty::F16, Ty::F16, Rounding::Default, false, sum).unwrap(), 0x3c00);
-    // Compare sees the carried value.
-    assert!(cmp(CmpOp::Gt, Ty::F16, sum, one));
-    // Exact results stay zero-extended.
-    assert_eq!(bin(BinOp::Add, Ty::F16, one, one).unwrap(), 0x4000);
+fn half_registers_are_plain_zero_extended_bits() {
+    // Each half op rounds (RNE); chains in f32 are lowering's job (D1).
+    let sum = bin(BinOp::Add, Ty::F16, 0x3c00, 0x1000).unwrap(); // 1 + 2^-11 -> tie -> 1
+    assert_eq!(sum, 0x3c00);
+    assert_eq!(bin(BinOp::Add, Ty::F16, sum, 0x1000).unwrap(), 0x3c00);
+    assert_eq!(cv(Ty::F16, Ty::F32, Rounding::Default, false, sum).unwrap(), f(1.0));
+}
+
+/// Bit-exact equivalence of every monomorphic fast path (`fast.rs`) with the
+/// generic element path over random and special operands and partial masks.
+#[test]
+fn fast_paths_match_the_generic_path() {
+    use super::{binary_generic, cast_generic, compare_generic, ternary_generic, unary_generic};
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let specials: [u64; 16] = [
+        0, 1, 0xffff_ffff_ffff_ffff, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0001, 0xffc0_0000,
+        0x7ff8_0000_0000_0001, 0x8000_0000_0000_0000, 0x7c00, 0xfc01, 0x7f7f_ffff, 0x0000_0001_0000_0000, 0x80, 0x7fff,
+    ];
+    let mut operand = |ty: Ty| -> Vec<WarpValue<u64>> {
+        let m = if ty.bits() >= 64 { u64::MAX } else { (1u64 << ty.bits()) - 1 };
+        vec![std::array::from_fn(|l| (if l % 4 == 0 { specials[(next() % 16) as usize] } else { next() }) & m)]
+    };
+    let ints = [Dtype::U8, Dtype::U16, Dtype::U32, Dtype::U64, Dtype::S8, Dtype::S16, Dtype::S32, Dtype::S64];
+    let floats = [Dtype::F32, Dtype::F64, Dtype::F16, Dtype::BF16];
+    let all: Vec<Dtype> = ints.iter().chain(floats.iter()).copied().chain([Dtype::Pred]).collect();
+    let mask = WarpMask(0xdead_beef);
+    let same = |what: String, f: OpResult, g: OpResult, fo: &[WarpValue<u64>], go: &[WarpValue<u64>]| {
+        match (&f, &g) {
+            (Ok(()), Ok(())) => assert_eq!(fo, go, "{what}"),
+            (Err(x), Err(y)) => assert_eq!(x, y, "{what}"),
+            _ => panic!("{what}: fast {f:?} generic {g:?}"),
+        }
+    };
+    for _round in 0..64 {
+        for &d in &all {
+            let ty = Ty::scalar(d);
+            for op in [
+                BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod, BinOp::FloorDiv, BinOp::FloorMod,
+                BinOp::Min, BinOp::Max, BinOp::And, BinOp::Or, BinOp::Xor, BinOp::Shl, BinOp::Shr,
+            ] {
+                let (a, b, init) = (operand(ty), operand(ty), operand(ty));
+                if fast::binary(op, ty, &a, &b, &mut init.clone(), mask).is_none() {
+                    continue;
+                }
+                let (mut fo, mut go) = (init.clone(), init.clone());
+                let f = fast::binary(op, ty, &a, &b, &mut fo, mask).unwrap();
+                let g = binary_generic(op, ty, &a, &b, &mut go, mask);
+                same(format!("binary {op:?} {d}"), f, g, &fo, &go);
+            }
+            for op in [UnOp::Neg, UnOp::Abs, UnOp::Not, UnOp::Sqrt, UnOp::Exp, UnOp::Exp2, UnOp::Log, UnOp::Log2, UnOp::Rsqrt] {
+                let (a, init) = (operand(ty), operand(ty));
+                let (mut fo, mut go) = (init.clone(), init.clone());
+                let Some(f) = fast::unary(op, ty, &a, &mut fo, mask) else { continue };
+                let g = unary_generic(op, ty, &a, &mut go, mask);
+                same(format!("unary {op:?} {d}"), f, g, &fo, &go);
+            }
+            {
+                let (a, b, c, init) = (operand(ty), operand(ty), operand(ty), operand(ty));
+                let (mut fo, mut go) = (init.clone(), init.clone());
+                if let Some(f) = fast::ternary(TerOp::Fma, ty, &a, &b, &c, &mut fo, mask) {
+                    let g = ternary_generic(TerOp::Fma, ty, &a, &b, &c, &mut go, mask);
+                    same(format!("fma {d}"), f, g, &fo, &go);
+                }
+            }
+            for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+                let (a, b) = (operand(ty), operand(ty));
+                let Some(f) = fast::compare(op, ty, &a, &b, mask) else { continue };
+                assert_eq!(f, compare_generic(op, ty, &a, &b, mask), "compare {op:?} {d}");
+            }
+            for &to in &all {
+                let to_ty = Ty::scalar(to);
+                let (a, init) = (operand(ty), operand(to_ty));
+                let (mut fo, mut go) = (init.clone(), init.clone());
+                let Some(f) = fast::cast(ty, to_ty, Rounding::Default, false, &a, &mut fo, mask) else { continue };
+                let g = cast_generic(ty, to_ty, Rounding::Default, false, &a, &mut go, mask);
+                same(format!("cast {d} -> {to}"), f, g, &fo, &go);
+            }
+        }
+    }
 }

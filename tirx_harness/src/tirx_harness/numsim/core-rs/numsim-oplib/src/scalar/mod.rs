@@ -193,7 +193,10 @@ pub fn floor_div_i64(lhs: i64, rhs: i64) -> Result<i64, OpError> {
 #[inline]
 pub fn floor_mod_i64(lhs: i64, rhs: i64) -> Result<i64, OpError> {
     let quotient = floor_div_i64(lhs, rhs)?;
-    Ok(lhs - quotient * rhs)
+    // Wrapping: e.g. `1 mod i64::MIN` has quotient -1 and `-1 * MIN`
+    // overflows although the result (`MIN + 1`) is representable. Legacy
+    // release builds wrapped the same way; debug builds panicked.
+    Ok(lhs.wrapping_sub(quotient.wrapping_mul(rhs)))
 }
 
 pub fn ptx_fns_b32(mask: u32, base: u32, offset: i32) -> u32 {

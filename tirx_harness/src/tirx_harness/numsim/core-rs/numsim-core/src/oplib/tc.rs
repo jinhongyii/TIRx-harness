@@ -178,7 +178,7 @@ fn decode_one(idesc: u32, kind: TcMmaKind, cta: usize, ws: bool) -> OpResult<Ins
                 ..common
             }
         }
-        TcMmaKind::I8 => {
+        TcMmaKind::I8 | TcMmaKind::Ti16 => {
             // Format 3/3 is the `.ti16` (s1z4m11) operand spelling; it has no
             // `Dtype`, so `a`/`b` stay `None`.
             let ti16 = (idesc >> 7) & 7 == 3;
@@ -381,10 +381,10 @@ pub(super) fn tc_mma_ctas(
     tmem_read: TcTmemRead<'_>,
     tmem_write: TcTmemWrite<'_>,
 ) -> OpResult {
-    // The program's form flags (`TcgenMmaArgs::{ti16, lut_b}`) select the
+    // The program's form (`TcMmaKind::Ti16`, `TcgenMmaArgs::lut_b`) selects the
     // form; the options carry what the args cannot (arch, LUT taddr, ...).
     let mut options = *options;
-    options.ti16 |= payload.args.ti16;
+    options.ti16 |= payload.args.kind == TcMmaKind::Ti16;
     if payload.args.lut_b && options.lut_b.is_none() {
         return Err(OpError::unsupported(
             "tcgen05.mma .lut_b needs the lookup-table taddr in TcMmaOptions::lut_b",

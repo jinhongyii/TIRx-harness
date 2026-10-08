@@ -403,6 +403,11 @@ pub(super) fn replace(
         TmapField::BoxDim => Some("box_dim"),
         TmapField::GlobalDim => Some("global_dim"),
         TmapField::GlobalStride => Some("global_stride"),
+        TmapField::GlobalStrideUpper => {
+            return Err(OpError::invalid(
+                "GlobalStrideUpper is an override operand: use TensorMapDesc::apply_overrides",
+            ))
+        }
         TmapField::ElementStride => Some("element_stride"),
         TmapField::ElemType => Some("elemtype"),
         TmapField::InterleaveLayout => Some("interleave_layout"),
@@ -412,6 +417,45 @@ pub(super) fn replace(
     if let Some(name) = name {
         image.replace_field(name, index, value_usize)?;
     }
+    *desc = image_to_desc(&image, desc.l2_promotion)?;
+    Ok(())
+}
+
+/// Per-instruction overrides (legacy `override_tensor_map`).
+pub(super) fn apply_overrides(desc: &mut TensorMapDesc, overrides: &[(TmapField, Option<u8>, u64)]) -> OpResult {
+    let mut dims: Vec<(u8, u64)> = Vec::new();
+    let mut lowers: Vec<(u8, u64)> = Vec::new();
+    let mut upper: Option<u64> = None;
+    for &(field, ord, value) in overrides {
+        match field {
+            TmapField::GlobalDim => dims.push((ord.ok_or_else(|| OpError::invalid("GlobalDim override needs an ordinal"))?, value)),
+            TmapField::GlobalStride => {
+                lowers.push((ord.ok_or_else(|| OpError::invalid("GlobalStride override needs an ordinal"))?, value))
+            }
+            TmapField::GlobalStrideUpper => {
+                if ord.is_some() || upper.replace(value).is_some() {
+                    return Err(OpError::invalid("GlobalStrideUpper: exactly one, without an ordinal"));
+                }
+            }
+            _ => replace(desc, field, ord, value)?,
+        }
+    }
+    if dims.is_empty() && lowers.is_empty() && upper.is_none() {
+        return Ok(());
+    }
+    dims.sort_unstable();
+    lowers.sort_unstable();
+    let ordered = |v: &[(u8, u64)]| v.iter().enumerate().all(|(i, (o, _))| usize::from(*o) == i);
+    if !ordered(&dims) || !ordered(&lowers) {
+        return Err(OpError::invalid("TMA override ordinals must be 0..rank without gaps or repeats"));
+    }
+    let rank = usize::from(desc.rank);
+    let mut image = desc_to_image(desc)?;
+    let as_i64 = |v: u64| i64::try_from(v).map_err(|_| OpError::invalid("TMA override operand out of range"));
+    let dims = dims.iter().map(|&(_, v)| as_i64(v)).collect::<OpResult<Vec<_>>>()?;
+    let lowers = lowers.iter().map(|&(_, v)| as_i64(v)).collect::<OpResult<Vec<_>>>()?;
+    let zeros = vec![0i64; rank];
+    image.apply_overrides(rank, &dims, &lowers, as_i64(upper.unwrap_or(0))?, &zeros)?;
     *desc = image_to_desc(&image, desc.l2_promotion)?;
     Ok(())
 }

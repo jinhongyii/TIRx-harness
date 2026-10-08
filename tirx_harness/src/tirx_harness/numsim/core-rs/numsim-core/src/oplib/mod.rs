@@ -21,6 +21,7 @@
 
 mod ptx;
 mod registry;
+mod simd;
 mod tc;
 mod tir;
 mod tma;
@@ -504,9 +505,19 @@ impl TensorMapDesc {
     pub fn decode(bytes: &[u8; 128]) -> OpResult<TensorMapDesc> {
         tma::decode(bytes)
     }
-    /// `tensormap.replace` / per-instruction override.
+    /// `tensormap.replace` (one field). `GlobalStrideUpper` only exists in
+    /// per-instruction overrides: use [`TensorMapDesc::apply_overrides`].
     pub fn replace(&mut self, field: TmapField, ord: Option<u8>, value: u64) -> OpResult {
         tma::replace(self, field, ord, value)
+    }
+    /// All per-instruction overrides of one TMA instruction at once (legacy
+    /// `override_tensor_map(dims[], lower_stride[], upper_stride)`):
+    /// `GlobalDim` (per ord) and `GlobalStride` lower operands (per ord) are
+    /// combined with the shared `GlobalStrideUpper` nibbles as
+    /// `stride[ord] = (lower | upper_nibble(ord) << 32) << 4`; every other
+    /// field is applied as `replace`. Call this instead of looping `replace`.
+    pub fn apply_overrides(&mut self, overrides: &[(TmapField, Option<u8>, u64)]) -> OpResult {
+        tma::apply_overrides(self, overrides)
     }
 }
 
@@ -648,7 +659,9 @@ pub struct TcMmaOptions {
     pub arch: TcArch,
     /// `kind::i8` with the `.ti16` (s1z4m11) operand spelling.
     pub ti16: bool,
-    /// `.lut_b`: TMEM address of the lookup table (f8f6f4 / mxf8f6f4).
+    /// `.lut_b`: TMEM address (taddr, `lane << 16 | column`) of the lookup
+    /// table (f8f6f4 / mxf8f6f4) — the value of `TcgenMmaArgs::lut_b_addr`
+    /// (`addr@tmem`). The table is read through `tmem_read`, never smem.
     pub lut_b: Option<u32>,
     /// `.ws` zero-column-mask descriptor. `None` falls back to the payload's
     /// `disable_output_lane` words (`[lo]` or `[lo, hi]`, as lowering passes
@@ -719,6 +732,19 @@ pub fn tc_collector_transition(
 ) -> OpResult<u8> {
     tc::collector_transition(state, collector_a, collector_b, b_buffer)
 }
+
+// ---------------------------------------------------------------------------
+// Data-movement maps: tcgen05.ld/st/cp, ldmatrix/stmatrix (W4-7)
+// ---------------------------------------------------------------------------
+
+mod mem;
+
+pub use mem::{
+    ldmatrix_fragments, ldmatrix_plan, stmatrix_plan, stmatrix_writes, tcgen_cp_decode,
+    tcgen_cp_plan, tcgen_ld_dst_count, tcgen_ld_reduce, tcgen_ld_spcompress, tcgen_ldst_map,
+    tcgen_ldst_registers, LdMatrixPlan, MatrixAccess, StMatrixPlan, TcgenCpPlan, TcgenCpWord,
+    TcgenLdRed, TcgenLdstMap, TcgenLdstPiece,
+};
 
 // ---------------------------------------------------------------------------
 // Op registry -> SUPPORTED_OPS.md

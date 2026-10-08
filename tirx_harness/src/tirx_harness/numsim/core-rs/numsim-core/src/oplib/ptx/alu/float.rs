@@ -450,6 +450,16 @@ fn mul_f32_direct<const FTZ: bool>(io: &mut PtxIo<'_>) -> OpResult {
 }
 
 fn fma_f32_direct<const FTZ: bool>(io: &mut PtxIo<'_>) -> OpResult {
+    if !FTZ {
+        // `fma.rn.f32` = one IEEE RNE fused multiply-add (`arith::fma_f32`
+        // with `RN`, no ftz/sat returns `mul_add`); lane-parallel hardware FMA.
+        let get = |i: usize| -> [f32; 32] { std::array::from_fn(|l| f32::from_bits(io.srcs[i][l] as u32)) };
+        let r = crate::oplib::simd::fma_f32(&get(0), &get(1), &get(2));
+        for lane in io.mask.lanes() {
+            io.dsts[0][lane] = u64::from(r[lane].to_bits());
+        }
+        return Ok(());
+    }
     for lane in io.mask.lanes() {
         let value = arith::fma_f32(
             src(io, 0, lane),
