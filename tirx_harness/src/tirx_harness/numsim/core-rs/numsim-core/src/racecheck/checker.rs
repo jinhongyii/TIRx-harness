@@ -1009,15 +1009,19 @@ impl Checker {
     }
 
     fn info(&self, w: &Witness) -> WitnessInfo {
-        let (lane, op) = match self.slot_of(w.stamp.actor()) {
-            Some(a) => (a.lane, Some(a.op)),
-            None => (w.lane(), None),
+        // An async op's stamp epoch is `gen_base + milestone`, and `gen_base`
+        // depends on slot reuse (GC timing, slot numbering): report the
+        // milestone (1 read side, 2 write side), which the event stream
+        // alone determines (deltas T22).
+        let (lane, op, epoch) = match self.slot_of(w.stamp.actor()) {
+            Some(a) => (a.lane, Some(a.op), w.stamp.epoch() - a.gen_base),
+            None => (w.lane(), None, w.stamp.epoch()),
         };
         let (s, e) = w.span(&self.wide);
         WitnessInfo {
             warp: self.warp_of(w),
             lane,
-            epoch: w.stamp.epoch(),
+            epoch,
             async_op: op,
             kind: w.kind(),
             proxy: w.proxy(),
