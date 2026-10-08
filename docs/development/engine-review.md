@@ -263,6 +263,49 @@ Case `t8192_m8192_h7168_i3072_e384_k6_g1`, `Engine(max_workers=16)`, NumSim mode
 - A per-warp resource-version skip (≤ 288 CPU-s, about 9%) would have to be disabled whenever an observer is attached, because parked retries emit poll events. That makes it an execution path that exists only without an observer, which the one-execution-path rule forbids.
 - The lever is the MMA arithmetic (W4) and interpreter hot paths (W13).
 
+### Mega MoE medium: per-worker CPU inflation (W2 split, W13 follow-up)
+
+**W2's phase split (NumSim mode).**
+
+| Workers | Outside partition work | Partition critical path |
+| --- | --- | --- |
+| 1 | ~0.3 s | 3.1 s |
+| 16 | ~0.3 s | ~1.5x the 1-worker partition CPU |
+| 32 | ~0.3 s | 5.7 s (~2.3x the 1-worker partition CPU) |
+
+Everything outside partition work stays at ~0.3 s for every worker count. The scheduler is not the cost; the partitions' own CPU is.
+
+**Hypothesis tested: register-file footprint (~910 KB per warp) causes the inflation. Not confirmed.**
+
+Measurement setup:
+- private build of HEAD 65a1be1, NoopObserver;
+- "partition CPU" = thread CPU time summed inside `Partition::run_round`;
+- host load 3–6; min of several runs.
+
+Partition CPU at 16 and 32 workers, relative to 1 worker:
+
+| Case | Register file per warp | 16 workers | 32 workers |
+| --- | --- | --- | --- |
+| synthetic loop, 128 CTAs × 4 warps, 16 registers live | 4 KB | 1.33x | 1.37x |
+| synthetic, 256 registers live | 64 KB | 1.39x | 1.71x |
+| synthetic, 4,096 registers live | 1 MB | 1.30x | 1.65x |
+| recurrent_kda_decode_one_warp (2,048 one-warp CTAs) | 280 KB | 1.45x | 1.55x |
+| gdn_decode_bf16_wide_vec_mtp (128 CTAs × 4 warps) | 370 KB | 1.45x | 1.54x |
+| mega_moe e24 | 910 KB | 1.84x | 3.0x |
+
+Kernels with 4–370 KB register files inflate about as much as 1 MB ones at 16 workers. Footprint is therefore not the main driver; it at most adds to e24 at 32 workers.
+
+Ruled out:
+- **Shared frequency or bandwidth limits:** 16 or 32 independent single-worker processes running concurrently show no inflation (1.00–1.05x).
+- **Partition-to-thread migration:** static partition-to-thread assignment and/or pinned threads leave recurrent_kda at 1.4–1.6x.
+- **Allocator trimming / munmap:** `GLIBC_TUNABLES` mmap and trim thresholds at 4 GiB change nothing.
+- **System time:** it is small (e24: +0.27 s at 16 workers, against +1.4 s of inflation).
+
+Partly explained:
+- **Worker sleep between rounds.** Busy-waiting up to 2 ms for the next round instead of sleeping on the condvar cuts e24 at 32 workers from 5.0 to 3.2 CPU-s (wall 0.46 → 0.33 s), but leaves recurrent_kda unchanged.
+
+Open: the remaining ~1.3–1.5x is an intra-run effect: it is absent across processes and independent of footprint. Hardware counters are unavailable on this host (`perf_event_paranoid=4`), so it is not attributed yet. Compact register storage stays a noted, unstarted lever (see "Interpreter hot paths"), not a fix for this inflation.
+
 ## tcgen05.mma cost: arithmetic, not the callback boundary (2026-10-08)
 
 **Decision (coordinator): borrowed-view MMA I/O is not landed.** Rule: no optimization without a measured gain.
