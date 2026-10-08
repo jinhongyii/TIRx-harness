@@ -414,8 +414,8 @@ def _multicast(c: PtxCtx) -> pb.Operand | None:
 
 
 def lower_bulk_copy(c: PtxCtx) -> None:
-    if c.has("byte_mask") or c.has("ignore_bytes_left") or c.flag("report"):
-        raise _Unsupported(c.node, f"{c.d.op_name}: byte masks / ignore_oob / report are not in BulkCopyArgs")
+    if c.has("ignore_bytes_left") or c.has("ignore_bytes_right"):
+        raise _Unsupported(c.node, f"{c.d.op_name}: ignore_oob byte counts are not in BulkCopyArgs")
     dst, dst_space = c.addr("dst_mem")
     src, src_space = c.addr("src_mem")
     reduce = None
@@ -423,7 +423,34 @@ def lower_bulk_copy(c: PtxCtx) -> None:
         reduce = [ATOM_OPS[c.mod("redop")], pb.Ty.from_ptx(c.mod("type")).elem]
     mods = pb.mem_mods(policy=c.opt_src("cache_policy"))
     c.emit("BulkCopy", dst=dst, dst_space=dst_space, src=src, src_space=src_space, size=c.src("size"),
-           completion=_completion(c), multicast=_multicast(c), reduce=reduce, mods=mods)
+           completion=_completion(c), multicast=_multicast(c), reduce=reduce,
+           byte_mask=c.opt_src("byte_mask") if "byte_mask" in c.ops else None,
+           ignore_oob=c.flag("ignore_oob"), report=_report(c), mods=mods)
+
+
+def _report(c: PtxCtx) -> Any:
+    """Contract item 13: ``mbarrier::report::*`` copy forms -> ``ReportMode`` (None = disabled)."""
+    token = c.mod("report")
+    if not token or token.endswith("::disabled"):
+        return None
+    if "per_element" in token:
+        return "PerElementFf"
+    if "per_16bytes" in token:
+        return "Per16Bytes"
+    raise _Unsupported(c.node, f"{c.d.op_name}: report mode {token!r}")
+
+
+def _overrides(c: PtxCtx) -> list[dict]:
+    """Per-instruction tensor-map overrides (contract item 13)."""
+    out: list[dict] = []
+    elem_bits = 16 if c.name.endswith("_b16") else 8 if c.name.endswith("_b8") else 0
+    if "global_address" in c.ops and c.has("global_address"):
+        out.append({"field": "GlobalAddress", "ord": None, "value": pb.opnd(c.src("global_address")),
+                    "elem_bits": 0})
+    if "tensor_size" in c.ops:
+        for ordinal, value in enumerate(c.srcs("tensor_size")):
+            out.append({"field": "GlobalDim", "ord": ordinal, "value": pb.opnd(value), "elem_bits": elem_bits})
+    return out
 
 
 def lower_bulk_prefetch(c: PtxCtx) -> None:
@@ -432,8 +459,8 @@ def lower_bulk_prefetch(c: PtxCtx) -> None:
 
 def lower_tma(c: PtxCtx) -> None:
     name = c.name
-    if any(part in name for part in ("override", "report")) or c.flag("report"):
-        raise _Unsupported(c.node, f"{c.d.op_name}: TMA overrides/report are not lowered yet")
+    if "override_global_dim_stride" in name:
+        raise _Unsupported(c.node, f"{c.d.op_name}: lower/upper stride overrides have no TmapOverride encoding")
     if name.startswith("cp_reduce_async_bulk_tensor"):
         direction = {"Reduce": ATOM_OPS[c.mod("redop")]}
     elif "prefetch" in name:
@@ -462,19 +489,19 @@ def lower_tma(c: PtxCtx) -> None:
     cta_group = c.int_mod("cta_group", "cta_group::")
     c.emit("Tma", dir=direction, mode=mode, tmap=tmap, tmap_space=tmap_space, coords=coords,
            im2col_offsets=offsets, smem=smem, smem_space=smem_space, completion=_completion(c),
-           multicast=_multicast(c), cta_group=cta_group, overrides=[],
+           multicast=_multicast(c), cta_group=cta_group, overrides=_overrides(c), report=_report(c),
            mods=pb.mem_mods(policy=c.opt_src("cache_policy")))
 
 
 def lower_st_async(c: PtxCtx) -> None:
-    if c.name == "st_async_release" or c.name == "red_async_release":
-        raise _Unsupported(c.node, f"{c.d.op_name}: st.async/red.async .release (no mbarrier) is not in StAsyncArgs")
     lanes = _vec_lanes(c)
     ty = c.ptx_ty("type", lanes)
     values = [c.lw.convert(v, ty.with_lanes(1)) for v in c.srcs("b" if "b" in c.ops else "value")]
     value = values[0] if lanes == 1 else c.lw.pack(values, ty)
-    addr, _ = c.addr("addr", "SharedCluster")
-    mbar, _ = c.addr("mbar", "SharedCluster")
+    release = c.name.endswith("_release")
+    addr, _ = c.addr("addr", "Global" if release else "SharedCluster")
+    # Contract item 12: the .release forms have no completion mbarrier.
+    mbar = None if release else c.addr("mbar", "SharedCluster")[0]
     red = ATOM_OPS[c.mod("op")] if c.name.startswith("red_async") else None
     c.emit("StAsync", ty=ty, value=value, addr=addr, mbar=mbar, red=red, sem=c.sem("Weak"),
            scope=c.scope("Cluster"))
@@ -602,15 +629,18 @@ def lower_mbarrier(c: PtxCtx) -> None:
         c.emit("MbarTx", op="Expect" if action == "expect_tx" else "Complete", mbar=mbar, space=space,
                bytes=c.src("tx_count"), multicast=_multicast(c), scope=c.scope("Cta"))
     elif action in ("test_wait", "try_wait"):
-        if "report" in name:
-            raise _Unsupported(c.node, f"{c.d.op_name}: mbarrier wait reports are not in MbarTestWait")
-        if c.mod("phase_type") == "phase_type::conditional":
-            raise _Unsupported(c.node, f"{c.d.op_name}: conditional phase type")
         mbar, space = c.addr("addr", "Shared")
-        phase = pb.phase_parity(c.src("phase")) if c.flag("parity") else pb.phase_state(c.src("state"))
+        if c.flag("parity"):
+            phase = pb.phase_parity(c.src("phase"))
+        else:
+            phase = pb.phase_state(c.src("state" if "state" in c.ops else "phase"))
         dst = c.dst("wait_complete")
+        # Contract item 11: report forms read the report predicate/value from the same snapshot.
+        report = c.dst("report_predicate") if "report_predicate" in c.ops else None
+        report_value = c.dst("report_value") if "report_value" in c.ops else None
         c.emit("MbarTestWait", kind="Test" if action == "test_wait" else "Try", mbar=mbar, space=space,
-               phase=phase, sem=c.sem("Acquire"), scope=c.scope("Cta"), dst=dst)
+               phase=phase, sem=c.sem("Acquire"), scope=c.scope("Cta"), dst=dst, report=report,
+               report_value=report_value)
     elif name == "mbarrier_pending_count":
         state = c.src("state")
         c.emit("MbarQuery", dst=c.dst("count"), op={"PendingCount": {"state": pb.opnd(state)}})
@@ -717,11 +747,12 @@ def lower_tcgen05(c: PtxCtx) -> None:
     elif name == "tcgen05_relinquish_alloc_permit":
         c.emit("TcgenRelinquish", cta_group=_cta_group(c))
     elif name.startswith("tcgen05_commit"):
-        if "sync_restrict" in name or "width" in name:
-            raise _Unsupported(c.node, f"{c.d.op_name}: commit variant not in TcgenCommit")
         mbar, space = c.addr("mbar", "SharedCluster")
-        multicast = c.src("mask") if c.has("mask") else None
-        c.emit("TcgenCommit", mbar=mbar, space=space, cta_group=_cta_group(c), multicast=multicast)
+        multicast = c.src("mask") if c.has("mask") else (c.src("cta_mask") if c.has("cta_mask") else None)
+        token = c.mod("multicast")
+        width = int(token.rsplit("::", 1)[1].rstrip("b")) if token.endswith(("::16b", "::32b")) else None
+        c.emit("TcgenCommit", mbar=mbar, space=space, cta_group=_cta_group(c), multicast=multicast,
+               sync_restrict=c.flag("sync_restrict"), multicast_width=width)
     elif name == "tcgen05_wait":
         c.emit("TcgenWait", st=c.mod("action") == "wait::st")
     elif name == "tcgen05_fence":
@@ -774,8 +805,7 @@ def _collector(token: str) -> tuple[str, int]:
 
 def lower_tcgen05_mma(c: PtxCtx) -> None:
     name = c.name
-    if "lut_b" in name:
-        raise _Unsupported(c.node, f"{c.d.op_name}: lut_b decompression is not in TcgenMmaArgs")
+    lut_b = "lut_b" in name
     kind = MMA_KINDS.get(c.mod("kind"))
     if kind is None:
         raise _Unsupported(c.node, f"{c.d.op_name}: MMA {c.mod('kind')} is not in TcMmaKind")
@@ -792,12 +822,16 @@ def lower_tcgen05_mma(c: PtxCtx) -> None:
         lanes = [c.src("zero_col_mask")]
     collector_a, _ = _collector(c.mod("collector_a"))
     collector_b, b_buffer = _collector(c.mod("collector_b"))
-    c.emit("TcgenMma", kind=kind, cta_group=_cta_group(c), d=c.src("d_tmem"), a=a, b_desc=c.src("b_desc"),
+    b_desc = c.src("b_compressed_desc") if lut_b else c.src("b_desc")
+    # Contract item 18: the lut_b table operand (``b_decompress_metadata``; a TMEM
+    # address in TVM's PTX table) travels in ``lut_b_addr``.
+    lut_b_addr = c.src("b_decompress_metadata") if lut_b else None
+    c.emit("TcgenMma", kind=kind, cta_group=_cta_group(c), d=c.src("d_tmem"), a=a, b_desc=b_desc,
            idesc=c.src("idesc"), enable_input_d=c.lw.cast_to(c.src("enable_input_d"), pb.Ty("Pred")),
            ws=c.flag("ws"), ws_b_buffer=b_buffer, block_scale=block_scale, scale_input_d=None,
            sparse_meta=c.src("sp_meta_tmem") if "sp_meta_tmem" in c.ops else None,
            disable_output_lane=lanes, collector_a=collector_a, collector_b=collector_b,
-           ashift=c.flag("ashift"), variant=None)
+           ashift=c.flag("ashift"), ti16=False, lut_b=lut_b, lut_b_addr=lut_b_addr)
 
 
 # ---------------------------------------------------------------------------

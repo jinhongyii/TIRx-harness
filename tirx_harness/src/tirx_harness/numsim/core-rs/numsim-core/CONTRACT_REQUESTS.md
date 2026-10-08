@@ -788,7 +788,9 @@ W4 can drop the bit-16 hack.
 - **Still unrepresentable (unit tests only):**
   - `kind::ti16` MMA (25 kernels): `TcMmaKind` has no `Ti16`, and the `ti16`
     flag alone cannot state the kind the PTX names.
-  - `lut_b` MMA (10): no field for the `b_decompress_metadata` TMEM operand.
+  - ~~`lut_b` MMA (10)~~: done with item 18. `lut_b_addr` carries
+    `b_decompress_metadata`. Note that TVM's PTX table types that operand
+    `addr@tmem`; the `lut_b_addr` doc says "shared-memory address value".
   - `cp.async.bulk(.tensor)` `ignore_bytes_left/right` counts (5) and the
     `override_global_dim_stride_*` lower/upper stride operands (15).
   - `tcgen05.ld` `.spcompress` / `.abs` / `.NaN` (5).

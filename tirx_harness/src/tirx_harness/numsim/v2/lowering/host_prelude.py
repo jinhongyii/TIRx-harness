@@ -57,6 +57,19 @@ class PreludeMixin:
             if kind == "tirx.BufferType":
                 program.host_abi.append(pb.ParamSlot(name=name, kind="Buffer", param_index=index))
                 buffers.append((slot, param))
+            elif kind == "ir.PrimType" and dtypes.known(str(ty.dtype)) and dtypes.bits(str(ty.dtype)) > 256:
+                # Coordinator ruling: register values are capped at 256 bits; a wider
+                # by-value parameter (e.g. boolx128) is a u8[N] Param-space buffer.
+                nbytes = (dtypes.bits(str(ty.dtype)) + 7) // 8
+                buf = self.builder.buffer(
+                    pb.BufferDecl(name=name, space="Param", dtype=pb.Ty("U8"), shape=(pb.DimExpr.const(nbytes),),
+                                  param_slot=slot, byte_len=pb.DimExpr.const(nbytes), align=16)
+                )
+                program.host_abi.append(pb.ParamSlot(name=name, kind="Buffer", param_index=index, dtype=pb.Ty("U8"),
+                                                     shape=(pb.DimExpr.const(nbytes),), buf=buf))
+                self.wide_params.add(handle(param))
+                self.refs[handle(param)] = MemRef(
+                    buf=buf, space="Param", info=Shape(dtype="uint8", shape=(), strides=(), layout=None))
             elif kind == "ir.PrimType":
                 program.host_abi.append(pb.ParamSlot(name=name, kind="Scalar", param_index=index,
                                                      dtype=self.ty(str(ty.dtype), param)))
@@ -92,15 +105,13 @@ class PreludeMixin:
         if type_key(ty.elem_offset) != "ir.IntImm" or int(ty.elem_offset.value) != 0:
             raise _Unsupported(param, f"buffer parameter {name} with an element offset")
         index = program.host_abi[slot].param_index
-        # CONTRACT: ParamKind has no shape-variable kind. Implicit shape
-        # variables become Scalar slots (``shape_of`` = (buffer slot, axis))
-        # that appear alone as ``Param`` in the buffer slot's shape; the binder
-        # takes their value from the bound array.
+        # Implicit shape variables become ``ParamKind::ImplicitShape{buffer, axis}``
+        # slots (contract item 16); the binder takes their value from the bound array.
         for axis, extent in enumerate(ty.shape):
             if type_key(extent) == "ir.Var" and handle(extent) not in self.scalar_slots:
                 shape_slot = len(program.host_abi)
                 program.host_abi.append(
-                    pb.ParamSlot(name=f"{name}.shape{axis}", local_name=str(extent.name), kind="Scalar",
+                    pb.ParamSlot(name=f"{name}.shape{axis}", local_name=str(extent.name), kind="ImplicitShape",
                                  dtype=self.ty(dtypes.dtype_of(extent), extent), shape_of=(slot, axis))
                 )
                 self.scalar_slots[handle(extent)] = shape_slot
@@ -235,15 +246,6 @@ class PreludeMixin:
             raise _Unsupported(call, f"TensorMap {target.name} is encoded more than once")
         if not 1 <= rank <= 5 or len(values) != 4 * rank - 1:
             raise _Unsupported(call, f"rank-{rank} TensorMap encode has {len(values)} extent arguments")
-        # CONTRACT: TensorMapSpec has no force_cu_dtype. CU_TENSOR_MAP_DATA_TYPE_TFLOAT32 (11) is
-        # carried as dtype TF32; 16U4_ALIGN8B (13) is the dense packed E2M1 layout, i.e. what
-        # dtype E2M1 means. 16U4_ALIGN16B (14, padded) has no encoding and fails closed.
-        if force == 11 and dtype == "float32":
-            dtype = "tf32"
-        elif force == 13 and dtype == "float4_e2m1fn":
-            pass
-        elif force != -1:
-            raise _Unsupported(call, f"TensorMap force_cu_dtype={force} for {dtype} is not in the contract")
         base_slot, base_offset = self.tensor_map_base(base)
         dims = [self.dim_expr(v) for v in values]
         box = dims[2 * rank - 1:3 * rank - 1]
@@ -255,6 +257,8 @@ class PreludeMixin:
             global_stride=tuple(dims[rank:2 * rank - 1]), box_dim=tuple(d.value for d in box),
             element_stride=tuple(d.value for d in elem), interleave=interleave, swizzle=swizzle,
             l2_promotion=l2, oob_fill=fill, base_offset=base_offset,
+            # Raw CUtensorMapDataType override (contract item 15): the engine decides.
+            force_cu_dtype=None if force == -1 else force,
         )
         program = self.builder.program
         slot = len(program.host_abi)

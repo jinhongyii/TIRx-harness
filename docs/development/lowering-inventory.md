@@ -1195,3 +1195,120 @@ Ranked by kernel count:
 | 9 | `ptx_legacy.ldmatrix` / `ptx_legacy.mma` | out of scope (legacy surface) |
 | 6 | `For` kind VECTORIZED | fails closed by design |
 | 1 | `boolx128` parameter | coordinator ruling: lower as a `u8[128]` buffer (not done yet) |
+
+---
+
+## Part D: Phase 3 status (2026-10-08)
+
+The corpus still lowers clean: 195/195 strict, and 131/131 cases in
+`test_lowering_corpus.py`.
+
+Full captured suite:
+
+- 2123/2343 kernels lower with no `Unsupported`.
+- All 2341 loadable kernels decode and `validate()` in Rust against the
+  current contract (batch 2 + `lut_b_addr`).
+
+### D.1 Rules added in phase 3
+
+**TMEM views (contract item 17).** A `DeclBuffer(scope="tmem")` becomes a
+`Space::Tmem` Buf:
+
+- `shape = [lane_span, col_span]` of the physical rectangle its `TileLayout`
+  covers;
+- `base` = the static `allocated_addr`;
+- `Load`/`Store` offset = `lane * col_span + col`, computed from
+  `Layout.apply` (axes `TLane`/`TCol`).
+
+Fail closed:
+
+- direct access that is not 32-bit;
+- replicated (`T.R`) layouts on direct access;
+- runtime `allocated_addr`.
+
+Views without a `tcgen05.alloc` in the kernel set
+`requirements.implicit_tmem`.
+
+**Half chains (ruling D1).** f16/bf16 expression trees compute in
+`Ty{F32, lanes}` and round once where the value leaves the chain: store,
+explicit `Cast`, call operand, `Bind`, or another consumer.
+`ir_walk.is_half_chain` / `wide` / `half_chain` implement this.
+
+**Reductions.** `cuda.warp_reduce` and `cuda.cta_reduce` are expanded exactly
+as TVM's `cpp/builtins.py` helpers:
+
+- `log2(width)` steps of `Shfl Bfly`;
+- the CTA form adds a scratch round trip with two `Barrier Sync`;
+- the leader warp's reduction of `num_warps` partials uses the op's identity
+  (`0` / `-inf` / `+inf`, or the integer extremes).
+
+**Effectful CUDA helpers whose body is one reviewed PTX statement.**
+`gdn_*` / `flashkda_*` tensormap replace / acquire / release lower to
+`TensorMapReplace` / `Fence{Tensormap*}`. The semantics are parsed from the
+helper's own asm text, not from its name.
+
+**Other additions.**
+
+- `tvm_access_ptr` and `T.ptx.addr` are address arithmetic.
+- `%clock_hi` / `%globaltimer_hi|lo` are derived from `Clock64` /
+  `GlobalTimer`.
+- An `Evaluate` of a pure expression evaluates its reads.
+- Out-of-range constant indices into promoted locals become
+  `LoadRegIndexed` / `StoreRegIndexed`, so the engine reports the OOB access.
+- By-value parameters wider than 256 bits (`boolx128`) are `u8[N]`
+  Param-space Buffer slots. Using them as a value fails closed.
+
+**Contract batch 2.**
+
+- `MbarTestWait.report` / `report_value` (conditional parity is now
+  accepted).
+- `StAsync.mbar = null` for the `.release` forms.
+- `BulkCopy.byte_mask` / `ignore_oob` / `report`, `Tma.report`, and
+  `Tma.overrides` (`GlobalAddress`, `GlobalDim` with `elem_bits`).
+- `TcgenCommit.sync_restrict` / `multicast_width`.
+- `TcgenMma.lut_b` + `lut_b_addr`.
+- `TensorMapSpec.force_cu_dtype` raw.
+- `ParamKind::ImplicitShape`.
+
+### D.2 The 71 tile-dispatch rejections
+
+Each was re-run through `TilePrimitiveDispatch` and classified by the test
+that produced it:
+
+- **18 are negative tests.** These are kernels a test expects to be
+  rejected, e.g. `test_typed_tma_reduce_rejects_*` and
+  `*_invalid_*`.
+- **53 are positive tests of legacy-only tile forms.** These are forms that
+  the installed TVM's own dispatch cannot compile for the GPU:
+
+| count | TVM's rejection | example |
+| --- | --- | --- |
+| 14 | invalid tcgen05 MMA shape (e.g. `kind::f16`, M128 **N8**) | `test_gemm_async_artifact.py::*two_cluster*` |
+| 10 | `permute_layout` warp-xor-swizzle not well-formed / no bank-free XOR | `test_permute_layout_artifact.py` |
+| 11 | dispatch variant names not registered in this TVM (`reg`, `gmem_smem`, `tma`) | `test_tile_codegen.py::test_cta_copy_uses_canonical_semantics_independent_of_dispatch` |
+| 6 | TMA inner-box-bytes constraint | `test_typed_tma_reduce_accepts_*` |
+| 3 | block-scale SFA K extent | `test_block_scaled_gemm_artifact.py` |
+| 9 | other (reduction / fill / elementwise variants, owner-transport mismatch) | `test_tile_reduction_variants.py`, `test_tile_unary_codegen.py` |
+
+Decision 6 defines tile semantics as TVM's dispatch output. These kernels
+therefore cannot run on hardware through this TVM, and fail closed is the
+correct outcome. They should move to W8's legacy-test retirement list. The
+alternative is to restore the element-map path (B.7) only for forms TVM
+rejects, which I do not recommend.
+
+### D.3 Remaining residuals (full suite, kernel-reason counts)
+
+| count | residual | class |
+| --- | --- | --- |
+| 105 | tile ops TVM's dispatch rejects (D.2) | out of scope (TVM-uncompilable / negative tests) |
+| 29 | `tcgen05.mma kind::ti16` | contract gap (`TcMmaKind` has no `Ti16`) |
+| 15 | TMA `override_global_dim_stride_*` (lower/upper stride operands) | contract gap (`TmapOverride` cannot encode the split stride) |
+| 13 + 7 | direct access to replicated / non-32-bit TMEM views | fails closed by ruling |
+| 12 (+11 follow-on) | TMEM view with runtime `allocated_addr` | contract gap (`BufferDecl.base` static) |
+| 19 | local buffers with register layouts (`laneid` / `tid_in_wg` axes) accessed directly | tile-only forms; out of scope with D.2 |
+| 5 | `tcgen05.ld .spcompress` / `.abs` / `.NaN` | contract gap |
+| 5 | `cp.async.bulk` `ignore_bytes_left/right` counts | contract gap (`BulkCopyArgs.ignore_oob` is a bool) |
+| 9 + 2 | `ptx_legacy.*`, `mma_store` | out of scope (legacy surface) |
+| 8 | `For` kind PARALLEL / VECTORIZED / THREAD_BINDING | fails closed by design |
+| 2 | `%nwarpid` | contract gap (no `SpecialReg`) |
+| ~10 | single-kernel negative tests (`wait_group -1`, unreviewed helper, `boolx128` used as a value, malformed `Shuffle` / `warp_reduce`, host `Div` extent, `address_of(handle)`) | fail closed by design |

@@ -67,6 +67,8 @@ HELPERS: dict[str, Helper] = {
     "tirx.tvm_warp_activemask": _s(""),
     "tirx.cuda.reduce_add_sync_u32": _s("vv"),
     "tirx.cuda.reduce_min_sync_u32": _s("vv"),
+    "tirx.cuda.warp_reduce": _s("vsv"),
+    "tirx.cuda.cta_reduce": _s("vsvv"),
     # memory / atomics / addresses
     "tirx.cuda.ldg": _s("va"),
     "tirx.cuda.atomic_add": _s("vv"),
@@ -140,7 +142,8 @@ PURE_FUNC_CALLS = frozenset(
     {
         "gdn_lg2_approx_ftz", "flashkda_rsqrtf", "flashkda_tanh_approx", "flashkda_fmaf_rn",
         "tvm_builtin_fma_scale_sub_f32x2", "combine_int_frac_ex2", "shl_u32_clamp",
-        "smem_desc_add_16B_offset",
+        "smem_desc_add_16B_offset", "tvm_builtin_cast_float32x2_float16x2",
+        "tvm_builtin_cast_float16x2_float32x2", "tvm_builtin_smem_desc_add_16B_offset",
     }
 )
 

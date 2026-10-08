@@ -74,3 +74,35 @@ def test_tcgen05_lifecycle_and_mma(lower_source):
     assert [program.regs[r.index].name for r in ld.dsts] == ["regs"] * 4
     wait = only(program, "TcgenWait")
     assert wait.st is False and wait.may_block
+
+
+def test_tmem_view_direct_access(lower_source):
+    """Phase 3 ruling: a TMEM DeclBuffer is a Space::Tmem Buf; Load/Store use dense lane x column offsets."""
+    program = lower_source('''
+@T.prim_func
+def k(out: T.Buffer((128, 4), "uint32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    T.cta_id([1])
+    T.warpgroup_id([1])
+    warp = T.warp_id_in_wg([4])
+    lane = T.lane_id([32])
+    tmem = T.decl_buffer((128, 4), "uint32", scope="tmem", layout=T.TileLayout(T.S[(128, 4):(1 @ Axis.TLane, 1 @ Axis.TCol)]), allocated_addr=0)
+    for col in range(4):
+        tmem[warp * 32 + lane, col] = T.Cast("uint32", col)
+    for col in range(4):
+        out[warp * 32 + lane, col] = tmem[warp * 32 + lane, col]
+''')
+    tmem = next(b for b in program.buffers if b.name == "tmem")
+    assert (tmem.space, tmem.dtype, tmem.base) == ("Tmem", pb.Ty("U32"), 0)
+    assert tmem.shape == (pb.DimExpr.const(128), pb.DimExpr.const(4))
+    buf = program.buffers.index(tmem)
+    store = next(i for i in all_of(program, "Store") if i.buf == buf)
+    load = next(i for i in all_of(program, "Load") if i.buf == buf)
+    assert store.ty == load.ty == pb.Ty("U32")
+    # offset = lane * 4 + col (dense addressing), computed by a Mul by the column span then an Add.
+    offset = next(i for i in program.code if store.offset in i.writes())
+    assert offset.variant == "Binary" and offset.op == "Add"
+    row = next(i for i in program.code if offset.a in i.writes())
+    assert (row.op, const(program, row.b)) == ("Mul", 4)
+    assert program.requirements.implicit_tmem      # views without tcgen05.alloc
+    assert not all_of(program, "AddrOf")            # no addresses of TMEM

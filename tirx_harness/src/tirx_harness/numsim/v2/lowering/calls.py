@@ -11,6 +11,7 @@ to the lvalue's register (or a temporary stored back).
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import TYPE_CHECKING, Any
 
 from . import builtins
@@ -29,6 +30,12 @@ def _string(node: Any) -> str | None:
     return str(node.value) if type_key(node) == "ir.StringImm" else None
 
 
+def _int32(value: int) -> Any:
+    from tvm import tirx
+
+    return tirx.IntImm("int32", value)
+
+
 def _op_name(call: Any) -> str:
     return str(getattr(call.op, "name", ""))
 
@@ -42,6 +49,14 @@ _SREGS = {
 }
 _SREG_AXIS = {"tid": "Tid", "ntid": "NTid", "ctaid": "CtaId", "nctaid": "NCtaId", "clusterid": "ClusterId",
               "nclusterid": "NClusterId", "cluster_ctaid": "ClusterCtaId", "cluster_nctaid": "ClusterNCtaId"}
+
+_ASM_REPLACE = re.compile(
+    r'"tensormap\.replace\.tile\.(global_address|global_dim|global_stride)\.global\.b1024\.b(32|64) '
+    r'\[%0\], (?:(\d+), )?%1;"'
+)
+_ASM_RELEASE = re.compile(r'"fence\.proxy\.tensormap::generic\.release\.(cta|cluster|gpu|sys);')
+_ASM_ACQUIRE = re.compile(r'"fence\.proxy\.tensormap::generic\.acquire\.(cta|cluster|gpu|sys) \[%0\], 128;')
+_SCOPES = {"cta": "Cta", "cluster": "Cluster", "gpu": "Gpu", "sys": "Sys"}
 
 _PURE_STRUCTURAL = frozenset({"tirx.reinterpret", "tirx.if_then_else", "prim.if_then_else", "tirx.likely"})
 
@@ -170,6 +185,19 @@ class CallsMixin:
     def call_tirx_handle_add_byte_offset(self: "Lowerer", node: Any) -> pb.Operand:
         return self.call_tirx_ptr_byte_offset(node)
 
+    def call_tirx_tvm_access_ptr(self: "Lowerer", node: Any) -> pb.Operand:
+        """``tvm_access_ptr(type, data, offset, extent, rw_mask)`` = ``data + offset`` elements.
+
+        ``extent`` and ``rw_mask`` are access-pattern hints with no semantics in the
+        engine (the Arena checks the actual accesses through the pointer).
+        """
+        type_node, data, offset = node.args[0], node.args[1], node.args[2]
+        elem = dtypes.dtype_of(type_node)
+        if not elem or elem in ("void", "handle"):
+            raise _Unsupported(node, "tvm_access_ptr without an element type")
+        base = self.as_address(self.expr(data))
+        return self.binary("Add", pb.Ty("U64"), base, self.element_bytes(elem, self.expr(offset)))
+
     def call_tirx_isnullptr(self: "Lowerer", node: Any) -> pb.Operand:
         value = self.as_address(self.expr(node.args[0]))
         dst = self.builder.reg(pb.Ty("Pred"), uniform=self.is_uniform(value))
@@ -243,6 +271,13 @@ class CallsMixin:
         ty = pb.Ty("U64") if bits == 64 else pb.Ty("U32")
         if name in _SREGS:
             return self.read_special(node, _SREGS[name], ty)
+        if name in ("clock_hi", "globaltimer_hi", "globaltimer_lo"):
+            source = self.builder.reg(pb.Ty("U64"))
+            self.builder.emit("ReadSpecial", dst=source,
+                              sreg="Clock64" if name.startswith("clock") else "GlobalTimer")
+            if name.endswith("_hi"):
+                source = self.binary("Shr", pb.Ty("U64"), source, self.const("uint64", 32))
+            return self.cast_to(source, dtypes.dtype_of(node) or "uint32")
         base, _, axis = name.partition(".")
         if base in _SREG_AXIS and axis in ("x", "y", "z"):
             return self.read_special(node, {_SREG_AXIS[base]: axis.upper()}, ty)
@@ -410,6 +445,112 @@ class CallsMixin:
     def call_tirx_cuda_reduce_min_sync_u32(self: "Lowerer", node: Any) -> pb.Operand:
         return self.redux(node, "Min")
 
+    # -- reductions (TVM's templated butterfly helpers, expanded) -------------
+    def butterfly(self: "Lowerer", node: Any, value: pb.Operand, op: str, width: int) -> pb.Operand:
+        """``tvm_builtin_cuda_warp_reduce_<op>_<width>``: log2(width) shfl.bfly steps."""
+        ty = self.operand_ty(value)
+        step = {"sum": "Add", "max": "Max", "min": "Min"}[op]
+        site = self.site(node, op_name=_op_name(node))
+        mask = width >> 1
+        while mask > 0:
+            shuffled = self.builder.reg(ty)
+            self.builder.emit("Shfl", site=site, mode="Bfly", ty=ty, dst=shuffled, dst_pred=None, src=value,
+                              lane=self.const("uint32", mask), clamp=self.const("uint32", 0x1F),
+                              membermask=self.full_mask())
+            value = self.binary(step, ty, value, shuffled)
+            mask >>= 1
+        return value
+
+    def reduce_args(self: "Lowerer", node: Any, op_arg: Any, count_arg: Any, what: str) -> tuple[str, int]:
+        op = _string(op_arg)
+        if op not in ("sum", "max", "min"):
+            raise _Unsupported(node, f"{what} op {op!r}")
+        if type_key(count_arg) != "ir.IntImm":
+            raise _Unsupported(node, f"{what} width must be a constant")
+        count = int(count_arg.value)
+        if count < 1 or count > 32 or count & (count - 1):
+            raise _Unsupported(node, f"{what} width {count} is not a power of two in [1, 32]")
+        return op, count
+
+    def call_tirx_cuda_warp_reduce(self: "Lowerer", node: Any) -> pb.Operand:
+        value_arg, op_arg = node.args[0], node.args[1]
+        width_arg = node.args[2] if len(node.args) > 2 else None
+        op, width = self.reduce_args(node, op_arg, width_arg if width_arg is not None else _int32(32), "warp_reduce")
+        ty = self.ty(dtypes.dtype_of(node), node)
+        return self.butterfly(node, self.cast_to(self.expr(value_arg), ty), op, width)
+
+    def call_tirx_cuda_cta_reduce(self: "Lowerer", node: Any) -> pb.Operand:
+        """``tvm_builtin_cuda_cta_reduce_<op>_<nw>(val, scratch)`` expanded (TVM cpp/builtins.py)."""
+        value_arg, op_arg, warps_arg, scratch_arg = node.args
+        op, num_warps = self.reduce_args(node, op_arg, warps_arg, "cta_reduce")
+        dtype = dtypes.dtype_of(node)
+        ty = self.ty(dtype, node)
+        b = self.builder
+        site = self.site(node, op_name=_op_name(node))
+        scratch = self.as_address(self.expr(scratch_arg))
+        value = self.butterfly(node, self.cast_to(self.expr(value_arg), ty), op, 32)
+        tid = b.reg(pb.Ty("S32"))
+        b.emit("ReadSpecial", dst=tid, sreg="ThreadInCta")
+        warp = self.binary("FloorDiv", "int32", tid, self.const("int32", 32))
+        lane = self.binary("FloorMod", "int32", tid, self.const("int32", 32))
+
+        def slot(index: pb.Operand) -> pb.Operand:
+            return self.binary("Add", pb.Ty("U64"), scratch, self.element_bytes(dtype, index))
+
+        def store(index: pb.Operand, data: pb.Operand) -> None:
+            b.emit("StoreAddr", site=site, ty=ty, addr=slot(index), space="Generic", value=data, sem="Weak",
+                   scope="Gpu", mods=pb.mem_mods())
+
+        def load(index: pb.Operand, dst: pb.Reg) -> None:
+            b.emit("LoadAddr", site=site, ty=ty, dst=dst, addr=slot(index), space="Generic", sem="Weak",
+                   scope="Gpu", mods=pb.mem_mods())
+
+        def guarded(cond: pb.Operand, then: Any, otherwise: Any = None) -> None:
+            if_pc = b.emit("If", site=site, cond=cond, else_pc=0, end_pc=0, elect=False)
+            then()
+            else_pc = -1
+            if otherwise is not None:
+                else_pc = b.emit("Else", end_pc=0)
+                otherwise()
+            end = b.emit("EndIf")
+            b.patch(if_pc, "If", cond=cond, else_pc=else_pc if else_pc >= 0 else end, end_pc=end, elect=False)
+            if else_pc >= 0:
+                b.patch(else_pc, "Else", end_pc=end)
+
+        def is_zero(x: pb.Operand) -> pb.Reg:
+            dst = b.reg(pb.Ty("Pred"))
+            b.emit("Compare", op="Eq", ty=pb.Ty("S32"), dst=dst, a=x, b=self.const("int32", 0))
+            return dst
+
+        guarded(is_zero(lane), lambda: store(warp, value))
+        b.emit("Barrier", site=site, kind="Sync", id=self.const("uint32", 0), count=None, aligned=True)
+        partial = b.reg(ty)
+
+        def leader_warp() -> None:
+            in_range = b.reg(pb.Ty("Pred"))
+            b.emit("Compare", op="Lt", ty=pb.Ty("S32"), dst=in_range, a=lane, b=self.const("int32", num_warps))
+            guarded(in_range, lambda: load(lane, partial),
+                    lambda: b.emit("Mov", dst=partial, src=self.reduce_identity(dtype, op)))
+            reduced = self.butterfly(node, partial, op, 32)
+            guarded(is_zero(lane), lambda: store(self.const("int32", 0), reduced))
+
+        guarded(is_zero(warp), leader_warp)
+        b.emit("Barrier", site=site, kind="Sync", id=self.const("uint32", 0), count=None, aligned=True)
+        result = b.reg(ty)
+        load(self.const("int32", 0), result)
+        return result
+
+    def reduce_identity(self: "Lowerer", dtype: str, op: str) -> pb.Const:
+        if op == "sum":
+            return self.const(dtype, 0)
+        if dtypes.is_float(dtype):
+            return self.const(dtype, float("-inf") if op == "max" else float("inf"))
+        # CUDA converts +-INFINITY to the integer type's extreme.
+        width = dtypes.bits(dtype)
+        if dtypes.is_signed(dtype):
+            return self.const(dtype, -(1 << (width - 1)) if op == "max" else (1 << (width - 1)) - 1)
+        return self.const(dtype, 0 if op == "max" else (1 << width) - 1)
+
     # -- memory helpers -------------------------------------------------------
     def call_tirx_cuda_ldg(self: "Lowerer", node: Any) -> pb.Operand:
         addr = self.as_address(self.expr(node.args[0]))
@@ -475,16 +616,58 @@ class CallsMixin:
         name = _string(args[0]) if args else None
         if name == "tvm_builtin_pointer_offset":
             return self.pointer_offset(node, args[1], args[2])
-        if name is None or name not in builtins.PURE_FUNC_CALLS:
-            raise _Unsupported(node, f"cuda.func_call of unreviewed or effectful helper {name!r}")
         args = args[1:]
         source = ""
         if args and _string(args[-1]) is not None:
             source = _string(args[-1]) or ""
             args = args[:-1]
+        if name is not None and name not in builtins.PURE_FUNC_CALLS:
+            if self.single_asm_helper(node, source, args):
+                return None
+        if name is None or name not in builtins.PURE_FUNC_CALLS:
+            raise _Unsupported(node, f"cuda.func_call of unreviewed or effectful helper {name!r}")
         digest = hashlib.sha256("".join(source.split()).encode()).hexdigest()[:16]
         return self.pure_helper(node, f"tirx.cuda.func_call.{name}", "v*", args=args,
                                 extra_mods=(f"source_sha256={digest}",))
+
+    def single_asm_helper(self: "Lowerer", node: Any, source: str, args: list[Any]) -> bool:
+        """Lower an effectful helper whose body is exactly one reviewed PTX statement.
+
+        The semantics come from the helper's own asm text (tensormap replace and
+        tensormap proxy fences), so a modified body cannot be accepted by name.
+        """
+        if source.count("asm") != 1:
+            return False
+        site = self.site(node, op_name="tirx.cuda.func_call")
+        match = _ASM_REPLACE.search(source)
+        if match and len(args) == 2:
+            field = {"global_address": "GlobalAddress", "global_dim": "GlobalDim",
+                     "global_stride": "GlobalStride"}[match.group(1)]
+            value_ty = pb.Ty("U64") if match.group(2) == "64" else pb.Ty("U32")
+            ordinal = int(match.group(3)) if match.group(3) is not None else None
+            tmap = self.as_address(self.expr(args[0]))
+            value = self.convert(self.expr(args[1]), value_ty)
+            self.builder.emit("TensorMapReplace", site=site, tmap=tmap, space="Global", field=field, ord=ordinal,
+                              value=value)
+            return True
+        match = _ASM_RELEASE.search(source)
+        if match and not args:
+            self.builder.emit("Fence", site=site, kind="TensormapRelease", sem="Release",
+                              scope=_SCOPES[match.group(1)])
+            return True
+        match = _ASM_ACQUIRE.search(source)
+        if match and len(args) == 1:
+            addr = self.as_address(self.expr(args[0]))
+            self.builder.emit("Fence", site=site, kind={"TensormapAcquire": {"addr": pb.opnd(addr), "space": "Generic"}},
+                              sem="Acquire", scope=_SCOPES[match.group(1)])
+            return True
+        return False
+
+    def call_tirx_ptx_addr(self: "Lowerer", node: Any) -> pb.Operand:
+        """``T.ptx.addr(base, byte_offset)``: an address operand ``base + byte_offset``."""
+        base = self.as_address(self.expr(node.args[0]))
+        offset = self.reinterpret(self.cast_to(self.expr(node.args[1]), "int64"), pb.Ty("U64"))
+        return self.binary("Add", pb.Ty("U64"), base, offset)
 
     def pointer_offset(self: "Lowerer", node: Any, pointer: Any, offset: Any) -> pb.Operand:
         """TVM's ``tvm_builtin_pointer_offset(T* ptr, int offset)`` = ``ptr + offset`` elements."""

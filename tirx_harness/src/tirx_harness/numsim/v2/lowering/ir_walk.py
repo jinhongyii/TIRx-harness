@@ -19,6 +19,7 @@ import tvm
 from tvm import tirx
 from tvm_ffi import structural_visit
 
+from . import builtins
 from . import dtypes
 from . import program_builder as pb
 from .calls import CallsMixin
@@ -70,6 +71,16 @@ _IGNORED_ATTRS = frozenset(
 
 _THREAD_TAGS = {"threadIdx": "Tid", "blockIdx": "CtaId", "clusterCtaIdx": "ClusterCtaId", "clusterIdx": "ClusterId"}
 
+_HALF_CHAIN_BINARY = frozenset({"prim.Add", "prim.Sub", "prim.Mul", "prim.Div", "prim.Min", "prim.Max"})
+
+
+def _numpy_half(dtype: str) -> Any:
+    import ml_dtypes
+    import numpy as np
+
+    return np.float16 if dtypes.split(dtype)[0] == "float16" else ml_dtypes.bfloat16
+
+
 _ELECT_OPS = frozenset({"tirx.cuda.elect_sync", "tirx.ptx.elect_sync"})
 
 WARPS_PER_WARPGROUP = 4
@@ -92,6 +103,8 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         self.pending_preds: list[tuple[list[pb.Instr], list[int], pb.Reg, pb.Reg, bool]] = []
         self.elect_buffers: set[int] = set()
         self.escaped: set[int] = set()
+        self.tmem_views = False
+        self.wide_params: set[int] = set()
 
     # ------------------------------------------------------------------ util
     def unsupported(self, node: Any, reason: str) -> None:
@@ -175,6 +188,8 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         program.topology.static_smem_bytes = static_smem
         program.topology.dyn_smem_bytes = pb.DimExpr.const(0)
         program.topology.min_blocks_per_sm = self.min_blocks_per_sm
+        if self.tmem_views and not any(i.variant == "TcgenAlloc" for i in program.code):
+            program.requirements.implicit_tmem = True   # views without tcgen05.alloc (legacy flag)
         return program
 
     # ------------------------------------------------------------- topology
@@ -279,6 +294,10 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
             self.unsupported(error.node if error.node is not None else node, error.reason)
         except pb.UnrepresentableType as error:
             self.unsupported(node, str(error))
+
+    def stmt_tirx_TilePrimitiveCall(self, node: Any) -> None:
+        reason = getattr(self, "dispatch_error", None) or "TVM dispatch produced no lowering"
+        raise _Unsupported(node, f"tile op {node.op.name if hasattr(node.op, 'name') else node.op}: {reason}")
 
     def stmt_tirx_SeqStmt(self, node: Any) -> None:
         for child in node.seq:
@@ -450,9 +469,11 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         if kind == "ir.Call":
             self.call(value, statement=True)
             return
-        if kind == "ir.IntImm":
-            return  # Evaluate(0): no-op
-        raise _Unsupported(node, f"evaluate of {kind}")
+        if kind in ("ir.IntImm", "ir.FloatImm", "ir.Var"):
+            return  # no effect
+        # A pure expression statement: evaluate it for its memory reads (they are
+        # accesses the checkers must see) and discard the value.
+        self.expr(value)
 
     def is_elect(self, cond: Any) -> bool:
         found = False
@@ -473,9 +494,65 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         return found
 
     # ---------------------------------------------------------- expressions
+    # -- half chains (coordinator ruling D1) --------------------------------
+    # A TIR expression tree of f16/bf16 dtype keeps its intermediate values in
+    # f32 registers (``Ty{F32, lanes}``); one ``Cast`` to the half type is
+    # inserted only where the value leaves the chain: a store, an explicit
+    # Cast, a call operand, a binding, or any other non-chain consumer.
+    def is_half_chain(self, node: Any) -> bool:
+        dtype = dtype_of(node)
+        if not dtype or dtypes.split(dtype)[0] not in ("float16", "bfloat16"):
+            return False
+        kind = type_key(node)
+        if kind in _HALF_CHAIN_BINARY or kind == "prim.Select":
+            return True
+        if kind == "ir.Call":
+            name = str(getattr(node.op, "name", ""))
+            return name in builtins.UNARY_OPS or name == "tirx.fma"
+        return False
+
+    def wide(self, node: Any) -> pb.Operand:
+        """``node``'s value as f32 (an inner chain value is never rounded to half)."""
+        dtype = dtype_of(node)
+        lanes = dtypes.split(dtype)[1]
+        f32 = pb.Ty("F32", lanes)
+        if self.is_half_chain(node):
+            return self.half_chain(node)
+        if type_key(node) == "ir.FloatImm" and lanes == 1:
+            import numpy as np
+
+            rounded = float(np.array([float(node.value)], dtype=_numpy_half(dtype))[0])
+            return self.const("float32", rounded)
+        return self.cast_to(self.expr(node), f32)
+
+    def half_chain(self, node: Any) -> pb.Operand:
+        kind = type_key(node)
+        lanes = dtypes.split(dtype_of(node))[1]
+        f32 = pb.Ty("F32", lanes)
+        if kind in _HALF_CHAIN_BINARY:
+            return self.binary(_BINARY[kind], f32, self.wide(node.a), self.wide(node.b))
+        if kind == "prim.Select":
+            cond = self.cast_to(self.expr(node.condition), pb.Ty("Pred"))
+            a, b = self.wide(node.true_value), self.wide(node.false_value)
+            dst = self.builder.reg(f32, uniform=all(self.is_uniform(v) for v in (cond, a, b)))
+            self.builder.emit("Select", ty=f32, dst=dst, cond=cond, a=a, b=b)
+            return dst
+        name = str(node.op.name)
+        if name == "tirx.fma":
+            a, b, c = (self.wide(x) for x in node.args)
+            dst = self.builder.reg(f32, uniform=all(self.is_uniform(v) for v in (a, b, c)))
+            self.builder.emit("Ternary", op="Fma", ty=f32, dst=dst, a=a, b=b, c=c)
+            return dst
+        value = self.wide(node.args[0])
+        dst = self.builder.reg(f32, uniform=self.is_uniform(value))
+        self.builder.emit("Unary", op=builtins.UNARY_OPS[name], ty=f32, dst=dst, a=value)
+        return dst
+
     def expr(self, node: Any) -> pb.Operand:
         kind = type_key(node)
         dtype = dtype_of(node)
+        if self.is_half_chain(node):
+            return self.cast_to(self.half_chain(node), dtype)
         if kind in ("ir.IntImm", "ir.FloatImm"):
             value = int(node.value) if kind == "ir.IntImm" else float(node.value)
             try:
@@ -546,6 +623,8 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         bound = self.host_binds.get(key)
         if bound is not None:
             return self.expr(bound)
+        if key in self.wide_params:
+            raise _Unsupported(node, f"{node.name} is wider than a register (256 bits) and used as a value")
         ref = self.refs.get(key)
         if isinstance(ref, MemRef):
             # A TensorMap (or buffer) variable used as a value is its address.
@@ -694,7 +773,9 @@ def lower(func: Any, *, name: str | None = None, strict: bool = True) -> pb.Prog
         attrs = func.attrs
         name = str(attrs["global_symbol"]) if attrs is not None and "global_symbol" in attrs else "kernel"
     func = dispatch_tile_primitives(func)
-    program = Lowerer(func, name).lower()
+    lowerer = Lowerer(func, name)
+    lowerer.dispatch_error = _DISPATCH_ERRORS.pop(id(func), None)
+    program = lowerer.lower()
     if strict and program.unsupported:
         raise LoweringUnsupported(program)
     return program
@@ -721,9 +802,13 @@ def dispatch_tile_primitives(func: Any) -> Any:
     try:
         with tvm.target.Target({"kind": "cuda", "arch": arch}):
             module = tirx.transform.TilePrimitiveDispatch()(tvm.IRModule({"main": func}))
-    except Exception:  # noqa: BLE001 - dispatch rejection: keep the tile op, fail closed later
+    except Exception as error:  # noqa: BLE001 - dispatch rejection: keep the tile op, fail closed later
+        _DISPATCH_ERRORS[id(func)] = " ".join(str(error).split())[:300]
         return func
     return module["main"]
+
+
+_DISPATCH_ERRORS: dict[int, str] = {}
 
 
 def lower_module(funcs: Any, *, strict: bool = True) -> pb.Module:

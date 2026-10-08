@@ -152,3 +152,27 @@ def bad(x: T.Buffer((32,), "int32")):
     gap = only(program, "Unsupported")
     assert "call_extern" in program.strings[gap.reason] or "builtin" in program.strings[gap.reason]
     assert program.site_of(program.code.index(gap)) is not None
+
+
+def test_half_chain_stays_f32_until_the_store(lower_source):
+    """Ruling D1: ``a*b+c`` in float16 computes in f32 and rounds once, at the store."""
+    program = lower_source('''
+@T.prim_func
+def fma16(a: T.Buffer((32,), "float16"), b: T.Buffer((32,), "float16"),
+          c: T.Buffer((32,), "float16"), d: T.Buffer((32,), "float16")):
+    T.device_entry()
+    lane = T.thread_id([32])
+    d[lane] = a[lane] * b[lane] + c[lane]
+''')
+    f16, f32 = pb.Ty("F16"), F32
+    loads = [i for i in program.code if i.variant == "Load"]
+    assert [i.ty for i in loads] == [f16, f16, f16]
+    widen = [i for i in program.code if i.variant == "Cast" and i.fields["to"] == f32]
+    assert [i.src for i in widen] == [ld.dst for ld in loads]   # each leaf widened exactly once
+    mul, add = [i for i in program.code if i.variant == "Binary"]
+    assert (mul.op, mul.ty, add.op, add.ty) == ("Mul", f32, "Add", f32)
+    assert add.a == mul.dst                                      # the product is not rounded to half
+    narrow = [i for i in program.code if i.variant == "Cast" and i.fields["to"] == f16]
+    assert len(narrow) == 1 and narrow[0].src == add.dst
+    store = only(program, "Store")
+    assert (store.ty, store.value) == (f16, narrow[0].dst)

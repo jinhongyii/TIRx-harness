@@ -257,11 +257,12 @@ SCHEMA: dict[str, dict[str, str] | None] = {
     "AsyncWait": {"domain": "json", "n": "int", "read": "bool"},
     "CpAsyncMbarArrive": {"mbar": "op", "space": "json", "noinc": "bool"},
     "BulkCopy": {"dst": "op", "dst_space": "json", "src": "op", "src_space": "json", "size": "op",
-                 "completion": "json", "multicast": "opt_op", "reduce": "json", "mods": "json"},
+                 "completion": "json", "multicast": "opt_op", "reduce": "json", "byte_mask": "opt_op",
+                 "ignore_oob": "bool", "report": "json", "mods": "json"},
     "Tma": {"dir": "json", "mode": "json", "tmap": "op", "tmap_space": "json", "coords": "ops",
             "im2col_offsets": "ops", "smem": "op", "smem_space": "json", "completion": "json",
-            "multicast": "opt_op", "cta_group": "int", "overrides": "json", "mods": "json"},
-    "StAsync": {"ty": "ty", "value": "op", "addr": "op", "mbar": "op", "red": "json", "sem": "json",
+            "multicast": "opt_op", "cta_group": "int", "overrides": "json", "report": "json", "mods": "json"},
+    "StAsync": {"ty": "ty", "value": "op", "addr": "op", "mbar": "opt_op", "red": "json", "sem": "json",
                 "scope": "json"},
     "TensorMapReplace": {"tmap": "op", "space": "json", "field": "json", "ord": "json", "value": "op"},
     "TensorMapCopyFence": {"dst": "op", "src": "op", "size": "int", "scope": "json"},
@@ -277,7 +278,7 @@ SCHEMA: dict[str, dict[str, str] | None] = {
     "MbarTx": {"op": "json", "mbar": "op", "space": "json", "bytes": "op", "multicast": "opt_op",
                "scope": "json"},
     "MbarTestWait": {"kind": "json", "mbar": "op", "space": "json", "phase": "json", "sem": "json",
-                     "scope": "json", "dst": "opt_reg"},
+                     "scope": "json", "dst": "opt_reg", "report": "opt_reg", "report_value": "opt_reg"},
     "MbarWait": {"mbar": "op", "space": "json", "phase": "json", "sem": "json", "scope": "json"},
     "MbarQuery": {"dst": "reg", "op": "json"},
     "Fence": {"kind": "json", "sem": "json", "scope": "json"},
@@ -290,7 +291,8 @@ SCHEMA: dict[str, dict[str, str] | None] = {
     "TcgenAlloc": {"dst": "op", "ncols": "op", "cta_group": "int", "exclusive": "bool"},
     "TcgenDealloc": {"taddr": "op", "ncols": "op", "cta_group": "int", "exclusive": "bool"},
     "TcgenRelinquish": {"cta_group": "int"},
-    "TcgenCommit": {"mbar": "op", "space": "json", "cta_group": "int", "multicast": "opt_op"},
+    "TcgenCommit": {"mbar": "op", "space": "json", "cta_group": "int", "multicast": "opt_op",
+                    "sync_restrict": "bool", "multicast_width": "json"},
     "TcgenLd": {"dsts": "regs", "taddr": "op", "shape": "json", "num": "int", "pack": "bool",
                 "red": "json", "spcompress": "bool"},
     "TcgenSt": {"srcs": "ops", "taddr": "op", "shape": "json", "num": "int", "unpack": "bool"},
@@ -301,7 +303,7 @@ SCHEMA: dict[str, dict[str, str] | None] = {
                  "idesc": "op", "enable_input_d": "op", "ws": "bool", "ws_b_buffer": "int",
                  "block_scale": "json", "scale_input_d": "opt_op", "sparse_meta": "opt_op",
                  "disable_output_lane": "ops", "collector_a": "json", "collector_b": "json",
-                 "ashift": "bool", "variant": "json"},
+                 "ashift": "bool", "ti16": "bool", "lut_b": "bool", "lut_b_addr": "opt_op"},
 }
 
 # Variants that may return Blocked (mirror of Instr::may_block).
@@ -556,6 +558,7 @@ class TensorMapSpec:
     l2_promotion: int
     oob_fill: int
     base_offset: DimExpr
+    force_cu_dtype: int | None = None   # raw CUtensorMapDataType when it differs from dtype
 
     def to_json(self) -> Any:
         return {
@@ -565,14 +568,14 @@ class TensorMapSpec:
             "box_dim": list(self.box_dim), "element_stride": list(self.element_stride),
             "interleave": self.interleave, "swizzle": self.swizzle,
             "l2_promotion": self.l2_promotion, "oob_fill": self.oob_fill,
-            "base_offset": self.base_offset.to_json(),
+            "base_offset": self.base_offset.to_json(), "force_cu_dtype": self.force_cu_dtype,
         }
 
 
 @dataclass
 class ParamSlot:
     name: str
-    kind: str                        # Buffer Pointer Scalar TensorMap
+    kind: str                        # Buffer Pointer Scalar TensorMap ImplicitShape
     dtype: Ty | None = None
     shape: tuple[DimExpr, ...] = ()
     tensor_map: TensorMapSpec | None = None
@@ -587,7 +590,9 @@ class ParamSlot:
     def to_json(self) -> Any:
         return {
             "name": self.name, "local_name": self.local_name or self.name, "aliases": list(self.aliases),
-            "kind": self.kind, "dtype": None if self.dtype is None else self.dtype.to_json(),
+            "kind": self.kind if self.shape_of is None else
+            {"ImplicitShape": {"buffer": self.shape_of[0], "axis": self.shape_of[1]}},
+            "dtype": None if self.dtype is None else self.dtype.to_json(),
             "shape": [d.to_json() for d in self.shape],
             "tensor_map": None if self.tensor_map is None else self.tensor_map.to_json(),
             "implicit_base": self.implicit_base, "buf": self.buf,
