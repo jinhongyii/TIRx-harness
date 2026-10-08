@@ -869,6 +869,35 @@ fn per_lane_cp_async_arrivals_stay_small() {
     assert!(stat(&r, "visited_state_count") < 5_000, "{:?}", r.coverage);
 }
 
+/// V2C-31 (`sm100_fp8_fp4_mega_moe`, `blockscaled_..._rubin`): eight waiters
+/// on two per-lane-arrival barriers. Warp-private async-group issues and
+/// ready waits that only other observers can precede are persistent
+/// singletons, so the waiters do not multiply the states.
+#[test]
+fn many_waiters_with_per_lane_arrivals_stay_small() {
+    let waiters = 8u32;
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(32));
+    log.cmd(0, 1, mbar(0, 8), init(32));
+    cta_sync(&mut log, 0, &(0..=waiters).collect::<Vec<_>>(), waiters + 1);
+    let groups = (0..32u8).map(|l| async_group_res(0, l, async_group::Domain::CpAsync)).collect::<Vec<_>>();
+    for (site, bar) in [(2, mbar(0, 0)), (4, mbar(0, 8))] {
+        log.cmds(0, site, groups.iter().map(|&g| (g, group(async_group::Cmd::Issue))).collect());
+        let targets = (0..32).map(|_| AsyncTarget { res: bar, bytes: 0, arrivals: 1 }).collect();
+        log.event(0, site + 1, groups.iter().map(|&g| (g, group(async_group::Cmd::ArriveOn))).collect(), targets, None, None, numsim_core::observe::ProtocolStatus::Committed);
+    }
+    for w in 1..=waiters {
+        log.cmd(w, 6, mbar(0, 0), wait(0));
+        log.cmd(w, 7, mbar(0, 8), wait(0));
+    }
+    // Count budgets only (no wall-time limit): deterministic under load.
+    let cfg = SynccheckConfig { certificates: false, state_budget: 20_000, ..config(cta(waiters + 1)) };
+    assert_eq!(cfg.limits.max_wall_time_ms, u64::MAX);
+    let r = check(&log.build(), &cfg);
+    assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+    assert!(stat(&r, "visited_state_count") < 5_000, "{:?}", r.coverage);
+}
+
 /// V2C-4: an engine may list only the recording warp in each record of a
 /// collective (cta_group::2 tcgen05 pairs); the members are the union.
 #[test]
@@ -973,4 +1002,20 @@ fn trailing_partial_warpgroup_sync_is_not_an_error() {
     for (name, r) in run_all(&log.build(), cta(6), Verdict::Error) {
         assert_eq!(kind(&r), "setmaxnreg_incomplete_warpgroup", "{name}");
     }
+}
+
+/// Sync delta B7 (engine, W2 phase 3 H1): a warp that exits leaves the
+/// membership of the CTA's count-less named barriers. An open generation it
+/// has not arrived at counts it as arrived: the engine logs that as a
+/// `Named` arrive of the exiting lanes (mask = live), which the explorer
+/// replays like any arrive, in every order relative to the other warps'
+/// `bar.sync`.
+#[test]
+fn exit_arrival_releases_count_less_named_barrier() {
+    let exit_arrive = SyncCmd::Named(named::Cmd::Arrive(named::Contribution { warp: 1, mask: FULL_MASK, live: FULL_MASK, count: 96, aligned: false }));
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, named_bar(0, 1), bar_sync(0, 96));
+    log.cmd(2, 1, named_bar(0, 1), bar_sync(2, 96));
+    log.cmd(1, 2, named_bar(0, 1), exit_arrive);
+    run_all(&log.build(), cta(3), Verdict::Clean);
 }

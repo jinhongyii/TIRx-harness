@@ -826,4 +826,37 @@ Mutation checks:
 | W2-18: sm_107f `.exclusive` TMEM limit (576 columns) | The explorer built every TMEM lifecycle with 512 | The limit is `SynccheckConfig::tcgen_exclusive_max` (from the arch, `sched::exclusive_tmem_columns`) when given. Otherwise it is the largest `.exclusive` width the run committed, and at least 512: an alloc's width is a static fact of its command, which the engine already validated against the launch's arch (a rejection is a Phase A failure) | `tcgen_exclusive_576_follows_the_arch` |
 | V2C-14: `cudnn_sm100_dense_blockscaled_gemm_persistent_{amax,dsrelu_quant}` stopped with `RegPool(IncompleteWarpgroup{wg:1})` | No setmaxnreg ran in warps 4-5. The CTA-wide aligned `bar.sync` credited `WarpgroupSync{wg:1}` for the 2-warp tail, and the sync model rejected the credit | The rule is unchanged for `setmaxnreg` (PTX 9.7.21.5: UB unless all warps of the warpgroup execute it; the tail is no warpgroup; legacy rejects it too). Crediting a sync for the tail is a no-op (reference `numsim-sync-ref` first, then `sync::setmaxnreg`) | `trailing_partial_warpgroup_sync_is_not_an_error`, ref `setmaxnreg_trailing_partial_warpgroup`; both kernels: engine Completed, synccheck Clean |
 
-**Known limit.** Eight independent waiters that each park on two per-lane-arrival barriers in sequence still exceed 20k states when nothing HB-orders their waits (the conformance kernels have that ordering). Arm/observer commutation across two barriers is not yet a diamond.
+**Resolved limit (sweep 3).** Eight waiters that each park on two per-lane-arrival barriers used to exceed 20k states (`many_waiters_with_per_lane_arrivals_stay_small`). See §5.8.
+
+### 5.8 Sweep 3 (2026-10-08, at 3124cec)
+
+**V2C-31 cleared (both synccheck rows).** In the replay, `blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin` is Clean in 0.6 s (it was at the 100k-state limit). `sm100_fp8_fp4_mega_moe` is Clean in 0.5 s (it was at 2.1M states and still incomplete at the 4M-transition limit). The two `gemm_proj_rope` rows are racecheck rows. Three reductions, each with a regression test:
+
+| Reduction | Why it is sound | Test |
+| --- | --- | --- |
+| The pending symmetry (§5.7) now also applies across commands. Of the enabled deferred completions that match on resource, FIFO, generation and count/bytes, only the lowest `(cmd, ord)` is offered. This collapses four producer warps × 32 per-lane arrivals | The mbarrier state does not record which issuer a landing came from. Once both are enabled they stay enabled. Neither may be named by a landing gate | `per_lane_cp_async_arrivals_stay_small` |
+| New `TransitionSystem::singleton_persistent` hook, a strict persistent set that may be combined with sleep sets (Godefroid: explore persistent \ sleep). (1) A warp-private async-group `Issue`/`Commit`: one participant, no async targets, groups no other command touches | No other warp can run something that conflicts with it or disables it. HB gates only open. ArriveOn closes its group, so a later issue never delays an attached deferred arrival. Milestones are eager | `many_waiters_with_per_lane_arrivals_stay_small` (it fails with rule (2) switched off) |
+| (2) A ready mbarrier parity wait/test (`Issue` or `Resume`) when everything that can still run before it on that barrier is another observer: other warps' commands not HB-gated behind it, their retries, and no pending completion | A wait is **not** invisible. It consumes the completed phase, and an arrive of the next phase before that consumption is `ReuseBeforeConsumption`. The first version used the S8 `independent_of_future` proof (contributors that cannot complete the open phase), and the lap-log equivalence oracle caught exactly that (`case 5 whole+all: Clean != Error`). The rule now requires that no contributor at all can run first | `synccheck_equivalence` (lap and random generators) |
+
+**V2C-28 `msa_prefill_multishape`: kernel bug (parity aliasing), not a model gap.** The `incomplete` is correct. Kernel: `tirx_kernels/msa/msa_prefill_multishape.py`, installed version.
+
+- The barrier is `o_smem_free = txl.MBarrier(smem, 1); o_smem_free.init(1)` (line 297), guarding the single shared `o_smem` output tile.
+- The store warp (warp 14, `r_store`, lines 936-973) handles tile `seq_s = it_s * N_TILES + i_q` (`N_TILES = 2`). For each tile it waits `o_staged` (parity `seq_s & 1`), issues the TMA store from `o_smem`, waits `cp.async.bulk.wait_group.read 0`, then `o_smem_free.arrive(0)`. So generation k of `o_smem_free` means "tile k has left `o_smem`".
+- Softmax warpgroup `wg_id` (warps 0-3 and 4-7) handles tile `seq_x = it_x * N_TILES + wg_id`. Its epilogue (lines 1279-1312) runs `o_smem_free.wait(0, (seq_x + 1) & 1)`, then writes `o_smem` and arrives `o_staged`. It means to wait for generation `seq_x - 1` (the previous tile left `o_smem`).
+- **Hazard.** Warpgroup 1, iteration 1 (`seq_x = 3`) waits with parity 0 for generation 2. Parity 0 is also satisfied while the barrier is still in phase 1, after generation 0 completed and generation 1 has not (the store warp is still storing tile 1, warpgroup 1's own iteration-0 tile). Nothing orders warpgroup 1's iteration-1 epilogue after generation 1:
+  - `o_ready` and `o_free` go through the MMA warp.
+  - `union_ready` and `union_free` need only the store warp to have *started* iteration 0 (`union_free.arrive(slot_s)` comes before its tile loop).
+  - `xu_turn` orders the softmax steps of the two warpgroups, not their epilogues.
+  - The metadata reads are data under `union_ready`; there is no spin on a memory flag.
+- **Interleaving.** The explorer's witness, on the `o_smem_free` projection:
+  1. Init; warpgroup 0's iteration-0 wait (vacuous parity 1).
+  2. The store warp frees tile 0 (generation 0).
+  3. Warpgroup 1's iteration-0 wait (parity 0, generation 0); it writes tile 1 and arrives `o_staged`.
+  4. Warpgroup 1 runs all of iteration 1 while the store warp's TMA read of tile 1 is still in flight.
+  5. Warpgroup 1's iteration-1 wait passes on the stale generation 0, and it overwrites `o_smem` while the bulk store still reads tile 1.
+  6. Its `o_staged` arrival also lands in the wrong `o_staged` phase.
+- The reference run happened to order it: there the wait observed generation 2. Legacy synccheck took that generation as fixed and reported clean. The race is real but needs the store warp to lag a whole softmax iteration.
+- **Fix options.**
+  - Make each epilogue wait on a generation that cannot alias: a turn barrier between the two warpgroups' epilogues (like `xu_turn`), so warpgroup 1 waits only after warpgroup 0 has consumed generation `seq_x - 2`.
+  - Or give each warpgroup its own `o_smem` tile and `o_smem_free` barrier, waiting on parity `it_x & 1`.
+- **Report.** It stays `incomplete` (`fixed_sync_program_model_incomplete` / `generation_assignment_differs`), with the operation (warp 4, op 4310, loop iteration 1) and the witness schedule. A proof that it is an error would need the race checker on the `o_smem` bytes; racecheck reports a new `data_race` on this case (V2C-37), and whether that is this race is unverified.

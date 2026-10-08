@@ -152,6 +152,10 @@ pub struct Ts<'p> {
     /// Local commands whose completions some landing gate names by ordinal
     /// (their pendings are not interchangeable).
     landing_gated: Vec<bool>,
+    /// Commands invisible to every other warp: one participant, no async
+    /// targets, only `AsyncGroup` issue/commit on groups no other warp's
+    /// command touches (persistent singletons).
+    private: Vec<bool>,
 }
 
 enum Tried {
@@ -277,7 +281,19 @@ impl<'p> Ts<'p> {
             }
         }
         let landing_gated = vec![false; cmds.len()];
-        let mut ts = Ts { program, key: spec.key, warps, programs, resources, cmds, initial_res, resource_cmds, global_local, landing_gated };
+        let private = cmds
+            .iter()
+            .map(|c| {
+                let [w] = c.participants[..] else { return false };
+                c.issued.is_empty()
+                    && !c.cmds.is_empty()
+                    && c.cmds.iter().all(|&(r, cmd)| {
+                        matches!(cmd, SyncCmd::AsyncGroup(async_group::Cmd::Issue | async_group::Cmd::Commit))
+                            && resource_cmds[r].iter().all(|&o| cmds[o].participants == [w])
+                    })
+            })
+            .collect();
+        let mut ts = Ts { program, key: spec.key, warps, programs, resources, cmds, initial_res, resource_cmds, global_local, landing_gated, private };
         if let Some(reference) = reference {
             for c in &mut ts.cmds {
                 let g = c.global;
@@ -606,12 +622,51 @@ impl<'p> Ts<'p> {
         Tried::Next(next, fx)
     }
 
-    /// Symmetry reduction (V2C-31): enabled pendings of one command that
-    /// differ only in their ordinal (per-lane `cp.async.mbarrier.arrive`,
-    /// multicast transactions) are interchangeable once both are enabled -
-    /// their async-group condition only becomes more true, and no landing
-    /// gate names their ordinals - so only the lowest one is offered.
-    /// Landing any of them reaches the same state up to that renaming.
+    /// `t` is a ready mbarrier observer and every command on its resource
+    /// that can still run before it (other warps' un-issued commands not
+    /// HB-gated behind it, their retries, pending completions) is an
+    /// observer too.
+    fn only_observers_before(&self, s: &State, t: &Transition) -> bool {
+        let Some((r, backend::Class::Observer, at)) = self.candidate(s, t) else { return false };
+        if !matches!(s.res[r], Res::Mbarrier(_)) || s.pending.iter().any(|p| p.res as usize == r) {
+            return false;
+        }
+        let behind_t = |lc: &LocalCmd| {
+            lc.gate.iter().any(|&(w, n)| at.iter().any(|&(tw, pos)| tw == w as usize && n as usize > pos))
+        };
+        for w in 0..self.warps.len() {
+            if at.iter().any(|&(tw, _)| tw == w) {
+                continue;
+            }
+            if let Some((rr, cmd)) = s.retry[w] {
+                if rr as usize == r && backend::classify(&cmd) != backend::Class::Observer {
+                    return false;
+                }
+            }
+            let start = s.cursors[w] as usize + usize::from(s.retry[w].is_some());
+            for &c in self.programs[w].iter().skip(start) {
+                let lc = &self.cmds[c];
+                if behind_t(lc) {
+                    break;
+                }
+                if lc.issued.iter().any(|&(ir, _, _)| ir == r)
+                    || lc.cmds.iter().any(|&(cr, ref cmd)| cr == r && backend::classify(cmd) != backend::Class::Observer)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Symmetry reduction (V2C-31): enabled pendings that differ only in
+    /// their issuing command and ordinal (per-lane
+    /// `cp.async.mbarrier.arrive`, multicast transactions, the same arrival
+    /// from several producer warps) are interchangeable once both are
+    /// enabled - their async-group condition only becomes more true, they
+    /// carry the same resource, generation, count/bytes and FIFO, and no
+    /// landing gate names either - so only the lowest `(cmd, ord)` is
+    /// offered. Landing any of them reaches the same state up to renaming.
     fn has_enabled_twin_below(&self, s: &State, p: &Pending) -> bool {
         if self.landing_gated[p.cmd as usize] {
             return false;
@@ -622,8 +677,8 @@ impl<'p> Ts<'p> {
             _ => false,
         };
         s.pending.iter().any(|q| {
-            q.cmd == p.cmd
-                && q.ord < p.ord
+            (q.cmd, q.ord) < (p.cmd, p.ord)
+                && !self.landing_gated[q.cmd as usize]
                 && q.res == p.res
                 && q.fifo == p.fifo
                 && same_kind(q.kind, p.kind)
@@ -1018,6 +1073,35 @@ impl TransitionSystem for Ts<'_> {
             backend::Class::Contributor(a) => stable || !observers || sum + a < remaining,
             _ => true,
         }
+    }
+
+    fn singleton_persistent(&self, s: &State, enabled: &[Transition]) -> Option<Transition> {
+        // A warp-private async-group issue/commit (V2C-31: cp.async lanes
+        // issuing into their own groups) commutes with every other
+        // transition and is invisible to them: a later issue goes into a
+        // newer group than any deferred arrival already attached (ArriveOn
+        // closes its group), and milestones are eager. Its warp cannot do
+        // anything else first, so it is a persistent singleton.
+        if let Some(t) = enabled.iter().copied().find(|t| matches!(*t, Transition::Issue(c) if self.private[c as usize])) {
+            if self.step(s, &t).is_ok() {
+                return Some(t);
+            }
+        }
+        // A ready parity wait/test on an mbarrier that only other observers
+        // can touch before it runs is a persistent singleton too (V2C-31:
+        // 22 waiters x 3 phases on one barrier pair). A wait is not
+        // invisible - it consumes the completed phase, and an arrive of the
+        // next phase before that is `ReuseBeforeConsumption` - so every
+        // arrival, pending completion or other mutation that can still run
+        // first rules it out (the S8 proof alone is not enough here).
+        if let Some(t) = enabled.iter().copied().find(|t| {
+            matches!(*t, Transition::Issue(_) | Transition::Resume(_)) && self.only_observers_before(s, t)
+        }) {
+            if self.step(s, &t).is_ok() {
+                return Some(t);
+            }
+        }
+        None
     }
 
     /// Today's terminal-completion rule (`sync_fixed_unified.rs:5304-5380`):

@@ -31,6 +31,13 @@ pub trait TransitionSystem {
     ) -> Option<Self::Transition> {
         None
     }
+    /// A transition that forms a persistent set on its own in the strict
+    /// sense (it commutes with every transition that can run before it
+    /// and none of them can disable it), so it may be combined with sleep
+    /// sets (Godefroid: explore persistent \ sleep). Default: none.
+    fn singleton_persistent(&self, _state: &Self::State, _enabled: &[Self::Transition]) -> Option<Self::Transition> {
+        None
+    }
     /// Proof obligation of the strong-diamond reduction beyond one step:
     /// no transition that can occur before `transition` (enabled now, or
     /// enabled later by any sequence of other transitions) conflicts with it
@@ -252,6 +259,7 @@ pub fn explore<M: TransitionSystem>(
         let persistent = (options.persistent && sleep.is_empty())
             .then(|| model.persistent_transition(&state, &enabled))
             .flatten()
+            .or_else(|| options.persistent.then(|| model.singleton_persistent(&state, &enabled)).flatten())
             .and_then(|t| enabled.binary_search(&t).ok());
         let canonical = (options.strong_diamonds && persistent.is_none() && active > 1)
             .then(|| all_strong_diamonds(model, &enabled, &successors))

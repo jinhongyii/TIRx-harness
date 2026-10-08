@@ -36,7 +36,7 @@ ISA cites use PTX 9.4 section numbers. Quotes are in `sync-isa-answers.md`.
 | B4 | `bar.red` mixed with `sync`/`arrive` in one generation | Allowed in all models | `RedMixed` | §9.7.15.1 "unpredictable" |
 | B5 | Incomplete generation at exit (dangling `bar.arrive`) | E: `CompletionSourceNotQuiescent` error. S: only full-CTA all-aligned generations. | Review lint `DanglingAtExit` | §9.7.14.7 |
 | B6 | Arrival counting | E and S: per active lane | 32 per warp arrival, once all non-exited lanes have executed the instruction | §9.7.15.1 "marks warps' arrival" |
-| B7 | Exit of whole warps releasing a barrier | Not modeled | Still not modeled (G8). The scheduler must report such a hang as `incomplete`, not success. | §9.7.14.7 |
+| B7 | Exit of whole warps releasing a barrier | Not modeled | Modeled for count-less barriers. A warp whose lanes have all exited leaves the membership of its CTA's count-less named barriers, so later generations expect 32 fewer threads. An open generation it has not arrived at counts it as arrived: the exit commits and logs a `Named` `Arrive` (`Red` in a `.red` generation) with `mask = live` of the exiting lanes (`interp/handlers/control.rs` `release_named_on_exit`). Synccheck replays that logged arrive like any other in every order (`exit_arrival_releases_count_less_named_barrier`). A generation with an explicit thread count names no membership: a hang there is reported as `incomplete` (G8), never success | §9.7.14.7 "Barriers exclusively waiting on arrivals from exited threads are always released"; sync-isa-answers Q3 (exited lanes leave the expected set) and Q4 (exited threads count as arrived) |
 
 ## Cluster barrier
 
