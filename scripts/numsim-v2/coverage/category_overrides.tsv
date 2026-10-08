@@ -10,3 +10,6 @@ tests/numsim/runtime/test_expr_codegen.py::test_varying_mask_and_uniform_boolean
 tests/numsim/microtests/test_cvt_f32_half.py::test_scalar_half_modifiers_match_independent_grid	A	flip	NumSim-only value-grid oracle via run_checked, not GPU-paired; converted in place to numsim P8 (W11)
 tests/numsim/integration/test_memory_plan.py::test_mapa_source_in_a_nominal_global_declbuffer_keeps_runtime_address_resolution	C	delete	asserts legacy Rust emission text (support.manifest.emitted_module: pointer_space_for_mask view arguments); no v2 observable (W1 rehearsal)
 tests/numsim/integration/test_memory_plan.py::test_all_declared_tmem_views_share_one_physical_backing	C	delete	counts allocate_cta_tmem( in legacy Rust emission (support.manifest.emitted_module); no v2 observable (W1 rehearsal)
+tests/perf/test_corpus_perf.py::test_mega_moe_numsim_max_config	N	keep	v2 perf gate (W8): new-layer test, never retired
+tests/perf/test_corpus_perf.py::test_mega_moe_racecheck	N	keep	v2 perf gate (W8): new-layer test, never retired
+tests/perf/test_corpus_perf.py::test_checker_phase_on_canonical_case	N	keep	v2 perf gate (W8): new-layer test, never retired

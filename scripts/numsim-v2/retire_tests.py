@@ -226,6 +226,8 @@ def plan(wave: str, results: Path | None = None):
     partial: dict[str, list[str]] = {}
     missing: dict[str, list[str]] = {}
     for file in sorted(chosen):
+        if file.startswith(("tests/conformance/", "tests/numsim/v2/", "tests/perf/")):
+            continue  # new-layer tests are never retired
         path = TESTS_BASE / file
         if not path.exists():
             missing[file] = sorted(chosen[file])

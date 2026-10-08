@@ -538,6 +538,9 @@ def retired_tests(waves: list[str], results: Path | None) -> tuple[set[str], dic
     return ids, info
 
 
+NEW_LAYER = ("tests/conformance/", "tests/numsim/v2/", "tests/perf/")
+
+
 def plan_tests(ids: set[str]) -> tuple[list[str], dict[str, list[str]]]:
     per_file: dict[str, set[str]] = collections.defaultdict(set)
     for test_id in ids:
@@ -546,8 +549,8 @@ def plan_tests(ids: set[str]) -> tuple[list[str], dict[str, list[str]]]:
     whole, partial = [], {}
     for file, funcs in sorted(per_file.items()):
         path = retire_tests.TESTS_BASE / file
-        if not path.exists():
-            continue
+        if not path.exists() or file.startswith(NEW_LAYER):
+            continue  # never retire a new-layer test, whatever the ledger says (W8: tests/perf)
         present = retire_tests.test_functions(path)
         live = funcs & present.keys()
         if live and live == set(present):
@@ -1216,6 +1219,7 @@ def build(waves: list[str], results: Path | None) -> Plan:
             "scripts/numsim-v2/coverage",
             f"{NUMSIM}/core-rs/tools/port_sync.py",
             "scripts/numsim-v2/make_contract_shim.py",
+            "scripts/numsim-v2/bench_backends.py",  # legacy-vs-v2 comparison; uses relax_unanchored / delta snapshots (W8)
             "scripts/numsim-v2/validate.sh",
             f"{NUMSIM}/core-rs/tools/validate-program",  # the Rust `validate` API stays
             "scripts/numsim-v2/retire_legacy.py",
@@ -1237,6 +1241,7 @@ def build(waves: list[str], results: Path | None) -> Plan:
         rel for rel in tracked(".")
         if rel.endswith((".py", ".md", ".yml", ".sh", ".toml"))
         and rel not in ("scripts/numsim-v2/retire_legacy.py", "docs/development/test-migration.md")
+        and not any(rel == t or rel.startswith(t.rstrip("/") + "/") for t in plan.tooling)  # deleted in section 6
         and (REPO / rel).is_file()
         and "NUMSIM_V2_" in (REPO / rel).read_text(errors="replace")
     )

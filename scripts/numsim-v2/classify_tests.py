@@ -28,7 +28,7 @@ Categories (``docs/development/test-migration.md``):
   ``coverage/tile_dispatch_rejections.txt`` (``tile_rejections.py``).
 * **F** infrastructure / CLI / packaging / ``dump_kernel``, unrelated to
   NumSim semantics → keep.
-* **N** already a new-layer test (``tests/conformance``, ``tests/numsim/v2``) → keep.
+* **N** already a new-layer test (``tests/conformance``, ``tests/numsim/v2``, ``tests/perf``) → keep.
 
 Precedence: reviewed coverage maps > ``OVERRIDES`` below > E list > path rules
 > AST signals. Every row carries the rule that decided it (``rule`` column),
@@ -308,7 +308,7 @@ def classify(row: Row, f: Features, module_src: str, rel: str, maps, tile) -> No
         # function normally; retiring just those params is a manual edit.
         row.signals = f"partial-E:{ratio}"
     # 4. Path rules.
-    if rel.startswith(("tests/conformance/", "tests/numsim/v2/")):
+    if rel.startswith(("tests/conformance/", "tests/numsim/v2/", "tests/perf/")):
         row.category, row.target, row.rule, row.reason = "N", "keep", "path", "new-layer test"
         return
     if rel.startswith("tests/numsim/microtests/"):

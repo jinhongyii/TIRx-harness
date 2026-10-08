@@ -2425,9 +2425,9 @@ tests/numsim/v2/tile_forms/test_tile_form_ports.py::test_register_owner_checks_o
 tests/numsim/v2/tile_forms/test_tile_form_ports.py::test_tvm_single_thread_fallback_on_registers_takes_the_tile_form,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/tile_forms/test_tile_form_ports.py::test_cross_owner_fragment_copy_is_transported_through_shared_scratch,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/tile_forms/test_tile_form_ports.py::test_fallback_watch_is_hooked_into_tvm_dispatch,numsim/v2,1,N,keep,path,new-layer test,,public,,
-tests/perf/test_corpus_perf.py::test_mega_moe_numsim_max_config,perf,1,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
-tests/perf/test_corpus_perf.py::test_mega_moe_racecheck,perf,?,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;checker;semantic
-tests/perf/test_corpus_perf.py::test_checker_phase_on_canonical_case,perf,?,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;checker;semantic
+tests/perf/test_corpus_perf.py::test_mega_moe_numsim_max_config,perf,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/perf/test_corpus_perf.py::test_mega_moe_racecheck,perf,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/perf/test_corpus_perf.py::test_checker_phase_on_canonical_case,perf,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/test_dump_kernel.py::test_dump_cuda_walks_imported_modules,(top),1,F,keep,override,dump_kernel tool,,public,,
 tests/test_dump_kernel.py::test_extract_symbols_handles_launch_bounds_and_duplicates,(top),1,F,keep,override,dump_kernel tool,,public,,
 tests/test_dump_kernel.py::test_parse_ptxas_extracts_resource_counts,(top),1,F,keep,override,dump_kernel tool,,public,,
