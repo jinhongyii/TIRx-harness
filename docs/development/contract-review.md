@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # numsim-core contract review (adversarial, 2026-10-07)
 
 Paths are relative to `tirx_harness/src/tirx_harness/numsim/core-rs/numsim-core/src/`.

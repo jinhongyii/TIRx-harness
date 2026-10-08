@@ -930,7 +930,7 @@ buffers:  [b0=a(Global,slot0), b1=b(Global,slot1), b2=c(Global,slot2)]
 abridged from the corpus IR). Buffers are renamed (`empty`, `full`, `A_s`)
 and the register and buffer numbers are illustrative. The source:
 
-```python
+```text
 if T.cuda.elect_sync() != 0:
     while ld_sched_done == 0:
         T.cuda.mbarrier_wait(T.address_of(empty[stage]), phase ^ 0)

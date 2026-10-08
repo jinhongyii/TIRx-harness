@@ -124,6 +124,7 @@ development/add-workload
 development/export-kernel
 development/contribute-kernel
 development/report-and-fix-bugs
+development/architecture
 development/build-the-docs
 ```
 

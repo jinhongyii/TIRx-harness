@@ -17,7 +17,7 @@ listed field names as keyword arguments.
 including output storage. `outputs` selects the result buffers. `reference`
 is a zero-argument callable returning a dictionary of expected outputs;
 `comparisons` maps output names to comparison specifications. Pass the case to
-{py:func}`~tirx_harness.numsim.run_case`.
+{py:func}`~tirx_harness.numsim.v2.api.run_case`.
 
 ```{eval-rst}
 .. autoapiclass:: tirx_harness.numsim.ComparisonSpec
@@ -45,7 +45,8 @@ be nonempty and have matching shapes.
 A tensor map describes the storage and tile shape for a tensor-memory transfer.
 Use `TensorMap(...).numpy()` to create a simulator descriptor, then bind that
 array under the kernel's tensor-map parameter name. This descriptor is for
-CPU simulation.
+CPU simulation. The descriptor addresses its base array; select the tensor
+map as an output to receive that array back in the map's logical layout.
 
 ```{eval-rst}
 .. autoapiclass:: tirx_harness.numsim.TensorMap
@@ -70,10 +71,12 @@ coordinates use width, height, and depth order (W/H/D).
 
 ## Launch selection
 
-Most callers execute the full launch. To select complete clusters or thread
-blocks, import `ExecutionSubset` from `tirx_harness.numsim.api` and pass it as
-`subset` to `Engine.run`. A cooperative thread array (CTA) is a thread block.
-For a multi-kernel launch, use a mapping from phase indices to selections.
+Most callers execute the full launch. To select complete clusters, import
+`ExecutionSubset` from `tirx_harness.numsim.api` and pass it as `subset` to
+`Engine.run`; only the selected clusters run. A cooperative thread array (CTA)
+is a thread block. The redesigned engine selects clusters only: a subset with
+`cta_ids` raises `NotImplementedError`. A run that skips part of the launch
+cannot certify it, so checker verdicts on a subset are at least `incomplete`.
 
 ```{eval-rst}
 .. autoapiclass:: tirx_harness.numsim.api.ExecutionSubset
@@ -93,3 +96,7 @@ indices to `ExecutionSubset` objects.
    :members: external_grid_dependencies_satisfied
    :undoc-members:
 ```
+
+The redesigned engine accepts `ExecutionAssumptions` and ignores it: grid
+dependencies on an earlier launch are satisfied at the launch boundary
+(pending: remove the type when the legacy engine is deleted).

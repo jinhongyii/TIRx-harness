@@ -15,8 +15,13 @@ To run an exported kernel with `tvm-ffi`, follow
 - Linux x86_64, Python 3.12 or 3.13, and pip 25.1 or later.
 - The CUDA Toolkit (`nvcc`, `ptxas`) where GPU kernels are compiled, and a
   compatible NVIDIA driver where they are run.
-- Cargo, **Rust 1.89.0 or later**, and a C linker for numerical simulation and
-  correctness checks with either installation method.
+- Cargo, **Rust 1.89.0 or later**, and a C linker. The NumSim engine is built
+  once, when the package is built; it does not compile each kernel. A Rust
+  toolchain is therefore needed to build from source and to use the optional
+  codegen backend, but not to run NumSim, Synccheck, or Racecheck with the
+  default interpreter (pending: until the migration completes, the legacy
+  engine compiles each kernel with Cargo at run time, so every installation
+  still needs the toolchain).
 
 ## Install Python packages
 
@@ -30,8 +35,8 @@ Install the released package without cloning this repository:
 python -m pip install tirx-harness
 ```
 
-Wheels include the native frontend. If pip builds from a source distribution,
-the build tools below are required.
+Wheels include the native components. If pip builds from a source
+distribution, the build tools below are required.
 
 ### Build from source
 
@@ -44,6 +49,27 @@ cd TIRx-harness
 git submodule update --init thirdparty/tvm-rust-ext
 python -m pip install .
 ```
+
+The `thirdparty/tvm-rust-ext` submodule builds the legacy TIRx frontend. The
+redesigned engine lowers TIRx in Python and does not use it (pending: drop
+the submodule step when the legacy engine and frontend are deleted).
+
+#### Build the NumSim engine extension
+
+The redesigned engine is the Rust workspace
+`tirx_harness/src/tirx_harness/numsim/core-rs`. Its Python extension,
+`numsim_core_py`, is built once and serves every kernel. With the
+environment's Python active, build it into the source tree of an editable
+checkout, such as one created with uv below:
+
+```bash
+bash tirx_harness/src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh
+```
+
+Pass `--debug` for a debug build. Set `PY` to choose another Python
+interpreter. Rerun the script after changing anything under `core-rs`.
+`python -m pip install .` does not build this extension yet (pending: build
+`numsim_core_py` in `setup.py` and ship it in wheels).
 
 #### Optional: install with uv
 
@@ -60,6 +86,12 @@ After any of these methods, check imports (this does not run checks or GPU kerne
 
 ```bash
 python -c "import tvm.tirx, tvm_ffi, tirx_kernels.tirx_lite, tirx_harness; print('Core imports OK')"
+```
+
+If you built the engine extension, check that it loads:
+
+```bash
+python -c "from tirx_harness.numsim.v2.compile import native; native(); print('Engine OK')"
 ```
 
 ## Install kcoral server dependencies

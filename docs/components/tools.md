@@ -23,6 +23,22 @@ NumSim, Synccheck, and Racecheck run on the CPU. See the
 The [Python API reference](../api/index.md) provides generated signatures,
 defaults, and return types for these tools.
 
+All three tools share one pipeline. Python lowers the TIRx function to a
+`Program`, a compact bytecode of warp-wide instructions. One Rust engine
+executes that program, and the two checkers observe the execution without
+changing it. A kernel that runs under NumSim therefore runs the same
+instructions, values, and control flow under Synccheck and Racecheck. The
+[architecture overview](../development/architecture.md) describes the
+components for contributors.
+
+```{note}
+This page describes the redesigned engine. Until the migration completes,
+`tirx_harness.numsim`, `tirx_harness.synccheck`, and
+`tirx_harness.racecheck` still run the legacy engine, and the redesigned
+engine is importable under the same names from `tirx_harness.numsim.v2`
+(pending: switch the public entry points to v2 and delete the legacy engine).
+```
+
 ## NumSim
 
 **When to use it.** Use NumSim when getting a real GPU run is costly or
@@ -44,11 +60,34 @@ mismatches by index and value before you spend a GPU allocation on the
 candidate. Resolve synchronization and race findings first; use the target
 GPU to validate selected candidates and measure performance.
 
-**Mechanism.** NumSim transpiles a specialized TIRx kernel into a cached native
-Rust artifact. Its CPU engine executes concrete control flow and modeled
-instructions, maintaining register values, memory, and asynchronous-operation
-state. It returns output arrays and diagnostics; comparison against an
+**Mechanism.** NumSim works in two stages:
+
+1. **Lower.** Python walks the specialized TIRx function and emits a
+   validated `Program`: warp-wide instructions over 32-lane registers,
+   structured control flow (`if`/`else` and loops with an active-lane mask),
+   a constant pool, and a table of source sites. Tile operations are lowered
+   through TVM's own tile dispatch, so NumSim runs the instructions the GPU
+   would run. The lowered module is cached on disk, keyed by the TIRx source
+   and the lowering version.
+2. **Execute.** The Rust engine runs the program. Its scheduler visits every
+   resident thread block (CTA) in rounds and gives each runnable warp a
+   bounded slice of instructions in a seeded order. Blocking instructions,
+   such as barrier waits, are retried on later rounds. Asynchronous copies
+   land after a seeded delay. Every synchronization protocol (mbarrier, named
+   and cluster barriers, async groups, tcgen05, `setmaxnreg`) is one state
+   machine shared by all three tools. Memory keeps one validity bit per byte,
+   so reading bytes that nothing wrote is reported. Numerical results come
+   from one operation library.
+
+NumSim returns output arrays and diagnostics. Comparing them with an
 independent reference identifies numerical mismatches.
+
+By default, the engine interprets the program directly, so no Rust compiler
+is involved at run time. An optional codegen backend prints the same program
+as Rust, where every instruction is a call to the interpreter's own handler,
+and compiles it once per module (pending: backend decision; after the
+performance comparison one of the two backends is removed). Both backends
+produce identical results.
 
 **Runnable example.** Save this kernel as `vector_add.py`:
 
@@ -94,31 +133,54 @@ Save this as `check_numsim.py` beside `vector_add.py` and run
 `python check_numsim.py`.
 
 Dictionary keys must match kernel parameter names; include output buffers
-alongside input arrays and any scalar parameters. Choose
+alongside input arrays and any scalar parameters. Shape parameters that a
+buffer's shape determines are filled from the bound array. Choose
 tolerances according to the workload; use `np.testing.assert_array_equal`
 when exact equality is required. Decode buffers carrying encoded values
 before comparing their numerical contents.
 
 | Interface | Main parameters | Result |
 | --- | --- | --- |
-| `numsim.transpile(func, *, cache_dir=None)` | `func`: specialized TIRx function. `cache_dir`: optional artifact-cache directory. | `CompiledModule` |
-| `numsim.Engine(...)` | `max_workers=8`: positive CPU-worker count, or `"auto"` to use the detected CPU count. | Execution engine |
-| `engine.run(module, inputs, *, outputs=None)` | `module`: transpiled artifact. `inputs`: concrete binding dictionary. `outputs`: buffer names or a mapping from result names to buffer names; `None` selects bound output buffers. | `NumSimResult` |
+| `numsim.transpile(func, *, cache_dir=None)` | `func`: specialized TIRx function, or a sequence of them for a multi-kernel launch. `cache_dir`: optional module-cache root; the default is `NUMSIM_CACHE_DIR`. | `CompiledModule` |
+| `numsim.Engine(max_workers=1, *, backend=None, seed=None)` | `max_workers`: threads that run independent clusters in parallel; results do not depend on it. `backend`: `"interp"` (default) or `"codegen"`. `seed`: scheduler seed. | Execution engine |
+| `engine.run(module, inputs, *, outputs=None)` | `module`: transpiled module. `inputs`: concrete binding dictionary. `outputs`: buffer names or a mapping from result names to buffer names; `None` selects bound output buffers. | `NumSimResult` |
 
-`NumSimResult` exposes `.outputs`, `.diagnostics`, and `.stats`. Keep simulator
-diagnostics alongside the workload's numerical comparison result.
+`NumSimResult` exposes `.outputs`, `.diagnostics`, `.stats`, and `.timing`
+(wall-clock milliseconds for lowering, binding, build, run, and report). Keep
+simulator diagnostics alongside the workload's numerical comparison result.
 
-See the {repo}`NumSim API source <tirx_harness/src/tirx_harness/numsim/api.py>`
-for full signatures.
+See the [NumSim API reference](../api/numsim.md) for full signatures.
 
 **Limitations.**
 
 - Only modeled TIRx operations and their supported dtype, shape, and modifier
-  combinations can execute. Opaque CUDA bodies are unsupported; consult the
-  {repo}`operation coverage table <tirx_harness/src/tirx_harness/numsim/engine-rs/SUPPORTED_OPS.md>`.
+  combinations can execute. Lowering rejects any other form with
+  `UnsupportedTIRxError` instead of guessing. Opaque CUDA bodies are
+  unsupported, and so is a tile operation that TVM's tile dispatch cannot
+  lower. Consult the
+  {repo}`operation coverage table <tirx_harness/src/tirx_harness/numsim/engine-rs/SUPPORTED_OPS.md>`
+  (pending: the table moves next to the new engine when the legacy engine is
+  deleted; the new engine renders it from the same operation registry).
 - Hardware timing and some instruction results use deterministic
-  representatives. Simulation time is not GPU latency, and numerical fidelity
-  depends on the operation's documented model.
+  representatives. Simulation time is not GPU latency. Transcendental math
+  that the legacy simulator did not model (for example `sin`, `cos`, `tanh`,
+  `exp2`, `pow`) uses the host math library, not CUDA's device library, so it
+  can differ in the last bits. Matrix multiply-accumulate operations sum each
+  output as one increasing-K chain of fused multiply-adds.
+- One run follows one seeded schedule. Change the seed (`Engine(seed=...)` or
+  `NUMSIM_V2_SEED`) to see other asynchronous-completion timings; the
+  checkers below cover the other orders.
+- Clusters run in parallel only when the launch has no launch-wide state. A
+  launch that uses grid synchronization or a cooperative launch, polls memory
+  with `wait_until`, or mixes tcgen05 `cta_group` sizes runs on one thread.
+- A warp that blocks inside one branch of a divergent `if` can resume the
+  other branch only when that `if` has an `else`. An `if` without an `else`
+  whose skipped lanes would release the blocked lanes, or a loop whose exit
+  differs between lanes while some lanes wait, stops the run as `incomplete`
+  (`divergent_block`), never as a deadlock.
+- Loop-iteration and scheduler-round budgets stop a run as `incomplete`.
+  Launch subsets select whole clusters; thread-block subsets are not
+  supported.
 - NumSim is not a numerical oracle or a race/synchronization verifier. Use
   independent reference outputs, the two checkers below, and device tests.
 
@@ -132,40 +194,65 @@ launch that could hang.
 
 **Guarantee.** Within its supported model, Synccheck detects:
 
-- Barrier use without initialization ordered before it, or reuse without the
-  required wait/consumption dependencies.
-- Invalid barrier participants, arrival counts, or asynchronous completion
-  counts.
-- Synchronization deadlocks and inconsistent final protocol states.
+- Barrier use without initialization ordered before it, and reuse of an
+  mbarrier phase before the previous phase was consumed by a successful wait.
+- Invalid barrier participants, arrival counts, or transaction counts. Every
+  non-exited thread of a warp must take part in a named or cluster barrier;
+  a single elected lane does not count for its warp.
+- Tensor-memory (TMEM) allocation errors: deallocation that does not match
+  its allocation, and inconsistent `cta_group` use. An allocation that cannot
+  be satisfied yet waits, as on hardware, instead of failing.
+- `setmaxnreg` errors: wrong direction, missing warpgroup synchronization,
+  and register-pool deadlocks.
+- Synchronization deadlocks, schedules that end in different final protocol
+  states, and inconsistent final protocol states.
 
 The check covers **all interleavings allowed by program order and
-synchronization dependencies**, with each warp's executed path and values
-held fixed. It therefore detects synchronization errors that another
-warp/completion order can expose, even when the CPU simulation happens to
-finish successfully.
+synchronization dependencies**, including when each asynchronous completion
+arrives and the order of register-pool grants. Each warp's executed path and
+values are held fixed. It therefore detects synchronization errors that
+another warp/completion order can expose, even when the CPU simulation
+happens to finish successfully.
 
-**Mechanism.** The algorithm has three steps:
+Exits follow the PTX rules. Exited threads leave cluster barriers and named
+barriers that use the default thread count, which can complete a pending
+phase. A `bar.arrive` with no matching completion at exit, or `cp.async`
+copies never committed to a group, is a `review` advisory, not an error.
+Bulk asynchronous copies left uncommitted at exit are committed implicitly.
 
-1. **Fully simulate the kernel.** Execute supported computations, memory
-   accesses, and data-dependent branches and loops on CPU. Record a separate
-   operation sequence for each warp, including its synchronization and
-   asynchronous events.
-2. **Check dependencies and counts.** Retain the order within each warp and
-   cross-warp dependencies established by synchronization. For common barrier
-   patterns, check each phase's
-   arrival/completion counts and required dependency chains, such as
-   initialization before use.
-3. **Explore the remaining patterns.** Keep each warp's next operation,
-   blocked status, barrier state, and pending completions. Try the next events
-   permitted by those dependencies, including orders different from the CPU
-   run; branch when several events are possible and merge equivalent states.
-   Report protocol violations or unfinished
-   states where no event can progress.
+**Mechanism.** The algorithm has four steps:
+
+1. **Run the kernel once.** Execute supported computations, memory accesses,
+   and data-dependent branches and loops on the CPU, and record each warp's
+   synchronization commands with their resolved barriers, counts, byte totals,
+   and parities. Each asynchronous operation is recorded with the barriers it
+   will signal. A protocol error in this run is reported directly.
+2. **Build a reference schedule.** Replay one complete order of the recorded
+   commands to number each barrier phase and record which commands are
+   ordered before which.
+3. **Split and certify.** Check each synchronization resource (a barrier, an
+   async group, a register pool) separately, keeping the ordering
+   constraints the other resources impose. For common patterns, such as a
+   pipeline ring of mbarriers, a certificate proves that every phase pairs
+   the same arrivals, completions, and waits in every schedule; a certified
+   resource needs no search. Resources with an identical command pattern
+   are checked once.
+4. **Explore the remaining patterns.** Keep each warp's next command, the
+   resource state, and the pending completions. Try every enabled command or
+   completion, including orders different from the CPU run, and merge
+   equivalent states and orders that cannot affect each other. Report
+   protocol violations with a witness schedule, deadlocks where no command
+   can progress, and schedules that end in different states.
 
 For example, warp A initializes a barrier and warp B uses it. The checker
 requires a dependency chain guaranteeing that A's initialization precedes
 B's use. A merely running first in the CPU simulation does not establish
 that guarantee.
+
+The check fails closed. It reports `incomplete` when a state, transition, or
+wall-time budget runs out, or when some schedule would let a wait pass on a
+different barrier phase than the reference schedule. A wall-time cut depends
+on host speed, but it can only produce `incomplete`.
 
 **API:** `synccheck(kernel, inputs=None)` returns a `SyncCheckReport`.
 
@@ -198,7 +285,11 @@ Both arguments and the report interface are described in
 **Limitations.** Data-dependent execution is supported, but the verification
 covers the synchronization program selected by this invocation. Alternate
 inputs, ordinary-memory values, atomic return orders, and the different
-control-flow paths they might select are not enumerated.
+control-flow paths they might select are not enumerated. The results of
+polls that succeeded and the TMEM addresses returned by allocations are also
+fixed by the run; a schedule in which an allocation would return a different
+address is reported as an error. A named barrier with an explicit thread
+count that waits on warps that already exited is reported as `incomplete`.
 
 ## Racecheck
 
@@ -210,14 +301,32 @@ on execution order.
 
 **Guarantee.** Within its supported model, Racecheck detects:
 
-- Read/write and write/write conflicts in global memory, shared memory, or
-  TMEM that lack the required ordering, including accesses through aliases of
-  the same storage.
-- Missing memory ordering, such as a required release/acquire dependency or
-  proxy fence between ordinary and asynchronous memory accesses, even when
-  their execution order is established.
+- Read/write and write/write conflicts in global memory, shared memory
+  (including another CTA's shared memory in the cluster), or TMEM that lack
+  the required ordering, including accesses through aliases of the same
+  storage and host arrays bound to overlapping memory.
+- Missing memory ordering, even when the execution order is established:
+  - a release/acquire pair whose scopes do not include both threads. An
+    mbarrier arrive or wait without a scope qualifier is `.cta`, so it does not
+    order a waiter in another CTA;
+  - an mbarrier wait with `.relaxed` semantics, which orders nothing until a
+    later acquire fence in the same thread;
+  - a missing proxy fence between ordinary accesses and asynchronous-proxy or
+    tensor-map accesses.
+- Asynchronous-completion errors. A `cp.async` or bulk group wait orders only
+  the waiting thread's own copies. `cp.async.bulk.wait_group.read` makes only
+  the source safe to reuse, not the destination safe to read. tcgen05 work
+  is complete only after its wait or after its commit is observed through an
+  mbarrier.
 - Accesses outside a buffer view or its backing allocation.
-- Reuse of memory still accessed by an unfinished asynchronous operation.
+- Reuse or release of memory still accessed by an unfinished asynchronous
+  operation.
+- Plain accesses that race on a word polled with `wait_until`.
+
+Racecheck reports every race it finds; it does not stop at the first one.
+Two strong accesses that the PTX memory model makes morally strong (same
+scope coverage, same proxy, complete overlap), such as two atomics of the
+same scope, are not a race.
 
 For the accesses selected by this invocation, the check requires both
 **execution ordering and the necessary memory-ordering dependencies**. It can
@@ -225,24 +334,37 @@ detect a race even when the CPU simulation produces the expected output.
 
 **Mechanism.** The algorithm has three steps:
 
-1. **Fully simulate the kernel.** Execute supported computations, memory
-   accesses, and data-dependent branches and loops on CPU. Record each active
-   lane's physical byte ranges, reads and writes, and synchronization events.
-2. **Track ordering dependencies.** Use vector clocks: compact records of
-   which earlier accesses each lane or asynchronous operation is ordered
-   after. Update these records through modeled program order, barriers,
-   release/acquire operations, and asynchronous completion waits. Also track
-   required memory and proxy fences to check visibility between accesses.
-3. **Check overlapping accesses.** For ordinary reads and writes, report a
-   race when two accesses overlap, at least one writes, and neither must
-   happen before the other. Compare physical bytes so different buffer names
-   cannot hide an overlap. Atomic accesses follow the model's atomicity and
-   scope rules.
+1. **Run the kernel once.** Execute supported computations, memory accesses,
+   and data-dependent branches and loops on the CPU. Racecheck observes the
+   run as two streams: each active lane's physical byte ranges with access
+   kind, strength, scope, and proxy, and the synchronization events (barrier
+   arrivals and waits with their scopes, fences, asynchronous issues and
+   completions).
+2. **Track ordering dependencies.** Keep vector clocks, compact records of
+   which earlier events each actor is ordered after. Actors are threads and
+   asynchronous operations; an asynchronous operation has separate
+   read-complete and write-complete milestones. Each happens-before rule is
+   taken from the PTX memory model: program order, barriers, release/acquire
+   through the value read and through fences, asynchronous completions, and
+   proxy and tcgen05 fences. For a `wait_until` poll, the ordering comes from
+   the earliest write that satisfies the predicate, whichever write the run
+   happened to observe.
+3. **Check overlapping accesses.** Each allocation keeps a shadow of byte
+   ranges holding the last write and the reads since it, in the style of the
+   FastTrack race detector. A new access is checked against the overlapping
+   ranges. A race is reported when two accesses overlap, at least one writes,
+   neither happens before the other, and they are not morally strong.
+   Physical bytes are compared, so different buffer names cannot hide an
+   overlap.
 
 For example, warp A writes a shared-memory value and warp B reads it. The
 checker requires a dependency chain ordering the write before the read.
 A merely writing first in the CPU simulation does not establish that
 guarantee.
+
+Racecheck fails closed: an event it cannot interpret, such as a barrier
+whose memory-ordering qualifiers were lost, or a `wait_until` exit no
+recorded write explains, is `incomplete`.
 
 **API:** `racecheck(kernel, inputs=None)` returns a `RaceReport`.
 
@@ -275,7 +397,12 @@ Both arguments and the report interface are described in
 **Limitations.** Data-dependent execution is supported, but the check covers
 the accesses selected by this invocation. Alternate inputs, ordinary-memory
 values, atomic return orders, and the different control-flow paths or addresses
-they might select are not enumerated.
+they might select are not enumerated. When clusters run in parallel, the
+checker sees the accesses in an order consistent with what each cluster read;
+if no such order exists, the result is `incomplete`. A bulk copy still in
+flight when its CTA exits is treated as drained, because the PTX ISA does not
+specify this case; a race between that copy and another CTA's later access is
+still reported.
 
 ## Checker API
 
@@ -295,18 +422,24 @@ shape, strides, dtype, and swizzle parameters.
 | --- | --- |
 | `.verdict` | `clean`, `review`, `incomplete`, or `error`. |
 | `.findings` | Structured findings with status, kind, message, and source/witness evidence. |
-| `.to_dict()` | JSON-safe report for an agent or artifact store. |
+| `.to_dict()` | JSON-safe report for an agent or artifact store (`schema_version` 5). |
 | `.print()` | Human-readable findings and available source context. |
 | `.require_clean()` | Raise unless the verdict is `clean`. |
 
-A verdict covers the supplied specialization, launch, and inputs. The public
-checkers currently require a single kernel phase. Missing bindings,
-unsupported effects, and coverage limits produce `incomplete`; `review`
-indicates an advisory, and `error` indicates a detected violation. A clean
-report does not establish correctness for other inputs or replace an
-independent GPU correctness test. The
+A verdict covers the supplied specialization, launch, and inputs. A
+multi-kernel invocation is checked launch by launch, and the report's verdict
+is the worst launch verdict (pending: the legacy entry points accept a single
+launch only). Unsupported effects and coverage limits produce
+`incomplete`; `review` indicates an advisory, and `error` indicates a
+detected violation. A clean report does not establish correctness for other
+inputs or replace an independent GPU correctness test. The
 {repo}`checker entry points <tirx_harness/src/tirx_harness/numsim/checkers.py>`
 own these signatures.
+
+Missing bindings, and forms that lowering rejects, also produce `incomplete`
+in the legacy entry points (pending: the v2 entry points raise `InputError`
+and `UnsupportedTIRxError` for these instead of returning an `incomplete`
+report).
 
 ## Inspecting generated code
 

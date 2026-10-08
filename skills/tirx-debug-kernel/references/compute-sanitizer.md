@@ -16,7 +16,7 @@ memory access, initialization, data race, and synchronization failures.
 | Concern | Prefer first | Device follow-up if needed |
 |---------|--------------|------|
 | Barrier protocol / deadlock | [synccheck](synccheck.md) (fast, pre-GPU) | `compute-sanitizer --tool synccheck` |
-| Data race on device memory | [racecheck](racecheck.md) (TMEM/SMEM model) | `compute-sanitizer --tool racecheck` |
+| Data race on device memory | [racecheck](racecheck.md) (global/SMEM/TMEM model) | `compute-sanitizer --tool racecheck` |
 | Invalid or out-of-bounds memory access | — | `compute-sanitizer --tool memcheck` |
 | Uninitialized device memory access | — | `compute-sanitizer --tool initcheck` |
 
@@ -55,4 +55,4 @@ Useful extras (see `compute-sanitizer --help`):
 ## Complements
 
 - [synccheck](synccheck.md) — CPU-side barrier check; sanitizer is the GPU-side follow-up for hangs
-- [racecheck](racecheck.md) — CPU-side TMEM/SMEM data-race check; sanitizer observes the launched GPU binary
+- [racecheck](racecheck.md) — CPU-side global/SMEM/TMEM data-race check; sanitizer observes the launched GPU binary

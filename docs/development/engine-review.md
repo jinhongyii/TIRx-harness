@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # NumSim engine review: interpreter and scheduler (HEAD fff0479)
 
 Scope: `numsim-core/src/{interp,sched,arena.rs}`, tests, and benches. Line numbers refer to HEAD. Programs use `testutil::ProgramBuilder` (`b.`).

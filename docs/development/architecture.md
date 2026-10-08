@@ -1,0 +1,230 @@
+# NumSim architecture
+
+```{container} lead
+How NumSim, Synccheck, and Racecheck are built, and where to make a change.
+```
+
+This page is the contributor overview of the redesigned engine. The user-facing
+behavior is described in [Compiler analysis](../components/tools.md); the
+detailed specifications are linked [at the end](#specifications). Day-to-day
+build, test, and environment commands are in the
+[development loop](dev-loop.md).
+
+The redesign replaces the legacy engine (`numsim/engine-rs`, the Rust frontend
+`frontend-rs`, and the legacy Python layer) kernel by kernel, with corpus
+snapshots as the oracle. Until the migration completes, both engines are in the
+tree and the public entry points still run the legacy one (pending: switch the
+public entry points to v2 and delete `engine-rs`, `frontend-rs`, and the
+legacy Python modules).
+
+## Design rules
+
+- **One execution path.** NumSim, Racecheck, and Synccheck run the same
+  instructions, values, memory, and control flow. The mode is a run-time
+  parameter. Checkers observe the run; they never change what the program
+  sees.
+- **One transition function per protocol.** Each synchronization protocol
+  (mbarrier, named barrier, cluster barrier, async group, tcgen05, `setmaxnreg`)
+  is one `step(state, command)` function. The engine and Synccheck call the
+  same function.
+- **Hot and cold events are separate.** Memory accesses are borrowed `Access`
+  records, delivered hundreds of thousands of times per kernel. Synchronization
+  events are owned `SyncEvent` records, delivered a few thousand times.
+- **Bytes and analysis metadata are separate.** The arena holds bytes and one
+  validity bit per byte. Race shadows live in the checker, keyed by allocation
+  and byte range.
+- **Fail closed.** An exhausted budget, an event a checker cannot interpret, or
+  an unsupported form is `incomplete`, never `clean`.
+- **Measure before optimizing.** Each pruning technique in the checkers has a
+  criterion benchmark; end-to-end budgets are relative to a per-host baseline.
+
+## Components
+
+| Component | Location | Owns |
+| --- | --- | --- |
+| Lowering (Python) | `numsim/v2/lowering/` | TIRx PrimFunc → `Module` (one `Program` per launch) |
+| Contract | `core-rs/numsim-core/src/{program,dtype,value,site,observe,report}.rs`, `numsim-types` | `Program`, `Instr`, `Dtype`, `SiteInfo`, the `Observer` trait, `Finding` |
+| Interpreter backend | `numsim-core/src/interp/` | `WarpState`, the mask stack, one handler per instruction family |
+| Codegen backend | `numsim-core/src/codegen/` | A printer from `Program` to Rust that calls the same handlers; one `rustc` per module |
+| Scheduler | `numsim-core/src/sched/` | Rounds, seeded warp rotation, async landing, deadlock and budget detection, cluster partitions |
+| Arena | `numsim-core/src/arena.rs` | Allocations, views, validity bits, address encodings |
+| SyncTable | `numsim-core/src/sync/` | Protocol states, `step` functions, the completion queue |
+| OpLib | `numsim-core/src/oplib/`, `core-rs/numsim-oplib/` | Pure numerics: conversions, low-precision formats, MMA, TMA and swizzle addressing, the operation registry |
+| Racecheck | `numsim-core/src/racecheck/` | Online observer: clocks, interval shadow, cell rules, findings |
+| Synccheck | `numsim-core/src/synccheck/` | Offline explorer over the recorded `SyncEvent` log |
+| Python binding | `core-rs/numsim-py/` | The `numsim_core_py` extension |
+| Python layer | `numsim/v2/{compile,run,report,options,api}.py` | Module cache, input binding, reports, environment |
+
+`core-rs` paths are relative to `tirx_harness/src/tirx_harness/numsim/`. The
+contract modules are owned by the coordinator; request a change in
+`numsim-core/CONTRACT_REQUESTS.md` instead of editing them in passing.
+
+Two crates are test oracles and benchmarks, not production code:
+`numsim-sync-ref` (one small, obviously correct reference state machine per
+protocol) and `numsim-race-core` / `numsim-sync-explore` (criterion benchmarks
+for the checkers' pruning techniques).
+
+## Data flow
+
+```text
+TIRx PrimFunc
+  │  lowering (Python): ir_walk, builtins, ptx_lower, TVM tile dispatch
+  ▼
+Module = [Program]                 cached as JSON under $NUMSIM_CACHE_DIR/v2-modules
+  │  numsim_core_py.run(module, inputs, mode, backend, seed, workers)
+  ▼
+Scheduler ── Interpreter or codegen step function ── handlers
+  │             │                    │                  │
+  │           Arena               SyncTable           OpLib
+  ▼
+Observer:  NoopObserver (NumSim) │ racecheck::Checker │ RecordingObserver
+                                 │  (online)          │  → synccheck::check (offline)
+  ▼
+outputs + diagnostics + checker reports → v2/report.py → schema 5 payloads
+```
+
+A `Program` holds the instruction vector, a constant pool, source sites, tile
+layouts, the launch shape, and the host parameter slots. Registers are 32-lane
+values with a static type. Control flow is structured: `If`/`Else`/`EndIf` keep
+the active-lane mask stack, and `LoopBegin`/`LoopIf`/`LoopEnd` carry the
+iteration budget, the scheduling quantum, and spin parking. A blocking
+instruction returns `Blocked(resource)` and the scheduler retries it on a later
+round; there are no wakers or waiter registries. `Program` is serializable, so
+Rust tests can load or hand-build one without Python or TVM.
+
+Within a round, each resident CTA gives every runnable warp one slice of up to
+`quantum` instructions from a seeded rotation offset. Its ready asynchronous
+operations then land (a seeded subset by default, so an operation can stay in
+flight across rounds). Each resident cluster is a partition with its own CTAs,
+`SyncTable`, and event buffer, and partitions run on up to `workers` threads.
+Global memory is shared through copy-on-write stripes that merge at the end of
+the round, and buffered events are replayed in an order consistent with what
+each partition read. A launch with launch-wide state (grid sync or cooperative
+launch, declared `wait_until` words, mixed tcgen05 `cta_group`s) runs as one
+partition. Results and observer streams never depend on the worker count.
+
+## Where each concept lives
+
+| Concept | Where |
+| --- | --- |
+| TIRx builtin → instruction family | `v2/lowering/builtins.py`; PTX decoding in `ptx_decode.py`, `ptx_lower.py` |
+| Half-precision expression chains | `v2/lowering/ir_walk.py` (`half_chain`) |
+| Instruction variants and validation | `numsim-core/src/program.rs` (`Instr`, `Program::validate`) |
+| Instruction semantics | `numsim-core/src/interp/handlers/*.rs`, one function per family |
+| Pure-register PTX tail (`mma.sync`, `cvt`, `shfl`, ...) | `Instr::Ptx`, resolved once at load by `oplib::resolve_ptx` |
+| Protocol rules and errors | `numsim-core/src/sync/<protocol>.rs` |
+| Event vocabulary | `numsim-core/src/observe.rs` (`Access`, `SyncEvent`, `SyncKind`) |
+| Happens-before rules | `numsim-core/src/racecheck/{observer,checker,knowledge}.rs` |
+| Conflict rule and shadow | `numsim-core/src/racecheck/{cell,shadow,clock}.rs` |
+| Synccheck projection, certificates, DFS | `numsim-core/src/synccheck/{projection,certificate,fingerprint,explore}.rs` |
+| Finding kinds and verdicts | `numsim-core/src/report.rs`; payload shape in `v2/report.py` |
+| Environment variables | `v2/options.py` (the only reader) |
+
+## Common changes
+
+### Add an instruction
+
+1. **Lower it.** Map the TIRx builtin or PTX form in `v2/lowering/`. A form
+   lowering cannot represent must raise `LoweringUnsupported`, which surfaces
+   as `UnsupportedTIRxError`; never approximate it.
+2. **Pure register op?** Lower to `Instr::Ptx` and implement the numerics in
+   OpLib, with an entry in the operation registry. No engine change is needed.
+3. **Engine-visible effect** (memory, synchronization, asynchronous work)?
+   Request an `Instr` variant through `CONTRACT_REQUESTS.md`, then write its
+   handler in `interp/handlers/`. The handler reads and writes the arena,
+   steps the `SyncTable` for protocol effects, and emits the `Access` and
+   `SyncEvent` records the checkers need. The codegen backend prints a call to
+   the same handler, so semantics never appear in generated code.
+4. **Test it** with a hand-built `Program` (`testutil::ProgramBuilder`) in
+   `numsim-core/tests/`, a lowering test under `tests/numsim/v2/`, and, when
+   the hardware behavior is uncertain, a paired NumSim/GPU microtest.
+
+### Add a checker rule
+
+1. Settle the semantics first: actors, state, happens-before, and terminal
+   conditions, with a PTX ISA citation. Record open questions and rulings in
+   `racecheck-isa-answers.md` or `sync-isa-answers.md`.
+2. Implement it in one place: a `step` function for a protocol rule, a
+   Racecheck observer or cell rule for an ordering rule. If the checker needs
+   a fact the event stream does not carry, extend `observe.rs` through a
+   contract request rather than reading engine state.
+3. Add a scenario test built from contract events (`numsim-core/tests/
+   racecheck_*.rs`, `synccheck_*.rs`). For a protocol change, update the
+   reference state machine in `numsim-sync-ref` too; the differential test
+   compares the two.
+4. Add a row to the matching behavior-delta file for every change a user can
+   observe. A changed snapshot with no delta row is a regression.
+
+### Add a corpus kernel
+
+1. Add a `CanonicalKernelCase` to `tests/numsim/corpus/canonical_cases.py`
+   with its inputs and an independent reference. Explain any expected
+   non-clean verdict in `canonical_verdict_rationale.md`.
+2. Generate its three snapshots (numsim, racecheck, synccheck) and review
+   them (pending: generated from the legacy engine until it is deleted; the
+   policy for generating snapshots afterwards is not decided).
+
+## Conformance snapshots and delta files
+
+`tests/conformance/` replays every canonical corpus case in the three modes
+and compares a normalized projection with
+`tests/conformance/snapshots/<case>/<mode>.json`. The projection keeps what
+users rely on: output bytes (as hashes) and the reference comparison for
+NumSim, and for the checkers each launch's verdict plus findings grouped by
+kind, status, memory space, classification, source anchors, and byte overlap.
+It drops internal counters and payload plumbing.
+
+Every intended behavior change is documented in one of three delta files:
+[NumSim numerics](numsim-behaviour-deltas.md),
+[synchronization](sync-behaviour-deltas.md), and
+[Racecheck](racecheck-behaviour-deltas.md). Each row states the legacy and the
+new behavior and the PTX ISA basis or ruling. When a row rules that legacy was
+wrong for a corpus case, the corrected oracle is stored beside the legacy
+snapshot as `<mode>.delta.json`, naming the row. The new engine is compared
+with the delta file when one exists.
+
+Snapshot policy:
+
+- Snapshots are regenerated with `--update-snapshots` only for an intentional,
+  documented change, and the commit message explains each changed case.
+- Legacy snapshots are regenerated only from the legacy engine, never from the
+  new engine to make it pass (pending: the regeneration rule after the legacy
+  engine is deleted).
+- `--update-snapshots` never writes delta files; they are edited by hand with
+  their delta row.
+
+The per-case state of the migration is tracked in
+[v2 conformance status](v2-conformance-status.md).
+
+## Test pyramid
+
+Allowed golden data is limited to three kinds: GPU results for operation
+numerics, corpus output bits, and corpus finding sets. Tests must not pin
+generated Rust text, scheduler poll or transition counts, internal payload
+fields, or absolute times.
+
+| Layer | What it checks | Where |
+| --- | --- | --- |
+| Semantic conformance | Corpus verdicts, findings, and outputs against snapshots | `tests/conformance/` |
+| Differential and property | Interpreter vs. codegen bit equality; reference state machine vs. `step`; reduced vs. exhaustive Synccheck search on random logs | `numsim-core/tests/{codegen_equivalence,sync_differential,synccheck_equivalence}.rs` |
+| Pure core | Hand-written `Program`s and contract events fed to the engine and checkers, without Python | `numsim-core/tests/` |
+| Lowering | The contents of the lowered `Program`, not any generated text | `tests/numsim/v2/` |
+| Performance | Criterion microbenchmarks and end-to-end checks relative to a per-host baseline; opt-in `performance` marker | `numsim-core/benches/`, `numsim-race-core`, `numsim-sync-explore`, `tests/perf/` |
+
+CI runs the Rust workspace tests and the Python suite without the GPU and
+performance markers, so snapshot drift fails CI (pending: CI does not build
+`numsim_core_py` yet, so the v2 Python tests and the `NUMSIM_IMPL=v2`
+conformance run skip there).
+
+## Specifications
+
+| Document | Contents |
+| --- | --- |
+| [Redesign plan](numsim-redesign.md) | Motivation, target architecture, migration steps (in Chinese) |
+| [Synchronization semantics](sync-semantics.md) | States, commands, transitions, and errors of the six protocols |
+| [Synchronization ISA answers](sync-isa-answers.md) | PTX rulings for the open protocol questions |
+| [Racecheck semantics](racecheck-semantics.md) | Happens-before edge table, conflict rule, clock representation |
+| [Racecheck ISA answers](racecheck-isa-answers.md) | PTX memory-model rulings |
+| [Synccheck explorer](synccheck-explorer.md) | Projection, certificates, fingerprints, DFS, budgets |
+| [Lowering inventory](lowering-inventory.md) | IR nodes, builtins, and layouts the corpus uses |
+| [Test migration](test-migration.md) | How the legacy test suite is retired |
