@@ -471,3 +471,19 @@ fn memory_and_encoding_dependent_helpers_fail_closed() {
         Some(OpErrorKind::Unsupported)
     );
 }
+
+#[test]
+fn log1p_and_sigmoid_resolve_for_float_carriers() {
+    let r = run("tirx.log1p", &[], &[Ty::F32], &[(Ty::F32, u128::from(1.0_f32.to_bits()))]).unwrap();
+    assert_eq!(r[0], u64::from(numsim_oplib::scalar::log1p_f32(1.0).to_bits()));
+    let r = run("tirx.sigmoid", &[], &[Ty::F32], &[(Ty::F32, 0)]).unwrap();
+    assert_eq!(r[0], u64::from(0.5_f32.to_bits()));
+    let r = run("tirx.log1p", &[], &[Ty::F64], &[(Ty::F64, u128::from((-1.0_f64).to_bits()))]).unwrap();
+    assert_eq!(r[0], f64::NEG_INFINITY.to_bits());
+    let r = run("tirx.sigmoid", &[], &[Ty::scalar(Dtype::F16)], &[(Ty::scalar(Dtype::F16), 0)]).unwrap();
+    assert_eq!(r[0], 0x3800);
+    let r = run("tirx.log1p", &[], &[Ty::scalar(Dtype::BF16)], &[(Ty::scalar(Dtype::BF16), 0x3f80)]).unwrap();
+    assert_eq!(r[0], 0x3f31);
+    let err = run("tirx.log1p", &[], &[Ty::U32], &[(Ty::U32, 1)]).unwrap_err();
+    assert_eq!(err.kind, OpErrorKind::Unsupported);
+}

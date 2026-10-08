@@ -1040,3 +1040,61 @@ fn host_fma_nan_matches_the_c_library() {
         }
     }
 }
+
+fn ulp_distance(a: f32, b: f32) -> u32 {
+    let key = |v: f32| {
+        let bits = v.to_bits() as i32;
+        if bits < 0 { i32::MIN - bits } else { bits }
+    };
+    key(a).abs_diff(key(b))
+}
+
+/// `tirx.log1p` special values are pinned; finite values stay within one
+/// binary32 ulp of an independent binary64 reference (`ln_1p` in f64,
+/// rounded once), and the legacy test's sweep matches it.
+#[test]
+fn log1p_special_values_and_accuracy() {
+    let f = f32::from_bits;
+    assert_eq!(log1p_f32(f(0x7fc0_1234)).to_bits(), 0x7fc0_1234);
+    assert_eq!(log1p_f32(f(0xffa0_0001)).to_bits(), 0xffe0_0001);
+    assert_eq!(log1p_f32(-2.0).to_bits(), 0xffc0_0000);
+    assert_eq!(log1p_f32(f32::NEG_INFINITY).to_bits(), 0xffc0_0000);
+    assert_eq!(log1p_f32(-1.0), f32::NEG_INFINITY);
+    assert_eq!(log1p_f32(-0.0).to_bits(), 0x8000_0000);
+    assert_eq!(log1p_f32(0.0).to_bits(), 0);
+    assert_eq!(log1p_f32(f32::INFINITY), f32::INFINITY);
+    assert_eq!(log1p_f32(f(1)).to_bits(), 1, "tiny x: log1p(x) = x");
+    assert_eq!(log1p_f64(-1.0), f64::NEG_INFINITY);
+    assert_eq!(log1p_f64(-3.0).to_bits(), 0xfff8_0000_0000_0000);
+    // Legacy test_gate_intrinsics sweep, plus a wide log-spaced sweep.
+    let mut inputs: Vec<f32> = (0..32).map(|i| -0.875 + i as f32 * (8.875 / 31.0)).collect();
+    let mut x = 1e-30_f32;
+    while x < 1e30 {
+        inputs.extend([x, -x.min(0.999_99)]);
+        x *= 1.37;
+    }
+    for x in inputs {
+        let reference = (x as f64).ln_1p() as f32;
+        assert!(ulp_distance(log1p_f32(x), reference) <= 1, "log1p({x:e}) = {} vs {reference}", log1p_f32(x));
+    }
+}
+
+/// `tirx.sigmoid`: the legacy formula in binary32, NaN pinned.
+#[test]
+fn sigmoid_special_values_and_accuracy() {
+    let f = f32::from_bits;
+    assert_eq!(sigmoid_f32(f(0x7fc0_1234)).to_bits(), 0xffc0_1234);
+    assert_eq!(sigmoid_f32(0.0), 0.5);
+    assert_eq!(sigmoid_f32(f32::INFINITY), 1.0);
+    assert_eq!(sigmoid_f32(f32::NEG_INFINITY), 0.0);
+    assert_eq!(sigmoid_f32(-200.0), 0.0);
+    for i in 0..200 {
+        let x = -20.0 + i as f32 * 0.2;
+        let reference = (1.0 / (1.0 + (-(x as f64)).exp())) as f32;
+        assert!(ulp_distance(sigmoid_f32(x), reference) <= 2, "sigmoid({x})");
+    }
+    // Half formats go through f32 with one RNE rounding back.
+    assert_eq!(half_unary(0x0000, false, sigmoid_f32), 0x3800); // 0.5 in f16
+    // bf16 1.0 = 0x3f80; log1p(1) = 0.693147 -> bf16 0x3f31 (RNE).
+    assert_eq!(half_unary(0x3f80, true, log1p_f32), 0x3f31);
+}

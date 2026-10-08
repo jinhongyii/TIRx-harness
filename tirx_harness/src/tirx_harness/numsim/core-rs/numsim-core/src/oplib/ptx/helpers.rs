@@ -53,6 +53,8 @@ pub(in crate::oplib) const NAMES: &[&str] = &[
     "tirx.cuda.half8tofloat8",
     "tirx.fma",
     "tirx.reinterpret",
+    "tirx.log1p",
+    "tirx.sigmoid",
 ];
 
 /// Run `body(lane)` for every executing lane.
@@ -281,6 +283,21 @@ fn fma_f64(io: &mut PtxIo<'_>) -> OpResult {
         F32RoundingMode::Nearest,
     )
     .to_bits());
+    Ok(())
+}
+
+fn unary32(io: &mut PtxIo<'_>, f: fn(f32) -> f32) -> OpResult {
+    each_lane!(io, |lane| io.dsts[0][lane] = bits32(f(f32_at(io, 0, lane))));
+    Ok(())
+}
+
+fn unary64(io: &mut PtxIo<'_>, f: fn(f64) -> f64) -> OpResult {
+    each_lane!(io, |lane| io.dsts[0][lane] = f(f64::from_bits(io.srcs[0][lane])).to_bits());
+    Ok(())
+}
+
+fn unary16(io: &mut PtxIo<'_>, bf16: bool, f: fn(f32) -> f32) -> OpResult {
+    each_lane!(io, |lane| io.dsts[0][lane] = u64::from(scalar::half_unary(io.srcs[0][lane] as u16, bf16, f)));
     Ok(())
 }
 
@@ -595,6 +612,29 @@ pub(in crate::oplib) fn resolve(
                 Some((Dtype::F64, 1)) => direct(fma_f64, &[64], &[64, 64, 64]),
                 _ => Err(OpError::unsupported(format!("tirx.fma: unmodeled carrier {:?}", ops.dst_tys))),
             }
+        }
+        "tirx.log1p" | "tirx.sigmoid" => {
+            // `numsim_oplib::scalar::{log1p,sigmoid}_*` (host rule, pinned
+            // NaNs); f16/bf16 through f32 with RNE back (legacy: f32 only).
+            no_mods(mods, name)?;
+            ops.arity(1, 1, name)?;
+            let (d, s) = (ops.dst_tys[0], ops.src_tys[0]);
+            if d != s || d.lanes != 1 {
+                return Err(OpError::unsupported(format!("{name}: expected one scalar float -> same type, got {s:?} -> {d:?}")));
+            }
+            let log1p = name == "tirx.log1p";
+            let f: crate::oplib::ptx::DirectFn = match (d.elem, log1p) {
+                (Dtype::F32, true) => |io| unary32(io, scalar::log1p_f32),
+                (Dtype::F32, false) => |io| unary32(io, scalar::sigmoid_f32),
+                (Dtype::F64, true) => |io| unary64(io, scalar::log1p_f64),
+                (Dtype::F64, false) => |io| unary64(io, scalar::sigmoid_f64),
+                (Dtype::F16, true) => |io| unary16(io, false, scalar::log1p_f32),
+                (Dtype::F16, false) => |io| unary16(io, false, scalar::sigmoid_f32),
+                (Dtype::BF16, true) => |io| unary16(io, true, scalar::log1p_f32),
+                (Dtype::BF16, false) => |io| unary16(io, true, scalar::sigmoid_f32),
+                _ => return Err(OpError::unsupported(format!("{name}: unsupported type {d:?}"))),
+            };
+            Ok(Some(Direct(f)))
         }
         "tirx.reinterpret" => {
             no_mods(mods, name)?;

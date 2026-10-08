@@ -732,3 +732,36 @@ fn ftz_element_types_are_representable() {
     bad.elem_ftz = true;
     assert!(bad.try_encode().is_err());
 }
+
+/// `tensormap.replace` of a per-dimension field at an ordinal outside the
+/// descriptor's slots (5 dimensions, 4 strides) is an operand error
+/// (`Invalid`), never a panic. Ordinals between the rank and the last slot
+/// are kept (legacy; kernels rewrite every slot before raising the rank).
+#[test]
+fn replace_rejects_ordinals_outside_the_descriptor_slots() {
+    let base = desc2d(Dtype::F32, [64, 8], 256, [16, 4], 0);
+    for (field, first_bad) in [
+        (TmapField::BoxDim, 5_u8),
+        (TmapField::GlobalDim, 5),
+        (TmapField::ElementStride, 5),
+        (TmapField::GlobalStride, 4),
+    ] {
+        for ord in [first_bad, first_bad + 1, 200, 255] {
+            let mut desc = base.clone();
+            let result = std::panic::catch_unwind(move || desc.replace(field, Some(ord), 16).map(|_| desc));
+            let result = result.unwrap_or_else(|_| panic!("{field:?}[{ord}] panicked"));
+            match result {
+                Err(e) => assert_eq!(e.kind, OpErrorKind::Invalid, "{field:?}[{ord}]: {e}"),
+                Ok(d) => panic!("{field:?}[{ord}] succeeded: {d:?}"),
+            }
+        }
+    }
+    // Inside the slots but beyond rank 2: stored, and live once the rank grows.
+    let mut desc = base.clone();
+    desc.replace(TmapField::GlobalDim, Some(2), 3).unwrap();
+    desc.replace(TmapField::BoxDim, Some(2), 3).unwrap();
+    desc.replace(TmapField::GlobalStride, Some(1), 4096).unwrap();
+    assert_eq!((desc.global_dim[2], desc.box_dim[2], desc.global_stride[1]), (3, 3, 4096));
+    desc.replace(TmapField::Rank, None, 2).unwrap();
+    assert_eq!(desc.rank, 3);
+}

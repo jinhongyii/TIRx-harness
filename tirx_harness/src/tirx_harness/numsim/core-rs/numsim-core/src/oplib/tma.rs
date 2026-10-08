@@ -389,6 +389,18 @@ pub(super) fn replace(
             if per_dim { "requires" } else { "does not take" }
         )));
     }
+    if let Some(ord) = index {
+        // An ordinal outside the descriptor's slots (5 dimensions, 4 stored
+        // strides) is an operand error. Ordinals between the current rank and
+        // the last slot are legal and kept, as in legacy and PTX: kernels
+        // rewrite every slot, or raise the rank afterwards (W4-18).
+        let slots = if field == TmapField::GlobalStride { 4 } else { 5 };
+        if ord >= slots {
+            return Err(OpError::invalid(format!(
+                "tensormap.replace {field:?} ordinal {ord} is outside the descriptor's {slots} slots"
+            )));
+        }
+    }
     if field == TmapField::GlobalAddress {
         if !value.is_multiple_of(16) {
             return Err(OpError::invalid(

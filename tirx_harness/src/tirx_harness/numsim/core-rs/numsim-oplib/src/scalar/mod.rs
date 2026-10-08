@@ -7,12 +7,14 @@
 
 mod exact;
 mod low;
+mod math;
 mod round;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use exact::*;
 pub use low::*;
+pub use math::*;
 pub use round::*;
 
 use crate::cvt::formats::*;

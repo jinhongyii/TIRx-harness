@@ -1831,6 +1831,25 @@ Open, for W1:
     read `outputs["tmap"]`: the public API's output naming for a
     TensorMap-bound array.
 
+## W4-18 (2026-10-08): `tirx.log1p` / `tirx.sigmoid`; tensormap.replace ordinals
+
+- `resolve_ptx` now implements `tirx.log1p` and `tirx.sigmoid` (no
+  modifiers; one scalar float in, the same type out: f32, f64, f16, bf16).
+  The kernels are in `numsim_oplib::scalar::math` (see delta D9).
+  - W1: no lowering change. `builtins.py` already lowers both as pure
+    `Ptx "tirx.log1p"` / `"tirx.sigmoid"` with the value argument.
+  - Neither op is in the legacy `SUPPORTED_OPS.md` tables, so there is
+    nothing to regenerate.
+- `TensorMapDesc::replace`: a per-dimension ordinal outside the
+  descriptor's slots (5 dimensions, 4 stored strides) is `Invalid`.
+  - Ordinals between the current rank and the last slot stay legal, as in
+    legacy. The GDN descriptor kernels and
+    `test_raw_descriptor_copy_replace_release_and_acquire_drive_raw_tma`
+    rewrite all five `global_dim` slots on a rank-2 map. A rank-based
+    bound would reject them, so the bound is the slot count.
+  - Test: `replace_rejects_ordinals_outside_the_descriptor_slots`, which
+    also checks that no ordinal panics.
+
 ## W5-10 (for W2, 2026-10-08): restricted commit and tcgen smem operand proxy
 
 Found with `test_tcgen05_restricted_commit` (a racecheck false negative) and
