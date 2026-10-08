@@ -239,7 +239,7 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
             let (name, ck) = match kind {
                 AdvisoryKind::CrossCtaAsyncOrder => ("cross_cta_async_order", FindingKind::CrossCtaAsyncOrder),
                 AdvisoryKind::UndeclaredProtocolWord => ("undeclared_protocol_word", FindingKind::UndeclaredProtocolWord),
-                AdvisoryKind::AliasStaleRead => ("alias_stale_read", FindingKind::Other("alias_stale_read".into())),
+                AdvisoryKind::AliasStaleRead => ("alias_stale_read", FindingKind::AliasStaleRead),
             };
             if *kind == AdvisoryKind::AliasStaleRead {
                 // Legacy advisory keys.
@@ -323,7 +323,11 @@ fn convert_incomplete(i: &Incomplete, count: u64, kernel: u32) -> Finding {
     if let Value::Object(m) = extra {
         d.extend(m);
     }
-    let kind = if matches!(i, Incomplete::FindingsTruncated { .. }) { FindingKind::BudgetExhausted } else { FindingKind::Unsupported };
+    let kind = match i {
+        Incomplete::FindingsTruncated { .. } => FindingKind::BudgetExhausted,
+        Incomplete::SignalWriteNotRecorded { .. } => FindingKind::SignalWriteNotRecorded,
+        _ => FindingKind::Unsupported,
+    };
     let _ = kernel;
     Finding {
         kind,
