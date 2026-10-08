@@ -4,7 +4,8 @@ Usage (repository root)::
 
     python scripts/numsim-v2/retire_legacy.py --dry-run            # print the whole plan
     python scripts/numsim-v2/retire_legacy.py --dry-run --list     # ... with every file / test id
-    python scripts/numsim-v2/retire_legacy.py --apply              # refuses while blockers remain
+    python scripts/numsim-v2/retire_legacy.py --apply              # refuses while blockers remain;
+                                                                   # needs a clean tree (it git-rm's tracked files)
 
 The plan has seven parts, printed in this order and applied in this order:
 
@@ -15,7 +16,7 @@ The plan has seven parts, printed in this order and applied in this order:
 2. Keep and relocate what v2 still imports from the legacy layer
    (``errors``, ``cases``, ``dtype_abi`` + ``dtype_registry.json``,
    ``report``; the ``compare`` closure of ``api.py`` moves to
-   ``v2/compare.py``) and the one data file a v2 tool reads from
+   ``v2/_compare.py``) and the one data file a v2 tool reads from
    ``engine-rs/`` (``SUPPORTED_OPS.md`` -> ``numsim-oplib/``).
 3. Retire legacy tests: the union of ``retire_tests.py`` waves 0, 1, 2, 4
    and 5b (wave 3, the corpus gates, once conformance matches), plus test
@@ -274,10 +275,14 @@ class Edit:
     old: str | None = None  # exact substring to replace (None: whole-file content)
     new: str | None = None
     manual: bool = False  # cannot be generated; printed as a checklist item
+    transform: str | None = None  # name of a TRANSFORMS function (path) -> None
 
     def apply(self) -> None:
         target = REPO / self.path
         if self.manual:
+            return
+        if self.transform:
+            TRANSFORMS[self.transform](target)
             return
         if self.old is None:
             target.write_text(self.new or "")
@@ -288,14 +293,66 @@ class Edit:
         target.write_text(text.replace(self.old, self.new or "", 1))
 
 
+def _conftest_shim(path: Path) -> None:
+    """Remove the ``NUMSIM_IMPL`` block (its comment banner, the v2 branch and
+    the legacy ``else`` branch) from tests/conftest.py."""
+    text = path.read_text()
+    start = text.find("# ---------------------------------------------------------------------------\n# NUMSIM_IMPL=v2")
+    if start < 0:
+        start = text.find('if os.environ.get("NUMSIM_IMPL"')
+    if start < 0:
+        raise SystemExit(f"{path}: NUMSIM_IMPL block not found")
+    lines = text[start:].split("\n")
+    end = 0
+    in_block = False
+    for index, line in enumerate(lines):
+        if line.startswith("if os.environ.get(\"NUMSIM_IMPL\""):
+            in_block = True
+            continue
+        if in_block and line and not line.startswith((" ", "\t", "else:", "elif ")):
+            end = index
+            break
+    else:
+        end = len(lines)
+    rest = "\n".join(lines[end:])
+    text = text[:start].rstrip() + "\n" + (("\n\n" + rest.lstrip("\n")) if rest.strip() else "")
+    text = text.replace(
+        "rewrite tests/conformance/snapshots from the selected NUMSIM_IMPL instead of comparing",
+        "rewrite tests/conformance/snapshots from NumSim instead of comparing",
+    )
+    path.write_text(text)
+
+
+def _post_deletion_ci(path: Path) -> None:
+    """tests.yml := tests.post-deletion.yml, triggers restored, header dropped."""
+    source = path.with_name("tests.post-deletion.yml")
+    lines = source.read_text().split("\n")
+    while lines and lines[0].startswith("#"):
+        lines.pop(0)
+    text = "\n".join(lines)
+    text = re.sub(r"^name: .*$", "name: Tests", text, count=1, flags=re.M)
+    text = re.sub(
+        r"^on:\n  workflow_dispatch:\n",
+        "on:\n  pull_request:\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
+        text,
+        count=1,
+        flags=re.M,
+    )
+    path.write_text(text.lstrip("\n"))
+    subprocess.run(["git", "rm", "-q", str(source.relative_to(REPO))], cwd=REPO, check=True)
+
+
+TRANSFORMS = {"conftest_shim": _conftest_shim, "post_deletion_ci": _post_deletion_ci}
+
+
 def rewrites() -> list[Edit]:
     edits = [
         Edit(f"{PKG}/__init__.py", "root racecheck/synccheck call numsim.v2", new=PKG_INIT),
         Edit(f"{NUMSIM}/__init__.py", "public numsim names re-export v2 (+ cases, errors)", new=NUMSIM_INIT),
         Edit(f"{NUMSIM}/v2/report.py", "compare: use the relocated closure",
              old="from tirx_harness.numsim.api import compare as legacy_compare",
-             new="from .compare import compare as legacy_compare"),
-        Edit(f"{NUMSIM}/v2/compare.py", "new file: compare closure moved from numsim/api.py (generated from AST)",
+             new="from ._compare import compare as legacy_compare"),
+        Edit(f"{NUMSIM}/v2/_compare.py", "new file: compare closure moved from numsim/api.py (generated from AST; private name so it never shadows the public compare function)",
              new=None),  # filled in plan() from api.py
         Edit("setup.py", "build numsim_core_py instead of the tvm-rust-ext frontend; drop the sdist submodule copy",
              new=SETUP_PY),
@@ -305,17 +362,27 @@ def rewrites() -> list[Edit]:
         Edit(f"{NUMSIM}/core-rs/numsim-oplib/tools/gen_registry.py", "registry source moved next to oplib",
              old='DEFAULT_SOURCE = CRATE.parents[1] / "engine-rs" / "SUPPORTED_OPS.md"',
              new='DEFAULT_SOURCE = CRATE / "SUPPORTED_OPS.md"'),
-        Edit("tirx_harness/tests/conftest.py", "drop the NUMSIM_IMPL=v2 rebinding shim (numsim *is* v2)",
-             manual=True),
+        Edit("tirx_harness/tests/conftest.py", "drop the NUMSIM_IMPL shim block, including the legacy-mode branch "
+             "that binds numsim.ExecutionSubset to the legacy api class (v2 exports ExecutionSubset itself)",
+             transform="conftest_shim"),
         Edit("tirx_harness/tests/conformance/snapshot.py",
-             "IMPLS = ('v2',); drop delta_snapshot_path (deltas are folded); --update-snapshots regenerates from v2 "
-             "(decision: every changed snapshot cites a delta row in the commit message)", manual=True),
+             "rewrite without the legacy comparison (RETIREMENT.md): delete legacy_available, selected_impl_name, "
+             "oracle_impl_name, IMPL_ENV/IMPLS, the legacy branch of load_implementation, relax_unanchored, the "
+             "<mode>.delta.json lookup in load_expected (deltas are folded), and the legacy-spelling space/offset "
+             "normalizations in record_space/normalize_records; --update-snapshots regenerates from v2 (every changed "
+             "snapshot cites a delta row in the commit message)", manual=True),
         Edit("tirx_harness/tests/conformance/test_conformance.py", "drop the legacy import path and the v2 skip guards",
              manual=True),
         Edit("tirx_harness/tests/conformance/README.md", "v2 is the implementation; regeneration rule", manual=True),
-        Edit(".github/workflows/tests.yml", "replace the submodule init step with "
-             "`bash tirx_harness/src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh`; add "
-             "`cargo test --workspace` (core-rs) and NUMSIM_IMPL-free conformance", manual=True),
+        Edit("tirx_harness/tests/conformance/snapshots", "after the snapshot.py rewrite: regenerate from v2 "
+             "(`pytest -n 32 tests/conformance --update-snapshots`; folded bases that matched only through "
+             "relax_unanchored change) and commit with the trailer `Snapshot-Regen: schema relax_unanchored projection`",
+             manual=True),
+        Edit(".github/workflows/tests.yml", "replaced by tests.post-deletion.yml with the push/pull_request "
+             "triggers restored and its NOT-ACTIVE header dropped (the post-deletion file is removed)",
+             transform="post_deletion_ci"),
+        Edit("docs/installation.md", "rewrite the build section: no tvm-rust-ext submodule; `pip install .` builds "
+             "numsim_core_py (setup.py) and needs a Rust toolchain", manual=True),
         Edit(".github/workflows/build_wheels.yml", "drop the tvm-rust-ext archive download; wheels build numsim_core_py",
              manual=True),
         Edit("scripts/smoke_wheel.py", "check numsim_core_py instead of the tvm-rust-ext licenses", manual=True),
@@ -327,7 +394,6 @@ def rewrites() -> list[Edit]:
         Edit(f"{NUMSIM}/AGENTS.md", "mirror CLAUDE.md", manual=True),
         Edit(".github/workflows/tests.yml", "add `python scripts/numsim-v2/check_snapshot_deltas.py --base origin/main` "
              "(fails when a snapshot changes without a delta row cited in the commit message)", manual=True),
-        Edit(f"{NUMSIM}/v2/run.py", "decision: a failed codegen build raises NumSimBuildError (today ValueError) [W8]", manual=True),
         Edit(f"{NUMSIM}/v2/api.py", "decision: missing bindings report `incomplete` instead of raising InputError [W8]", manual=True),
         Edit(f"{NUMSIM}/core-rs/numsim-oplib/tools/gen_registry.py",
              "decision: SUPPORTED_OPS.md becomes generated from the oplib registry (invert the generator) [W4]", manual=True),
@@ -339,7 +405,6 @@ SUBMODULE_DOC_LINES = [
     ("docs/optimization-runs.md", "git submodule update --init thirdparty/tvm-rust-ext"),
     ("docs/installation.md", "git submodule update --init thirdparty/tvm-rust-ext"),
     ("tirx_harness/tests/CLAUDE.md", "git submodule update --init thirdparty/tvm-rust-ext  # repo root"),
-    (".github/workflows/tests.yml", "git submodule update --init thirdparty/tvm-rust-ext"),
 ]
 
 # (pending: ...) markers fall in three classes:
@@ -347,8 +412,8 @@ SUBMODULE_DOC_LINES = [
 #             DECISION makes the text true; the parenthetical is removed;
 #   action  - an undecided question (none left after the 2026-10-08 decisions);
 #   keep    - unrelated to the legacy engine (backend decision, worker count).
-RESOLVES = re.compile(r"legacy|delet|submodule|switch|migration completes|numsim_core_py", re.I)
-KEEP = re.compile(r"backend decision|detected CPU count", re.I)
+RESOLVES = re.compile(r"legacy|delet|submodule|switch|migration completes|numsim_core_py|backend decision", re.I)
+KEEP = re.compile(r"detected CPU count", re.I)  # the backend decision is made: codegen deleted (W12)
 
 # Coordinator decisions for the step-5 open items (2026-10-08). Each names the
 # marker text it settles and the change step 5 must make.
@@ -360,7 +425,7 @@ DECISIONS = [
     ("env-prefix", re.compile(r"NUMSIM_V2_. prefix", re.I),
      "rename NUMSIM_V2_* to NUMSIM_*; v2/options.py keeps NUMSIM_V2_* as aliases for one release"),
     ("build-error", re.compile(r"NumSimBuildError", re.I),
-     "NumSimBuildError stays: a failed codegen build raises NumSimBuildError (W8 change in v2/run.py)"),
+     "NumSimBuildError stays as a public type; the codegen backend is deleted, so no build step raises it (W12)"),
     ("check-failed", re.compile(r"CheckFailed", re.I),
      "CheckFailed stays: reports raise tirx_harness._report.CheckFailed (already the v2 behaviour)"),
     ("ops-table", re.compile(r"table moves", re.I),
@@ -608,23 +673,36 @@ def broken_imports(removed: set[str], cut: dict[str, list[str]] | None = None) -
 
 
 def prune_legacy_imports(path: Path) -> None:
-    """Drop imports of deleted modules whose names nothing uses any more."""
-    bound, used = legacy_import_uses(path, set())
-    unused = set(bound) - used
+    """Drop imports of deleted modules whose bound names are referenced nowhere
+    else in the file (any scope). A block left empty gets ``pass``."""
+    source = path.read_text()
+    bound, _ = legacy_import_uses(path, set())
+    if not bound:
+        return
+    tree = ast.parse(source)
+    referenced = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.value.id for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+    }
+    unused = {name for name in bound if name not in referenced}
     if not unused:
         return
-    tree = ast.parse(path.read_text())
-    lines = path.read_text().split("\n")
+    lines = source.split("\n")
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in sorted(ast.walk(tree), key=lambda n: -getattr(n, "lineno", 0)):
         if not isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
         names = [a for a in node.names if (a.asname or a.name).split(".")[0] in unused or (a.asname or a.name) in unused]
-        if names and len(names) == len(node.names):
-            del lines[node.lineno - 1 : node.end_lineno]
-        elif names:
+        if not names:
+            continue
+        indent = lines[node.lineno - 1][: len(lines[node.lineno - 1]) - len(lines[node.lineno - 1].lstrip())]
+        if len(names) == len(node.names):
+            parent = parents.get(node)
+            body = getattr(parent, "body", None) if parent is not None else None
+            only_statement = isinstance(body, list) and len(body) == 1 and body[0] is node and not isinstance(parent, ast.Module)
+            lines[node.lineno - 1 : node.end_lineno] = [indent + "pass"] if only_statement else []
+        else:
             keep = [a for a in node.names if a not in names]
             text = ", ".join(a.name + (f" as {a.asname}" if a.asname else "") for a in keep)
-            indent = lines[node.lineno - 1][: len(lines[node.lineno - 1]) - len(lines[node.lineno - 1].lstrip())]
             head = f"from {'.' * node.level}{node.module or ''} import " if isinstance(node, ast.ImportFrom) else "import "
             lines[node.lineno - 1 : node.end_lineno] = [indent + head + text]
     path.write_text("\n".join(lines))
@@ -633,6 +711,10 @@ def prune_legacy_imports(path: Path) -> None:
 def blockers(info: dict[str, str], removed: set[str] | None = None, cut: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
     out: dict[str, list[str]] = collections.defaultdict(list)
     for entry in broken_imports(removed or set(), cut):
+        # tests/conftest.py's legacy ExecutionSubset import sits inside the
+        # NUMSIM_IMPL block that the automated _conftest_shim rewrite deletes.
+        if entry.startswith("tests/conftest.py ") and "_LegacyExecutionSubset" in entry:
+            continue
         out["surviving code uses a deleted legacy module"].append(entry)
     status = COVERAGE / "step5_a_status.tsv"
     if status.exists():
@@ -665,6 +747,7 @@ class Plan:
     doc_lines: list[tuple[str, str]] = field(default_factory=list)
     markers: list[tuple[str, int, str, str]] = field(default_factory=list)
     tooling: list[str] = field(default_factory=list)
+    tooling_decide: list[str] = field(default_factory=list)
     delta_snapshots: list[str] = field(default_factory=list)
     env_files: list[str] = field(default_factory=list)
     blockers: dict[str, list[str]] = field(default_factory=dict)
@@ -700,21 +783,38 @@ def build(waves: list[str], results: Path | None) -> Plan:
             plan.remove.append(tree)
     plan.remove.append(SUBMODULE)
     plan.artefacts = [a for a in LEGACY_ARTEFACTS if (REPO / a).exists()]
-    plan.relocate = {s: d for s, d in RELOCATE.items() if (REPO / s).exists()}
+    plan.relocate = {s: d for s, d in RELOCATE.items() if (REPO / s).exists() and not (REPO / d).exists()}
     ids, info = retired_tests(waves, results)
     plan.whole_tests, plan.cut_tests = plan_tests(ids)
     plan.support = orphaned_support(set(plan.whole_tests))
     plan.edits = rewrites()
     for edit in plan.edits:
-        if edit.path.endswith("v2/compare.py"):
+        if edit.path.endswith("v2/_compare.py"):
             edit.new = compare_module()
     plan.doc_lines = [(p, line) for p, line in SUBMODULE_DOC_LINES if line in (REPO / p).read_text()]
     plan.markers = pending_markers()
+    # Migration tooling and its ledger (scripts/numsim-v2/RETIREMENT.md).
+    # This script deletes itself last; check_snapshot_deltas.py stays.
     plan.tooling = [
-        "scripts/numsim-v2/capture_plugin.py",  # hooks legacy transpiler entry points
-        "scripts/numsim-v2/tile_rejections.py",  # needs a legacy capture run
-        "scripts/numsim-v2/lower_sweep.py",  # consumes the legacy capture
+        p for p in (
+            "scripts/numsim-v2/classify_tests.py",
+            "scripts/numsim-v2/retire_tests.py",
+            "scripts/numsim-v2/step5_status.py",
+            "scripts/numsim-v2/v2_public_status.py",
+            "scripts/numsim-v2/tile_rejections.py",
+            "scripts/numsim-v2/coverage",
+            f"{NUMSIM}/core-rs/tools/port_sync.py",
+            "scripts/numsim-v2/make_contract_shim.py",
+            "scripts/numsim-v2/validate.sh",
+            f"{NUMSIM}/core-rs/tools/validate-program",  # the Rust `validate` API stays
+            "scripts/numsim-v2/retire_legacy.py",
+        )
+        if (REPO / p).exists()
     ]
+    # Kept by ruling (RETIREMENT.md): capture_plugin.py (retargeted to
+    # v2.transpile), inventory.py, walk.py, lower_sweep.py,
+    # check_snapshot_deltas.py; record_race_fixtures.py already lives in numsim-core/examples (W5).
+    plan.tooling_decide = []
     plan.blockers = blockers(info, set(plan.whole_tests) | set(plan.support), plan.cut_tests)
     plan.delta_snapshots = sorted(
         p.relative_to(REPO).as_posix() for p in (REPO / "tirx_harness/tests/conformance/snapshots").glob("*/*.delta.json")
@@ -749,7 +849,7 @@ def show(plan: Plan, listing: bool) -> None:
     section("2. kept / relocated")
     for path, why in KEPT_MODULES.items():
         print(f"keep   {path}    # {why}")
-    print(f"move   {NUMSIM}/api.py::{{{', '.join(COMPARE_CLOSURE)}}} -> {NUMSIM}/v2/compare.py")
+    print(f"move   {NUMSIM}/api.py::{{{', '.join(COMPARE_CLOSURE)}}} -> {NUMSIM}/v2/_compare.py")
     for src, dst in plan.relocate.items():
         print(f"git mv {src} {dst}")
 
@@ -769,7 +869,7 @@ def show(plan: Plan, listing: bool) -> None:
 
     section("4. rewrites")
     for edit in plan.edits:
-        tag = "manual" if edit.manual else ("write " if edit.old is None else "edit  ")
+        tag = "manual" if edit.manual else ("xform " if edit.transform else ("write " if edit.old is None else "edit  "))
         print(f"{tag} {edit.path}    # {edit.what}")
 
     section("5. docs")
@@ -790,9 +890,11 @@ def show(plan: Plan, listing: bool) -> None:
     for path in plan.env_files:
         print(f"rename {path}")
 
-    section("6. migration tooling that needs the legacy engine")
+    section("6. migration tooling and its ledger (deleted last)")
     for path in plan.tooling:
-        print(f"git rm {path}")
+        print(f"git rm -r {path}")
+    for path in plan.tooling_decide:
+        print(f"decide {path}    # keep only if retargeted to v2.transpile (coordinator ruling pending)")
 
     section("7. blockers")
     if not plan.blockers:
@@ -806,13 +908,16 @@ def show(plan: Plan, listing: bool) -> None:
 
 def apply(plan: Plan) -> None:
     for src, dst in plan.relocate.items():
+        if (REPO / dst).exists():
+            continue  # already moved (e.g. generated in oplib); the source goes with its tree
         subprocess.run(["git", "mv", src, dst], cwd=REPO, check=True)
     for edit in plan.edits:
         edit.apply()
+    subprocess.run(["git", "add", f"{NUMSIM}/v2/_compare.py"], cwd=REPO, check=True)
     subprocess.run(["git", "rm", "-r", "-q", *[p for p in plan.remove if p != SUBMODULE]], cwd=REPO, check=True)
     subprocess.run(["git", "rm", "-q", SUBMODULE], cwd=REPO, check=True)  # also edits .gitmodules
-    for artefact in plan.artefacts:
-        subprocess.run(["rm", "-rf", str(REPO / artefact)], check=True)
+    for artefact in plan.artefacts + [t for t in LEGACY_TREES if (REPO / t).exists()]:
+        subprocess.run(["rm", "-rf", str(REPO / artefact)], check=True)  # incl. __pycache__ left behind
     subprocess.run(["git", "rm", "-q", *[f"tirx_harness/{f}" for f in plan.whole_tests + plan.support]], cwd=REPO, check=True)
     for file, funcs in plan.cut_tests.items():
         retire_tests.cut(retire_tests.TESTS_BASE / file, funcs)
@@ -840,11 +945,11 @@ def apply(plan: Plan) -> None:
         if rel.endswith("numsim/v2/options.py"):
             text = re.sub(r'os\.environ\.get\("NUMSIM_V2_(\w+)"', r'_env("\1"', text)
             text = text.replace("NUMSIM_V2_", "NUMSIM_")
-            text = text.replace("def ", ENV_HELPER + "\n\ndef ", 1)
+            text = re.sub(r"^(def |class |@)", ENV_HELPER + "\n\n\n\\1", text, count=1, flags=re.M)
         else:
             text = text.replace("NUMSIM_V2_", "NUMSIM_")
         target.write_text(text)
-    subprocess.run(["git", "rm", "-q", *plan.tooling], cwd=REPO, check=True)
+    subprocess.run(["git", "rm", "-r", "-q", *plan.tooling], cwd=REPO, check=True)
     print("applied; now do the `manual` items, rebuild numsim_core_py, run the suite and conformance", file=sys.stderr)
 
 
@@ -855,7 +960,7 @@ def main() -> int:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
     parser.add_argument("--list", action="store_true", help="print every test id and blocker")
-    parser.add_argument("--waves", nargs="+", default=["0", "1", "2", "4", "5b"])
+    parser.add_argument("--waves", nargs="+", default=["0", "1", "2", "3", "4", "5b"])
     parser.add_argument("--v2-results", type=Path, help="junit XML of the v2 replacements (waves 2, 4)")
     parser.add_argument("--force", action="store_true", help="apply despite blockers")
     ARGS = parser.parse_args()

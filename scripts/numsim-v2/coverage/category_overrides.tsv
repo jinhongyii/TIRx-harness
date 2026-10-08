@@ -7,3 +7,4 @@ tests/numsim/runtime/test_expr_codegen.py::test_signed_index_adapter_is_explicit
 tests/numsim/runtime/test_expr_codegen.py::test_varying_casts_and_arithmetic_keep_fixed_width_types	C	delete	only pins legacy generated Rust text (support/manifest.emitted_module); no output or error is asserted
 tests/numsim/runtime/test_expr_codegen.py::test_varying_mask_algebra_uses_native_bit_operations	C	delete	only pins legacy generated Rust text (support/manifest.emitted_module); no output or error is asserted
 tests/numsim/runtime/test_expr_codegen.py::test_varying_mask_and_uniform_boolean_avoid_lane_scan	C	delete	only pins legacy generated Rust text (support/manifest.emitted_module); no output or error is asserted
+tests/numsim/integration/test_api.py::test_execution_subset_is_not_publicly_exported	C	delete	pins the legacy public surface; v2 exports ExecutionSubset by design (W8)

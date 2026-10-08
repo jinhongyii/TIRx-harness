@@ -27,7 +27,7 @@ from tvm.tirx import Stmt
 from tvm_ffi import structural_map, structural_walk
 
 from tests.numsim.microtests.harness import require_numsim_gpu, run_gpu_primfunc
-from tests.numsim.runtime.test_tcgen05_ti16 import ti16_kernel
+from tests.numsim.v2.checkers._tcgen_kernels import ti16_kernel
 from tests.numsim.support.tcgen_descriptor import INSTR_DESC, encode_dense_instr_descriptor_fields
 from tests.numsim.v2.checkers._runnable import assert_clean, requires_v2_engine
 from tirx_harness.numsim import v2
@@ -434,7 +434,7 @@ def input_codec_cases():
         raw_e5m2_e4m3_f16_d_ss_m128_layout_d,
         raw_e5m2_ss_m64_layout_f_valid_descriptor,
     )
-    from tests.numsim.runtime.test_tcgen05_i8 import i8_case
+    from tests.numsim.v2.checkers._tcgen_kernels import i8_case
 
     kernel, descriptor = with_input_descriptor(raw_e5m2_ss_m64_layout_f_valid_descriptor)
     for make_inputs, a_format, a_dtype in (
@@ -465,7 +465,7 @@ def test_tcgen_input_descriptor_codecs():
         replay(kernel, inputs, expected, output="output" if "output" in inputs else "out")
     # The current TVM sparse entry requires SM107 collector syntax; keep the
     # existing model's dynamic-descriptor control off the SM100 GPU path.
-    from tests.numsim.runtime.test_tcgen05_sparse_b16 import sparse_float_case
+    from tests.numsim.v2.checkers._tcgen_kernels import sparse_float_case
 
     kernel, inputs, expected = sparse_float_case(1, 64, False, 1, 1, False, False, False)
     kernel, descriptor = with_input_descriptor(kernel)

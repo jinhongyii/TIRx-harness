@@ -159,7 +159,7 @@ def k(a: T.Buffer((64,), "float32"), tensor_map: T.handle("tensormap")):
 
 def test_runtime_tensor_map_box_is_a_param_expression():
     """Contract item 30: box_dim / element_stride are DimExprs; runtime prologue values stay symbolic."""
-    from tests.numsim.integration.test_host_prelude import host_encoded_dynamic_integer_tensor_map
+    from tests.numsim.v2._kernels import host_encoded_dynamic_integer_tensor_map
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(host_encoded_dynamic_integer_tensor_map)
@@ -182,7 +182,7 @@ def _eval_dim(expr, params):
 
 def test_host_prelude_truncdiv_truncates_toward_zero():
     """W2-20: `T.truncdiv` in the host prelude is truncating, not flooring (-7 // 2 -> -3)."""
-    from tests.numsim.integration.test_host_prelude import host_encoded_dynamic_integer_tensor_map
+    from tests.numsim.v2._kernels import host_encoded_dynamic_integer_tensor_map
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(host_encoded_dynamic_integer_tensor_map)
@@ -217,7 +217,7 @@ def k(out: T.Buffer((32,), "uint32")):
 
 def test_ptx_call_sites_carry_their_source_text():
     """Sweep 3: every site has text; a PTX call site shows its source statement."""
-    from tests.numsim.runtime.test_atomic_f32_noftz import atomic_kernel
+    from tests.numsim.v2._kernels import atomic_kernel
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(atomic_kernel("atom", 1, "global"))
@@ -227,7 +227,7 @@ def test_ptx_call_sites_carry_their_source_text():
 
 
 def test_site_text_reads_the_source_line_when_the_span_has_a_file():
-    from tests.analysis_tools.synccheck.test_reported_tool_regressions import packed_bf16_vector_reduction
+    from tests.numsim.v2._kernels import packed_bf16_vector_reduction
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(packed_bf16_vector_reduction.func)
@@ -256,7 +256,7 @@ def k(a: T.Buffer((32,), "float32"), out: T.Buffer((32,), "float32")):
 
 def test_per_16bytes_report_carries_its_pattern_and_width():
     """W2-8: `.mbarrier::report::per_16bytes::<hex>` -> ReportMode::Per16BytesPattern."""
-    from tests.numsim.runtime.test_mbarrier_report import report_kernel
+    from tests.numsim.v2._kernels import report_kernel
     from tirx_harness.numsim.v2.lowering import lower
 
     for token, pattern, bits in (("per_16bytes::80000000", 0x80000000, 32), ("per_16bytes::8000", 0x8000, 16),
@@ -271,7 +271,7 @@ def test_sites_name_one_logical_buffer_per_pointer_operand():
     """W5-15 (format 3): `SiteInfo.buffers` lists each pointer operand's logical
     buffer in PTX operand order (copy: dst, src, then the mbarrier); `buffer` is
     buffers[0]."""
-    from tests.numsim.runtime.test_mbarrier_report import report_kernel
+    from tests.numsim.v2._kernels import report_kernel
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(report_kernel("per_element::ff", cluster=False, layout=1))

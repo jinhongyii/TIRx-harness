@@ -189,12 +189,12 @@ def test_tmem_views_take_the_containing_named_buffers_logical_identity():
 
 
 def test_gemm_async_declared_shape_rides_on_each_dispatched_mma():
-    """W4-W11-7: a gemm_async that declares mma_m/mma_n carries [M, N, K]
-    (K = the per-instruction K of the kind) on every tcgen05.mma it dispatches
-    to; one without a declared shape, like a raw tcgen05.mma, carries None."""
+    """W4-W11-7: a typed gemm_async carries [M, N, K] (K = the per-instruction K
+    of the kind) on every tcgen05.mma it dispatches to: its explicit mma_m/mma_n,
+    else TVM's tile choice from the accumulator region. Raw MMAs carry None."""
     from tests.numsim.v2.ports.test_validshape_gemm_async_artifact import dense_gemm_async_cta1_n16
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(dense_gemm_async_cta1_n16)
     declared = [i.declared for i in program.code if i.variant == "TcgenMma"]
-    assert declared == [[128, 16, 16], None]
+    assert declared == [[128, 16, 16], [128, 16, 16]]

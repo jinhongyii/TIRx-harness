@@ -258,7 +258,7 @@ def k(out: T.Buffer((64,), "float32")):
 
 def test_predicated_vector_atomic_is_guarded():
     """W4-12: `@p atom.v2.f32` adds only where the guard holds (the Atom sits inside the If)."""
-    from tests.numsim.runtime.test_atomic_f32_noftz import atomic_kernel
+    from tests.numsim.v2._kernels import atomic_kernel
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(atomic_kernel("atom", 2, "global"))
@@ -275,7 +275,7 @@ def test_predicated_vector_atomic_is_guarded():
 
 def test_vector_red_packs_pieces_that_tile_the_access_type():
     """`red.v2.bf16x2` packs two bf16x2 pieces into bf16x4 (pack tiling rule)."""
-    from tests.analysis_tools.synccheck.test_reported_tool_regressions import packed_bf16_vector_reduction
+    from tests.numsim.v2._kernels import packed_bf16_vector_reduction
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(packed_bf16_vector_reduction.func)
@@ -318,7 +318,7 @@ def k(out: T.Buffer((256,), "bfloat16"), off: T.int32):
 def test_packed_eight_conversions_read_their_first_pointer():
     """`cuda_{float8tohalf8,half8tofloat8}(void* src, void* dst)`: source first
     (unlike `float22half2(dst, src)`), as TVM's builtins and legacy define them."""
-    from tests.numsim.runtime.test_scalar_control import pointer_conversions_and_descriptor
+    from tests.numsim.v2._kernels import pointer_conversions_and_descriptor
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(pointer_conversions_and_descriptor)
@@ -339,7 +339,7 @@ def test_cross_owner_fragment_copy_is_transported_through_shared_scratch():
     """A copy between register fragments with different thread layouts stages the
     source through a shared scratch, synchronizes the warpgroup, then each
     destination owner writes its own elements (no cross-thread register writes)."""
-    from tests.numsim.runtime.test_tile_owner_transport import _copy_cross_warp_owner_remap
+    from tests.numsim.v2._kernels import _copy_cross_warp_owner_remap
     from tirx_harness.numsim.v2.lowering import lower
 
     program = lower(_copy_cross_warp_owner_remap)
@@ -355,7 +355,7 @@ def test_legacy_mma_fill_and_store_follow_the_lane_register_layout():
     to row 8*((id%4)//2) + l//4, col 8*(id//4) + 2*(l%4) + id%2 (legacy emit/matrix.rs)."""
     import numpy as np
 
-    from tests.numsim.runtime.test_matrix_instruction_codegen import mma_fragment_fill_and_store
+    from tests.numsim.v2._kernels import mma_fragment_fill_and_store
     from tirx_harness.numsim import v2
 
     result = v2.Engine().run(v2.transpile(mma_fragment_fill_and_store), {
@@ -370,14 +370,10 @@ def test_legacy_mma_fill_and_store_follow_the_lane_register_layout():
 def test_shared_scope_view_over_a_mapa_result_reads_the_cluster_window():
     """A `decl_buffer(scope="shared", data=<mapa.shared::cluster result>)` is addressed in
     shared::cluster space (32-bit window address), not as a generic pointer (W2)."""
-    import inspect
-    import re
-
-    from tests.numsim.runtime import test_scalar_control as module
+    from tests.numsim.v2._kernels import canonical_mapa
     from tirx_harness.numsim.v2.lowering import lower
 
-    test = inspect.getsource(module.test_canonical_mapa_integer_address_resolves_shared_memory)
-    kernel = getattr(module, re.search(r"transpile\((\w+)", test).group(1))
+    kernel = canonical_mapa
     program = lower(kernel)
     reads = [i for i in all_of(program, "LoadAddr") if i.space != "Generic"]
     assert reads and all(i.space == "SharedCluster" for i in reads)

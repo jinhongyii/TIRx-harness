@@ -14,6 +14,8 @@ Waves (rows of ``coverage/test_classification.csv``):
   test built from contract events replaces them.
 * ``2``  category B with status ``v2_kernel_test``: retired once every v2
   replacement (``tests/numsim/v2/checkers``) passes.
+* ``3``  category A with target ``conformance``: the corpus / wiki verdict
+  gates that tests/conformance snapshots replace (run at deletion time).
 * ``4``  category A, public-API surface: functions with a v2 copy in
   ``coverage/v2_ports_*.tsv`` are retired once every copy passes; functions
   that pass unchanged under ``NUMSIM_IMPL=v2`` (``v2_public_status.tsv``)
@@ -116,6 +118,9 @@ def selection(wave: str, results: Path | None) -> tuple[set[str], dict[str, str]
     info: dict[str, str] = {}
     if wave == "0":
         return {r["test_id"] for r in rows if r["category"] == "E"}, info
+    if wave == "3":
+        # Corpus / wiki verdict gates: tests/conformance snapshots cover them.
+        return {r["test_id"] for r in rows if r["category"] == "A" and r["target"] == "conformance"}, info
     if wave == "1":
         return {r["test_id"] for r in rows if r["category"] == "B" and r["target"] in {"covered", "ported"}}, info
     if wave == "5b":
@@ -199,7 +204,7 @@ def cut(path: Path, funcs: list[str]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--wave", required=True, choices=["0", "1", "2", "4", "5b"])
+    parser.add_argument("--wave", required=True, choices=["0", "1", "2", "3", "4", "5b"])
     parser.add_argument("--v2-results", type=Path, help="junit XML of the v2 replacements (waves 2 and 4)")
     parser.add_argument("--verbose", action="store_true", help="also print flip / hold rows")
     parser.add_argument("--dry-run", action="store_true")

@@ -241,7 +241,7 @@ def k(source: T.Buffer((2,), "int32"), output: T.Buffer((32,), "int32")):
 def test_cta_thread_and_cluster_size_limits_fail_closed(lower_source):
     """Legacy NumSimBuildError "warps_per_cta=33 ... maximum 32" and
     "ctas_per_cluster=65 ... maximum 64"."""
-    from tests.numsim.integration.test_topology_artifact import too_many_cluster_ctas, too_many_warps
+    from tests.numsim.v2._kernels import too_many_cluster_ctas, too_many_warps
     from tirx_harness.numsim.v2.lowering import lower
 
     assert lower(too_many_warps, strict=False).unsupported == [
