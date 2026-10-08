@@ -2049,3 +2049,44 @@ RaceObserver: 147 s for the same 200 rounds (engine ~5 s). More than 95% is in R
 
 1. **W2-18 (done in synccheck).** `SynccheckConfig::tcgen_exclusive_max: Option<u32>`. Request to the numsim-py owner: set it from `Program.arch` via `sched::exclusive_tmem_columns`. Without it, synccheck uses the largest `.exclusive` width the run committed (at least 512), which is sound because the engine already validated each width against the arch. The `tcgen_exclusive_576_sm107` special scenario can now assert synccheck Clean (`tests/interp_checkers_smoke.rs`, W2).
 2. **V2C-14 (rule clarified, reference and sync changed).** `setmaxnreg` by the trailing warps of a CTA (warp count not a multiple of 4) stays `IncompleteWarpgroup`. `WarpgroupSync` for such a tail is a no-op in `numsim-sync-ref::setmaxnreg` and `numsim-core::sync::setmaxnreg` (sync-semantics §7.4). Optional for W2: `interp/handlers/sync.rs` could skip crediting a group with fewer than 4 warps (`n < 4`). The model now tolerates it either way.
+
+## W1 (2026-10-08): W2-20 lowering items
+
+1. **Guarded `Ptx` keeps its destinations: fixed.** A `@p` op now emits
+   `keep_dst: true`, and memory write-backs run under `If(p)`.
+   `sparse_flashmla_prefill_head128_small_topk_phase1` completes, because the
+   CLC sentinel survives.
+2. **`flash_attention_backward_sm100:1277`: fixed.**
+   - The op is a `cp.async.bulk.shared::cluster.shared::cta` whose mbarrier
+     operand the TVM table tags `.shared`. PTX puts it in `.shared::cluster`,
+     the destination CTA's barrier.
+   - A bulk copy with a shared::cluster destination now gets a
+     `SharedCluster` completion barrier (cvta'd if it is generic).
+   - The case runs to completion.
+3. **Guarded tcgen05 ops: already inside `If(pred)`** (`c.emit`). The inactive
+   runs pass numsim and synccheck.
+   - The 10 `test_tcgen_inactive_boundaries` params now fail only on
+     `finding.details["operation"]`, a legacy report field (W2/report).
+4. **Zero-step `For` and shuffle width: fixed.**
+   - A runtime step gets `Assert(step > 0, "For step must be positive")`.
+   - A constant step of 0 or less is rejected at lowering.
+   - `__shfl*_sync` width: `Assert`, as in round 2.
+   - Also fixed: `continue` inside a `for` skipped the increment (infinite
+     loop). With a `continue` in the body, the increment now sits at the loop
+     head and the variable starts one step early. The
+     `test_loop_bounds` numerics pass; the remaining failures pin
+     `rust_source`.
+5. **`mxf8_cta2`: fixed.** A TMEM view with a runtime `allocated_addr`
+   recomputes `base_reg` immediately before every access, not at the
+   `decl_buffer`. `test_mxf8_cta2` passes 4/4.
+6. **Host-prelude truncdiv/truncmod: fixed without a contract change.**
+   - For a constant divisor `b > 0`: `trunc(a/b) = FloorDiv(Max(a,0), b) +
+     CeilDiv(Min(a,0), b)`. `b < 0` negates the result, and
+     `truncmod = a - b*trunc`.
+   - A runtime divisor fails closed. That would need `DimExpr::TruncDiv`,
+     which no corpus kernel requires.
+7. **`mega_moe` negative element index: fixed.** A same-dtype, constant-offset
+   view of a global buffer is now addressed in its root buffer
+   (`elem_base` + index), like a C pointer: indices may reach before or past
+   the view. Its logical identity was already the root.
+   `sm100_fp8_fp4_mega_moe` runs to completion.

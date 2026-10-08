@@ -167,3 +167,45 @@ def test_runtime_tensor_map_box_is_a_param_expression():
     assert not spec.box_dim[0].is_const
     assert "Param" in json.dumps(spec.box_dim[0].to_json())
     assert spec.element_stride[0] == pb.DimExpr.const(1)
+
+
+def _eval_dim(expr, params):
+    op = expr.op
+    if op == "Const":
+        return expr.value
+    if op == "Param":
+        return params[expr.value]
+    a, b = (_eval_dim(x, params) for x in expr.args)
+    return {"Add": lambda: a + b, "Sub": lambda: a - b, "Mul": lambda: a * b, "FloorDiv": lambda: a // b,
+            "CeilDiv": lambda: -((-a) // b), "Min": lambda: min(a, b), "Max": lambda: max(a, b)}[op]()
+
+
+def test_host_prelude_truncdiv_truncates_toward_zero():
+    """W2-20: `T.truncdiv` in the host prelude is truncating, not flooring (-7 // 2 -> -3)."""
+    from tests.numsim.integration.test_host_prelude import host_encoded_dynamic_integer_tensor_map
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(host_encoded_dynamic_integer_tensor_map)
+    spec = next(s.tensor_map for s in program.host_abi if s.tensor_map is not None)
+    param = next(i for i, s in enumerate(program.host_abi) if s.kind == "Scalar")
+    # global_dim[0] = truncdiv(delta, 2) + 35; box_dim[0] = floordiv(delta, 2) + 20.
+    dim = {v: _eval_dim(spec.global_dim[0], {param: v}) for v in (-7, -1, 0, 7)}
+    assert dim == {-7: 32, -1: 35, 0: 35, 7: 38}
+    assert _eval_dim(spec.box_dim[0], {param: -7}) == 16
+
+
+def test_guarded_ptx_keeps_its_destination(lower_source):
+    """W2-20: a guarded pure-register PTX op leaves its destination unchanged when off."""
+    program = lower_source('''
+@T.prim_func
+def k(out: T.Buffer((32,), "uint32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    r: T.uint32
+    r = T.uint32(7)
+    T.ptx.add.u32(r, r, T.uint32(1), pred=lane < 4)
+    out[lane] = r
+''')
+    ptx = [i for i in all_of(program, "Ptx") if i.pred is not None]
+    assert ptx and all(i.keep_dst for i in ptx)

@@ -133,3 +133,36 @@ def k(out: T.Buffer((128,), "float32")):
 ''')
     assert not program.unsupported
     assert [i.variant for i in program.code].count("LoopBegin") == 1
+
+
+def test_runtime_for_step_is_asserted_positive(lower_source):
+    """W2-20: a zero/negative runtime step is a run-time error, not a budget stop."""
+    program = lower_source('''
+@T.prim_func
+def k(steps: T.Buffer((32,), "int32"), out: T.Buffer((32,), "int32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    for i in range(0, 8, steps[lane]):
+        out[lane] = i
+''')
+    variants = [i.variant for i in program.code]
+    assert variants.index("Assert") < variants.index("LoopBegin")
+
+
+def test_continue_keeps_the_loop_increment(lower_source):
+    """`continue` jumps to the loop head, so the increment must live there."""
+    program = lower_source('''
+@T.prim_func
+def k(out: T.Buffer((32,), "int32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    for i in T.serial(4):
+        if lane < 8:
+            T.evaluate(T.continue_loop())
+        out[lane] = i
+''')
+    variants = [i.variant for i in program.code]
+    head = variants.index("LoopBegin") + 1
+    assert variants[head] == "Binary" and "Continue" in variants

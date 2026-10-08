@@ -240,9 +240,19 @@ def lower_generic(c: PtxCtx) -> None:
                 srcs.append(reg)
             dsts.append(reg)
     op = lw.builder.op(pb.OpKey(c.d.op_name, c.d.mod_tokens))
+    # A guarded op leaves its destinations untouched where the guard is off
+    # (legacy `keep` semantics; e.g. a CLC response sentinel survives).
     lw.builder.emit("Ptx", site=c.site(), op=op, dsts=dsts, srcs=srcs, pred=c.pred,
-                    keep_dst=c.d.preserve_dst)
-    c.flush()
+                    keep_dst=c.d.preserve_dst or c.pred is not None)
+    if c.pred is not None and c.write_backs:
+        # Memory destinations are written back only where the guard held.
+        b = lw.builder
+        if_pc = b.emit("If", site=c.site(), cond=c.pred, else_pc=0, end_pc=0, elect=False)
+        c.flush()
+        end = b.emit("EndIf")
+        b.patch(if_pc, "If", cond=c.pred, else_pc=end, end_pc=end, elect=False)
+    else:
+        c.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +448,15 @@ def lower_cp_async_mbar_arrive(c: PtxCtx) -> None:
     c.emit("CpAsyncMbarArrive", mbar=mbar, space=space, noinc=c.flag("noinc"))
 
 
-def _completion(c: PtxCtx) -> Any:
+def _completion(c: PtxCtx, cluster: bool = False) -> Any:
     if "mbar" in c.ops and c.has("mbar"):
+        if cluster:
+            # PTX: with a .shared::cluster destination the mbarrier is the
+            # destination CTA's, a .shared::cluster address (the TVM table tags
+            # the operand `.shared`); a shared::cta address is a valid
+            # shared::cluster address of the executing CTA.
+            mbar = c.lw.address_in(c.src("mbar"), "SharedCluster")
+            return pb.bulk_completion(mbar, "SharedCluster")
         mbar, space = c.addr("mbar", "Shared")
         return pb.bulk_completion(mbar, space)
     return pb.bulk_completion(None)
@@ -460,7 +477,10 @@ def lower_bulk_copy(c: PtxCtx) -> None:
         reduce = [ATOM_OPS[c.mod("redop")], pb.Ty.from_ptx(c.mod("type")).elem]
     mods = pb.mem_mods(policy=c.opt_src("cache_policy"))
     c.emit("BulkCopy", dst=dst, dst_space=dst_space, src=src, src_space=src_space, size=c.src("size"),
-           completion=_completion(c), multicast=_multicast(c), reduce=reduce,
+           # The completion barrier lives with a shared::cluster destination
+           # (possibly in the peer CTA), W2-20 flash_attention_backward:1277.
+           completion=_completion(c, cluster=dst_space == "SharedCluster"),
+           multicast=_multicast(c), reduce=reduce,
            byte_mask=c.opt_src("byte_mask") if "byte_mask" in c.ops else None,
            ignore_oob=_ignore_oob(c), report=_report(c), mods=mods)
 

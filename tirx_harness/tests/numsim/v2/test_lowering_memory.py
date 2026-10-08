@@ -168,7 +168,7 @@ def test_dtype_changing_view_is_its_own_logical_buffer(lower_source):
     site = lambda instr: program.site_of(program.code.index(instr)).buffer  # noqa: E731
     loads = {names[i.buf]: i for i in all_of(program, "Load")}
     assert site(loads["wide"]) == "wide"
-    assert site(loads["halves"]) == "state"
+    assert site(loads["state"]) == "state"  # same-dtype global view: addressed in its root
     assert all(b.name for b in program.buffers)
 
 

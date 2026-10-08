@@ -441,19 +441,34 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
         start = self.cast_to(self.expr(node.min), ty)
         extent = self.cast_to(self.expr(node.extent), ty)
         step = self.cast_to(self.expr(node.step), ty) if node.step is not None else self.const(ty, 1)
+        if node.step is not None and not isinstance(step, pb.Const):
+            # A zero or negative step never terminates: a run-time error (W2-20,
+            # legacy wording), not a loop-budget stop.
+            positive = b.reg(pb.Ty("Pred"))
+            b.emit("Compare", op="Gt", ty=ty, dst=positive, a=step, b=self.const(ty, 0))
+            b.emit("Assert", site=self.site(node), cond=positive, msg=b.string("For step must be positive"))
+        elif node.step is not None and _signed_value(b.program.const_value(step), ty) <= 0:
+            raise _Unsupported(node, "For step must be positive")
         uniform = all(self.is_uniform(v) for v in (start, extent, step))
         var = b.reg(ty, name=str(node.loop_var.name), uniform=uniform)
-        b.emit("Mov", dst=var, src=start)
+        # `continue` jumps to the loop head, so with a Continue in the body the
+        # increment lives at the head (var starts one step early); otherwise it
+        # stays at the end of the body.
+        head_increment = _has_continue(node.body)
+        b.emit("Mov", dst=var, src=self.binary("Sub", ty, start, step) if head_increment else start)
         stop = self.binary("Add", ty, start, extent)
         self.vars[handle(node.loop_var)] = var
         site = self.site(node)
         begin_pc = b.emit("LoopBegin", site=site, end_pc=0)
         head_pc = b.pc
+        if head_increment:
+            b.emit("Binary", op="Add", ty=ty, dst=var, a=var, b=step)
         cond = b.reg(pb.Ty("Pred"), uniform=uniform)
         b.emit("Compare", op="Lt", ty=ty, dst=cond, a=var, b=stop)
         loopif_pc = b.emit("LoopIf", cond=cond, end_pc=0)
         self.stmt(node.body)
-        b.emit("Binary", op="Add", ty=ty, dst=var, a=var, b=step)
+        if not head_increment:
+            b.emit("Binary", op="Add", ty=ty, dst=var, a=var, b=step)
         end_pc = b.emit("LoopEnd", head_pc=head_pc)
         b.patch(begin_pc, "LoopBegin", end_pc=end_pc)
         b.patch(loopif_pc, "LoopIf", cond=cond, end_pc=end_pc)
@@ -884,6 +899,35 @@ def dispatch_tile_primitives(func: Any) -> Any:
 
 _DISPATCH_ERRORS: dict[int, str] = {}
 
+
+
+def _has_continue(body: Any) -> bool:
+    """Does ``body`` contain a ``continue`` that targets the enclosing loop?"""
+    found = False
+
+    def on_continue(node: Any, visitor: Any) -> None:
+        nonlocal found
+        found = True
+
+    def skip_loop(node: Any, visitor: Any) -> None:
+        return None  # a nested loop's continue targets that loop
+
+    def on_call(node: Any, visitor: Any) -> None:
+        nonlocal found
+        if str(getattr(node.op, "name", "")) == "tirx.continue_loop":
+            found = True
+        visitor.default_visit(node)
+
+    structural_visit(body, [(tirx.Continue, on_continue), (tvm.ir.Call, on_call),
+                            (tirx.For, skip_loop), (tirx.While, skip_loop)])
+    return found
+
+
+def _signed_value(bits: int, ty: pb.Ty) -> int:
+    width = ty.bits
+    if ty.elem.startswith("S") and bits >> (width - 1) & 1:
+        return bits - (1 << width)
+    return bits
 
 
 def lower_module(funcs: Any, *, strict: bool = True) -> pb.Module:

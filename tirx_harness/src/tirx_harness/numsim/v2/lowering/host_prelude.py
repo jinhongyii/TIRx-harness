@@ -39,8 +39,6 @@ if TYPE_CHECKING:
 _DIM_OPS = {
     "prim.Add": "Add", "prim.Sub": "Sub", "prim.Mul": "Mul", "prim.FloorDiv": "FloorDiv",
     "prim.Min": "Min", "prim.Max": "Max",
-    # Extents are non-negative, where truncating and flooring division agree.
-    "prim.Div": "FloorDiv",
 }
 
 
@@ -162,6 +160,8 @@ class PreludeMixin:
             raise _Unsupported(node, f"extent references non-parameter variable {node.name}")
         if kind == "prim.Cast":
             return self.dim_expr(node.value)
+        if kind in ("prim.Div", "prim.Mod"):
+            return self.trunc_dim(node, kind == "prim.Mod")
         op = _DIM_OPS.get(kind)
         if op is None:
             raise _Unsupported(node, f"unsupported integer operation {kind.rpartition('.')[2]} in a host extent expression (no DimExpr)")
@@ -171,6 +171,31 @@ class PreludeMixin:
             if folded is not None:
                 return pb.DimExpr.const(folded)
         return pb.DimExpr(op, args=(a, b))
+
+    def trunc_dim(self: "Lowerer", node: Any, modulo: bool) -> pb.DimExpr:
+        """TIR ``truncdiv``/``truncmod`` (``prim.Div``/``prim.Mod``) as a DimExpr.
+
+        DimExpr has no truncating division, but for a constant divisor ``b > 0``
+        ``trunc(a / b) = floor(max(a, 0) / b) + ceil(min(a, 0) / b)`` (and the
+        negated form for ``b < 0``); ``truncmod = a - b * truncdiv``. A runtime
+        divisor needs a contract TruncDiv (fails closed).
+        """
+        a, b = self.dim_expr(node.a), self.dim_expr(node.b)
+        if a.is_const and b.is_const and b.value != 0:
+            q = abs(a.value) // abs(b.value) * (1 if (a.value >= 0) == (b.value > 0) else -1)
+            return pb.DimExpr.const(a.value - b.value * q if modulo else q)
+        if not b.is_const or b.value == 0:
+            raise _Unsupported(node, "truncating division by a runtime divisor in a host extent expression "
+                                     "(DimExpr has no TruncDiv)")
+        zero = pb.DimExpr.const(0)
+        divisor = pb.DimExpr.const(abs(b.value))
+        quotient = pb.DimExpr("Add", args=(pb.DimExpr("FloorDiv", args=(pb.DimExpr("Max", args=(a, zero)), divisor)),
+                                           pb.DimExpr("CeilDiv", args=(pb.DimExpr("Min", args=(a, zero)), divisor))))
+        if b.value < 0:
+            quotient = pb.DimExpr("Sub", args=(zero, quotient))
+        if not modulo:
+            return quotient
+        return pb.DimExpr("Sub", args=(a, pb.DimExpr("Mul", args=(b, quotient))))
 
     # -- host prelude -------------------------------------------------------
     def split_prelude(self: "Lowerer", body: Any) -> list[Any]:

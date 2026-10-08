@@ -67,7 +67,9 @@ class Shape:
     layout: Any | None              # non-trivial TVM layout, else None
     tmem_cols: int | None = None    # TMEM view: physical column span (dense lane x column addressing)
     tmem_per_cell: int = 1          # TMEM view: elements per 32-bit cell (contract item 28)
+    tmem_refresh: Any = None        # TMEM view with a runtime base: emits the base_reg update
     tmem_origin: tuple[Any, Any] | None = None  # TMEM layout offset (lane, col) folded into the base
+    elem_base: int = 0              # global same-dtype view folded into its root: element offset
 
     @property
     def static_shape(self) -> tuple[int, ...] | None:
@@ -251,6 +253,15 @@ class MemoryMixin:
             return
         if isinstance(backing, MemRef) and type_key(offset) == "ir.IntImm":
             parent = self.builder.program.buffers[backing.buf]
+            if parent.space == "Global" and parent.view_of is None and parent.dtype == elem_ty \
+                    and info.layout is None and not info.strides:
+                # A same-dtype view of a global buffer is an offset into it, like a
+                # C pointer: indices may legally reach before or past the view
+                # (W2-20, mega_moe's signed delta to a sibling plane), so it is
+                # addressed in the root, whose logical identity it shares anyway.
+                info.elem_base = int(offset.value)
+                self.refs[handle(var)] = MemRef(buf=backing.buf, space=backing.space, info=info)
+                return
             static = info.static_shape
             shape = tuple(pb.DimExpr.const(e) for e in static) if static is not None else \
                 tuple(self.dim_expr(e) for e in info.shape)
@@ -328,19 +339,27 @@ class MemoryMixin:
             base = int(start.value) + (int(lane_off.value) << 16 if lane_off is not None else 0) + (
                 int(col_off.value) // per_cell if col_off is not None else 0)
         else:
-            # Contract item 22: runtime taddr in a register (read at each access); base 0.
-            value = self.cast_to(self.expr(start), pb.Ty("U32"))
-            if lane_off is not None:
-                lane_bits = self.binary("Shl", pb.Ty("U32"), self.cast_to(self.expr(lane_off), pb.Ty("U32")),
-                                        self.const("uint32", 16))
-                value = self.binary("Add", pb.Ty("U32"), value, lane_bits)
-            if col_off is not None:
-                cell_off = self.cast_to(self.expr(col_off), pb.Ty("U32"))
-                if per_cell > 1:
-                    cell_off = self.binary("FloorDiv", pb.Ty("U32"), cell_off, self.const("uint32", per_cell))
-                value = self.binary("Add", pb.Ty("U32"), value, cell_off)
-            base_reg = self.builder.reg(pb.Ty("U32"), name=f"{var.name}.taddr", uniform=self.is_uniform(value))
-            self.builder.emit("Mov", dst=base_reg, src=value)
+            # Contract item 22: runtime taddr in a register, read at each access;
+            # base 0. The address expression is evaluated right before every
+            # access, not at the declaration: the view is often declared before
+            # `tcgen05.alloc` writes the address (W2-20, mxf8_cta2).
+            base_reg = self.builder.reg(pb.Ty("U32"), name=f"{var.name}.taddr")
+
+            def refresh(start=start, lane_off=lane_off, col_off=col_off, per_cell=per_cell,
+                        base_reg=base_reg) -> None:
+                value = self.cast_to(self.expr(start), pb.Ty("U32"))
+                if lane_off is not None:
+                    lane_bits = self.binary("Shl", pb.Ty("U32"), self.cast_to(self.expr(lane_off), pb.Ty("U32")),
+                                            self.const("uint32", 16))
+                    value = self.binary("Add", pb.Ty("U32"), value, lane_bits)
+                if col_off is not None:
+                    cell_off = self.cast_to(self.expr(col_off), pb.Ty("U32"))
+                    if per_cell > 1:
+                        cell_off = self.binary("FloorDiv", pb.Ty("U32"), cell_off, self.const("uint32", per_cell))
+                    value = self.binary("Add", pb.Ty("U32"), value, cell_off)
+                self.builder.emit("Mov", dst=base_reg, src=value)
+
+            info.tmem_refresh = refresh
         if lane_off is not None or col_off is not None:
             info.tmem_origin = (lane_off, col_off)
         buf = self.builder.buffer(
@@ -418,6 +437,8 @@ class MemoryMixin:
             if info.tmem_cols is None:
                 # Contract item 29.
                 raise _Unsupported(None, f"tmem_replicated_view: {self.builder.program.buffers[ref.buf].name}")
+            if info.tmem_refresh is not None:
+                info.tmem_refresh()
             width = dtypes.bits(info.dtype) * lanes
             if width not in (8, 16, 32) or (width < 32 and info.tmem_per_cell == 1):
                 raise _Unsupported(None, f"direct TMEM access of {info.dtype}x{lanes} (32-bit, 16-bit or 8-bit cells only)")
@@ -433,6 +454,11 @@ class MemoryMixin:
             return self.binary("Add", idx_dtype, row, col), lanes
         if info.layout is not None:
             flat = self.apply_layout(info.layout, flat, idx_dtype)
+        if isinstance(ref, MemRef) and info.elem_base:
+            if idx_dtype == "int32" and not -(1 << 31) <= info.elem_base < (1 << 31):
+                idx_dtype = "int64"
+                flat = self.cast_to(flat, idx_dtype)
+            flat = self.binary("Add", idx_dtype, flat, self.const(idx_dtype, info.elem_base))
         if isinstance(ref, MemRef):
             # Buffer-relative offsets count scalar elements of the buffer's
             # `dtype.elem`, not whole vector elements (V2C-11): a `uint32x4`
