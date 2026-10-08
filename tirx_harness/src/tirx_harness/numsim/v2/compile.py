@@ -87,6 +87,9 @@ class KernelSpec:
     sites: tuple[dict[str, Any], ...]
     # Legacy attribute read by conformance tooling; v2 embeds spans instead.
     source_map: tuple = ()
+    # Launch topology (grid/cluster/block; grid dims are `{"Const": n}` or
+    # host expressions), for mapping legacy `cta_ids` subsets to clusters.
+    topology: dict[str, Any] = field(default_factory=dict, compare=False)
 
     def source_span(self, site: int | None) -> dict[str, Any] | None:
         if site is None or site < 0 or site >= len(self.sites):
@@ -107,6 +110,7 @@ def _module_spec(module: dict[str, Any]) -> ModuleSpec:
                 name=str(kernel.get("name", f"kernel{index}")),
                 host_abi=tuple(kernel.get("host_abi", ())),
                 sites=tuple(kernel.get("sites", ())),
+                topology=dict(kernel.get("topology") or {}),
             )
             for index, kernel in enumerate(module.get("kernels", ()))
         )

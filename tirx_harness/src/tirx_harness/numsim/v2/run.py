@@ -15,7 +15,7 @@ import time
 import struct
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Union
 
 import re
 
@@ -26,6 +26,7 @@ from .options import BACKENDS, options
 from .report import (
     AnalysisResult,
     attach_operations,
+    stop_facts,
     checker_phase_payload,
     NumSimResult,
     diagnostic_from_core,
@@ -75,9 +76,13 @@ def _raise_unless_completed(status: Mapping[str, Any], diagnostics: list[dict[st
         leaf = span["spans"][-1] if span.get("kind") == "sequential" else span
         where = f" at {leaf.get('source_name')}:{leaf.get('line')}"
     detail = first.get("message") or first.get("reason") or ""
+    facts = stop_facts(first)
+    if facts:
+        detail = f"{detail} ({facts})"
     raise ExecutionError(
         f"NumSim execution {status.get('kind')}: {first.get('kind')}: {detail}{where}", diagnostics
     )
+
 
 
 @dataclass(frozen=True)
@@ -114,10 +119,113 @@ def _slot_kind(slot: Mapping[str, Any]) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", str(kind)).lower()
 
 
+@dataclass(frozen=True)
+class ExecutionSubset:
+    """Select whole clusters of a launch to run.
+
+    ``cluster_ids`` are linear cluster ids (x fastest). ``cta_ids`` are
+    flattened global CTA ids and must select a union of whole clusters (a
+    single CTA is a whole cluster when the cluster shape is 1x1x1). When both
+    are given, the run uses their intersection. A subset run cannot certify
+    the launch, so checker verdicts on it are at least ``incomplete``."""
+
+    cluster_ids: tuple[int, ...] | list[int] | None = None
+    cta_ids: tuple[int, ...] | list[int] | None = None
+
+    def to_payload(self) -> dict[str, list[int] | None]:
+        return {
+            "cluster_ids": None if self.cluster_ids is None else list(self.cluster_ids),
+            "cta_ids": None if self.cta_ids is None else list(self.cta_ids),
+        }
+
+
+#: An ``ExecutionSubset`` or a mapping from phase (launch) index to one. One
+#: engine run serves every launch of a module, so the mapped subsets must be
+#: equal.
+ExecutionSubsetSelection = Union[ExecutionSubset, Mapping[int, ExecutionSubset]]
+
+
+def _clusters_of_ctas(module: CompiledModule, cta_ids: list[int]) -> set[int]:
+    """Linear cluster ids covering flattened CTA ids ``cta_ids`` (x fastest),
+    per ``sched::cta_coords``. The CTAs must form whole clusters, and every
+    kernel of the module must agree (one launch shape)."""
+
+    def dims(value: Any, what: str) -> tuple[int, int, int]:
+        out = []
+        for d in value or (1, 1, 1):
+            if isinstance(d, Mapping):
+                if "Const" not in d:
+                    raise InputError(f"cta_ids subsets need a static {what}; select cluster_ids instead")
+                d = d["Const"]
+            out.append(max(int(d), 1))
+        return tuple(out)  # type: ignore[return-value]
+
+    shapes = set()
+    for kernel in module.spec.kernels:
+        topo = kernel.topology
+        shapes.add((dims(topo.get("grid"), "grid"), dims(topo.get("cluster"), "cluster shape")))
+    if len(shapes) != 1:
+        raise InputError("cta_ids subsets need one launch shape across the module's kernels; select cluster_ids instead")
+    (grid, cluster), = shapes
+    total = grid[0] * grid[1] * grid[2]
+    ncl = (grid[0] // cluster[0], grid[1] // cluster[1])
+    per_cluster: dict[int, set[int]] = {}
+    for cta in cta_ids:
+        if not 0 <= cta < total:
+            raise InputError(f"cta id {cta} is outside the grid of {total} CTAs")
+        c = (cta % grid[0], (cta // grid[0]) % grid[1], cta // (grid[0] * grid[1]))
+        cid = c[0] // cluster[0] + (c[1] // cluster[1]) * ncl[0] + (c[2] // cluster[2]) * ncl[0] * ncl[1]
+        per_cluster.setdefault(cid, set()).add(cta)
+    size = cluster[0] * cluster[1] * cluster[2]
+    partial = sorted(cid for cid, ctas in per_cluster.items() if len(ctas) != size)
+    if partial:
+        raise InputError(f"cta_ids must select whole clusters of {size} CTAs; clusters {partial} are partial")
+    return set(per_cluster)
+
+
+def _attach_subset_scope(payload: dict[str, Any], topology: Mapping[str, Any]) -> None:
+    """A subset run: ``analysis_scope`` names it (legacy shape: kind
+    ``subset`` with selected/total warp counts) and the ``subset_execution``
+    incomplete record carries the same counts when the launch is static."""
+
+    records = [r for r in payload.get("incomplete", ()) if r.get("reason") == "subset_execution"]
+    if not records:
+        return
+    scope: dict[str, Any] = {"kind": "subset"}
+
+    def static(value: Any) -> list[int] | None:
+        out = []
+        for d in value or (1, 1, 1):
+            if isinstance(d, Mapping):
+                if "Const" not in d:
+                    return None
+                d = d["Const"]
+            out.append(max(int(d), 1))
+        return out
+
+    grid, cluster, block = (static(topology.get(k)) for k in ("grid", "cluster", "block"))
+    clusters = records[0].get("resident_cluster_ids")
+    if grid and cluster and block and isinstance(clusters, list):
+        warps_per_cta = -(-(block[0] * block[1] * block[2]) // 32)
+        cluster_size = cluster[0] * cluster[1] * cluster[2]
+        scope["selected_warp_count"] = len(clusters) * cluster_size * warps_per_cta
+        scope["total_warp_count"] = grid[0] * grid[1] * grid[2] * warps_per_cta
+        for record in records:
+            record.update(selected_warp_count=scope["selected_warp_count"], total_warp_count=scope["total_warp_count"])
+    payload["analysis_scope"] = scope
+
+
 def _scalar_bits(name: str, value: Any, ty: Mapping[str, Any] | None) -> int:
     elem = str((ty or {}).get("elem", "S64")).upper()
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        value = value[()]
     if isinstance(value, np.generic):
         value = value.item()
+    if isinstance(value, (np.ndarray, list, tuple, bytes, bytearray, memoryview)) or hasattr(value, "__dlpack__"):
+        # W5-17: a buffer (e.g. descriptor storage) bound to a scalar parameter.
+        shape = getattr(value, "shape", None)
+        what = f"{type(value).__name__} of shape {tuple(shape)}" if shape is not None else type(value).__name__
+        raise InputError(f"scalar argument {name!r} has a buffer value ({what}); pass a Python or NumPy scalar")
     if isinstance(value, (bool, np.bool_)) or elem == "PRED":
         return int(bool(value))
     if elem == "F16":
@@ -604,21 +712,37 @@ class Engine:
         return int(addresses[canonical])
 
     @staticmethod
-    def _subset_extra(subset: Any, assumptions: Any = None) -> dict[str, Any]:
-        """``ExecutionSubset`` -> resident cluster ids for ``RunConfig::subset``."""
+    def _subset_extra(subset: Any, assumptions: Any = None, module: CompiledModule | None = None) -> dict[str, Any]:
+        """``ExecutionSubset`` -> resident cluster ids for ``RunConfig::subset``.
+
+        ``cluster_ids`` are linear cluster ids. ``cta_ids`` (flattened global
+        CTA ids, the legacy public selector) must name whole clusters; they
+        map to the clusters they cover. Both given: their intersection."""
 
         # Host assumptions are dropped in v2 (W8-4 ruling): the only legacy
         # field, external_grid_dependencies_satisfied, is satisfied
         # automatically at a launch boundary, and no corpus case sets it.
         del assumptions
+        if isinstance(subset, Mapping):
+            chosen = {(tuple(getattr(v, "cluster_ids", None) or ()) if getattr(v, "cluster_ids", None) is not None else None,
+                       tuple(getattr(v, "cta_ids", None) or ()) if getattr(v, "cta_ids", None) is not None else None)
+                      for v in subset.values()}
+            if len(chosen) > 1:
+                raise InputError("per-phase subsets must be equal: one engine run serves every launch")
+            subset = next(iter(subset.values()), None)
         if subset is None:
             return {}
-        if getattr(subset, "cta_ids", None) is not None:
-            raise NotImplementedError("v2 subsets select clusters; cta_ids subsets are not supported")
         clusters = getattr(subset, "cluster_ids", None)
-        if clusters is None:
+        selected = None if clusters is None else {int(c) for c in clusters}
+        cta_ids = getattr(subset, "cta_ids", None)
+        if cta_ids is not None:
+            if module is None:
+                raise InputError("a cta_ids subset needs the module's launch topology")
+            from_ctas = _clusters_of_ctas(module, [int(c) for c in cta_ids])
+            selected = from_ctas if selected is None else selected & from_ctas
+        if selected is None:
             return {}
-        return {"subset": tuple(int(c) for c in clusters)}
+        return {"subset": tuple(sorted(selected))}
 
     # -- NumSim ------------------------------------------------------------
     def run(
@@ -630,7 +754,7 @@ class Engine:
         assumptions: Any = None,
         outputs: Iterable[str] | Mapping[str, str] | None = None,
     ) -> NumSimResult:
-        extra = self._subset_extra(subset, assumptions)
+        extra = self._subset_extra(subset, assumptions, module)
         started = time.perf_counter()
         bound = canonicalize_inputs(module, inputs)
         selected = _select_outputs(bound, outputs, module)
@@ -751,6 +875,7 @@ class Engine:
             span_of_kernel=span_of_kernel,
             site_info_of=_site_info_resolver(module),
         )
+        _attach_subset_scope(payload, kernels[phase_index].topology)
         payload.setdefault("stats", {}).update(raw.get("stats") or {})
         # One engine run serves every phase of a module; its build/run/check
         # times are repeated on each phase payload.
@@ -773,7 +898,7 @@ class Engine:
         (v2 has no isolated-phase mode; ``advance_prefix`` is accepted)."""
 
         del inspect_accesses, max_polls, advance_prefix
-        extra = self._subset_extra(subset)
+        extra = self._subset_extra(subset, None, module)
         if max_transitions is not None:
             extra["max_rounds"] = int(max_transitions)
         return self._checker_phase("racecheck", module, inputs, phase_index, extra)
@@ -793,7 +918,7 @@ class Engine:
         advance_prefix: bool = False,
     ) -> AnalysisResult:
         del max_polls, advance_prefix
-        extra = self._subset_extra(subset, assumptions)
+        extra = self._subset_extra(subset, assumptions, module)
         if resource_limits is not None:
             extra["state_budget"] = int(resource_limits.max_backtrack_nodes)
             extra["transition_budget"] = int(resource_limits.max_loop_steps)

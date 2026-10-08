@@ -3,8 +3,8 @@
 ``test-migration.md`` ("Public-API A tests under ``NUMSIM_IMPL=v2``") rules
 these A: v2 raises the same exception type for the same fault, only the
 wording differs. Each copy asserts the exception type and the v2 error kind
-(plus the structured detail where it is part of the kind, e.g.
-``MissingWarpgroupSync``), never the human text. Kernels are copied verbatim
+(plus the structured protocol error where it is part of the kind, e.g.
+``error == "missing_warpgroup_sync"``), never the human text. Kernels are copied verbatim
 from the legacy files.
 """
 
@@ -53,7 +53,7 @@ def _anchor_text(stop: dict, source: str | None) -> str:
 def _assert_stop(
     excinfo,
     kinds: Iterable[str],
-    detail: str | None = None,
+    error: str | None = None,
     *,
     anchor: str | None = None,
     source: str | None = None,
@@ -61,21 +61,22 @@ def _assert_stop(
     warp: int | None = None,
 ) -> None:
     """``ExecutionError`` whose stopping diagnostic is an ``error`` of one of
-    ``kinds``; ``detail`` is the structured variant name the kind carries
-    (e.g. ``RegPool(MissingWarpgroupSync {..})``).
+    ``kinds``; ``error`` is the structured protocol error the kind carries
+    (the diagnostic's ``error`` field, e.g. ``missing_warpgroup_sync`` for
+    ``RegPool(MissingWarpgroupSync {..})``).
 
     W11 (pin-message): the legacy text also carried *where* the fault is, so
     ``anchor`` checks the source line of the diagnostic's ``source_span``
     (``source`` is the TVMScript text for ``from_source`` kernels), and
     ``lanes`` / ``warp`` check the structured faulting lanes and warp."""
 
-    error = excinfo.value
-    assert isinstance(error, v2.ExecutionError), type(error)
-    stop = _first_stop(error)
+    exc = excinfo.value
+    assert isinstance(exc, v2.ExecutionError), type(exc)
+    stop = _first_stop(exc)
     assert stop["status"] == "error", stop
     assert stop["kind"] in set(kinds), stop
-    if detail is not None:
-        assert detail in str(stop.get("message", "")), stop
+    if error is not None:
+        assert stop.get("error") == error, stop
     if anchor is not None:
         assert anchor in _anchor_text(stop, source), (anchor, stop)
     if lanes is not None:
@@ -299,7 +300,7 @@ def test_setmaxnreg_requires_explicit_warpgroup_sync_before_a_later_call():
     module = v2.transpile(setmaxnreg_without_intervening_sync)
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(module, {"output": np.zeros(1, dtype=np.int32)})
-    _assert_stop(excinfo, {"sync_protocol_error"}, detail="MissingWarpgroupSync", anchor="setmaxnreg.dec", warp=0)
+    _assert_stop(excinfo, {"sync_protocol_error"}, error="missing_warpgroup_sync", anchor="setmaxnreg.dec", warp=0)
 
 
 def test_setmaxnreg_rejects_warp_disagreement_within_one_occurrence():
@@ -378,8 +379,9 @@ def ptx_rem_s32_error_path(
 def test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane(kernel, symbol):
     """Replaces ``tests/numsim/runtime/test_ptx_integer_arithmetic.py::test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane``.
 
-    Kind ``invalid_operand`` (legacy also named lane 7 in its text; v2's
-    diagnostic reports the warp, not the lane)."""
+    Kind ``invalid_operand``; legacy named lane 7 in its text, v2 carries it
+    as structured facts (W11-pin-message 1): the ``lanes`` mask and
+    ``faulting_lanes`` hold only lane 7, ``operands`` its sources."""
 
     rhs = np.ones(32, dtype=np.int32)
     rhs[7] = 0
@@ -393,7 +395,9 @@ def test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane(kernel, 
             },
             outputs=("output",),
         )
-    _assert_stop(excinfo, {"invalid_operand"}, anchor="T.ptx.div" if symbol == "/" else "T.ptx.rem")
+    _assert_stop(excinfo, {"invalid_operand"}, anchor="T.ptx.div" if symbol == "/" else "T.ptx.rem", lanes=1 << 7)
+    stop = _first_stop(excinfo.value)
+    assert stop["faulting_lanes"] == [7] and stop["operands"] == [29, 0], stop
 
 
 @pytest.mark.parametrize(
@@ -414,7 +418,9 @@ def test_ptx_signed_division_overflow_fails_closed(kernel, symbol):
             },
             outputs=("output",),
         )
-    _assert_stop(excinfo, {"invalid_operand"}, anchor="T.ptx.div" if symbol == "/" else "T.ptx.rem")
+    _assert_stop(excinfo, {"invalid_operand"}, anchor="T.ptx.div" if symbol == "/" else "T.ptx.rem", lanes=0xFFFFFFFF)
+    stop = _first_stop(excinfo.value)
+    assert stop["faulting_lanes"] == list(range(32)) and len(stop["operands"]) == 2, stop
 
 
 # -- tests/numsim/runtime/test_scalar_control.py -----------------------------
@@ -477,7 +483,7 @@ def test_mbarrier_state_token_rejects_a_generation_older_than_the_previous_one()
     module = v2.transpile(mbarrier_stale_state_token)
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(module, {"output": np.zeros(4, dtype=np.uint32)})
-    _assert_stop(excinfo, {"sync_protocol_error"}, detail="InvalidStateToken", anchor="mbarrier.try_wait", lanes=0x1)
+    _assert_stop(excinfo, {"sync_protocol_error"}, error="invalid_state_token", anchor="mbarrier.try_wait", lanes=0x1)
 
 
 def test_integer_trap_predicate_uses_cpp_truth_conversion():

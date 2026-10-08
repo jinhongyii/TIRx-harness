@@ -120,15 +120,49 @@ def test_canonicalize_inputs_validates(module):
         v2.canonicalize_inputs(module, inputs)
 
 
+def test_scalar_parameter_rejects_buffer_values():
+    """W5-17: descriptor storage (or any array) bound to a scalar parameter is
+    a typed InputError naming the argument, not a TypeError."""
+
+    from tirx_harness.numsim.v2.run import _scalar_bits
+
+    with pytest.raises(v2.InputError, match=r"scalar argument 'mode' has a buffer value \(ndarray of shape \(128,\)\)"):
+        _scalar_bits("mode", np.zeros(128, np.uint8), {"elem": "S32"})
+    assert _scalar_bits("mode", np.array(7, np.int32), {"elem": "S32"}) == 7
+    assert _scalar_bits("mode", np.int64(-1), {"elem": "S32"}) == 0xFFFFFFFF
+
+
 def test_engine_subset_selects_clusters(module):
     from tirx_harness.numsim.api import ExecutionSubset
 
-    with pytest.raises(NotImplementedError, match="cta_ids"):
-        v2.Engine().run(module, _inputs(), subset=ExecutionSubset(cta_ids=[0]))
     result = _skip_if_unimplemented(
         lambda: v2.Engine().run(module, _inputs(), subset=ExecutionSubset(cluster_ids=[0]))
     )
     assert any(d.get("reason") == "subset_execution" for d in result.diagnostics), result.diagnostics
+
+
+def test_engine_subset_maps_cta_ids_to_whole_clusters(module):
+    """Legacy public selector: flattened CTA ids naming whole clusters map to
+    cluster ids (vector_add: grid 8, cluster 1); intersection with
+    cluster_ids; out-of-grid ids are a typed InputError."""
+
+    from tirx_harness.numsim.v2 import ExecutionSubset
+    from tirx_harness.numsim.v2.run import Engine
+
+    assert Engine._subset_extra(ExecutionSubset(cta_ids=[3, 1]), None, module) == {"subset": (1, 3)}
+    per_phase = {0: ExecutionSubset(cluster_ids=[2]), 1: ExecutionSubset(cluster_ids=[2])}
+    assert Engine._subset_extra(per_phase, None, module) == {"subset": (2,)}
+    with pytest.raises(v2.InputError, match="must be equal"):
+        Engine._subset_extra({0: ExecutionSubset(cluster_ids=[1]), 1: ExecutionSubset(cluster_ids=[2])}, None, module)
+    both = ExecutionSubset(cta_ids=[1, 3], cluster_ids=[3, 5])
+    assert Engine._subset_extra(both, None, module) == {"subset": (3,)}
+    with pytest.raises(v2.InputError, match="outside the grid"):
+        Engine._subset_extra(ExecutionSubset(cta_ids=[8]), None, module)
+    result = _skip_if_unimplemented(
+        lambda: v2.Engine().run(module, _inputs(), subset=ExecutionSubset(cta_ids=[0]))
+    )
+    (record,) = [d for d in result.diagnostics if d.get("reason") == "subset_execution"]
+    assert record["resident_cluster_ids"] == [0]
 
 
 # -- execution (skips until W2 lands) ---------------------------------------
@@ -380,6 +414,47 @@ def test_renderer_prints_classification_and_hint():
         "    bytes [0, 4)",
         "    Hint: If this access relies on a hand-written spin wait, consider wait_until.",
     ]
+
+
+def test_renderer_prints_both_conflicting_operations_and_scope():
+    """v2 wording (report doc, "Rendered text"): a racecheck report names the
+    checked memory spaces, and a race prints both sides as ``Prior:`` /
+    ``Current:`` lines with warp, source op, source text, location, lane,
+    access, space, allocation and bytes."""
+
+    span = {"kind": "span", "source_name": "k.py", "line": 7, "column": 1, "end_line": 7, "end_column": 9}
+
+    def access(warp, kind):
+        return {
+            "access_kind": kind, "lane": 0, "proxy": "generic", "space": "shared",
+            "span": {"allocation_id": 1, "byte_offset": 0, "byte_len": 4, "byte_end": 4},
+            "operation": {"global_warp_id": warp, "kernel_index": 0, "site": 3, "source_span": span},
+        }
+
+    record = {"kind": "data_race", "status": "error", "message": "write_write conflict",
+              "prior": access(0, "write"), "current": access(1, "write")}
+    base = {"checked_memory_spaces": ["global", "shared", "tmem"], "findings": [record]}
+    info = {"kind": "tirx.BufferStore", "text": "shared[0] = warp + 1"}
+    payload = rep.checker_phase_payload(base, checker="racecheck", phase_index=0, phase_name="k",
+                                        status={"kind": "completed"}, diagnostics=[],
+                                        span_of_kernel=lambda k, s: span, site_info_of=lambda k, s: info)
+    text = rep.RaceReport([rep.AnalysisResult("racecheck", payload)]).format()
+    assert "  race conflicts checked in global, shared, tmem" in text.splitlines()
+    for label, warp in (("Prior", 0), ("Current", 1)):
+        assert (f"    {label}: warp {warp}, source op 3 (tirx.BufferStore) `shared[0] = warp + 1` at k.py:7; "
+                "lane 0 write shared allocation#1 bytes [0, 4)") in text.splitlines(), text
+
+
+def test_stop_facts_render_structured_engine_attrs():
+    """W11-pin-message 1/5: engine stop attrs in words (ExecutionError text
+    and the report's ``Stop:`` line)."""
+
+    alu = {"warp": 0, "faulting_lanes": [7], "operation_name": "tirx.ptx.div.s32", "operands": [29, 0]}
+    assert rep.stop_facts(alu) == "warp 0, lane 7, tirx.ptx.div.s32, operands 29, 0"
+    loop = {"warp": 2, "lanes": 0xFFFF, "kernel": 0, "budget": 1000, "iteration": 1000}
+    assert rep.stop_facts(loop) == "warp 2, lanes 0x0000ffff, loop budget 1000 at iteration 1000"
+    assert rep.stop_facts({"max_rounds": 50}) == "round budget 50"
+    assert rep.stop_facts({"operation": {"source_op_id": 1}}) == ""
 
 
 def test_incomplete_reason_is_the_message_when_message_is_empty():

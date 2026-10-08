@@ -1,6 +1,6 @@
 {
  "case": "deepgemm_sm100_tf32_hc_prenorm_gemm",
- "delta": "CONTRACT_REQUESTS W2-20, register-space uninit reports (V2C-19/20): v2 reports the uninitialized TMEM read (columns 128-160) where data moves into registers, legacy at the later register use -- a documented reporting-point delta",
+ "delta": "numsim-behaviour-deltas H5 (W2-20, V2C-19/20): v2 reports the uninitialized TMEM read (columns 128-160) where data moves into registers, legacy at the later register use -- a documented reporting-point delta",
  "mode": "racecheck",
  "phases": [
   {

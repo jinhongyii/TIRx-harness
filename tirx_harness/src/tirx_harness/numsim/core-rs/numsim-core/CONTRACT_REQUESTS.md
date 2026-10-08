@@ -2969,3 +2969,35 @@ Request: export a v2 `ExecutionSubset` (`cluster_ids`, `cta_ids`), and the `Exec
   - Engine knob validation is W8's (`v2.Engine` constructor), as W9 filed it.
 - **`test_canonical_mapa_integer_address_resolves_shared_memory`.** Lowering (W1, fixed): a shared-scope view over a mapa result was loaded as Generic, and 0 is now a null dereference. The engine was unchanged.
 - **Results.** `cargo test --workspace` passes 1039 / 1039; codegen equivalence passes 4 / 4.
+
+## W8 (2026-10-08): answers to W11-pin-message, W11-api, W5-17 and the racecheck-suite renderer items
+
+- W11-pin-message 2 and 3 are done in numsim-py `exec_error_json`.
+  - A protocol stop has a prose message plus `protocol`, `error` and the variant fields. The Debug form is in `detail`.
+  - Handler context, such as `pending_count: NotNoComplete` or named-barrier lane masks, is kept after `; ` and in `context`.
+  - `tcgen` `live_allocations_at_exit` reads "kernel exited with live TMEM allocations (CTA C)".
+  - A bad address has `address`, `aperture` and the shared CTA rank and offset.
+- W11-pin-message 1 and 5 use W2's attrs, which are rendered.
+  - `v2.report.stop_facts` gives "warp W, lane(s) L, <op>, operands A, B" and "loop budget N at iteration I" / "round budget N".
+  - These facts go in the `ExecutionError` text and in a report `Stop:` line.
+  - W2's string `operation` attr is kept as `operation_name`. `operation` stays the legacy-shaped source-op record.
+  - The ports that pinned variant names in `message` now assert the structured fields.
+- W11-api is done.
+  - `tirx_harness.numsim.v2.api` exports `ExecutionSubset(cluster_ids, cta_ids)` and `ExecutionSubsetSelection`.
+  - `cta_ids` must cover whole clusters and need a static grid. Combined with `cluster_ids`, the run uses their intersection.
+  - Per-phase mappings must be equal, because one engine run serves every launch.
+  - On a subset run, `analysis_scope` is `{"kind": "subset", selected_warp_count, total_warp_count}`.
+  - docs/api/inputs.md is updated.
+- W5-17 is done: binding an array to a scalar parameter raises `InputError` with "scalar argument '<name>' has a buffer value (...)".
+- The report wording is decided. The stable fragments are listed in docs/development/architecture.md, section "Rendered report text". It adds the racecheck scope line and `Prior:` / `Current:` lines for both sides of a race.
+
+## W12-tile-forms 1 (2026-10-08, for the engine owner): `AddrOf` scales its offset by the whole vector dtype
+
+- **Contract.** `Instr::Load`/`Store` count `offset` in `buffers[buf].dtype.elem`, as `BufferDecl::byte_offset` does. `AddrOf` is documented as "address of `buf[offset]`". The lowering emits the same element offset for all three: the scalar-element offset, which for a vector buffer is already multiplied by the lane count (V2C-11).
+- **Bug.** `interp::handlers::mem::addr_of` computes `byte = offset * dtype.bits() / 8` using the whole `Ty`, not `dtype.elem`. On a vector-dtype buffer the lane count is therefore applied twice.
+  - Example: `T.cuda.ldg(source.ptr_to([31 - lane]), "float32x2")` over `float32x2[32]`. The lowering emits `AddrOf{offset = (31 - lane) * 2}`, and the engine turns that into byte `(31 - lane) * 16`, which is past the 256-byte buffer: `bad_address`.
+- **Ask.** Use `BufferDecl::byte_offset(offset)` in `addr_of` (and in the codegen printer), the same as Load/Store.
+- **Tests waiting on it.** 9 v2 xfails stay xfail until then:
+  - `test_p6c_cuda_ldg_overloads.py::test_cuda_ldg_packed_vectors_preserve_physical_bits[8 dtypes]`;
+  - `test_p6c_cuda_packed_vector_forms.py::test_cuda_ldg_supports_float32x2_as_one_packed_64bit_load`.
+- **No lowering change is needed.** I did not paper over this in Python: dividing the offset by the lane count there would break once the handler is fixed.

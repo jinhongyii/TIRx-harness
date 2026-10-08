@@ -55,8 +55,13 @@ def test_no_complete_rejects_exhausted_arrivals(count):
         assert any(
             f.status == "error"
             and f.kind == expected_kind[name]
-            and "NoCompleteWouldComplete" in f.message
+            # racecheck: the engine stop's structured ``error`` field;
+            # synccheck: the explorer finding names the transition error.
+            and (f.details.get("error") == "no_complete_would_complete" or "NoCompleteWouldComplete" in f.message)
             for f in report.findings
         ), report.format()
-    with pytest.raises(v2.ExecutionError, match="NoCompleteWouldComplete"):
+    with pytest.raises(v2.ExecutionError) as excinfo:
         v2.Engine().run(v2.transpile(no_complete), inputs)
+    assert any(d.get("error") == "no_complete_would_complete" for d in excinfo.value.diagnostics), (
+        excinfo.value.diagnostics
+    )

@@ -280,7 +280,33 @@ def attach_operations(records: Iterable[dict[str, Any]], kernel: int,
             site = next((x for x in sites if isinstance(x, int) and not isinstance(x, bool)), None)
         if site is None:
             continue
+        if isinstance(record.get("operation"), str):
+            # Engine stop attr (W2: the faulting op, e.g. "tirx.ptx.div.s32");
+            # `operation` itself is the legacy-shaped source-op record.
+            record.setdefault("operation_name", record["operation"])
         record["operation"] = operation_of(site_info_of(k, site), kernel=k, site=site, span=span_of_kernel(k, site))
+
+
+def attach_access_sources(records: Iterable[dict[str, Any]], kernel: int,
+                          site_info_of: Callable[[int, int], Any]) -> None:
+    """Name the source op of each side of a race (``prior`` / ``current``
+    accesses): ``operation.source_op_id`` and ``operation.source`` (kind and
+    text), so the report can print both conflicting operations."""
+
+    for record in records:
+        for side in ("prior", "current"):
+            access = record.get(side) if isinstance(record, dict) else None
+            operation = access.get("operation") if isinstance(access, dict) else None
+            if not isinstance(operation, dict) or "source" in operation:
+                continue
+            site = operation.get("site")
+            if not isinstance(site, int) or isinstance(site, bool):
+                continue
+            k = operation.get("kernel_index", kernel)
+            k = k if isinstance(k, int) and not isinstance(k, bool) else kernel
+            built = operation_of(site_info_of(k, site), kernel=k, site=site, span=operation.get("source_span"))
+            operation["source_op_id"] = built["source_op_id"]
+            operation["source"] = built["source"]
 
 
 def checker_phase_payload(
@@ -350,6 +376,7 @@ def checker_phase_payload(
     if site_info_of is not None:
         for key in ("findings", "advisories", "incomplete"):
             attach_operations(payload[key], phase_index, site_info_of, span_of_kernel)
+        attach_access_sources(payload["findings"], phase_index, site_info_of)
         if isinstance(payload["execution_error"], dict):
             attach_operations([payload["execution_error"]], phase_index, site_info_of, span_of_kernel)
     payload.update(
@@ -537,9 +564,88 @@ def _location(record: Mapping[str, Any]) -> str:
     return ", ".join(dict.fromkeys(parts))
 
 
+def stop_facts(stop: Mapping[str, Any]) -> str:
+    """The structured facts of an engine stop in words (W11-pin-message 1/5):
+    warp, faulting lanes, faulting op and operands, and for budget stops the
+    budget and iteration (or the round budget)."""
+
+    def is_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    parts = []
+    if is_int(stop.get("warp")):
+        parts.append(f"warp {stop['warp']}")
+    lanes = stop.get("faulting_lanes")
+    if isinstance(lanes, list) and lanes:
+        parts.append(f"lane{'s' if len(lanes) > 1 else ''} {', '.join(str(x) for x in lanes)}")
+    elif is_int(stop.get("lanes")):
+        parts.append(f"lanes {stop['lanes']:#010x}")
+    name = stop.get("operation_name", stop.get("operation"))
+    if isinstance(name, str) and name:
+        parts.append(name)
+    operands = stop.get("operands")
+    if isinstance(operands, list) and operands:
+        parts.append(f"operands {', '.join(str(x) for x in operands)}")
+    if is_int(stop.get("budget")):
+        parts.append(f"loop budget {stop['budget']}" + (f" at iteration {stop['iteration']}" if is_int(stop.get("iteration")) else ""))
+    if is_int(stop.get("max_rounds")):
+        parts.append(f"round budget {stop['max_rounds']}")
+    return ", ".join(parts)
+
+
+def _render_access(label: str, access: Mapping[str, Any]) -> str | None:
+    """``Prior: warp 0, source op 1 (tirx.BufferStore) `shared[0] = warp + 1`
+    at f.py:27; lane 0 write shared allocation#1 bytes [0, 4)`` (v2 wording)."""
+
+    operation = access.get("operation")
+    if not isinstance(operation, Mapping):
+        return None
+    head = f"    {label}: warp {operation.get('global_warp_id', '?')}"
+    source = operation.get("source") or {}
+    op_id = operation.get("source_op_id", operation.get("site"))
+    if op_id is not None:
+        head += f", source op {op_id}"
+        if source.get("kind"):
+            head += f" ({source['kind']})"
+    if source.get("source_text"):
+        head += f" `{source['source_text']}`"
+    where = _location({"source_span": operation.get("source_span")})
+    if where:
+        head += f" at {where}"
+    what = [f"lane {access['lane']}"] if isinstance(access.get("lane"), int) else []
+    what.append(str(access.get("access_kind") or "access"))
+    if access.get("proxy") and access.get("proxy") != "generic":
+        what.append(f"({access['proxy']} proxy)")
+    span = access.get("span") or {}
+    if access.get("space"):
+        what.append(str(access["space"]))
+    if "allocation_id" in span:
+        what.append(f"allocation#{span['allocation_id']}")
+    if "byte_offset" in span and "byte_end" in span:
+        what.append(f"bytes [{span['byte_offset']}, {span['byte_end']})")
+    return f"{head}; {' '.join(what)}"
+
+
+def _scope_line(report: _Report) -> str | None:
+    """Racecheck scope: the memory spaces whose conflicts were checked."""
+
+    payloads = getattr(report, "payloads", None)
+    if report.checker_name != "racecheck" or payloads is None:
+        return None
+    spaces: list[str] = []
+    for payload in payloads():
+        for space in payload.get("checked_memory_spaces") or ():
+            if space not in spaces:
+                spaces.append(str(space))
+    return f"  race conflicts checked in {', '.join(spaces)}" if spaces else None
+
+
 def render(report: _Report) -> str:
     findings = report.findings
     lines = [f"{report.checker_name} {report.verdict.upper()} - {len(findings)} finding(s)"]
+    scope = _scope_line(report)
+    if scope:
+        lines.append(scope)
     for finding in findings:
         where = _location(finding.details)
         lines.append(f"  [{finding.status.upper()}] {finding.kind}: {finding.message}".rstrip())
@@ -551,6 +657,15 @@ def render(report: _Report) -> str:
                 lines.append(f"    {label}: {value}")
         if where:
             lines.append(f"    at {where}")
+        if finding.details.get("source") == "run_status":
+            facts = stop_facts(finding.details)
+            if facts:
+                lines.append(f"    Stop: {facts}")
+        for side, label in (("prior", "Prior"), ("current", "Current")):
+            access = finding.details.get(side)
+            line = _render_access(label, access) if isinstance(access, Mapping) else None
+            if line:
+                lines.append(line)
         for overlap in finding.details.get("overlaps") or ():
             lines.append(f"    bytes [{overlap['byte_offset']}, {overlap['byte_end']})")
         hint = finding.details.get("hint")

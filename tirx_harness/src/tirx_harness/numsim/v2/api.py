@@ -22,7 +22,15 @@ from .report import (
     compare,
     payload_json_schema,
 )
-from .run import Engine, ExecutionError, InputError, MissingBindingsError, canonicalize_inputs
+from .run import (
+    Engine,
+    ExecutionError,
+    ExecutionSubset,
+    ExecutionSubsetSelection,
+    InputError,
+    MissingBindingsError,
+    canonicalize_inputs,
+)
 
 
 def _nonnegative(owner: Any) -> None:
@@ -147,6 +155,8 @@ __all__ = [
     "CoverageBounds",
     "Engine",
     "ExecutionError",
+    "ExecutionSubset",
+    "ExecutionSubsetSelection",
     "Finding",
     "InputError",
     "MissingBindingsError",
