@@ -18,7 +18,7 @@ import tvm
 from tvm.ir.type import PointerType
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 from tirx_harness.numsim.errors import UnsupportedTIRxError
 
@@ -158,12 +158,6 @@ def test_cuda_ldg_public_dtype_contract_rejects_exactly():
         v2.transpile(_cuda_ldg_kernel("float32x2", source_dtype="float32"))
 
 
-@v2_gap(
-    "every packed ldg stops with ExecutionError bad_address (e.g. int8x2: "
-    "'Global address 0x10000000007c is not mapped', float32x4: 0x...7c0): the "
-    "engine's AddrOf scales the scalar-element offset by the whole vector dtype "
-    "(lane count applied twice; CONTRACT_REQUESTS W12-tile-forms 1)"
-)
 @pytest.mark.parametrize(
     "dtype",
     [
