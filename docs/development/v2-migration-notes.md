@@ -17,6 +17,13 @@ Each bullet names the behaviour-delta row that rules it:
 
 Each bullet reads: change: before → now. Why.
 
+**One executor.** v2 had an optional `codegen` backend (`NUMSIM_V2_BACKEND`,
+`Engine(backend=...)`) → it is deleted; the interpreter is the only executor,
+and every instruction's semantics live in one handler. Why: codegen was never
+faster (median 0.87–0.94x of interpreter core time, plus ~117 ms per call and
+long cold builds), while the interpreter is 2.3–3.0x faster than legacy
+([backend-comparison.md](backend-comparison.md) "Summary").
+
 ## 1. What changed
 
 ### Running NumSim
@@ -32,11 +39,14 @@ Each bullet reads: change: before → now. Why.
   - Register copies that TVM would lower with its single-thread fallback also run the legacy form.
   - Expect ≤ a few ulp differences where TVM's arithmetic differs, for example the pairwise f32x2 `sum` and rounding toward zero (`rz`) f32 `add` (N:R1, N:R9). Why: the dispatched code is what runs on the GPU.
 - **Partial-warp tile ops** (N:F3): `warp`/`warpgroup` tile ops still require all 32 lanes; only the message changed (`warp_collective_divergence`). Why: PTX `.sync` membermask rule.
-- **Numerics** (N:D8–D11):
+- **Shared-memory window** (N:F5): a window beyond the 18-bit (`sm_100`/`sm_103`) or 19-bit (`sm_107a`) tcgen05 descriptor range was rejected at transpile, even without a descriptor over it → only a descriptor that addresses past its range stops the run (`invalid_operand`), and on `sm_100*`/`sm_103*` a CTA needing more than 232448 bytes of shared memory is rejected at transpile ("above the 232448-byte per-CTA capacity"). A `decl_buffer` view past its pool no longer grows the window. Why: the bit limit belongs to the descriptor's address field, and a CTA above capacity cannot launch.
+- **Numerics** (N:D8–D13):
   - NaN payloads of host-computed `fma` and `+ - * /` are pinned (D8);
   - `log1p`/`sigmoid` accept f16, bf16 and f64 (D9);
   - `erf`, `exp10`, `log10` and `nearbyint` are new (D10);
-  - integer-vector `&`, `|`, `^`, `<<` and `>>` run lane-wise, while vector `~` is rejected (D11).
+  - integer-vector `&`, `|`, `^`, `<<` and `>>` run lane-wise, while vector `~` is rejected (D11);
+  - f64 `min`/`max` of two NaNs returned the second operand → returns the canonical NaN `0x7fffffffffffffff`, as f32 does (D12);
+  - f32/f64 `atom.add`/`red.add` with both the old value and the operand NaN propagated the operand's NaN → propagates the old value's NaN (PTX order `old + b`, D8 rule) (D13).
   - Why: these follow TVM's CUDA codegen, or they need a pinned reference until there is a GPU golden.
 
 ### Reading racecheck findings
@@ -48,17 +58,26 @@ Each bullet reads: change: before → now. Why.
 - **`elect.sync` is not a memory fence** (R:T19): lanes that only meet the elected lane at `elect.sync` are not ordered with it. Expect true-positive `data_race` findings there.
 - **Cross-CTA async-proxy writes** ordered only by base causality (R:X4): were clean → now a `CrossCtaAsyncOrder` review. Why: the ISA is silent here.
 - **Thread-scope tile copies to shared memory** (R:T21): all lanes writing the same bytes in one instruction is no longer a race (R:V11). A warpgroup copy from an unlayouted local can now race, because TVM's code has every thread store the whole tile.
+- **Evidence `epoch` of async-op accesses** (R:T22): was the internal stamp epoch → is the milestone, 1 = read side, 2 = write side. Why: the old value moved with internal slot reuse, and reports must depend only on module, inputs, config and seed.
+- **`alias_stale_read` names** (R:P7, superseded by W5-15): the logical name came from the op's first pointer → each access is named by its own operand's buffer. A same-dtype view (including a strided alias or two `decl_buffer`s over one pool word) shares its root's name, so legacy's `review` there is now clean; only a dtype-changing view is a new name. Why: one name per operand, no borrowed names.
+- **Racecheck wall time**: more `max_workers` speed up only the engine; the checker consumes events on one thread, so a racecheck run is engine time plus serial checker time ([racecheck-semantics.md](racecheck-semantics.md) "Merge design and the serial-checker limit").
 
 ### Reading synccheck findings
 
 - **TMEM allocation** (S:T2, S:T8): an `.exclusive` `tcgen05.alloc` blocks until no other allocation is live. Any allocation while an exclusive one is live is an error (`tcgen_alloc_while_exclusive`). Why: §9.7.18.7.1.
 - **`pending_count` on a token not from `.noComplete`** (S:M14): still an error; the message is now `pending_count: NotNoComplete`.
 - **Divergent blocking waits and partial `__syncwarp`** (S:M15, S:B8): were errors → are now `incomplete` with reason `divergent_block`. Why: under independent thread scheduling the kernel can be valid, and the engine cannot prove otherwise.
+- **Partial-lane waits nothing can complete** (S:M17): a TMA that lands fewer bytes than its `expect_tx`, or a `wait_until` on a word nobody writes, reached by only some lanes → was a `deadlock` error → is `incomplete` (`divergent_block`) in all three tools; it is never reported clean. Why: the same structured-SIMT limit as M15/B8; the other lanes run only after the branch.
+- **TMEM access outside every live allocation** (S:T9): was a synccheck-only `synchronization_collective_publication` finding → is a `bad_address` error in every mode ("not in a live tcgen05 allocation"). Cross-warp dealloc itself stays legal. Why: §9.7.18.7.1, `taddr` must point into a live allocation.
+- **Restricted `tcgen05.commit`** (`.sync_restrict::shared::read::mma::a`, S:T10): was treated as a full commit → orders only operand-A shared reads, after earlier restricted commits and before later unrestricted ones. Why: §9.7.18.12.1.
+- **Multicast mask naming a rank outside the cluster** (S:M16): same error, now `bad_address` ("multicast CTA mask … names ranks outside the N-CTA cluster"), raised before any target is touched. Why: a mask bit with no CTA fails closed.
 
 ### Binding inputs
 
 - **Overlapping host arrays**: they are one device allocation, so writes through one name are seen through the other, and races between them are reported.
 - **Raw pointer words**: to pass a buffer's address as data, take it from `Engine().address_of(module, inputs, name)`. Do not use `ndarray.ctypes.data` (N:H1).
+- **One parameter under several names** (N:H7): `k1:output` and its alias `output` in one dict was rejected ("provided through multiple aliases") → the same object, or arrays with identical bytes, is one binding; different values raise `InputError` ("bound more than once with different values"). Why: the binding is unambiguous, and one dict can serve several modules.
+- **Integer scalar width and signedness** (N:H8): e.g. `np.uint32(7)` for an `int32` parameter was rejected ("requires dtype int32, got uint32") → any integer value that fits the parameter's dtype binds; an out-of-range value raises `InputError` ("outside <dtype> range"), and a float for an integer parameter raises "requires dtype …". Why: Python ints and `np.int64` arithmetic results must bind when the value is representable.
 - **Duplicate public names**: two parameters of one kernel with the same public name are rejected (`InputError: ambiguous host binding`).
 - **Packed sub-byte dtypes** (fp4/fp6/int4) must be bound as packed `uint8`.
 - **Wrong-shape scalars**: binding an array to a scalar parameter raises `InputError` ("scalar argument '<name>' has a buffer value").
@@ -67,8 +86,8 @@ Each bullet reads: change: before → now. Why.
 ### Selecting launches
 
 - **Phase-indexed subsets** (N:H6): `subset={phase: ExecutionSubset}` on a multi-kernel module must select the same clusters for every launch. Otherwise it raises `InputError` ("per-phase subsets must be equal"). A bare subset on a multi-kernel `Engine.run` is rejected ("not broadcast"). Why: one engine run serves every launch.
-- **`cta_ids`**: allowed, but must name whole clusters. Combined with `cluster_ids`, the run uses their intersection.
-- **Partial runs**: a subset run reports `subset_execution`, and its checker verdict is at least `incomplete` for the unexecuted part.
+- **`ExecutionSubset(cta_ids=...)`**: the same selector as legacy, now `tirx_harness.numsim.v2.ExecutionSubset`: flattened CTA ids that must form whole clusters of a static grid (`InputError` otherwise); with `cluster_ids` too, the run uses their intersection ([dev-loop.md](dev-loop.md) "v2 binder rules"). Why: the engine schedules whole clusters.
+- **Partial runs**: a subset run records the `incomplete` reason `subset_execution` (`analysis_scope` kind `subset`), so its verdict is never `clean` ([engine-review.md](engine-review.md) "Engine `incomplete` reasons"). Why: unexecuted clusters are unchecked.
 
 ## 2. Environment and engine switches
 
@@ -113,6 +132,7 @@ fragment below:
 | `StructuralEqual check failed … TileLayout` (gemm_async) | Accumulator layout contradicts the MMA output layout (N:L8). | Declare the instruction's TMEM layout. |
 | `tmem_replicated_view: <buffer>` | Direct load or store on a replicated TMEM view (N:L1). | Access TMEM through `tcgen05.ld`/`st` or a non-replicated view. |
 | `builtin tirx.ptx_legacy.<op>` | Deprecated spelling (N:L2). | Use the `T.ptx.*` table form (`mma.sync`, `ldmatrix`). |
+| `non-writable physical pointer` / `cannot add write access` / `outside tvm_access_ptr range` | A load or store breaks its `tvm_access_ptr` mask or extent (N:L9). Legacy raised the same fragments at run time; v2 rejects at transpile, anchored at the access. | Fix the access mask or extent; the GPU would not check it, so the IR is malformed. |
 | `kind::f8f6f4 cta_group::2 requires tirx.cuda_arch in [...]` | The descriptor semantics differ by architecture. | Set `tirx.cuda_arch` (for example `sm_100a`). |
 | `cuda.ldg has no __ldg overload for '<dtype>'` / `pointer to … does not match the loaded dtype` | The CUDA `__ldg` overload set. | Load a supported dtype through a pointer of that dtype. |
 | `bitwise_not on vector operand` | CUDA vector types have no `~` (N:D11). | Apply `~` per lane. |
@@ -124,3 +144,7 @@ fragment below:
 
 A rejection is never a statement that your kernel is wrong. It means v2 will
 not simulate a form it cannot model exactly.
+
+## 5. For contributors: building the extension
+
+- **Private builds only** ([dev-loop.md](dev-loop.md), `core-rs/numsim-py/build_dev.sh`): rebuilding the shared `v2/numsim_core_py.abi3.so` while other runs have it loaded crashed them (`Bus error`) → build into a private target and package, `CARGO_TARGET_DIR=<dir>/target bash core-rs/numsim-py/build_dev.sh --out <dir>/ext`, and run pytest with `-o "pythonpath=<dir>/ext/pkg ."`. Why: concurrent builds must share neither the cargo target dir nor the installed `.so`.
