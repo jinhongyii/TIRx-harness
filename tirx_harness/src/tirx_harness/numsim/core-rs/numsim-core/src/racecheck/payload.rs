@@ -107,6 +107,8 @@ fn incomplete_reason(i: &Incomplete) -> (String, Value) {
         Incomplete::EventOutsideLaunch { events } => ("event_outside_launch", json!({"events": events})),
         Incomplete::FindingsTruncated { dropped } => ("findings_truncated", json!({"dropped": dropped})),
         Incomplete::AsyncLaneUnknown { op } => ("async_lane_unknown", json!({"async_op": op.0})),
+        Incomplete::CompletionWarpOutOfRange { warp } => ("shadow_rejected", json!({"cause": "completion_warp_out_of_range", "warp_id": warp})),
+        Incomplete::KernelMismatch { expected, got } => ("kernel_mismatch", json!({"expected": expected, "got": got})),
     };
     (reason.to_string(), extra)
 }
@@ -202,7 +204,7 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
             };
             (kind, if review { Status::Review } else { Status::Error }, msg)
         }
-        RK::ScopeMismatch { release_scope, acquire_scope, release_warp, acquire_warp } => {
+        RK::ScopeMismatch { release_scope, acquire_scope, release_warp, acquire_warp, release_site, acquire_site } => {
             race.insert("legacy_kind".into(), json!("scope_mismatch"));
             race.insert("ordering_domain".into(), json!("memory"));
             race.insert("ordering_failure".into(), json!("scope_mismatch"));
@@ -210,6 +212,21 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
             race.insert("acquire_scope".into(), json!(scope_name(*acquire_scope)));
             race.insert("release_warp_id".into(), json!(release_warp));
             race.insert("acquire_warp_id".into(), json!(acquire_warp));
+            race.insert("release_site".into(), json!(release_site.0));
+            race.insert("acquire_site".into(), json!(acquire_site.0));
+            for (role, site, w) in [("release", *release_site, *release_warp), ("acquire", *acquire_site, *acquire_warp)] {
+                ev.push(Evidence {
+                    role: role.into(),
+                    kernel,
+                    site,
+                    actor: None,
+                    buffer: None,
+                    space: None,
+                    alloc: None,
+                    bytes: None,
+                    detail: Some(format!("{role} by warp {w}")),
+                });
+            }
             let msg = format!(
                 "release .{} (warp {release_warp}) and acquire .{} (warp {acquire_warp}) do not mutually cover each other's thread",
                 scope_name(*release_scope),
@@ -273,15 +290,17 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
             detail: None,
         });
     }
+    sites.extend(ev.iter().filter(|e| e.role == "release" || e.role == "acquire").map(|e| e.site));
     sites.sort();
     sites.dedup();
     let attrs: BTreeMap<String, Value> = race.into_iter().collect();
     Finding { kind, status, message, attrs, sites, evidence: ev }
 }
 
-fn convert_incomplete(i: &Incomplete, kernel: u32) -> Finding {
+fn convert_incomplete(i: &Incomplete, count: u64, kernel: u32) -> Finding {
     let (reason, extra) = incomplete_reason(i);
     let mut d = Map::new();
+    d.insert("occurrences".into(), json!(count));
     d.insert("legacy_kind".into(), json!("analysis_incomplete"));
     d.insert("reason".into(), json!(reason));
     if let Value::Object(m) = extra {
@@ -305,7 +324,9 @@ pub fn reports(obs: &RaceObserver) -> Vec<Report> {
         .iter()
         .map(|lr| {
             let mut findings: Vec<Finding> = lr.report.findings.iter().map(|f| convert(f, lr)).collect();
-            findings.extend(lr.report.incomplete.iter().map(|i| convert_incomplete(i, lr.kernel)));
+            findings.extend(
+                lr.report.incomplete.iter().zip(lr.report.incomplete_counts.iter()).map(|(i, n)| convert_incomplete(i, *n, lr.kernel)),
+            );
             let mut r = Report::new("racecheck", findings);
             r.launch = lr.launch;
             r.coverage = vec![

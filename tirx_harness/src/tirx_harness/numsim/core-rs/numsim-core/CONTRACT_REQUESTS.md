@@ -731,3 +731,15 @@ wrappers where noted, so existing call sites keep compiling; please migrate.
 - `TcgenMmaArgs::{ti16, lut_b}` (contract) are honoured by `tc_mma_ctas`;
   `lut_b` still needs the table taddr in `TcMmaOptions::lut_b` (fails closed
   without it) because the args carry only the flag.
+
+## W5-6: declared-word history numbering is stated two ways
+
+There are two conflicting statements:
+- `README.md` decision 14: bit i = the i-th **(Access, lane)** write, lanes
+  ascending.
+- `observe.rs:25-28`: index i = the i-th delivered write **Access**.
+
+Racecheck follows decision 14: one entry per (Access, lane), for every
+overlapping declared word, lanes ascending (`checker-review.md` S4). Please
+reconcile the `observe.rs` comment, and make the engine's history match,
+before W2 emits `WaitVerdicts`.

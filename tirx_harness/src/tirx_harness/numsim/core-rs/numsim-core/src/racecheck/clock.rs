@@ -65,17 +65,13 @@ pub struct Chunk {
     e: [Epoch; CHUNK],
 }
 
-thread_local! {
-    static NEXT_CHUNK_ID: Cell<u64> = const { Cell::new(1) };
-}
+/// Process-global chunk identities: a checker may migrate between threads
+/// (pyo3 `Send`), so ids must never repeat across threads (review R6).
+static NEXT_CHUNK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Chunk {
     fn new(e: [Epoch; CHUNK]) -> Arc<Self> {
-        let id = NEXT_CHUNK_ID.with(|c| {
-            let id = c.get();
-            c.set(id + 1);
-            id
-        });
+        let id = NEXT_CHUNK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Arc::new(Chunk { id, e })
     }
     #[inline]
@@ -245,6 +241,57 @@ impl Epochs {
         }
     }
 
+    /// Chunk-wise rebuild: `f(actor, epoch)` per slot, one allocation per
+    /// touched chunk (O(chunks · CHUNK), never per-component `raise`).
+    pub fn map_chunks(&self, mut f: impl FnMut(ActorId, Epoch) -> Epoch) -> Epochs {
+        let Some(cur) = &self.chunks else { return Epochs::default() };
+        let v: Vec<Option<Arc<Chunk>>> = cur
+            .iter()
+            .enumerate()
+            .map(|(ci, c)| {
+                let c = c.as_ref()?;
+                let mut e = c.e;
+                let mut any = false;
+                for (s, x) in e.iter_mut().enumerate() {
+                    if *x != 0 {
+                        *x = f((ci * CHUNK + s) as ActorId, *x);
+                        any |= *x != 0;
+                    }
+                }
+                if e == c.e {
+                    Some(c.clone())
+                } else if any {
+                    Some(Chunk::new(e))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Epochs { chunks: Some(v.into()) }
+    }
+
+    /// Component-wise minimum, chunk by chunk.
+    pub fn meet(&self, other: &Epochs) -> Epochs {
+        let (Some(a), Some(b)) = (&self.chunks, &other.chunks) else { return Epochs::default() };
+        let v: Vec<Option<Arc<Chunk>>> = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| match (x, y) {
+                (Some(x), Some(y)) if Arc::ptr_eq(x, y) || y.dominates(x) => Some(x.clone()),
+                (Some(x), Some(y)) if x.dominates(y) => Some(y.clone()),
+                (Some(x), Some(y)) => {
+                    let mut e = x.e;
+                    for (s, o) in e.iter_mut().zip(y.e.iter()) {
+                        *s = (*s).min(*o);
+                    }
+                    Some(Chunk::new(e))
+                }
+                _ => None,
+            })
+            .collect();
+        Epochs { chunks: Some(v.into()) }
+    }
+
     /// `self ⊑ other` (every component covered).
     pub fn leq(&self, other: &Self, memo: &JoinMemo) -> bool {
         if self.ptr_eq(other) {
@@ -253,8 +300,11 @@ impl Epochs {
         let Some(cur) = &self.chunks else { return true };
         cur.iter().enumerate().all(|(ci, own)| {
             let Some(own) = own else { return true };
+            // Pointer equality, then a direct dominance test: a comparison
+            // never allocates or touches the memo.
+            let _ = memo;
             match other.chunks.as_ref().and_then(|o| o.get(ci)).and_then(|c| c.as_ref()) {
-                Some(theirs) => matches!(memo.join(theirs, own), ChunkJoin::Current),
+                Some(theirs) => Arc::ptr_eq(theirs, own) || theirs.dominates(own),
                 None => own.e.iter().all(|e| *e == 0),
             }
         })
@@ -371,17 +421,25 @@ impl Clock {
             let same = matches!(&self.lanes, Some(sl) if Arc::ptr_eq(sl, ol));
             if !same {
                 for (a, v) in ol.iter() {
-                    let before = self.lanes.clone();
-                    self.raise_lanes(*a, v);
-                    changed |= !lanes_ptr_eq(&before, &self.lanes);
+                    // Compare before raising instead of snapshotting the
+                    // entry list (a clone would force `make_mut` to copy).
+                    let lane_known = |lane: usize, e: Epoch| e == 0 || self.observes(Stamp::new(*a, e), lane as u8);
+                    if !v.iter().enumerate().all(|(lane, e)| lane_known(lane, *e)) {
+                        self.raise_lanes(*a, v);
+                        changed = true;
+                    }
                 }
             }
         }
         if changed {
             // Scalar growth can dominate lane entries.
-            if let Some(l) = self.lanes.clone() {
-                for (a, _) in l.iter() {
-                    self.normalize_actor(*a);
+            let epochs = &self.epochs;
+            if let Some(l) = &mut self.lanes {
+                if l.iter().any(|(a, v)| v.iter().all(|e| *e <= epochs.get(*a))) {
+                    Arc::make_mut(l).retain(|(a, v)| !v.iter().all(|e| *e <= epochs.get(*a)));
+                }
+                if l.is_empty() {
+                    self.lanes = None;
                 }
             }
         }
@@ -390,12 +448,7 @@ impl Clock {
 
     /// The components whose actor satisfies `keep` (lane entries included).
     pub fn filter(&self, mut keep: impl FnMut(ActorId) -> bool) -> Clock {
-        let mut out = Clock::default();
-        for (a, e) in self.epochs.nonzero() {
-            if keep(a) {
-                out.epochs.raise(a, e);
-            }
-        }
+        let mut out = Clock { epochs: self.epochs.map_chunks(|base, e| if keep(base) { e } else { 0 }), lanes: None };
         if let Some(l) = &self.lanes {
             for (a, v) in l.iter() {
                 if keep(*a) {
@@ -409,18 +462,10 @@ impl Clock {
     /// Component-wise minimum (lane entries dropped: a lower bound). Used by
     /// the dominated-frontier GC; O(nonzero components).
     pub fn meet(&self, other: &Clock) -> Clock {
-        let mut out = Clock::default();
         if self.epochs.ptr_eq(&other.epochs) {
-            out.epochs = self.epochs.clone();
-            return out;
+            return Clock { epochs: self.epochs.clone(), lanes: None };
         }
-        for (a, e) in self.epochs.nonzero() {
-            let m = e.min(other.get(a));
-            if m > 0 {
-                out.epochs.raise(a, m);
-            }
-        }
-        out
+        Clock { epochs: self.epochs.meet(&other.epochs), lanes: None }
     }
 
     pub fn leq(&self, other: &Clock, memo: &JoinMemo) -> bool {
@@ -436,10 +481,3 @@ impl Clock {
     }
 }
 
-fn lanes_ptr_eq(a: &Option<Arc<LaneEntries>>, b: &Option<Arc<LaneEntries>>) -> bool {
-    match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-        (None, None) => true,
-        _ => false,
-    }
-}

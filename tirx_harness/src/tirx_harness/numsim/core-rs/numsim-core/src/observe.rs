@@ -22,10 +22,12 @@
 //!   Blocked attempts are *not* delivered (`seq` counts committed commands
 //!   only); a warp still blocked at launch end gets one final event with
 //!   `ProtocolStatus::BlockedAtExit`.
-//! * Declared-word history: index 0 = value before the launch (or at
-//!   declaration), index i >= 1 = the i-th delivered write `Access` with
-//!   `declared_word` overlapping the word. Engine and checker number the
-//!   same stream.
+//! * Declared-word history (README decision 14): index 0 = value before the
+//!   launch (or at declaration); index i >= 1 = the i-th delivered
+//!   (write `Access`, lane) pair with `declared_word` overlapping the word,
+//!   in delivery order with lanes ascending inside one `Access`; the value
+//!   is the byte-merged post-image of that lane's write. Engine and checker
+//!   number the same stream, per word.
 //!
 //! Observers must never change program-visible behaviour. Handlers check
 //! [`Observer::enabled`] before building anything ([`NoopObserver`] for NumSim).

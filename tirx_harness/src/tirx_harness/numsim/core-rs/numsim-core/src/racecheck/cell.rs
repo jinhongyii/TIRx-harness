@@ -43,6 +43,8 @@ const WIDE_BIT: u64 = 1 << 16;
 const LEN_SHIFT: u32 = 17;
 const LEN_MAX: u64 = (1 << 15) - 1;
 const START_SHIFT: u32 = 32;
+/// Proxy and domain fields.
+const VIEW_CLASS_MASK: u64 = (7 << PROXY_SHIFT) | (3 << DOMAIN_SHIFT);
 /// Mask of the span fields (wide, len, start).
 const SPAN_MASK: u64 = !((1u64 << 16) - 1);
 
@@ -66,9 +68,25 @@ fn proxy_of(c: u64) -> Proxy {
     }
 }
 
-/// Spans that do not fit the compact encoding.
+/// Spans that do not fit the compact encoding, deduplicated: the table is
+/// bounded by the number of distinct wide spans (review R3).
 #[derive(Clone, Debug, Default)]
-pub struct WideSpans(pub Vec<(u64, u64)>);
+pub struct WideSpans {
+    pub spans: Vec<(u64, u64)>,
+    index: std::collections::HashMap<(u64, u64), u64>,
+}
+
+impl WideSpans {
+    fn intern(&mut self, span: (u64, u64)) -> u64 {
+        if let Some(&i) = self.index.get(&span) {
+            return i;
+        }
+        let i = self.spans.len() as u64;
+        self.spans.push(span);
+        self.index.insert(span, i);
+        i
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 impl Witness {
@@ -110,8 +128,7 @@ impl Witness {
         if span.0 < (1 << 32) && len <= LEN_MAX {
             bits |= (len << LEN_SHIFT) | (span.0 << START_SHIFT);
         } else {
-            let i = wide.0.len() as u64;
-            wide.0.push(span);
+            let i = wide.intern(span);
             bits |= WIDE_BIT | (i << START_SHIFT);
         }
         Witness { stamp, bits }
@@ -163,7 +180,7 @@ impl Witness {
     pub fn span(&self, wide: &WideSpans) -> (u64, u64) {
         let start = self.bits >> START_SHIFT;
         if self.bits & WIDE_BIT != 0 {
-            wide.0[start as usize]
+            wide.spans[start as usize]
         } else {
             (start, start + ((self.bits >> LEN_SHIFT) & LEN_MAX))
         }
@@ -182,9 +199,17 @@ impl Witness {
         self.stamp == o.stamp && self.lane() == o.lane()
     }
 
+    /// Same proxy and same address window: the views a future access uses
+    /// to judge the two are the same (bridges are keyed by the prior's
+    /// window), so transitivity through `self` covers `prior`.
+    #[inline(always)]
+    pub fn same_view_class(&self, o: &Witness) -> bool {
+        (self.bits ^ o.bits) & VIEW_CLASS_MASK == 0
+    }
+
     /// `self` (newer) may stand in for `prior` in a frontier.
     pub fn subsumes_contract(&self, prior: &Witness, wide: &WideSpans) -> bool {
-        if self.kind() != prior.kind() {
+        if self.kind() != prior.kind() || !self.same_view_class(prior) {
             return false;
         }
         match self.scope() {
@@ -351,6 +376,6 @@ mod tests {
         assert_eq!(w.span(&wide), (4096, 4160));
         let big = Witness::pack(Stamp::new(1, 1), 0, Proxy::Generic, None, AccessKind::Read, None, false, (1 << 33, (1 << 33) + (1 << 20)), &mut wide);
         assert_eq!(big.span(&wide), (1 << 33, (1 << 33) + (1 << 20)));
-        assert_eq!(wide.0.len(), 1);
+        assert_eq!(wide.spans.len(), 1);
     }
 }

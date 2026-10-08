@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use crate::arena::{AllocId, ByteSpan, Space};
 use crate::observe::{
     Access as CAccess, Actor, CtaId, FenceEvent, LaunchInfo, Observer, PublishTarget, SyncEvent as CSync, SyncKind,
-    WarpEnd, WarpId as CWarpId,
+    WarpEnd, WarpId as CWarpId, ALL_LANES,
 };
 use crate::program::{Proxy, Scope, Sem};
 use crate::sync::completion::AsyncId;
@@ -107,7 +107,8 @@ impl RaceObserver {
     pub fn finish_launch(&mut self) {
         let Some(mut c) = self.checker.take() else { return };
         c.gc();
-        let stats = c.stats;
+        let mut stats = c.stats;
+        stats.wide_spans = c.wide_span_count();
         let mut report = c.finish();
         if self.outside_launch > 0 {
             report.incomplete.push(Incomplete::EventOutsideLaunch { events: self.outside_launch });
@@ -149,6 +150,18 @@ fn core_epoch(c: &mut Checker, warp: u32, epoch: u64) -> Option<u32> {
             c.note_incomplete(Incomplete::EpochOverflow { warp });
             None
         }
+    }
+}
+
+/// A warp actor's span lane. `ALL_LANES` marks a warp-collective access
+/// (ldmatrix/stmatrix, 32x32b tcgen05.ld/st, tile ops), performed by the
+/// warp as one rendezvous: it is attributed to lane 0 (the engine emits the
+/// surrounding `WarpSync`s that order the other lanes).
+fn warp_lane(lane: u8) -> u8 {
+    if lane == ALL_LANES {
+        0
+    } else {
+        lane & 31
     }
 }
 
@@ -205,6 +218,7 @@ impl Observer for RaceObserver {
         // The readonly proxy (ld.global.nc) is modelled as generic.
         let proxy = if a.proxy == Proxy::ReadOnly { Proxy::Generic } else { a.proxy };
         let base = |who| ri::Access {
+            seq: a.seq.0,
             who,
             alloc: a.alloc,
             range: 0..0,
@@ -223,12 +237,12 @@ impl Observer for RaceObserver {
                 if sc {
                     let mut lanes = LaneMask::NONE;
                     for s in a.spans {
-                        lanes = lanes.or(LaneMask::lane(s.lane as usize & 31));
+                        lanes = lanes.or(LaneMask::lane(warp_lane(s.lane) as usize));
                     }
-                    c.sync(ri::SyncEvent::Fence { warp: warp.0, lanes, kind: ri::FenceKind::Sc(scope.unwrap()), epoch });
+                    c.sync(ri::SyncEvent::Fence { warp: warp.0, lanes, kind: ri::FenceKind::Sc(scope.unwrap()), site: a.site, epoch });
                 }
                 for s in a.spans {
-                    let mut x = base(ri::Who::Lane { warp: warp.0, lane: s.lane & 31, epoch });
+                    let mut x = base(ri::Who::Lane { warp: warp.0, lane: warp_lane(s.lane), epoch });
                     x.range = span_range(s.span);
                     c.access(&x);
                 }
@@ -267,6 +281,12 @@ impl Observer for RaceObserver {
             self.outside_launch += 1;
             return;
         };
+        if e.kernel != self.kernel && !matches!(e.actor, Actor::Host) {
+            // Per-launch reports: an event of another kernel cannot be
+            // judged with this launch's topology and clocks.
+            c.note_incomplete(Incomplete::KernelMismatch { expected: self.kernel, got: e.kernel });
+            return;
+        }
         let wa = match e.actor {
             Actor::Warp { warp, epoch } => match core_epoch(c, warp.0, epoch) {
                 Some(epoch) => Some((warp.0, epoch)),
@@ -310,10 +330,10 @@ impl Observer for RaceObserver {
                     // `None` qualifier = lost in lowering → incomplete;
                     // `scope: None` = named barrier (participants).
                     SyncKind::Arrive { obj, phase, release, scope } => {
-                        ri::SyncEvent::Arrive { warp, lanes, obj: *obj, phase: *phase, release: *release, scope: *scope, epoch }
+                        ri::SyncEvent::Arrive { warp, lanes, obj: *obj, phase: *phase, release: *release, scope: *scope, site: e.site, epoch }
                     }
                     SyncKind::Wait { obj, phase, acquire, scope } => {
-                        ri::SyncEvent::Wait { warp, lanes, obj: *obj, phase: *phase, acquire: *acquire, scope: *scope, epoch }
+                        ri::SyncEvent::Wait { warp, lanes, obj: *obj, phase: *phase, acquire: *acquire, scope: *scope, site: e.site, epoch }
                     }
                     SyncKind::Fence(f) => {
                         let kind = match *f {
@@ -331,7 +351,7 @@ impl Observer for RaceObserver {
                             // shadow is keyed by physical bytes already.
                             FenceEvent::MbarrierInit | FenceEvent::ProxyAlias => return,
                         };
-                        ri::SyncEvent::Fence { warp, lanes, kind, epoch }
+                        ri::SyncEvent::Fence { warp, lanes, kind, site: e.site, epoch }
                     }
                     SyncKind::AsyncIssue { op, class, proxy, preds, footprint, .. } => {
                         let preds: Vec<AsyncId> = preds
@@ -382,6 +402,7 @@ impl Observer for RaceObserver {
                         range: span_range(*span),
                         scope: *scope,
                         verdicts: verdicts.iter().map(|v| (v.lanes, v.accepted.clone(), v.observed)).collect(),
+                        site: e.site,
                         pred_reads: pred_reads.iter().map(|(a, s)| (*a, span_range(*s))).collect(),
                         epoch,
                     },

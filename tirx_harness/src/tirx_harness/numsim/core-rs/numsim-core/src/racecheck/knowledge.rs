@@ -20,21 +20,22 @@
 //!   through *every* thread sync, including relaxed arrives / relaxed waits
 //!   (PTX 9.7.18.6.4.4), and is moved into `tcgen` by `after_thread_sync`.
 //!
-//! * `tmap_rel[scope]` / `g2t` — the tensormap proxy (descriptor bytes
-//!   written generically, read by TMA through the tensormap proxy).
-//!   `fence.proxy.tensormap::generic.release.<scope>` snapshots `hb` into
-//!   `tmap_rel[scope]` (propagating like a bridge); the consuming thread's
-//!   `.acquire.<scope> [addr], size` keeps, per acquired range, the
-//!   components whose releaser and acquirer scopes mutually include each
-//!   other. A TMA issued afterwards inherits those ranges; `g2t` is the view
-//!   computed for one tensormap-proxy access (PTX §9.7.15.4).
+//! * `tmap_rel` / `g2t` — the tensormap proxy (descriptor bytes written
+//!   generically, read by TMA through the tensormap proxy). Each
+//!   `fence.proxy.tensormap::generic.release.<scope>` adds a head
+//!   `(releasing warp, scope, hb snapshot)`; heads propagate like a bridge.
+//!   The consuming thread's `.acquire.<scope> [addr], size` keeps the heads
+//!   whose *releasing fence* and the acquire mutually include each other's
+//!   thread (PTX §8.9.4, §9.7.15.4), per acquired byte range. A TMA issued
+//!   afterwards inherits those ranges; `g2t` is the view computed for one
+//!   tensormap-proxy access.
 //!
 //! Shared memory, TMEM and global memory use this one structure; their
 //! differences are which slots are ever consulted (TMEM: `tcgen`; shared and
 //! global: `hb` + bridges for their domain).
 
 use super::clock::{Clock, JoinMemo, Stamp};
-use super::input::{Domain, Proxy, Scope};
+use super::input::{Domain, Proxy, Scope, SiteId};
 
 pub const NDOM: usize = 3;
 
@@ -45,8 +46,31 @@ pub struct Knowledge {
     pub a2g: [Clock; NDOM],
     pub tcgen: Clock,
     pub tcgen_rel: Clock,
-    pub tmap_rel: [Clock; 4],
+    pub tmap_rel: TmapHeads,
     pub g2t: Clock,
+}
+
+/// Tensormap release heads keyed by `(releasing warp, scope)`, sorted.
+pub type TmapHeads = Option<std::sync::Arc<Vec<(u32, Scope, Clock)>>>;
+
+/// `a ⊔= b` on head lists (join clocks with equal keys).
+pub fn join_tmap(a: &mut TmapHeads, b: &TmapHeads, memo: &JoinMemo) {
+    let Some(bv) = b else { return };
+    match a {
+        None => *a = Some(bv.clone()),
+        Some(av) if std::sync::Arc::ptr_eq(av, bv) => {}
+        Some(av) => {
+            let v = std::sync::Arc::make_mut(av);
+            for (w, s, c) in bv.iter() {
+                match v.binary_search_by_key(&(*w, *s), |(x, y, _)| (*x, *y)) {
+                    Ok(i) => {
+                        v[i].2.join(c, memo);
+                    }
+                    Err(i) => v.insert(i, (*w, *s, c.clone())),
+                }
+            }
+        }
+    }
 }
 
 /// The release heads a write carries: its own head plus the heads it
@@ -61,6 +85,8 @@ pub struct Rel {
     /// `None` for payloads that carry only `tcgen_rel` (relaxed stores).
     pub scope: Option<Scope>,
     pub warp: u32,
+    /// Site of the releasing operation (evidence for `ScopeMismatch`).
+    pub site: SiteId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,9 +164,7 @@ impl Knowledge {
             self.a2g[d].join(&o.a2g[d], memo);
         }
         self.tcgen_rel.join(&o.tcgen_rel, memo);
-        for s in 0..4 {
-            self.tmap_rel[s].join(&o.tmap_rel[s], memo);
-        }
+        join_tmap(&mut self.tmap_rel, &o.tmap_rel, memo);
     }
 
     pub fn join_all(&mut self, o: &Knowledge, memo: &JoinMemo) {

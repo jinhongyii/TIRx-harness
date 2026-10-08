@@ -1105,6 +1105,77 @@ reserves the top values). The adapter converts the epoch with
 the event; it never truncates or panics. Async-slot epochs share the same
 32-bit field, at 2 per slot generation.
 
+### Fixes from the adversarial review (`checker-review.md`)
+
+**Soundness**
+- **S2 — eviction respects proxy and window.** A frontier entry evicts a
+  prior only if both have the same proxy and the same address window. A
+  plain write evicts only same-class readers. A `shared::cta` store therefore
+  no longer hides an unbridged `shared::cluster` store.
+- **S3 — a missing scope on a non-named barrier is a lost qualifier.**
+  Named barriers are recognised by `ResourceId::Named`, not by
+  `scope: None`. On an mbarrier or cluster barrier, a `None` scope gives
+  `SyncQualifierUnknown` and no edge.
+- **S4 — declared-word history numbering follows README decision 14.** Bit i
+  is the i-th `(Access, lane)` write, lanes ascending, counted for every
+  declared word the write overlaps. This deliberately differs from
+  `observe.rs:25`, which says "per Access".
+- **S6 — tensormap heads keep their releaser.** A head is
+  `(releasing warp, scope, hb)`, and the acquire filters on the releasing
+  fence rather than on each component's actor.
+- **S7 / F2 — failed mbarrier scope checks are reported.** They emit
+  `ScopeMismatch`, carrying both sites and an occurrence count, deduplicated
+  per (release site, acquire site, scopes).
+
+**False positives**
+- **F1 — `CrossCtaAsyncOrder` is narrower.** It is emitted only when the
+  current issuer's CTA did not itself observe the prior op's completion
+  (through its mbarrier or a warp wait). Multicast and 2-CTA consumers no
+  longer trigger it.
+- **F3 — `fence.sc` history.** The latest `fence.sc` is kept per
+  `(thread, scope)` instead of per thread.
+
+**Robustness**
+- **R1.** A completion that targets a warp outside the launch is reported as
+  incomplete.
+- **R2.** Incompletes are deduplicated with counts (`incomplete_counts`, and
+  `occurrences` in the payload). Advisories are deduplicated through an
+  index.
+- **R3 — bounded growth.**
+  - The wide-span table is interned.
+  - Phases are kept for the last 4 per object.
+  - `pending_acq` is deduplicated and capped at 1024; dropping entries only
+    loses edges.
+  - Tensormap ranges are shared through an `Arc`, and identical ranges are
+    joined.
+  - The reclaimed-op set is gone: a non-live predecessor adds no ordering,
+    which is conservative.
+  - A declared-word history payload that every live actor already holds is
+    dropped by GC; its index is kept.
+- **R4 — faster paths.**
+  - `Clock::meet` and `filter` are rebuilt chunk by chunk.
+  - `Clock::join` no longer deep-copies lane entries.
+  - `Epochs::leq` does not allocate.
+  - Retired-generic summaries are indexed by page, and retired witnesses are
+    packed once.
+  - Words are looked up per allocation.
+- **R5.** GC uses per-cluster meets for shared memory and TMEM, so they
+  retire without waiting for other CTAs or later waves. Global memory uses
+  the launch-wide meet.
+- **R6.** Chunk identities come from a process-global `AtomicU64`.
+- **R7.** Zero-length spans are skipped instead of being reported as out of
+  bounds.
+
+**Contract**
+- `SyncEvent.kernel` must match the launch, otherwise `KernelMismatch`
+  (incomplete).
+- A warp access with `ALL_LANES` is warp-collective and is attributed to
+  lane 0.
+- `red` no longer feeds `tcgen_in`.
+
+**Cost.** `checker_tile_loop` went from 1.46 ms to 1.70 ms (phase map and
+per-arrival sites); `checker_readers` went from 2.77 ms to 2.93 ms.
+
 ### Contract update (e2551cf, b3c72f3)
 
 - Arrive/Wait carry qualifiers and scope. There is no adapter-side

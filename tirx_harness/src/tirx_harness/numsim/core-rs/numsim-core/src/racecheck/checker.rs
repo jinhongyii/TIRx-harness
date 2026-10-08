@@ -22,7 +22,7 @@ use std::sync::Arc;
 use super::cell::{effective_heads, overlap, Cell, Entry, WideSpans, Witness};
 use super::clock::{ActorId, Clock, Epoch, JoinMemo, LaneVec, Stamp};
 use super::input::*;
-use super::knowledge::{fence_domains, select_view, Heads, Knowledge, Rel, View, NDOM};
+use super::knowledge::{fence_domains, join_tmap, select_view, Heads, Knowledge, Rel, View, NDOM};
 use super::shadow::IntervalShadow;
 
 // ---------------------------------------------------------------- report --
@@ -71,7 +71,14 @@ pub enum FindingKind {
     /// Same evidence as a data race whose prior is an unwaited tcgen05.ld.
     TmemLifetimeReview { class: RaceClass, failure: OrderingFailure },
     /// A release/acquire pair whose scopes do not mutually cover.
-    ScopeMismatch { release_scope: Scope, acquire_scope: Scope, release_warp: WarpId, acquire_warp: WarpId },
+    ScopeMismatch {
+        release_scope: Scope,
+        acquire_scope: Scope,
+        release_warp: WarpId,
+        acquire_warp: WarpId,
+        release_site: SiteId,
+        acquire_site: SiteId,
+    },
     /// Advisory (`review`): not a proven race, an unresolved risk.
     Advisory { kind: AdvisoryKind },
     /// An allocation ended while an async op with a footprint in it had not
@@ -104,7 +111,7 @@ pub struct Finding {
     pub occurrences: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Incomplete {
     EpochRegression { warp: WarpId },
     EpochOverflow { warp: WarpId },
@@ -126,6 +133,10 @@ pub enum Incomplete {
     EventOutsideLaunch { events: u64 },
     /// A multi-lane per-thread async op's access did not name its lane.
     AsyncLaneUnknown { op: AsyncId },
+    /// An `AsyncComplete` named a warp outside the launch.
+    CompletionWarpOutOfRange { warp: WarpId },
+    /// A sync event's `kernel` differs from the launch being checked.
+    KernelMismatch { expected: u32, got: u32 },
     /// `max_findings` reached; later findings were not recorded.
     FindingsTruncated { dropped: u64 },
 }
@@ -133,7 +144,10 @@ pub enum Incomplete {
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub findings: Vec<Finding>,
+    /// Distinct incomplete reasons, first occurrence order.
     pub incomplete: Vec<Incomplete>,
+    /// Occurrences of each `incomplete[i]`.
+    pub incomplete_counts: Vec<u64>,
 }
 
 impl Report {
@@ -156,25 +170,15 @@ pub struct Stats {
     pub witnesses_retired: u64,
     pub async_slots_reclaimed: u64,
     pub async_slots: u64,
+    /// Distinct spans in the wide-span side table.
+    pub wide_spans: u64,
 }
 
 // ----------------------------------------------------------------- state --
 
-/// Bridge-row slots: g2a[0..NDOM], a2g[NDOM..2NDOM], tensormap release per
-/// scope [2NDOM..2NDOM+4].
-const NSLOT: usize = 2 * NDOM + 4;
-const TSLOT: usize = 2 * NDOM;
-
-fn scope_index(s: Scope) -> usize {
-    match s {
-        Scope::Cta => 0,
-        Scope::Cluster => 1,
-        Scope::Gpu => 2,
-        Scope::Sys => 3,
-    }
-}
-
-const SCOPES: [Scope; 4] = [Scope::Cta, Scope::Cluster, Scope::Gpu, Scope::Sys];
+const MAX_PENDING: usize = 1024;
+/// Bridge-row slots: g2a[0..NDOM], a2g[NDOM..2NDOM].
+const NSLOT: usize = 2 * NDOM;
 
 struct Warp {
     actor: ActorId,
@@ -203,7 +207,7 @@ struct Warp {
     tcgen_pub: Vec<Clock>,
     /// Tensormap ranges each lane acquired (`fence.proxy.tensormap::generic
     /// .acquire`), with the release knowledge that reached it.
-    g2t_ranges: Vec<Vec<(AllocId, Range<u64>, Clock)>>,
+    g2t_ranges: Vec<Arc<Vec<(AllocId, Range<u64>, Clock)>>>,
     /// `(epoch, site)` of every instruction that accessed memory, ascending;
     /// pruned below the oldest epoch any witness still references.
     sites: Vec<(Epoch, SiteId)>,
@@ -226,7 +230,7 @@ impl Warp {
             tcgen_issued: vec![Clock::default(); 32],
             tcgen_waited: vec![Clock::default(); 32],
             tcgen_pub: vec![Clock::default(); 32],
-            g2t_ranges: vec![Vec::new(); 32],
+            g2t_ranges: vec![Arc::new(Vec::new()); 32],
             sites: Vec::new(),
         }
     }
@@ -272,6 +276,19 @@ impl Warp {
         k
     }
 
+    /// Park a relaxed observation for a later acquire fence. Deduplicated by
+    /// payload and bounded: dropping the oldest only loses edges (more races
+    /// reported, never fewer).
+    fn push_pending(&mut self, lane: u8, rel: Arc<Rel>) {
+        if self.pending_acq.iter().any(|(l, r)| *l == lane && Arc::ptr_eq(r, &rel)) {
+            return;
+        }
+        if self.pending_acq.len() >= MAX_PENDING {
+            self.pending_acq.drain(..MAX_PENDING / 2);
+        }
+        self.pending_acq.push((lane, rel));
+    }
+
     /// The tcgen05 fence frontier lanes `lanes` carry through any sync.
     fn tcgen_publication(&self, lanes: LaneMask, memo: &JoinMemo) -> Clock {
         let mut c = Clock::default();
@@ -290,9 +307,7 @@ impl Warp {
                 x.g2a[d].join(&k.g2a[d], memo);
                 x.a2g[d].join(&k.a2g[d], memo);
             }
-            for s in 0..4 {
-                x.tmap_rel[s].join(&k.tmap_rel[s], memo);
-            }
+            join_tmap(&mut x.tmap_rel, &k.tmap_rel, memo);
         };
         if lanes.is_all() {
             join(&mut self.base);
@@ -312,10 +327,8 @@ impl Warp {
 fn slot_mut(k: &mut Knowledge, s: usize) -> &mut Clock {
     if s < NDOM {
         &mut k.g2a[s]
-    } else if s < 2 * NDOM {
-        &mut k.a2g[s - NDOM]
     } else {
-        &mut k.tmap_rel[s - 2 * NDOM]
+        &mut k.a2g[s - NDOM]
     }
 }
 
@@ -331,8 +344,11 @@ struct AsyncActor {
     site: SiteId,
     kind: AsyncKind,
     k: Knowledge,
-    /// Tensormap ranges the issuing lanes acquired.
-    g2t_ranges: Vec<(AllocId, Range<u64>, Clock)>,
+    /// Tensormap ranges the issuing lanes acquired (shared with the lane).
+    g2t_ranges: Arc<Vec<(AllocId, Range<u64>, Clock)>>,
+    /// CTAs that observed this op's completion directly (its mbarrier's
+    /// CTA, or the waiting warp's CTA).
+    completed_ctas: Vec<u32>,
     preds: Vec<usize>,
     footprint: Vec<(AllocId, Range<u64>)>,
     /// Highest milestone reached (0 none, 1 read, 2 write/full).
@@ -342,6 +358,8 @@ struct AsyncActor {
 struct Alloc {
     size: u64,
     space: Space,
+    /// Owning CTA (shared / TMEM reach: its cluster).
+    cta: u32,
     shadow: IntervalShadow<Cell>,
     /// Proxies that have accessed the allocation (bit = proxy code).
     seen: u8,
@@ -351,15 +369,18 @@ struct Alloc {
     /// access is checked against them, so GC never hides a cross-proxy race
     /// (legacy RS `RetiredGenericHistory`, made view-aware; legacy G's
     /// proxy-blind floor dropped them).
-    retired: HashMap<(ActorId, u8, bool, u8, u64), RetiredGeneric>,
+    /// Keyed `(start page, actor, lane, write, window)`, so a range query by
+    /// page finds the candidates (review R4).
+    retired: std::collections::BTreeMap<(u64, ActorId, u8, bool, u8), RetiredGeneric>,
+    /// Widest retired hull, in pages (bounds the backward page scan).
+    retired_span_pages: u64,
 }
 
 #[derive(Clone, Debug)]
 struct RetiredGeneric {
-    stamp: Stamp,
-    lane: u8,
-    write: bool,
-    domain: Option<Domain>,
+    /// Latest witness, packed once with the hull (re-packed only when the
+    /// hull grows).
+    w: Witness,
     lo: u64,
     hi: u64,
     info: WitnessInfo,
@@ -384,13 +405,20 @@ fn domain_code(d: Option<Domain>) -> u8 {
     }
 }
 
+struct Arrival {
+    /// Representative arriving warp (the group's first).
+    warp: WarpId,
+    scope: Option<Scope>,
+    site: SiteId,
+    k: Arc<Knowledge>,
+}
+
 #[derive(Default)]
 struct Phase {
-    /// Release arrivals grouped by `(arriver CTA, scope)` (`None` = named
-    /// barrier), each with a representative warp. Mutual scope inclusion
-    /// depends on the arriver only through its CTA / cluster, so a group is
-    /// judged once and joined once per waiter (O(groups), not O(arrivers)).
-    arrivals: Vec<(WarpId, Option<Scope>, Arc<Knowledge>)>,
+    /// Release arrivals grouped by `(arriver CTA, scope)`. Mutual scope
+    /// inclusion depends on the arriver only through its CTA / cluster, so a
+    /// group is judged once and joined once per waiter (O(groups)).
+    arrivals: Vec<Arrival>,
     /// tcgen05 fence frontier carried by every arrive, relaxed included.
     tcgen_rel: Clock,
     /// Async completions (complete-tx: release at cluster scope for the
@@ -401,12 +429,19 @@ struct Phase {
 struct HistEntry {
     rel: Option<Heads>,
     is_async: bool,
+    /// GC found the payload dominated by every live actor and dropped it.
+    consumed: bool,
 }
 
+/// A declared word. History numbering follows the contract (README
+/// decision 14): bit 0 = launch value, bit i = the i-th `(Access, lane)`
+/// write overlapping the word, in delivery order, lanes ascending — kept for
+/// every overlapping word, not only the first.
 struct Word {
-    alloc: AllocId,
     range: Range<u64>,
     history: Vec<HistEntry>,
+    /// Last `(access seq, lane)` appended (one entry per lane per Access).
+    last: Option<(u64, u8)>,
 }
 
 /// Who performs the access being checked.
@@ -423,12 +458,16 @@ pub struct Checker {
     asyncs: Vec<AsyncActor>,
     free_slots: Vec<usize>,
     async_index: HashMap<AsyncId, usize>,
-    reclaimed: HashSet<AsyncId>,
     allocs: HashMap<AllocId, Alloc>,
-    phases: HashMap<(SyncObjId, u64), Phase>,
-    /// Latest `fence.sc` per thread `(warp, lane)` with its scope.
-    sc: HashMap<(WarpId, u8), (Scope, Arc<Knowledge>)>,
-    words: Vec<Word>,
+    /// Per sync object, its most recent phases (older ones can no longer be
+    /// waited on: mbarrier parity / barrier generations).
+    phases: HashMap<SyncObjId, std::collections::BTreeMap<u64, Phase>>,
+    incomplete_index: HashMap<Incomplete, usize>,
+    scope_dedup: HashMap<(SiteId, SiteId, Scope, Scope), usize>,
+    /// Latest `fence.sc` per `(warp, lane, scope)`.
+    sc: HashMap<(WarpId, u8, Scope), Arc<Knowledge>>,
+    words: HashMap<AllocId, Vec<Word>>,
+    advisory_dedup: HashMap<(AdvisoryKind, AllocId, SiteId), usize>,
     wide: WideSpans,
     report: Report,
     dedup: HashMap<(AllocId, RaceClass, SiteId, SiteId, bool), usize>,
@@ -475,11 +514,13 @@ impl Checker {
             asyncs: Vec::new(),
             free_slots: Vec::new(),
             async_index: HashMap::new(),
-            reclaimed: HashSet::new(),
             allocs: HashMap::new(),
             phases: HashMap::new(),
+            incomplete_index: HashMap::new(),
+            scope_dedup: HashMap::new(),
             sc: HashMap::new(),
-            words: Vec::new(),
+            words: HashMap::new(),
+            advisory_dedup: HashMap::new(),
             wide: WideSpans::default(),
             report: Report::default(),
             dedup: HashMap::new(),
@@ -513,9 +554,18 @@ impl Checker {
 
     /// Record an incomplete reason once (adapter use).
     pub fn note_incomplete(&mut self, i: Incomplete) {
-        if !self.report.incomplete.contains(&i) {
-            self.report.incomplete.push(i);
+        match self.incomplete_index.get(&i) {
+            Some(&k) => self.report.incomplete_counts[k] += 1,
+            None => {
+                self.incomplete_index.insert(i.clone(), self.report.incomplete.len());
+                self.report.incomplete.push(i);
+                self.report.incomplete_counts.push(1);
+            }
         }
+    }
+
+    pub fn wide_span_count(&self) -> u64 {
+        self.wide.spans.len() as u64
     }
 
     /// Findings so far (the run is not finalised).
@@ -525,19 +575,24 @@ impl Checker {
 
     /// Finalise: outstanding async work is incomplete.
     pub fn finalize(&mut self) {
-        for a in &self.asyncs {
-            if a.in_use && a.done == 0 && a.kind != AsyncKind::TcgenCommit {
-                self.report.incomplete.push(Incomplete::AsyncNeverCompleted { op: a.op });
-            }
+        let never: Vec<AsyncId> = self
+            .asyncs
+            .iter()
+            .filter(|a| a.in_use && a.done == 0 && a.kind != AsyncKind::TcgenCommit)
+            .map(|a| a.op)
+            .collect();
+        for op in never {
+            self.note_incomplete(Incomplete::AsyncNeverCompleted { op });
         }
         if self.dropped_findings > 0 {
-            self.report.incomplete.push(Incomplete::FindingsTruncated { dropped: self.dropped_findings });
+            self.note_incomplete(Incomplete::FindingsTruncated { dropped: self.dropped_findings });
             self.dropped_findings = 0;
         }
     }
 
     pub fn finish(mut self) -> Report {
         self.finalize();
+        self.stats.wide_spans = self.wide.spans.len() as u64;
         self.report
     }
 
@@ -552,26 +607,26 @@ impl Checker {
     }
 
     fn tick(&mut self, w: WarpId, epoch: Epoch) -> bool {
-        let Some(warp) = self.warps.get_mut(w as usize) else {
-            self.report.incomplete.push(Incomplete::EpochRegression { warp: w });
+        let Some(cur) = self.warps.get(w as usize).map(|x| x.epoch) else {
+            self.note_incomplete(Incomplete::CompletionWarpOutOfRange { warp: w });
             return false;
         };
-        if epoch < warp.epoch {
-            self.report.incomplete.push(Incomplete::EpochRegression { warp: w });
+        if epoch < cur {
+            self.note_incomplete(Incomplete::EpochRegression { warp: w });
             return false;
         }
         if epoch >= u32::MAX - 1 {
-            self.report.incomplete.push(Incomplete::EpochOverflow { warp: w });
+            self.note_incomplete(Incomplete::EpochOverflow { warp: w });
             return false;
         }
-        warp.epoch = epoch;
+        self.warps[w as usize].epoch = epoch;
         true
     }
 
     fn async_idx(&mut self, op: AsyncId) -> Option<usize> {
         let r = self.async_index.get(&op).copied();
         if r.is_none() {
-            self.report.incomplete.push(Incomplete::UnknownAsyncOp { op });
+            self.note_incomplete(Incomplete::UnknownAsyncOp { op });
         }
         r
     }
@@ -714,8 +769,13 @@ impl Checker {
         prior.proxy() == Proxy::Async
             && cur_proxy == Proxy::Async
             && prior.stamp.actor() != self.asyncs[a].actor
-            && self.slot_of(prior.stamp.actor()).is_some()
-            && self.topo.cta_of(self.warp_of(prior)) != self.topo.cta_of(self.asyncs[a].warp)
+            && self.slot_of(prior.stamp.actor()).is_some_and(|p| {
+                // Ordered through the prior op's own completion, observed in
+                // the current issuer's CTA (the multicast / 2-CTA consumer
+                // pattern), is not "base causality alone" (review F1).
+                let cur_cta = self.topo.cta_of(self.asyncs[a].warp);
+                self.topo.cta_of(p.warp) != cur_cta && !p.completed_ctas.contains(&cur_cta)
+            })
     }
 
     fn info(&self, w: &Witness) -> WitnessInfo {
@@ -744,12 +804,8 @@ impl Checker {
             return;
         }
         let site = self.site_of(cw);
-        if self
-            .report
-            .findings
-            .iter()
-            .any(|f| f.kind == FindingKind::Advisory { kind } && f.alloc == alloc && f.current.as_ref().is_some_and(|c| c.site == site))
-        {
+        if let Some(&i) = self.advisory_dedup.get(&(kind, alloc, site)) {
+            self.report.findings[i].occurrences += 1;
             return;
         }
         let f = Finding {
@@ -761,7 +817,9 @@ impl Checker {
             current: Some(self.info(cw)),
             occurrences: 1,
         };
-        self.push_finding(f);
+        if let Some(i) = self.push_finding(f) {
+            self.advisory_dedup.insert((kind, alloc, site), i);
+        }
     }
 
     fn report_race(&mut self, alloc: AllocId, bytes: Range<u64>, cur: Cur, prior: &Witness, cw: &Witness) {
@@ -810,7 +868,7 @@ impl Checker {
         self.stats.accesses += 1;
         self.maybe_gc();
         let Some(size) = self.allocs.get(&a.alloc).map(|x| x.size) else {
-            self.report.incomplete.push(Incomplete::UnknownAlloc { alloc: a.alloc });
+            self.note_incomplete(Incomplete::UnknownAlloc { alloc: a.alloc });
             return;
         };
         let (cur, stamp, lane) = match a.who {
@@ -830,7 +888,10 @@ impl Checker {
                 (Cur::Async { a: i }, Stamp::new(act.actor, act.gen_base + side_index(side)), 0)
             }
         };
-        if a.range.end > size || a.range.start >= a.range.end {
+        if a.range.start == a.range.end {
+            return; // e.g. cp.async zfill with src-size 0: no bytes (review R7)
+        }
+        if a.range.end > size || a.range.start > a.range.end {
             let current = matches!(cur, Cur::Lane { .. }).then(|| {
                 let w = Witness::pack(stamp, lane, a.proxy, a.domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.wide);
                 self.info(&w)
@@ -871,7 +932,7 @@ impl Checker {
             }
             // The tensormap view for exactly these descriptor bytes.
             let mut v = Clock::default();
-            for (al, r, k) in &self.asyncs[i].g2t_ranges {
+            for (al, r, k) in self.asyncs[i].g2t_ranges.iter() {
                 if *al == a.alloc && r.start < a.range.end && a.range.start < r.end {
                     v.join(k, &self.memo);
                 }
@@ -888,12 +949,12 @@ impl Checker {
                 let warp = &self.warps[wi];
                 if matches!(a.order, MemOrder::Release | MemOrder::AcqRel) {
                     let k = warp.publication(one_lane(lane), epoch, &self.memo);
-                    Some(Arc::new(Rel { k, scope: a.scope, warp: wi as u32 }))
+                    Some(Arc::new(Rel { k, scope: a.scope, warp: wi as u32, site: a.site }))
                 } else if let Some(f) = &warp.fence_rel[lane as usize] {
                     Some(f.clone())
                 } else {
                     let k = Knowledge { tcgen_rel: warp.tcgen_publication(one_lane(lane), &self.memo), ..Default::default() };
-                    Some(Arc::new(Rel { k, scope: None, warp: wi as u32 }))
+                    Some(Arc::new(Rel { k, scope: None, warp: wi as u32, site: a.site }))
                 }
             }
             _ => None,
@@ -908,13 +969,21 @@ impl Checker {
         }
         let mut advisories: Vec<(Range<u64>, Witness, AdvisoryKind)> = Vec::new();
         let mut acquired: Vec<Heads> = Vec::new();
-        let mut word_rel: Option<Option<Heads>> = None;
-        let word_start = self
+        // Every declared word this access overlaps, with the byte whose
+        // segment decides the word's entry.
+        let word_points: Vec<(usize, u64)> = self
             .words
-            .iter()
-            .find(|x| x.alloc == a.alloc && x.range.start < a.range.end && a.range.start < x.range.end)
-            .map(|x| x.range.start);
-        let in_word = word_start.is_some();
+            .get(&a.alloc)
+            .map(|ws| {
+                ws.iter()
+                    .enumerate()
+                    .filter(|(_, x)| x.range.start < a.range.end && a.range.start < x.range.end)
+                    .map(|(i, x)| (i, x.range.start.max(a.range.start)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let in_word = !word_points.is_empty();
+        let mut word_rels: Vec<(usize, Option<Heads>)> = Vec::new();
 
         let mut shadow = std::mem::take(&mut self.allocs.get_mut(&a.alloc).unwrap().shadow);
         {
@@ -973,15 +1042,19 @@ impl Checker {
                             Some(Arc::new(v))
                         }
                     };
-                    if word_start.is_some_and(|s| seg.start <= s && s < seg.end) {
-                        word_rel = Some(rel.clone());
+                    for (i, pt) in &word_points {
+                        if seg.start <= *pt && *pt < seg.end {
+                            word_rels.push((*i, rel.clone()));
+                        }
                     }
                     cell.writes.record(Entry { w, rel, base }, wide, |p| this.ordered(cur, p, a.proxy));
                     if !strong {
                         // A plain write supersedes the readers it is ordered
                         // after; a strong write keeps them (a later access
                         // morally strong with it may still race them).
-                        cell.reads.retain(|r| !this.ordered(cur, &r.w, a.proxy));
+                        // Only readers in the same proxy and window: a reader
+                        // judged by a different bridge is not covered.
+                        cell.reads.retain(|r| !(w.same_view_class(&r.w) && this.ordered(cur, &r.w, a.proxy)));
                     }
                 } else {
                     cell.reads.record(Entry { w, rel: None, base: None }, wide, |p| this.ordered(cur, p, a.proxy));
@@ -995,10 +1068,15 @@ impl Checker {
         for (bytes, prior, kind) in advisories {
             self.report_advisory(a.alloc, bytes, &prior, &w, kind);
         }
-        if let Some(rel) = word_rel {
-            let ws = word_start.unwrap();
-            if let Some(word) = self.words.iter_mut().find(|x| x.alloc == a.alloc && x.range.start == ws) {
-                word.history.push(HistEntry { rel, is_async: matches!(cur, Cur::Async { .. }) });
+        if !word_rels.is_empty() {
+            let is_async = matches!(cur, Cur::Async { .. });
+            let ws = self.words.get_mut(&a.alloc).unwrap();
+            for (i, rel) in word_rels {
+                let word = &mut ws[i];
+                if word.last != Some((a.seq, lane)) {
+                    word.last = Some((a.seq, lane));
+                    word.history.push(HistEntry { rel, is_async, consumed: false });
+                }
             }
         }
         if let Cur::Lane { w: wi, lane, .. } = cur {
@@ -1006,13 +1084,13 @@ impl Checker {
             let can_acquire = a.kind != AccessKind::Rmw || a.returns_value;
             for heads in acquired {
                 for rel in heads.iter() {
-                    self.warps[wi].tcgen_in[lane as usize].join(&rel.k.tcgen_rel, &self.memo);
                     if !can_acquire {
-                        continue;
+                        continue; // `red` observes nothing, tcgen included
                     }
+                    self.warps[wi].tcgen_in[lane as usize].join(&rel.k.tcgen_rel, &self.memo);
                     match a.order {
-                        MemOrder::Acquire | MemOrder::AcqRel => self.acquire_rel(wi as u32, one_lane(lane), a.scope.unwrap(), rel),
-                        MemOrder::Relaxed | MemOrder::Release => self.warps[wi].pending_acq.push((lane, rel.clone())),
+                        MemOrder::Acquire | MemOrder::AcqRel => self.acquire_rel(wi as u32, one_lane(lane), a.scope.unwrap(), rel, a.site),
+                        MemOrder::Relaxed | MemOrder::Release => self.warps[wi].push_pending(lane, rel.clone()),
                         MemOrder::Weak => {}
                     }
                 }
@@ -1023,28 +1101,27 @@ impl Checker {
     /// Check a non-generic access against the generic witnesses GC folded
     /// into the allocation's summary.
     fn check_retired_generic(&mut self, a: &Access, cur: Cur, cw: &Witness) {
-        let Some(alloc) = self.allocs.get_mut(&a.alloc) else { return };
+        let Some(alloc) = self.allocs.get(&a.alloc) else { return };
         if alloc.retired.is_empty() {
             return;
         }
-        let entries: Vec<RetiredGeneric> = alloc
+        let lo_page = (a.range.start >> 12).saturating_sub(alloc.retired_span_pages);
+        let hi_page = (a.range.end - 1) >> 12;
+        let hits: Vec<(Witness, Range<u64>, WitnessInfo)> = alloc
             .retired
-            .values()
-            .filter(|e| e.lo < a.range.end && a.range.start < e.hi && (e.write || cw.writes()))
-            .cloned()
+            .range((lo_page, 0, 0, false, 0)..=(hi_page, u32::MAX, u8::MAX, true, u8::MAX))
+            .map(|(_, e)| e)
+            .filter(|e| e.lo < a.range.end && a.range.start < e.hi && (e.w.writes() || cw.writes()))
+            .filter(|e| !self.ordered(cur, &e.w, a.proxy))
+            .map(|e| (e.w, e.lo.max(a.range.start)..e.hi.min(a.range.end), e.info.clone()))
             .collect();
-        for e in entries {
-            let kind = if e.write { AccessKind::Write } else { AccessKind::Read };
-            let pw = Witness::pack(e.stamp, e.lane, Proxy::Generic, e.domain, kind, None, false, (e.lo, e.hi), &mut self.wide);
-            if !self.ordered(cur, &pw, a.proxy) {
-                let bytes = e.lo.max(a.range.start)..e.hi.min(a.range.end);
-                self.report_race_with(a.alloc, bytes, cur, &pw, cw, Some(e.info.clone()));
-            }
+        for (pw, bytes, info) in hits {
+            self.report_race_with(a.alloc, bytes, cur, &pw, cw, Some(info));
         }
     }
 
     /// Acquire a release payload, checking that the scopes mutually cover.
-    fn acquire_rel(&mut self, me: WarpId, lanes: LaneMask, my_scope: Scope, rel: &Rel) {
+    fn acquire_rel(&mut self, me: WarpId, lanes: LaneMask, my_scope: Scope, rel: &Rel, acq_site: SiteId) {
         let Some(rs) = rel.scope else {
             for c in lanes.lanes8() {
                 self.warps[me as usize].tcgen_in[c as usize].join(&rel.k.tcgen_rel, &self.memo);
@@ -1055,16 +1132,36 @@ impl Checker {
             let memo = &self.memo;
             self.warps[me as usize].acquire(lanes, &rel.k, memo);
         } else {
-            let f = Finding {
-                kind: FindingKind::ScopeMismatch { release_scope: rs, acquire_scope: my_scope, release_warp: rel.warp, acquire_warp: me },
-                severity: Severity::Error,
-                alloc: AllocId(u32::MAX),
-                bytes: 0..0,
-                prior: None,
-                current: None,
-                occurrences: 1,
-            };
-            self.push_finding(f);
+            self.report_scope_mismatch(rs, my_scope, rel.warp, me, rel.site, acq_site);
+        }
+    }
+
+    /// One `ScopeMismatch` per (release site, acquire site, scopes), with an
+    /// occurrence count (review F2 / R2).
+    fn report_scope_mismatch(&mut self, rs: Scope, acq: Scope, rw: WarpId, aw: WarpId, rsite: SiteId, asite: SiteId) {
+        let key = (rsite, asite, rs, acq);
+        if let Some(&i) = self.scope_dedup.get(&key) {
+            self.report.findings[i].occurrences += 1;
+            return;
+        }
+        let f = Finding {
+            kind: FindingKind::ScopeMismatch {
+                release_scope: rs,
+                acquire_scope: acq,
+                release_warp: rw,
+                acquire_warp: aw,
+                release_site: rsite,
+                acquire_site: asite,
+            },
+            severity: Severity::Error,
+            alloc: AllocId(u32::MAX),
+            bytes: 0..0,
+            prior: None,
+            current: None,
+            occurrences: 1,
+        };
+        if let Some(i) = self.push_finding(f) {
+            self.scope_dedup.insert(key, i);
         }
     }
 
@@ -1073,8 +1170,16 @@ impl Checker {
     pub fn sync(&mut self, s: SyncEvent) {
         self.maybe_gc();
         match s {
-            SyncEvent::AllocBegin { alloc, size, space, .. } => {
-                self.allocs.insert(alloc, Alloc { size, space, shadow: IntervalShadow::new(), seen: proxy_bit(Proxy::Generic), retired: HashMap::new() });
+            SyncEvent::AllocBegin { alloc, size, space, cta } => {
+                self.allocs.insert(alloc, Alloc {
+                        size,
+                        space,
+                        cta,
+                        shadow: IntervalShadow::new(),
+                        seen: proxy_bit(Proxy::Generic),
+                        retired: Default::default(),
+                        retired_span_pages: 0,
+                    });
             }
             SyncEvent::AllocEnd { alloc } => {
                 let mut lifetime = Vec::new();
@@ -1098,11 +1203,12 @@ impl Checker {
                     self.push_finding(f);
                 }
                 self.allocs.remove(&alloc);
-                self.words.retain(|w| w.alloc != alloc);
+                self.words.remove(&alloc);
             }
             SyncEvent::DeclareWord { alloc, range } => {
-                if !self.words.iter().any(|w| w.alloc == alloc && w.range == range) {
-                    self.words.push(Word { alloc, range, history: Vec::new() });
+                let ws = self.words.entry(alloc).or_default();
+                if !ws.iter().any(|w| w.range == range) {
+                    ws.push(Word { range, history: Vec::new(), last: None });
                 }
             }
             SyncEvent::WarpSync { warp, mask, epoch } => {
@@ -1111,87 +1217,23 @@ impl Checker {
                 }
                 self.warp_sync(warp, mask, epoch);
             }
-            SyncEvent::Arrive { warp, lanes, obj, phase, release, scope, epoch } => {
+            SyncEvent::Arrive { warp, lanes, obj, phase, release, scope, site, epoch } => {
                 if !self.tick(warp, epoch) {
                     return;
                 }
-                let Some(release) = release else {
-                    self.report.incomplete.push(Incomplete::SyncQualifierUnknown { warp });
-                    return;
-                };
-                let w = &self.warps[warp as usize];
-                let tc = w.tcgen_publication(lanes, &self.memo);
-                let pubk = release.then(|| Arc::new(w.publication(lanes, epoch, &self.memo)));
-                let ph = self.phases.entry((obj, phase)).or_default();
-                ph.tcgen_rel.join(&tc, &self.memo);
-                if let Some(k) = pubk {
-                    let cta = self.topo.cta_of(warp);
-                    let topo = self.topo;
-                    match ph.arrivals.iter_mut().find(|(aw, s, _)| *s == scope && topo.cta_of(*aw) == cta) {
-                        Some((_, _, g)) => Arc::make_mut(g).join_propagating(&k, &self.memo),
-                        None => ph.arrivals.push((warp, scope, k)),
-                    }
-                }
+                self.arrive(warp, lanes, obj, phase, release, scope, site, epoch);
             }
-            SyncEvent::Wait { warp, lanes, obj, phase, acquire, scope, epoch } => {
+            SyncEvent::Wait { warp, lanes, obj, phase, acquire, scope, site, epoch } => {
                 if !self.tick(warp, epoch) {
                     return;
                 }
-                let Some(acquire) = acquire else {
-                    self.report.incomplete.push(Incomplete::SyncQualifierUnknown { warp });
-                    return;
-                };
-                let ph = self.phases.entry((obj, phase)).or_default();
-                let topo = self.topo;
-                let assumed = self.mbarrier_scope_assumed && matches!(obj, SyncObjId::Mbarrier { .. });
-                let mut unknown_scope = false;
-                let memo = &self.memo;
-                let w = &mut self.warps[warp as usize];
-                if !ph.tcgen_rel.is_empty() {
-                    for c in lanes.lanes8() {
-                        w.tcgen_in[c as usize].join(&ph.tcgen_rel, memo);
-                    }
-                }
-                for (aw, ascope, k) in &ph.arrivals {
-                    if acquire {
-                        let ok = match (ascope, scope) {
-                            (Some(a), Some(s)) => *a >= required_scope(&topo, *aw, warp) && s >= required_scope(&topo, warp, *aw),
-                            _ => true, // named barrier: participants, no scope
-                        };
-                        if ok {
-                            w.acquire(lanes, k, memo);
-                        } else if assumed {
-                            unknown_scope = true;
-                        }
-                    } else {
-                        let rel = Arc::new(Rel { k: (**k).clone(), scope: Some(ascope.unwrap_or(Scope::Cta)), warp: *aw });
-                        for c in lanes.lanes8() {
-                            w.pending_acq.push((c, rel.clone()));
-                        }
-                    }
-                }
-                if unknown_scope {
-                    self.report.incomplete.push(Incomplete::MbarrierScopeUnknown { warp });
-                }
-                let ph = &self.phases[&(obj, phase)];
-                let memo = &self.memo;
-                let w = &mut self.warps[warp as usize];
-                if acquire {
-                    w.acquire(lanes, &ph.completion, memo);
-                } else {
-                    // Any later acquire fence of the waiter suffices for the
-                    // copy's own bytes: scope Sys, attributed to the waiter.
-                    let rel = Arc::new(Rel { k: ph.completion.clone(), scope: Some(Scope::Sys), warp });
-                    for c in lanes.lanes8() {
-                        w.pending_acq.push((c, rel.clone()));
-                    }
-                }
+                self.wait(warp, lanes, obj, phase, acquire, scope, site);
             }
-            SyncEvent::Fence { warp, lanes, kind, epoch } => {
+            SyncEvent::Fence { warp, lanes, kind, site, epoch } => {
                 if !self.tick(warp, epoch) {
                     return;
                 }
-                self.fence(warp, lanes, kind, epoch);
+                self.fence(warp, lanes, kind, site, epoch);
             }
             SyncEvent::AsyncIssue { op, warp, lanes, kind, proxy: _, preds, footprint, site, epoch } => {
                 if !self.tick(warp, epoch) {
@@ -1213,10 +1255,20 @@ impl Checker {
                 let c = self.completion(i, m);
                 match target {
                     CompletionTarget::Phase { obj, phase } => {
-                        let ph = self.phases.entry((obj, phase)).or_default();
+                        if let SyncObjId::Mbarrier { cta, .. } = obj {
+                            self.asyncs[i].completed_ctas.push(cta.0);
+                        }
+                        self.phase_mut(obj, phase);
+                        let ph = self.phases.get_mut(&obj).and_then(|m| m.get_mut(&phase)).unwrap();
                         ph.completion.join_propagating(&c, &self.memo);
                     }
                     CompletionTarget::Warp { warp, lanes } => {
+                        if warp as usize >= self.warps.len() {
+                            self.note_incomplete(Incomplete::CompletionWarpOutOfRange { warp });
+                            return;
+                        }
+                        let cta = self.topo.cta_of(warp);
+                        self.asyncs[i].completed_ctas.push(cta);
                         let memo = &self.memo;
                         let w = &mut self.warps[warp as usize];
                         match kind {
@@ -1234,18 +1286,119 @@ impl Checker {
                     }
                 }
             }
-            SyncEvent::WaitVerdicts { warp, lanes, alloc, range, scope, verdicts, pred_reads, epoch } => {
+            SyncEvent::WaitVerdicts { warp, lanes, alloc, range, scope, verdicts, pred_reads, site, epoch } => {
                 if !self.tick(warp, epoch) {
                     return;
                 }
                 if !self.pred_reads_stable(warp, lanes, epoch, &pred_reads) {
-                    self.report.incomplete.push(Incomplete::WaitPredicateReadsUnstable { warp });
+                    self.note_incomplete(Incomplete::WaitPredicateReadsUnstable { warp });
                     return;
                 }
                 // Each lane group judged by its own verdicts (never a
                 // lane-wise conjunction).
                 for (glanes, accepted, observed) in verdicts {
-                    self.wait_verdicts(warp, glanes, alloc, range.clone(), scope, &accepted, observed);
+                    self.wait_verdicts(warp, glanes, alloc, range.clone(), scope, &accepted, observed, site);
+                }
+            }
+        }
+    }
+
+    /// The phase record, keeping only the most recent phases per object.
+    fn phase_mut(&mut self, obj: SyncObjId, phase: u64) -> &mut Phase {
+        let m = self.phases.entry(obj).or_default();
+        if !m.contains_key(&phase) {
+            m.insert(phase, Phase::default());
+            while m.len() > 4 {
+                m.pop_first();
+            }
+        }
+        m.entry(phase).or_default()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn arrive(&mut self, warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u64, release: Option<bool>, scope: Option<Scope>, site: SiteId, epoch: Epoch) {
+        let Some(release) = release else {
+            self.note_incomplete(Incomplete::SyncQualifierUnknown { warp });
+            return;
+        };
+        let w = &self.warps[warp as usize];
+        let tc = w.tcgen_publication(lanes, &self.memo);
+        let pubk = release.then(|| Arc::new(w.publication(lanes, epoch, &self.memo)));
+        let topo = self.topo;
+        let cta = topo.cta_of(warp);
+        self.phase_mut(obj, phase);
+        let ph = self.phases.get_mut(&obj).and_then(|m| m.get_mut(&phase)).unwrap();
+        ph.tcgen_rel.join(&tc, &self.memo);
+        if let Some(k) = pubk {
+            match ph.arrivals.iter_mut().find(|x| x.scope == scope && topo.cta_of(x.warp) == cta) {
+                Some(x) => Arc::make_mut(&mut x.k).join_propagating(&k, &self.memo),
+                None => ph.arrivals.push(Arrival { warp, scope, site, k }),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wait(&mut self, warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u64, acquire: Option<bool>, scope: Option<Scope>, site: SiteId) {
+        let Some(acquire) = acquire else {
+            self.note_incomplete(Incomplete::SyncQualifierUnknown { warp });
+            return;
+        };
+        let named = matches!(obj, SyncObjId::Named { .. });
+        self.phase_mut(obj, phase);
+        let topo = self.topo;
+        let ph = &self.phases[&obj][&phase];
+        let mut lost = false;
+        let mut mismatches = Vec::new();
+        let mut acquires: Vec<Arc<Knowledge>> = Vec::new();
+        let mut pend: Vec<Arc<Rel>> = Vec::new();
+        for x in &ph.arrivals {
+            // Named barriers synchronise their participants without a scope;
+            // every other object needs both scopes (None = qualifier lost).
+            let (a, s) = match (named, x.scope, scope) {
+                (true, _, _) => (Scope::Sys, Scope::Sys),
+                (false, Some(a), Some(s)) => (a, s),
+                _ => {
+                    lost = true;
+                    continue;
+                }
+            };
+            if acquire {
+                if a >= required_scope(&topo, x.warp, warp) && s >= required_scope(&topo, warp, x.warp) {
+                    acquires.push(x.k.clone());
+                } else {
+                    mismatches.push((a, s, x.warp, x.site));
+                }
+            } else {
+                pend.push(Arc::new(Rel { k: (*x.k).clone(), scope: Some(a), warp: x.warp, site: x.site }));
+            }
+        }
+        let tcgen_rel = ph.tcgen_rel.clone();
+        let completion = ph.completion.clone();
+        if lost {
+            self.note_incomplete(Incomplete::SyncQualifierUnknown { warp });
+        }
+        for (a, s, aw, asite) in mismatches {
+            self.report_scope_mismatch(a, s, aw, warp, asite, site);
+        }
+        let memo = &self.memo;
+        let w = &mut self.warps[warp as usize];
+        if !tcgen_rel.is_empty() {
+            for c in lanes.lanes8() {
+                w.tcgen_in[c as usize].join(&tcgen_rel, memo);
+            }
+        }
+        for k in acquires {
+            w.acquire(lanes, &k, memo);
+        }
+        if acquire {
+            w.acquire(lanes, &completion, memo);
+        } else {
+            // A relaxed wait synchronises nothing until a later acquire
+            // fence; the copy's own bytes then need no scope match.
+            pend.push(Arc::new(Rel { k: completion, scope: Some(Scope::Sys), warp, site }));
+            for rel in pend {
+                for c in lanes.lanes8() {
+                    w.push_pending(c, rel.clone());
                 }
             }
         }
@@ -1318,22 +1471,24 @@ impl Checker {
         if kind == AsyncKind::TcgenCommit {
             // tcgen05.commit carries an implicit fence::before_thread_sync
             // for its issuing thread.
-            self.fence(warp, lanes, FenceKind::TcgenBefore, epoch);
+            self.fence(warp, lanes, FenceKind::TcgenBefore, site, epoch);
         }
         let w = &self.warps[warp as usize];
         let mut k = w.publication(lanes, epoch, &self.memo);
-        let mut g2t_ranges = Vec::new();
-        for c in lanes.lanes8() {
+        let mut g2t_ranges: Arc<Vec<(AllocId, Range<u64>, Clock)>> = Arc::new(Vec::new());
+        for (n, c) in lanes.lanes8().enumerate() {
             k.tcgen.join(&w.tcgen[c as usize], &self.memo);
-            g2t_ranges.extend(w.g2t_ranges[c as usize].iter().cloned());
+            if n == 0 {
+                g2t_ranges = w.g2t_ranges[c as usize].clone(); // shared, not copied
+            } else if !w.g2t_ranges[c as usize].is_empty() {
+                Arc::make_mut(&mut g2t_ranges).extend(w.g2t_ranges[c as usize].iter().cloned());
+            }
         }
         let mut pred_idx = Vec::new();
         for p in preds {
             let Some(pi) = self.async_index.get(&p).copied() else {
-                if !self.reclaimed.contains(&p) {
-                    self.report.incomplete.push(Incomplete::UnknownAsyncOp { op: p });
-                }
-                // A reclaimed op completed and left no witness behind.
+                // Not live: completed and reclaimed (no witness left), or
+                // unknown. Either way adding no ordering is conservative.
                 continue;
             };
             let pa = &self.asyncs[pi];
@@ -1359,7 +1514,8 @@ impl Checker {
                     site,
                     kind,
                     k: Knowledge::default(),
-                    g2t_ranges: Vec::new(),
+                    g2t_ranges: Arc::new(Vec::new()),
+                    completed_ctas: Vec::new(),
                     preds: Vec::new(),
                     footprint: Vec::new(),
                     done: 0,
@@ -1379,6 +1535,7 @@ impl Checker {
         slot.kind = kind;
         slot.k = k;
         slot.g2t_ranges = g2t_ranges;
+        slot.completed_ctas.clear();
         slot.preds = pred_idx;
         slot.footprint = footprint;
         slot.done = 0;
@@ -1462,7 +1619,7 @@ impl Checker {
         }
     }
 
-    fn fence(&mut self, warp: WarpId, lanes: LaneMask, kind: FenceKind, epoch: Epoch) {
+    fn fence(&mut self, warp: WarpId, lanes: LaneMask, kind: FenceKind, site: SiteId, epoch: Epoch) {
         match kind {
             FenceKind::AcqRel(scope) | FenceKind::Sc(scope) => {
                 // Acquire half: pending relaxed observations.
@@ -1470,7 +1627,7 @@ impl Checker {
                 let mut keep = Vec::new();
                 for (lane, rel) in pending {
                     if lanes.has(lane) {
-                        self.acquire_rel(warp, one_lane(lane), scope, &rel);
+                        self.acquire_rel(warp, one_lane(lane), scope, &rel, site);
                     } else {
                         keep.push((lane, rel));
                     }
@@ -1484,8 +1641,8 @@ impl Checker {
                         let incoming: Vec<Arc<Knowledge>> = self
                             .sc
                             .iter()
-                            .filter(|((ow, ol), (os, _))| (*ow, *ol) != (warp, c) && self.covers(*os, *ow, warp) && self.covers(scope, warp, *ow))
-                            .map(|(_, (_, k))| k.clone())
+                            .filter(|((ow, ol, os), _)| (*ow, *ol) != (warp, c) && self.covers(*os, *ow, warp) && self.covers(scope, warp, *ow))
+                            .map(|(_, k)| k.clone())
                             .collect();
                         for k in incoming {
                             self.warps[warp as usize].acquire(one_lane(c), &k, &self.memo);
@@ -1493,14 +1650,17 @@ impl Checker {
                     }
                     for c in lanes.lanes8() {
                         let k = Arc::new(self.warps[warp as usize].publication(one_lane(c), epoch, &self.memo));
-                        self.sc.insert((warp, c), (scope, k));
+                        // Latest fence per (thread, scope): a later fence of the
+                        // same thread and scope covers the earlier one, but a
+                        // narrower later fence must not hide a wider one.
+                        self.sc.insert((warp, c, scope), k);
                     }
                 }
                 // Release half: the head a later relaxed strong write carries.
                 let w = &mut self.warps[warp as usize];
                 for c in lanes.lanes8() {
                     let k = w.publication(one_lane(c), epoch, &self.memo);
-                    w.fence_rel[c as usize] = Some(Arc::new(Rel { k, scope: Some(scope), warp }));
+                    w.fence_rel[c as usize] = Some(Arc::new(Rel { k, scope: Some(scope), warp, site }));
                 }
             }
             FenceKind::ProxyAsync(dom) => {
@@ -1509,44 +1669,51 @@ impl Checker {
                 self.snapshot_hb_into(warp, lanes, &slots);
             }
             FenceKind::TensormapRelease(scope) => {
-                let s = TSLOT + scope_index(scope);
-                self.bridge_rows(warp, lanes, &[s], epoch);
-                self.snapshot_hb_into(warp, lanes, &[s]);
+                // One head per releasing lane: (this warp, scope, what the
+                // lane knows now, own lanes exact).
+                let heads: Vec<(u8, Clock)> = {
+                    let w = &self.warps[warp as usize];
+                    lanes.lanes8().map(|c| (c, w.publication(one_lane(c), epoch, &self.memo).hb)).collect()
+                };
+                let memo = &self.memo;
+                let w = &mut self.warps[warp as usize];
+                for (c, hb) in heads {
+                    let x = w.extra[c as usize].get_or_insert_with(Default::default);
+                    join_tmap(&mut x.tmap_rel, &Some(Arc::new(vec![(warp, scope, hb)])), memo);
+                }
             }
             FenceKind::TensormapAcquire { scope, alloc, range } => {
-                // Per acquiring lane: every release that reached it whose
-                // releaser and this acquire mutually include each other.
-                let nw = self.topo.num_warps();
+                // Keep the heads whose releasing fence and this acquire
+                // mutually include each other's thread (review S6: filter by
+                // the releaser, not by each component's own actor).
                 let topo = self.topo;
-                let warp_of = |a: ActorId| if a < nw { a } else { self.asyncs[(a - nw) as usize].warp };
                 let mut acquired = Vec::new();
                 {
                     let w = &self.warps[warp as usize];
                     for c in lanes.lanes8() {
+                        let mut heads = w.base.tmap_rel.clone();
+                        if let Some(x) = &w.extra[c as usize] {
+                            join_tmap(&mut heads, &x.tmap_rel, &self.memo);
+                        }
                         let mut t = Clock::default();
-                        for (si, rs) in SCOPES.iter().enumerate() {
-                            let mut r = w.base.tmap_rel[si].clone();
-                            if let Some(x) = &w.extra[c as usize] {
-                                r.join(&x.tmap_rel[si], &self.memo);
+                        for (rw, rs, clk) in heads.iter().flat_map(|h| h.iter()) {
+                            if *rs >= required_scope(&topo, *rw, warp) && scope >= required_scope(&topo, warp, *rw) {
+                                t.join(clk, &self.memo);
                             }
-                            if let Some(br) = &w.bridge_rows {
-                                let own = br[TSLOT + si][c as usize];
-                                if own.iter().any(|x| *x != 0) {
-                                    r.raise_lanes(w.actor, &own);
-                                }
-                            }
-                            let f = r.filter(|a| {
-                                let aw = warp_of(a);
-                                *rs >= required_scope(&topo, aw, warp) && scope >= required_scope(&topo, warp, aw)
-                            });
-                            t.join(&f, &self.memo);
                         }
                         acquired.push((c, t));
                     }
                 }
+                let memo = &self.memo;
                 let w = &mut self.warps[warp as usize];
                 for (c, t) in acquired {
-                    w.g2t_ranges[c as usize].push((alloc, range.clone(), t));
+                    let v = Arc::make_mut(&mut w.g2t_ranges[c as usize]);
+                    match v.iter_mut().find(|(al, r, _)| *al == alloc && *r == range) {
+                        Some((_, _, k)) => {
+                            k.join(&t, memo);
+                        }
+                        None => v.push((alloc, range.clone(), t)),
+                    }
                 }
             }
             FenceKind::TcgenBefore => {
@@ -1595,22 +1762,23 @@ impl Checker {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn wait_verdicts(&mut self, warp: WarpId, lanes: LaneMask, alloc: AllocId, range: Range<u64>, scope: Scope, accepted: &[u64], observed: u32) {
-        let Some(wi) = self.words.iter().position(|w| w.alloc == alloc && w.range == range) else {
-            self.report.incomplete.push(Incomplete::WaitExitUnproven { warp });
+    fn wait_verdicts(&mut self, warp: WarpId, lanes: LaneMask, alloc: AllocId, range: Range<u64>, scope: Scope, accepted: &[u64], observed: u32, site: SiteId) {
+        let Some(wi) = self.words.get(&alloc).and_then(|ws| ws.iter().position(|w| w.range == range)) else {
+            self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
         };
         // Earliest predicate-accepted history entry: schedule independent.
         let first = accepted.iter().enumerate().find(|(_, b)| **b != 0).map(|(i, b)| i as u32 * 64 + b.trailing_zeros());
         let Some(mut idx) = first else {
-            self.report.incomplete.push(Incomplete::WaitExitUnproven { warp });
+            self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
         };
         if idx == 0 {
             return; // the launch value satisfied the predicate: no edge owed
         }
-        let Some(e) = self.words[wi].history.get(idx as usize - 1) else {
-            self.report.incomplete.push(Incomplete::WaitExitUnproven { warp });
+        let word = &self.words[&alloc][wi];
+        let Some(e) = word.history.get(idx as usize - 1) else {
+            self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
         };
         if e.is_async {
@@ -1622,58 +1790,84 @@ impl Checker {
                 return;
             }
         }
-        let Some(heads) = self.words[wi].history.get(idx as usize - 1).and_then(|e| e.rel.clone()) else {
+        let word = &self.words[&alloc][wi];
+        let Some(heads) = word.history.get(idx as usize - 1).and_then(|e| e.rel.clone()) else {
             return; // plain publication: no edge, later reads race
         };
         for rel in heads.iter() {
-            self.acquire_rel(warp, lanes, scope, rel);
+            self.acquire_rel(warp, lanes, scope, rel, site);
         }
     }
 
     // ------------------------------------------------------------- GC --
 
     /// View-aware dominated-frontier GC plus async-slot reclaim.
+    ///
+    /// The meet is taken per reach: shared memory and TMEM of a cluster can
+    /// only be accessed by that cluster's warps (plus in-flight async ops),
+    /// so a CTA's witnesses retire without waiting for unrelated CTAs or
+    /// later waves (review R5); global memory uses every live actor.
     pub fn gc(&mut self) {
         self.since_gc = 0;
         self.stats.gc_runs += 1;
-        // Meet of what every live actor knows, per view. Lane extras only
-        // add knowledge, so `base` is a sound lower bound for a warp; the
-        // per-lane tcgen views are met lane by lane.
-        let mut meet: Option<Knowledge> = None;
-        let mut fold = |k: &Knowledge, tcgen: Clock| {
-            let m = meet.get_or_insert_with(|| {
-                let mut x = k.clone();
-                x.tcgen = tcgen.clone();
-                x
-            });
-            m.hb = m.hb.meet(&k.hb);
-            for d in 0..NDOM {
-                m.g2a[d] = m.g2a[d].meet(&k.g2a[d]);
-                m.a2g[d] = m.a2g[d].meet(&k.a2g[d]);
+        fn fold(meet: &mut Option<Knowledge>, k: &Knowledge, tcgen: &Clock) {
+            match meet {
+                None => {
+                    let mut x = k.propagating();
+                    x.tcgen = tcgen.clone();
+                    x.g2t = k.g2t.clone();
+                    *meet = Some(x);
+                }
+                Some(m) => {
+                    m.hb = m.hb.meet(&k.hb);
+                    for d in 0..NDOM {
+                        m.g2a[d] = m.g2a[d].meet(&k.g2a[d]);
+                        m.a2g[d] = m.a2g[d].meet(&k.a2g[d]);
+                    }
+                    m.g2t = m.g2t.meet(&k.g2t);
+                    m.tcgen = m.tcgen.meet(tcgen);
+                }
             }
-            m.g2t = m.g2t.meet(&k.g2t);
-            m.tcgen = m.tcgen.meet(&tcgen);
-        };
+        }
+        fn meet2(a: &Option<Knowledge>, b: &Option<Knowledge>) -> Option<Knowledge> {
+            match (a, b) {
+                (None, x) | (x, None) => x.clone(),
+                (Some(a), Some(b)) => {
+                    let mut m = Some(a.clone());
+                    fold(&mut m, b, &b.tcgen);
+                    m
+                }
+            }
+        }
+        // Lane extras only add knowledge, so `base` is a sound lower bound
+        // for a warp; per-lane tcgen views are met lane by lane.
+        let mut async_meet: Option<Knowledge> = None;
+        for a in self.asyncs.iter().filter(|a| a.in_use && a.done < 2 && a.kind != AsyncKind::TcgenCommit) {
+            fold(&mut async_meet, &a.k, &a.k.tcgen);
+        }
+        let ncl = (self.topo.num_ctas / self.topo.ctas_per_cluster.max(1)).max(1) as usize;
+        let mut cluster_meet: Vec<Option<Knowledge>> = vec![None; ncl];
+        let mut any_live = vec![false; ncl];
         for w in self.warps.iter().filter(|w| !w.done) {
+            let cl = (self.topo.cluster_of(w.actor) as usize).min(ncl - 1);
             let mut t = w.tcgen[0].clone();
             for l in 1..32 {
                 t = t.meet(&w.tcgen[l]);
             }
-            fold(&w.base, t);
+            fold(&mut cluster_meet[cl], &w.base, &t);
+            any_live[cl] = true;
         }
-        for a in self.asyncs.iter().filter(|a| a.in_use && a.done < 2 && a.kind != AsyncKind::TcgenCommit) {
-            fold(&a.k, a.k.tcgen.clone());
+        let mut global_meet: Option<Knowledge> = async_meet.clone();
+        for m in &cluster_meet {
+            global_meet = meet2(&global_meet, m);
         }
-        let Some(meet) = meet else { return };
-        let fully_dead = |w: &Witness, space: Space| {
-            future_proxies(space).iter().all(|pc| meet.view(select_view(w.proxy(), *pc, w.domain())).observes(w.stamp, w.lane()))
-        };
-        let same_proxy_dead = |w: &Witness| meet.view(select_view(w.proxy(), w.proxy(), w.domain())).observes(w.stamp, w.lane());
-        let dead_in_seen = |w: &Witness, seen: u8| {
-            [Proxy::Async, Proxy::TensorMap, Proxy::ReadOnly, Proxy::Tcgen]
-                .iter()
-                .filter(|p| seen & proxy_bit(**p) != 0)
-                .all(|pc| meet.view(select_view(w.proxy(), *pc, w.domain())).observes(w.stamp, w.lane()))
+        let any_global = global_meet.is_some();
+        let cluster_meet: Vec<Option<Knowledge>> = cluster_meet.iter().map(|m| meet2(m, &async_meet)).collect();
+        let ctas_per_cluster = self.topo.ctas_per_cluster.max(1);
+        // `None` meet with nobody live: nothing can access it any more.
+        let dead_in = |meet: &Option<Knowledge>, live: bool, w: &Witness, pcs: &[Proxy]| match meet {
+            None => !live,
+            Some(m) => pcs.iter().all(|pc| m.view(select_view(w.proxy(), *pc, w.domain())).observes(w.stamp, w.lane())),
         };
         let mut retired = 0u64;
         let mut live_actors: HashSet<ActorId> = HashSet::new();
@@ -1681,6 +1875,18 @@ impl Checker {
         let mut allocs = std::mem::take(&mut self.allocs);
         for alloc in allocs.values_mut() {
             let (space, seen) = (alloc.space, alloc.seen);
+            let (meet, live) = match space {
+                Space::Shared | Space::Tmem => {
+                    let cl = ((alloc.cta / ctas_per_cluster) as usize).min(ncl - 1);
+                    (&cluster_meet[cl], any_live[cl] || async_meet.is_some())
+                }
+                _ => (&global_meet, any_global),
+            };
+            let seen_proxies: Vec<Proxy> =
+                [Proxy::Async, Proxy::TensorMap, Proxy::ReadOnly, Proxy::Tcgen].into_iter().filter(|p| seen & proxy_bit(*p) != 0).collect();
+            let fully_dead = |w: &Witness| dead_in(meet, live, w, future_proxies(space));
+            let same_proxy_dead = |w: &Witness| dead_in(meet, live, w, &[w.proxy()]);
+            let dead_in_seen = |w: &Witness| dead_in(meet, live, w, &seen_proxies);
             let mut folded: Vec<Witness> = Vec::new();
             alloc.shadow.retain_mut(|cell| {
                 let last = cell.writes.last().map(|e| e.w);
@@ -1692,7 +1898,7 @@ impl Checker {
                     if pinned {
                         return true;
                     }
-                    if fully_dead(w, space) {
+                    if fully_dead(w) {
                         retired += 1;
                         return false;
                     }
@@ -1700,7 +1906,7 @@ impl Checker {
                     // live actor's hb observes them, any view carrying a
                     // later generation of the slot was snapshotted after
                     // that, so it observes the old stamp as well.
-                    if w.proxy() == Proxy::Generic && space != Space::Tmem && same_proxy_dead(w) && dead_in_seen(w, seen) {
+                    if w.proxy() == Proxy::Generic && space != Space::Tmem && same_proxy_dead(w) && dead_in_seen(w) {
                         folded.push(*w);
                         retired += 1;
                         return false;
@@ -1721,39 +1927,61 @@ impl Checker {
             for w in folded {
                 let info = self.info(&w);
                 let (lo, hi) = w.span(&self.wide);
-                let key = (w.stamp.actor(), w.lane(), w.writes(), domain_code(w.domain()), lo >> 12);
-                let e = alloc.retired.entry(key).or_insert_with(|| RetiredGeneric {
-                    stamp: w.stamp,
-                    lane: w.lane(),
-                    write: w.writes(),
-                    domain: w.domain(),
-                    lo,
-                    hi,
-                    info: info.clone(),
-                });
-                if w.stamp.epoch() >= e.stamp.epoch() {
-                    e.stamp = w.stamp;
+                let page = lo >> 12;
+                alloc.retired_span_pages = alloc.retired_span_pages.max((hi.saturating_sub(1) >> 12) - page);
+                let key = (page, w.stamp.actor(), w.lane(), w.writes(), domain_code(w.domain()));
+                let e = alloc.retired.entry(key).or_insert_with(|| RetiredGeneric { w, lo, hi, info: info.clone() });
+                if w.stamp.epoch() >= e.w.stamp.epoch() {
                     e.info = info;
+                    e.w = w;
                 }
-                e.lo = e.lo.min(lo);
-                e.hi = e.hi.max(hi);
+                if lo < e.lo || hi > e.hi {
+                    e.lo = e.lo.min(lo);
+                    e.hi = e.hi.max(hi);
+                    alloc.retired_span_pages = alloc.retired_span_pages.max((e.hi.saturating_sub(1) >> 12) - page);
+                }
+                let kind = if e.w.writes() { AccessKind::Write } else { AccessKind::Read };
+                e.w = Witness::pack(e.w.stamp, e.w.lane(), Proxy::Generic, e.w.domain(), kind, None, false, (e.lo, e.hi), &mut self.wide);
                 e.info.span = e.lo..e.hi;
             }
         }
         self.allocs = allocs;
         self.stats.witnesses_retired += retired;
+        // Declared-word history: a release whose payload every live actor
+        // already holds adds nothing when acquired; drop the payload, keep
+        // the index (verdict bitsets index absolute positions).
+        if let Some(m) = &global_meet {
+            for words in self.words.values_mut() {
+                for word in words.iter_mut() {
+                    for e in word.history.iter_mut() {
+                        let useless = e.rel.as_ref().is_some_and(|h| {
+                            h.iter().all(|r| {
+                                r.k.hb.leq(&m.hb, &self.memo)
+                                    && (0..NDOM).all(|d| r.k.g2a[d].leq(&m.g2a[d], &self.memo) && r.k.a2g[d].leq(&m.a2g[d], &self.memo))
+                                    && r.k.tcgen_rel.is_empty()
+                                    && r.k.tmap_rel.is_none()
+                            })
+                        });
+                        if useless {
+                            e.rel = None;
+                            e.consumed = true;
+                        }
+                    }
+                }
+            }
+        }
         // Async-slot reclaim: completed ops with no witness left.
         for i in 0..self.asyncs.len() {
             let a = &self.asyncs[i];
             if a.in_use && a.done >= 2 && !live_actors.contains(&a.actor) {
                 let op = a.op;
                 self.async_index.remove(&op);
-                self.reclaimed.insert(op);
                 let a = &mut self.asyncs[i];
                 a.in_use = false;
                 a.gen_base += 2; // next generation starts above every old epoch
                 a.k = Knowledge::default();
-                a.g2t_ranges.clear();
+                a.g2t_ranges = Arc::new(Vec::new());
+                a.completed_ctas.clear();
                 a.preds.clear();
                 a.footprint.clear();
                 self.free_slots.push(i);

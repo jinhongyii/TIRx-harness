@@ -110,6 +110,21 @@ that a future change is caught.
 | I7 | `wait_until` verdicts | One verdict per wait (G: per lane, conjunctive plan) | Per lane group. Each group's earliest accepted write gives that group's edge. | §8.9.4 (contract review item 6) |
 | I8 | Tensormap acquire | Descriptor-generation frontiers, scope checked | Release snapshots per scope. The acquire keeps only releasers whose scope mutually includes it, and only for the acquired byte range. A TMA's descriptor read is checked per acquired range. | §9.7.15.4 |
 
+## Review fixes (`checker-review.md`)
+
+| ID | Change | Before (committed core) | New | Basis |
+| --- | --- | --- | --- | --- |
+| V1 | Frontier eviction across window or proxy (S2) | A `shared::cta` store evicted a `shared::cluster` store, so an X2 race was lost | Eviction requires the same proxy and the same window | X2, §9.7.15.4 |
+| V2 | `scope: None` on an mbarrier or cluster barrier (S3) | Unconditional HB | `SyncQualifierUnknown`, no edge | R4/R5 |
+| V3 | Declared-word history numbering (S4) | Per lane, first overlapping word only | Per `(Access, lane)`, lanes ascending, for every overlapping word (README decision 14) | contract |
+| V4 | Tensormap acquire filter (S6) | Filtered by each component's actor | Filtered by the releasing fence's warp and scope | §8.9.4 |
+| V5 | Failed mbarrier scope check (S7, F2) | Silent, so it surfaced as an unlabelled race | `ScopeMismatch` with sites, one per site pair, with a count | R4 |
+| V6 | `CrossCtaAsyncOrder` (F1) | Every multicast or 2-CTA consumer | Only when the consumer CTA did not observe the prior op's completion | §8.9.5, §9.7.15.16.19 |
+| V7 | `fence.sc` history (F3) | Latest per thread | Latest per `(thread, scope)` | §8.9.3 |
+| V8 | Zero-length span (R7) | `OutOfBounds` | Skipped | — |
+| V9 | Events of another kernel | Merged | `KernelMismatch` (incomplete) | contract |
+| V10 | Repeated incompletes (R2) | One entry each | One entry with an occurrence count | — |
+
 ## Known gaps (not deltas yet)
 
 - **CTA-parallel inbox-drain merge.** The scheduler is single-threaded today,

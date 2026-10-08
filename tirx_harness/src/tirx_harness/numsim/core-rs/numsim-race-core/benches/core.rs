@@ -163,6 +163,7 @@ fn checker_loop(c: &mut Criterion) {
             for &l in &lanes {
                 let off = (w as u64 * 32 + l as u64) * 16;
                 ev.push(Event::Access(Access {
+                    seq: 0,
                     who: Who::Lane { warp: w, lane: l, epoch: epoch[w as usize] },
                     alloc: AllocId(1),
                     range: off..off + 16,
@@ -179,11 +180,11 @@ fn checker_loop(c: &mut Criterion) {
         }
         for w in 0..4u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: it as u64, release: Some(true), scope: None, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: it as u64, release: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
         }
         for w in 0..4u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: it as u64, acquire: Some(true), scope: None, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: it as u64, acquire: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
         }
     }
     let n = ev.len();
@@ -206,6 +207,7 @@ fn checker_readers(c: &mut Criterion) {
             epoch[w as usize] += 1;
             for l in 0..32u8 {
                 ev.push(Event::Access(Access {
+                    seq: 0,
                     who: Who::Lane { warp: w, lane: l, epoch: epoch[w as usize] },
                     alloc: AllocId(1),
                     range: (l as u64 * 4)..(l as u64 * 4 + 4),
@@ -222,15 +224,16 @@ fn checker_readers(c: &mut Criterion) {
         }
         for w in 0..16u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64, release: Some(true), scope: None, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64, release: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
         }
         for w in 0..16u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64, acquire: Some(true), scope: None, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64, acquire: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
         }
         epoch[0] += 1;
         for l in 0..32u8 {
             ev.push(Event::Access(Access {
+                    seq: 0,
                 who: Who::Lane { warp: 0, lane: l, epoch: epoch[0] },
                 alloc: AllocId(1),
                 range: (l as u64 * 4)..(l as u64 * 4 + 4),
@@ -246,11 +249,11 @@ fn checker_readers(c: &mut Criterion) {
         }
         for w in 0..16u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64 + 1, release: Some(true), scope: None, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64 + 1, release: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
         }
         for w in 0..16u32 {
             epoch[w as usize] += 1;
-            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64 + 1, acquire: Some(true), scope: None, epoch: epoch[w as usize] }));
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64 + 1, acquire: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
         }
     }
     let n = ev.len();

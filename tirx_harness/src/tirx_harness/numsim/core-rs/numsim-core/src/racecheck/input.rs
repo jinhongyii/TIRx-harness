@@ -70,6 +70,9 @@ pub enum Who {
 /// One lane's (or one async side's) contiguous footprint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Access {
+    /// Contract `AccessSeq` of the batch this lane item came from
+    /// (declared-word history numbering is per `(Access, lane)`).
+    pub seq: u64,
     pub who: Who,
     pub alloc: AllocId,
     pub range: Range<u64>,
@@ -111,10 +114,11 @@ pub enum SyncEvent {
     DeclareWord { alloc: AllocId, range: Range<u64> },
     WarpSync { warp: WarpId, mask: LaneMask, epoch: u32 },
     /// `release: None` = qualifier lost in lowering (incomplete).
-    /// `scope: None` = named barrier (participants, no scope).
-    Arrive { warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u64, release: Option<bool>, scope: Option<Scope>, epoch: u32 },
-    Wait { warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u64, acquire: Option<bool>, scope: Option<Scope>, epoch: u32 },
-    Fence { warp: WarpId, lanes: LaneMask, kind: FenceKind, epoch: u32 },
+    /// `scope: None` on a named barrier = participants, no scope; on an
+    /// mbarrier or cluster barrier = qualifier lost (incomplete).
+    Arrive { warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u64, release: Option<bool>, scope: Option<Scope>, site: SiteId, epoch: u32 },
+    Wait { warp: WarpId, lanes: LaneMask, obj: SyncObjId, phase: u64, acquire: Option<bool>, scope: Option<Scope>, site: SiteId, epoch: u32 },
+    Fence { warp: WarpId, lanes: LaneMask, kind: FenceKind, site: SiteId, epoch: u32 },
     AsyncIssue {
         op: AsyncId,
         warp: WarpId,
@@ -137,6 +141,7 @@ pub enum SyncEvent {
         /// lane-wise conjunction.
         verdicts: Vec<(LaneMask, Vec<u64>, u32)>,
         pred_reads: Vec<(AllocId, Range<u64>)>,
+        site: SiteId,
         epoch: u32,
     },
 }

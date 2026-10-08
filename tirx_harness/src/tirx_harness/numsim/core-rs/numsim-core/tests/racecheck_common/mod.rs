@@ -95,6 +95,11 @@ pub fn default_scope(obj: &ResourceId) -> Option<Scope> {
     }
 }
 
+/// An mbarrier living in CTA `cta`.
+pub fn mbar_in(cta: u32, n: u32) -> ResourceId {
+    ResourceId::Mbarrier { cta: CtaId(cta), alloc: AllocId(99), offset: n }
+}
+
 pub fn mbar(n: u32) -> ResourceId {
     ResourceId::Mbarrier { cta: CtaId(0), alloc: AllocId(99), offset: n }
 }
@@ -106,6 +111,10 @@ pub struct K {
     spaces: HashMap<AllocId, Space>,
     phase: HashMap<u64, u64>,
     next_op: u64,
+    /// Issuing lane of every single-lane async op (contract: async spans
+    /// name the ISSUING lane; `ALL_LANES` only for warp-collective accesses).
+    issuer_lane: HashMap<u64, u8>,
+    pub kernel: u32,
     pub gc_every: u64,
 }
 
@@ -118,6 +127,8 @@ impl K {
             spaces: HashMap::new(),
             phase: HashMap::new(),
             next_op: 100,
+            issuer_lane: HashMap::new(),
+            kernel: 0,
             gc_every: 1 << 14,
         };
         k.alloc(SMEM, Space::Shared, 4096);
@@ -132,12 +143,20 @@ impl K {
     }
 
     fn sync_ev(&mut self, actor: Actor, lanes: LaneMask, kind: SyncKind) {
-        self.ev.push(Ev::Sync(CSync { kernel: 0, actor, seq: 0, site: SiteId(0), frames: vec![], lanes, kind }));
+        let site = SiteId(self.ev.len() as u32 + 500_000);
+        self.ev.push(Ev::Sync(CSync { kernel: self.kernel, actor, seq: 0, site, frames: vec![], lanes, kind }));
     }
 
     pub fn alloc(&mut self, alloc: AllocId, space: Space, size: u64) {
         self.spaces.insert(alloc, space);
         self.sync_ev(Actor::Host, LaneMask::NONE, SyncKind::AllocBegin { alloc, space, size, cta: CtaId(0) });
+    }
+
+    /// Re-register an allocation as owned by CTA `cta` (GC reach).
+    pub fn alloc_cta(&mut self, alloc: AllocId, cta: u32) {
+        let space = self.spaces[&alloc];
+        let size = if space == Space::Tmem { 1 << 16 } else { 4096 };
+        self.sync_ev(Actor::Host, LaneMask::NONE, SyncKind::AllocBegin { alloc, space, size, cta: CtaId(cta) });
     }
 
     pub fn alloc_end(&mut self, alloc: AllocId) -> &mut Self {
@@ -296,6 +315,7 @@ impl K {
     pub fn issue(&mut self, w: WarpId, lane: u8, kind: AsyncKind, proxy: Proxy, preds: &[AsyncId], footprint: &[(AllocId, Range<u64>)]) -> AsyncId {
         let op = AsyncId(self.next_op);
         self.next_op += 1;
+        self.issuer_lane.insert(op.0, lane);
         let a = self.wactor(w);
         let footprint = footprint.iter().map(|(a, r)| (*a, ByteSpan::new(r.start, r.end - r.start))).collect();
         self.sync_ev(
@@ -356,6 +376,13 @@ impl K {
     }
 
     pub fn aacc(&mut self, op: AsyncId, side: Milestone, kind: AccessKind, proxy: Proxy, alloc: AllocId, r: Range<u64>) -> &mut Self {
+        let lane = self.issuer_lane.get(&op.0).copied().unwrap_or(ALL_LANES);
+        self.aacc_lane(op, side, kind, proxy, alloc, r, lane)
+    }
+
+    /// Async access with an explicit span lane (`ALL_LANES` = warp-collective).
+    #[allow(clippy::too_many_arguments)]
+    pub fn aacc_lane(&mut self, op: AsyncId, side: Milestone, kind: AccessKind, proxy: Proxy, alloc: AllocId, r: Range<u64>, lane: u8) -> &mut Self {
         let window = self.window(alloc);
         self.ev.push(Ev::Access {
             actor: Actor::Async { op, side },
@@ -369,7 +396,7 @@ impl K {
             returns_value: false,
             proxy,
             window,
-            spans: vec![LaneSpan { lane: ALL_LANES, span: ByteSpan::new(r.start, r.end - r.start) }],
+            spans: vec![LaneSpan { lane, span: ByteSpan::new(r.start, r.end - r.start) }],
         });
         self
     }
@@ -387,6 +414,11 @@ impl K {
         self.sync_ev(Actor::Async { op, side: m }, LaneMask::NONE, SyncKind::AsyncComplete { op, milestone: m, target: PublishTarget::Phase { obj: mbar(obj), phase } });
         self
     }
+    pub fn done_phase_r(&mut self, op: AsyncId, m: Milestone, obj: ResourceId, phase: u64) -> &mut Self {
+        self.sync_ev(Actor::Async { op, side: m }, LaneMask::NONE, SyncKind::AsyncComplete { op, milestone: m, target: PublishTarget::Phase { obj, phase } });
+        self
+    }
+
     pub fn done_warp(&mut self, op: AsyncId, m: Milestone, w: WarpId, lanes: u32) -> &mut Self {
         self.sync_ev(
             Actor::Async { op, side: m },
