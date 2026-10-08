@@ -313,6 +313,7 @@ The cost of being observed on e24 fell from ~1.2 s to ~230 ms.
 | In-place tcgen access items; event-buffer lane-span pool; sorted-input sort skip | tcgen.rs, partition.rs, support.rs | `observed_overhead/*/counting` | fp16_bf16_gemm 73 → 62.5 ms; e24 at 16 workers 845 → 606 ms |
 | Register files ≥ 128 KiB zeroed at the warp's first step, on the worker | interp/mod.rs, sched/mod.rs `admit` | `observed_overhead/mega_moe…/noop` | 652 → 379 ms at 16 workers; small files unchanged |
 | Unstable key sort in `emit_accesses`; event-buffer access counter | support.rs, partition.rs | `observed_overhead/fp16_bf16_gemm/counting` | ~1.5% |
+| Incremental `spin_hash`: sum of per-slot hashes, re-hashing only slots written since the last call; every write goes through `WarpState::reg_mut` / `reg_write_raw`, and debug builds recompute the hash from scratch on every call | interp/mod.rs, alu.rs, support.rs, tcgen.rs, mem.rs | `corpus_numsim/kda_backward_packed`, `spin_wait_regs/pad32768_iters1024` | kda_backward_packed (34,649 registers, 8.7 MB per warp) 1.02 s → 0.121 s at 1 worker (legacy: 1.007 s); spin row 27.3 → 16.3 ms; 1d1d 4.24 → 3.97 ms |
 
 Observer-gated fast paths were made observer-independent, so each path is selected by data shape alone and emits the same events: `tcgen_ld` direct copy, `RunImages` under predicate capture, load/store fast paths under word history, `tcgen_st`. The audit table is in the W13 reports.
 
@@ -329,4 +330,6 @@ Observer-gated fast paths were made observer-independent, so each path is select
 - `merge_shard` and `shard_replay_order`: ~3%, on W5's replay/fork-join path.
 - `emit_accesses` copying lane spans into each `Access`: ~5%.
 
-Engine-side, mega_moe is bounded by MMA arithmetic (previous section) and by the full-register-file memcmp of `spin_hash` on poll-only loop ends. Removing that memcmp needs register-write tracking, which is a `value.rs` contract change.
+Engine-side, mega_moe is bounded by MMA arithmetic (previous section). The per-poll register-file scan of `spin_hash` is gone: polls now cost O(written slots).
+
+**Noted, not started: compact register storage.** Mega MoE medium loses per-partition CPU as workers increase: 1.5x at 16 workers and 2.3x at 32 (W2's phase split). The likely cause is cache pressure from ~910 KB per-warp register files: one 64-bit × 32-lane slot per SSA register, with no reuse. Compact register storage (paged or sparse `RegFile`) or slot reuse in lowering would address it. Either needs a `RegFile`/lowering contract change.
