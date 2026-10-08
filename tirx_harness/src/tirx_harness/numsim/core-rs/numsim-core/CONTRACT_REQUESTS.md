@@ -1620,3 +1620,18 @@ truncated log. Current table: `docs/development/v2-conformance-status.md`
 - Minimal reproduction: `msa_sparse_atten_fwd_nvfp4_kv_sm100` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "msa_sparse_atten_fwd_nvfp4_kv_sm100-racecheck"`
 - Observed: TMEM lifetime conflict requires review: the earlier tcgen05.ld may not have completed before the conflicting reuse (read_write conflict on bytes [256..260416) of allocation 17: async_lifetime_not_drai; TMEM lifetime conflict requires review: the earlier tcgen05.ld may not have completed before the conflicting reuse (read_write conflict on bytes [320..260480) of allocation 17: async_lifetime_not_drai
 
+
+## W4-11 (2026-10-08): V2C-32 sub-byte TMA stores
+
+`TmaPlan` gained `global_bits: Vec<TmaBitFragment{global, smem, source_shift,
+target_shift, mask}>` (Default empty): masked partial-byte global writes of a
+sub-byte store (packed FP4 E2M1, U6), from legacy `plan_tiled_s2g` /
+`apply_s2g_copy`. **W2**: for `Store` plans apply the byte spans first, then
+each fragment `g = (g & !(mask << target_shift)) | (((s >> source_shift) &
+mask) << target_shift)` with `s` = shared byte at `smem`, `g` = global byte at
+`global` (each is a 1-byte global write/read-modify-write and a 1-byte shared
+read for the observer). Packed FP4 stores have *only* fragments (every
+element is a nibble). The 16-byte-aligned padded FP4 layout has no
+shared-to-global copy in PTX; legacy rejected it and so does `tma_plan_dir`
+(`Invalid`, "align16 padded FP4 TensorMap does not support shared-to-global
+Tensor Copy"). Scatter4 of sub-byte types stays `Unsupported` (no legacy).

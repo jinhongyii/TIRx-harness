@@ -556,6 +556,23 @@ pub struct TmaPlan {
     /// rounded f32 -> tf32 on landing (NaN -> `0x7fffe000`); see
     /// [`tma_tf32_round`].
     pub tf32_round: bool,
+    /// Store of a sub-byte map (FP4 packed/padded, U6): masked partial-byte
+    /// global writes, applied after the byte spans:
+    /// `g = (g & !(mask << target_shift)) | (((s >> source_shift) & mask) << target_shift)`
+    /// with `s` the shared byte at `smem` and `g` the global byte at `global`.
+    pub global_bits: Vec<TmaBitFragment>,
+}
+
+/// One masked sub-byte TMA store write (see [`TmaPlan::global_bits`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TmaBitFragment {
+    /// Global virtual address of the destination byte.
+    pub global: u64,
+    /// Shared-window offset of the source byte.
+    pub smem: u64,
+    pub source_shift: u8,
+    pub target_shift: u8,
+    pub mask: u8,
 }
 
 /// Direction of a TMA plan (`cp.reduce.async.bulk.tensor` plans as `Store`).

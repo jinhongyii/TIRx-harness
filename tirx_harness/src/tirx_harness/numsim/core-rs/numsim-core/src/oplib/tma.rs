@@ -34,7 +34,7 @@
 //!   tiled. An im2col-mode plan on a map without a box uses a zero
 //!   bounding box (lower = upper = 0, `wide` from the mode).
 
-use super::{Im2colBox, OpError, OpResult, TensorMapDesc, TmaFill, TmaPlan, TmaPlanDir};
+use super::{Im2colBox, OpError, OpResult, TensorMapDesc, TmaBitFragment, TmaFill, TmaPlan, TmaPlanDir};
 use crate::arena::ByteSpan;
 use crate::dtype::Dtype;
 use crate::program::{TmaMode, TmapField};
@@ -581,14 +581,29 @@ fn load_plan(
             element_type,
             TensorMapElementType::Tf32 | TensorMapElementType::Tf32Ftz
         ),
+        global_bits: Vec::new(),
     })
 }
 
 fn store_plan(plan: S2gPlan, global_address: u64, smem_offset: u64) -> OpResult<TmaPlan> {
-    if !plan.destination_bits.is_empty() {
-        return Err(OpError::unsupported(
-            "sub-byte (FP4/U6) TMA store fragments are not representable in TmaPlan",
-        ));
+    // Sub-byte stores (legacy `plan_tiled_s2g` / `apply_s2g_copy`): each
+    // fragment's payload byte comes from the source run that covers it.
+    let mut global_bits = Vec::with_capacity(plan.destination_bits.len());
+    for fragment in &plan.destination_bits {
+        let run = plan
+            .source_runs
+            .iter()
+            .find(|r| (r.payload_offset..r.payload_offset + r.byte_len).contains(&fragment.payload_offset))
+            .ok_or_else(|| OpError::invalid("TMA sub-byte store fragment has no shared source byte"))?;
+        let smem = smem_offset + (run.byte_offset + (fragment.payload_offset - run.payload_offset)) as u64;
+        let narrow = |v: usize, what: &str| u8::try_from(v).map_err(|_| OpError::invalid(format!("TMA fragment {what} overflow")));
+        global_bits.push(TmaBitFragment {
+            global: global_address + fragment.byte_offset as u64,
+            smem,
+            source_shift: narrow(fragment.source_shift, "source shift")?,
+            target_shift: narrow(fragment.target_shift, "target shift")?,
+            mask: fragment.mask,
+        });
     }
     let (global, smem, _) = pair_runs(
         &plan.destination_runs,
@@ -600,6 +615,7 @@ fn store_plan(plan: S2gPlan, global_address: u64, smem_offset: u64) -> OpResult<
         global,
         smem,
         bytes: plan.payload_len as u64,
+        global_bits,
         ..TmaPlan::default()
     })
 }

@@ -560,3 +560,57 @@ fn fp4_padded_and_u6_element_types_round_trip() {
     bad.fp4_padded = true;
     assert!(bad.try_encode().is_err());
 }
+
+/// Apply a store plan to byte arrays the way the engine does: byte spans
+/// pairwise in concatenation order, then the masked sub-byte fragments.
+fn apply_store(plan: &TmaPlan, shared: &[u8], global: &mut [u8], va: u64) {
+    let src: Vec<u8> = plan.smem.iter().flat_map(|s| shared[s.start as usize..s.end() as usize].to_vec()).collect();
+    let mut at = 0usize;
+    for g in &plan.global {
+        let off = (g.start - va) as usize;
+        global[off..off + g.len as usize].copy_from_slice(&src[at..at + g.len as usize]);
+        at += g.len as usize;
+    }
+    assert_eq!(at, src.len());
+    for f in &plan.global_bits {
+        let mask = f.mask << f.target_shift;
+        let s = (shared[f.smem as usize] >> f.source_shift) & f.mask;
+        let g = &mut global[(f.global - va) as usize];
+        *g = (*g & !mask) | ((s << f.target_shift) & mask);
+    }
+}
+
+#[test]
+fn fp4_tma_store_matches_the_legacy_planner_packed_and_padded() {
+    use numsim_oplib::tma::{execute_s2g_copy, plan_tiled_s2g};
+    // Packed FP4 stores write every element as a masked nibble (legacy
+    // `append_s2g_bits`); the box is partially out of bounds on the right
+    // (cols 192..320 of 256) and the bottom (rows 2..6 of 4).
+    for padded in [false] {
+        let mut d = desc2d(Dtype::E2M1, [256, 4], 128, [128, 4], 3);
+        d.fp4_padded = padded;
+        let smem_offset = 2048u64;
+        let plan = tma_plan_dir(&d, TmaPlanDir::Store, TmaMode::Tile, &[192, 2], &[], smem_offset).unwrap();
+        assert!(!plan.global_bits.is_empty(), "padded={padded}: expected sub-byte fragments");
+        // Legacy reference over the same layout.
+        let mut image = super::desc_to_image(&d).unwrap();
+        image.host_address = false;
+        image.allocation_id = 0;
+        let layout = image.materialize(image.rank, usize::MAX, VA).unwrap();
+        let reference = plan_tiled_s2g(&layout, &[192, 2], smem_offset as usize).unwrap();
+        let shared: Vec<u8> = (0..16384u32).map(|i| (i.wrapping_mul(37) ^ (i >> 3)) as u8).collect();
+        let global_len = 128 * 4;
+        let mut want = vec![0xa5u8; global_len];
+        execute_s2g_copy(&reference, &shared, smem_offset as usize, &mut want).unwrap();
+        let mut got = vec![0xa5u8; global_len];
+        apply_store(&plan, &shared, &mut got, VA);
+        assert_eq!(got, want, "padded={padded}");
+        assert_ne!(got, vec![0xa5u8; global_len], "the store wrote something");
+    }
+    // The 16-byte-aligned padded FP4 layout has no shared-to-global copy
+    // (PTX; legacy rejected it the same way).
+    let mut d = desc2d(Dtype::E2M1, [256, 4], 128, [128, 4], 3);
+    d.fp4_padded = true;
+    let err = tma_plan_dir(&d, TmaPlanDir::Store, TmaMode::Tile, &[0, 0], &[], 0).unwrap_err();
+    assert!(err.message.contains("padded FP4"), "{err}");
+}
