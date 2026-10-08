@@ -308,6 +308,12 @@ racecheck B1/R4, B7 and T19, and the advisories X4 and P7. The gate asserts thes
 kinds. `medium_moe` and `large_moe` are skipped unless `NUMSIM_PERF_SLOW=1`, because
 the racecheck checker replays serially on the calling thread (racecheck-semantics.md,
 "Merge design and the serial-checker limit"; W5 is working on the actor space).
+This gap is tracked: the fix is the parallel checker planned in
+`docs/development/racecheck-parallel-design.md` (W5), and both workloads get baselines
+once it lands.
+
+Follow-up: re-record every v2 baseline on a quiet host
+(`perf_gate.py --run -n 1 --record`, without `--force`) and then review each limit.
 
 ### Legacy vs v2 corpus comparison
 
