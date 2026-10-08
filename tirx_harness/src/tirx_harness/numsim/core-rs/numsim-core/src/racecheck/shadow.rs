@@ -64,7 +64,8 @@ impl<C: Clone + Default + PartialEq> IntervalShadow<C> {
         if range.start >= range.end {
             return;
         }
-        if let Some((end, cell)) = self.map.get_mut(&range.start) {
+        if !super::tuning::on(&super::tuning::EXACT_HIT) {
+        } else if let Some((end, cell)) = self.map.get_mut(&range.start) {
             if *end == range.end {
                 self.exact_hits += 1;
                 f(range, cell);

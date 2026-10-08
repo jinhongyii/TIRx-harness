@@ -22,6 +22,7 @@ pub mod knowledge;
 pub mod observer;
 pub mod payload;
 pub mod shadow;
+pub mod tuning;
 
 pub use checker::{AdvisoryKind, Checker, Finding as RaceFinding, FindingKind as RaceFindingKind, Incomplete, OrderingFailure, RaceClass, Report as RaceReport, Severity};
 pub use observer::{RaceObserver, RacecheckConfig};

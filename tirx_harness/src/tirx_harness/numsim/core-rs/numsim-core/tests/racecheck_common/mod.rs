@@ -464,6 +464,7 @@ impl K {
         self
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn wait_until(&mut self, w: WarpId, lane: u8, alloc: AllocId, r: Range<u64>, scope: Scope, accepted: u64, observed: u32) -> &mut Self {
         self.wait_until_pred(w, lane, alloc, r, scope, accepted, observed, &[])
     }

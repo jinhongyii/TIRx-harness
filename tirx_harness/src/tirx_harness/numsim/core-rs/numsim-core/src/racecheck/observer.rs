@@ -319,7 +319,7 @@ impl Observer for RaceObserver {
                 // Only weak, non-atomic accesses: a strong or atomic span is
                 // one element whose exact extent decides moral strength.
                 let mut spans: Vec<(u8, Range<u64>)> = a.spans.iter().map(|s| (s.lane, span_range(s.span))).collect();
-                if spans.len() > 1 && scope.is_none() && !a.atomic {
+                if spans.len() > 1 && scope.is_none() && !a.atomic && super::tuning::on(&super::tuning::ASYNC_SPAN_MERGE) {
                     spans.sort_unstable_by_key(|(l, r)| (*l, r.start));
                     let mut out: Vec<(u8, Range<u64>)> = Vec::with_capacity(spans.len());
                     for (l, r) in spans {

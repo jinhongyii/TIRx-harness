@@ -292,7 +292,8 @@ impl Frontier {
     #[inline]
     pub fn record(&mut self, new: Entry, wide: &WideSpans, mut observed: impl FnMut(&Witness) -> bool) {
         let nw = new.w;
-        let mut evict = |p: &Witness| nw.subsumes_contract(p, wide) && (p.same_event(&nw) || observed(p));
+        let eviction = super::tuning::on(&super::tuning::FRONTIER_EVICTION);
+        let mut evict = |p: &Witness| eviction && nw.subsumes_contract(p, wide) && (p.same_event(&nw) || observed(p));
         match self {
             Frontier::Empty => *self = Frontier::One(new),
             Frontier::One(prior) => {

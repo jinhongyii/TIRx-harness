@@ -2,19 +2,18 @@
 orphan: true
 ---
 
-# Racecheck semantics (legacy extraction + unified-core spec)
+# Racecheck semantics (v2 core spec, with the legacy behaviour it replaced)
 
-Status: draft, 2026-10-07, branch `refactor/clean-core`. Worker W5.
-Revised after the PTX rulings in `racecheck-isa-answers.md` (R1–R9). Every
-behaviour change vs legacy is listed in `racecheck-behaviour-deltas.md`.
+Status: final for the v2 core (2026-10-08), branch `refactor/clean-core`. Worker W5.
+Rules are justified in `racecheck-isa-answers.md` (R1–R10); every behaviour change vs
+legacy is a row in `racecheck-behaviour-deltas.md`. The implementation is
+`tirx_harness/src/tirx_harness/numsim/core-rs/numsim-core/src/racecheck/` (abbreviated
+`checker.rs`, `cell.rs`, `clock.rs`, `knowledge.rs`, `shadow.rs`, `observer.rs`,
+`payload.rs`, `tuning.rs` below); §3.1 maps every HB rule to the function that implements
+it and to its ISA answer.
 
-This document has two jobs:
-
-1. Pin down what the legacy racecheck **actually does**, with citations, so that
-   the rewrite can be judged against it. Section 9 lists the places where the
-   legacy behaviour looks unjustified or contradictory.
-2. Specify the unified core in plan §2.5. The standalone prototype lives at
-   `tirx_harness/src/tirx_harness/numsim/core-rs/numsim-race-core/`.
+The legacy columns cite the legacy engine (to be deleted) so a reviewer can compare;
+they are not a spec.
 
 **Path abbreviations.** All paths are relative to
 `tirx_harness/src/tirx_harness/numsim/engine-rs/src/`.
@@ -34,39 +33,6 @@ This document has two jobs:
 | **CR** | `numsim/checker_report.py` |
 
 Line numbers are for `c3eac62` plus the working tree at the time of writing.
-
----
-
-## 0. Corrections to the redesign plan
-
-Each correction was verified in the code.
-
-1. **A shared-memory or TMEM race does abort the operation.** The plan's section 0
-   says "`findings.push` 后继续 (`race_check.rs:3165`)". That is wrong for the RS
-   path:
-   - RC:3163-3167 pushes the finding and then runs
-     `return Err(EngineError::message(..))`.
-   - The engine propagates that error with `?` (KE:2149, KE:1257).
-   - All eleven RS `findings.push` sites behave this way: RC:3165, 3357, 3542,
-     3962, 4276, 4430, 4869, 4951, 6122, 6487, 6668.
-   - Only **global** races continue. `GlobalRaceShared::insert_finding` (G:5149,
-     G:9495) aggregates the finding and lets execution go on.
-
-   Consequence: today an RS run reports at most one shared-memory or TMEM race.
-   The RS write rule "a plain write clears every reader" (RS:5823-5825) is sound
-   *only because* of this fail-fast behaviour. The new core never aborts, so it
-   must not clear readers unconditionally (see §2.6).
-2. **The `wait_until` rule is "earliest accepted write *after the already-observed
-   prefix*", not a full-history scan.**
-   - In `declared_word_candidates`, `skip` is the `take_while` prefix of history
-     entries whose carrier epoch the waiter already covers (G:8718-8737).
-   - The engine scans from `skip` (KE:3263-3269).
-   - The fallback to the observed `current_version` (G:8784-8852) is gated only
-     on `accepted == None && !satisfied_on_entry`. That gate covers async
-     publications, but also truncated histories, wide (b128) strong writes, plain
-     writes and launch-value exits.
-   - The plan's statement is the *intended* rule. Section 5 adopts it, with the
-     fallback restricted to async publications as the plan says.
 
 ---
 
@@ -144,8 +110,7 @@ Each correction was verified in the code.
 
 ### 2.4 Morally-strong exemption
 
-The two shadows apply different rules. This is a genuine semantic difference
-(see §8).
+The two legacy shadows applied different rules; the core has one (below).
 
 **RS, `atomic_modification_order_pair` (RS:5995-6027).** A pair is exempt if
 either holds:
@@ -260,12 +225,12 @@ the exact segment belongs to the current operation.
   5847-5849, 5480-5482). RMW and strong writes do not clear reads.
 - Non-exact geometry collapses the whole span to a fresh state holding only the
   new witness (RS:6726-6748, 6853-6871, 7176-7190), for any `kind.writes()`.
-  This is a bug for RMW (§9).
+  This was a bug for RMW (deltas R1).
 
 **G** (`GlobalFrontiers`, G:3394-3804):
 - There is one entry per frontier actor (lane or async lease).
 - `insert` replaces the actor's previous entry **regardless of semantics**
-  (G:3446-3456, 3682-3683). This is a bug (§9).
+  (G:3446-3456, 3682-3683). This was a bug (deltas R1/R6).
 - A write removes only its own actor's reader entry (G:3786).
 - Non-atomic supersession requires the same kind, the same semantics and HB
   (G:3793-3804).
@@ -359,7 +324,7 @@ The "Core" column names the unified-core event and rule.
 | 3 | `bar.warp.sync`, `__syncwarp`, `tcgen05.alloc.sync.aligned` | LO release+acquire(mask) (RC:1332-1347); WC collapses only PB lanes (RS:9292-9306); GL `release_mask` (G:8149-8174); TG mask (RC:8226-8291). Emitted at KE:1878-1891 | `WarpSync{mask}` |
 | 4 | `ldmatrix` / `stmatrix .sync.aligned` | LO + PB collapse before and after the access; **not** GL/TG (RC:8293-8310; KE:3531-3592) | producer emits `WarpSync` before and after |
 | 5 | `shfl`, `vote`, `match`, `redux`, `mma.sync` | **no edge** | none |
-| 6 | `grid.sync` | **no edge** (KE:1892-1896) | open (§10) |
+| 6 | `grid.sync` | **no edge** (KE:1892-1896) | `Arrive`/`Wait` on `ResourceId::Grid`, release/acquire at `.gpu` |
 | 7 | `bar.sync` / `bar.red` / `bar.arrive` (named barrier, generation g) | arrive: WC release masked, LO release, TG publish into `named_barrier_*[(id, g)]`; resume: acquire (RC:5548-5699). GL: lane clock **replaced** by the payload (G:8263-8327, 8559-8580). No scope (implicitly CTA) | `Arrive{release: Some(true), scope: None}` for every participant; `Wait` only for `sync`/`red`. An `arrive`-only thread gets no acquire (R5, §8.9.4) |
 | 8 | `barrier.cluster.arrive[.release/.relaxed]` → `wait[.acquire]` | TG always; memory payload only if `publishes_memory` (RC:5701-5787); a missing payload in A is treated as relaxed (RC:6933-6936); GL (G:8329-8399) | defaults release/acquire at `.cluster` (§9.7.15.3); a qualifier lost in lowering (`None`) → `SyncQualifierUnknown` incomplete, never assumed relaxed |
 | 9 | `mbarrier.arrive` (release) → successful wait on the same generation | WC/LO/TG into `barrier_*_payloads[(bar, g)]`; waiter: TG always, copy payload always, WC+LO **only if `has_acquire`** (RC:5240-5395, 1919-1956); GL (G:8190-8261). **No scope field** (SY:387-394, 626-632) | `Phase.arrivals` keep the arriver and its scope (default `.release.cta`). The waiter (default `.acquire.cta`) acquires an arrival only if the scopes mutually include each other (R4, §8.9.4). A `.relaxed` wait parks arrivals **and** completions in `pending_acq` until a later `fence.acquire`/`acq_rel` (§8.8) |
@@ -371,7 +336,7 @@ The "Core" column names the unified-core event and rule.
 | 15 | Group milestones `SourceReadComplete` / `FullComplete` | `advance_async_actor`; accesses committed at the new token clock; implicit a2g (RC:6040-6160, 6591-6818) | read-side accesses stamped epoch 1, write-side epoch 2 |
 | 16 | `cp.async.wait_group`, `cp.async.bulk.wait_group[.read]` | WC `barrier_acquire_masked` of the members' milestone clocks; `.read` → `source_read`. **The full token clock includes issuer history**; no LO acquire (RC:5092-5153). GL `acquire_async_token` (G:7511-7545) | `AsyncComplete{Warp{lanes}}`, **per lane** (ISA Q7); `.read` gives `Milestone::Read` only |
 | 17 | `cp.async.mbarrier.arrive[.noinc]` | arrival payload = completed copy actors of that `(warp, lane)` only, flagged `copy_completion` (RC:5792-5844, 6760-6800; G:7481-7509) | `AsyncComplete{Phase}` per copy |
-| 18 | `tcgen05.{mma,cp,shift,ld,st}` issue | token = lane-acquired WC with uncompleted TCGEN components **cleared** ⊔ pipeline predecessor (only if every active lane has one) (RC:4316-4482, 2009-2061; RS:8461-8501). Pipeline pairs: TF:46-65 | `AsyncIssue{kind}`; `k.tcgen` = the warp's `tcgen` view ⊔ the producer-resolved `preds` |
+| 18 | `tcgen05.{mma,cp,shift,ld,st}` issue | token = lane-acquired WC with uncompleted TCGEN components **cleared** ⊔ pipeline predecessor (only if every active lane has one) (RC:4316-4482, 2009-2061; RS:8461-8501). Pipeline pairs: TF:46-65 | `AsyncIssue{kind}`; `k.tcgen` = the warp's `tcgen` view ⊔ the producer-resolved `preds` issued by the **same thread** (PTX ISA §9.7.16.6: pipelines are per thread; a cross-thread pred, such as the engine's per-CTA execution chain, adds nothing, and the fence pair is what orders it) |
 | 19 | `tcgen05.wait::ld/st` | `complete_tcgen_work_set`; WC acquire; `tcgen_wait_frontiers` (RC:5521-5547, 4484-4550) | `AsyncComplete{Warp}` on a tcgen op: the warp's `tcgen` and `tcgen_waited` gain `{T}` |
 | 20 | `tcgen05.commit` → mbarrier | implicit before-fence; marks work complete **at commit issue**; payload = WC release ⊔ commit frontiers ⊔ TG (RC:4569-4593, 5412-5514, 6333-6400). Relaxed waiters get TG only | `AsyncIssue{TcgenCommit, preds}` (an implicit `TcgenBefore`). Completion = the issuer's generic knowledge at commit + `{T}` ⊔ `T.tcgen` for each tracked T. **No a2g** |
 | 21 | `tcgen05.fence::before_thread_sync` | capture commit-bound pipeline frontiers ⊔ fenced ⊔ wait → published, fenced (RC:1669-1757) | `tcgen_rel ⊔= issued ⊔ waited ⊔ tcgen`; `tcgen ⊔= issued` |
@@ -384,11 +349,54 @@ The "Core" column names the unified-core event and rule.
 | 28 | `fence.proxy.async[.d]` | see §2.7. PB is transported through barrier payloads (RS:1623-1671) | per-lane bridge snapshot |
 | 29 | Implicit a2g at async completion | RS:1097-1117; G:2326-2333 | in the copy completion projection |
 | 30 | `wait_until` | §5 | `WaitVerdicts` |
-| 31 | TensorMap release / acquire / consume | descriptor frontiers; consume without acquire → **Err** (G:7555-7698) | not in the prototype (§10) |
+| 31 | TensorMap release / acquire / consume | descriptor frontiers; consume without acquire → **Err** (G:7555-7698) | `Fence(TensormapRelease)` snapshots `hb` into `tmap_rel`; `Fence(TensormapAcquire{range})` moves it into the lane's `g2t` ranges; a descriptor read (async op or warp lane) is judged by the acquired ranges covering it (deltas I1, I8, I9) |
 | 32 | `fence.mbarrier_init`, `expect_tx`, `init`/`inval` | no racecheck edge; synccheck owns them (RC:5163-5168, 5208-5239) | none (synccheck) |
 | 33 | TMEM alloc/dealloc/relinquish, `setmaxnreg` | no-op in racecheck (RC:5788-5791) | `AllocBegin/AllocEnd` give lifetime only |
 
 ---
+
+### 3.1 Implementation and ISA map
+
+Every row of §3, the function that implements it, and the ISA answer it rests on
+(`racecheck-isa-answers.md` R1–R10; rows with no R entry cite the PTX section and the
+delta row that records the ruling).
+
+| # | Implementation (`racecheck/` file: function) | ISA answer |
+|---|---|---|
+| 1 | `checker.rs`: `Checker::ordered` (same-lane program-order branch) | R7; §8.9.1 |
+| 2 | `checker.rs`: `Checker::ordered` (lane-order matrix `row`), `Warp::knows` | R7 |
+| 3 | `checker.rs`: `Checker::warp_sync` | R7 |
+| 4 | `checker.rs`: `Checker::warp_sync` (producer-emitted `WarpSync`) | R7 |
+| 5 | none (no event) | R7 ("the warp is not a scope") |
+| 6 | `checker.rs`: `Checker::arrive`, `Checker::wait` (`ResourceId::Grid`, `.gpu`) | R5 |
+| 7 | `checker.rs`: `Checker::arrive`, `Checker::wait` (named: participants, no scope) | R5 |
+| 8 | `checker.rs`: `Checker::arrive`, `Checker::wait` (cluster defaults; `SyncQualifierUnknown`) | R5 |
+| 9 | `checker.rs`: `Checker::arrive`, `Checker::wait`, `required_scope`, `report_scope_mismatch` | R4 (deltas B1, B7) |
+| 10 | `checker.rs`: `Checker::arrive`/`Checker::wait` (`tcgen_rel`), `Warp::push_pending` | R4 (deltas B2) |
+| 11 | `checker.rs`: `Checker::phase_mut` | R4 |
+| 12 | `checker.rs`: `Checker::async_issue` | R4, R6 |
+| 13 | `checker.rs`: `Checker::sync` (`AsyncComplete`), `Checker::completion` | R4 |
+| 14 | `checker.rs`: `Checker::async_issue` | R6 |
+| 15 | `checker.rs`: `Checker::access` (async side epochs), `Checker::sync` (`AsyncComplete`) | R6 |
+| 16 | `checker.rs`: `Checker::sync` (`AsyncComplete{Warp}`) | R6 |
+| 17 | `checker.rs`: `Checker::sync` (`AsyncComplete{Phase}` per copy) | R4, R6 |
+| 18 | `checker.rs`: `Checker::async_issue` (`tcgen` inherits hb) | §9.7.16 tcgen05 memory consistency (deltas T1) |
+| 19 | `checker.rs`: `Checker::sync` (`AsyncComplete` on a tcgen op) | §9.7.16 (deltas T1, T10) |
+| 20 | `checker.rs`: `Checker::async_issue` (`TcgenCommit`, all earlier ops unless `restricted`), `Checker::completion`, `Checker::commit_closure` | `tcgen05.commit` (deltas T7, T11, T15) |
+| 21–23 | `checker.rs`: `Checker::fence` (`TcgenBefore`, `TcgenAfter`), `Warp::tcgen_publication` | §9.7.16 tcgen05 fences (deltas T1) |
+| 24 | `checker.rs`: `Checker::access` (read-from heads), `Checker::apply_read_from`, `Checker::acquire_rel` | R1, R2, R4 (§8.9.4) |
+| 25 | `checker.rs`: `Checker::access` (`base` heads); `cell.rs`: `effective_heads` | R1 |
+| 26 | `checker.rs`: `Checker::fence` (`AcqRel`), `Warp::push_pending` | R8; §8.8 |
+| 27 | `checker.rs`: `Checker::fence` (`Sc`) | R8 |
+| 28 | `checker.rs`: `Checker::fence` (`ProxyAsync`), `Checker::bridge_rows`, `Checker::snapshot_hb_into`; `knowledge.rs`: `select_view`, `fence_domains` | R3 |
+| 29 | `checker.rs`: `Checker::completion` (`a2g` for the op's own milestone) | R3, R4 |
+| 30 | `checker.rs`: `Checker::wait_verdicts`, `Checker::flush_polls` | §8.9.4 (deltas W1–W8, T18) |
+| 31 | `checker.rs`: `Checker::fence` (`TensormapRelease`/`TensormapAcquire`), `Checker::access` (`lane_g2t`); `knowledge.rs`: `select_view` | R3 (deltas I1, I8, I9) |
+| 32 | none (synccheck) | — |
+| 33 | `checker.rs`: `Checker::sync` (`AllocBegin`/`AllocEnd`: lifetime, S7 drain) | ISA silent (deltas S7) |
+
+The conflict rule itself (§2) is `checker.rs`: `Checker::access` (the `check` closure),
+`Checker::morally_strong` and `Checker::classify` (R2, R9).
 
 ## 4. Async ops, lifetimes, memory reuse, OOB
 
@@ -543,8 +551,8 @@ The "Core" column names the unified-core event and rule.
   | 1024 | 0.24 µs | 51 µs |
 
   The one-component test is independent of the actor count.
-- The core's witness is 48 bytes. The 16-byte packing is a later memory
-  optimisation, not semantics.
+- The core's witness is 16 bytes (`cell::Witness`: stamp + one metadata word;
+  wide spans in a side table).
 
 ### 6.2 Single witness per actor-contract (frontier antichain)
 
@@ -658,7 +666,7 @@ to answer a ≤ query on incomparable chunks (RS:583-589). That is fixable.
 - `GlobalFloor` is the meet over all shards, collected with `try_lock`
   (G:9948-10220; RC:6280-6328).
 - It drops floor-dominated entries **by epoch only, proxy-blind**
-  (G:10153-10166; see §9).
+  (G:10153-10166; proxy-blind, a legacy bug).
 - Lanes created after a retirement are laggards: `RetiredRecordsUnobserved`
   (G:268-391, 2969-2985).
 
@@ -668,7 +676,7 @@ to answer a ≤ query on incomparable chunks (RS:583-589). That is fixable.
 - GC costs O(segments) every K safe points and bounds memory by live
   concurrency.
 
-**Core.** Not implemented in the prototype. The rule to keep:
+**Core** (`checker.rs` `Checker::gc`, details in §8 "View-aware GC"). The rule:
 - a witness may be dropped iff, for **every** view an unseen future access could
   use against it, the meet of all live actors' views observes it;
 - if it cannot be decided, keep the witness.
@@ -698,9 +706,10 @@ for lane precision.
 **Why.** Shards (one per cluster) share the global shadow. Without stripes,
 tiles of one weight buffer serialise on one lock.
 
-**Core.** Single-threaded per checker instance. Plan §2.4 replaces locks with
-stripe ownership plus inbox drains (merge points). That is a W2/W5 integration
-item and is not in the prototype.
+**Core.** One checker per launch, fed by the scheduler in delivery order; no
+locks or stripes. The scheduler is currently single-partition for programs with
+launch-wide state, which is a known performance blocker (W2), not a racecheck
+constraint.
 
 ---
 
@@ -825,214 +834,7 @@ From `RaceCheckIncompleteReason` (RC:71-140) and RCP:592-735:
 
 ---
 
-## 8. Shared/TMEM shadow vs global shadow: can they be unified?
-
-**Verdict: yes.** Every difference is one of three things:
-- an actor-set or topology difference;
-- a fence or scope table difference;
-- a representation or performance choice;
-- or a legacy inconsistency to be *resolved*, not preserved.
-
-No difference needs a second algorithm. The prototype runs every test case,
-across shared, global and TMEM, through one `Checker` (74 tests).
-
-| # | Difference | Class | Unified treatment |
-|---|---|---|---|
-| 1 | Warp clocks + lane overlay (RS) vs per-lane components (G) | representation | warp scalar + sparse lane vectors |
-| 2 | Per-cluster actors (RS) vs launch-wide actors (G) | actor set | one dense index; shared memory simply never sees foreign CTAs' accesses |
-| 3 | Async registry: 14-bit generation/16-bit epoch (RS) vs launch-wide lease (G); G rejects multi-lane issuers | actor set + representation | async actor index; the issuing lane set is part of the fork |
-| 4 | Morally-strong rule: RS unconditional RMW/RMW and strong loads exempt; G excludes generic loads and adds a scope diagnostic | **legacy inconsistency** (both wrong per R2/R9) | one PTX rule (§2.4); the carve-out is replaced by a `review` advisory |
-| 5 | Release/acquire machinery lives in G; RS receives `SharedClockFrontier`s (RC:2434-2493) | fence table (layering) | cell entries carry `Rel` in every space |
-| 6 | Bridge table `2×3×3` with aliasing (RS) vs `2×1` (G) | fence table | `2 × 3` keyed by the prior's domain, no aliasing |
-| 7 | Copy-completion bridge only for already-bridged domains (RS) vs always (G:7446) | legacy inconsistency (minor) | always a2g for the op's own milestone (§3 row 13) |
-| 8 | Bridge propagation: per-mask collapse (RS) vs merge in every join (G) | representation | per-lane overlays; propagate on acquire |
-| 9 | Tick discipline: RS ticks at barriers, G does not | representation | the producer supplies epochs per instruction |
-| 10 | Frontier replacement: RS contract-aware, G same-actor overwrite | **legacy bug in G** | contract-aware (§2.6) |
-| 11 | Race policy: RS aborts, G continues | **legacy inconsistency** | continue always |
-| 12 | GC: RS keeps retired cross-proxy history, G is proxy-blind | legacy bug in G | view-aware GC (§6.5) |
-| 13 | Failure classification (RMW vs atomic-class) | cosmetic | strong or RMW → release/acquire |
-| 14 | Spatial structure: stripes + `RwLock` + deferred reads (G) vs per-allocation `Arc` map + patches + tile windows (RS) | representation / concurrency | `IntervalShadow` per allocation; stripes become an ownership partition |
-| 15 | TMEM owned by RS; G transports the TCGEN frontier | actor set | TMEM accesses use the `tcgen` view |
-
----
-
-## 9. Unjustified, contradictory or ad-hoc legacy behaviour
-
-Roughly ordered by impact.
-
-1. **RS aborts on its first race; G continues** (§0.1). The verdicts and the read
-   clearing depend on it. With fail-fast, one RS race hides every later one,
-   including the second item in a test such as
-   `test_native_same_warp_tmem_review.py`, which relies on review findings not
-   aborting.
-2. **RMW/RMW is always exempt in RS** (RS:6000-6004). This ignores scope, proxy
-   and span. CTA-scoped atomics from two CTAs of a cluster on DSMEM are treated
-   as morally strong. G would report a scope mismatch.
-3. **The non-exact write collapse drops prior reads and RMW writers even for RMW**
-   (RS:6726-6748, 6853-6871, 7176-7190). The exact path keeps them, so the result
-   depends on geometry. That can miss a race.
-4. **G same-actor frontier replacement ignores semantics** (G:3446-3456,
-   3682-3683). Plain `st X` then `atom.gpu X` by one lane, followed by a remote
-   unordered `atom.gpu X`: the plain-store race is lost.
-5. **G GC is proxy-blind** (G:10153-10166). A cross-proxy pair can be lost after
-   retirement. RS has `RetiredGenericHistory` for exactly this case.
-6. **The compact (direct) RS path never sets `strong_scope`** (RS:5410, 5554,
-   6683, 7113, 7794, 8143 use `from_parts`). Scoped shared atomics on this path
-   lose the morally-strong exemption (false positive) and a strong atomic write
-   clears reads.
-7. **Cross-warp lane-stamped priors never fall back to the vector clock** (§2.5).
-   An HB path that updates WC but not LO gives false positives. G release paths
-   feed LO only when `order.has_release()` (RC:3851-3857, 4623-4627).
-8. **`observed_by_frontier` uses only `shared_lanes` when present**
-   (RS:4571-4575). Merged lane-aware and lane-less bridges can reject a covered
-   access.
-9. **Retention uses the non-acquired clock while validation uses the acquired
-   one** (RS:4917, 4974 vs 4744-4746). Classification also uses the raw clock
-   (RS:5962-5968, 4811-4814). That can turn a TMEM *review* into an *error*.
-10. **WC merges lane-masked acquisitions into the whole warp** (RS:927-938,
-    9243-9258). Same-proxy async witnesses — classic `cp.async` and the TMEM
-    domain — are judged by WC, so a lane that did not wait inherits another
-    lane's wait. ISA Q7 (`sync-isa-answers.md`) confirms that completion is
-    **per thread**. The core acquires per lane (`async_group_wait_is_per_lane`).
-11. **The full async-group token clock includes issuer history** (RC:5092-5153),
-    whereas the mbarrier copy projection strips it (RS:1119-1154). `.read` waits
-    acquire `source_read`. The core publishes only the op's own milestone; `.read`
-    → `Milestone::Read` (`bulk_wait_read_does_not_publish_destination`).
-12. **RS records mbarrier bulk-copy source reads at the issuer warp's clock**
-    (RS:9043-9058), but G records them at the token clock (G:7328-7336).
-    Consequently, after the issuer's `bar.sync`, another warp's overwrite of the
-    source counts as "ordered" while the copy may still be in flight.
-13. **Mbarrier and named-barrier HB has no scope** (SY:387-394, 626-632). A
-    `.cta` arrive observed cross-CTA through `shared::cluster` still yields full
-    HB.
-14. **A missing cluster-barrier payload is treated as "relaxed only"**
-    (RC:6933-6936), unlike named barriers (Err) and G (`ShadowRejected`).
-15. **`grid.sync` gives no HB edge** (KE:1892-1896).
-16. **Declared word:**
-    - the fallback is not limited to async publications (G:8784);
-    - a launch-value exit still takes the observed edge (G:8831-8859),
-      contradicting G:8743-8746;
-    - "earliest" means earliest after the observed prefix (G:8730-8736);
-    - multi-lane post-images are taken after the whole warp batch, so
-      intermediate RMW values are missing (KE:2997-3024);
-    - history is kept for **every** 4- or 8-byte global atomic write, not only
-      declared words, and is never retired (G:5051, 4129-4132 vs KE:3018-3025).
-17. *(Closed in legacy's favour, R1.)* `test_native_racecheck_release_rmw_handoff.py`
-    asserts a race for `L0: st data; all lanes atom.release flag; L1: ld.acquire
-    flag; ld data`. Legacy is right:
-    - PTX has observation order, not release sequences;
-    - the 32 lanes are independent threads, and the coherence order of their
-      same-address RMWs is unconstrained.
-
-    The core now withholds sibling-lane heads and reports the race
-    (`release_rmw_handoff_sibling_lanes_race`).
-18. **Only the latest release fence per lane is kept** (G:8136). A narrower later
-    fence drops an earlier wider head.
-19. **The TCGEN cross-thread predecessor is all-or-nothing across lanes**
-    (RC:2033-2059). Commit retires work at commit *issue* (RC:5446).
-    `TcgenFenceFrontier::covers` and `merge` disagree on a missing descriptor
-    (TF:107-111 vs 152-155).
-20. **`RetiredCrossProxyHistory` is a hard error built on an over-approximation**
-    (64 ranges or 4096 allocations; RS:3745-3753, 3894-3902) and carries no
-    witness.
-21. **Magic thresholds and panics instead of `incomplete`:**
-    - process-global `u32` chunk id with `assert!` (RS:318-323);
-    - `AppendOnlyTable` 2^28 (RS:2246-2289);
-    - async epoch 16 bits with a silent clamp on import (RS:877);
-    - generation windows 8 and 64 justified by MegaMoE (RC:6840-6849);
-    - tile windows 32 / 2^16 / 1024 (RS:10086-10095).
-22. **Stale comments:** G:9363-9370 (bypass check moved), G:875-877 and
-    G:2468-2478 (structure descriptions).
-
----
-
-## 10. Unified core: decisions and open items
-
-**Decided in the prototype:**
-- One conflict rule (PTX moral strength).
-- Contract-aware eviction.
-- Continue after races.
-- Per-lane async completion.
-- Two milestones per async op.
-- Bridges keyed by the prior's window domain.
-- tcgen ordering through `tcgen_rel` and the fence pair.
-- Commit forwards the issuer's generic knowledge plus the tracked ops and their
-  causal predecessors.
-- Earliest-accepted declared-word rule, with an async-only fallback.
-- Fail-closed `reads_memory` predicates.
-- After the R1–R9 rulings:
-  - the PTX moral-strength rule, with no atomic requirement and no load
-    carve-out;
-  - the undeclared-word advisory;
-  - scoped mbarrier edges;
-  - relaxed waits that need a `fence.acquire`;
-  - named-barrier arrive as a source only;
-  - lost cluster-barrier qualifiers → incomplete;
-  - pairwise Fence-SC;
-  - `.shared::cluster` proxy fences cover `shared::cta`;
-  - cross-CTA async writers → review advisory;
-  - sibling-lane RMW heads withheld.
-
-**Open:**
-
-| # | Open item | Notes |
-|---|---|---|
-| a | *Closed (R9).* | PTX semantics plus the `UndeclaredProtocolWord` review advisory. |
-| b | *Closed (R4, R5).* | mbarrier edges are scoped, and the SyncTable must carry `.sem`/`.scope` on arrive and wait. Named barriers stay scopeless and participants-only. |
-| c | `grid.sync` | Edge, or `incomplete`. |
-| d | TensorMap release/acquire/consume | Not ported. |
-| e | View-aware GC and async-slot reclamation | Not ported. |
-| f | Inbox-drain merge of the global shadow (plan §2.4) | Not ported. |
-| g | *Closed in legacy's favour (R1).* | §9.17 |
-| i | `red` never forms an acquire pattern (§8.8) | The input needs a `returns_value` bit (atom vs red). Today a relaxed RMW parks its read heads for a later `fence.acquire`, which is wrong for `red`. |
-| h | tcgen state is per warp in the prototype | The elected issuing lane makes this exact for current kernels. Per-lane tcgen is a mechanical extension. |
-
-**Phase 3 (integration) status.** The core now lives in
-`numsim-core/src/racecheck/`. `RaceObserver: Observer` adapts contract events;
-see §11. The open items d, e and h are implemented there: TensorMap, GC,
-slot reclaim and per-lane tcgen. Item i is also done: `red` never acquires,
-using `Access::returns_value`.
-
-**Input shape needed from the contract.** It is defined in
-`numsim-race-core/src/input.rs`, the only file to change when the contract lands.
-
-`Access` (hot path, per lane or per async op):
-- `who`: `Lane{warp, lane, epoch}` | `Async{op, side: Read|Write}`;
-- `alloc`, `range`;
-- `kind` (R/W/RMW), `order`, `scope: Option`, `atomic`;
-- `proxy` (Generic/Async/Tcgen);
-- `domain` (window: global / `shared::cta` / `shared::cluster`; `None` for TMEM);
-- `site`.
-
-Epochs are per warp instruction; sibling lanes share one epoch.
-
-`SyncEvent` (cold path):
-
-| Event | Fields |
-|---|---|
-| `AllocBegin` / `AllocEnd` | |
-| `DeclareWord` | |
-| `WarpSync` | `mask` |
-| `Arrive` | `obj`, `phase`, `release: Option<bool>`, `scope: Option<Scope>` |
-| `Wait` | `obj`, `phase`, `acquire: Option<bool>`, `scope: Option<Scope>` |
-| `Fence` | `AcqRel(s)`, `Sc(s)`, `ProxyAsync(d?)`, `TcgenBefore`, `TcgenAfter` |
-| `AsyncIssue` | `op`, `lanes`, `kind ∈ {Copy, TcgenPipelined, TcgenLd, TcgenSt, TcgenCommit}`, `proxy`, `preds` (pipeline predecessors or commit-tracked ops, resolved by the SyncTable), `footprint` |
-| `AsyncComplete` | `op`, `milestone`, `target: Phase{obj, phase} \| Warp{warp, lanes}` |
-| `WaitVerdicts` | `lanes`, `alloc`, `range`, `scope`, verdict bitset, `observed`, `pred_reads` |
-
-The SyncTable resolves:
-- phases and generations;
-- which async groups a `wait_group N` completes;
-- per-thread group membership (ISA Q7);
-- tcgen pipeline pairs (TF:46-65);
-- the ops a commit tracks.
-
-The checker sees only resolved milestones.
-
-
----
-
-## 11. Integration with the contract (phase 3)
+## 8. Integration with the contract
 
 ### Layout
 
@@ -1111,122 +913,6 @@ reserves the top values). The adapter converts the epoch with
 `u32::try_from`. On overflow it records `Incomplete::EpochOverflow` and skips
 the event; it never truncates or panics. Async-slot epochs share the same
 32-bit field, at 2 per slot generation.
-
-### Test-migration rulings (`test-migration.md`)
-
-**Phase 2 rulings** (see `racecheck-behaviour-deltas.md` T1–T6):
-- **tcgen05 work.** Completed work (`tcgen05.wait::ld/st`, or a commit
-  observed through its mbarrier) joins the waiter's hb and is ordered through
-  ordinary thread sync. A tcgen05 op inherits completed work from its issuer's
-  hb. The `before_thread_sync`/`after_thread_sync` pair is required only for
-  uncompleted (pipelined) work. This refines §3 rows 19–23.
-- **`st.async`/`red.async` `.release`** is a generic-proxy strong release
-  whose head holds the issuer's knowledge at issue.
-- **`SignalProtocolError`.** A race on declared-word bytes where one side is
-  weak is reported with this kind.
-- **Poll read-froms.** The read-from of a strong pure read of a declared word
-  is held back until the warp's next event. A `WaitVerdicts` for that lane and
-  word discards it; anything else applies it.
-- **Plain-write wake-ups.** A wait explained only by a plain write is
-  `WaitExitUnproven`.
-
-- **Wide or narrow writes to a declared word.** These are numbered (V3), but a
-  wait that accepts one is `SignalWriteNotRecorded`, the legacy
-  `signal_write_not_recorded` (delta W5). Mixed-size accesses are outside the
-  morally strong relation (PTX §8.7.2).
-- **`alias_stale_read` is ported** (delta P7). It is driven by
-  `SiteInfo::buffer`.
-- **Same-rank `mapa` is the CTA's own `shared::cta` window**, because
-  `mapa(p, own rank) == p`. The checker normalises the window by comparing the
-  accessor's CTA with the allocation's CTA (delta X10).
-- **Declared words may live in shared memory** (delta W6).
-- **A qualifier-less remote `mbarrier.arrive.shared::cluster` defaults to
-  `.cta`**, which gives `ScopeMismatch` (delta B7). Lowering keeps the PTX
-  default.
-
-### Fixes from the adversarial review (`checker-review.md`)
-
-**Soundness**
-- **S2 — eviction respects proxy and window.** A frontier entry evicts a
-  prior only if both have the same proxy and the same address window. A
-  plain write evicts only same-class readers. A `shared::cta` store therefore
-  no longer hides an unbridged `shared::cluster` store.
-- **S3 — a missing scope on a non-named barrier is a lost qualifier.**
-  Named barriers are recognised by `ResourceId::Named`, not by
-  `scope: None`. On an mbarrier or cluster barrier, a `None` scope gives
-  `SyncQualifierUnknown` and no edge.
-- **S4 — declared-word history numbering follows README decision 14.** Bit i
-  is the i-th `(Access, lane)` write, lanes ascending, counted for every
-  declared word the write overlaps. This deliberately differs from
-  `observe.rs:25`, which says "per Access".
-- **S6 — tensormap heads keep their releaser.** A head is
-  `(releasing warp, scope, hb)`, and the acquire filters on the releasing
-  fence rather than on each component's actor.
-- **S7 / F2 — failed mbarrier scope checks are reported.** They emit
-  `ScopeMismatch`, carrying both sites and an occurrence count, deduplicated
-  per (release site, acquire site, scopes).
-
-**False positives**
-- **F1 — `CrossCtaAsyncOrder` is narrower.** It is emitted only when the
-  current issuer's CTA did not itself observe the prior op's completion
-  (through its mbarrier or a warp wait). Multicast and 2-CTA consumers no
-  longer trigger it.
-- **F3 — `fence.sc` history.** The latest `fence.sc` is kept per
-  `(thread, scope)` instead of per thread.
-
-**Robustness**
-- **R1.** A completion that targets a warp outside the launch is reported as
-  incomplete.
-- **R2.** Incompletes are deduplicated with counts (`incomplete_counts`, and
-  `occurrences` in the payload). Advisories are deduplicated through an
-  index.
-- **R3 — bounded growth.**
-  - The wide-span table is interned.
-  - Phases are kept for the last 4 per object.
-  - `pending_acq` is deduplicated and capped at 1024; dropping entries only
-    loses edges.
-  - Tensormap ranges are shared through an `Arc`, and identical ranges are
-    joined.
-  - The reclaimed-op set is gone: a non-live predecessor adds no ordering,
-    which is conservative.
-  - A declared-word history payload that every live actor already holds is
-    dropped by GC; its index is kept.
-- **R4 — faster paths.**
-  - `Clock::meet` and `filter` are rebuilt chunk by chunk.
-  - `Clock::join` no longer deep-copies lane entries.
-  - `Epochs::leq` does not allocate.
-  - Retired-generic summaries are indexed by page, and retired witnesses are
-    packed once.
-  - Words are looked up per allocation.
-- **R5.** GC uses per-cluster meets for shared memory and TMEM, so they
-  retire without waiting for other CTAs or later waves. Global memory uses
-  the launch-wide meet.
-- **R6.** Chunk identities come from a process-global `AtomicU64`.
-- **R7.** Zero-length spans are skipped instead of being reported as out of
-  bounds.
-
-**Contract**
-- `SyncEvent.kernel` must match the launch, otherwise `KernelMismatch`
-  (incomplete).
-- A warp access with `ALL_LANES` is warp-collective and is attributed to
-  lane 0.
-- `red` no longer feeds `tcgen_in`.
-
-**Cost.** `checker_tile_loop` went from 1.46 ms to 1.70 ms (phase map and
-per-arrival sites); `checker_readers` went from 2.77 ms to 2.93 ms.
-
-### Contract update (e2551cf, b3c72f3)
-
-- Arrive/Wait carry qualifiers and scope. There is no adapter-side
-  assumption: `None` → `SyncQualifierUnknown`.
-- `WaitVerdicts` is judged per lane group.
-- `Finding.attrs` carries every structured fact: `access_pair`,
-  `ordering_*`, `proxy_bridge`, `hint`, `occurrences`, `reason`, and
-  `prior`/`current` witness objects.
-- New `FindingKind` variants replace `Other(..)`.
-- Tensormap fences carry a scope, and the acquire carries a byte range.
-- Per-thread async ops issued by several lanes are split per lane by the
-  adapter (contract review item 5).
 
 ### Further ports
 
@@ -1307,7 +993,8 @@ citing B7.
 ### Benchmarks
 
 `numsim-race-core/benches/core.rs`, same machine. "Before" is the phase-2
-prototype with 48-byte witnesses; "after" is the phase-3 core.
+prototype with 48-byte witnesses; "after" is the phase-3 core (16-byte packed
+witnesses, `cell::Witness`).
 
 | Benchmark | Before | After |
 | --- | --- | --- |

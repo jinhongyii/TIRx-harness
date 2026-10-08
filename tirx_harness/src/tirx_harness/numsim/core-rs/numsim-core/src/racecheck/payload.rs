@@ -378,7 +378,8 @@ fn convert_incomplete(i: &Incomplete, count: u64, kernel: u32) -> Finding {
 fn merge_alias(fs: &[RaceFinding], lr: &LaunchResult) -> Vec<RaceFinding> {
     use std::collections::HashMap;
     let mut out: Vec<RaceFinding> = Vec::with_capacity(fs.len());
-    let mut rep: HashMap<(Option<String>, Option<String>, Option<Space>, u32, u32), usize> = HashMap::new();
+    type StaticPair = (Option<String>, Option<String>, Option<Space>, u32, u32);
+    let mut rep: HashMap<StaticPair, usize> = HashMap::new();
     // Legacy `record_review_findings`: one TmemLifetimeReview per static
     // (prior site, current site) pair across allocations, the first.
     let mut review: HashMap<(u32, u32), usize> = HashMap::new();

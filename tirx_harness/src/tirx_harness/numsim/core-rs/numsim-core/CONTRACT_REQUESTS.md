@@ -3033,3 +3033,10 @@ W12 triaged the remaining `v2_gap` marks with `--runxfail`. These need an owner 
 6. **[scheduler / subset, coordinator] CLC task stealing under a cluster subset.**
    - Test: `tests/numsim/v2/ports/test_p8_canonical_kernels.py::test_flashmla_small_topk_task_steal_matches_independent_numerical_oracle`.
    - A subset run with only cluster 0 resident never claims the non-resident cluster's task through CLC. `out[1, 0, 0]` keeps its NaN sentinel; the full launch matches.
+
+## W5 (2026-10-08): W12-gaps 4 resolved on the checker side; engine `preds` note for W2
+
+- **Cause.** For tcgen05 ops, the engine's `AsyncIssue.preds` names the CTA's previous pipelined op (`ctx.aux.tcgen_last`, keyed by CTA, in `interp/handlers/tcgen.rs`), whichever thread issued it. In `tcgen_cp_to_mma_handoff_n16`, the MMA of warp 1 lists the `tcgen05.cp` of warp 0 in `preds`. In `commit_forwards_only_issued_work_n16`, the cp of warp 2 lists the cp of warp 0. The checker joined every pred as pipeline order, so the cross-thread handoff was ordered without the fence pair.
+- **Rule.** PTX ISA §9.7.16.6 (tcgen05 memory consistency): the implicit pipeline order between `tcgen05.{mma,cp,shift}`, and what a `tcgen05.commit` tracks, apply only to ops issued by the same thread. Across threads, an op is ordered only by `fence::before_thread_sync`, a thread sync, then `fence::after_thread_sync`.
+- **Fix (W5).** `checker.rs` `async_issue` ignores a pred whose issuing thread (warp, lane) is not the current issuer. Scenarios: `racecheck_tcgen.rs` `cp_to_mma_handoff_needs_both_fences` and `commit_forwards_only_issued_work`, both with and without the cross-thread chain pred.
+- **For W2 (no checker dependency).** The contract documents `preds` as "architected-pipeline predecessors". A cross-thread entry is an execution-order dependency of the engine (a valid schedule), not an architected one. Either emit only the issuing thread's predecessor in `AsyncIssue.preds` and keep the per-CTA chain internal to `Issue.after`, or document that `preds` may include execution-only dependencies. The checker is correct either way.

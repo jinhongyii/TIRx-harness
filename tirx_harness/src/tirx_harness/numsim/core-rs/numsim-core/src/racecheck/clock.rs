@@ -103,6 +103,7 @@ const MEMO_PRUNE_EVERY: u32 = 1 << 10;
 
 impl JoinMemo {
     fn join(&self, cur: &Arc<Chunk>, inc: &Arc<Chunk>) -> ChunkJoin {
+        let memo = super::tuning::on(&super::tuning::JOIN_MEMO);
         if Arc::ptr_eq(cur, inc) || cur.dominates(inc) {
             return ChunkJoin::Current;
         }
@@ -110,6 +111,13 @@ impl JoinMemo {
             return ChunkJoin::Incoming;
         }
         let key = (cur.id, inc.id);
+        if !memo {
+            let mut e = cur.e;
+            for (s, i) in e.iter_mut().zip(inc.e.iter()) {
+                *s = (*s).max(*i);
+            }
+            return ChunkJoin::New(Chunk::new(e));
+        }
         if let Some(hit) = self.map.borrow().get(&key).and_then(Weak::upgrade) {
             self.hits.set(self.hits.get() + 1);
             return ChunkJoin::New(hit);
@@ -190,7 +198,8 @@ impl Epochs {
         // Fast path: the incoming side dominates chunk-wise (the barrier
         // fan-in steady state). Adopt its slice outright, so synchronised
         // clocks converge on one storage and later joins are pointer-equal.
-        if inc.len() >= cur.len()
+        if super::tuning::on(&super::tuning::JOIN_MEMO)
+            && inc.len() >= cur.len()
             && cur.iter().zip(inc.iter()).all(|(c, i)| match (c, i) {
                 (None, _) => true,
                 (Some(_), None) => false,

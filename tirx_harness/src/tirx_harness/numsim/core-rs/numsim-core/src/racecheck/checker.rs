@@ -109,6 +109,14 @@ pub enum AdvisoryKind {
     DeclaredWordRawRead,
 }
 
+/// `(lanes, columns)` ranges of a TMEM finding.
+pub type TmemRects = (Vec<Range<u64>>, Vec<Range<u64>>);
+/// Acquired tensormap ranges of one lane: `(alloc, bytes, view)`.
+type G2tRanges = Vec<(AllocId, Range<u64>, Clock)>;
+/// Legacy alias advisory key: (alloc, reader name, writer name, reader
+/// warp, reader site, writer warp, writer site).
+type AliasKey = (AllocId, Arc<str>, Arc<str>, WarpId, SiteId, WarpId, SiteId);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
     pub kind: FindingKind,
@@ -125,7 +133,7 @@ pub struct Finding {
     /// columns; TMEM byte = (lane * 512 + column) * 4).
     /// `(lanes, columns)`: sorted, disjoint, merged only when overlapping or
     /// adjacent, over every occurrence's exact overlap.
-    pub tmem: Option<(Vec<Range<u64>>, Vec<Range<u64>>)>,
+    pub tmem: Option<TmemRects>,
     /// `AliasStaleRead` only: the merged byte spans of every occurrence
     /// (legacy `overlaps`); empty for other kinds.
     pub spans: Vec<Range<u64>>,
@@ -232,7 +240,7 @@ struct Warp {
     tcgen_pub: Vec<Clock>,
     /// Tensormap ranges each lane acquired (`fence.proxy.tensormap::generic
     /// .acquire`), with the release knowledge that reached it.
-    g2t_ranges: Vec<Arc<Vec<(AllocId, Range<u64>, Clock)>>>,
+    g2t_ranges: Vec<Arc<G2tRanges>>,
     /// `(epoch, site)` of every instruction that accessed memory, ascending;
     /// pruned below the oldest epoch any witness still references.
     sites: Vec<(Epoch, SiteId)>,
@@ -255,7 +263,7 @@ impl Warp {
             tcgen_issued: vec![Clock::default(); 32],
             tcgen_waited: vec![Clock::default(); 32],
             tcgen_pub: vec![Clock::default(); 32],
-            g2t_ranges: vec![Arc::new(Vec::new()); 32],
+            g2t_ranges: (0..32).map(|_| Arc::new(Vec::new())).collect(),
             sites: Vec::new(),
         }
     }
@@ -370,7 +378,7 @@ struct AsyncActor {
     kind: AsyncKind,
     k: Knowledge,
     /// Tensormap ranges the issuing lanes acquired (shared with the lane).
-    g2t_ranges: Arc<Vec<(AllocId, Range<u64>, Clock)>>,
+    g2t_ranges: Arc<G2tRanges>,
     /// CTAs that observed this op's completion directly (its mbarrier's
     /// CTA, or the waiting warp's CTA).
     completed_ctas: Vec<u32>,
@@ -540,7 +548,7 @@ pub struct Checker {
     lane_g2t: Option<Clock>,
     /// One advisory per (alloc, reader name, writer name, reader warp/site,
     /// writer warp/site), as legacy keyed them.
-    alias_dedup: HashMap<(AllocId, Arc<str>, Arc<str>, WarpId, SiteId, WarpId, SiteId), usize>,
+    alias_dedup: HashMap<AliasKey, usize>,
     /// Logical buffer name per site (`SiteInfo::buffer`), for
     /// `AliasStaleRead`. Empty = advisory off.
     pub site_buffer: HashMap<SiteId, Arc<str>>,
@@ -1743,8 +1751,8 @@ impl Checker {
     /// The phase record, keeping only the most recent phases per object.
     fn phase_mut(&mut self, obj: SyncObjId, phase: u64) -> &mut Phase {
         let m = self.phases.entry(obj).or_default();
-        if !m.contains_key(&phase) {
-            m.insert(phase, Phase::default());
+        if let std::collections::btree_map::Entry::Vacant(v) = m.entry(phase) {
+            v.insert(Phase::default());
             while m.len() > 4 {
                 m.pop_first();
             }
@@ -1913,7 +1921,7 @@ impl Checker {
         }
         let w = &self.warps[warp as usize];
         let mut k = w.publication(lanes, epoch, &self.memo);
-        let mut g2t_ranges: Arc<Vec<(AllocId, Range<u64>, Clock)>> = Arc::new(Vec::new());
+        let mut g2t_ranges: Arc<G2tRanges> = Arc::new(Vec::new());
         for (n, c) in lanes.lanes8().enumerate() {
             k.tcgen.join(&w.tcgen[c as usize], &self.memo);
             if matches!(kind, AsyncKind::TcgenPipelined | AsyncKind::TcgenLd | AsyncKind::TcgenSt) {
@@ -1937,6 +1945,16 @@ impl Checker {
                 continue;
             };
             let pa = &self.asyncs[pi];
+            if pa.warp != warp || !lanes.has(pa.lane) {
+                // PTX ISA §9.7.16.6 (tcgen05 memory consistency): the
+                // implicit pipeline order (and a commit's tracking) covers
+                // only ops issued by the same thread. A predecessor issued
+                // by another thread is ordered only through
+                // fence::before_thread_sync, a thread sync and
+                // fence::after_thread_sync (the `tcgen` view), so the
+                // engine's per-CTA execution order adds no hb (semantics row 18).
+                continue;
+            }
             if kind != AsyncKind::TcgenCommit {
                 k.tcgen.join(&pa.k.tcgen, &self.memo);
                 k.tcgen.raise(pa.actor, pa.gen_base + 2);
@@ -2469,7 +2487,7 @@ impl Checker {
             }
         }
         let cells: u64 = allocs.values().map(|a| a.shadow.len() as u64).sum();
-        self.gc_period = 2 * cells;
+        self.gc_period = if super::tuning::on(&super::tuning::ADAPTIVE_GC) { 2 * cells } else { 0 };
         self.allocs = allocs;
         self.stats.witnesses_retired += retired;
         // Declared-word history: a release whose payload every live actor

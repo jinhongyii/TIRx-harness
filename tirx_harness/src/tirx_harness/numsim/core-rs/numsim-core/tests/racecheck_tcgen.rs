@@ -26,8 +26,11 @@ enum Handoff {
     MbarArriveRelaxedCluster,
 }
 
-/// cp→mma handoff across threads with the fence pair.
-fn cp_mma(h: Handoff, before: bool, after: bool) -> Report {
+/// cp→mma handoff across threads with the fence pair. `chain`: the MMA
+/// names the other thread's cp in `preds`, as the engine's per-CTA execution
+/// chain does; pipeline order is per thread (PTX ISA §9.7.16.6), so that
+/// pred must add no ordering.
+fn cp_mma(h: Handoff, before: bool, after: bool, chain: bool) -> Report {
     let mut k = K::new(2, 1, 1);
     let cp = tc(&mut k, 0, AsyncKind::TcgenPipelined, &[], Some(0..16), None);
     if before {
@@ -52,7 +55,8 @@ fn cp_mma(h: Handoff, before: bool, after: bool) -> Report {
     if after {
         k.fence(1, 1, FenceKind::TcgenAfter);
     }
-    let mma = tc(&mut k, 1, AsyncKind::TcgenPipelined, &[], Some(0..32), None);
+    let pred: &[AsyncId] = if chain { &[cp] } else { &[] };
+    let mma = tc(&mut k, 1, AsyncKind::TcgenPipelined, pred, Some(0..32), None);
     let c = k.issue(1, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[mma], &[]);
     k.done_phase(c, Milestone::Write, 10, 0).wait(1, 1, 10, 0, true);
     let c0 = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[cp], &[]);
@@ -69,9 +73,11 @@ fn cp_to_mma_handoff_needs_both_fences() {
         Handoff::MbarArriveRelaxedTestWait,
         Handoff::MbarArriveRelaxedCluster,
     ] {
-        assert!(clean(&cp_mma(h, true, true)));
-        assert!(has_race(&cp_mma(h, false, true)));
-        assert!(has_race(&cp_mma(h, true, false)));
+        for chain in [false, true] {
+            assert!(clean(&cp_mma(h, true, true, chain)));
+            assert!(has_race(&cp_mma(h, false, true, chain)));
+            assert!(has_race(&cp_mma(h, true, false, chain)));
+        }
     }
 }
 
@@ -158,7 +164,9 @@ fn cross_thread_ld_to_st_needs_producer_wait() {
 }
 
 /// commit forwards only issued work (and that work's causal predecessors).
-fn commit_forwards(local_work: bool) -> Report {
+/// `chain`: every pipelined op names the CTA's previous one in `preds`
+/// (the engine's per-CTA execution chain), across threads.
+fn commit_forwards(local_work: bool, chain: bool) -> Report {
     let mut k = K::new(3, 1, 1);
     let cp1 = tc(&mut k, 0, AsyncKind::TcgenPipelined, &[], Some(0..16), None);
     k.fence(0, 1, FenceKind::TcgenBefore).arrive(0, 1, 20, 0, true);
@@ -166,12 +174,15 @@ fn commit_forwards(local_work: bool) -> Report {
     k.wait(1, 1, 20, 0, true).fence(1, 1, FenceKind::TcgenAfter);
     let mut preds = vec![];
     if local_work {
-        preds.push(tc(&mut k, 1, AsyncKind::TcgenPipelined, &[], Some(64..96), None));
+        let p: &[AsyncId] = if chain { &[cp1] } else { &[] };
+        preds.push(tc(&mut k, 1, AsyncKind::TcgenPipelined, p, Some(64..96), None));
     }
     let c1 = k.issue(1, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &preds, &[]);
     k.done_phase(c1, Milestone::Write, 21, 0);
     k.wait(2, 1, 21, 0, true).fence(2, 1, FenceKind::TcgenAfter);
-    let cp2 = tc(&mut k, 2, AsyncKind::TcgenPipelined, &[], Some(0..16), None);
+    let last = preds.last().copied().unwrap_or(cp1);
+    let p: &[AsyncId] = if chain { &[last] } else { &[] };
+    let cp2 = tc(&mut k, 2, AsyncKind::TcgenPipelined, p, Some(0..16), None);
     let c2 = k.issue(2, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[cp2], &[]);
     k.done_phase(c0, Milestone::Write, 22, 0).done_phase(c2, Milestone::Write, 23, 0);
     k.run()
@@ -179,8 +190,10 @@ fn commit_forwards(local_work: bool) -> Report {
 
 #[test]
 fn commit_forwards_only_issued_work() {
-    assert!(has_race(&commit_forwards(false)));
-    assert!(clean(&commit_forwards(true)));
+    for chain in [false, true] {
+        assert!(has_race(&commit_forwards(false, chain)));
+        assert!(clean(&commit_forwards(true, chain)));
+    }
 }
 
 /// tcgen transfer lifetime (same warp): 0 ld,st  1 ld,wait,st  2 st,ld
