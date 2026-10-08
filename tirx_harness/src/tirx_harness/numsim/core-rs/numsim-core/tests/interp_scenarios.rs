@@ -1898,3 +1898,62 @@ fn clc_claims_non_resident_tasks_under_a_subset() {
     completed(&o);
     assert_eq!(u32s(&o, "out"), vec![1, 1, 1, 1]);
 }
+
+/// Records every callback; with `forks`, offers a child per partition
+/// (decision 17) and appends the child's record at `join`.
+#[derive(Default)]
+struct ForkRec {
+    forks: bool,
+    log: Vec<String>,
+}
+impl Observer for ForkRec {
+    fn wants_word_history(&self) -> bool {
+        true
+    }
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        self.log.push(format!("A {:?} {:?} {:?} {:?} {:?} {:?} {}", a.seq, a.actor, a.site, a.alloc, a.kind, a.spans, a.operand));
+    }
+    fn sync(&mut self, e: &SyncEvent) {
+        self.log.push(format!("S {e:?}"));
+    }
+    fn warp_done(&mut self, w: numsim_core::observe::WarpId, end: numsim_core::observe::WarpEnd) {
+        self.log.push(format!("D {w:?} {end:?}"));
+    }
+    fn round_boundary(&mut self, c: numsim_core::observe::CtaId, r: u64) {
+        self.log.push(format!("R {c:?} {r}"));
+    }
+    fn phase_end(&mut self, r: u64) {
+        self.log.push(format!("P {r}"));
+    }
+    fn fork(&mut self, _p: &numsim_core::observe::PartitionInfo<'_>) -> Option<Box<dyn numsim_core::observe::ForkedObserver>> {
+        self.forks.then(|| Box::new(ForkRec::default()) as Box<dyn numsim_core::observe::ForkedObserver>)
+    }
+    fn join(&mut self, _p: &numsim_core::observe::PartitionInfo<'_>, child: Box<dyn numsim_core::observe::ForkedObserver>) {
+        let child = child.into_any().downcast::<ForkRec>().expect("our child");
+        self.log.extend(child.log);
+    }
+}
+impl numsim_core::observe::ForkedObserver for ForkRec {
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
+}
+
+/// Decision 17: a forking observer (children per partition, replayed on the
+/// pool, joined in replay order) sees exactly the stream a non-forking one
+/// sees, including `phase_end` points and `Access::seq`, at 1/8/32 workers.
+#[test]
+fn forked_replay_equals_serial_replay() {
+    for s in &scenarios::all() {
+        for workers in [1usize, 8, 32] {
+            let cfg = RunConfig { workers, ..s.config.clone() };
+            let mut serial = ForkRec::default();
+            let a = sched::run_with_config(&s.module, &s.inputs, &mut serial, &cfg).unwrap();
+            let mut forked = ForkRec { forks: true, log: Vec::new() };
+            let b = sched::run_with_config(&s.module, &s.inputs, &mut forked, &cfg).unwrap();
+            assert_eq!(format!("{:?}", a.status), format!("{:?}", b.status), "{} {workers}", s.name);
+            assert_eq!(serial.log, forked.log, "{} at {workers} workers", s.name);
+            assert!(serial.log.iter().any(|l| l.starts_with("P ")), "{}: no phase_end", s.name);
+        }
+    }
+}

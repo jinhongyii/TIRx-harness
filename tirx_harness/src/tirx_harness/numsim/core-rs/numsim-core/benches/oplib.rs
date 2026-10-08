@@ -209,37 +209,8 @@ fn tc(c: &mut Criterion) {
                     mem.note(off as u64 | 1 << 41, data.len() as u64);
                     Ok(())
                 };
-                oplib::tc_mma_ctas(black_box(&payload), &options, &smem_read, &tmem_read, &mut tmem_write, None)
+                oplib::tc_mma_ctas(black_box(&payload), &options, &smem_read, &tmem_read, &mut tmem_write)
                     .unwrap_or_else(|e| panic!("{}: {e}", case.name));
-            })
-        });
-        // The same MMA served from borrowed whole-allocation views (`TcViews`):
-        // every piece is in bounds and valid, so no callback runs.
-        let smem_valid = numsim_core::arena::BitSet::new(mem.smem.len() as u64, true);
-        let mut tmem_image = mem.tmem.borrow().clone();
-        let mut tmem_valid = numsim_core::arena::BitSet::new(tmem_bytes as u64, true);
-        let mut reads = Vec::new();
-        let mut writes = Vec::new();
-        let mut uninit = Vec::new();
-        g.bench_function(format!("{}_views", case.name), |bench| {
-            bench.iter(|| {
-                reads.clear();
-                writes.clear();
-                uninit.clear();
-                let mut tmem_write = |_cta: u32, _lane: u32, _col: u32, _data: &[u8]| -> oplib::OpResult {
-                    Err(oplib::OpError::invalid("view bench: unexpected callback write"))
-                };
-                let cta_views = usize::from(case.cta_group);
-                let views = oplib::TcViews {
-                    smem: (0..cta_views).map(|_| Some(oplib::TcShared { bytes: &mem.smem, valid: &smem_valid })).collect(),
-                    tmem: vec![Some(oplib::TcTmem { alloc: AllocId(1), bytes: &mut tmem_image, valid: &mut tmem_valid })],
-                    reads: Some(&mut reads),
-                    writes: &mut writes,
-                    policy: numsim_core::arena::ValidityPolicy::Error,
-                    uninit: &mut uninit,
-                };
-                oplib::tc_mma_ctas(black_box(&payload), &options, &smem_read, &tmem_read, &mut tmem_write, Some(views))
-                    .unwrap_or_else(|e| panic!("{} views: {e}", case.name));
             })
         });
     }

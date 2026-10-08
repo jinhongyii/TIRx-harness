@@ -840,61 +840,8 @@ pub fn tc_mma_ctas(
     smem: TcSmemRead<'_>,
     tmem_read: TcTmemRead<'_>,
     tmem_write: TcTmemWrite<'_>,
-    views: Option<TcViews<'_>>,
 ) -> OpResult {
-    tc::tc_mma_ctas(payload, options, smem, tmem_read, tmem_write, views)
-}
-
-/// One CTA's whole shared window, borrowed for one MMA ([`TcViews`]).
-pub struct TcShared<'a> {
-    /// Window bytes (index = window offset, `addr::decode_shared(addr).1`).
-    pub bytes: &'a [u8],
-    /// Per-byte validity of `bytes`.
-    pub valid: &'a crate::arena::BitSet,
-}
-
-/// One CTA's whole TMEM allocation, borrowed mutably for one MMA
-/// (index = `addr::tmem_byte_offset(lane, col)`).
-pub struct TcTmem<'a> {
-    /// The allocation (named in an uninitialized-read error).
-    pub alloc: crate::arena::AllocId,
-    pub bytes: &'a mut [u8],
-    pub valid: &'a mut crate::arena::BitSet,
-}
-
-/// Which memory a recorded view read came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TcSpace {
-    Shared,
-    Tmem,
-}
-
-/// Borrowed whole-allocation views for [`tc_mma_ctas`] (W2/W4, 2026-10-08).
-/// Index = the `cta` the callbacks receive; `None` = use the callbacks for
-/// that CTA (overlaid or metadata-only allocation).
-///
-/// * Shared: a piece in bounds whose bytes are all valid is served from the
-///   slice; any other piece goes to the copying callback (exact errors and
-///   validity policy; the window stays readable by the engine).
-/// * TMEM (moved out of the arena for the call): an in-bounds piece is always
-///   served from the view; a piece touching an invalid byte is recorded on
-///   `uninit` and then follows `policy` exactly as `Arena::read` does
-///   (`Error`: the `ArenaError::Uninit` error at the first invalid byte;
-///   `Allow`: raw bytes; `ZeroAndReport`: invalid bytes read as zero).
-///   Out-of-bounds pieces go to the callbacks, which raise the range error.
-pub struct TcViews<'a> {
-    pub smem: Vec<Option<TcShared<'a>>>,
-    pub tmem: Vec<Option<TcTmem<'a>>>,
-    /// Pieces served from a view, `(space, cta, offset, len)` in request order
-    /// (the callbacks keep recording their own pieces); `None` = not recorded.
-    pub reads: Option<&'a mut Vec<(TcSpace, u32, u64, u64)>>,
-    /// TMEM write runs served from a view, `(cta, offset, len)`, always recorded.
-    pub writes: &'a mut Vec<(u32, u64, u64)>,
-    /// Validity policy for in-bounds TMEM view reads.
-    pub policy: crate::arena::ValidityPolicy,
-    /// In-bounds TMEM view reads that touched an invalid byte, `(cta, offset,
-    /// len)`, in request order (recorded before the policy applies).
-    pub uninit: &'a mut Vec<(u32, u64, u64)>,
+    tc::tc_mma_ctas(payload, options, smem, tmem_read, tmem_write)
 }
 
 /// Single-CTA wrapper of [`tc_mma_ctas`] (default options; `cta_group::2`

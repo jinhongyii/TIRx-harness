@@ -380,7 +380,6 @@ pub(super) fn tc_mma_ctas(
     smem: TcSmemRead<'_>,
     tmem_read: TcTmemRead<'_>,
     tmem_write: TcTmemWrite<'_>,
-    views: Option<super::TcViews<'_>>,
 ) -> OpResult {
     // The program's form (`TcMmaKind::Ti16`, `TcgenMmaArgs::lut_b`) selects the
     // form; the options carry what the args cannot (arch, LUT taddr, ...).
@@ -394,7 +393,7 @@ pub(super) fn tc_mma_ctas(
     if !payload.args.lut_b {
         options.lut_b = None;
     }
-    mma::run(payload, &options, smem, tmem_read, tmem_write, views)
+    mma::run(payload, &options, smem, tmem_read, tmem_write)
 }
 
 pub(super) fn tc_mma(
@@ -435,7 +434,6 @@ pub(super) fn tc_mma(
         &smem2,
         &read2,
         &mut write2,
-        None,
     )
 }
 

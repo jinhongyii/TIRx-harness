@@ -392,23 +392,22 @@ fn effective_taddr(ctx: &ExecCtx<'_>, taddr: Operand, row: Operand, col: Operand
 }
 
 /// Register spans (in the warp's metadata `Reg` allocation) of `regs` in `lanes`.
-fn reg_spans(_ctx: &ExecCtx<'_>, regs: &[Reg], lanes: WarpMask) -> Vec<LaneSpan> {
-    let mut v = Vec::new();
+fn reg_spans(_ctx: &ExecCtx<'_>, alloc: crate::arena::AllocId, regs: &[Reg], lanes: WarpMask) -> Accesses {
+    let mut v = Accesses { items: Vec::with_capacity(lanes.count() as usize * regs.len()) };
     for l in lanes.lanes() {
         for r in regs {
-            v.push(LaneSpan { lane: l as u8, span: ByteSpan::new((r.0 as u64 * 32 + l as u64) * 8, 8) });
+            v.items.push((alloc, None, LaneSpan { lane: l as u8, span: ByteSpan::new((r.0 as u64 * 32 + l as u64) * 8, 8) }));
         }
     }
     v
 }
 
-fn emit_async_spans(ctx: &mut ExecCtx<'_>, op: AsyncId, side: Side, kind: AccessKind, alloc: crate::arena::AllocId, spans: Vec<LaneSpan>) {
-    if !ctx.observing || spans.is_empty() {
+/// One access event of an async tcgen op: `acc` holds lane spans of one
+/// allocation, built in place (W13: no intermediate span list).
+fn emit_async_spans(ctx: &mut ExecCtx<'_>, op: AsyncId, side: Side, kind: AccessKind, mut acc: Accesses) {
+    if !ctx.observing || acc.items.is_empty() {
         return;
     }
-    let mut acc = Accesses {
-        items: spans.into_iter().map(|s| (alloc, None, s)).collect(),
-    };
     let spec = AccessSpec {
         actor: Actor::Async { op, side },
         site: ctx.site(),
@@ -576,7 +575,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
     };
     let op = ldst_op(ctx, AsyncClass::TcgenLd);
     let tmem = ctx.cta.tmem;
-    let mut tspans = Vec::with_capacity(if ctx.observing { active.count() as usize * nregs } else { 0 });
+    let mut tspans = Accesses { items: Vec::with_capacity(if ctx.observing { active.count() as usize * nregs } else { 0 }) };
     // One register image buffer for every lane (no per-lane allocation).
     let mut bytes = vec![0u8; nregs * 4];
     // W4-16: each live, fully valid cell run is read once into `image`;
@@ -597,7 +596,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
                             for p in map.pieces(r, t) {
                                 capture_piece(ctx, tmem, p);
                                 if ctx.observing {
-                                    tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
+                                    tspans.items.push((tmem, None, LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) }));
                                 }
                             }
                         }
@@ -617,7 +616,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
                         support::write_masked(ctx.warp.regs.get_mut(base + s), &[0u64; 32], active);
                     }
                 }
-                return finish_ld(ctx, args, op, tmem, tspans, &red, active);
+                return finish_ld(ctx, args, op, tspans, &red, active);
             }
         }
     }
@@ -658,7 +657,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
                         }
                     }
                     if ctx.observing {
-                        tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
+                        tspans.items.push((tmem, None, LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) }));
                     }
                 }
             }
@@ -693,7 +692,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
                         support::mem_read(ctx, loc, t, &mut bytes[at..at + n])?;
                     }
                     if ctx.observing {
-                        tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
+                        tspans.items.push((tmem, None, LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) }));
                     }
                 }
             }
@@ -727,7 +726,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
             }
         }
     }
-    finish_ld(ctx, args, op, tmem, tspans, &red, active)
+    finish_ld(ctx, args, op, tspans, &red, active)
 }
 
 /// Image offset of every piece of `map` (register-major, then lane) when
@@ -772,19 +771,18 @@ fn finish_ld(
     ctx: &mut ExecCtx<'_>,
     args: &TcgenLdArgs,
     op: AsyncId,
-    tmem: crate::arena::AllocId,
-    tspans: Vec<LaneSpan>,
+    tspans: Accesses,
     red: &Option<(oplib::TcgenLdRed, Vec<Reg>)>,
     active: WarpMask,
 ) -> HResult {
-    emit_async_spans(ctx, op, Side::Read, AccessKind::Read, tmem, tspans);
+    emit_async_spans(ctx, op, Side::Read, AccessKind::Read, tspans);
     let mut written: Vec<Reg> = args.dsts.clone();
     if let Some((_, regs)) = red {
         written.extend(regs.iter().copied());
     }
-    let rs = if ctx.observing { reg_spans(ctx, &written, active) } else { Vec::new() };
     if let Some(&ra) = ctx.aux.reg_allocs.get(ctx.warp.id.0 as usize) {
-        emit_async_spans(ctx, op, Side::Write, AccessKind::Write, ra, rs);
+        let rs = if ctx.observing { reg_spans(ctx, ra, &written, active) } else { Accesses::default() };
+        emit_async_spans(ctx, op, Side::Write, AccessKind::Write, rs);
     }
     let cmds: Vec<_> = active.lanes().map(|l| (work_res(ctx, l), SyncCmd::TcgenWork(tcgen::WorkCmd::Load))).collect();
     support::step_all(ctx, &cmds)?;
@@ -804,7 +802,7 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
     let nregs = map.registers;
     let op = ldst_op(ctx, AsyncClass::TcgenSt);
     let tmem = ctx.cta.tmem;
-    let mut tspans = Vec::with_capacity(if ctx.observing { active.count() as usize * nregs } else { 0 });
+    let mut tspans = Accesses { items: Vec::with_capacity(if ctx.observing { active.count() as usize * nregs } else { 0 }) };
     // W4-16: live, fully valid cell runs are patched in `image` and written
     // back once (validity is unchanged: already valid); other pieces take
     // the per-piece path. The images are flushed before any error returns.
@@ -838,7 +836,7 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
                         support::mem_write(ctx, loc, t, &bytes[at..at + n])?;
                     }
                     if ctx.observing {
-                        tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
+                        tspans.items.push((tmem, None, LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) }));
                     }
                 }
             }
@@ -848,11 +846,11 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
     runs.store(ctx, tmem)?;
     res?;
     let regs: Vec<Reg> = args.srcs.iter().filter_map(|s| if let Operand::Reg(r) = s { Some(*r) } else { None }).collect();
-    let rs = if ctx.observing { reg_spans(ctx, &regs, active) } else { Vec::new() };
     if let Some(&ra) = ctx.aux.reg_allocs.get(ctx.warp.id.0 as usize) {
-        emit_async_spans(ctx, op, Side::Read, AccessKind::Read, ra, rs);
+        let rs = if ctx.observing { reg_spans(ctx, ra, &regs, active) } else { Accesses::default() };
+        emit_async_spans(ctx, op, Side::Read, AccessKind::Read, rs);
     }
-    emit_async_spans(ctx, op, Side::Write, AccessKind::Write, tmem, tspans);
+    emit_async_spans(ctx, op, Side::Write, AccessKind::Write, tspans);
     let cmds: Vec<_> = active.lanes().map(|l| (work_res(ctx, l), SyncCmd::TcgenWork(tcgen::WorkCmd::Store))).collect();
     support::step_all(ctx, &cmds)?;
     ctx.aux.tcgen_ldst.entry(ctx.warp.id).or_default().push((op, active, true));
@@ -1247,7 +1245,7 @@ pub(crate) fn mma_a_footprint_probe(p: &TcgenMmaPayload, options: &oplib::TcMmaO
             Ok(())
         };
         let mut tw = |_: u32, _: u32, _: u32, _: &[u8]| -> oplib::OpResult { Ok(()) };
-        let _ = oplib::tc_mma_ctas(payload, options, &smem, &tr, &mut tw, None);
+        let _ = oplib::tc_mma_ctas(payload, options, &smem, &tr, &mut tw);
         reads.into_inner()
     };
     let first = probe(p);

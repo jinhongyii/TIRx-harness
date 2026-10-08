@@ -818,7 +818,11 @@ pub fn emit_accesses(
         return;
     }
     // Stable grouping by (alloc, window), preserving lane order inside.
-    acc.items.sort_by_key(|a| (a.0, window_key(a.1), a.2));
+    // Items are usually pushed in this order already (W13: skip the sort,
+    // a stable sort leaves sorted input unchanged).
+    if !acc.items.is_sorted_by_key(|a| (a.0, window_key(a.1), a.2)) {
+        acc.items.sort_by_key(|a| (a.0, window_key(a.1), a.2));
+    }
     let mut spans: Vec<LaneSpan> = Vec::with_capacity(acc.items.len());
     let mut i = 0;
     while i < acc.items.len() {

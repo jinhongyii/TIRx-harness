@@ -39,7 +39,9 @@ pub(crate) fn sched_error(kind: ExecErrorKind, kernel: u32, warp: WarpId, site: 
     ExecError { kind, kernel, warp, pc: Pc(0), site, lanes: WarpMask::NONE, message, attrs: Default::default() }
 }
 
-/// An owned copy of an [`Access`] (its `seq` is assigned at replay).
+/// An owned copy of an [`Access`] (its `seq` is assigned at replay). Its
+/// lane spans live in the buffer's span pool (W13: one allocation reused
+/// across rounds instead of one per access, freed on another thread).
 #[derive(Clone, Debug)]
 struct OwnedAccess {
     actor: Actor,
@@ -53,7 +55,7 @@ struct OwnedAccess {
     returns_value: bool,
     proxy: Proxy,
     window: Option<Window>,
-    spans: Vec<LaneSpan>,
+    spans: std::ops::Range<usize>,
     declared_word: bool,
     operand: u8,
 }
@@ -72,6 +74,8 @@ pub(crate) struct EventBuffer {
     pub enabled: bool,
     pub history: bool,
     events: Vec<Event>,
+    /// Lane spans of the buffered accesses (`OwnedAccess::spans`).
+    spans: Vec<LaneSpan>,
 }
 
 impl EventBuffer {
@@ -115,6 +119,7 @@ impl EventBuffer {
     /// Deliver and clear the buffered events; `Access::seq` is assigned
     /// here, in delivery order.
     pub fn replay(&mut self, observer: &mut dyn Observer, next_seq: &mut u64) {
+        let pool = &self.spans;
         for e in self.events.drain(..) {
             match e {
                 Event::Access(a) => {
@@ -131,7 +136,7 @@ impl EventBuffer {
                         returns_value: a.returns_value,
                         proxy: a.proxy,
                         window: a.window,
-                        spans: &a.spans,
+                        spans: &pool[a.spans],
                         declared_word: a.declared_word,
                         operand: a.operand,
                     };
@@ -143,10 +148,17 @@ impl EventBuffer {
                 Event::RoundBoundary(c, r) => observer.round_boundary(c, r),
             }
         }
+        self.spans.clear();
     }
 
     pub fn clear(&mut self) {
         self.events.clear();
+        self.spans.clear();
+    }
+
+    /// Buffered accesses (each takes one `Access::seq` at replay).
+    pub fn access_count(&self) -> u64 {
+        self.events.iter().filter(|e| matches!(e, Event::Access(_))).count() as u64
     }
 }
 
@@ -161,6 +173,8 @@ impl Observer for EventBuffer {
         if !self.enabled {
             return;
         }
+        let at = self.spans.len();
+        self.spans.extend_from_slice(a.spans);
         self.events.push(Event::Access(OwnedAccess {
             actor: a.actor,
             site: a.site,
@@ -173,7 +187,7 @@ impl Observer for EventBuffer {
             returns_value: a.returns_value,
             proxy: a.proxy,
             window: a.window,
-            spans: a.spans.to_vec(),
+            spans: at..self.spans.len(),
             declared_word: a.declared_word,
             operand: a.operand,
         }));
@@ -223,7 +237,7 @@ impl Partition {
             counters: LaunchCounters::default(),
             completions: 0,
             rng: Rng::new(seed ^ ((first_cluster as u64 + 1) << 32)),
-            events: EventBuffer { enabled: observing, history, events: Vec::new() },
+            events: EventBuffer { enabled: observing, history, events: Vec::new(), spans: Vec::new() },
             serial: Vec::new(),
             ends: Vec::new(),
             deferred: Vec::new(),
@@ -1343,7 +1357,7 @@ fn run_mma(
         note(&mut writes, al, span);
         Ok(())
     };
-    crate::oplib::tc_mma_ctas(p, &options, &smem, &tmem_read, &mut tmem_write, None)?;
+    crate::oplib::tc_mma_ctas(p, &options, &smem, &tmem_read, &mut tmem_write)?;
     let mut r = reads.into_inner();
     coalesce(&mut r);
     coalesce(&mut writes);

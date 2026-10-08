@@ -1028,6 +1028,89 @@ impl<'p> Scheduler<'p> {
         status
     }
 
+    /// Deliver the parallel phase's buffered events of partitions `order`
+    /// (replay order), after sequence assignment and verdict renumbering
+    /// (decision 17; W6 H4). Each partition is offered to
+    /// `Observer::fork` (keyed by its first cluster id, D3); a child gets
+    /// that partition's events on the worker pool, with the exact `seq`
+    /// values serial replay would assign; the children are joined, and the
+    /// other partitions replayed into `observer`, serially in replay order
+    /// after the pool returns (D4). Then one `phase_end` (H3). With the
+    /// default observer (no children) this is today's serial replay.
+    fn replay_partitions(&mut self, order: &[usize], observer: &mut dyn Observer, pool: Option<&pool::Pool>) {
+        use crate::observe::{ForkedObserver, PartitionInfo};
+        if order.is_empty() {
+            return;
+        }
+        let ctas_of = |p: &Partition| -> Vec<CtaId> { p.ctas.iter().map(|c| c.ctx.id).collect() };
+        let key_of = |p: &Partition| p.clusters.first().copied().unwrap_or(0);
+        let mut children: Vec<Option<Box<dyn ForkedObserver>>> = Vec::with_capacity(order.len());
+        let mut starts: Vec<u64> = Vec::with_capacity(order.len());
+        let mut seq = self.next_seq;
+        for &k in order {
+            let p = &self.partitions[k];
+            let ctas = ctas_of(p);
+            children.push(observer.fork(&PartitionInfo { key: key_of(p), ctas: &ctas }));
+            starts.push(seq);
+            seq += p.events.access_count();
+        }
+        if children.iter().any(Option::is_some) {
+            let mut evs: Vec<Option<&mut partition::EventBuffer>> = self.partitions.iter_mut().map(|p| Some(&mut p.events)).collect();
+            type Item<'a> = (&'a mut partition::EventBuffer, &'a mut Box<dyn ForkedObserver>, u64, Option<Box<dyn std::any::Any + Send>>);
+            let items: Vec<std::cell::UnsafeCell<Item<'_>>> = order
+                .iter()
+                .zip(children.iter_mut())
+                .zip(&starts)
+                .filter_map(|((&k, c), &st)| c.as_mut().map(|c| (k, c, st)))
+                .map(|(k, c, st)| std::cell::UnsafeCell::new((evs[k].take().expect("each partition once"), c, st, None)))
+                .collect();
+            struct Items<'a, 'b>(&'b [std::cell::UnsafeCell<Item<'a>>]);
+            // SAFETY: `par_for` hands every index to exactly one thread, and
+            // each item borrows a distinct event buffer and child.
+            unsafe impl Sync for Items<'_, '_> {}
+            impl<'a> Items<'a, '_> {
+                #[allow(clippy::mut_from_ref)]
+                unsafe fn item(&self, i: usize) -> &mut Item<'a> {
+                    &mut *self.0[i].get()
+                }
+            }
+            let shared = Items(&items);
+            let run = |i: usize| {
+                // SAFETY: see `Items`.
+                let (ev, child, start, panic) = unsafe { shared.item(i) };
+                let mut s = *start;
+                let child: &mut dyn Observer = child.as_mut();
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ev.replay(child, &mut s))) {
+                    *panic = Some(payload);
+                }
+            };
+            match pool {
+                Some(pool) if items.len() > 1 => pool.par_for(items.len(), &run),
+                _ => (0..items.len()).for_each(run),
+            }
+            for it in items {
+                if let Some(payload) = it.into_inner().3 {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        }
+        for (i, &k) in order.iter().enumerate() {
+            match children[i].take() {
+                Some(child) => {
+                    let p = &self.partitions[k];
+                    let ctas = ctas_of(p);
+                    observer.join(&PartitionInfo { key: key_of(p), ctas: &ctas }, child);
+                }
+                None => {
+                    let mut s = starts[i];
+                    self.partitions[k].events.replay(observer, &mut s);
+                }
+            }
+        }
+        self.next_seq = seq;
+        observer.phase_end(self.round);
+    }
+
     /// Replay partition `pi`'s buffered events and absorb its round results.
     fn absorb(&mut self, pi: usize, observer: &mut dyn Observer) {
         self.partitions[pi].events.replay(observer, &mut self.next_seq);
@@ -1071,7 +1154,8 @@ impl<'p> Scheduler<'p> {
                 observing: self.observing,
             };
             let r = self.partitions[0].run_round(&env, arena);
-            self.absorb(0, observer);
+            self.replay_partitions(&[0], observer, None);
+            self.absorb_state(0);
             self.merge_words(&[0]);
             return r;
         }
@@ -1180,9 +1264,7 @@ impl<'p> Scheduler<'p> {
         // its events are about to be delivered; buffered verdicts are
         // renumbered to the merged (delivery-order) history first (W6-P1).
         self.merge_words(&order);
-        for &k in &order {
-            self.partitions[k].events.replay(observer, &mut self.next_seq);
-        }
+        self.replay_partitions(&order, observer, pool);
         let mut progress = false;
         let mut first_err = None;
         for (k, result) in results.iter_mut().enumerate().take(kept) {
@@ -1245,7 +1327,14 @@ impl<'p> Scheduler<'p> {
             // merge each partition's history before the next one runs, so a
             // later partition's verdicts see earlier entries (W6 S-b).
             self.merge_words(&[pi]);
+            if let Err(e) = r {
+                observer.phase_end(self.round);
+                return Err(e);
+            }
             progress |= r?;
+        }
+        if !self.partitions.is_empty() {
+            observer.phase_end(self.round);
         }
         Ok(progress)
     }
@@ -1468,7 +1557,14 @@ impl<'p> Scheduler<'p> {
             let r = p.land(None, &env, arena, true).and_then(|a| Ok(a | p.apply_completions(&env)?));
             self.absorb(pi, observer);
             self.merge_words(&[pi]);
+            if let Err(e) = r {
+                observer.phase_end(self.round);
+                return Err(e);
+            }
             any |= r?;
+        }
+        if !self.partitions.is_empty() {
+            observer.phase_end(self.round);
         }
         Ok(any)
     }

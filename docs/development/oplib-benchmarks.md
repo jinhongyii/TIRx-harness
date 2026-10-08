@@ -173,3 +173,21 @@ profile choice, not adopted here.
 The NaN re-pin of the MMA chain (delta D8) costs nothing on finite outputs.
 When many outputs are NaN, it recomputes each of their chains with the scalar
 pinned FMA; that is the `mma_chain/f32_m128_n256_k16_with_nan` row.
+
+## Measured negative: borrowed-view MMA operand I/O (reverted)
+
+A whole-allocation view API on `tc_mma_ctas` (`TcViews`, landed in 79e643d) let the
+MMA read shared operands and read/write TMEM straight from borrowed allocation
+slices instead of through the per-piece copying callbacks (about 2,200 calls per
+block-scaled MMA on the Mega MoE e24 stream). On oplib's own criterion rows with
+cheap callbacks it measured `tc_mma/f16_ss_m128_n256_k16_accumulate` 348 -> 169 µs
+and `tc_mma/mxf8f6f4_e4m3_ss_m128_n256_k32` 270 -> 228 µs. Wired into the engine,
+a same-moment A/B on the Mega MoE max config and e24 showed no measurable gain
+(per MMA 207-271 µs with views off vs 244-262 µs on; the max-config differences
+equal host drift). The earlier "callback boundary is half the cost" estimate came
+from a stub with zero-filled operands that took cheaper arithmetic paths. The
+engine-side per-MMA cost is the per-element work in oplib (operand decode, the
+increasing-K FMA chain, accumulator encode), so the API was removed (W4/W2,
+2026-10-08). Further gains need fewer per-element operations, not a cheaper I/O
+boundary.
+

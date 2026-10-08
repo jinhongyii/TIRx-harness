@@ -263,3 +263,16 @@ Case `t8192_m8192_h7168_i3072_e384_k6_g1`, `Engine(max_workers=16)`, NumSim mode
 - A per-warp resource-version skip (≤ 288 CPU-s, about 9%) would have to be disabled whenever an observer is attached, because parked retries emit poll events. That makes it an execution path that exists only without an observer, which the one-execution-path rule forbids.
 - The lever is the MMA arithmetic (W4) and interpreter hot paths (W13).
 
+## tcgen05.mma cost: arithmetic, not the callback boundary (2026-10-08)
+
+**Decision (coordinator): borrowed-view MMA I/O is not landed.** Rule: no optimization without a measured gain.
+- **Background.** oplib calls the engine about 2,200 times per block-scaled MMA on Mega MoE e24 (544 shared-memory reads, 1,397 TMEM reads, 256 TMEM writes; about 41 KB). Stubbing those callbacks once seemed to halve `run_mma` (250 → 105–165 µs). That experiment was flawed: the stubs zero-filled the operands, which let oplib take cheaper arithmetic paths.
+- **Measured with a correct A/B.** Whole-allocation borrowed views (`TcViews`, W2/W4) were bit-identical to the callbacks (all scenarios × 3 validity policies × 1/16 workers, plus the e24 and radix streams) but gave:
+  - e24: 207–271 µs per MMA without views, 244–262 µs with them;
+  - max config, same-moment A/B: MMA landing 1,530 → 1,412 CPU-s, but untouched Copy and TcgenCp also fell about 7%, which is host drift.
+- **Also neutral, measured:**
+  - a validated-run validity cache (2× worse);
+  - moving TMEM out of the arena so callbacks are slices;
+  - fixed-size small copies.
+- **Conclusion.** The MMA cost is oplib's arithmetic per MMA. Engine-side callback work is not the lever. Don't retry views or callback micro-optimizations without a new profile that attributes time below `tc_mma_ctas` correctly (py-spy's native unwinding truncates there).
+
