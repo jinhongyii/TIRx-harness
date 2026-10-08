@@ -129,6 +129,8 @@ pub struct Finding {
     /// `AliasStaleRead` only: the merged byte spans of every occurrence
     /// (legacy `overlaps`); empty for other kinds.
     pub spans: Vec<Range<u64>>,
+    /// `AliasStaleRead` only: (reader, writer) logical names (W5-15).
+    pub names: Option<(Arc<str>, Arc<str>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -542,6 +544,8 @@ pub struct Checker {
     /// Logical buffer name per site (`SiteInfo::buffer`), for
     /// `AliasStaleRead`. Empty = advisory off.
     pub site_buffer: HashMap<SiteId, Arc<str>>,
+    /// W5-15: logical buffer of each (site, pointer operand).
+    pub operand_buffer: HashMap<(SiteId, u8), Arc<str>>,
     /// Declared space of each site's named buffer (see `alias_access`).
     pub site_buffer_space: HashMap<SiteId, Space>,
     /// Sites of `wait_until` polls (lowering's `tirx.cuda.wait_until`).
@@ -649,6 +653,7 @@ impl Checker {
             site_buffer: HashMap::new(),
             poll_sites: HashSet::new(),
             site_buffer_space: HashMap::new(),
+            operand_buffer: HashMap::new(),
             wide: WideSpans::default(),
             report: Report::default(),
             dedup: HashMap::new(),
@@ -991,7 +996,8 @@ impl Checker {
             current: Some(self.info(cw)),
             occurrences: 1,
             tmem: None,
-            spans: Vec::new(),        };
+            spans: Vec::new(),
+            names: None,        };
         if let Some(i) = self.push_finding(f) {
             self.advisory_dedup.insert((kind, alloc, site), i);
         }
@@ -1003,15 +1009,22 @@ impl Checker {
     /// bytes (adjacent bytes of one writer coalesce). Unnamed accesses
     /// neither report nor overwrite; async copies carry no name. No
     /// ordering requirement: the advisory is about logical identity.
-    fn alias_access(&mut self, alloc: AllocId, r: Range<u64>, site: SiteId, warp: WarpId, cw: &Witness) {
-        let Some(buf) = self.site_buffer.get(&site).filter(|b| !b.is_empty()).cloned() else {
+    fn alias_access(&mut self, alloc: AllocId, r: Range<u64>, site: SiteId, operand: u8, warp: WarpId, cw: &Witness) {
+        // W5-15: the access's own operand names it when lowering provides
+        // per-operand buffers; otherwise the site's single name, guarded by
+        // the space rule below (deltas P7 interim).
+        let exact = self.operand_buffer.get(&(site, operand)).cloned();
+        if exact.is_none() && operand != 0 {
+            return;
+        }
+        let Some(buf) = exact.clone().or_else(|| self.site_buffer.get(&site).cloned()).filter(|b| !b.is_empty()) else {
             return;
         };
         // A site names one operand's buffer; an access in another space
         // (e.g. tensormap.cp_fenceproxy's shared-memory source, named after
         // its global destination) has no known logical name (deltas P7).
         let space = self.allocs.get(&alloc).map(|a| a.space);
-        if self.site_buffer_space.get(&site).is_some_and(|s| Some(*s) != space) {
+        if exact.is_none() && self.site_buffer_space.get(&site).is_some_and(|s| Some(*s) != space) {
             return;
         }
         if cw.kind() != AccessKind::Write {
@@ -1047,6 +1060,7 @@ impl Checker {
                     occurrences: 1,
                     tmem: None,
                     spans: Vec::new(),
+                    names: Some((buf.clone(), seg.buf.clone())),
                 };
                 if let Some(i) = self.push_finding(f) {
                     self.alias_dedup.insert(key, i);
@@ -1120,7 +1134,8 @@ impl Checker {
             current: Some(self.info(cw)),
             occurrences: 1,
             tmem: None,
-            spans: Vec::new(),        };
+            spans: Vec::new(),
+            names: None,        };
         if let Some(i) = self.push_finding(f) {
             self.dedup.insert(key, i);
         }
@@ -1195,7 +1210,8 @@ impl Checker {
                 current,
                 occurrences: 1,
                 tmem: None,
-                spans: Vec::new(),            };
+                spans: Vec::new(),
+            names: None,            };
             self.push_finding(f);
             return;
         }
@@ -1298,7 +1314,7 @@ impl Checker {
             })
             .unwrap_or_default();
         let in_word = !word_points.is_empty();
-        let alias_space = !self.site_buffer.is_empty()
+        let alias_space = !(self.site_buffer.is_empty() && self.operand_buffer.is_empty())
             && self.allocs.get(&a.alloc).is_some_and(|al| matches!(al.space, Space::Shared | Space::Tmem));
         let mut word_rels: Vec<(usize, Option<Heads>, bool)> = Vec::new();
 
@@ -1323,17 +1339,15 @@ impl Checker {
                         races.push((overlap(p.span(wide), &seg), *p));
                     } else if ordered && this.cross_cta_async(p, cur, a.proxy) {
                         advisories.push((overlap(p.span(wide), &seg), *p, AdvisoryKind::CrossCtaAsyncOrder));
-                    } else if !ordered && ms && in_word && p.writes() != writes {
+                    } else if !ordered && ms && in_word && !writes && p.writes() {
                         // T18: a strong read of a declared word that is not
-                        // a `wait_until` poll, unordered with a write of it.
-                        let read_site = if writes { this.site_of(p) } else { a.site };
-                        if !this.poll_sites.contains(&read_site) {
+                        // a `wait_until` poll observed an unordered write of
+                        // it. Only this order: a spin's early reads (before
+                        // the publication) are the loop working.
+                        if !this.poll_sites.contains(&a.site) {
                             advisories.push((overlap(p.span(wide), &seg), *p, AdvisoryKind::DeclaredWordRawRead));
                         }
-                    } else if !ordered && ms && !in_word && p.writes() != writes && (p.writes() || !p.atomic()) {
-                        // Either order: a strong load that ran before an
-                        // unordered strong write could have read it on
-                        // another schedule (T18 note, #677).
+                    } else if !ordered && ms && !in_word && !writes && p.writes() {
                         advisories.push((overlap(p.span(wide), &seg), *p, AdvisoryKind::UndeclaredProtocolWord));
                     }
                 };
@@ -1412,7 +1426,7 @@ impl Checker {
         }
         if alias_space {
             if let Cur::Lane { w: wi, .. } = cur {
-                self.alias_access(a.alloc, a.range.clone(), a.site, wi as WarpId, &w);
+                self.alias_access(a.alloc, a.range.clone(), a.site, a.operand, wi as WarpId, &w);
             }
         }
         if !word_rels.is_empty() {
@@ -1536,7 +1550,8 @@ impl Checker {
             current: None,
             occurrences: 1,
             tmem: None,
-            spans: Vec::new(),        };
+            spans: Vec::new(),
+            names: None,        };
         if let Some(i) = self.push_finding(f) {
             self.scope_dedup.insert(key, i);
         }
@@ -1601,7 +1616,8 @@ impl Checker {
                         current: None,
                         occurrences: 1,
                         tmem: None,
-                        spans: Vec::new(),                    };
+                        spans: Vec::new(),
+            names: None,                    };
                     self.push_finding(f);
                 }
                 self.allocs.remove(&alloc);

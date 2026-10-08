@@ -263,8 +263,12 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
                 let reader = f.current.as_ref().map(|c| c.site);
                 let writer = f.prior.as_ref().map(|c| c.site);
                 let name = |s: Option<crate::site::SiteId>| s.and_then(|s| lr.buffer_of_site.get(&s).cloned());
-                race.insert("reader_buffer".into(), json!(name(reader)));
-                race.insert("writer_buffer".into(), json!(name(writer)));
+                let (rn, wn) = match &f.names {
+                    Some((r, w)) => (Some(r.to_string()), Some(w.to_string())),
+                    None => (name(reader), name(writer)),
+                };
+                race.insert("reader_buffer".into(), json!(rn));
+                race.insert("writer_buffer".into(), json!(wn));
                 race.insert("allocation_id".into(), json!(f.alloc.0));
                 race.insert("space".into(), json!(lr.buffers.get(&f.alloc).map(|(_, s)| space_name(*s))));
                 let spans: Vec<Value> = if f.spans.is_empty() { std::slice::from_ref(&f.bytes) } else { &f.spans[..] }
@@ -394,7 +398,11 @@ fn merge_alias(fs: &[RaceFinding], lr: &LaunchResult) -> Vec<RaceFinding> {
             continue;
         };
         let name = |s| lr.buffer_of_site.get(&s).cloned();
-        let key = (name(c.site), name(p.site), lr.buffers.get(&f.alloc).map(|(_, s)| *s), c.site.0, p.site.0);
+        let (rn, wn) = match &f.names {
+            Some((r, w)) => (Some(r.to_string()), Some(w.to_string())),
+            None => (name(c.site), name(p.site)),
+        };
+        let key = (rn, wn, lr.buffers.get(&f.alloc).map(|(_, s)| *s), c.site.0, p.site.0);
         let order = |f: &RaceFinding| {
             let (p, c) = (f.prior.as_ref().unwrap(), f.current.as_ref().unwrap());
             (c.warp, c.epoch, p.warp, p.epoch, f.alloc.0)

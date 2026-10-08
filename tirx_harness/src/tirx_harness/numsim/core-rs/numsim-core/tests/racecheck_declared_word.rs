@@ -222,12 +222,13 @@ fn raw_strong_read_of_declared_word_is_review() {
     k.a(1, 0, ld(MemOrder::Relaxed, Scope::Gpu), GMEM2, FLAG).st(1, 0, GMEM, 0..4);
     let r = k.run();
     assert!(review_only(&r) && has_advisory(&r, AdvisoryKind::DeclaredWordRawRead), "{r:?}");
-    // Raw read delivered before the publication: reported too.
+    // Raw read delivered before the publication (a spin's early reads):
+    // not reported; only a read that observed the unordered write is.
     let mut k = K::new(1, 1, 2);
     k.declare(GMEM2, FLAG);
     k.a(1, 0, ld(MemOrder::Relaxed, Scope::Gpu), GMEM2, FLAG);
     k.a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, FLAG);
-    assert!(has_advisory(&k.run(), AdvisoryKind::DeclaredWordRawRead));
+    assert!(!has_advisory(&k.run(), AdvisoryKind::DeclaredWordRawRead));
     // A poll (the read the wait_until is made of) is the protocol working.
     let mut k = K::new(1, 1, 2);
     k.declare(GMEM2, FLAG);

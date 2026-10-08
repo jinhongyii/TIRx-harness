@@ -175,6 +175,7 @@ fn checker_loop(c: &mut Criterion) {
                     domain: Some(Domain::SharedCta),
                     site: SiteId(w),
                     returns_value: false,
+                    operand: 0,
                 }));
             }
         }
@@ -219,6 +220,7 @@ fn checker_readers(c: &mut Criterion) {
                     domain: Some(Domain::SharedCta),
                     site: SiteId(w),
                     returns_value: false,
+                    operand: 0,
                 }));
             }
         }
@@ -245,6 +247,7 @@ fn checker_readers(c: &mut Criterion) {
                 domain: Some(Domain::SharedCta),
                 site: SiteId(99),
                 returns_value: false,
+                    operand: 0,
             }));
         }
         for w in 0..16u32 {

@@ -86,6 +86,8 @@ pub struct Access {
     pub proxy: Proxy,
     pub domain: Option<Domain>,
     pub site: SiteId,
+    /// Pointer operand of the site that produced the access (W5-15).
+    pub operand: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

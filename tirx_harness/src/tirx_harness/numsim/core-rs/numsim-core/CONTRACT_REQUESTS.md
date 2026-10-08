@@ -2904,3 +2904,18 @@ The mapping is in `scripts/numsim-v2/coverage/deleted_modules_w11.tsv` and `v2_p
     - `test_deltas_sync_instruction_predicates::test_pending_count_instruction_predicates` (NotNoComplete);
     - `test_triage_memory_coverage_next::test_no_complete_rejects_exhausted_arrivals[2,3]`.
   - Owner: W8 / W11, to update these ports to the structured fields.
+
+## W5-16 (for W1, 2026-10-08): bare `fence.<scope>` lowers to `.sc`; it should be `.acq_rel`
+
+In `v2/lowering/ptx_lower.py`, `lower_fence` emits `Fence { kind: Thread, sem: c.sem("Sc") }`, so a
+`fence.cta` with no `.sem` becomes a sequentially-consistent fence. In PTX, the `.sem` of `fence`
+defaults to `.acq_rel`, which the legacy engine also assumed. Reproducer:
+`tests/analysis_tools/racecheck/test_native_shared_publication.py::test_sc_causality_and_lane_controls[global|shared]`
+(the `""` order case is clean under v2; legacy and the test expect `error`, the same as `acq_rel`).
+Request: default to `AcqRel`.
+
+## W5-17 (for W8, 2026-10-08): public racecheck/synccheck crash on descriptor storage for a scalar
+
+`tests/analysis_tools/racecheck/test_native_public_api.py::test_public_checkers_reject_descriptor_storage_for_scalar[racecheck|synccheck]`
+raises `TypeError: only integer scalar arrays can be converted to a scalar index` inside the v2
+input binding, where the test expects a typed rejection.
