@@ -13,14 +13,13 @@ fn scalar_roundtrip() {
     assert!(resolve_ptx(&key, &[Ty::U32], &[Ty::F32]).is_ok());
 }
 
+/// The legacy-format renderer over the registry. (The comparison with the
+/// deleted `engine-rs/SUPPORTED_OPS.md` is gone with that file; the v2
+/// `numsim-oplib/SUPPORTED_OPS.md` is pinned by `supported_ops_md_is_current`.)
 #[test]
-fn render_md_reproduces_legacy_supported_ops() {
+fn render_md_covers_the_registry() {
     let md = render_supported_ops_md(registry());
     assert!(md.contains("| `tirx.ptx.ld` | raw_memory | modeled |"));
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../engine-rs/SUPPORTED_OPS.md");
-    if let Ok(legacy) = std::fs::read_to_string(path) {
-        assert_eq!(md, legacy);
-    }
     assert_eq!(registry().len(), 600);
     let tile = registry().iter().find(|e| e.name == "tirx.tile.copy_async").unwrap();
     assert_eq!(tile.instr, "tile");
