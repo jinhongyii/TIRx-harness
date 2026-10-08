@@ -24,6 +24,7 @@
 
 mod cvt;
 mod helpers;
+mod hints;
 mod io;
 mod vector;
 mod warp;
@@ -69,6 +70,8 @@ pub(super) fn resolve(key: &OpKey, dst_tys: &[Ty], src_tys: &[Ty]) -> OpResult<P
     let name = key.name.as_str();
     let resolved = if let Some(found) = vector::resolve(name, &mods, &ops)? {
         found
+    } else if let Some(found) = hints::resolve(name, &mods, &ops)? {
+        found
     } else if let Some(found) = helpers::resolve(name, &mods, &ops)? {
         found
     } else if let Some(found) = cvt::resolve(name, &mods, &ops)? {
@@ -94,6 +97,7 @@ pub(super) fn resolve(key: &OpKey, dst_tys: &[Ty], src_tys: &[Ty]) -> OpResult<P
 pub(in crate::oplib) fn known_ops() -> Vec<&'static str> {
     let mut names = Vec::new();
     names.extend_from_slice(vector::NAMES);
+    names.extend_from_slice(hints::NAMES);
     names.extend_from_slice(helpers::NAMES);
     names.extend_from_slice(cvt::NAMES);
     names.extend_from_slice(warp::NAMES);

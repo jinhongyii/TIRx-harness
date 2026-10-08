@@ -37,6 +37,8 @@ that matches no row here is a regression.
 | P3 | Confirmed | `tirx.cuda.sm100_2sm_leader_smem_addr` | Clears hardware CTA-rank bit 24 | `Unsupported`. Under the `arena::addr` cluster encoding (`(rank+1)<<24`) bit 24 has no faithful meaning. | Not a numeric question; it is an address-model decision for the contract worker. |
 | P4 | New | `tirx.cuda.float22half2` / `float8tohalf8` / `half8tofloat8` | Modeled as pointer read-modify-writes | `Unsupported` through `resolve_ptx`. The operands are memory, not registers. | None. Lowering must route these to memory instructions. |
 | P5 | Confirmed | `shfl.sync` whose resolved source lane is not an active participant | Error: "warp shuffle reads a non-participant lane" | The same error from `oplib::shfl_sync` and from `tirx.ptx.shfl_sync*`. The infallible compatibility `oplib::shfl` returns the source value with predicate false. | — |
+| P6 | Open (W2) | `prefetch.L1::32B.valid_addr` | Validated that the address names one addressable global byte | No-op in OpLib; the check needs engine memory (CONTRACT_REQUESTS W4-9). | — |
+| P7 | Open (W2) | `applypriority.async.bulk*` with `completion=bulk_group` | Joined the thread's bulk async group | No-op in OpLib unless the handler registers it with the group (CONTRACT_REQUESTS W4-9). Values never change; only group counting would differ. | — |
 
 ## Async / tensor-core numerics
 

@@ -1211,3 +1211,72 @@ request a `SynccheckConfig`/input flag (or a `RecordingObserver` marker from
   one side is a weak (plain) access. It is reported as `status=error`, with
   the race evidence and the bypass hint (deltas T3). Until the variant exists
   it uses `Other("signal_protocol_error")`.
+
+### W8-6 update (2026-10-08): identical-span aliasing implemented in Python
+
+Parameters bound to the *identical* host byte span (one array bound twice,
+the common corpus case) now share one allocation without a core change: the
+binder marks the later parameters `alias` of the first and specializes the
+module so their `ParamSlot.aliases` name the first parameter, which
+`run_with_config` already resolves to the same allocation
+(`CompiledModule.with_buffer_aliases`). Only partially overlapping views
+still fail closed and still need `ArgValue::View`.
+
+### W8-7 [sched]: engine addresses of bindings before the run
+
+Raw-pointer kernels (legacy `test_native_global_write_seed.py`: pointer
+words such as `pointer_bits = [source.ctypes.data]` passed as data) need
+the engine address of a binding to put into another input before the run.
+Synthetic global VAs are deterministic, but only the arena knows the policy
+(alignment, guard gaps, allocation order). Request a pure
+`sched::plan_global_addresses(module, inputs) -> Result<BTreeMap<String, u64>, RunError>`
+(same allocation order as `run_with_config`), which numsim-py will expose as
+`Engine.address_of(module, inputs, name)`.
+
+### V2C-24 [interp]: `Requirements.implicit_tmem` is ignored
+
+`tests/numsim/v2/checkers/test_alias_advisory.py::test_tmem_view_keeps_one_logical_identity`
+(and the partitioned / full-extent variants): a TMEM `decl_buffer(...,
+allocated_addr=0)` store/load without `tcgen05.alloc`. Lowering sets
+`requirements.implicit_tmem = true`; the engine stops with `Incomplete
+"tmem[0]: tmem column 0 is not in a live allocation"` and the output reads
+0. Legacy treated such programs as owning the whole TMEM.
+
+### V2C-25 [sched]: `ArgValue::TensorMapOf` base is "not mapped"
+
+`tests/numsim/v2/checkers/test_global_write_seed.py::test_tensor_map_initial_and_replaced_bases_keep_compact_alias_races[distinct-initial-base]`:
+a host `numsim.TensorMap` over an array that is not otherwise a kernel
+argument binds as `TensorMapOf { base: "target_map.__base__", offset: 0, .. }`
+with that array as a `Buffer` argument; the TMA store faults with
+`bad_address: Global address 0x7d0000000040 is not mapped`. Probably the
+same root cause as V2C-9 (corpus `flash_attention4`, `fastcu_nvfp4_gemm_gb300`,
+`gdn_prefill_sm100`, all host-descriptor TMA kernels). The `replaced-base`
+variant reports `missing_proxy_bridge` on the descriptor bytes after
+`tensormap.replace` + `fence.proxy.tensormap::generic` (racecheck).
+
+## W4-9 (2026-10-08): v2 conformance V2C-1 / V2C-8 (oplib)
+
+- **V2C-1 `tirx.ptx.prefetch*` / `applypriority*`** now resolve
+  (`oplib/ptx/hints.rs`): every `prefetch`, `prefetch_valid_addr`,
+  `prefetchu`, `applypriority`, `applypriority_async_bulk*` form W1 lowers
+  through `lower_generic_ordering` (`Instr::Ptx`, no dsts). Modifiers are
+  validated against the TVM table (bare tokens or `slot=token`; unknown /
+  missing / duplicate fail closed); the op is a no-op with no `Access`
+  (legacy `ptx_cache_hint`, `ordering_only`; `prefetch.tensormap` had no
+  effect in legacy either). **W2**, two legacy checks need engine state and
+  belong in the `Ptx` handler (or a dedicated variant) if they are wanted:
+  `tirx.ptx.prefetch_valid_addr` validated that its address names at least
+  one addressable global byte (legacy
+  `validate_global_cache_hint_address(.., 1, 1, "prefetch.L1::32B.valid_addr")`),
+  and `applypriority.async.bulk*` (`completion=bulk_group`) joined the
+  thread's bulk async group (a later `cp.async.bulk.commit_group` /
+  `wait_group` counts it). Without them both are plain no-ops (recorded as
+  delta P6/P7).
+- **V2C-8**: `TensorMapDesc` gained `fp4_padded: bool` (Default false): with
+  `elem: Some(E2M1)` it selects the 16-byte-aligned padded FP4 shared layout
+  (`CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B`) instead of the packed
+  `16U4_ALIGN8B`. `decode` sets it, `encode` honours it, `tma_plan` plans it
+  with the legacy padded unit (8 data bytes per 16-byte shared slot). Also
+  `Dtype::U6` now maps to/from the `16U6_ALIGN16B` element type. W2/W8:
+  host-side tensor maps built from a `CUtensorMap` data type 14 must set
+  `fp4_padded = true` (the binder previously had no way to say so).

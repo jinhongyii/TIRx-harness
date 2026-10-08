@@ -533,3 +533,30 @@ fn gather4_reads_four_rows() {
     );
     assert_eq!(plan.smem, vec![ByteSpan::new(0, 128)]);
 }
+
+#[test]
+fn fp4_padded_and_u6_element_types_round_trip() {
+    let mut ends = Vec::new();
+    for (elem, padded) in [(Dtype::E2M1, false), (Dtype::E2M1, true), (Dtype::U6, false)] {
+        let mut d = desc2d(elem, [256, 4], 128, [128, 4], 3);
+        d.fp4_padded = padded;
+        let bytes = d.try_encode().unwrap_or_else(|e| panic!("{elem:?} padded={padded}: {e}"));
+        let back = TensorMapDesc::decode(&bytes).unwrap();
+        assert_eq!((back.elem, back.fp4_padded), (Some(elem), padded));
+        assert_eq!(back.try_encode().unwrap(), bytes);
+        if elem == Dtype::E2M1 {
+            // The legacy planner accepts both FP4 shared layouts for loads:
+            // 256 payload bytes either way; the padded layout spreads each
+            // 8-byte unit over a 16-byte slot, doubling the shared extent.
+            let plan = tma_plan(&d, TmaMode::Tile, &[0, 0], &[], 1024).unwrap();
+            assert_eq!(plan.bytes, 256, "padded={padded}");
+            let copied: u64 = plan.smem.iter().map(|s| s.len).sum();
+            assert_eq!(copied, 256, "padded={padded}");
+            ends.push(plan.smem.iter().map(|s| s.end()).max().unwrap());
+        }
+    }
+    assert!(ends[1] > ends[0], "padded FP4 spreads over a larger shared extent: {ends:?}");
+    let mut bad = desc2d(Dtype::F16, [64, 4], 128, [64, 4], 0);
+    bad.fp4_padded = true;
+    assert!(bad.try_encode().is_err());
+}

@@ -488,6 +488,10 @@ pub struct TensorMapDesc {
     pub swizzle_atomicity: u8,
     /// Im2col bounding box; `None` = tiled map.
     pub im2col: Option<Im2colBox>,
+    /// `elem == E2M1` only: the shared-memory layout is the 16-byte-aligned
+    /// padded one (`CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B`, one FP4 element
+    /// per byte pair slot) instead of the packed `16U4_ALIGN8B` (false).
+    pub fp4_padded: bool,
 }
 
 impl TensorMapDesc {

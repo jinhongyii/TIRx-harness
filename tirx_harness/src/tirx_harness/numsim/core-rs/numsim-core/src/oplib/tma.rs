@@ -27,8 +27,9 @@
 //!   `global_stride[4]` must be 0.
 //! * `elem`: `Pred`=bool, `U8`, `S8`, `E4M3`, `UE8M0`, `S16`, `U16`, `F16`,
 //!   `BF16`, `S32`, `U32`, `F32`, `TF32`, `F64`, `S64`, `U64`, `E2M1`
-//!   (packed 16U4_ALIGN8B layout). The image types U6, U32x2, F32_FTZ and
-//!   TF32_FTZ have no `Dtype` and decode as `Unsupported`.
+//!   (packed 16U4_ALIGN8B, or 16U4_ALIGN16B with `fp4_padded`), `U6`
+//!   (16U6_ALIGN16B). The image types U32x2, F32_FTZ and TF32_FTZ have no
+//!   `Dtype` and decode as `Unsupported`.
 //! * `im2col`: the image's im2col extension (corners, `wide`); `None` =
 //!   tiled. An im2col-mode plan on a map without a box uses a zero
 //!   bounding box (lower = upper = 0, `wide` from the mode).
@@ -51,11 +52,14 @@ pub(crate) const L2_PROMOTION_BYTE: usize = TENSOR_MAP_DESCRIPTOR_BYTES - 1;
 // Field mappings
 // ---------------------------------------------------------------------------
 
-fn elem_to_image(elem: Option<Dtype>) -> OpResult<(TensorMapElementType, Option<Fp4SharedLayout>)> {
+fn elem_to_image(elem: Option<Dtype>, fp4_padded: bool) -> OpResult<(TensorMapElementType, Option<Fp4SharedLayout>)> {
     use TensorMapElementType as E;
     let Some(elem) = elem else {
         return Err(OpError::invalid("TensorMap has no element type"));
     };
+    if fp4_padded && elem != Dtype::E2M1 {
+        return Err(OpError::invalid("TensorMap fp4_padded requires elem E2M1"));
+    }
     Ok(match elem {
         Dtype::Pred => (E::Bool, None),
         Dtype::U8 => (E::U8, None),
@@ -73,7 +77,9 @@ fn elem_to_image(elem: Option<Dtype>) -> OpResult<(TensorMapElementType, Option<
         Dtype::F64 => (E::F64, None),
         Dtype::S64 => (E::I64, None),
         Dtype::U64 => (E::U64, None),
+        Dtype::E2M1 if fp4_padded => (E::Float4E2M1Fn, Some(Fp4SharedLayout::Align16Padded)),
         Dtype::E2M1 => (E::Float4E2M1Fn, Some(Fp4SharedLayout::Align8Packed)),
+        Dtype::U6 => (E::U6, None),
         other => {
             return Err(OpError::unsupported(format!(
                 "TensorMap element type {other:?} has no CUtensorMap data type"
@@ -101,7 +107,8 @@ fn elem_from_image(elem: TensorMapElementType, fp4: Option<Fp4SharedLayout>) -> 
         E::F64 => Dtype::F64,
         E::I64 => Dtype::S64,
         E::U64 => Dtype::U64,
-        E::Float4E2M1Fn if fp4 == Some(Fp4SharedLayout::Align8Packed) => Dtype::E2M1,
+        E::Float4E2M1Fn if fp4.is_some() => Dtype::E2M1,
+        E::U6 => Dtype::U6,
         other => {
             return Err(OpError::unsupported(format!(
                 "TensorMap element type {other} (shared layout {fp4:?}) is not representable as a Dtype"
@@ -226,7 +233,7 @@ fn desc_to_image(desc: &TensorMapDesc) -> OpResult<TensorMapImage> {
             "TensorMap rank must be in 1..=5, got {rank}"
         )));
     }
-    let (element_type, fp4_shared_layout) = elem_to_image(desc.elem)?;
+    let (element_type, fp4_shared_layout) = elem_to_image(desc.elem, desc.fp4_padded)?;
     let (swizzle_bytes, swizzle_atomicity) = swizzle_of_desc(desc)?;
     let fill_mode = match desc.oob_fill {
         0 => TensorMapFillMode::Zero,
@@ -306,6 +313,7 @@ fn image_to_desc(image: &TensorMapImage, l2_promotion: u8) -> OpResult<TensorMap
         swizzle_atomicity,
         l2_promotion,
         oob_fill: u8::from(image.fill_mode == TensorMapFillMode::OobNan),
+        fp4_padded: image.fp4_shared_layout == Some(Fp4SharedLayout::Align16Padded),
         im2col: image.im2col.as_ref().map(|b| Im2colBox {
             lower: b.lower,
             upper: b.upper,
