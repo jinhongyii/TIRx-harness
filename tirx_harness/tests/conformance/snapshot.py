@@ -283,15 +283,20 @@ def normalize_records(
         key = json.dumps(key_fields, sort_keys=True)
         group = groups.setdefault(key, {**key_fields, "_bytes": {}})
         columns = record.get("tmem_columns")
-        explicit_columns = (
-            isinstance(columns, (list, tuple)) and len(columns) == 2
-            and all(isinstance(c, int) and not isinstance(c, bool) for c in columns)
+        # numsim-core states TMEM footprints as exact column ranges
+        # (`tmem_columns = [[lo, hi], ...]` in 4-byte columns; an older single
+        # `[lo, hi]` is accepted too); its byte spans are taddr-encoded and
+        # not comparable to legacy's lane*2048+col*4.
+        if isinstance(columns, (list, tuple)) and len(columns) == 2 and all(isinstance(c, int) for c in columns):
+            columns = [columns]
+        explicit_columns = isinstance(columns, (list, tuple)) and bool(columns) and all(
+            isinstance(r, (list, tuple)) and len(r) == 2
+            and all(isinstance(c, int) and not isinstance(c, bool) for c in r)
+            for r in columns
         )
         if explicit_columns:
-            # numsim-core states TMEM footprints as lane/column ranges
-            # (`tmem_columns`, in 4-byte columns); its byte spans are
-            # taddr-encoded and not comparable to legacy's lane*2048+col*4.
-            group["_bytes"].setdefault("tmem-columns", []).append((columns[0] * 4, columns[1] * 4))
+            for lo, hi in columns:
+                group["_bytes"].setdefault("tmem-columns", []).append((lo * 4, hi * 4))
         for region, start, end in _intervals(record):
             if region.startswith("tmem") and explicit_columns:
                 continue
