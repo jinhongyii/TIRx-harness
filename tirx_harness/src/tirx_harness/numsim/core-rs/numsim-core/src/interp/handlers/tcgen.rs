@@ -411,6 +411,8 @@ fn emit_async_spans(ctx: &mut ExecCtx<'_>, op: AsyncId, side: Side, kind: Access
         atomic: false,
         returns_value: false,
         proxy: Proxy::Tcgen,
+        // The TMEM address (or the register file): the only pointer operand.
+        operand: 0,
     };
     support::emit(ctx, spec, &mut acc);
 }

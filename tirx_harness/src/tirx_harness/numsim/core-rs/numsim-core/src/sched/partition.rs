@@ -55,6 +55,7 @@ struct OwnedAccess {
     window: Option<Window>,
     spans: Vec<LaneSpan>,
     declared_word: bool,
+    operand: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +96,7 @@ impl EventBuffer {
                         window: a.window,
                         spans: &a.spans,
                         declared_word: a.declared_word,
+                        operand: a.operand,
                     };
                     *next_seq += 1;
                     observer.access(&acc);
@@ -136,6 +138,7 @@ impl Observer for EventBuffer {
             window: a.window,
             spans: a.spans.to_vec(),
             declared_word: a.declared_word,
+            operand: a.operand,
         }));
     }
     fn sync(&mut self, e: &SyncEvent) {
@@ -374,6 +377,7 @@ impl Partition {
                             atomic: false,
                             returns_value: false,
                             proxy: Proxy::Generic,
+                            operand: 0,
                         };
                         support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, spec, &mut acc);
                     }
@@ -688,6 +692,9 @@ impl Partition {
                 atomic: false,
                 returns_value: false,
                 proxy,
+                // Copies: destination 0, source 1 (PTX operand order); the
+                // read side is refined below for MMA operands.
+                operand: if side == Side::Write { 0 } else { 1 },
             };
             let window = |arena: &Arena, a: AllocId| match arena.get(a).space {
                 Space::Global => Some(Window::Global),
@@ -712,13 +719,20 @@ impl Partition {
             let tc_op = matches!(op.kind, crate::sync::AsyncKind::TcgenMma | crate::sync::AsyncKind::TcgenCp);
             let (shared_reads, other_reads): (Vec<_>, Vec<_>) =
                 reads.iter().copied().partition(|&(a, _)| tc_op && arena.get(a).space == Space::Shared);
-            for (group, prox) in [(shared_reads, Proxy::Async), (other_reads, proxy)] {
+            // Pointer operand of each read group: MMA d/a/b = 0/1/2 (the
+            // shared-A read op is A, other shared reads B, TMEM reads D);
+            // tcgen05.cp taddr/s-desc = 0/1; copies src = 1.
+            let is_mma = op.kind == crate::sync::AsyncKind::TcgenMma;
+            let shared_operand = if is_mma && !is_a_read { 2 } else { 1 };
+            let other_operand = if tc_op { 0 } else { 1 };
+            for (group, prox, operand) in [(shared_reads, Proxy::Async, shared_operand), (other_reads, proxy, other_operand)] {
                 if group.is_empty() {
                     continue;
                 }
                 acc.items = group.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
                 let mut sp = mk(Side::Read, AccessKind::Read);
                 sp.proxy = prox;
+                sp.operand = operand;
                 support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, sp, &mut acc);
             }
             let reduce_elem = match &op.payload {

@@ -358,6 +358,7 @@ fn epoch_beyond_32_bits_is_incomplete() {
         window: None,
         spans: &spans,
         declared_word: false,
+        operand: 0,
     });
     obs.finish_launch();
     assert!(obs.launches[0].report.incomplete.iter().any(|i| matches!(i, Incomplete::EpochOverflow { .. })));

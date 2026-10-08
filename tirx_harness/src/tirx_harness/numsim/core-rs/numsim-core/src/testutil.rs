@@ -69,6 +69,14 @@ impl ProgramBuilder {
         id
     }
 
+    /// Name the buffers of the current site's pointer operands, in operand
+    /// order (`SiteInfo::buffers`, README decision 15).
+    pub fn site_buffers(&mut self, buffers: &[Option<&str>]) {
+        if let Some(s) = self.p.sites.get_mut(self.site.0 as usize) {
+            s.buffers = buffers.iter().map(|b| b.map(str::to_string)).collect();
+        }
+    }
+
     /// Clear the current site (pure ALU code).
     pub fn no_site(&mut self) {
         self.site = SiteId::NONE;

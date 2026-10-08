@@ -1339,3 +1339,50 @@ fn tensormap_replace_through_a_generic_shared_address() {
     let d = numsim_core::oplib::TensorMapDesc::decode(&bytes).expect("decodes");
     assert_eq!(d.rank, 2);
 }
+
+/// README decision 15 (W5-15): `SiteInfo.buffers` JSON; a module without
+/// it (legacy `buffer`) derives `[buffer]`; both fields are written.
+#[test]
+fn site_info_buffers_json_shapes() {
+    use numsim_core::site::SiteInfo;
+    let legacy = r#"{"kind":"k","spans":[],"op_name":"o","text":"t","dtype":null,"buffer":"x"}"#;
+    let s: SiteInfo = serde_json::from_str(legacy).unwrap();
+    assert_eq!(s.buffers, vec![Some("x".to_string())]);
+    assert_eq!(s.buffer(), Some("x"));
+    let new = r#"{"kind":"k","spans":[],"op_name":"o","text":"t","dtype":null,"buffers":["d",null,"s"]}"#;
+    let s: SiteInfo = serde_json::from_str(new).unwrap();
+    assert_eq!(s.buffer_of(0), Some("d"));
+    assert_eq!(s.buffer_of(1), None);
+    assert_eq!(s.buffer_of(2), Some("s"));
+    let back: serde_json::Value = serde_json::to_value(&s).unwrap();
+    assert_eq!(back["buffer"], "d");
+    assert_eq!(back["buffers"], serde_json::json!(["d", null, "s"]));
+    assert_eq!(serde_json::from_value::<SiteInfo>(back).unwrap(), s);
+    let bad = r#"{"kind":"k","spans":[],"op_name":"o","text":"t","dtype":null,"buffers":[],"extra":1}"#;
+    assert!(serde_json::from_str::<SiteInfo>(bad).is_err());
+}
+
+/// README decision 15: `Access.operand` of a TMA load: the shared
+/// destination writes are operand 0, the global source reads operand 1,
+/// and the issue-time tensor-map read is operand 1.
+#[test]
+fn access_operand_names_the_pointer_operand() {
+    #[derive(Default)]
+    struct Ops(Vec<(numsim_core::observe::Actor, numsim_core::arena::Space, numsim_core::observe::AccessKind, u8)>);
+    impl Observer for Ops {
+        fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+            self.0.push((a.actor, a.space, a.kind, a.operand));
+        }
+    }
+    use numsim_core::arena::Space;
+    use numsim_core::observe::{AccessKind, Actor};
+    let s = scenarios::tma_load();
+    let mut obs = Ops::default();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).expect("run starts");
+    completed(&o);
+    let async_writes: Vec<u8> = obs.0.iter().filter(|x| matches!(x.0, Actor::Async { .. }) && x.2 == AccessKind::Write && x.1 == Space::Shared).map(|x| x.3).collect();
+    let async_reads: Vec<u8> = obs.0.iter().filter(|x| matches!(x.0, Actor::Async { .. }) && x.2 == AccessKind::Read && x.1 == Space::Global).map(|x| x.3).collect();
+    assert!(!async_writes.is_empty() && async_writes.iter().all(|&o| o == 0), "{async_writes:?}");
+    assert!(!async_reads.is_empty() && async_reads.iter().all(|&o| o == 1), "{async_reads:?}");
+    assert!(obs.0.iter().any(|x| matches!(x.0, Actor::Warp { .. }) && x.1 == Space::Param && x.3 == 1), "{:?}", obs.0);
+}

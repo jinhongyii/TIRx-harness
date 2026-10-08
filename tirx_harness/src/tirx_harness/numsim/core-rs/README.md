@@ -104,7 +104,7 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
     later internal change.
 11. **Tile ops** remain as a provisional `Instr::Tile` with W1's element-map
     `TileLayout`; W1 prefers lowering through TVM's dispatch to PTX-level IR.
-12. **Strict serde, `FORMAT_VERSION` 2** (contract review item 7): every
+12. **Strict serde, `FORMAT_VERSION` 3** (2 until decision 15) (contract review item 7): every
     program type rejects unknown fields and every `Option` field must be
     present (`null`), so a misspelled or dropped field is a decode error, not
     a silent default. `Program::validate` is exhaustive (indices, type widths,
@@ -114,3 +114,23 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
 14. **Epochs are `u64`**; declared-word history bit 0 = launch value, bit i =
     the i-th (Access, lane) write in delivery order, lanes ascending, value =
     byte-merged post-image.
+15. **Per-operand buffer attribution** (W5-15, `FORMAT_VERSION` 3).
+    - `SiteInfo.buffers: Vec<Option<String>>` names the buffer behind each
+      pointer operand of the site, in operand order (`None` = a raw
+      pointer). `SiteInfo::buffer()` = `buffers[0]` is a transition accessor
+      for the former single `buffer` field and will be removed.
+    - Until lowering emits `buffers`, a module JSON without it is accepted
+      and `buffers` is derived as `[buffer]`. Serialization writes both.
+    - `observe::Access.operand: u8` is the index of the pointer operand that
+      produced the access, so checkers name the right buffer per access.
+      - Loads, stores, atomics, `st.bulk`, `discard`, `tensormap.replace`,
+        `st.async`/`red.async`, and the remote DSMEM inbox write: 0.
+      - Async copies (bulk, `cp.async`, TMA, bulk reductions): destination
+        (write side) 0, source (read side) 1. The TMA tensor-map read at
+        issue is 1 for loads/prefetch and 0 for stores/reductions.
+      - `tensormap.cp_fenceproxy`: dst 0, src 1.
+      - `tcgen05.mma`: D (TMEM) 0, A 1 (the shared-A read op), B 2.
+      - `tcgen05.cp`: TMEM 0, shared source 1.
+      - `tcgen05.ld/st` TMEM and register spans: 0.
+    - The codegen backend runs the same handlers and carries no access
+      semantics of its own.

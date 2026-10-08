@@ -218,10 +218,22 @@ impl Observer for RaceObserver {
             .sites
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| s.buffer.clone().filter(|b| !b.is_empty()).map(|b| (crate::site::SiteId(i as u32), b)))
+            .filter_map(|(i, s)| s.buffer().map(str::to_string).filter(|b| !b.is_empty()).map(|b| (crate::site::SiteId(i as u32), b)))
             .collect();
         self.set_site_buffers(names);
         if let Some(c) = &mut self.checker {
+            // W5-15: one logical name per pointer operand.
+            c.operand_buffer = info
+                .program
+                .sites
+                .iter()
+                .enumerate()
+                .flat_map(|(i, s)| {
+                    s.buffers.iter().enumerate().filter_map(move |(o, b)| {
+                        b.as_deref().filter(|b| !b.is_empty()).map(|b| ((crate::site::SiteId(i as u32), o as u8), std::sync::Arc::<str>::from(b)))
+                    })
+                })
+                .collect();
             // The site's buffer names ONE operand (the first pointer of a
             // multi-operand op such as tensormap.cp_fenceproxy): record its
             // space so an access in another space is not given that name.
@@ -231,7 +243,7 @@ impl Observer for RaceObserver {
                 .sites
                 .iter()
                 .enumerate()
-                .filter_map(|(i, s)| s.buffer.as_deref().and_then(|b| space_of.get(b)).map(|sp| (crate::site::SiteId(i as u32), *sp)))
+                .filter_map(|(i, s)| s.buffer().and_then(|b| space_of.get(b)).map(|sp| (crate::site::SiteId(i as u32), *sp)))
                 .collect();
             c.poll_sites = info
                 .program
@@ -280,6 +292,7 @@ impl Observer for RaceObserver {
             proxy,
             domain: a.window,
             site: a.site,
+            operand: a.operand,
         };
         match a.actor {
             Actor::Warp { warp, epoch } => {

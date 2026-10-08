@@ -141,6 +141,11 @@ pub struct Access<'a> {
     /// At least one span overlaps a declared word (only when the observer
     /// `wants_word_history`).
     pub declared_word: bool,
+    /// Index of the instruction's pointer operand that produced this
+    /// access, into `SiteInfo::buffers` (README decision 15, W5-15): 0 for
+    /// loads/stores/atomics; for copies the destination is 0 and the source
+    /// 1; MMA D/A/B are 0/1/2.
+    pub operand: u8,
 }
 
 impl<'a> Access<'a> {

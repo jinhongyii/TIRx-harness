@@ -120,9 +120,22 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         self.builder.program.unsupported.append(f"site#{site} {kind}: {reason}")
         self.builder.emit("Unsupported", site=site, reason=self.builder.string(reason))
 
-    def site(self, node: Any, op_name: str | None = None, buffer: int | None = None) -> int:
+    def site(self, node: Any, op_name: str | None = None, buffer: int | None = None,
+             operands: list[Any] | None = None) -> int:
+        """Site of ``node``. ``operands``: its pointer operands in operand order;
+        each one's logical buffer goes to ``SiteInfo.buffers`` (W5-15)."""
         spans = _spans(getattr(node, "span", None))
-        key = (handle(node), op_name, buffer) if hasattr(node, "__chandle__") else None
+        key = (handle(node), op_name, buffer, len(operands or ())) if hasattr(node, "__chandle__") else None
+        buffers: tuple[str | None, ...] = ()
+        if operands:
+            names = []
+            for operand in operands:
+                found = _operand_buffer(operand, self)
+                names.append(self.logical_identity(found)[0] if isinstance(found, int) else found)
+            buffers = tuple(names)
+            if buffer is None:
+                buffer = next((_operand_buffer(o, self) for o in operands if _operand_buffer(o, self) is not None),
+                              None)
         # W5-7 / W9: the LOGICAL buffer identity (root of the view_of chain, stopping
         # at the shared.dyn pool, which is storage, not a buffer); the view's own
         # name goes to ``text`` when it differs.
@@ -135,7 +148,8 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
             text = f"{text} [view {view}]"
         return self.builder.site(
             pb.SiteInfo(kind=type_key(node), spans=spans, op_name=op_name or "",
-                        text=text[:200], dtype=dtype_of(node) or None, buffer=root),
+                        text=text[:200], dtype=dtype_of(node) or None,
+                        buffer=buffers[0] if buffers else root, buffers=buffers),
             key=key,
         )
 
@@ -793,6 +807,41 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
 # ---------------------------------------------------------------------------
 
 
+def _operand_buffer(operand: Any, lowerer: "Lowerer") -> int | str | None:
+    """Buffer one pointer operand addresses (``address_of``/``buffer_data`` inside
+    it, or a buffer's data Var), else None (a raw pointer)."""
+    if operand is None or isinstance(operand, str):
+        return None
+    if type_key(operand) == "ir.TensorLoad":
+        ref = lowerer.refs.get(handle(operand.source))
+        return getattr(ref, "buf", None) if ref is not None else str(operand.source.name)
+    if type_key(operand) == "ir.Var":
+        ref = lowerer.refs.get(handle(operand))
+        return getattr(ref, "buf", None)
+    found: list[Any] = []
+
+    def resolve(var: Any) -> int | str:
+        ref = lowerer.refs.get(handle(var))
+        buf = getattr(ref, "buf", None)
+        return buf if buf is not None else str(var.name)
+
+    def on_call(sub: Any, visitor: Any) -> None:
+        if found:
+            return
+        name = str(getattr(sub.op, "name", ""))
+        if name in ("tirx.address_of", "tirx.buffer_data") and sub.args:
+            target = sub.args[0]
+            if type_key(target) == "ir.TensorLoad":
+                found.append(resolve(target.source))
+            elif type_key(target) == "ir.Var":
+                found.append(resolve(target))
+            return
+        visitor.default_visit(sub)
+
+    structural_visit(operand, [(tvm.ir.Call, on_call)])
+    return found[0] if found else None
+
+
 def _logical_buffer(node: Any, lowerer: "Lowerer") -> int | str | None:
     """The buffer an access or call addresses first (argument order).
 
@@ -943,6 +992,15 @@ def dispatch_tile_primitives(func: Any) -> Any:
                 module = tirx.transform.TilePrimitiveDispatch()(tvm.IRModule({"main": current}))
         except Exception as error:  # noqa: BLE001 - dispatch rejection
             message = " ".join(str(error).split())
+            if "deferred ScopeIdDef" in message and "warpgroup_scope" not in reasons:
+                # TVM cannot infer the warpgroup extent when a kernel declares
+                # `warp_id_in_wg` without `warpgroup_id`; the CTA then has one
+                # warpgroup (the legacy topology rule). Declare it and retry.
+                reasons["warpgroup_scope"] = message[:300]
+                repaired = _declare_single_warpgroup(current)
+                if repaired is not None:
+                    current = repaired
+                    continue
             match = re.search(r"op=(tirx\.tile\.\w+)", message)
             if match is None or not tile_forms.handles(match.group(1)) or match.group(1) in reasons:
                 _DISPATCH_ERRORS[id(original)] = message[:300]
@@ -962,6 +1020,34 @@ def dispatch_tile_primitives(func: Any) -> Any:
         return module["main"]
     _DISPATCH_ERRORS[id(original)] = "TVM dispatch did not converge"
     return original
+
+
+def _declare_single_warpgroup(func: Any) -> Any | None:
+    """Insert ``warpgroup_id([1])`` before the first ``warp_id_in_wg`` definition
+    when the kernel declares no warpgroup id (one warpgroup per CTA)."""
+    from tvm_ffi import structural_mutate
+
+    defs: list[Any] = []
+    structural_visit(func.body, [(tirx.ScopeIdDefStmt, lambda n, v: defs.append(getattr(n, "def")))])
+    if not any(int(d.scope) == 5 for d in defs) or any(int(d.scope) == 3 for d in defs):
+        return None
+    done: list[bool] = []
+
+    def on_seq(node: Any, mutator: Any) -> Any:
+        if done:
+            return node
+        seq = list(node.seq)
+        for index, stmt in enumerate(seq):
+            if type_key(stmt) == "tirx.ScopeIdDefStmt" and int(getattr(stmt, "def").scope) == 5:
+                group = tirx.Var("v2_warpgroup", "int32")
+                seq.insert(index, tirx.ScopeIdDefStmt(tirx.ScopeIdDef([group], [tirx.IntImm("int32", 1)],
+                                                                      "cta", "warpgroup")))
+                done.append(True)
+                return tirx.SeqStmt(seq)
+        return mutator.default_mutate(node)
+
+    body = structural_mutate(func.body, [(tirx.SeqStmt, on_seq)])
+    return func.with_body(body) if done else None
 
 
 def _repair_tile_calls(func: Any, op_name: str) -> Any | None:

@@ -26,7 +26,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-FORMAT_VERSION = 2  # CONTRACT: numsim_core::program::FORMAT_VERSION
+FORMAT_VERSION = 3  # CONTRACT: numsim_core::program::FORMAT_VERSION (3: SiteInfo.buffers, W5-15)
 SITE_NONE = 0xFFFF_FFFF
 
 # ---------------------------------------------------------------------------
@@ -455,10 +455,20 @@ class SiteInfo:
     text: str = ""
     dtype: str | None = None
     buffer: str | None = None
+    # W5-15: logical buffer of each pointer operand, in operand order (None = raw
+    # pointer). Empty: derived as `[buffer]`. `buffer` stays `buffers[0]`.
+    buffers: tuple[str | None, ...] = ()
+
+    def all_buffers(self) -> list[str | None]:
+        if self.buffers:
+            return list(self.buffers)
+        return [self.buffer] if self.buffer is not None else []
 
     def to_json(self) -> Any:
+        buffers = self.all_buffers()
         return {"kind": self.kind, "spans": [s.to_json() for s in self.spans], "op_name": self.op_name,
-                "text": self.text, "dtype": self.dtype, "buffer": self.buffer}
+                "text": self.text, "dtype": self.dtype, "buffer": buffers[0] if buffers else None,
+                "buffers": buffers}
 
 
 @dataclass(frozen=True)

@@ -44,9 +44,11 @@ pub struct Span {
 
 /// Static facts about one site.
 /// Serde: unknown fields are rejected and `Option` fields must be present
-/// (`null` for none), like every program type.
+/// (`null` for none), like every program type. `buffers` (README decision
+/// 15) may be absent while lowering still emits only the legacy `buffer`;
+/// it is then derived as `[buffer]`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "SiteInfoWire", into = "SiteInfoWire")]
 pub struct SiteInfo {
     /// IR node `type_key` (`tirx.Call`, `tirx.BufferStore`, ...).
     pub kind: String,
@@ -57,8 +59,57 @@ pub struct SiteInfo {
     pub op_name: String,
     /// Short TVMScript rendering (<= 200 chars, children elided).
     pub text: String,
-    #[serde(deserialize_with = "crate::program::required")]
     pub dtype: Option<String>,
+    /// Buffer named by each pointer operand of the site, in operand order
+    /// (`None`: a raw pointer with no buffer). `observe::Access::operand`
+    /// indexes it (W5-15).
+    pub buffers: Vec<Option<String>>,
+}
+
+impl SiteInfo {
+    /// The first pointer operand's buffer (transition accessor for the
+    /// pre-W5-15 single `buffer` field).
+    pub fn buffer(&self) -> Option<&str> {
+        self.buffers.first().and_then(|b| b.as_deref())
+    }
+    /// Buffer of pointer operand `operand`.
+    pub fn buffer_of(&self, operand: u8) -> Option<&str> {
+        self.buffers.get(operand as usize).and_then(|b| b.as_deref())
+    }
+}
+
+/// JSON shape of [`SiteInfo`]: `buffers` is the contract field; the legacy
+/// `buffer` is still accepted (and written, `= buffers[0]`) during the
+/// transition.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SiteInfoWire {
+    kind: String,
+    spans: Vec<Span>,
+    op_name: String,
+    text: String,
     #[serde(deserialize_with = "crate::program::required")]
-    pub buffer: Option<String>,
+    dtype: Option<String>,
+    #[serde(default)]
+    buffer: Option<String>,
+    #[serde(default)]
+    buffers: Option<Vec<Option<String>>>,
+}
+
+impl From<SiteInfoWire> for SiteInfo {
+    fn from(w: SiteInfoWire) -> SiteInfo {
+        let buffers = match (w.buffers, w.buffer) {
+            (Some(b), _) => b,
+            (None, Some(b)) => vec![Some(b)],
+            (None, None) => Vec::new(),
+        };
+        SiteInfo { kind: w.kind, spans: w.spans, op_name: w.op_name, text: w.text, dtype: w.dtype, buffers }
+    }
+}
+
+impl From<SiteInfo> for SiteInfoWire {
+    fn from(s: SiteInfo) -> SiteInfoWire {
+        let buffer = s.buffer().map(str::to_string);
+        SiteInfoWire { kind: s.kind, spans: s.spans, op_name: s.op_name, text: s.text, dtype: s.dtype, buffer, buffers: Some(s.buffers) }
+    }
 }

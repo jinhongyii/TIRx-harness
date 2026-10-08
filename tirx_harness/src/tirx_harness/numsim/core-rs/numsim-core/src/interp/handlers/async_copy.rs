@@ -812,7 +812,10 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
             ctx.aux.groups.issue(g, op);
         }
     }
-    let sp = support::spec(ctx, AccessKind::Read, Sem::Weak, Scope::Cta, Proxy::TensorMap);
+    // The tensor-map operand: `[dst], [tmap, coords]` for loads/prefetch
+    // (operand 1), `[tmap, coords], [src]` for stores/reductions (0).
+    let mut sp = support::spec(ctx, AccessKind::Read, Sem::Weak, Scope::Cta, Proxy::TensorMap);
+    sp.operand = if matches!(args.dir, TmaDir::Load | TmaDir::Prefetch) { 1 } else { 0 };
     support::emit(ctx, sp, &mut acc);
     if !cmds.is_empty() {
         let extra = ProtoExtra { issued, ..Default::default() };
@@ -954,7 +957,9 @@ pub fn tensormap_cp_fence(ctx: &mut ExecCtx<'_>, dst: Operand, src: Operand, siz
         racc.push(sl, crate::observe::ALL_LANES, n);
         wacc.push(dl, crate::observe::ALL_LANES, n);
     }
-    let sp = support::spec(ctx, AccessKind::Read, Sem::Weak, scope, Proxy::Generic);
+    // `tensormap.cp_fenceproxy [dst], [src]`: dst = operand 0, src = 1.
+    let mut sp = support::spec(ctx, AccessKind::Read, Sem::Weak, scope, Proxy::Generic);
+    sp.operand = 1;
     support::emit(ctx, sp, &mut racc);
     let sp = support::spec(ctx, AccessKind::Write, Sem::Weak, scope, Proxy::Generic);
     support::emit(ctx, sp, &mut wacc);

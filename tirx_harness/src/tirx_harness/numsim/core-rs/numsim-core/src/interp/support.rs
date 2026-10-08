@@ -704,6 +704,8 @@ pub struct AccessSpec {
     pub atomic: bool,
     pub returns_value: bool,
     pub proxy: Proxy,
+    /// `observe::Access::operand`.
+    pub operand: u8,
 }
 
 /// Per-instruction access collector: `(alloc, window, lane span)` in lane
@@ -765,6 +767,7 @@ pub fn emit_accesses(
             window,
             spans: &spans,
             declared_word: declared,
+            operand: spec.operand,
         };
         observer.access(&a);
         // Warp writes are logged per lane at `mem_write` (with the lane's
@@ -799,7 +802,7 @@ pub fn emit(ctx: &mut ExecCtx<'_>, spec: AccessSpec, acc: &mut Accesses) {
 
 /// Default spec for a warp instruction.
 pub fn spec(ctx: &ExecCtx<'_>, kind: AccessKind, sem: Sem, scope: Scope, proxy: Proxy) -> AccessSpec {
-    AccessSpec { actor: ctx.actor(), site: ctx.site(), kind, sem, scope, atomic: false, returns_value: false, proxy }
+    AccessSpec { actor: ctx.actor(), site: ctx.site(), kind, sem, scope, atomic: false, returns_value: false, proxy, operand: 0 }
 }
 
 // ---------------------------------------------------------------------------

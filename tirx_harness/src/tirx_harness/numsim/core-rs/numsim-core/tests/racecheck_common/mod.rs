@@ -528,6 +528,7 @@ impl K {
                         window: *window,
                         spans,
                         declared_word: false,
+                        operand: 0,
                     };
                     obs.access(&a);
                 }

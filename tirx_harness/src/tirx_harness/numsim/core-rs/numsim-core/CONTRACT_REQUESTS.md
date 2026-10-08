@@ -2876,3 +2876,31 @@ The mapping is in `scripts/numsim-v2/coverage/deleted_modules_w11.tsv` and `v2_p
 - **W11-6 [W1 lowering]: `T.cuda.mov_sreg(32, "%laneid")` is rejected.**
   - The error is `unsupported TIRx: special register %%laneid`. Legacy normalized the `%` prefix, so `"laneid"` and `"%laneid"` gave the same code.
   - Reproducer: `test_w11_registry.py::test_fetch_register_alias_normalization_is_explicit` (`v2_gap`). It compares the lowered Program code and registers of the two spellings.
+
+## W2 (2026-10-08): W5-15 implemented (README decision 15), delta H5
+
+- **`SiteInfo.buffers: Vec<Option<String>>`.**
+  - Accessors: `SiteInfo::buffer()` = `buffers[0]` (transition) and `buffer_of(operand)`.
+  - The JSON wire form accepts either `buffers` or the legacy `buffer`, deriving `[buffer]`, and writes both.
+- **`observe::Access.operand: u8`.** Set by every handler; the table is in README decision 15.
+- **Format version.**
+  - `FORMAT_VERSION` = 3 and `MIN_FORMAT_VERSION` = 2. Format-2 modules load until lowering moves; W1 has since moved to 3.
+  - The fixtures `vadd_w1.json` and `vector_add.module.json` are regenerated.
+- **Supporting changes.**
+  - `ProgramBuilder::site_buffers` added.
+  - Racecheck observer moved to `buffer()`.
+  - Codegen is unchanged: it runs the same handlers.
+- **Tests.**
+  - New: `site_info_buffers_json_shapes` and `access_operand_names_the_pointer_operand`.
+  - `cargo test --workspace` passes 1043 / 1043.
+  - Conformance: 321 passed, 1 failed (`kda_forward_portfolio_multishape-synccheck`, `resource_limit`, from W6's in-flight explorer edits).
+- **Delta.** `numsim-behaviour-deltas.md` H5 is the uninit reporting point (W2-20 / V2C-19/20); W8 is repointing the 3 tf32_hc_prenorm snapshots to it.
+- **`tests/numsim/v2/ports`: 9 failures, none from W2.**
+  - All 9 come from the uncommitted numsim-py diagnostics change (W11-pin-message item 2, report renderer, W8). `sync_protocol_error` `message` is now prose ("reg pool protocol error: invalid direction (count=256, current=24, inc=false)"), and the Debug text is in `detail` plus structured fields.
+  - Ports still match `message` against variant names:
+    - `test_error_kinds` x2;
+    - `test_p6c_tcgen_codegen` (InvalidColumns);
+    - `test_p6d_ordering_calls` x3 (InvalidDirection);
+    - `test_deltas_sync_instruction_predicates::test_pending_count_instruction_predicates` (NotNoComplete);
+    - `test_triage_memory_coverage_next::test_no_complete_rejects_exhausted_arrivals[2,3]`.
+  - Owner: W8 / W11, to update these ports to the structured fields.

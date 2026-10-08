@@ -90,7 +90,9 @@ use std::fmt;
 
 /// Serialization format version of [`Module`]/[`Program`]. Bump on any
 /// change to the types in this file.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
+/// Oldest format still loaded (README decision 15 transition).
+pub const MIN_FORMAT_VERSION: u32 = 2;
 
 /// Serde rule for `Option` fields of program types: the field must be
 /// present (JSON `null` for `None`). Every program struct also has
@@ -2077,7 +2079,9 @@ impl Module {
         Ok(m)
     }
     fn check_version(&self) -> Result<(), ProgramError> {
-        if self.format_version != FORMAT_VERSION {
+        // Format 2 (pre-decision 15) is still accepted: the only change is
+        // `SiteInfo.buffers`, derived as `[buffer]` when absent.
+        if self.format_version != FORMAT_VERSION && self.format_version != MIN_FORMAT_VERSION {
             return Err(ProgramError::Version {
                 found: self.format_version,
                 expected: FORMAT_VERSION,
