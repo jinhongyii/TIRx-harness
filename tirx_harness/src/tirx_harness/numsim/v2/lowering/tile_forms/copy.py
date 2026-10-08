@@ -443,6 +443,12 @@ def elementwise_value(call: Any, op: str, values: list[Any], dtype: str) -> Any:
 
 
 # ------------------------------------------------- TVM's single-thread fallback
+class _Picked(list):
+    """Calls TVM lowered with ``copy/fallback``; ``hooked`` = variants watched."""
+
+    hooked = 0
+
+
 @contextlib.contextmanager
 def fallback_watch() -> Any:
     """Record the ``tirx.tile.copy`` calls TVM's dispatch lowers with its
@@ -455,7 +461,7 @@ def fallback_watch() -> Any:
     copy only its own (thread-private locals). Such calls go to the legacy
     form instead (``reroute``; numsim-behaviour-deltas F4).
     """
-    picked: list[Any] = []
+    picked = _Picked()
     patched: list[tuple[Any, Any]] = []
     try:
         from tvm.tirx.operator.tile_primitive import dispatcher
@@ -477,6 +483,7 @@ def fallback_watch() -> Any:
 
             case.impl = spy
             patched.append((case, original))
+    picked.hooked = len(patched)
     try:
         yield picked
     finally:

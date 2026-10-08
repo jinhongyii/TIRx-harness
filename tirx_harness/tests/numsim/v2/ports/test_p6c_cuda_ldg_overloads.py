@@ -145,13 +145,6 @@ def test_cuda_ldg_public_dtype_contract_is_accepted_or_rejected_exactly():
         v2.transpile(_cuda_ldg_kernel(dtype))
 
 
-@v2_gap(
-    "v2.transpile accepts every dtype legacy rejected for T.cuda.ldg: scalar and "
-    "x2/x4 float8 variants, bool, bfloat16x4, float16x4, the packed-bool raw "
-    "pointer forms boolx2/boolx4, and the float32x2 load through a float32 "
-    "pointer; legacy rejected each (no __ldg overload / no packed-bool ABI / "
-    "pointer dtype mismatch)"
-)
 def test_cuda_ldg_public_dtype_contract_rejects_exactly():
     """Rejected half of ``tests/numsim/runtime/test_cuda_ldg_overloads.py::test_cuda_ldg_public_dtype_contract_is_accepted_or_rejected_exactly``."""
 
@@ -168,8 +161,8 @@ def test_cuda_ldg_public_dtype_contract_rejects_exactly():
 @v2_gap(
     "every packed ldg stops with ExecutionError bad_address (e.g. int8x2: "
     "'Global address 0x10000000007c is not mapped', float32x4: 0x...7c0): the "
-    "ptr_to([31 - lane]) element offset over a vector-dtype buffer is scaled by "
-    "the lane count twice, so high lanes read past the buffer"
+    "engine's AddrOf scales the scalar-element offset by the whole vector dtype "
+    "(lane count applied twice; CONTRACT_REQUESTS W12-tile-forms 1)"
 )
 @pytest.mark.parametrize(
     "dtype",

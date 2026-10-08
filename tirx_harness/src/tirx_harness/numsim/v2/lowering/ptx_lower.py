@@ -44,6 +44,7 @@ EVICT = {"": "Normal", "L1::evict_normal": "Normal", "L1::evict_first": "First",
          "L1::evict_unchanged": "Unchanged", "L1::no_allocate": "NoAllocate"}
 L2_PREFETCH = {"": 0, "L2::64B": 64, "L2::128B": 128, "L2::256B": 256}
 TC_SHAPES = {"32x32b": "S32x32b", "16x64b": "S16x64b", "16x128b": "S16x128b", "16x256b": "S16x256b"}
+TCGEN_DESCRIPTOR_ARCHES = frozenset({"sm_100a", "sm_100f", "sm_103a", "sm_103f", "sm_107a", "sm_107f"})
 MMA_KINDS = {"kind::f16": "F16", "kind::tf32": "Tf32", "kind::f8f6f4": "F8f6f4", "kind::i8": "I8",
              "kind::mxf8f6f4": "MxF8f6f4", "kind::mxf4": "MxF4", "kind::mxf4nvf4": "MxF4Nvf4",
              "kind::ti16": "Ti16"}
@@ -1040,6 +1041,12 @@ def lower_tcgen05_mma(c: PtxCtx) -> None:
     # Contract item 18: the lut_b table operand (``b_decompress_metadata``; a TMEM
     # address in TVM's PTX table) travels in ``lut_b_addr``.
     lut_b_addr = c.src("b_decompress_metadata") if lut_b else None
+    if kind == "F8f6f4" and _cta_group(c) == 2 and c.lw.builder.program.arch not in TCGEN_DESCRIPTOR_ARCHES:
+        # The CTA-pair f8f6f4 descriptor semantics differ between SM100/SM103
+        # and SM107 (legacy require_tcgen_descriptor_layout): the kernel must
+        # name its exact architecture.
+        raise _Unsupported(c.node, f"{c.d.op_name}: kind::f8f6f4 cta_group::2 requires tirx.cuda_arch in "
+                                   f"{sorted(TCGEN_DESCRIPTOR_ARCHES)}, got {c.lw.builder.program.arch!r}")
     c.emit("TcgenMma", kind=kind, cta_group=_cta_group(c), d=c.src("d_tmem"), a=a, b_desc=b_desc,
            idesc=c.src("idesc"), enable_input_d=c.lw.cast_to(c.src("enable_input_d"), pb.Ty("Pred")),
            ws=c.flag("ws"), ws_b_buffer=b_buffer, block_scale=block_scale, scale_input_d=None,
@@ -1122,6 +1129,8 @@ def lower_ptx(lw: "Lowerer", node: Any) -> None:
         handler = handler_for(decoded.table_name)
     except KeyError:
         raise _Unsupported(node, f"{decoded.op_name} is rejected (not modeled for the SM100 target)") from None
+    if decoded.table_name.startswith("spdecompress"):
+        _check_distinct_registers(lw, node, decoded)
     ctx = PtxCtx(lw, node, decoded)
     b = lw.builder
     if_pc = None
@@ -1147,6 +1156,52 @@ def lower_ptx(lw: "Lowerer", node: Any) -> None:
         end = b.emit("EndIf")
         b.patch(if_pc, "If", cond=guard, else_pc=end, end_pc=end, elect=False)
     del start
+
+
+def _check_distinct_registers(lw: "Lowerer", node: Any, decoded: ptx_decode.DecodedPtx) -> None:
+    """spdecompress register operands must be distinct physical registers (PTX:
+    overlapping data/metadata registers are undefined; legacy rejected them)."""
+    from .memory import MemRef, RegArray, sum_bases
+
+    seen: dict[Any, str] = {}
+    for info, values in zip(decoded.operands, decoded.values):
+        for value in values:
+            if value is ptx_decode.SINK or isinstance(value, str) or type_key(value) != "ir.TensorLoad":
+                continue
+            ref = lw.ref_of(value.source)
+            if isinstance(ref, RegArray):
+                root, base, elem_bytes = ("regs", id(ref.regs[0])), 0, 1
+                flat_static = lw.reg_array_slot(ref, value.indices)
+            elif isinstance(ref, MemRef):
+                buffers = lw.builder.program.buffers
+                root_buf = ref.buf
+                while buffers[root_buf].view_of is not None:
+                    root_buf = buffers[root_buf].view_of
+                root, base = ("buf", root_buf), sum_bases(buffers, ref.buf)
+                elem_bytes = max(1, buffers[ref.buf].dtype.bits // 8)
+                indices = [int(i.value) if type_key(i) == "ir.IntImm" else None for i in value.indices]
+                shape = ref.info.static_shape
+                flat_static = None
+                if None not in indices and shape is not None and not ref.info.strides and ref.info.layout is None:
+                    flat_static = 0
+                    for extent, index in zip(shape, indices):
+                        flat_static = flat_static * extent + index
+            else:
+                continue
+            if not isinstance(flat_static, int):
+                if any(key[0] == root for key in seen):
+                    raise _Unsupported(node, f"{decoded.op_name}: cannot prove disjoint physical registers "
+                                             f"({info.name} has a dynamic index)")
+                seen[(root, None)] = info.name
+                continue
+            key = (root, base + flat_static * elem_bytes)
+            if (root, None) in seen:
+                raise _Unsupported(node, f"{decoded.op_name}: cannot prove disjoint physical registers "
+                                         f"({seen[(root, None)]} has a dynamic index)")
+            if key in seen:
+                raise _Unsupported(node, f"{decoded.op_name}: undefined register overlap: {info.name} and "
+                                         f"{seen.get(key, '?')} name the same physical register (aliased)")
+            seen[key] = info.name
 
 
 __all__ = ["lower_ptx", "handler_for"]

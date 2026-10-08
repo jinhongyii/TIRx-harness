@@ -61,6 +61,42 @@ _SCOPES = {"cta": "Cta", "cluster": "Cluster", "gpu": "Gpu", "sys": "Sys"}
 _PURE_STRUCTURAL = frozenset({"tirx.reinterpret", "tirx.if_then_else", "prim.if_then_else", "tirx.likely"})
 
 
+def _cuda_ldg_rejection(node: Any, dtype: str) -> str | None:
+    """CUDA's ``__ldg`` overload set (legacy ``is_cuda_ldg_dtype``/``cuda_ldg_parts``).
+
+    Scalars: integers, float16, bfloat16, float32, float64. Vectors: integer,
+    float32 and float64 lanes; float16/bfloat16 x2 or x8; float8 only as a
+    64- or 128-bit packet. bool and packed bool have no overload (boolx2/x4
+    have no packed-bool ABI). An ``address_of(buf[i])`` pointer must point at
+    the loaded dtype.
+    """
+    result = dtypes.dtype_of(node)
+    if result != dtype:
+        return f"cuda.ldg dtype attribute {dtype!r} does not match the result dtype {result!r}"
+    base, _, lanes_text = dtype.rpartition("x")
+    if not (base and lanes_text.isdigit()):
+        base, lanes = dtype, 1
+    else:
+        lanes = int(lanes_text)
+    integer = base.startswith(("int", "uint")) and base[-1].isdigit()
+    if lanes == 1:
+        ok = integer or base in ("float16", "bfloat16", "float32", "float64")
+    elif base.startswith("float8_"):
+        ok = 8 * lanes in (64, 128)
+    elif base in ("float16", "bfloat16"):
+        ok = lanes in (2, 8)
+    else:
+        ok = integer or base in ("float32", "float64")
+    if not ok:
+        return f"cuda.ldg has no __ldg overload for {dtype!r}"
+    pointer = node.args[0]
+    if type_key(pointer) == "ir.Call" and _op_name(pointer) == "tirx.address_of" and len(pointer.args) == 1:
+        pointee = dtypes.dtype_of(pointer.args[0])
+        if pointee and pointee != dtype:
+            return f"cuda.ldg pointer to {pointee!r} does not match the loaded dtype {dtype!r}"
+    return None
+
+
 class CallsMixin:
     """Mixed into ``Lowerer``."""
 
@@ -582,12 +618,41 @@ class CallsMixin:
         text = _string(node.args[1]) if len(node.args) > 1 else None
         if text is None or len(node.args) != 2:
             raise _Unsupported(node, "cuda.ldg vector/destination form")
+        rejection = _cuda_ldg_rejection(node, text)
+        if rejection is not None:
+            raise _Unsupported(node, rejection)
         ty = self.ty(text, node)
         dst = self.builder.reg(ty)
         self.builder.emit("LoadAddr", site=self.site(node, op_name=_op_name(node)), ty=ty, dst=dst, addr=addr,
                           space="Global", sem="Weak", scope="Gpu", mods=pb.mem_mods(nc=True))
         self.builder.program.requirements.readonly_proxy = True
         return self.result_from(node, dst)
+
+    def call_tirx_s_tir_ldg32(self: "Lowerer", node: Any) -> None:
+        """``s_tir.ldg32(reg.data, guard, src[i], k)``: TVM's CUDA codegen emits
+        ``setp.ne.b32 p, guard, 0; @!p mov.b32 reg[k], 0; @p ld.global.nc.f32
+        reg[k], [&src[i]]``: the guarded lanes load, the others write 0.0."""
+        from tvm import tirx
+        from tvm.script import tirx as T
+
+        if len(node.args) != 4:
+            raise _Unsupported(node, "s_tir.ldg32 requires (reg, guard, source load, reg offset)")
+        reg, guard, load, offset = node.args
+        if type_key(reg) != "ir.Call" or str(getattr(reg.op, "name", "")) != "tirx.buffer_data":
+            raise _Unsupported(node, "s_tir.ldg32 destination must be a local buffer's data")
+        var = reg.args[0]
+        if str(var.ty.storage_scope) != "local" or str(var.ty.dtype.dtype) != "float32":
+            raise _Unsupported(node, "s_tir.ldg32 destination must be a float32 local buffer")
+        if type_key(load) != "ir.TensorLoad" or str(load.source.ty.dtype.dtype) != "float32" or \
+                str(load.source.ty.storage_scope) != "global":
+            raise _Unsupported(node, "s_tir.ldg32 source must be a float32 global buffer element")
+        value = T.cuda.ldg(tirx.address_of(load), "float32")
+        cond = tirx.NE(tirx.Cast("int32", guard) if str(guard.ty.dtype) != "int32" else guard,
+                       tirx.IntImm("int32", 0))
+        self.stmt(tirx.IfThenElse(cond, tirx.BufferStore(var, value, [offset], span=node.span),
+                                  tirx.BufferStore(var, tirx.FloatImm("float32", 0.0), [offset], span=node.span),
+                                  span=node.span))
+        return None
 
     def atomic(self: "Lowerer", node: Any, op: str) -> pb.Operand:
         args = list(node.args)

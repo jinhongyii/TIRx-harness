@@ -620,7 +620,7 @@ A listed operation may still reject modifier, dtype, shape, or layout values out
 
 ## Other operations v2 lowers
 
-Not in the legacy table: 48 op names the v2 lowering accepts (TIR math, structural calls, CUDA helpers), with how it runs them.
+Not in the legacy table: 49 op names the v2 lowering accepts (TIR math, structural calls, CUDA helpers), with how it runs them.
 
 | Operation | v2 | Deltas |
 | --- | --- | --- |
@@ -659,6 +659,7 @@ Not in the legacy table: 48 op names the v2 lowering accepts (TIR math, structur
 | `tirx.reinterpret` | engine instruction (`call_tirx_reinterpret`) |  |
 | `tirx.round` | `Instr::Unary` (oplib `unary`) | D2 |
 | `tirx.rsqrt` | `Instr::Unary` (oplib `unary`) |  |
+| `tirx.s_tir_ldg32` | engine instruction (`call_tirx_s_tir_ldg32`) |  |
 | `tirx.sin` | `Instr::Unary` (oplib `unary`) | D3 |
 | `tirx.sqrt` | `Instr::Unary` (oplib `unary`) | D3 |
 | `tirx.tanh` | `Instr::Unary` (oplib `unary`) | D3 |

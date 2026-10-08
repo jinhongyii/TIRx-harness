@@ -45,9 +45,9 @@ def cuda_shfl_sync_float16x2(
 
 @v2_gap(
     "T.cuda.ldg(source.ptr_to([lane]), 'float32x2') over a float32x2[32] buffer "
-    "stops with ExecutionError bad_address 'Global address 0x100000000100 is not "
-    "mapped' (an access past the 256-byte buffer; the packed element offset is "
-    "mis-scaled); expected one 64-bit load per lane"
+    "stops with ExecutionError bad_address: the engine's AddrOf scales the "
+    "scalar-element offset by the whole vector dtype (CONTRACT_REQUESTS "
+    "W12-tile-forms 1)"
 )
 def test_cuda_ldg_supports_float32x2_as_one_packed_64bit_load():
     """Port of ``tests/numsim/runtime/test_cuda_packed_vector_forms.py::test_cuda_ldg_supports_float32x2_as_one_packed_64bit_load``."""

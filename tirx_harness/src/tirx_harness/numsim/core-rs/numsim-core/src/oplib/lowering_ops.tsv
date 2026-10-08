@@ -610,6 +610,7 @@ tirx.ptx.xor	ptx_op
 tirx.reinterpret	instr:call_tirx_reinterpret
 tirx.round	unary
 tirx.rsqrt	unary
+tirx.s_tir_ldg32	instr:call_tirx_s_tir_ldg32
 tirx.sigmoid	pure_op
 tirx.sin	unary
 tirx.sqrt	unary

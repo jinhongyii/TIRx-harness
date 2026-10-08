@@ -12,7 +12,7 @@ import pytest
 from tvm.script import tirx as T
 from tvm.tirx.layout import S, TCol, TileLayout, TLane
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 from tirx_harness.numsim.errors import UnsupportedTIRxError
 
@@ -204,20 +204,18 @@ def _run(kernel):
     return v2.Engine().run(v2.transpile(kernel), {})
 
 
-@v2_gap(
-    "a 262160-byte static shared arena with no tirx.cuda_arch transpiles and runs to "
-    "completion; legacy rejected it (shared-memory span exceeds the 18-bit SM100 "
-    "descriptor). v2 accepts a legacy rejection"
-)
-def test_shared_span_above_18_bits_requires_a_supported_sm107_descriptor_form():
-    """Port of ``tests/numsim/runtime/test_raw_tcgen_codegen.py::test_shared_span_above_18_bits_requires_a_supported_sm107_descriptor_form``.
+def test_shared_span_above_18_bits_is_checked_where_a_descriptor_addresses_it():
+    """Delta F5 of ``tests/numsim/runtime/test_raw_tcgen_codegen.py::test_shared_span_above_18_bits_requires_a_supported_sm107_descriptor_form``.
 
-    ``analyze`` + ``emit_rust_module`` become ``v2.transpile``; the rejection
-    is kept as ``UnsupportedTIRxError`` (legacy message text not pinned).
+    Legacy rejected any kernel whose shared window exceeded the 18-bit SM100
+    descriptor address space, even one that builds no descriptor. v2 checks
+    the bound where a descriptor addresses shared memory (the run stops with
+    ``invalid_operand``; see the extended-span test below), so this kernel,
+    which only stores to its last byte, transpiles and runs.
     """
 
-    with pytest.raises(UnsupportedTIRxError):
-        v2.transpile(shared_span_above_18_bits_without_sm107_descriptor)
+    result = _run(shared_span_above_18_bits_without_sm107_descriptor)
+    assert result.status.get("kind") == "completed", result.status
 
 
 def test_f8f6f4_cta2_k32_extended_shared_span_is_gated_by_arch_not_k_bit():
@@ -246,23 +244,8 @@ def test_f8f6f4_cta2_k32_extended_shared_span_is_gated_by_arch_not_k_bit():
 @pytest.mark.parametrize(
     "arch",
     [
-        pytest.param(
-            None,
-            id="missing",
-            marks=v2_gap(
-                "CTA2 K32 f8f6f4 tcgen05.mma without tirx.cuda_arch transpiles and runs to "
-                "completion; legacy required the PrimFunc attribute. v2 accepts a legacy rejection"
-            ),
-        ),
-        pytest.param(
-            "sm_999a",
-            id="unknown",
-            marks=v2_gap(
-                "tirx.cuda_arch='sm_999a' transpiles (Program.arch='sm_999a') and runs to "
-                "completion; legacy rejected the unsupported CUDA architecture. v2 accepts a "
-                "legacy rejection"
-            ),
-        ),
+        pytest.param(None, id="missing"),
+        pytest.param("sm_999a", id="unknown"),
     ],
 )
 def test_raw_tcgen_f8f6f4_cta2_requires_exact_kernel_architecture(arch):
@@ -300,11 +283,14 @@ def test_raw_tcgen_dense_mma_gate_names_the_exact_legal_set(kernel):
     accepts the kernel at transpile and validates the instruction descriptor
     when the mma executes: the run fails closed with an ``invalid_operand``
     error (stage moved from transpile to run; no delta row). Dropped: the
-    ``target_id`` and message text.
+    ``target_id`` and message text. The kernels carry ``tirx.cuda_arch =
+    sm_100a``: a CTA-pair f8f6f4 mma needs an exact architecture (W12, see
+    ``test_raw_tcgen_f8f6f4_cta2_requires_exact_kernel_architecture``), as in
+    legacy, so the descriptor gate is reached.
     """
 
     with pytest.raises(v2.ExecutionError) as caught:
-        _run(kernel)
+        _run(kernel.with_attr("tirx.cuda_arch", "sm_100a"))
     stop = _stop(caught.value)
     assert stop["status"] == "error", stop
     assert stop["kind"] == "invalid_operand", stop

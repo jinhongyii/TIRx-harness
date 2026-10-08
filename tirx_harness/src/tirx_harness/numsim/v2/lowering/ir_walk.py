@@ -66,6 +66,10 @@ _SCOPE_BINDINGS = {
     9: ("cluster", "cta_pair"),
 }
 
+# Loop annotations that only steer code generation (no numerical semantics).
+_LOOP_ANNOTATIONS = frozenset({"disable_unroll", "pragma_unroll", "pragma_auto_unroll_max_step",
+                               "pragma_unroll_explicit"})
+
 # AttrStmt keys without numerical semantics (recorded where useful).
 _IGNORED_ATTRS = frozenset(
     {
@@ -235,6 +239,8 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         program.topology.static_smem_bytes = static_smem
         program.topology.dyn_smem_bytes = pb.DimExpr.const(0)
         program.topology.min_blocks_per_sm = self.min_blocks_per_sm
+        if any(i.variant in ("TcgenAlloc", "TcgenDealloc") for i in program.code):
+            program.requirements.dynamic_tmem_lifecycle = True   # tcgen05.alloc/dealloc lease lifecycle
         if self.tmem_views and not self.tmem_runtime_views \
                 and not any(i.variant == "TcgenAlloc" for i in program.code):
             # Static-address views without tcgen05.alloc (legacy flag). A view
@@ -247,6 +253,25 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
     def collect_topology(self, statements: list[Any]) -> None:
         extents: dict[tuple[str, str], pb.DimExpr] = {}
         launch_threads: dict[str, pb.DimExpr] = {}
+        problems: list[str] = []
+        # Statement-order `T.let` bindings feed constant folding of launch extents
+        # (legacy resolved `cta_id([Select(4 > 3, min(3, 3), 1)])` to 3).
+        from tvm.sym.analyzer import Analyzer
+
+        analyzer = Analyzer()
+
+        def on_bind(node: Any, visitor: Any) -> None:
+            try:
+                analyzer.bind(node.var, analyzer.simplify(node.value))
+            except Exception:  # noqa: BLE001 - not foldable: the var stays symbolic
+                pass
+            visitor.default_visit(node)
+
+        def extent_dim(extent: Any) -> pb.DimExpr:
+            folded = analyzer.simplify(extent)
+            if type_key(folded) == "ir.IntImm":
+                return pb.DimExpr.const(int(folded.value))
+            return self.dim_expr(folded)
 
         def visit(node: Any, visitor: Any) -> None:
             definition = getattr(node, "def")
@@ -255,10 +280,20 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
                 total = pb.DimExpr.const(1)
                 for extent in definition.extents:
                     try:
-                        total = _mul(total, self.dim_expr(extent))
+                        total = _mul(total, extent_dim(extent))
                     except _Unsupported:
+                        problems.append(f"topology: launch extent {extent} of {binding[0]}>{binding[1]} is not "
+                                        "statically known")
                         return
-                extents.setdefault(binding, total)
+                if binding[0] != "kernel" and not total.is_const:
+                    # Only the grid may be a runtime expression; CTA- and cluster-level
+                    # extents fix the launch shape.
+                    problems.append(f"topology: launch extent of {binding[0]}>{binding[1]} is not statically known")
+                    return
+                previous = extents.setdefault(binding, total)
+                if previous.is_const and total.is_const and previous.value != total.value:
+                    problems.append(f"topology: conflicting {binding[0]}>{binding[1]} extents "
+                                    f"{previous.value} and {total.value}")
 
         def on_attr(node: Any, visitor: Any) -> None:
             key = str(node.attr_key)
@@ -275,7 +310,8 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
             visitor.default_visit(node)
 
         for statement in statements:
-            structural_visit(statement, [(tirx.ScopeIdDefStmt, visit), (tirx.AttrStmt, on_attr)])
+            structural_visit(statement, [(tirx.ScopeIdDefStmt, visit), (tirx.AttrStmt, on_attr),
+                                         (tirx.Bind, on_bind)])
 
         if launch_threads:
             self.thread_extent_topology(launch_threads)
@@ -284,6 +320,28 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         def static(key: tuple[str, str]) -> int | None:
             value = extents.get(key)
             return value.value if value is not None and value.is_const else None
+
+        # Legacy topology rules: a warpgroup is 4 warps / 128 threads, and the
+        # direct and nested descriptions of the same level must agree.
+        if static(("warpgroup", "warp")) not in (None, WARPS_PER_WARPGROUP):
+            problems.append(f"topology: warpgroup>warp extent {static(('warpgroup', 'warp'))} != "
+                            f"{WARPS_PER_WARPGROUP}")
+        if static(("warpgroup", "thread")) not in (None, WARPS_PER_WARPGROUP * 32):
+            problems.append(f"topology: warpgroup>thread extent {static(('warpgroup', 'thread'))} != "
+                            f"{WARPS_PER_WARPGROUP * 32}")
+        direct_warps, groups = static(("cta", "warp")), static(("cta", "warpgroup"))
+        if direct_warps is not None and groups is not None and direct_warps != groups * WARPS_PER_WARPGROUP:
+            problems.append(f"topology: cta>warp extent {direct_warps} disagrees with {groups} warpgroups")
+        direct_threads = static(("cta", "thread"))
+        if direct_threads is not None and direct_warps is not None and direct_threads != direct_warps * 32:
+            problems.append(f"topology: cta>thread extent {direct_threads} disagrees with {direct_warps} warps")
+        clusters, per_cluster, ctas = (static(("kernel", "cluster")), static(("cluster", "cta")),
+                                       static(("kernel", "cta")))
+        if None not in (clusters, per_cluster, ctas) and ctas != clusters * per_cluster:
+            problems.append(f"topology: kernel>cta extent {ctas} disagrees with {clusters} clusters of "
+                            f"{per_cluster} CTAs")
+        if problems:
+            self.builder.program.unsupported.extend(problems)
 
         threads = static(("cta", "thread"))
         warps = static(("cta", "warp"))
@@ -374,6 +432,8 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         if key == TILE_OP_MARK:
             # The code TVM dispatched (or the v2 tile form) for one tile call:
             # checks that code raises are anchored at the call (W11-5).
+            if type_key(node.value) == "ir.IntImm" and int(node.value.value) == 1:
+                self.single_issuer_check(node)
             self.tile_ops.append(node)
             try:
                 self.stmt(node.body)
@@ -383,6 +443,18 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         if key not in _IGNORED_ATTRS:
             raise _Unsupported(node, f"attribute {key!r}")
         self.stmt(node.body)
+
+    def single_issuer_check(self, node: Any) -> None:
+        """A thread-scope ``gemm_async`` is issued by exactly one active lane of the
+        warp (legacy "exactly one active issuing lane"): Assert(mask is one bit)."""
+        u32 = pb.Ty("U32")
+        mask = self.builder.reg(u32)
+        self.builder.emit("ReadSpecial", dst=mask, sreg="ActiveMask")
+        others = self.binary("And", u32, mask, self.binary("Sub", u32, mask, self.const("uint32", 1)))
+        one = self.builder.reg(pb.Ty("Pred"))
+        self.builder.emit("Compare", op="Eq", ty=u32, dst=one, a=others, b=self.const("uint32", 0))
+        self.builder.emit("Assert", site=self.site(node), cond=one,
+                          msg=self.builder.string("thread-scope gemm_async requires exactly one active issuing lane"))
 
     def stmt_tirx_ScopeIdDefStmt(self, node: Any) -> None:
         definition = getattr(node, "def")
@@ -473,6 +545,13 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         # loop is one thread's elementwise work, so serial order is exact.
         if kind not in (0, 2, 3):
             raise _Unsupported(node, f"for-loop kind {kind}")
+        if kind == 2 and handle(node.loop_var) in getattr(self, "user_vectorized", ()):
+            # Legacy fail-closed rule: a source-level T.vectorized loop is not
+            # silently sequentialized (its lanes are one SIMD operation).
+            raise _Unsupported(node, "for-loop kind VECTORIZED written in the kernel source")
+        unknown = sorted(str(k) for k in (node.annotations or {}).keys() if str(k) not in _LOOP_ANNOTATIONS)
+        if unknown:
+            raise _Unsupported(node, f"for-loop annotations {unknown} have no modeled semantics")
         if node.thread_binding is not None:
             raise _Unsupported(node, "thread-bound loop")
         b = self.builder
@@ -663,6 +742,10 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
             return dst
         if kind in ("prim.Not", "prim.BitwiseNot"):
             ty = self.ty(dtype, node)
+            if kind == "prim.BitwiseNot" and ty.lanes > 1:
+                # TVM's C/CUDA codegen prints `(~x)` for any lane count, and CUDA
+                # vector types (int2, ...) have no `~`: not compilable (delta D11).
+                raise _Unsupported(node, f"bitwise_not on vector operand {dtype}")
             a = self.cast_to(self.expr(node.a), ty)
             dst = self.builder.reg(ty, uniform=self.is_uniform(a))
             self.builder.emit("Unary", op="Not" if kind == "prim.Not" else "BitNot", ty=ty, dst=dst, a=a)
@@ -951,8 +1034,19 @@ def lower(func: Any, *, name: str | None = None, strict: bool = True) -> pb.Prog
     if name is None:
         attrs = func.attrs
         name = str(attrs["global_symbol"]) if attrs is not None and "global_symbol" in attrs else "kernel"
+    # Loops the kernel author wrote as T.vectorized (TVM's dispatch output may use
+    # vectorized loops for its own elementwise code; those stay accepted).
+    user_vectorized: set[int] = set()
+
+    def on_for(node: Any, visitor: Any) -> None:
+        if int(node.kind) == 2:
+            user_vectorized.add(handle(node.loop_var))
+        visitor.default_visit(node)
+
+    structural_visit(func.body, [(tirx.For, on_for)])
     func = dispatch_tile_primitives(func)
     lowerer = Lowerer(func, name)
+    lowerer.user_vectorized = user_vectorized
     lowerer.dispatch_error = _DISPATCH_ERRORS.pop(id(func), None)
     lowerer.owner_transport = id(func) in _OWNER_TRANSPORT
     _OWNER_TRANSPORT.discard(id(func))
@@ -1051,8 +1145,11 @@ def _mark_tile_ops(func: Any) -> Any:
     from tvm_ffi import structural_mutate
 
     def on_call(node: Any, mutator: Any) -> Any:
-        return tirx.AttrStmt(tvm.ir.StringImm(str(node.op.name)), TILE_OP_MARK, tirx.IntImm("int32", 0), node,
-                             span=node.span)
+        # Marker value 1: a thread-scope gemm_async, which needs exactly one
+        # active issuing lane (legacy rule; checked at run time by the walker).
+        single = str(node.op.name) == "tirx.tile.gemm_async" and str(node.scope) == 'T.ExecScope("thread")'
+        return tirx.AttrStmt(tvm.ir.StringImm(str(node.op.name)), TILE_OP_MARK, tirx.IntImm("int32", int(single)),
+                             node, span=node.span)
 
     return func.with_body(structural_mutate(func.body, [(tirx.TilePrimitiveCall, on_call)]))
 
