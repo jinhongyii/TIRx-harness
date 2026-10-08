@@ -380,3 +380,123 @@ fn history_overflow_crossed_in_the_serial_phase() {
     overflow_is_incomplete_everywhere(&s);
 }
 
+
+// ---------------------------------------------------------------------------
+// I8 (observer independence): W13 audit 23ab620, items 1-3 (W2 to fix).
+// Each asserts identical RunStatus and outputs with no observer and with a
+// word-history observer, at 1 and 8 workers.
+// ---------------------------------------------------------------------------
+
+fn observer_independent(s: &Scenario) {
+    for workers in [1usize, 8] {
+        let plain = run(s, workers, &mut NoopObserver);
+        let mut obs = WordOracle::default();
+        let watched = run(s, workers, &mut obs);
+        assert_eq!(
+            (format!("{:?}", plain.status), &plain.outputs),
+            (format!("{:?}", watched.status), &watched.outputs),
+            "{}: the observer changes the run at {workers} workers",
+            s.name
+        );
+    }
+}
+
+/// W13-1: a declared word written more than MAX_WORD_HISTORY times (two
+/// clusters, MAX/2 + 4 each). Today only a history observer stops the run
+/// (`Unsupported`, history overflow).
+#[test]
+#[ignore = "xfail: W13 audit item 1 (W2) -- word-history overflow stops only observed runs"]
+fn word_history_overflow_is_observer_independent() {
+    let each = MAX / 2 + 4;
+    observer_independent(&overflow_writers([each - 1, each - 1], [0, 0], [SENTINEL, SENTINEL]));
+}
+
+/// One CTA, two warps. The flag starts at 1. Warp 1 lane 0 stores 0, then
+/// `st.release` 5, then `bar.sync 0`. Warp 0 does `bar.sync 0`, then lane 0
+/// `wait_until(100 / flag == 20)`. The current value 5 accepts, but the
+/// historical value 0 divides by zero.
+fn pred_faults_on_history() -> Scenario {
+    let mut b = ProgramBuilder::new("pred_faults_on_history", 64);
+    let flag = b.global("flag", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    b.declare_sync_words(flag);
+    let w = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let fa = b.reg(Ty::U64);
+    let got = b.reg(Ty::U32);
+    let arg = b.reg(Ty::U32);
+    let q = b.reg(Ty::U32);
+    let res = b.reg(Ty::PRED);
+    b.warp_id(w);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k5 = b.k_u32(5);
+    let k20 = b.k_u32(20);
+    let k100 = b.k_u32(100);
+    b.addr_of(fa, flag, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k1);
+    b.if_(p);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.push(Instr::StoreAddr { ty: Ty::U32, addr: fa.into(), space: AddrSpace::Generic, value: k0, sem: Sem::Relaxed, scope: Scope::Gpu, mods: MemMods::default() });
+    b.push(Instr::StoreAddr { ty: Ty::U32, addr: fa.into(), space: AddrSpace::Generic, value: k5, sem: Sem::Release, scope: Scope::Gpu, mods: MemMods::default() });
+    b.end_if();
+    b.end_if();
+    b.bar_sync(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b.if_(p);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.site("wait_until", 1);
+    let placeholder = b.push(Instr::Nop);
+    b.no_site();
+    b.st_u32(out, k0, got);
+    b.end_if();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    let start = Pc(prog.code.len() as u32);
+    prog.code.push(Instr::Binary { op: BinOp::Div, ty: Ty::U32, dst: q, a: k100, b: arg.into() });
+    prog.code.push(Instr::Compare { op: CmpOp::Eq, ty: Ty::U32, dst: res, a: q.into(), b: k20 });
+    prog.code_sites.push(numsim_core::site::SiteId::NONE);
+    prog.code_sites.push(numsim_core::site::SiteId::NONE);
+    prog.preds.push(PredProgram { arg, start, end: Pc(start.0 + 2), result: res, reads_memory: false });
+    prog.code[placeholder.0 as usize] =
+        Instr::WaitUntil { dst: got, addr: fa.into(), ty: Ty::U32, space: AddrSpace::Generic, sem: Sem::Acquire, scope: Scope::Gpu, pred: PredId(0), captures: vec![] };
+    prog.validate().expect("valid");
+    let inputs: Inputs = scenarios::inputs(vec![("flag", u32_buf([1])), ("out", u32_buf([0]))]);
+    let config = RunConfig { loop_budget: 1 << 40, ..RunConfig::default() };
+    Scenario { name: "pred_faults_on_history", module: Module::new(vec![prog]), inputs, config }
+}
+
+/// Control: without an observer the wait accepts the current value 5.
+#[test]
+fn pred_faults_on_history_completes_unobserved() {
+    let s = pred_faults_on_history();
+    let o = run(&s, 1, &mut NoopObserver);
+    assert_eq!(o.status, RunStatus::Completed, "{:?}", o.status);
+    assert_eq!(u32s(&o, "out"), vec![5]);
+}
+
+/// W13-2: `emit_verdicts` evaluates the predicate on historical values only
+/// under a history observer, so a fault on an old value (0) stops only
+/// observed runs.
+#[test]
+#[ignore = "xfail: W13 audit item 2 (W2) -- predicate re-evaluation on history faults only when observed"]
+fn predicate_fault_on_history_is_observer_independent() {
+    observer_independent(&pred_faults_on_history());
+}
+
+/// W13-3: a `sync_words` buffer whose dtype is not a whole number of bytes
+/// (E2M1) has no well-defined word. Today that is `Unsupported` only when
+/// the observer wants word history.
+#[test]
+#[ignore = "xfail: W13 audit item 3 (W2) -- malformed sync_words span is Unsupported only under history"]
+fn malformed_sync_words_is_observer_independent() {
+    let mut s = scenarios::wait_until_flag();
+    let flag = s.module.kernels[0].buffers.iter().position(|b| b.name == "flag").unwrap();
+    s.module.kernels[0].buffers[flag].dtype = numsim_core::dtype::Ty::scalar(Dtype::E2M1);
+    observer_independent(&s);
+}
