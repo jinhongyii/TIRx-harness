@@ -225,33 +225,51 @@ const N_I8_CTA1: &[i64] = &[
     8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256,
 ];
 
-// kind, CTA group, M, K, sparse, N encodings
+// kind, CTA group, M, K, sparse, N encodings.
+//
+// PTX ISA 9.4, 9.7.18.2.1 (tcgen05.mma shape table), as ruled in
+// `docs/development/numsim-isa-answers.md` "tcgen05.mma shapes" (delta L4):
+// for `.kind::f16`, `.kind::tf32` and `.kind::f8f6f4`,
+//   "cta_group::1, M = 64:  N % 8 == 0, 8 <= N <= 256";
+//   "cta_group::1, M = 128: N % 16 == 0, 16 <= N <= 256";
+//   "cta_group::2, M = 128 / 256: N % 32 == 0, 32 <= N <= 256".
+// `.kind::i8`: cta_group::1 M = 64 / 128 take N % 16 plus N in {8, 24};
+// cta_group::2 takes N % 32. Block-scaled kinds (`mxf8f6f4`, `mxf4`,
+// `mxf4nvf4`): cta_group::1 M = 128 takes N % 8; cta_group::2 M = 128 / 256
+// takes N % 16, and a sparse cta_group::2 form needs M = 256. K per kind is
+// TVM's `_TCGEN05_MMA_K`, plus dense K = 96 for the two MXF4 kinds at
+// (cta_group::1, M = 128) and (cta_group::2, M = 256) (9.7.18.2.1.1). This is
+// the same table as TVM's `_TCGEN05_MMA_SHAPE_RULES`. Legacy used N % 8 for
+// M = 128 and N % 16 at cta_group::2, which was too permissive.
+// The block-scaled scale-factor K extent per instruction ({1, 4, 16}) is a
+// property of the tile-level SFA/SFB region and is checked by TVM's dispatch;
+// a raw instruction carries no such extent.
 #[rustfmt::skip]
 const SHAPE_ENCODINGS: &[(&str, i64, i64, i64, bool, &[i64])] = &[
     ("f16", 1, 64, 16, false, N8),
-    ("f16", 1, 128, 16, false, N8),
+    ("f16", 1, 128, 16, false, N16),
     ("f16", 1, 64, 32, true, N8),
-    ("f16", 1, 128, 32, true, N8),
-    ("f16", 2, 128, 16, false, N16),
-    ("f16", 2, 256, 16, false, N16),
-    ("f16", 2, 128, 32, true, N16),
-    ("f16", 2, 256, 32, true, N16),
+    ("f16", 1, 128, 32, true, N16),
+    ("f16", 2, 128, 16, false, N32),
+    ("f16", 2, 256, 16, false, N32),
+    ("f16", 2, 128, 32, true, N32),
+    ("f16", 2, 256, 32, true, N32),
     ("tf32", 1, 64, 8, false, N8),
-    ("tf32", 1, 128, 8, false, N8),
+    ("tf32", 1, 128, 8, false, N16),
     ("tf32", 1, 64, 16, true, N8),
-    ("tf32", 1, 128, 16, true, N8),
-    ("tf32", 2, 128, 8, false, N16),
-    ("tf32", 2, 256, 8, false, N16),
-    ("tf32", 2, 128, 16, true, N16),
-    ("tf32", 2, 256, 16, true, N16),
+    ("tf32", 1, 128, 16, true, N16),
+    ("tf32", 2, 128, 8, false, N32),
+    ("tf32", 2, 256, 8, false, N32),
+    ("tf32", 2, 128, 16, true, N32),
+    ("tf32", 2, 256, 16, true, N32),
     ("f8f6f4", 1, 64, 32, false, N8),
-    ("f8f6f4", 1, 128, 32, false, N8),
+    ("f8f6f4", 1, 128, 32, false, N16),
     ("f8f6f4", 1, 64, 64, true, N8),
-    ("f8f6f4", 1, 128, 64, true, N8),
-    ("f8f6f4", 2, 128, 32, false, N16),
-    ("f8f6f4", 2, 256, 32, false, N16),
-    ("f8f6f4", 2, 128, 64, true, N16),
-    ("f8f6f4", 2, 256, 64, true, N16),
+    ("f8f6f4", 1, 128, 64, true, N16),
+    ("f8f6f4", 2, 128, 32, false, N32),
+    ("f8f6f4", 2, 256, 32, false, N32),
+    ("f8f6f4", 2, 128, 64, true, N32),
+    ("f8f6f4", 2, 256, 64, true, N32),
     ("i8", 1, 64, 32, false, N_I8_CTA1),
     ("i8", 1, 128, 32, false, N_I8_CTA1),
     ("i8", 1, 64, 64, true, N_I8_CTA1),
@@ -464,6 +482,63 @@ pub fn encode_matrix_descriptor(shared_address: u32, ldo: i64, sdo: i64, swizzle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TVM's `_check_tcgen05_mma_matrix_shape` (the PTX ISA table, delta L4),
+    /// written out independently of `SHAPE_ENCODINGS`.
+    fn isa_shape(kind: &str, cta: i64, m: i64, n: i64, k: i64, sparse: bool) -> bool {
+        let block = matches!(kind, "mxf8f6f4" | "mxf4" | "mxf4nvf4");
+        let rule: Option<(&[(i64, i64)], &[i64])> = match (kind, cta) {
+            ("f16" | "tf32" | "f8f6f4", 1) => Some((&[(64, 8), (128, 16)], &[])),
+            ("f16" | "tf32" | "f8f6f4", 2) => Some((&[(128, 32), (256, 32)], &[])),
+            ("i8", 1) => Some((&[(64, 16), (128, 16)], &[8, 24])),
+            ("i8", 2) => Some((&[(128, 32), (256, 32)], &[])),
+            (_, 1) if block => Some((&[(128, 8)], &[])),
+            (_, 2) if block => Some((&[(128, 16), (256, 16)], &[])),
+            _ => None,
+        };
+        let Some((steps, extra)) = rule else { return false };
+        if block && cta == 2 && sparse && m != 256 {
+            return false;
+        }
+        let Some(&(_, step)) = steps.iter().find(|(mm, _)| *mm == m) else { return false };
+        if !extra.contains(&n) && !((step..=256).contains(&n) && n % step == 0) {
+            return false;
+        }
+        let (dense, sparse_k) = match kind {
+            "f16" => (16, 32),
+            "tf32" => (8, 16),
+            "f8f6f4" | "i8" | "mxf8f6f4" => (32, 64),
+            _ => (64, 128),
+        };
+        let k96 = !sparse && matches!(kind, "mxf4" | "mxf4nvf4") && matches!((cta, m), (1, 128) | (2, 256)) && k == 96;
+        k == if sparse { sparse_k } else { dense } || k96
+    }
+
+    /// Exhaustive grid: every kind, CTA group, M, N, K and density is
+    /// accepted exactly when the PTX ISA shape table lists it.
+    #[test]
+    fn shape_table_matches_the_ptx_isa_grid() {
+        let mut accepted = 0;
+        for kind in ["f16", "tf32", "f8f6f4", "i8", "mxf8f6f4", "mxf4", "mxf4nvf4"] {
+            for cta in [1, 2] {
+                for m in (16..=256).step_by(16) {
+                    for n in (8..=256).step_by(8) {
+                        for k in [8, 16, 32, 64, 96, 128] {
+                            for sparse in [false, true] {
+                                let ours = validate_tcgen05_instruction_shape(kind, cta, m, n, k, sparse).is_ok();
+                                assert_eq!(ours, isa_shape(kind, cta, m, n, k, sparse), "{kind} cta{cta} M{m} N{n} K{k} sparse {sparse}");
+                                accepted += usize::from(ours);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(accepted > 0);
+        // The two shapes the ruling names.
+        assert!(validate_tcgen05_instruction_shape("f16", 1, 128, 8, 16, false).is_err());
+        assert!(validate_tcgen05_instruction_shape("f16", 2, 128, 16, 16, false).is_err());
+    }
     use crate::tcgen05::instr_desc::{decode_b16, decode_mxf8f6f4};
 
     #[test]

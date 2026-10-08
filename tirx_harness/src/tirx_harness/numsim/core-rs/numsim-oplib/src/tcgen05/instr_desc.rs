@@ -112,9 +112,10 @@ pub fn decode_f8f6f4(
         .checked_mul(8)
         .ok_or_else(|| OpError::message("raw f8f6f4 N overflow"))?;
     let b_mn_major = descriptor & (1_u32 << 16) != 0;
-    // PTX 9.7.17.10.1: 8-bit MN-major B requires N by 16 for CTA1, by 32 for CTA2.
-    let cta1_n_granularity = if b_mn_major { 16 } else { 8 };
-    let cta2_n_granularity = if b_mn_major { 32 } else { 16 };
+    // PTX ISA shape table (delta L4): CTA1 M=64 N%8 (N%16 for 8-bit
+    // MN-major B, 9.7.17.10.1), CTA1 M=128 N%16, CTA2 N%32.
+    let cta1_n_granularity = if b_mn_major || m == 128 { 16 } else { 8 };
+    let cta2_n_granularity = 32;
     let valid_geometry = match (cta_group, weight_stationary) {
         (1, true) => matches!(m, 32 | 64 | 128) && (matches!(n, 64 | 128) || (!sparse && n == 256)),
         (1, false) => {
@@ -218,10 +219,11 @@ pub fn valid_b16_tf32_shape(
     match (cta_group, m, weight_stationary) {
         (1, 32, true) => matches!(n, 64 | 128) || (!sparse && n == 256),
         (1, 64, true) if sparse => matches!(n, 64 | 128),
+        // PTX ISA shape table (delta L4): M=64 N%8, M=128 N%16, CTA2 N%32.
         (1, 64, _) => (8..=256).contains(&n) && n.is_multiple_of(8),
-        (1, 128, false) => (8..=256).contains(&n) && n.is_multiple_of(8),
+        (1, 128, false) => (16..=256).contains(&n) && n.is_multiple_of(16),
         (1, 128, true) => matches!(n, 64 | 128) || (!sparse && n == 256),
-        (2, 128 | 256, false) => (16..=256).contains(&n) && n.is_multiple_of(16),
+        (2, 128 | 256, false) => (32..=256).contains(&n) && n.is_multiple_of(32),
         _ => false,
     }
 }

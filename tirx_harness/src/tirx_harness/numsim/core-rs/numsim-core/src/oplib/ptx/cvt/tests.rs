@@ -472,3 +472,60 @@ fn every_table_op_has_resolvable_forms() {
         "table ops with no resolvable form: {empty:?}"
     );
 }
+
+/// Integer `cvt.{d}.{a}` into every carrier width 8..=128 (W11-4): the
+/// source is read from its carrier's low `a` bits, converted (truncate to
+/// `d`, no saturation), and the carrier is filled by extending the `d`-bit
+/// result per `d`'s signedness, both 64-bit slots of a 128-bit carrier
+/// included (legacy's register semantics).
+#[test]
+fn integer_cvt_extends_into_every_carrier_width() {
+    let ints: [(&str, u32, bool); 8] = [
+        ("u8", 8, false), ("s8", 8, true), ("u16", 16, false), ("s16", 16, true),
+        ("u32", 32, false), ("s32", 32, true), ("u64", 64, false), ("s64", 64, true),
+    ];
+    let carriers = [Dtype::U8, Dtype::S8, Dtype::U16, Dtype::S16, Dtype::U32, Dtype::S32, Dtype::U64, Dtype::S64, Dtype::B128];
+    let values: [u64; 6] = [0, 1, 0x7f, 0x80, 0xffff_ffff_ffff_ff81, 0x8000_0000_1234_5678];
+    let ext = |v: u64, bits: u32, signed: bool| -> u128 {
+        let m = if bits == 64 { v } else { v & ((1u64 << bits) - 1) };
+        if signed && bits < 128 && (m >> (bits - 1)) & 1 == 1 {
+            u128::from(m) | (u128::MAX << bits)
+        } else {
+            u128::from(m)
+        }
+    };
+    let mut checked = 0;
+    for (d, d_bits, d_signed) in ints {
+        for (a, a_bits, a_signed) in ints {
+            let key = OpKey { name: "tirx.ptx.cvt".into(), mods: vec![format!("dtype={d}"), format!("atype={a}")] };
+            for dst_carrier in carriers.iter().filter(|c| Ty::scalar(**c).bits() >= d_bits) {
+                for src_carrier in carriers.iter().filter(|c| Ty::scalar(**c).bits() >= a_bits) {
+                    let (dt, st) = (Ty::scalar(*dst_carrier), Ty::scalar(*src_carrier));
+                    let Ok(f) = resolve_ptx(&key, &[dt], &[st]) else {
+                        panic!("cvt.{d}.{a} {dt:?} <- {st:?} did not resolve");
+                    };
+                    for &v in &values {
+                        let mut srcs = vec![[v; WARP_SIZE]];
+                        if st.slots() > 1 {
+                            srcs.push([0xabcd_ef01_2345_6789; WARP_SIZE]);
+                        }
+                        let mut out = vec![[0x5555_5555_5555_5555u64; WARP_SIZE]; dt.slots() as usize];
+                        let mut io = PtxIo { dsts: &mut out, dst_tys: &[dt], srcs: &srcs, src_tys: &[st], mask: WarpMask::lane(0) };
+                        f.call(&mut io).unwrap();
+                        // Reference: source value (a bits), then d bits, then the carrier.
+                        let source = ext(v, a_bits, a_signed) as u64;
+                        let mut want = ext(source, d_bits, d_signed);
+                        let carrier_bits = dt.bits();
+                        if carrier_bits < 128 {
+                            want &= (1u128 << carrier_bits) - 1;
+                        }
+                        let got = u128::from(out[0][0]) | if dt.slots() > 1 { u128::from(out[1][0]) << 64 } else { 0 };
+                        assert_eq!(got, want, "cvt.{d}.{a} {dt:?} <- {st:?} value {v:#x}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 1000, "{checked}");
+}

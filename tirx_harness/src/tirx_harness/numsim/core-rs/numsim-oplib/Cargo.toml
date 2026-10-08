@@ -18,6 +18,14 @@ numpy = ["dep:pyo3"]
 # Embed an interpreter so the NumPy tests can run under `cargo test`.
 numpy-embed = ["numpy", "pyo3/auto-initialize"]
 
+[dev-dependencies]
+# W4: kernel microbenches (benches/kernels.rs).
+criterion = { version = "=0.5.1", default-features = false }
+
+[[bench]]
+name = "kernels"
+harness = false
+
 [dependencies]
 numsim-types = { path = "../numsim-types" }
 libm = "=0.2.16"

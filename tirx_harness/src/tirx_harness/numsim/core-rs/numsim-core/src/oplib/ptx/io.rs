@@ -146,6 +146,12 @@ impl Operands {
             value &= (1u64 << carrier) - 1;
         }
         io.dsts[self.dst_off[i]][lane] = value;
+        if ty.slots() > 1 {
+            // A 128-bit carrier (int128/uint128/b128): the upper slot is the
+            // extension of the result (legacy, W11-4).
+            let negative = signed && ptx_bits > 0 && ptx_bits <= 64 && (value >> 63) & 1 == 1;
+            io.dsts[self.dst_off[i] + 1][lane] = if negative { u64::MAX } else { 0 };
+        }
     }
     /// Write a 128-bit value to destination `i` (two slots when the carrier has them).
     #[inline]

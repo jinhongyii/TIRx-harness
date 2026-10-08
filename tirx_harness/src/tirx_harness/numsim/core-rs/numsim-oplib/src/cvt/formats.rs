@@ -143,7 +143,18 @@ pub fn float8_e4m3fn_bits_to_f32(bits: u8) -> f32 {
 }
 
 /// Encode `f32` with round-to-nearest-even and finite saturation to E4M3FN.
+///
+/// Arithmetic encoder (`f32_to_narrow_float_bits_rn_satfinite`); the legacy
+/// nearest-code search it replaces is kept as the test oracle
+/// (`e4m3_encoder_matches_the_nearest_code_search`), ~100x faster (W4 bench
+/// `cvt_x1024/f32_to_e4m3_satfinite`).
 pub fn f32_to_float8_e4m3fn_bits(value: f32) -> u8 {
+    f32_to_narrow_float_bits_rn_satfinite(value, FLOAT8_E4M3)
+}
+
+/// The legacy nearest-code search (oracle for [`f32_to_float8_e4m3fn_bits`]).
+#[cfg(test)]
+pub(crate) fn f32_to_float8_e4m3fn_bits_search(value: f32) -> u8 {
     if value.is_nan() {
         return 0x7f;
     }
@@ -160,6 +171,26 @@ pub fn f32_to_float8_e4m3fn_bits(value: f32) -> u8 {
         }
     }
     sign | best
+}
+
+#[cfg(test)]
+mod e4m3_tests {
+    /// Every f32 high half-word, with low bits 0 / ties / just above and
+    /// below ties: the arithmetic encoder equals the nearest-code search.
+    #[test]
+    fn e4m3_encoder_matches_the_nearest_code_search() {
+        for hi in 0..=u16::MAX as u32 {
+            for lo in [0, 0x8000, 0x7fff, 0x8001, 0xffff] {
+                let v = f32::from_bits((hi << 16) | lo);
+                assert_eq!(
+                    super::f32_to_float8_e4m3fn_bits(v),
+                    super::f32_to_float8_e4m3fn_bits_search(v),
+                    "{:#010x}",
+                    v.to_bits()
+                );
+            }
+        }
+    }
 }
 
 /// How a narrow float's greatest exponent encodes non-finite values.

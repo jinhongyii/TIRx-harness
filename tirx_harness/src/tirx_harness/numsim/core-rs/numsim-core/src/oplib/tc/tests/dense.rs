@@ -110,7 +110,7 @@ fn f16_ts_with_disabled_output_lane() {
 
 #[test]
 fn tf32_ss_truncates_storage_bits() {
-    let (m, n, k) = (128, 8, 8);
+    let (m, n, k) = (128, 16, 8);
     let mut machine = Machine::new();
     // Low mantissa bits are dropped (tf32 storage), not rounded.
     let a_desc = machine.place(0x1000, m, k * 4, |row, byte| {

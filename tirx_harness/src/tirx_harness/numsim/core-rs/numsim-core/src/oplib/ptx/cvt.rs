@@ -218,15 +218,19 @@ pub(in crate::oplib) fn resolve(
     let layout = spec.layout;
     ops.arity(1, layout.sources() + usize::from(scaled), name)?;
     let (dst_bits, signed) = destination(&parsed);
-    if ops.dst_tys[0].bits() < dst_bits || ops.dst_tys[0].slots() != 1 {
+    // A carrier wider than the PTX result is extended per the result's
+    // signedness (128-bit carriers: both slots, `Operands::put`).
+    if ops.dst_tys[0].bits() < dst_bits || ops.dst_tys[0].slots() > 2 {
         return Err(OpError::unsupported(format!(
             "{name} ({text}): destination carrier {:?} cannot hold a {dst_bits}-bit result",
             ops.dst_tys[0]
         )));
     }
-    if ops.src_tys.iter().any(|ty| ty.slots() != 1) {
+    // A 128-bit source carrier holds the operand in its low slot (cvt reads
+    // at most 64 source bits, truncating the carrier like legacy).
+    if ops.src_tys.iter().any(|ty| ty.slots() > 2) {
         return Err(OpError::unsupported(format!(
-            "{name} ({text}): source carriers {:?} wider than 64 bits",
+            "{name} ({text}): source carriers {:?} wider than 128 bits",
             ops.src_tys
         )));
     }
