@@ -1155,7 +1155,9 @@ pub mod addr {
     /// Unmapped gap after every global allocation.
     pub const GLOBAL_GUARD: u64 = 1 << 16;
     /// Generic aperture of the cluster's distributed shared memory.
-    pub const GENERIC_SHARED_BASE: u64 = 0x0000_7f00_0000_0000;
+    /// The hardware window base (device-validated generic `mapa`/`cvta` bits,
+    /// W9-public-API).
+    pub const GENERIC_SHARED_BASE: u64 = 0x0000_fffe_0000_0000;
     /// Generic aperture of the executing thread's local memory.
     pub const GENERIC_LOCAL_BASE: u64 = 0x0000_7e00_0000_0000;
     /// Generic aperture of the launch's kernel-parameter block

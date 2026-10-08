@@ -977,6 +977,107 @@ pub fn tcgen_alloc_lanes_read() -> Scenario {
     scenario("tcgen_alloc_lanes_read", b.build_module(), inputs(vec![("out", u32_buf([7; 64]))]))
 }
 
+/// W9-public-API: `discard.global.L2 [data + 4 * index], 128` by lane 0
+/// (`index` 0: 128-byte aligned, completes; 1: misaligned, an error).
+pub fn discard_at(index: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("discard_at", 32);
+    let data = b.global("data", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let g = b.reg(Ty::U64);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let ki = b.k_u32(index);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.addr_of(g, data, ki);
+    b.push(Instr::Discard { addr: g.into(), space: AddrSpace::Global, size: 128 });
+    b.end_if();
+    b.exit();
+    scenario("discard_at", b.build_module(), inputs(vec![("data", u32_buf(0..64))]))
+}
+
+/// W9-public-API: `st.bulk.global [data + 8 * lane], size` by lanes 0 and 1
+/// (`size` 16 completes; 1 is not a multiple of 8, 24 MiB exceeds the
+/// maximum: errors before any address check).
+pub fn st_bulk_size(size: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("st_bulk_size", 32);
+    let data = b.global("data", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let g = b.reg(Ty::U64);
+    let idx = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k2 = b.k_u32(2);
+    let ks = b.k_u32(size);
+    b.compare(CmpOp::Lt, Ty::U32, p, lane, k2);
+    b.if_(p);
+    b.binary(BinOp::Mul, Ty::U32, idx, lane, k2);
+    b.addr_of(g, data, idx);
+    b.push(Instr::StBulk { addr: g.into(), space: AddrSpace::Global, size: ks });
+    b.end_if();
+    b.exit();
+    scenario("st_bulk_size", b.build_module(), inputs(vec![("data", u32_buf([7; 16]))]))
+}
+
+/// W9-public-API: a 2-CTA cluster; each CTA's lane 0 takes the generic
+/// address of its shared buffer, maps it to rank `r` (own, then peer) with
+/// generic `mapa`, and records `isspacep.shared::cta`,
+/// `isspacep.shared::cluster` and the mapped address's high and low 32 bits:
+/// `out[cta * 8 + 4 * (r == peer) + k]`.
+pub fn mapa_isspacep() -> Scenario {
+    let mut b = ProgramBuilder::new("mapa_isspacep", 32);
+    b.grid(2, 1, 1);
+    b.cluster(2, 1, 1);
+    let out = b.global("out", Dtype::U32);
+    let sm = b.shared("s", Dtype::U32, 4);
+    let lane = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let g = b.reg(Ty::U64);
+    let m = b.reg(Ty::U64);
+    let q = b.reg(Ty::U32);
+    let hi = b.reg(Ty::U64);
+    let v = b.reg(Ty::U32);
+    let base = b.reg(Ty::U32);
+    let at = b.reg(Ty::U32);
+    let peer = b.reg(Ty::U32);
+    b.lane_id(lane);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k8 = b.k_u32(8);
+    let k32 = b.k_u32(32);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.addr_of(g, sm, k0);
+    b.binary(BinOp::Mul, Ty::U32, base, cta, k8);
+    b.binary(BinOp::Sub, Ty::U32, peer, k1, cta);
+    for (half, rank) in [(0u32, Operand::Reg(cta)), (4, Operand::Reg(peer))] {
+        b.push(Instr::Mapa { dst: m, src: g.into(), rank, space: AddrSpace::Generic });
+        let kh = b.k_u32(half);
+        for (k, space) in [(0u32, AddrSpace::Shared), (1, AddrSpace::SharedCluster)] {
+            b.push(Instr::Isspacep { dst: q, src: m.into(), space });
+            let kk = b.k_u32(half + k);
+            b.add_u32(at, base, kk);
+            b.st_u32(out, at, q);
+        }
+        let _ = kh;
+        b.binary(BinOp::Shr, Ty::U64, hi, m, k32);
+        b.cast(Ty::U64, Ty::U32, v, hi);
+        let k2 = b.k_u32(half + 2);
+        b.add_u32(at, base, k2);
+        b.st_u32(out, at, v);
+        b.cast(Ty::U64, Ty::U32, v, m);
+        let k3 = b.k_u32(half + 3);
+        b.add_u32(at, base, k3);
+        b.st_u32(out, at, v);
+    }
+    b.end_if();
+    b.exit();
+    scenario("mapa_isspacep", b.build_module(), inputs(vec![("out", u32_buf([7; 16]))]))
+}
+
 /// Rows x cols of the TMA scenario's f32 tensor, and its box.
 pub const TMA_ROWS: u32 = 8;
 pub const TMA_COLS: u32 = 16;
@@ -3354,6 +3455,9 @@ pub const MAX_HISTORY_PROBE: u32 = (crate::interp::aux::MAX_WORD_HISTORY as u32)
 pub fn all() -> Vec<Scenario> {
     vec![
         vector_add(),
+        discard_at(0),
+        st_bulk_size(16),
+        mapa_isspacep(),
         polled_flag_words(),
         copy_report_16(true),
         tcgen_alloc_lanes_read(),

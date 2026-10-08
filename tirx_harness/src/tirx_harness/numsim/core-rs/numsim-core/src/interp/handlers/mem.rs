@@ -546,13 +546,29 @@ pub fn atom(
     Ok(Flow::Next)
 }
 
+/// Largest `st.bulk` byte count (legacy `memory_ops.rs`).
+const ST_BULK_MAX: i64 = 16 * 1024 * 1024;
+
 #[inline]
 pub fn st_bulk(ctx: &mut ExecCtx<'_>, a: Operand, space: AddrSpace, size: Operand) -> HResult {
     active_or_next!(ctx);
     let mut acc = Accesses::default();
     for l in ctx.warp.active.lanes() {
         let v = lane_val(ctx, a, l);
-        let n = lane_val(ctx, size, l);
+        // The size operand is signed in the 64-bit forms: read it as i64.
+        let n_signed = lane_int(ctx, size, l);
+        if n_signed < 0 || n_signed % 8 != 0 || n_signed > ST_BULK_MAX {
+            return Err(support::err(
+                ctx,
+                ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+                WarpMask::lane(l),
+                format!("st.bulk byte count {n_signed} must be a multiple of 8 with maximum {ST_BULK_MAX} on lane {l}"),
+            ));
+        }
+        let n = n_signed as u64;
+        if v % 8 != 0 {
+            return Err(support::err(ctx, ExecErrorKind::Misaligned, WarpMask::lane(l), format!("st.bulk address {v:#x} is not 8-byte aligned on lane {l}")));
+        }
         let loc = support::resolve(ctx, space, v, l, n)?;
         support::readonly_write(ctx, loc.alloc, loc.span(n), l)?;
         let view = support::whole(ctx.arena, loc.alloc);
@@ -577,6 +593,15 @@ pub fn discard(ctx: &mut ExecCtx<'_>, a: Operand, space: AddrSpace, size: u32) -
     let mut acc = Accesses::default();
     for l in ctx.warp.active.lanes() {
         let v = lane_val(ctx, a, l);
+        // `discard.L2 [a], 128` works on one 128-byte line (legacy check).
+        if v % 128 != 0 {
+            return Err(support::err(
+                ctx,
+                ExecErrorKind::Misaligned,
+                WarpMask::lane(l),
+                format!("discard requires a 128-byte aligned address (got {v:#x} on lane {l})"),
+            ));
+        }
         let loc = support::resolve(ctx, space, v, l, size as u64)?;
         let view = support::whole(ctx.arena, loc.alloc);
         if let Err(e) = ctx.arena.invalidate(view, &[loc.span(size as u64)]) {
@@ -638,7 +663,10 @@ pub fn isspacep(ctx: &mut ExecCtx<'_>, dst: Reg, src: Operand, space: AddrSpace)
         let in_param = matches!(g, addr::Generic::Param(_));
         let yes = match space {
             AddrSpace::Global => matches!(g, addr::Generic::Global(_)),
-            AddrSpace::Shared | AddrSpace::SharedCluster => matches!(g, addr::Generic::Shared(_)),
+            // `.shared::cta`: the executing CTA's own window only (a peer's
+            // window, e.g. from `mapa`, is `.shared::cluster`).
+            AddrSpace::Shared => matches!(g, addr::Generic::Shared(sh) if addr::decode_shared(sh).0 == ctx.cta.rank_in_cluster),
+            AddrSpace::SharedCluster => matches!(g, addr::Generic::Shared(_)),
             AddrSpace::Local => matches!(g, addr::Generic::Local(_)),
             AddrSpace::Param => in_param,
             AddrSpace::Generic => true,
