@@ -1,14 +1,15 @@
 # Migration tooling: what stays after the legacy engine is deleted
 
 One line per file. **keep** = permanent dev tooling; **delete** = removed in
-step 5 (redesign §4) together with the legacy engine
-(`retire_legacy.py --apply` lists it in section 6). Every former "decide"
+step 5 (redesign §4, commit 79f04eb) together with the legacy engine
+(`retire_legacy.py --apply` section 6; the deleted files are in the parent
+commit 7c7d049). Every former "decide"
 line was ruled by the coordinator on 2026-10-08. Paths are relative to the
 repository root.
 
 ## `scripts/numsim-v2/`
 
-- `bench_backends.py`: keep, renamed `bench_engine.py`. Drop the legacy and codegen variants and keep the interp measurement.
+- `bench_backends.py`: deleted at step 5 (its legacy-vs-v2 and codegen modes were dead; it used `relax_unanchored` and the delta snapshots). `perf_gate.py` and `tests/perf/` keep the interp measurement.
 - `capture_plugin.py`: keep (ruled 2026-10-08). It hooks `v2.transpile`. Until step 5 it also captures kernels reached only through legacy internals at the legacy normalization hook; that block disables itself once the legacy modules are gone. The file format is unchanged.
 - `check_snapshot_deltas.py`: keep (CI: every snapshot change cites a delta row).
 - `classify_tests.py`: delete.
@@ -32,7 +33,7 @@ repository root.
 
 - `test_classification.csv`: delete.
 - `category_overrides.tsv`: delete.
-- `v2_ports_*.tsv` (all: `deltas`, `failclosed`, `internals`, `messages`, `p6b`, `p6c`, `p6d`, `p7`, `p8`, `p9`, `racedeltas`, `reductions`, `stats`, `triage`, `validshape`, `w11`, `w1triage`, `w4`, `w6`): delete.
+- `v2_ports_*.tsv` (all: `deltas`, `failclosed`, `internals`, `messages`, `p6b`, `p6c`, `p6d`, `p7`, `p8`, `p9`, `racedeltas`, `reductions`, `stats`, `triage`, `validshape`, `w1triage`, `w4`, `w6`, `w8`, `w9`, `w11`, `w12`): delete.
 - `v2_public_status.tsv`: delete.
 - `v2_xfail_inventory.tsv`: delete. The open gaps live as `v2_gap` marks and in `CONTRACT_REQUESTS.md`.
 - `step5_a_status.tsv`: delete.

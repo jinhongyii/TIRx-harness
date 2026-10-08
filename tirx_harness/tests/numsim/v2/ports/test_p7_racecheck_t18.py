@@ -25,8 +25,7 @@ pytestmark = requires_v2_engine
 _T18 = pytest.mark.xfail(
     strict=True,
     reason=(
-        "T18 documented limitation (racecheck-behaviour-deltas.md row T18; expected outcome, "
-        "category_overrides.tsv category=expected): a raw read "
+        "T18 documented limitation (racecheck-behaviour-deltas.md row T18; expected outcome): a raw read "
         "of a declared word before its publication is indistinguishable from a spin's first "
         "iteration without loop information; v2 reports clean"
     ),
