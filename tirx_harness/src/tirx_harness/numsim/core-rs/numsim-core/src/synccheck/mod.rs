@@ -178,6 +178,17 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
             .find(|(k, _)| *k == program.kernel)
             .map_or(config.init, |(_, shape)| ResourceInit { policy: config.init.policy, ..resource_init(shape) })
     };
+    // Fail closed: never explore a setmaxnreg pool with 0 warps or a cluster
+    // barrier with 0 participants because the launch shape is unknown.
+    let needs = |pred: fn(&crate::sync::ResourceId) -> bool| program.resources.iter().any(pred);
+    if (init.warps_per_cta == 0 && needs(|r| matches!(r, crate::sync::ResourceId::RegPool { .. })))
+        || (init.cluster_warps == 0 && needs(|r| matches!(r, crate::sync::ResourceId::Cluster { .. })))
+    {
+        out.program_build(
+            "launch shape unknown: neither the recording (`RecordingObserver::launches`) nor `SynccheckConfig.init` gives warps per CTA / cluster participants".into(),
+        );
+        return out.finish(started);
+    }
     let reference = match reference::run(&program, &init) {
         Ok(r) => r,
         Err(detail) => {

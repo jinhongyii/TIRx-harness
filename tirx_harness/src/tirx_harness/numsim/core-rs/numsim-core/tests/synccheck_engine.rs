@@ -71,3 +71,14 @@ fn every_engine_scenario_is_checked_within_budget() {
         }
     }
 }
+
+/// No launch shape anywhere: fail closed instead of a zero-warp pool (W2-10).
+#[test]
+fn unknown_launch_shape_is_incomplete() {
+    let s = scenarios::all().into_iter().find(|s| s.name == "setmaxnreg_launch_bounds").expect("scenario");
+    let (_, mut log) = run(&s);
+    log.launches.clear();
+    let r = check(&log, &SynccheckConfig::default());
+    assert_eq!(r.verdict, Verdict::Incomplete, "{:#}", serialize(&r));
+    assert_eq!(serialize(&r)["incomplete"][0]["reason"], "fixed_sync_program_build");
+}
