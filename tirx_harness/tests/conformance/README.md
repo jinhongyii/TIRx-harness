@@ -27,6 +27,14 @@ while that module is missing or does not yet expose `transpile`, `Engine`
 legacy snapshot is an exception are skipped under v2 (no oracle), and so is
 any v2 run that raises `NotImplementedError` (unfinished numsim-core bodies).
 
+## Space names
+
+numsim-core reports tracked locals (register arrays) as space `reg`; legacy
+called them `register`. The projection maps `reg` to `register` before
+grouping (`snapshot._SPACE_ALIASES`); payloads keep `reg`. The byte offsets
+inside the region are still each engine's own layout, so a differing
+footprint there is a layout question, not a missing finding (V2C-20).
+
 ## Delta snapshots
 
 When a behaviour-delta row rules that legacy was wrong, the corrected oracle

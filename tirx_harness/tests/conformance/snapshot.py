@@ -228,13 +228,17 @@ def _intervals(value: Any) -> Iterable[tuple[str, int, int]]:
         yield _region(space, alloc), start, start + int(value["byte_len"])
 
 
+# numsim-core space names that legacy spelled differently.
+_SPACE_ALIASES = {"reg": "register"}
+
+
 def record_space(value: Mapping[str, Any]) -> str | None:
     """Memory space of a record, falling back to its witness accesses."""
 
     if value.get("space") is not None:
-        return str(value["space"])
+        return _SPACE_ALIASES.get(str(value["space"]), str(value["space"]))
     spaces = {
-        str(side["space"])
+        _SPACE_ALIASES.get(str(side["space"]), str(side["space"]))
         for side in (value.get("prior"), value.get("current"))
         if isinstance(side, Mapping) and side.get("space") is not None
     }
