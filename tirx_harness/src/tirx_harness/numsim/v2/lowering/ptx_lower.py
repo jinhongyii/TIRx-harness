@@ -493,7 +493,14 @@ def _report(c: PtxCtx) -> Any:
     if "per_element" in token:
         return "PerElementFf"
     if "per_16bytes" in token:
-        return "Per16Bytes"
+        # `.per_16bytes::<hex>` (W2-8): the pattern and its element width
+        # (hex digits x 4). The bare legacy form keeps failing closed.
+        digits = token.rsplit("per_16bytes", 1)[1].lstrip(":")
+        if not digits:
+            return "Per16Bytes"
+        if len(digits) not in (1, 2, 4, 8) or any(ch not in "0123456789abcdefABCDEF" for ch in digits):
+            raise _Unsupported(c.node, f"{c.d.op_name}: report pattern {digits!r}")
+        return {"Per16BytesPattern": {"pattern": int(digits, 16), "bits": 4 * len(digits)}}
     raise _Unsupported(c.node, f"{c.d.op_name}: report mode {token!r}")
 
 

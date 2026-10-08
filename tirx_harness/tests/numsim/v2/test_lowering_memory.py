@@ -313,3 +313,38 @@ def k(out: T.Buffer((256,), "bfloat16"), off: T.int32):
     out = result.outputs["out"].view(np.uint16)
     assert np.nonzero(out)[0].tolist() == list(range(128, 192))
     assert out[128] == 1 and out[191] == 16
+
+
+def test_packed_eight_conversions_read_their_first_pointer():
+    """`cuda_{float8tohalf8,half8tofloat8}(void* src, void* dst)`: source first
+    (unlike `float22half2(dst, src)`), as TVM's builtins and legacy define them."""
+    from tests.numsim.runtime.test_scalar_control import pointer_conversions_and_descriptor
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(pointer_conversions_and_descriptor)
+
+    def buffer_of(addr):
+        instr = definition(program, addr)
+        while instr.variant != "AddrOf":
+            instr = definition(program, next(o for o in instr.operands() if isinstance(o, pb.Reg)))
+        return program.buffers[instr.buf].name
+
+    loads = [(i.ty, buffer_of(i.addr)) for i in all_of(program, "LoadAddr")]
+    stores = [(i.ty, buffer_of(i.addr)) for i in all_of(program, "StoreAddr")]
+    assert (pb.Ty("F32", 8), "source") in loads and (pb.Ty("F16", 8), "half") in stores
+    assert (pb.Ty("F16", 8), "half") in loads and (pb.Ty("F32", 8), "roundtrip") in stores
+
+
+def test_cross_owner_fragment_copy_is_transported_through_shared_scratch():
+    """A copy between register fragments with different thread layouts stages the
+    source through a shared scratch, synchronizes the warpgroup, then each
+    destination owner writes its own elements (no cross-thread register writes)."""
+    from tests.numsim.runtime.test_tile_owner_transport import _copy_cross_warp_owner_remap
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(_copy_cross_warp_owner_remap)
+    scratch = [b for b in program.buffers if b.name.endswith(".transport")]
+    assert len(scratch) == 1 and scratch[0].space == "Shared"
+    barriers = all_of(program, "Barrier")
+    assert len(barriers) == 2 and all(const(program, b.id) == 8 for b in barriers)
+    assert not any(i.variant == "Unsupported" for i in program.code)

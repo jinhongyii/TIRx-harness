@@ -252,3 +252,16 @@ def k(a: T.Buffer((32,), "float32"), out: T.Buffer((32,), "float32")):
     load = next(i for i, x in enumerate(program.code) if x.variant == "Load" and program.buffers[x.buf].name == "a")
     opened = max(i for i in range(load) if variants[i] == "If")
     assert "EndIf" not in variants[opened:load]
+
+
+def test_per_16bytes_report_carries_its_pattern_and_width():
+    """W2-8: `.mbarrier::report::per_16bytes::<hex>` -> ReportMode::Per16BytesPattern."""
+    from tests.numsim.runtime.test_mbarrier_report import report_kernel
+    from tirx_harness.numsim.v2.lowering import lower
+
+    for token, pattern, bits in (("per_16bytes::80000000", 0x80000000, 32), ("per_16bytes::8000", 0x8000, 16),
+                                 ("per_16bytes::80", 0x80, 8), ("per_16bytes::8", 0x8, 4)):
+        program = lower(report_kernel(token, cluster=False, layout=1))
+        copy = only(program, "BulkCopy")
+        assert copy.report == {"Per16BytesPattern": {"pattern": pattern, "bits": bits}}
+    assert only(lower(report_kernel("per_element::ff", cluster=False, layout=1)), "BulkCopy").report == "PerElementFf"

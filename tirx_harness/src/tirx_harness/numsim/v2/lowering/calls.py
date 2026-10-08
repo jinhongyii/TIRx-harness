@@ -613,8 +613,13 @@ class CallsMixin:
 
     call_tirx_cuda_smem_addr_from_uint64 = call_tirx_cuda_cvta_generic_to_shared
 
-    def convert_through_memory(self: "Lowerer", node: Any, src_ty: pb.Ty, dst_ty: pb.Ty) -> None:
-        dst_ptr, src_ptr = (self.as_address(self.expr(a)) for a in node.args)
+    def convert_through_memory(self: "Lowerer", node: Any, src_ty: pb.Ty, dst_ty: pb.Ty,
+                               src_first: bool = False) -> None:
+        # TVM's signatures differ: `cuda_float22half2(void* dst, void* src)` but
+        # `cuda_{half8tofloat8,float8tohalf8}(void* src_addr, void* dst_addr)`
+        # (legacy cuda_helper.rs DPS_HELPERS: destination index 0 vs 1).
+        first, second = (self.as_address(self.expr(a)) for a in node.args)
+        src_ptr, dst_ptr = (first, second) if src_first else (second, first)
         site = self.site(node, op_name=_op_name(node))
         loaded = self.builder.reg(src_ty)
         self.builder.emit("LoadAddr", site=site, ty=src_ty, dst=loaded, addr=src_ptr, space="Generic",
@@ -629,10 +634,10 @@ class CallsMixin:
         self.convert_through_memory(node, pb.Ty("F32", 2), pb.Ty("F16", 2))
 
     def call_tirx_cuda_float8tohalf8(self: "Lowerer", node: Any) -> None:
-        self.convert_through_memory(node, pb.Ty("F32", 8), pb.Ty("F16", 8))
+        self.convert_through_memory(node, pb.Ty("F32", 8), pb.Ty("F16", 8), src_first=True)
 
     def call_tirx_cuda_half8tofloat8(self: "Lowerer", node: Any) -> None:
-        self.convert_through_memory(node, pb.Ty("F16", 8), pb.Ty("F32", 8))
+        self.convert_through_memory(node, pb.Ty("F16", 8), pb.Ty("F32", 8), src_first=True)
 
     # -- reviewed CUDA helpers ------------------------------------------------
     def call_tirx_cuda_func_call(self: "Lowerer", node: Any) -> pb.Operand | None:

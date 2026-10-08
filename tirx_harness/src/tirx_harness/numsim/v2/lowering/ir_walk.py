@@ -26,6 +26,7 @@ from .calls import CallsMixin
 from .dtypes import dtype_of, type_key
 from .host_prelude import PreludeMixin
 from .memory import MemoryMixin, MemRef, _Unsupported, escaped_locals, handle, promotable_locals
+from .owner_transport import OwnerTransportMixin, function_is_owner_transport
 from .tile_checks import tile_rejection
 from .uninit import maybe_uninit_locals
 
@@ -89,7 +90,7 @@ WARPS_PER_WARPGROUP = 4
 U64 = pb.Ty("U64")
 
 
-class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
+class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
     def __init__(self, func: Any, name: str):
         self.func = func
         self.builder = pb.ProgramBuilder(name)
@@ -328,6 +329,9 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
             self.unsupported(node, str(error))
 
     def stmt_tirx_TilePrimitiveCall(self, node: Any) -> None:
+        if getattr(self, "owner_transport", False):
+            self.lower_owner_transport(node)
+            return
         reason = getattr(self, "dispatch_error", None) or "TVM dispatch produced no lowering"
         raise _Unsupported(node, f"tile op {node.op.name if hasattr(node.op, 'name') else node.op}: {reason}")
 
@@ -880,6 +884,8 @@ def lower(func: Any, *, name: str | None = None, strict: bool = True) -> pb.Prog
     func = dispatch_tile_primitives(func)
     lowerer = Lowerer(func, name)
     lowerer.dispatch_error = _DISPATCH_ERRORS.pop(id(func), None)
+    lowerer.owner_transport = id(func) in _OWNER_TRANSPORT
+    _OWNER_TRANSPORT.discard(id(func))
     program = lowerer.lower()
     if strict and program.unsupported:
         raise LoweringUnsupported(program)
@@ -906,6 +912,11 @@ def dispatch_tile_primitives(func: Any) -> Any:
     structural_visit(func.body, [(tirx.TilePrimitiveCall, on_tile)])
     if not found:
         return func
+    if not unknown and function_is_owner_transport(func):
+        # Element-wise ops moving values across register-fragment owners: lowered
+        # by owner transport (owner_transport.py), not by TVM's dispatch.
+        _OWNER_TRANSPORT.add(id(func))
+        return func
     if unknown:
         # Legacy fail-closed rules TVM's dispatch does not enforce (tile_checks).
         _DISPATCH_ERRORS[id(func)] = "; ".join(unknown)
@@ -922,6 +933,7 @@ def dispatch_tile_primitives(func: Any) -> Any:
 
 
 _DISPATCH_ERRORS: dict[int, str] = {}
+_OWNER_TRANSPORT: set[int] = set()
 
 
 

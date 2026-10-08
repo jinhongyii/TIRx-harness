@@ -1850,6 +1850,25 @@ Open, for W1:
   - Test: `replace_rejects_ordinals_outside_the_descriptor_slots`, which
     also checks that no ordinal panics.
 
+## W4-engine-stops (2026-10-08): sweep-5 `engine-stops` class (22 items, 19 functions), oplib share
+
+Run against the live tree:
+- 13 functions stop with `bad_address: ... tmem lane N is outside warp 0's
+  sub-partition`. With `test_launch_resource_facts::test_exclusive_tmem_uses_cta_local_lifecycle_without_placement`
+  (`Tcgen(AllocWhileExclusive)`, sync delta T8) these are W2's 14 TMEM-slice
+  functions, already ruled as deltas; W9 is porting them.
+- 3 functions stop with `RegPool(InvalidDirection)`: setmaxnreg.dec, ruled
+  as a delta.
+- `test_gate_intrinsics::test_gate_intrinsics_match_float32_semantics`: the
+  only oplib item (`tirx.log1p` / `tirx.sigmoid` were unimplemented). Fixed
+  by W4-18; its numerics pass. It now fails only on the
+  `module.rust_source` pin (pin-internals, W9).
+- `test_tile_owner_transport::test_copy_transports_unique_owners_across_warps`:
+  passes in the live tree. It was the lowering's register-owner `Assert`
+  trap, fixed on the W1 side.
+
+No engine (interp/sched/arena) item remains for W2 beyond the ruled deltas.
+
 ## W5-10 (for W2, 2026-10-08): restricted commit and tcgen smem operand proxy
 
 Found with `test_tcgen05_restricted_commit` (a racecheck false negative) and
@@ -2576,3 +2595,53 @@ by delta rows and have no delta snapshot yet: `alphamoe_fp8_blockscale_qwen3next
 `undeclared_protocol_word` instead of `data_race`) and `kda_backward_packed` (X4,
 `cross_cta_async_order` advisory). Public-API set: 551 of 762 pass; per-function status in
 `scripts/numsim-v2/coverage/v2_public_status.tsv`, triage by owner in the status doc.
+
+## W5-15 (for W1 + W2, 2026-10-08): per-operand logical buffer for `alias_stale_read`
+
+`alias_stale_read` names an access by `SiteInfo::buffer`, which is ONE name per
+site: the first pointer operand. A multi-operand op that reads one buffer and
+writes another gets the wrong name for one of its accesses. Example:
+`tensormap.cp_fenceproxy(destination, image)` reads shared `image` under the
+name `destination`, which gave a false advisory in `test_tensor_map_predicate_effects`.
+The pointer identity is not elsewhere in the stream either: `Evidence` carries
+kernel, space and alloc, and `TensormapAcquire` carries alloc and span; neither
+has the logical name.
+
+- **Interim (racecheck, delta P7):** a site's name is used only when the
+  access's allocation space equals the named buffer's declared space. This
+  fixes the example. It cannot tell apart two same-space operands, e.g. a
+  shared→shared copy.
+- **Request:** `SiteInfo.buffers: Vec<String>`, one per pointer operand in
+  operand order (W1, lowering), plus `Access.operand: Option<u8>`, the operand
+  index the access came from (W2, engine emit). Racecheck then uses
+  `buffers[operand]`.
+
+## W1 (2026-10-08): report pattern, half8 pointer order, owner transport (no contract change)
+
+- **`Per16BytesPattern`: done.** `_report` maps
+  `.mbarrier::report::per_16bytes::<hex>` to
+  `{"Per16BytesPattern": {pattern, bits = 4 x hex digits}}`. The bare form
+  stays `Per16Bytes` (fails closed) and `per_element::ff` stays
+  `PerElementFf`.
+- **`float8tohalf8` / `half8tofloat8`: fixed.** Their signature is
+  `(void* src_addr, void* dst_addr)`, while `float22half2` is
+  `(void* dst, void* src)`. This matches TVM `backend/cuda/cpp/builtins.py`
+  and legacy `cuda_helper.rs` `DPS_HELPERS`, where the destination index is
+  1 vs 0. Lowering now reads the first pointer of the two eight-element
+  helpers.
+- **Cross-warp register transport: done with existing ops**
+  (`lowering/owner_transport.py`).
+  - Scope: a function whose tile ops are all element-wise and that has at
+    least one op between register fragments of different thread layouts.
+    Ops covered: copy, cast, add/sub/mul/div/max/min, sqrt/exp/log/abs and
+    similar.
+  - Such a function skips TVM dispatch. TVM's copy fallback writes other
+    threads' registers, and it rejects mul and cast outright.
+  - Instead, each source fragment owned differently from the executor is
+    staged through a per-op shared scratch (`<buf>.transport`): every owner
+    stores its elements, then the scope barrier runs (warpgroup:
+    `bar.sync 8, 128`, as TVM's `warpgroup_sync(8)`).
+  - Each destination owner then computes and writes its own elements, and a
+    second barrier releases the scratch.
+  - All 3 `test_tile_owner_transport` tests pass; synccheck and racecheck are
+    clean.
