@@ -99,16 +99,27 @@ instruction returns `Blocked(resource)` and the scheduler retries it on a later
 round; there are no wakers or waiter registries. `Program` is serializable, so
 Rust tests can load or hand-build one without Python or TVM.
 
-Within a round, each resident CTA gives every runnable warp one slice of up to
-`quantum` instructions from a seeded rotation offset. Its ready asynchronous
-operations then land (a seeded subset by default, so an operation can stay in
-flight across rounds). Each resident cluster is a partition with its own CTAs,
-`SyncTable`, and event buffer, and partitions run on up to `workers` threads.
-Global memory is shared through copy-on-write stripes that merge at the end of
-the round, and buffered events are replayed in an order consistent with what
-each partition read. A launch with launch-wide state (grid sync or cooperative
-launch, declared `wait_until` words, mixed tcgen05 `cta_group`s) runs as one
-partition. Results and observer streams never depend on the worker count.
+Each resident cluster is a scheduling partition with its own CTAs, `SyncTable`,
+event buffer and RNG. A launch runs as one partition when it has launch-wide
+state: a cooperative launch or `grid.sync`, mixed tcgen05 `cta_group`s, or
+`RunConfig::single_partition`. A round has three phases:
+
+1. Every partition runs on its own arena shard, on up to `workers` threads.
+   Within a CTA each runnable warp gets one slice of up to `quantum`
+   instructions from a seeded rotation, then a seeded subset of ready async
+   operations lands. Global memory is a copy-on-write stripe overlay, so
+   another cluster's writes become visible next round.
+2. Shards merge in partition order. Buffered events replay in an order
+   consistent with what each partition read: a reader of bytes another
+   partition wrote this round replays first. When no such order exists, the
+   launch is reported `incomplete` (`cross_cluster_same_round_cycle`).
+3. Global read-modify-writes inside a shard run serially on the main arena, in
+   partition order.
+
+Declared-word history is merged in delivery order before replay, and buffered
+`wait_until` verdicts are renumbered to the merged history. Results and
+observer streams do not depend on the worker count, and results do not depend
+on the observer; tests check both (numsim-redesign.md §2.3).
 
 ## Where each concept lives
 

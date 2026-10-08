@@ -4,7 +4,7 @@ orphan: true
 
 # NumSim / Racecheck / Synccheck 重构方案
 
-状态：实施中，2026-10-08 更新。分支 `refactor/clean-core`。第 0–3 步已完成：v2 在全部 corpus case 上与旧快照一致或有裁定的 delta（`v2-conformance-status.md`）。第 4 步的后端对比已出结论（`backend-comparison.md`：保留 `interp`，删除 `codegen`），删除尚未执行。第 5 步（删旧）由 `test-migration.md` 的退役计划驱动，尚未执行。
+状态：实施中，2026-10-08 更新。分支 `refactor/clean-core`。第 0–3 步已完成：v2 在全部 corpus case 上与旧快照一致或有裁定的 delta（`v2-conformance-status.md`）。第 4 步已完成：后端对比结论为保留 `interp`，`codegen` 已删除（`backend-comparison.md`）。第 5 步（删旧）由 `test-migration.md` 的退役计划驱动，尚未执行。
 
 本文是重构的工作合约：所有 worker 以此为准，分歧回到这里改文档再改代码。
 
@@ -42,9 +42,8 @@ orphan: true
 | 组件 | 职责 | 唯一拥有的数据结构 |
 | --- | --- | --- |
 | Lowering（Python） | TIRx PrimFunc → `Program` | `Program` |
-| Backend: Interpreter | 执行 `Program`，mask 栈重汇聚，循环预算与量子 | `WarpState` |
-| Backend: Codegen | `Program` → Rust 文本，每条指令打印为对同一 handler 的调用；rustc 一次 | 生成的 cdylib |
-| Scheduler | CTA 为 lockstep 单位，warp 按 id 轮转，seeded；跨 CTA 经 per-CTA inbox 每轮排空一次 | `CtaState`, `Inbox` |
+| Interpreter（唯一执行器） | 执行 `Program`，mask 栈重汇聚，循环预算与量子 | `WarpState` |
+| Scheduler | 驻留 cluster 为分区单位，轮内 warp seeded 轮转；global 经写时复制条带共享，轮末按分区序合并（§2.3） | `Partition`, `CtaState` |
 | Arena | 字节 + 每字节 1 bit validity + view/OOB | `Vec<Allocation>` |
 | SyncTable | mbarrier / named / cluster / async group / tcgen lifecycle / setmaxnreg 的 `step` 函数 + 待完成队列 | `map<ResourceId, Resource>`, `VecDeque<Completion>` |
 | OpLib | 纯数值：cvt、fp8/fp4/bf16、MMA、TMA/im2col/swizzle 地址生成、shfl/reduce。生成 `SUPPORTED_OPS.md` | 静态 op 表 |
@@ -70,12 +69,29 @@ pub struct Program {
 
 `Program` 可 serde 序列化。Rust 侧测试直接加载或手写，不需要 Python 和 TVM。
 
-### 2.3 两个后端、一个开关
+### 2.3 后端与调度器（已定）
 
-- `backend = "interp" | "codegen"`，运行期选择，默认先 `interp`。
-- Codegen 后端是 `Program` 的打印器：每条 `Instr` 打印成 `handlers::ld_f32(&mut ctx, dst, buf, off, SPACE, SEM, SITE)` 这类调用，寄存器编号、dtype、space 变成常量让 LLVM 内联折叠。**不允许**在生成代码里出现独立的语义实现。
-- 两个后端共享 Arena、SyncTable、OpLib、Observer、checker，差别只有分派。性能对比在 corpus 上做，按 kernel 分 NumSim / racecheck / synccheck 三个模式报告。
-- 对比结论出来后删掉输的那个。两个后端共存不是最终状态。结论：`interp` 胜出，`codegen` 待删（`backend-comparison.md`）。
+**后端：只保留解释器。**
+
+
+- 原计划：`interp` 与 `codegen`（`Program` → Rust 打印器，每条 `Instr` 调用同一 handler，rustc 一次）并存，在 corpus 上按 NumSim / racecheck / synccheck 三模式对比后删掉输家。
+- 结论（`backend-comparison.md`）：codegen 在任何 case 上都不比解释器快，核心时间中位数为解释器的 0.87–0.94x，每次调用多约 117 ms，冷构建最长达数小时；解释器比旧引擎快 2.3–3.0x。
+- 已执行：`numsim-core/src/codegen/`、`Backend` 枚举、`NUMSIM_V2_BACKEND`、`Engine(backend=...)`、codegen 等价测试与 bench 均已删除。解释器是唯一执行器，每条指令的语义只在 `interp::handlers` 中。
+
+**调度器（`sched/`，分区协议，W6 评审通过，2026-10-08）。**
+
+- 分区：每个驻留 cluster 是一个 `Partition`，自有 CTA、`SyncTable`、`LaunchAux`、事件缓冲与 RNG（种子取 cluster 号）；async op id 按分区编号。cluster 内的跨 CTA 效果（远端 shared 写、远端 mbarrier 命令）同步生效。以下情形整次 launch 用单分区（fallback）：cooperative / `grid.sync`、`max_resident_ctas == 0`、tcgen05 `cta_group::1` 与 `::2` 混用、`RunConfig::single_partition`。分区规则只取决于 program 与 config，与 observer、worker 数无关。
+- 一轮三相：
+  1. 并行相：各分区在自己的 arena shard 上跑；私有分配原地读写，global/param 经 4 KiB 写时复制条带覆盖轮初状态，故其他 cluster 本轮的 global 写下一轮才可见。worker 数为 1 时也走 shard 路径。
+  2. 合并：shard 按分区序合并（同字节后者胜）；首个出错分区之后的分区丢弃。
+  3. 串行相（主 arena，分区序）：shard 内的 global RMW（atom/red，以及落到 global 的 bulk/tensor/async 归约）在此逐条执行，不丢更新。
+- 事件回放序：分区事件整块回放，序与各分区所见一致——读了别人本轮所写字节的分区先回放，同字节写者保持分区序；分区读回自己本轮所写的字节不算读轮初值。无此序（互读对方所写，SB 型结果）时按分区序回放并报 `incomplete`（`cross_cluster_same_round_cycle`）。`Access::seq` 在回放时分配。
+- declared word 历史：launch 级 `WordTable` 为准。分区在副本上记录自己的写；`merge_words` 在回放**之前**按回放序（串行相、`drain_all` 按分区逐个）把新条目按交付序追加，并记录每个本地条目的合并位置，据此改写缓冲中的 `WaitVerdicts`（`observed`、`accepted`）和分区的 verdict 缓存。别的分区本轮的条目对已缓冲的 verdict 记为未接受：等待方的 shard 看不到这些字节，故这样不会多出 HB 边；若无可接受条目，racecheck 报 `WaitExitUnproven`。合并越过 `MAX_WORD_HISTORY` 即 overflow，等待以 `incomplete` 失败关闭。
+- 已测不变量：结果与 observer 流与 worker 数无关，有无 observer 结果相同（只有回放序与上面的 cycle 诊断依赖 observer）；verdict 编号等于交付序。测试：
+  - `interp_scenarios`：`partitioned_wait_until_is_deterministic_across_workers`（1/8/32 worker）、`partitioned_words_do_not_depend_on_the_observer`、`wait_verdict_indices_follow_the_delivery_order`、`sharded_matches_single_partition_reference`、`moe_synthetic_partitions_and_serial_atomics`；
+  - `sched_partition_review`：`every_scenario_is_observer_and_worker_independent`（全部场景 × 3 个种子，1 对 8 worker）、`same_round_writers_each_waiting_on_their_own_value`、`history_overflow_crossed_only_in_the_partition_merge`、`history_overflow_crossed_in_the_serial_phase`；
+  - `arena::tests::reading_own_writes_is_not_a_round_start_read`。
+- 已取消：CTA 级（cluster 内）分区（peer shared 作写时复制共享状态、远端 mbarrier 按（发送 rank，issue 序）应用、`shared::cluster` 原子作串行点）。HEAD 在主 kernel 上已快于旧引擎：`cudnn_sm100_gemm_proj_rope_mxfp8_bf16in` NumSim，32/8/1 worker 为 4.79 s / 9.31 s / 53.4 s，旧引擎为 12.63 s / 17.80 s / 73.2 s（主机负载 67–131，见 engine-review.md）。
 
 ### 2.4 内存与 shadow
 
@@ -122,7 +138,6 @@ pub struct Program {
 | observe | ~0.6K |
 | racecheck | ~4K |
 | synccheck | ~4K |
-| codegen 打印器 | ~2K |
 | py | ~1K |
 | 合计 | ~48K，对比今天 ~310K |
 
@@ -134,7 +149,7 @@ pub struct Program {
 
 层次：
 1. 语义一致性：corpus × verdict/findings/输出快照。
-2. 差分与属性：解释器 vs codegen 后端位级一致；在线 racecheck vs 回放一致；参考状态机 vs `step`。
+2. 差分与属性：在线 racecheck vs 回放一致；参考状态机 vs `step`。
 3. 纯核心：手写 `Program` 喂 checker，不经 Python。
 4. Lowering：断言 `Program` 内容，不断言 Rust 文本。
 5. 性能：criterion 微基准 + 端到端相对基线，`performance` marker opt-in，nightly 开 profile。
@@ -149,7 +164,7 @@ pub struct Program {
 1. 新引擎只跑 NumSim（解释器后端），按 corpus kernel 逐个切换，位级对照旧引擎。（完成）
 2. racecheck 核心，逐 kernel 切换，finding 集合对照。（完成）
 3. synccheck 与探索器。（完成）
-4. codegen 后端作为 `Program` 打印器；三模式性能对比；删掉输家。（对比完成，删除 `codegen` 待执行）
+4. codegen 后端作为 `Program` 打印器；三模式性能对比；删掉输家。（完成：保留 `interp`，`codegen` 已删除；数据见 `backend-comparison.md`）
 5. 删旧：`engine-rs/`、`frontend-rs/`、旧 Python 层、钉实现的测试。（待执行；`scripts/numsim-v2/retire_legacy.py`、`retire_tests.py`）
 
 ### 4.1 并行分工
@@ -164,7 +179,7 @@ pub struct Program {
 | W4 oplib | 从 `scalar.rs`/`tcgen_ops.rs`/`tensor_map.rs`/fp-env 搬运数值代码并去掉引擎耦合 | 合约 |
 | W5 racecheck | Clock、IntervalShadow、Cell 规则、proxy 维度、declared word 位图 | 合约 + Observer |
 | W6 synccheck | SyncEvent 日志、投影、DFS、incomplete 规则 | 合约 + Observer |
-| W7 codegen | `Program` 打印器 + 单次 rustc 构建器 | W2 的 handler 接口 |
+| W7 codegen（已删除） | `Program` 打印器 + 单次 rustc 构建器；对比后删除 | W2 的 handler 接口 |
 | W8 python + 测试基建 | compile/run/report/api、快照基建、CI、criterion 骨架 | 合约 |
 
 ## 5. 代码位置
@@ -176,7 +191,7 @@ pub struct Program {
 
 ## 6. 待决与风险
 
-- 解释器在 scalar 密集 kernel 上可能慢 2 到 5 倍；codegen 后端对比后决定，必要时对直线块加 Cranelift JIT（增量）。
+- 解释器性能：codegen 对比已证明打印成 Rust 没有收益（§2.3）；剩余差距在调度器扩展性（25 个大 kernel），必要时再考虑对直线块加 Cranelift JIT（增量）。
 - lowering 重写里 tile form / layout 分析（frontend-rs 约 6K 行）是 op 覆盖回归最先暴露的地方。
 - 异步 proxy 的 scoped HB（cluster multicast TMA、部分 tx 完成、cp.async.bulk 只读等待、tcgen05 commit → mbarrier）需要两个完成里程碑，预计要第二轮迭代。
 - Synccheck 状态爆炸：16 warp、K 级、N 迭代流水线可能击穿 sleep set，届时加按资源相位计数证书。
