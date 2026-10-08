@@ -318,6 +318,9 @@ fn cluster_warp(ctx: &ExecCtx<'_>) -> u32 {
 #[inline]
 pub fn cluster_arrive(ctx: &mut ExecCtx<'_>, sem: Sem, aligned: bool) -> HResult {
     active_or_next!(ctx);
+    if ctx.warp.active != ctx.warp.live || ctx.aux.cluster_partial.contains_key(&ctx.warp.id) {
+        return cluster_partial(ctx, false, sem != Sem::Relaxed, aligned);
+    }
     let active = ctx.warp.active;
     let res = ResourceId::Cluster { cluster: ctx.cta.cluster };
     let cmd = SyncCmd::Cluster(cluster::Cmd::Arrive { warp: cluster_warp(ctx), mask: active.bits(), aligned });
@@ -336,6 +339,9 @@ pub fn cluster_arrive(ctx: &mut ExecCtx<'_>, sem: Sem, aligned: bool) -> HResult
 pub fn cluster_wait(ctx: &mut ExecCtx<'_>, acquire: bool, aligned: bool) -> HResult {
     active_or_next!(ctx);
     let _ = acquire; // the wait always acquires (sync-semantics §4.1)
+    if ctx.warp.active != ctx.warp.live || ctx.aux.cluster_partial.contains_key(&ctx.warp.id) {
+        return cluster_partial(ctx, true, true, aligned);
+    }
     let active = ctx.warp.active;
     let res = ResourceId::Cluster { cluster: ctx.cta.cluster };
     let cmd = SyncCmd::Cluster(cluster::Cmd::Wait { warp: cluster_warp(ctx), mask: active.bits(), aligned });
@@ -347,6 +353,96 @@ pub fn cluster_wait(ctx: &mut ExecCtx<'_>, acquire: bool, aligned: bool) -> HRes
             Ok(Flow::Next)
         }
         out => Err(internal(ctx, "cluster wait", out)),
+    }
+}
+
+/// `barrier.cluster.{arrive,wait}` executed by part of a warp, or by lanes
+/// joining / retrying such a gather (sync §4.6, Q11; W6). The lanes wait
+/// for the rest of the warp to execute the same kind (any site); then the
+/// warp makes ONE command with the full live mask, and ONE `Arrive` / `Wait`
+/// event names every gathered lane (checker-review §3). `.aligned` partial
+/// forms, missing lanes that exit or run the other kind, and a second
+/// execution before completion fail closed (`cluster::gather`).
+fn cluster_partial(ctx: &mut ExecCtx<'_>, wait: bool, release: bool, aligned: bool) -> HResult {
+    use crate::interp::aux::{ClusterPartial, ClusterPass};
+    let active = ctx.warp.active;
+    let live = ctx.warp.live;
+    let res = ResourceId::Cluster { cluster: ctx.cta.cluster };
+    let k = wait as usize;
+    let cw = cluster_warp(ctx);
+    let wid = ctx.warp.id;
+    let entry = ctx.aux.cluster_partial.entry(wid).or_insert_with(|| ClusterPartial { gather: cluster::Gather { warp: cw, pending: None }, pass: [None, None] });
+    // Retry by lanes already gathered into a completed command of this kind.
+    if let Some(p) = entry.pass[k].filter(|p| p.waiting.and(active) == active) {
+        if wait && !p.passed {
+            let cmd = SyncCmd::Cluster(cluster::Cmd::Wait { warp: cw, mask: live.bits(), aligned: false });
+            match support::step(ctx, res, cmd)? {
+                Step::Blocked(r) => return Ok(Flow::Blocked(r)),
+                Step::Done(Outcome::Cluster(cluster::Outcome::Ready { gen })) => {
+                    support::protocol(ctx, live, vec![(res, cmd)], ProtoExtra::default());
+                    support::sync_event(ctx, p.lanes, SyncKind::Wait { obj: res, phase: gen, acquire: Some(true), scope: Some(Scope::Cluster) });
+                }
+                out => return Err(internal(ctx, "cluster wait", out)),
+            }
+        }
+        cluster_pass(ctx, k, active, true);
+        return Ok(Flow::Next);
+    }
+    let entry = ctx.aux.cluster_partial.get_mut(&wid).expect("entry");
+    // Gathered lanes whose command is not complete yet: keep waiting.
+    if entry.gather.pending.is_some_and(|p| p.wait == wait && p.lanes & active.bits() == active.bits()) {
+        return Ok(Flow::Blocked(res));
+    }
+    let out = cluster::gather(&mut entry.gather, cluster::GatherCmd::Execute { wait, mask: active.bits(), live: live.bits(), aligned })
+        .map_err(|e| support::sync_err(ctx, crate::sync::SyncError::Cluster(e)))?;
+    match out {
+        cluster::GatherOutcome::Wait => Ok(Flow::Blocked(res)),
+        cluster::GatherOutcome::Idle => Err(internal(ctx, "cluster gather", out)),
+        cluster::GatherOutcome::Complete { mask } => {
+            let lanes = WarpMask(mask);
+            ctx.aux.cluster_partial.get_mut(&wid).expect("entry").pass[k] = Some(ClusterPass { lanes, waiting: lanes, passed: false });
+            if !wait {
+                let cmd = SyncCmd::Cluster(cluster::Cmd::Arrive { warp: cw, mask: live.bits(), aligned: false });
+                let out = support::step(ctx, res, cmd)?;
+                let Step::Done(Outcome::Cluster(cluster::Outcome::Arrived { gen, .. })) = out else {
+                    return Err(internal(ctx, "cluster arrive", out));
+                };
+                let participants = ctx.launch.ctas_per_cluster() * ctx.launch.warps_per_cta();
+                let extra = ProtoExtra { counts: Counts { participants: Some(participants), ..Default::default() }, ..Default::default() };
+                support::protocol(ctx, live, vec![(res, cmd)], extra);
+                support::sync_event(ctx, lanes, SyncKind::Arrive { obj: res, phase: gen, release: Some(release), scope: Some(Scope::Cluster) });
+                cluster_pass(ctx, k, active, true);
+                return Ok(Flow::Next);
+            }
+            let cmd = SyncCmd::Cluster(cluster::Cmd::Wait { warp: cw, mask: live.bits(), aligned: false });
+            match support::step(ctx, res, cmd)? {
+                Step::Blocked(r) => Ok(Flow::Blocked(r)),
+                Step::Done(Outcome::Cluster(cluster::Outcome::Ready { gen })) => {
+                    support::protocol(ctx, live, vec![(res, cmd)], ProtoExtra::default());
+                    support::sync_event(ctx, lanes, SyncKind::Wait { obj: res, phase: gen, acquire: Some(true), scope: Some(Scope::Cluster) });
+                    cluster_pass(ctx, k, active, true);
+                    Ok(Flow::Next)
+                }
+                out => Err(internal(ctx, "cluster wait", out)),
+            }
+        }
+    }
+}
+
+/// Lanes `lanes` passed the gathered cluster command of kind `k`.
+fn cluster_pass(ctx: &mut ExecCtx<'_>, k: usize, lanes: WarpMask, passed: bool) {
+    let wid = ctx.warp.id;
+    if let Some(e) = ctx.aux.cluster_partial.get_mut(&wid) {
+        if let Some(p) = e.pass[k].as_mut() {
+            p.passed |= passed;
+            p.waiting = p.waiting.and_not(lanes);
+            if p.waiting.is_empty() {
+                e.pass[k] = None;
+            }
+        }
+        if e.pass.iter().all(Option::is_none) && e.gather.pending.is_none() {
+            ctx.aux.cluster_partial.remove(&wid);
+        }
     }
 }
 
@@ -1130,6 +1226,7 @@ pub fn clc_try_cancel(ctx: &mut ExecCtx<'_>, resp: Operand, mbar: Operand, multi
                 lut_b: None,
                 strong: None,
                 restricted: false,
+                preds: None,
             },
         );
     }

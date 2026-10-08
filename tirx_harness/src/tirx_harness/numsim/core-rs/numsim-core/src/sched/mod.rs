@@ -110,26 +110,8 @@ use crate::report::Finding;
 use crate::site::SiteId;
 use crate::sync::{async_group, cluster, mbarrier, setmaxnreg, Policy, ResourceId, ResourceInit, SyncCmd, SyncError, SyncTable};
 use crate::value::WarpMask;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
-
-/// Which executor runs warp slices.
-#[derive(Clone)]
-pub enum Backend {
-    Interp,
-    /// One compiled step function per kernel of the module (same order as
-    /// `Module::kernels`), produced by the codegen backend.
-    Codegen(Vec<WarpStepFn>),
-}
-
-impl fmt::Debug for Backend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Backend::Interp => f.write_str("Interp"),
-            Backend::Codegen(v) => write!(f, "Codegen({} kernels)", v.len()),
-        }
-    }
-}
 
 /// When pending async completions fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -266,7 +248,6 @@ pub enum RunError {
     InvalidProgram(String),
     MissingArg(String),
     BadArg { name: String, message: String },
-    Backend(String),
 }
 
 impl fmt::Display for RunError {
@@ -405,6 +386,10 @@ fn cta_coords(shape: &LaunchShape, id: u32, rank: u32) -> [u32; 3] {
     let r = [rank % cl[0], (rank / cl[0]) % cl[1], rank / (cl[0] * cl[1])];
     [cc[0] * cl[0] + r[0], cc[1] * cl[1] + r[1], cc[2] * cl[2] + r[2]]
 }
+
+/// Per declared region `(alloc, region start)`: the merged-history log
+/// position of each of a partition's local log entries (`merge_words`).
+type PositionMap = HashMap<(AllocId, u64), Vec<Option<usize>>>;
 
 /// One partition's work item in a parallel round: the partition, its arena
 /// shard and its result slot.
@@ -988,22 +973,8 @@ impl<'p> Scheduler<'p> {
     }
 
     /// Run the launch to completion / deadlock / error / budget.
-    pub fn run(&mut self, arena: &mut Arena, observer: &mut dyn Observer, backend: &Backend) -> RunStatus {
-        let step_fn: WarpStepFn = match backend {
-            Backend::Interp => step_warp,
-            Backend::Codegen(v) => match v.get(self.kernel_index as usize) {
-                Some(f) => *f,
-                None => {
-                    return RunStatus::Error(sched_error(
-                        ExecErrorKind::Internal,
-                        self.kernel_index,
-                        WarpId(0),
-                        SiteId::NONE,
-                        format!("codegen backend has no step function for kernel {}", self.kernel_index),
-                    ))
-                }
-            },
-        };
+    pub fn run(&mut self, arena: &mut Arena, observer: &mut dyn Observer) -> RunStatus {
+        let step_fn: WarpStepFn = step_warp;
         self.observing = observer.enabled();
         self.wants_history = self.observing && observer.wants_word_history();
         self.single = self.single_partition();
@@ -1166,7 +1137,7 @@ impl<'p> Scheduler<'p> {
                         kernel,
                         WarpId(u32::MAX),
                         SiteId::NONE,
-                        format!("panic in partition: {}", crate::codegen::rt::panic_message(&*payload)),
+                        format!("panic in partition: {}", crate::interp::panic_message(&*payload)),
                     ))
                 }));
             };
@@ -1215,12 +1186,13 @@ impl<'p> Scheduler<'p> {
                 arena.discard_shard(shard);
             }
         }
+        // Declared-word history: each partition's new entries, in the order
+        // its events are about to be delivered; buffered verdicts are
+        // renumbered to the merged (delivery-order) history first (W6-P1).
+        self.merge_words(&order);
         for &k in &order {
             self.partitions[k].events.replay(observer, &mut self.next_seq);
         }
-        // Declared-word history: each partition's new entries, in the same
-        // order its events were delivered.
-        self.merge_words(&order);
         let mut progress = false;
         let mut first_err = None;
         for (k, result) in results.iter_mut().enumerate().take(kept) {
@@ -1307,16 +1279,24 @@ impl<'p> Scheduler<'p> {
             return;
         }
         let base = self.launch_words.clone();
+        // Per partition (index into `order`): its table before the merge and
+        // the merged log position of each of its log entries, per region.
+        let mut locals: Vec<crate::interp::aux::WordTable> = Vec::with_capacity(order.len());
+        let mut maps: Vec<PositionMap> = Vec::with_capacity(order.len());
         let base_len = |alloc: &AllocId, span: ByteSpan| {
             base.regions.get(alloc).and_then(|rs| rs.iter().find(|r| r.span == span)).map(|r| r.log.len())
         };
         let mut changed = false;
         for &k in order {
             let local = &self.partitions[k].aux.words;
+            locals.push(local.clone());
+            let mut map: PositionMap = HashMap::new();
             for (alloc, regions) in &local.regions {
                 for r in regions {
                     let start = base_len(alloc, r.span);
+                    let mut m: Vec<Option<usize>> = (0..start.unwrap_or(0).min(r.log.len())).map(Some).collect();
                     if start == Some(r.log.len()) && !r.overflow {
+                        map.insert((*alloc, r.span.start), m);
                         continue;
                     }
                     changed = true;
@@ -1334,6 +1314,7 @@ impl<'p> Scheduler<'p> {
                             t.overflow = true;
                             break;
                         }
+                        m.push(Some(t.log.len()));
                         let mut merged = t.log.last().map(|e| e.1.clone()).unwrap_or_else(|| t.init.clone());
                         for sp in spans {
                             let lo = sp.start.max(r.span.start);
@@ -1346,10 +1327,62 @@ impl<'p> Scheduler<'p> {
                         t.log.push((spans.clone(), merged));
                     }
                     t.overflow |= r.overflow;
+                    map.insert((*alloc, r.span.start), m);
                 }
             }
+            maps.push(map);
         }
         if changed {
+            // Renumber each partition's buffered verdicts and rebase its
+            // verdict cache wherever the merged history interleaves other
+            // partitions' entries before its own.
+            for (oi, &k) in order.iter().enumerate() {
+                let (local, map) = (&locals[oi], &maps[oi]);
+                let shifted = map.values().any(|m| m.iter().enumerate().any(|(i, g)| *g != Some(i)));
+                if !shifted {
+                    continue;
+                }
+                let global = &self.launch_words;
+                let hist_map = |alloc: AllocId, span: ByteSpan, h: u32| -> Option<u32> {
+                    if h == 0 {
+                        return Some(0);
+                    }
+                    let lr = local.region(alloc, span)?;
+                    let gr = global.region(alloc, span)?;
+                    let m = map.get(&(alloc, lr.span.start))?;
+                    let lp = lr.log.iter().enumerate().filter(|(_, e)| e.0.iter().any(|s| s.overlaps(span))).nth(h as usize - 1)?.0;
+                    let gp = (*m.get(lp)?)?;
+                    Some(1 + gr.log[..gp].iter().filter(|e| e.0.iter().any(|s| s.overlaps(span))).count() as u32)
+                };
+                self.partitions[k].events.remap_verdicts(hist_map);
+                // Cached evaluations at or past the first foreign entry are
+                // dropped: the next poll evaluates the merged history there.
+                let mut first_foreign: HashMap<(AllocId, u64), usize> = HashMap::new();
+                for ((alloc, rs), m) in map {
+                    let mut images: Vec<usize> = m.iter().flatten().copied().collect();
+                    images.sort_unstable();
+                    let f = images.iter().enumerate().find(|(i, g)| *i != **g).map(|(i, _)| i).unwrap_or(images.len());
+                    first_foreign.insert((*alloc, *rs), f + 1);
+                }
+                for ((_, _, alloc, start), cache) in self.partitions[k].aux.verdicts.iter_mut() {
+                    let Some(r) = local.regions.get(alloc).and_then(|rs| rs.iter().find(|r| r.span.start <= *start && *start < r.span.end())) else { continue };
+                    let Some(&f) = first_foreign.get(&(*alloc, r.span.start)) else { continue };
+                    for l in 0..32 {
+                        if cache.evaluated[l] > f {
+                            cache.evaluated[l] = f;
+                        }
+                        if let Some(b) = cache.bits.get_mut(l) {
+                            for (wi, w) in b.iter_mut().enumerate() {
+                                for bit in 0..64 {
+                                    if wi * 64 + bit >= f {
+                                        *w &= !(1u64 << bit);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             for p in &mut self.partitions {
                 p.aux.words = self.launch_words.clone();
             }
@@ -1683,11 +1716,10 @@ pub fn run(
     module: &Module,
     inputs: &Inputs,
     observer: &mut dyn Observer,
-    backend: &Backend,
     seed: u64,
 ) -> Result<RunOutcome, RunError> {
     let config = RunConfig { seed, ..RunConfig::default() };
-    run_with_config(module, inputs, observer, backend, &config)
+    run_with_config(module, inputs, observer, &config)
 }
 
 /// Allocate (once per module run) the global allocation of buffer argument `name`.
@@ -1915,14 +1947,8 @@ pub fn run_with_config(
     module: &Module,
     inputs: &Inputs,
     observer: &mut dyn Observer,
-    backend: &Backend,
     config: &RunConfig,
 ) -> Result<RunOutcome, RunError> {
-    if let Backend::Codegen(v) = backend {
-        if v.len() != module.kernels.len() {
-            return Err(RunError::Backend(format!("{} step functions for {} kernels", v.len(), module.kernels.len())));
-        }
-    }
     let mut arena = Arena::new(config.validity);
     let mut globals: BTreeMap<String, AllocId> = BTreeMap::new();
     // Buffer slots bound to an `ArgValue::View`: (offset, len) in the
@@ -2014,7 +2040,7 @@ pub fn run_with_config(
         // Readonly-proxy contract, for kernels with `ld.global.nc` loads.
         let nc_loads = program.code.iter().any(|i| matches!(i, Instr::Load { mods, .. } | Instr::LoadAddr { mods, .. } if mods.nc));
         arena.set_readonly_tracking(program.requirements.readonly_proxy || nc_loads);
-        let status = sched.run(&mut arena, observer, backend);
+        let status = sched.run(&mut arena, observer);
         arena.set_readonly_tracking(false);
         outcome.stats.instrs += sched.stats.instrs;
         outcome.stats.rounds += sched.stats.rounds;

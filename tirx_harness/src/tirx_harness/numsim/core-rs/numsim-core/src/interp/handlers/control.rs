@@ -308,6 +308,16 @@ pub fn exit(ctx: &mut ExecCtx<'_>) -> HResult {
     if lanes.is_empty() {
         return Ok(Flow::Next);
     }
+    // Lanes exiting while other lanes of the warp are gathered at a
+    // non-`.aligned` cluster barrier (sync §4.6): fail closed.
+    if let Some(e) = ctx.aux.cluster_partial.get_mut(&ctx.warp.id) {
+        if e.gather.pending.is_some() {
+            let live = ctx.warp.live.and_not(lanes).bits();
+            if let Err(err) = crate::sync::cluster::gather(&mut e.gather, crate::sync::cluster::GatherCmd::Exit { live }) {
+                return Err(support::sync_err(ctx, crate::sync::SyncError::Cluster(err)));
+            }
+        }
+    }
     // Lanes exiting while other lanes of the warp wait at a non-`.aligned`
     // barrier for them: the Q3/Q5 fail-closed case.
     if let Some(p) = ctx.aux.named_partial.get(&ctx.warp.id).filter(|p| p.gen.is_none()) {

@@ -502,6 +502,7 @@ fn op_effect(ctx: &mut ExecCtx<'_>, effect: crate::interp::OpEffect, srcs: &[Ope
                         lut_b: None,
                         strong: None,
                         restricted: false,
+                        preds: None,
                     },
                 );
                 ctx.aux.groups.issue(gres, op);

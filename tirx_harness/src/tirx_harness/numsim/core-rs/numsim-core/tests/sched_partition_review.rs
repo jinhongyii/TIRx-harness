@@ -126,8 +126,7 @@ fn own_value_flags(ctas: u32) -> Scenario {
     };
     prog.validate().expect("valid");
     let inputs: Inputs = scenarios::inputs(vec![("flag", u32_buf([0])), ("out", u32_buf(vec![0; ctas as usize]))]);
-    let mut config = RunConfig::default();
-    config.loop_budget = 1 << 40;
+    let config = RunConfig { loop_budget: 1 << 40, ..RunConfig::default() };
     Scenario { name: "own_value_flags", module: Module::new(vec![prog]), inputs, config }
 }
 
@@ -147,7 +146,6 @@ fn run_seed(s: &Scenario, workers: usize, seed: u64, obs: &mut dyn Observer) -> 
 /// history (launch entries + its own write) and its indices no longer match
 /// the merged history, where partition 0's write comes first.
 #[test]
-#[ignore = "xfail: CONTRACT_REQUESTS W6-P1 (W2) -- verdicts computed on partition-local history"]
 fn same_round_writers_each_waiting_on_their_own_value() {
     for workers in [1usize, 8] {
         let s = own_value_flags(2);
@@ -337,9 +335,7 @@ fn overflow_writers(stores: [u32; 2], atoms: [u32; 2], finals: [u32; 2]) -> Scen
     };
     prog.validate().expect("valid");
     let inputs: Inputs = scenarios::inputs(vec![("flag", u32_buf([0])), ("ns", u32_buf(stores)), ("na", u32_buf(atoms)), ("fin", u32_buf(finals))]);
-    let mut config = RunConfig::default();
-    config.loop_budget = 1 << 40;
-    config.quantum = 1 << 30;
+    let config = RunConfig { loop_budget: 1 << 40, quantum: 1 << 30, ..RunConfig::default() };
     Scenario { name: "overflow_writers", module: Module::new(vec![prog]), inputs, config }
 }
 

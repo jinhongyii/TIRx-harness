@@ -303,6 +303,25 @@ pub struct NamedPartial {
     pub red: RedAcc,
 }
 
+/// See [`LaunchAux::cluster_partial`].
+#[derive(Clone, Debug)]
+pub struct ClusterPartial {
+    pub gather: crate::sync::cluster::Gather,
+    /// `[arrive, wait]`: the completed warp command's lanes still to pass.
+    pub pass: [Option<ClusterPass>; 2],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClusterPass {
+    /// Every gathered lane (the warp's one command).
+    pub lanes: crate::value::WarpMask,
+    /// Gathered lanes that have not passed yet.
+    pub waiting: crate::value::WarpMask,
+    /// `wait`: the warp's Wait completed (later groups pass without
+    /// stepping again).
+    pub passed: bool,
+}
+
 /// One setmaxnreg warpgroup rendezvous.
 #[derive(Clone, Debug, Default)]
 pub struct SetmaxRendezvous {
@@ -374,6 +393,8 @@ pub struct LaunchAux {
     pub tcgen_pairs: HashMap<(CtaId, u8), PairRendezvous>,
     /// Last tcgen05 pipelined op issued by each CTA (pipeline order).
     pub tcgen_last: HashMap<CtaId, AsyncId>,
+    /// Last pipelined tcgen05 op per issuing thread (`AsyncIssue.preds`).
+    pub tcgen_last_thread: HashMap<(WarpId, u8), AsyncId>,
     /// tcgen05 mma/cp ops per issuing thread issued since its last
     /// unrestricted commit.
     pub tcgen_uncommitted: HashMap<(WarpId, u8), Vec<AsyncId>>,
@@ -416,6 +437,10 @@ pub struct LaunchAux {
     /// Non-`.aligned` named-barrier arrival of a divergent warp in progress
     /// (lanes accumulate until every non-exited lane arrived; Q3 ruling).
     pub named_partial: HashMap<WarpId, NamedPartial>,
+    /// Non-`.aligned` `barrier.cluster` arrive/wait executed by part of a
+    /// warp (sync §4.6, Q11): the per-warp gather plus, per kind, the
+    /// gathered lanes still to pass the instruction.
+    pub cluster_partial: HashMap<WarpId, ClusterPartial>,
     /// Shared-A read ops (`MmaSharedARead`) per issuing thread that a
     /// `tcgen05.commit.sync_restrict` tracks (W5-10).
     pub tcgen_shared_reads: HashMap<(WarpId, u8), Vec<AsyncId>>,

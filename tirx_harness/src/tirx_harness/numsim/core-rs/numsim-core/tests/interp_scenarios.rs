@@ -5,13 +5,13 @@ use numsim_core::arena::ValidityPolicy;
 use numsim_core::interp::ExecErrorKind;
 use numsim_core::observe::{Observer, RecordingObserver, SyncEvent, SyncKind};
 use numsim_core::report::{FindingKind, Status};
-use numsim_core::sched::{self, Backend, CompletionPolicy, RunConfig, RunOutcome, RunStatus};
+use numsim_core::sched::{self, CompletionPolicy, RunConfig, RunOutcome, RunStatus};
 use numsim_core::sync::ResourceId;
 use numsim_core::testutil::scenarios::{self, Scenario};
 
 fn run_cfg(s: &Scenario, config: &RunConfig) -> RunOutcome {
     let mut obs = RecordingObserver::new();
-    sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, config).expect("run starts")
+    sched::run_with_config(&s.module, &s.inputs, &mut obs, config).expect("run starts")
 }
 
 fn run(s: &Scenario) -> RunOutcome {
@@ -214,7 +214,7 @@ impl Observer for History {
 fn wait_until_and_verdicts() {
     let s = scenarios::wait_until_flag();
     let mut h = History::default();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut h, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut h, &s.config).unwrap();
     completed(&o);
     assert_eq!(u32s(&o, "out"), vec![43; 32]);
     let v: Vec<_> = h
@@ -241,28 +241,13 @@ fn deterministic_for_fixed_seed() {
     for s in [scenarios::mbarrier_producer_consumer(), scenarios::named_barrier(), scenarios::cp_async_copy()] {
         let log = |seed| {
             let mut obs = RecordingObserver::new();
-            let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &RunConfig { seed, ..s.config.clone() }).unwrap();
+            let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &RunConfig { seed, ..s.config.clone() }).unwrap();
             (o, obs)
         };
         let (a, la) = log(5);
         let (b, lb) = log(5);
         assert_eq!(a, b);
         assert_eq!(la, lb, "{}", s.name);
-    }
-}
-
-#[test]
-fn codegen_backend_shape_uses_the_same_path() {
-    // `Backend::Codegen` with the interpreter's own step function must be
-    // indistinguishable from `Backend::Interp`.
-    for s in scenarios::all() {
-        let mut o1 = RecordingObserver::new();
-        let mut o2 = RecordingObserver::new();
-        let a = sched::run_with_config(&s.module, &s.inputs, &mut o1, &Backend::Interp, &s.config).unwrap();
-        let fns = vec![numsim_core::interp::step_warp as numsim_core::interp::WarpStepFn; s.module.kernels.len()];
-        let b = sched::run_with_config(&s.module, &s.inputs, &mut o2, &Backend::Codegen(fns), &s.config).unwrap();
-        assert_eq!(a, b, "{}", s.name);
-        assert_eq!(o1, o2, "{}", s.name);
     }
 }
 
@@ -299,20 +284,20 @@ fn workers_do_not_change_results_or_streams() {
     for s in scenarios::all() {
         for history in [false, true] {
             let mut t1 = Trace(Vec::new(), history);
-            let a = sched::run_with_config(&s.module, &s.inputs, &mut t1, &Backend::Interp, &s.config).unwrap();
+            let a = sched::run_with_config(&s.module, &s.inputs, &mut t1, &s.config).unwrap();
             for workers in [2, 8, 33] {
                 let mut tn = Trace(Vec::new(), history);
                 let cfg = RunConfig { workers, ..s.config.clone() };
-                let b = sched::run_with_config(&s.module, &s.inputs, &mut tn, &Backend::Interp, &cfg).unwrap();
+                let b = sched::run_with_config(&s.module, &s.inputs, &mut tn, &cfg).unwrap();
                 assert_eq!(a, b, "{} workers={workers}", s.name);
                 assert!(t1.0 == tn.0, "{} workers={workers}: observer streams differ", s.name);
             }
         }
         // NumSim (no observer) gives the same outputs as observed runs.
         let mut o = numsim_core::observe::NoopObserver;
-        let c = sched::run_with_config(&s.module, &s.inputs, &mut o, &Backend::Interp, &RunConfig { workers: 8, ..s.config.clone() }).unwrap();
+        let c = sched::run_with_config(&s.module, &s.inputs, &mut o, &RunConfig { workers: 8, ..s.config.clone() }).unwrap();
         let mut t = Trace(Vec::new(), true);
-        let d = sched::run_with_config(&s.module, &s.inputs, &mut t, &Backend::Interp, &s.config).unwrap();
+        let d = sched::run_with_config(&s.module, &s.inputs, &mut t, &s.config).unwrap();
         assert_eq!(c.outputs, d.outputs, "{}: observer changed outputs", s.name);
         assert_eq!(c.status, d.status, "{}", s.name);
     }
@@ -456,7 +441,7 @@ impl Observer for Events {
 
 fn run_events(s: &Scenario) -> (RunOutcome, Events) {
     let mut ev = Events::default();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut ev, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut ev, &s.config).unwrap();
     (o, ev)
 }
 
@@ -490,7 +475,7 @@ fn bulk_reductions_are_atomic_and_serialized() {
         let s = scenarios::bulk_reduce(6);
         let cfg = RunConfig { workers, ..s.config.clone() };
         let mut ev = Events::default();
-        let o = sched::run_with_config(&s.module, &s.inputs, &mut ev, &Backend::Interp, &cfg).unwrap();
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut ev, &cfg).unwrap();
         completed(&o);
         let want: Vec<u32> = (0..32u32).map(|i| i * 7 + (0..6u32).map(|c| c * 1000 + i).sum::<u32>()).collect();
         assert_eq!(u32s(&o, "acc"), want, "workers={workers}");
@@ -615,7 +600,7 @@ fn seeded_completion_latency_survives_rounds() {
 fn wait_group_read_covers_only_the_awaited_prefix() {
     let s = scenarios::bulk_wait_read();
     let mut log = RecordingObserver::new();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &s.config).unwrap();
     completed(&o);
     assert_eq!(u32s(&o, "out"), (0..32).collect::<Vec<_>>());
     let mut reads = 0;
@@ -636,7 +621,7 @@ fn wait_group_read_covers_only_the_awaited_prefix() {
 fn lane_split_mbarrier_events() {
     let s = scenarios::lane_split_mbarrier();
     let mut log = RecordingObserver::new();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &s.config).unwrap();
     completed(&o);
     let mut arrive_lanes: Vec<u32> = all_events(&log)
         .iter()
@@ -691,7 +676,7 @@ fn st_async_lands_as_generic_release() {
     }
     let s = scenarios::st_async_copy();
     let mut acc = Acc(Vec::new());
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut acc, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut acc, &s.config).unwrap();
     completed(&o);
     assert_eq!(u32s(&o, "out"), (100..132).collect::<Vec<_>>());
     assert_eq!(acc.0.len(), 32);
@@ -714,7 +699,7 @@ fn tcgen_st_after_dealloc_is_bad_address() {
 fn wait_until_predicate_reads_are_captured() {
     let s = scenarios::wait_until_pred_reads();
     let mut obs = (Trace(Vec::new(), true), RecordingObserver::new());
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).unwrap();
     completed(&o);
     let found = all_events(&obs.1).iter().any(|e| matches!(&e.kind, SyncKind::WaitVerdicts { pred_reads, .. } if !pred_reads.is_empty()));
     assert!(found, "no WaitVerdicts with pred_reads");
@@ -726,7 +711,7 @@ fn wait_until_predicate_reads_are_captured() {
 fn word_history_overflow_is_incomplete() {
     let s = scenarios::word_history_overflow(scenarios::MAX_HISTORY_PROBE);
     let mut t = Trace(Vec::new(), true);
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut t, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut t, &s.config).unwrap();
     match &o.status {
         RunStatus::Incomplete { reason, .. } => assert!(reason.contains("history"), "{reason}"),
         other => panic!("expected incomplete, got {other:?}"),
@@ -736,7 +721,7 @@ fn word_history_overflow_is_incomplete() {
     // Below the limit the verdict is computed.
     let s = scenarios::word_history_overflow(100);
     let mut t = Trace(Vec::new(), true);
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut t, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut t, &s.config).unwrap();
     completed(&o);
 }
 
@@ -774,7 +759,7 @@ fn cross_cluster_visibility_and_stream_cycles() {
         observed.diagnostics
     );
     let mut noop = numsim_core::observe::NoopObserver;
-    let plain = sched::run_with_config(&s.module, &s.inputs, &mut noop, &Backend::Interp, &s.config).unwrap();
+    let plain = sched::run_with_config(&s.module, &s.inputs, &mut noop, &s.config).unwrap();
     assert_eq!(plain.outputs, observed.outputs);
     assert!(plain.diagnostics.is_empty());
 }
@@ -818,7 +803,7 @@ fn observer_panic_with_workers_does_not_hang() {
         let s = scenarios::moe_synthetic(4, 1);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut b = Boom;
-            let _ = sched::run_with_config(&s.module, &s.inputs, &mut b, &Backend::Interp, &RunConfig { workers: 2, ..s.config.clone() });
+            let _ = sched::run_with_config(&s.module, &s.inputs, &mut b, &RunConfig { workers: 2, ..s.config.clone() });
         }));
         let _ = tx.send(r.is_err());
     });
@@ -859,14 +844,14 @@ fn param_aperture_reads_params_and_rejects_stores() {
 fn setmaxnreg_initial_budget_from_launch_bounds() {
     let s = scenarios::setmaxnreg_default_budget();
     let mut log = RecordingObserver::new();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &s.config).unwrap();
     completed(&o);
     assert!(log.other.iter().any(|e| format!("{:?}", e.kind).contains("Configure { count: 256 }")), "no Configure 256");
     // min_blocks_per_sm = 4 caps the base at 512 / 4 = 128 (< 256: still an increase).
     let mut s = scenarios::setmaxnreg_default_budget();
     s.module.kernels[0].topology.min_blocks_per_sm = Some(4);
     let mut log = RecordingObserver::new();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &s.config).unwrap();
     assert!(log.other.iter().any(|e| format!("{:?}", e.kind).contains("Configure { count: 128 }")), "no Configure 128");
     let _ = o;
 }
@@ -888,7 +873,7 @@ fn aliased_views_share_one_allocation() {
 fn hint_ops_engine_effects() {
     let s = scenarios::hint_ops(true);
     let mut log = RecordingObserver::new();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &s.config).unwrap();
     completed(&o);
     let issued = log.per_warp[0].iter().any(|e| matches!(&e.kind, SyncKind::Protocol { cmds, .. } if cmds.iter().any(|c| format!("{:?}", c.cmd).contains("Issue"))));
     assert!(issued, "applypriority.async.bulk did not join the bulk group");
@@ -970,7 +955,7 @@ fn planned_global_addresses_match_the_run() {
     let mut inputs = s.inputs.clone();
     inputs.args.insert("out".into(), sched::ArgValue::Buffer { bytes: vec![0; 16], valid: None });
     let plan = sched::plan_global_addresses(&module, &inputs).unwrap();
-    let o = sched::run_with_config(&module, &inputs, &mut numsim_core::observe::NoopObserver, &Backend::Interp, &RunConfig::default()).unwrap();
+    let o = sched::run_with_config(&module, &inputs, &mut numsim_core::observe::NoopObserver, &RunConfig::default()).unwrap();
     completed(&o);
     let got: Vec<u64> = o.outputs.buffers["out"].0.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
     assert_eq!(got, vec![plan["x"], plan["z"]]);
@@ -1137,7 +1122,7 @@ fn run_uses_its_own_fp_environment_and_restores_the_callers() {
     let inputs = scenarios::inputs(vec![("x", scenarios::f32_buf((0..32).map(|i| 1.0 + i as f32 * 0.1))), ("out", scenarios::f32_buf([0.0; 32]))]);
     let run_it = |workers| {
         let cfg = RunConfig { workers, ..RunConfig::default() };
-        sched::run_with_config(&module, &inputs, &mut numsim_core::observe::NoopObserver, &Backend::Interp, &cfg).unwrap().outputs
+        sched::run_with_config(&module, &inputs, &mut numsim_core::observe::NoopObserver, &cfg).unwrap().outputs
     };
     let reference = run_it(1);
     for workers in [1, 4] {
@@ -1168,7 +1153,7 @@ fn cp_async_mbarrier_arrive_publishes_copies() {
     for seed in 0..4 {
         let s = scenarios::cp_async_mbar_publish();
         let mut log = RecordingObserver::new();
-        let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &RunConfig { seed, ..s.config.clone() }).unwrap();
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &RunConfig { seed, ..s.config.clone() }).unwrap();
         completed(&o);
         assert_eq!(u32s(&o, "out"), (0..32).map(|i| i * 11 + 1).collect::<Vec<_>>());
         let published = all_events(&log)
@@ -1216,7 +1201,7 @@ fn tcgen_ldst_spans_are_exact_on_both_paths() {
         let s = scenarios::tcgen_ld_wide(store);
         let mut obs = TmemAccesses::default();
         let cfg = RunConfig { validity: ValidityPolicy::ZeroAndReport, ..s.config.clone() };
-        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &cfg).expect("run starts");
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &cfg).expect("run starts");
         completed(&o);
         obs.0
     };
@@ -1314,7 +1299,7 @@ fn sync_words_are_declared_per_element() {
     }
     let s = scenarios::polled_flag_words();
     let mut obs = Words::default();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).expect("run starts");
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).expect("run starts");
     completed(&o);
     assert_eq!(u32s(&o, "out"), (1..=32).collect::<Vec<u32>>());
     assert_eq!(obs.0.len(), 32, "{:?}", obs.0);
@@ -1380,7 +1365,7 @@ fn access_operand_names_the_pointer_operand() {
     use numsim_core::observe::{AccessKind, Actor};
     let s = scenarios::tma_load();
     let mut obs = Ops::default();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).expect("run starts");
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).expect("run starts");
     completed(&o);
     let async_writes: Vec<u8> = obs.0.iter().filter(|x| matches!(x.0, Actor::Async { .. }) && x.2 == AccessKind::Write && x.1 == Space::Shared).map(|x| x.3).collect();
     let async_reads: Vec<u8> = obs.0.iter().filter(|x| matches!(x.0, Actor::Async { .. }) && x.2 == AccessKind::Read && x.1 == Space::Global).map(|x| x.3).collect();
@@ -1450,7 +1435,7 @@ fn tcgen_alloc_address_store_is_one_warp_access() {
     }
     let s = scenarios::tcgen_alloc_lanes_read();
     let mut obs = Stores::default();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config)
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config)
         .expect("run starts");
     completed(&o);
     assert!(!obs.0.is_empty());
@@ -1612,7 +1597,7 @@ fn partitioned_wait_until_is_deterministic_across_workers() {
     for workers in [1usize, 8, 32] {
         let mut obs = StreamHash::default();
         let cfg = RunConfig { workers, ..s.config.clone() };
-        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &cfg).expect("run starts");
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &cfg).expect("run starts");
         completed(&o);
         assert_eq!(u32s(&o, "out"), (0..8).collect::<Vec<u32>>(), "workers {workers}");
         assert_eq!(u32s(&o, "flag"), vec![8]);
@@ -1631,9 +1616,9 @@ fn partitioned_wait_until_is_deterministic_across_workers() {
 #[test]
 fn partitioned_words_do_not_depend_on_the_observer() {
     let s = scenarios::wait_until_chain(8);
-    let plain = sched::run_with_config(&s.module, &s.inputs, &mut numsim_core::observe::NoopObserver, &Backend::Interp, &s.config).unwrap();
+    let plain = sched::run_with_config(&s.module, &s.inputs, &mut numsim_core::observe::NoopObserver, &s.config).unwrap();
     let mut obs = StreamHash::default();
-    let watched = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).unwrap();
+    let watched = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).unwrap();
     assert_eq!(plain.status, watched.status);
     assert_eq!(plain.outputs, watched.outputs);
     assert_eq!(plain.stats.rounds, watched.stats.rounds);
@@ -1648,7 +1633,7 @@ fn sub_byte_sync_words_fail_closed() {
     let flag = s.module.kernels[0].buffers.iter().position(|b| b.name == "flag").unwrap();
     s.module.kernels[0].buffers[flag].dtype = numsim_core::dtype::Ty::scalar(numsim_core::dtype::Dtype::E2M1);
     let mut obs = StreamHash::default();
-    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).unwrap();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).unwrap();
     match &o.status {
         RunStatus::Incomplete { reason, .. } => assert!(reason.contains("sync_words"), "{reason}"),
         other => panic!("expected incomplete, got {other:?}"),
@@ -1732,7 +1717,7 @@ fn wait_verdict_indices_follow_the_delivery_order() {
         let s = scenarios::atomic_count_wait(4);
         let mut obs = Check::default();
         let cfg = RunConfig { workers, ..s.config.clone() };
-        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &cfg).expect("run starts");
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &cfg).expect("run starts");
         completed(&o);
         assert_eq!(u32s(&o, "out"), vec![4; 4]);
         assert_eq!(obs.verdicts.len(), 4, "{:?}", obs.verdicts);
@@ -1740,4 +1725,20 @@ fn wait_verdict_indices_follow_the_delivery_order() {
             assert_eq!(observed, delivered, "verdict index vs delivered writes: {:?}", obs.verdicts);
         }
     }
+}
+
+/// W6 (sync §4.6, Q11): a non-aligned cluster arrive from the two arms of a
+/// divergent `If` is gathered into one warp arrival; a missing arm that
+/// exits instead is `PartialWarp`.
+#[test]
+fn cluster_barrier_gathers_partial_warp_arrivals() {
+    let o = run(&scenarios::cluster_partial_arrive(false));
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![2]);
+    let o = run(&scenarios::cluster_partial_arrive(true));
+    let RunStatus::Error(e) = &o.status else { panic!("{:?}", o.status) };
+    assert!(
+        matches!(e.kind, ExecErrorKind::Protocol(numsim_core::sync::SyncError::Cluster(numsim_core::sync::cluster::Error::PartialWarp { .. }))),
+        "{e:?}"
+    );
 }

@@ -75,6 +75,43 @@ pub(crate) struct EventBuffer {
 }
 
 impl EventBuffer {
+    /// Rewrite the buffered `WaitVerdicts` history indices (`observed` and
+    /// the `accepted` bits) through `map(alloc, span, local index)`: the
+    /// partition numbered them against its local history; the launch
+    /// history (delivery order) may have other partitions' same-round
+    /// entries before its own (W6-P1). Unmapped bits are dropped.
+    pub(crate) fn remap_verdicts(&mut self, mut map: impl FnMut(AllocId, ByteSpan, u32) -> Option<u32>) {
+        for e in &mut self.events {
+            let Event::Sync(se) = e else { continue };
+            let SyncKind::WaitVerdicts { alloc, span, verdicts, .. } = &mut se.kind else { continue };
+            for v in verdicts.iter_mut() {
+                if let Some(o) = map(*alloc, *span, v.observed) {
+                    v.observed = o;
+                }
+                let mut nb: Vec<u64> = Vec::new();
+                for (wi, &w) in v.accepted.iter().enumerate() {
+                    for b in 0..64 {
+                        if w >> b & 1 == 1 {
+                            if let Some(g) = map(*alloc, *span, (wi * 64 + b) as u32) {
+                                let g = g as usize;
+                                if nb.len() <= g / 64 {
+                                    nb.resize(g / 64 + 1, 0);
+                                }
+                                nb[g / 64] |= 1 << (g % 64);
+                            }
+                        }
+                    }
+                }
+                if nb.is_empty() {
+                    nb.push(0);
+                }
+                v.accepted = nb;
+            }
+        }
+    }
+}
+
+impl EventBuffer {
     /// Deliver and clear the buffered events; `Access::seq` is assigned
     /// here, in delivery order.
     pub fn replay(&mut self, observer: &mut dyn Observer, next_seq: &mut u64) {
@@ -257,7 +294,7 @@ impl Partition {
             counters,
             aux,
         };
-        let r = crate::codegen::rt::guard(&mut ctx, quantum, env.step_fn);
+        let r = crate::interp::guard_step(&mut ctx, quantum, env.step_fn);
         let progressed = ctx.counters.progress != prog0;
         (r, progressed)
     }
