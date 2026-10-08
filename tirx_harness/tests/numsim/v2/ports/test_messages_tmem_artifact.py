@@ -79,6 +79,12 @@ def _assert_bad_address(excinfo) -> None:
     stops = [d for d in error.diagnostics if d.get("status") in ("error", "incomplete")]
     assert stops and stops[0]["status"] == "error", error.diagnostics
     assert stops[0]["kind"] == "bad_address", stops[0]
+    # W11 (pin-message): the legacy text named the TMEM access; the diagnostic is
+    # anchored at the statement that touches the out-of-lease TMEM view.
+    span = stops[0]["source_span"]
+    with open(span["source_name"]) as handle:
+        line = handle.read().splitlines()[span["line"] - 1]
+    assert "tmem[" in line, (line, stops[0])
 
 
 def test_tmem_runtime_address_without_a_dynamic_lease_is_rejected():

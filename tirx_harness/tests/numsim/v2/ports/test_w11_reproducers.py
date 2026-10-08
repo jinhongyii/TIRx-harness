@@ -10,7 +10,7 @@ behaviour. All three are fixed and pass: W11-1 (``.pred`` bridge) and W11-3
 (committed dynamic shared size) in lowering, W11-2 (per-signature PTX op
 resolution) in the interpreter (W2 Rust scenario ``ptx_op_per_signature``).
 W11-4 (128-bit destination carrier of a narrow ``cvt``), uncovered by the W11-2
-fix, stays ``v2_gap``.
+fix, is fixed in oplib (W4 unit test ``integer_cvt_extends_into_every_carrier_width``).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -127,7 +127,6 @@ def narrow_cvt_into_b128_carrier(output: T.Buffer((2,), "uint64")):
         output[1] = bytes_[1]
 
 
-@v2_gap("W11-4: cvt.s8.s8 into an int128 carrier stops 'destination carrier B128 cannot hold a 8-bit result'")
 def test_w11_4_narrow_cvt_extends_into_a_128_bit_carrier():
     result = v2.Engine().run(v2.transpile(narrow_cvt_into_b128_carrier), {"output": np.zeros(2, np.uint64)})
     # Sign extension to the full register width, as legacy computes for int128/uint128 carriers.

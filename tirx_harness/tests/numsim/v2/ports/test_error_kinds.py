@@ -37,10 +37,37 @@ def _first_stop(error: v2.ExecutionError) -> dict:
     return stops[0]
 
 
-def _assert_stop(excinfo, kinds: Iterable[str], detail: str | None = None) -> None:
+def _anchor_text(stop: dict, source: str | None) -> str:
+    """Text of the source line the stopping diagnostic is anchored at."""
+    span = stop.get("source_span") or {}
+    assert span.get("kind") == "span", stop
+    line = span["line"]
+    if source is None:
+        with open(span["source_name"]) as handle:
+            lines = handle.read().splitlines()
+    else:
+        lines = source.splitlines()
+    return lines[line - 1]
+
+
+def _assert_stop(
+    excinfo,
+    kinds: Iterable[str],
+    detail: str | None = None,
+    *,
+    anchor: str | None = None,
+    source: str | None = None,
+    lanes: int | None = None,
+    warp: int | None = None,
+) -> None:
     """``ExecutionError`` whose stopping diagnostic is an ``error`` of one of
     ``kinds``; ``detail`` is the structured variant name the kind carries
-    (e.g. ``RegPool(MissingWarpgroupSync {..})``)."""
+    (e.g. ``RegPool(MissingWarpgroupSync {..})``).
+
+    W11 (pin-message): the legacy text also carried *where* the fault is, so
+    ``anchor`` checks the source line of the diagnostic's ``source_span``
+    (``source`` is the TVMScript text for ``from_source`` kernels), and
+    ``lanes`` / ``warp`` check the structured faulting lanes and warp."""
 
     error = excinfo.value
     assert isinstance(error, v2.ExecutionError), type(error)
@@ -49,6 +76,12 @@ def _assert_stop(excinfo, kinds: Iterable[str], detail: str | None = None) -> No
     assert stop["kind"] in set(kinds), stop
     if detail is not None:
         assert detail in str(stop.get("message", "")), stop
+    if anchor is not None:
+        assert anchor in _anchor_text(stop, source), (anchor, stop)
+    if lanes is not None:
+        assert stop.get("lanes") == f"WarpMask(0x{lanes:08x})", stop
+    if warp is not None:
+        assert stop.get("warp") == warp, stop
 
 
 def _run(kernel, inputs, **kwargs):
@@ -126,7 +159,7 @@ def test_warp_collectives_reject_invalid_participant_contracts():
                 "output": output,
             },
         )
-    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"}, anchor="T.cuda.ballot_sync", lanes=0xFFFFFFFF)
 
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(
@@ -137,7 +170,7 @@ def test_warp_collectives_reject_invalid_participant_contracts():
                 "output": output,
             },
         )
-    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"}, anchor="T.cuda.ballot_sync", lanes=0xFFFFFFFF)
 
     inconsistent = np.full(32, np.uint32(0xFFFFFFFF), dtype=np.uint32)
     inconsistent[7] = np.uint32(0xFFFFFFFE)
@@ -146,7 +179,7 @@ def test_warp_collectives_reject_invalid_participant_contracts():
             module,
             {"participant_masks": inconsistent, "active_count": active_count, "output": output},
         )
-    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"}, anchor="T.cuda.ballot_sync", lanes=0xFFFFFFFF)
 
     active_count[0] = np.int32(16)
     with pytest.raises(NumSimExecutionError) as excinfo:
@@ -158,7 +191,7 @@ def test_warp_collectives_reject_invalid_participant_contracts():
                 "output": output,
             },
         )
-    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"}, anchor="T.cuda.ballot_sync", lanes=0x0000FFFF)
 
 
 # -- tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py ----------
@@ -198,7 +231,7 @@ def test_if_then_else_mixed_pointer_spaces_fail_closed():
                 "output": np.zeros(32, dtype=np.uint32),
             },
         )
-    _assert_stop(excinfo, {"bad_address"})
+    _assert_stop(excinfo, {"bad_address"}, anchor="T.ptx.ld.global_", lanes=0x2)
 
 
 # -- tests/numsim/runtime/test_memory_coverage_next.py -----------------------
@@ -211,8 +244,7 @@ def test_ldu_rejects_nonuniform_or_misaligned_vector(address):
     Legacy accepted either message ("lane-varying" or the 8-byte alignment
     rule) for either param; v2 kinds ``divergence`` or ``misaligned``."""
 
-    kernel = tvm.script.from_source(
-        f"""
+    kernel_source = f"""
 @T.prim_func
 def invalid(source: T.Buffer((64,), "uint32")):
     T.device_entry()
@@ -220,12 +252,18 @@ def invalid(source: T.Buffer((64,), "uint32")):
     lane = T.lane_id([32])
     out = T.alloc_local((2,), "uint32")
     T.ptx.ldu.global_.v2.u32(out[0], out[1], {address})
-""",
-        {"T": T},
-    )
+"""
+    kernel = tvm.script.from_source(kernel_source, {"T": T})
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(v2.transpile(kernel), {"source": np.zeros(64, np.uint32)})
-    _assert_stop(excinfo, {"divergence", "warp_collective_divergence", "misaligned"})
+    # The first faulting lane: lane 1 (byte offset 4) for ptr_to([lane]), lane 0 for ptr_to([1]).
+    _assert_stop(
+        excinfo,
+        {"divergence", "warp_collective_divergence", "misaligned"},
+        anchor="T.ptx.ldu.global_",
+        source=kernel_source,
+        lanes=0x2 if "lane" in address else 0x1,
+    )
 
 
 # -- tests/numsim/runtime/test_ordering_calls.py -----------------------------
@@ -261,7 +299,7 @@ def test_setmaxnreg_requires_explicit_warpgroup_sync_before_a_later_call():
     module = v2.transpile(setmaxnreg_without_intervening_sync)
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(module, {"output": np.zeros(1, dtype=np.int32)})
-    _assert_stop(excinfo, {"sync_protocol_error"}, detail="MissingWarpgroupSync")
+    _assert_stop(excinfo, {"sync_protocol_error"}, detail="MissingWarpgroupSync", anchor="setmaxnreg.dec", warp=0)
 
 
 def test_setmaxnreg_rejects_warp_disagreement_within_one_occurrence():
@@ -270,7 +308,7 @@ def test_setmaxnreg_rejects_warp_disagreement_within_one_occurrence():
     module = v2.transpile(setmaxnreg_warp_disagreement)
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(module, {"output": np.zeros(1, dtype=np.int32)})
-    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"})
+    _assert_stop(excinfo, {"divergence", "warp_collective_divergence"}, anchor="setmaxnreg.inc", warp=1)
 
 
 # -- tests/numsim/runtime/test_packed_float4_global_views.py -----------------
@@ -355,7 +393,7 @@ def test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane(kernel, 
             },
             outputs=("output",),
         )
-    _assert_stop(excinfo, {"invalid_operand"})
+    _assert_stop(excinfo, {"invalid_operand"}, anchor="T.ptx.div" if symbol == "/" else "T.ptx.rem")
 
 
 @pytest.mark.parametrize(
@@ -376,7 +414,7 @@ def test_ptx_signed_division_overflow_fails_closed(kernel, symbol):
             },
             outputs=("output",),
         )
-    _assert_stop(excinfo, {"invalid_operand"})
+    _assert_stop(excinfo, {"invalid_operand"}, anchor="T.ptx.div" if symbol == "/" else "T.ptx.rem")
 
 
 # -- tests/numsim/runtime/test_scalar_control.py -----------------------------
@@ -439,7 +477,7 @@ def test_mbarrier_state_token_rejects_a_generation_older_than_the_previous_one()
     module = v2.transpile(mbarrier_stale_state_token)
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(module, {"output": np.zeros(4, dtype=np.uint32)})
-    _assert_stop(excinfo, {"sync_protocol_error"}, detail="InvalidStateToken")
+    _assert_stop(excinfo, {"sync_protocol_error"}, detail="InvalidStateToken", anchor="mbarrier.try_wait", lanes=0x1)
 
 
 def test_integer_trap_predicate_uses_cpp_truth_conversion():
@@ -455,7 +493,7 @@ def test_integer_trap_predicate_uses_cpp_truth_conversion():
         v2.Engine().run(
             module, {"flag": np.array([0], dtype=np.int32), "output": np.zeros(32, dtype=np.int32)}
         )
-    _assert_stop(excinfo, {"trap"})
+    _assert_stop(excinfo, {"trap"}, anchor="trap_when_assert_failed")
 
 
 @pytest.mark.parametrize("predicate", [np.float32(0.0), np.float32(-0.0)])
@@ -470,7 +508,7 @@ def test_floating_trap_rejects_signed_zero(predicate):
                 "output": np.zeros(32, dtype=np.int32),
             },
         )
-    _assert_stop(excinfo, {"trap"})
+    _assert_stop(excinfo, {"trap"}, anchor="trap_when_assert_failed")
 
 
 def test_cuda_pointer_helpers_check_typed_dereference_alignment():
@@ -482,7 +520,7 @@ def test_cuda_pointer_helpers_check_typed_dereference_alignment():
             module,
             {"source": np.arange(32, dtype=np.uint8), "destination": np.zeros(32, dtype=np.uint8)},
         )
-    _assert_stop(excinfo, {"misaligned"})
+    _assert_stop(excinfo, {"misaligned"}, anchor="float22half2", lanes=0x1)
 
 
 # -- tests/numsim/runtime/test_wait_until.py ---------------------------------
@@ -515,4 +553,4 @@ def test_a_candidate_index_outside_its_local_table_is_an_execution_error():
 
     with pytest.raises(NumSimExecutionError) as excinfo:
         v2.Engine().run(module, inputs)
-    _assert_stop(excinfo, {"out_of_bounds"})
+    _assert_stop(excinfo, {"out_of_bounds"}, anchor="wait_until", source=_INDEXED_PREDICATE, lanes=0x1)

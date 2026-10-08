@@ -3,7 +3,8 @@
 
 - Signed ``cvt`` into a wider carrier (e.g. ``cvt.s8.s8`` into ``int16``/``int32``)
   sign-extends; v2 used to resolve each PTX op with its first use's operand
-  types (CONTRACT_REQUESTS "W11-other-assertion" W11-2, fixed by W2).
+  types (CONTRACT_REQUESTS "W11-other-assertion" W11-2, fixed by W2), and
+  extends into 128-bit carriers (W11-4, fixed by W4).
 - Mode 1 (``pred=lane % 2 == 0`` without ``preserve_dst``): the odd (off) lanes
   keep the 0x5A fill instead of legacy's 0, numsim-behaviour-deltas P8 (TVM's
   write-only binding leaves the GPU value unspecified).
@@ -20,7 +21,7 @@ import tvm
 from tvm.backend.cuda.ptx.table import TABLE, mods, operand_dtypes, tokens_for
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -141,7 +142,6 @@ def _types(kind):
 
 
 @pytest.mark.parametrize("kind", ("u", "s", "f"))
-@v2_gap("W11-4: 128-bit destination carriers (int128/uint128) of a narrow cvt stop as unsupported")
 def test_cvt_carriers_truncate_extend_and_gate_reads(kind):
     """Delta copy; see the module docstring (P8 for mode 1 off lanes)."""
     for ptx_type in _types(kind):
