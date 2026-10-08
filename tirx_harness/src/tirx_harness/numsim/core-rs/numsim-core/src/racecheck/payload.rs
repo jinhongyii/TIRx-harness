@@ -361,11 +361,49 @@ fn convert_incomplete(i: &Incomplete, count: u64, kernel: u32) -> Finding {
 }
 
 /// One `report::Report` per launch.
+/// Legacy `append_report_advisories`: `alias_stale_read` advisories of one
+/// static (reader name, writer name, space, reader site, writer site) pair
+/// collapse to one representative, the smallest (reader warp, epoch, writer
+/// warp, epoch, allocation), keeping its own overlaps and the summed
+/// occurrence count.
+fn merge_alias(fs: &[RaceFinding], lr: &LaunchResult) -> Vec<RaceFinding> {
+    use std::collections::HashMap;
+    let mut out: Vec<RaceFinding> = Vec::with_capacity(fs.len());
+    let mut rep: HashMap<(Option<String>, Option<String>, Option<Space>, u32, u32), usize> = HashMap::new();
+    for f in fs {
+        let (RK::Advisory { kind: AdvisoryKind::AliasStaleRead }, Some(p), Some(c)) = (&f.kind, &f.prior, &f.current) else {
+            out.push(f.clone());
+            continue;
+        };
+        let name = |s| lr.buffer_of_site.get(&s).cloned();
+        let key = (name(c.site), name(p.site), lr.buffers.get(&f.alloc).map(|(_, s)| *s), c.site.0, p.site.0);
+        let order = |f: &RaceFinding| {
+            let (p, c) = (f.prior.as_ref().unwrap(), f.current.as_ref().unwrap());
+            (c.warp, c.epoch, p.warp, p.epoch, f.alloc.0)
+        };
+        match rep.get(&key) {
+            Some(&i) => {
+                let total = out[i].occurrences + f.occurrences;
+                if order(f) < order(&out[i]) {
+                    out[i] = f.clone();
+                }
+                out[i].occurrences = total;
+            }
+            None => {
+                rep.insert(key, out.len());
+                out.push(f.clone());
+            }
+        }
+    }
+    out
+}
+
 pub fn reports(obs: &RaceObserver) -> Vec<Report> {
     obs.launches
         .iter()
         .map(|lr| {
-            let mut findings: Vec<Finding> = lr.report.findings.iter().map(|f| convert(f, lr)).collect();
+            let merged = merge_alias(&lr.report.findings, lr);
+            let mut findings: Vec<Finding> = merged.iter().map(|f| convert(f, lr)).collect();
             findings.extend(
                 lr.report.incomplete.iter().zip(lr.report.incomplete_counts.iter()).map(|(i, n)| convert_incomplete(i, *n, lr.kernel)),
             );

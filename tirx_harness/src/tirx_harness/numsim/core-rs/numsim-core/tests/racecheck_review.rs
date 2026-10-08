@@ -434,3 +434,26 @@ fn alias_stale_read_overlaps_every_occurrence() {
     let o: Vec<(u64, u64)> = a["overlaps"].as_array().unwrap().iter().map(|s| (s["byte_offset"].as_u64().unwrap(), s["byte_end"].as_u64().unwrap())).collect();
     assert_eq!(o, vec![(0, 2), (8, 10), (16, 18), (24, 26)]);
 }
+
+/// V2C-18 (legacy `AliasTracker`): the advisory covers exactly the bytes
+/// whose last named writer used another name; a later write through the
+/// reader's own name removes its bytes; one advisory per (reader, writer)
+/// name and site pair.
+#[test]
+fn alias_stale_read_per_byte_last_writer() {
+    use numsim_core::site::SiteId;
+    let mut k = K::one_warp();
+    let lanes: Vec<u8> = (0..8).collect();
+    // epoch 1: s8 stores through W to bytes 0..8; epoch 2: R rewrites 4..8;
+    // epoch 3: u32 loads through R of 0..8.
+    k.inst(0, &lanes, PLAIN_ST, |l| (SMEM, u64::from(l)..u64::from(l) + 1));
+    k.a(0, 0, PLAIN_ST, SMEM, 4..8);
+    k.inst(0, &[0, 1], PLAIN_LD, |l| (SMEM, u64::from(l) * 4..u64::from(l) * 4 + 4));
+    k.site_buffers = vec![(SiteId(1), "W.s8".into()), (SiteId(2), "R.u32".into()), (SiteId(3), "R.u32".into())];
+    let p = serialize(&report(&k.observe()));
+    let adv: Vec<_> = p["advisories"].as_array().unwrap().iter().filter(|a| a["kind"] == "alias_stale_read").collect();
+    assert_eq!(adv.len(), 1, "{p:#}");
+    let o: Vec<(u64, u64)> = adv[0]["overlaps"].as_array().unwrap().iter().map(|s| (s["byte_offset"].as_u64().unwrap(), s["byte_end"].as_u64().unwrap())).collect();
+    assert_eq!(o, vec![(0, 4)]);
+}
+

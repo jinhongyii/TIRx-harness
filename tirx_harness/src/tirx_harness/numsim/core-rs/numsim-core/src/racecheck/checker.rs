@@ -484,6 +484,17 @@ struct Word {
 }
 
 /// Who performs the access being checked.
+/// One segment of the alias tracker: `[start, end)` last written through
+/// logical name `buf` by `w` (warp `warp`, site `site`).
+#[derive(Clone)]
+struct AliasSeg {
+    end: u64,
+    buf: Arc<str>,
+    warp: WarpId,
+    site: SiteId,
+    w: Witness,
+}
+
 #[derive(Clone, Copy)]
 enum Cur {
     Lane { w: usize, lane: u8, epoch: Epoch },
@@ -510,6 +521,12 @@ pub struct Checker {
     /// the warp's next event.
     poll_stash: HashMap<WarpId, Vec<PollStash>>,
     advisory_dedup: HashMap<(AdvisoryKind, AllocId, SiteId), usize>,
+    /// `alias_stale_read` (legacy alias tracker): per allocation, the last
+    /// named warp-lane writer of every byte, keyed by segment start.
+    alias_writers: HashMap<AllocId, std::collections::BTreeMap<u64, AliasSeg>>,
+    /// One advisory per (alloc, reader name, writer name, reader warp/site,
+    /// writer warp/site), as legacy keyed them.
+    alias_dedup: HashMap<(AllocId, Arc<str>, Arc<str>, WarpId, SiteId, WarpId, SiteId), usize>,
     /// Logical buffer name per site (`SiteInfo::buffer`), for
     /// `AliasStaleRead`. Empty = advisory off.
     pub site_buffer: HashMap<SiteId, Arc<str>>,
@@ -606,6 +623,8 @@ impl Checker {
             words: HashMap::new(),
             poll_stash: HashMap::new(),
             advisory_dedup: HashMap::new(),
+            alias_writers: HashMap::new(),
+            alias_dedup: HashMap::new(),
             site_buffer: HashMap::new(),
             wide: WideSpans::default(),
             report: Report::default(),
@@ -943,6 +962,79 @@ impl Checker {
         }
     }
 
+    /// Legacy `alias_stale_read` (engine-rs `AliasTracker`): a warp-lane
+    /// read through logical name R of bytes whose last named warp-lane
+    /// writer used another name W is a review advisory over exactly those
+    /// bytes (adjacent bytes of one writer coalesce). Unnamed accesses
+    /// neither report nor overwrite; async copies carry no name. No
+    /// ordering requirement: the advisory is about logical identity.
+    fn alias_access(&mut self, alloc: AllocId, r: Range<u64>, site: SiteId, warp: WarpId, cw: &Witness) {
+        let Some(buf) = self.site_buffer.get(&site).filter(|b| !b.is_empty()).cloned() else {
+            return;
+        };
+        if cw.kind() != AccessKind::Write {
+            let mut hits: Vec<(Range<u64>, AliasSeg)> = Vec::new();
+            if let Some(segs) = self.alias_writers.get(&alloc) {
+                let first = segs.range(..r.start).next_back().filter(|(_, s)| s.end > r.start).map(|(k, _)| *k).unwrap_or(r.start);
+                for (&st, seg) in segs.range(first..r.end) {
+                    if seg.buf == buf {
+                        continue;
+                    }
+                    let o = st.max(r.start)..seg.end.min(r.end);
+                    match hits.last_mut() {
+                        Some((h, prev)) if h.end == o.start && prev.w == seg.w && prev.buf == seg.buf => h.end = o.end,
+                        _ => hits.push((o, seg.clone())),
+                    }
+                }
+            }
+            for (o, seg) in hits {
+                let key = (alloc, buf.clone(), seg.buf.clone(), warp, site, seg.warp, seg.site);
+                if let Some(&i) = self.alias_dedup.get(&key) {
+                    self.bump(i, &o);
+                    continue;
+                }
+                let mut prior = self.info(&seg.w);
+                prior.site = seg.site;
+                let f = Finding {
+                    kind: FindingKind::Advisory { kind: AdvisoryKind::AliasStaleRead },
+                    severity: Severity::Review,
+                    alloc,
+                    bytes: o,
+                    prior: Some(prior),
+                    current: Some(self.info(cw)),
+                    occurrences: 1,
+                    tmem: None,
+                    spans: Vec::new(),
+                };
+                if let Some(i) = self.push_finding(f) {
+                    self.alias_dedup.insert(key, i);
+                }
+            }
+        }
+        if cw.writes() {
+            let segs = self.alias_writers.entry(alloc).or_default();
+            // Split the segment straddling r.start, drop covered ones, keep
+            // the tail of one straddling r.end.
+            if let Some((&st, seg)) = segs.range(..r.start).next_back() {
+                if seg.end > r.start {
+                    let tail = seg.clone();
+                    segs.get_mut(&st).unwrap().end = r.start;
+                    if tail.end > r.end {
+                        segs.insert(r.end, tail);
+                    }
+                }
+            }
+            let inside: Vec<u64> = segs.range(r.start..r.end).map(|(k, _)| *k).collect();
+            for k in inside {
+                let seg = segs.remove(&k).unwrap();
+                if seg.end > r.end {
+                    segs.insert(r.end, seg);
+                }
+            }
+            segs.insert(r.start, AliasSeg { end: r.end, buf, warp, site, w: *cw });
+        }
+    }
+
     fn report_race(&mut self, alloc: AllocId, bytes: Range<u64>, cur: Cur, prior: &Witness, cw: &Witness) {
         self.report_race_with(alloc, bytes, cur, prior, cw, None)
     }
@@ -1184,23 +1276,6 @@ impl Checker {
                         check(&p.w);
                     }
                 }
-                // alias_stale_read: a read through one logical name of bytes
-                // last written (and ordered before it) through another name
-                // of the same pooled allocation.
-                // Legacy rule: thread (generic) reads against thread writes
-                // only; async copies carry no logical buffer of their own.
-                if !writes && alias_space && matches!(cur, Cur::Lane { .. }) {
-                    if let Some(last) = cell.writes.last().filter(|e| e.w.stamp.actor() < this.topo.num_warps()) {
-                        if this.ordered(cur, &last.w, a.proxy) {
-                            if let (Some(rb), Some(wb)) = (this.site_buffer.get(&a.site), this.site_buffer.get(&this.site_of(&last.w))) {
-                                // An unnamed buffer has no logical identity to compare.
-                                if rb != wb && !rb.is_empty() && !wb.is_empty() {
-                                    advisories.push((overlap(last.w.span(wide), &seg), last.w, AdvisoryKind::AliasStaleRead));
-                                }
-                            }
-                        }
-                    }
-                }
                 // The write this access reads from: the latest one that is
                 // not a sibling lane of the same instruction.
                 let prev = cell
@@ -1261,6 +1336,11 @@ impl Checker {
         }
         for (bytes, prior, kind) in advisories {
             self.report_advisory(a.alloc, bytes, &prior, &w, kind);
+        }
+        if alias_space {
+            if let Cur::Lane { w: wi, .. } = cur {
+                self.alias_access(a.alloc, a.range.clone(), a.site, wi as WarpId, &w);
+            }
         }
         if !word_rels.is_empty() {
             let is_async = matches!(cur, Cur::Async { .. });
@@ -1418,6 +1498,7 @@ impl Checker {
                     });
             }
             SyncEvent::AllocEnd { alloc } => {
+                self.alias_writers.remove(&alloc);
                 // Shared memory ends only at CTA exit, and the hardware keeps
                 // it until the CTA's outstanding bulk copies are done (ruling
                 // S7: no final `cp.async.bulk.wait_group` is not an error).
