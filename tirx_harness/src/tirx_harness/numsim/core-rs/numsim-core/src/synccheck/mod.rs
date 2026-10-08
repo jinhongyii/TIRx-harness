@@ -162,6 +162,20 @@ fn truncation(log: &RecordingObserver) -> Option<String> {
     None
 }
 
+/// Phase A protocol errors (`ProtocolStatus::Failed`) recorded in the log.
+fn protocol_failures(log: &RecordingObserver) -> Vec<program::PhaseAFailure> {
+    log.per_warp
+        .iter()
+        .flatten()
+        .filter_map(|event| match &event.kind {
+            crate::observe::SyncKind::Protocol { status: crate::observe::ProtocolStatus::Failed(error), .. } => {
+                Some(program::PhaseAFailure { event: event.clone(), error: Some(error.clone()) })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// One [`Report`] per launch in the log (never merged).
 pub fn check_launches(log: &RecordingObserver, config: &SynccheckConfig) -> Vec<Report> {
     split_launches(log).into_iter().map(|(_, l)| check(&l, config)).collect()
@@ -188,7 +202,15 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
     let (program, failures) = match program::build(log) {
         Ok(x) => x,
         Err(detail) => {
-            out.program_build(detail);
+            // A protocol error the engine hit stops the launch, so the log
+            // can be structurally incomplete (e.g. collective records of
+            // warps that never got there): the error is the finding.
+            let errors = protocol_failures(log);
+            if errors.is_empty() {
+                out.program_build(detail);
+            } else {
+                out.phase_a(&errors);
+            }
             return out.finish(started);
         }
     };

@@ -845,18 +845,25 @@ fn wall_time_limit_is_incomplete() {
 /// states, the symmetry reduction keeps it linear.
 #[test]
 fn per_lane_cp_async_arrivals_stay_small() {
-    let waiters = 8u32;
+    let waiters = 2u32;
     let mut log = LogBuilder::new();
     log.cmd(0, 1, mbar(0, 0), init(32));
+    log.cmd(0, 1, mbar(0, 8), init(32));
     cta_sync(&mut log, 0, &(0..=waiters).collect::<Vec<_>>(), waiters + 1);
     let groups = (0..32u8).map(|l| async_group_res(0, l, async_group::Domain::CpAsync)).collect::<Vec<_>>();
-    log.cmds(0, 2, groups.iter().map(|&g| (g, group(async_group::Cmd::Issue))).collect());
-    let targets = (0..32).map(|_| AsyncTarget { res: mbar(0, 0), bytes: 0, arrivals: 1 }).collect();
-    log.event(0, 3, groups.iter().map(|&g| (g, group(async_group::Cmd::ArriveOn))).collect(), targets, None, None, numsim_core::observe::ProtocolStatus::Committed);
-    for w in 1..=waiters {
-        log.cmd(w, 4, mbar(0, 0), wait(0));
+    for (site, bar) in [(2, mbar(0, 0)), (4, mbar(0, 8))] {
+        log.cmds(0, site, groups.iter().map(|&g| (g, group(async_group::Cmd::Issue))).collect());
+        let targets = (0..32).map(|_| AsyncTarget { res: bar, bytes: 0, arrivals: 1 }).collect();
+        log.event(0, site + 1, groups.iter().map(|&g| (g, group(async_group::Cmd::ArriveOn))).collect(), targets, None, None, numsim_core::observe::ProtocolStatus::Committed);
     }
+    for w in 1..=waiters {
+        log.cmd(w, 6, mbar(0, 0), wait(0));
+        log.cmd(w, 7, mbar(0, 8), wait(0));
+    }
+    // Count budgets only (no wall-time limit): deterministic under load.
+    // 2,541 states with the symmetry rule; the 20k limit without it.
     let cfg = SynccheckConfig { certificates: false, state_budget: 20_000, ..config(cta(waiters + 1)) };
+    assert_eq!(cfg.limits.max_wall_time_ms, u64::MAX);
     let r = check(&log.build(), &cfg);
     assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
     assert!(stat(&r, "visited_state_count") < 5_000, "{:?}", r.coverage);
@@ -898,4 +905,36 @@ fn tcgen_commits_land_in_issue_order() {
     let cfg = SynccheckConfig { certificates: false, ..config(cta(2)) };
     let r = check(&log.build(), &cfg);
     assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+}
+
+/// A protocol error that stopped the launch is the finding even when the
+/// truncated log cannot be built (a collective whose other members never
+/// recorded it): no extra `fixed_sync_program_build` incomplete
+/// (`sparse_flashmla_decode_head64`, sync delta B1).
+#[test]
+fn protocol_error_wins_over_unbuildable_truncated_log() {
+    use numsim_core::observe::{Collective, ProtocolStatus, WarpId};
+    let mut log = LogBuilder::new();
+    log.failed(0, 1, named_bar(0, 1), bar_sync(0, 64), SyncError::Named(named::Error::PartialWarp { mask: 0xffff_fffe, live: FULL_MASK }));
+    let c = Collective { id: 3, participants: vec![WarpId(1), WarpId(2)] };
+    log.event(1, 2, vec![(mbar(0, 0), init(1))], Vec::new(), None, Some(c), ProtocolStatus::Committed);
+    let r = check(&log.build(), &config(cta(3)));
+    let p = serialize(&r);
+    assert_eq!(r.verdict, Verdict::Error, "{p:#}");
+    assert!(p["incomplete"].as_array().is_none_or(|a| a.is_empty()), "{p:#}");
+}
+
+/// Bulk (TMA / cp.async.bulk) issues are committed implicitly at exit, even
+/// though the engine does not log that `Exit` command: no exit lint
+/// (`flash_mla_sparse_fwd`, `bsa_backward_blk128`, `sparse_flashmla_prefill_head64_phase1`).
+/// Uncommitted `cp.async` stays the `UncommittedAtExit` review lint (delta A3).
+#[test]
+fn uncommitted_bulk_issue_at_exit_is_not_a_lint() {
+    for (domain, verdict) in [(async_group::Domain::Bulk, Verdict::Clean), (async_group::Domain::CpAsync, Verdict::Review)] {
+        let g = async_group_res(0, 0, domain);
+        let mut log = LogBuilder::new();
+        log.cmd(0, 1, g, group(async_group::Cmd::Issue));
+        let r = check(&log.build(), &config(one()));
+        assert_eq!(r.verdict, verdict, "{domain:?}: {:#}", serialize(&r));
+    }
 }

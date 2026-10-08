@@ -121,7 +121,16 @@ pub fn async_new_groups(res: &Res, from: u64) -> Vec<u64> {
 pub fn exit_lint(res: &Res) -> Option<(crate::report::FindingKind, String)> {
     match res {
         Res::Named(s) => p::named::exit_lint(s).map(|l| (p::named::lint_kind(&l), format!("{l:?}"))),
-        Res::AsyncGroup(s) => p::async_group::exit_lint(s).map(|l| (p::async_group::lint_kind(&l), format!("{l:?}"))),
+        Res::AsyncGroup(s) => {
+            // Bulk issues are committed implicitly at exit. The engine
+            // applies `async_group::Cmd::Exit` without logging it (W6-4
+            // item 3), so apply it here: only uncommitted cp.async is a lint.
+            let mut s = s.clone();
+            if s.domain == p::async_group::Domain::Bulk {
+                let _ = p::async_group::step(&mut s, p::async_group::Cmd::Exit);
+            }
+            p::async_group::exit_lint(&s).map(|l| (p::async_group::lint_kind(&l), format!("{l:?}")))
+        }
         _ => None,
     }
 }
