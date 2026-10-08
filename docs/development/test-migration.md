@@ -58,6 +58,20 @@ Two further rows had the right category but missed a stats pin
 Review each row when its file is converted; the counts are good enough to
 plan from.
 
+## Current status (2026-10-08, sweep 7)
+
+The numbered sections below are dated snapshots; this block is the current state.
+
+- Public-API A set under `NUMSIM_IMPL=v2`: 562 of 761 items pass unchanged.
+  Counting a function as covered when every v2 copy mapped to it in
+  `coverage/v2_ports_*.tsv` passes, 760 of 761 items are pass-or-covered
+  (`coverage/v2_public_status.tsv`). The 4 GPU-only functions skip on CPU.
+- Step-5 blockers (W9 `retire_legacy.py --dry-run`): 19 A functions are
+  blocked by v2 with no copy yet (17 internal, 2 public), and 5 have copies
+  still held by a `v2_gap` mark.
+- Open v2 gaps: the `v2_gap` marks in `tests/numsim/v2`, listed by owner in
+  `coverage/v2_xfail_inventory.tsv` and `CONTRACT_REQUESTS.md`.
+
 ## Where tests live
 
 | layer | location | holds |
@@ -260,9 +274,11 @@ The tests use only the public `tirx_harness.numsim.v2` API.
   - initial base: `bad_address`;
   - replaced base: `missing_proxy_bridge` despite the fence pair.
 
-Host aliasing raises `NotImplementedError` (W8-6), so all aliased parameters
-are xfail. Kernels fed raw host addresses (`ctypes.data`) cannot be ported
-until v2 exposes a binding's engine address.
+(Dated.) Host aliasing then raised `NotImplementedError`; W8-6 has since
+implemented it (dev-loop.md "v2 binder rules"; only a non-contiguous view in
+an aliasing group still raises). A binding's engine address is available as
+`Engine.address_of`; kernels fed raw host addresses (`ctypes.data`) remain
+the no-spec host-aliasing xfails.
 
 ### Remaining gaps
 
@@ -833,27 +849,16 @@ Each item below was confirmed by grep across `racecheck-semantics.md`,
 `synccheck-explorer.md` and the three delta docs. Each needs a spec sentence
 or a delta row, whichever way it is ruled.
 
-1. **`alias_stale_read`.** This review advisory flags a stale logical buffer
-   name over pooled smem or TMEM. It is dropped silently: there is no delta
-   row, no `AdvisoryKind`, and no contract field. `v2/report.py` still lists
-   it in `ADVISORY_KINDS`.
-2. **Host-input aliasing.** Overlapping host arrays bound to two parameters
-   must be checked as one allocation. This covers raw pointer offsets,
-   TensorMap base replacement and `discard`.
-3. **Same-rank `mapa`.** Legacy resolves a `mapa` to the CTA's own rank as a
-   `shared::cta` window: a `.shared::cta` fence is clean and a
-   `.shared::cluster` fence races. The new core treats every `mapa` address as
-   `shared::cluster`, which gives the opposite verdicts. Delta X2's "Legacy:
-   Race" column is inaccurate for this case.
+1. *(Resolved: racecheck-behaviour-deltas P7 and T8 rule `alias_stale_read`; identity rule W5-9)*
+2. *(Resolved: host-input aliasing is implemented in the v2 binder, CONTRACT_REQUESTS W8-6, dev-loop.md "v2 binder rules")*
+3. *(Resolved: racecheck-behaviour-deltas X10)*
 4. **How a bulk reduction (`cp.reduce.async.bulk`) is emitted.** It is atomic
    per PTX element. A matching-width peer `red` is clean; a `.u32` peer racing
    on f16 elements races. Nothing specifies that the producer emits an
    atomic `Rmw`, relaxed `.gpu`, `returns_value = false`, one span per
    element. A wrong emission gives a false race or a missed one.
 5. *(Resolved: the core now reports a wide release write to a declared word as incomplete, as the spec says; the port is un-ignored.)*
-6. **Declared words are global-only.** A `shared::cluster` poll can never be
-   declared, so it always draws `UndeclaredProtocolWord`. Legacy kept it as a
-   deliberately clean control.
+6. *(Resolved: racecheck-behaviour-deltas W6: a declared word may live in any allocation)*
 7. **A declared `wait_until` as a thread sync for the tcgen05 fence pair.**
    It counts as an execution-ordering thread sync for the tcgen05
    before/after fence pair. The spec states this only for relaxed mbarrier
@@ -862,14 +867,15 @@ or a delta row, whichever way it is ruled.
    exists anywhere.
 9. **Footprint narrowing.** `.ignore_oob` read clipping, `.cp_mask` byte
    selection and gather4 rows are not covered; only multicast is.
-10. **Hidden accesses of tile and helper primitives** (`cta_sum` scratch and
-    barriers, `permute_layout` zero-fill).
+10. *(Resolved: the `cta_sum` scratch and barrier accesses are emitted; `permute_layout` zero-fill is numsim-behaviour-deltas F1. `tests/numsim/v2/checkers/test_tile_hidden_accesses.py` passes)*
 11. **The default `.cta` scope for a qualifier-less raw arrive on a remote
     mbarrier.** B1 states the default but not that it flips a real kernel's
     verdict.
 12. *(Resolved by 1159d17: the allocation-result check is restored.)*
 13. *(Resolved by 1159d17: host `Configure` is now the initial state.)*
-14. **Kind names.** Several kinds were renamed with no delta row:
+14. **Kind names.** (Partly resolved: v2 emits `warp_collective_divergence`
+    again, and racecheck-behaviour-deltas T6 lists the racecheck kinds.)
+    Several kinds were renamed with no delta row:
     - `synchronization_contract_mismatch` (an execution_error) is now
       `named_barrier_contract_mismatch`;
     - `warp_collective_divergence` is now `divergence`;
@@ -897,10 +903,6 @@ or a delta row, whichever way it is ruled.
     `ld.global.nc` / `proxy::readonly`) is assigned to no checker.
 21. **The proxy of `st.async` / `red.async`.** Legacy treats them as generic;
     the interpreter emits the async proxy.
-22. **Global `st.async.release` / `red.async.release` with no mbarrier as a
-    publication.** Async-actor writes carry no release head.
-23. **The `signal_protocol_error` kind** (a declared-word bypass) has no
-    equivalent.
-24. **The tcgen05 fence requirement** after a waited `tcgen05.st` or commit
-    across a plain `cta_sync`. The new core races where legacy is clean, and
-    no delta row covers it.
+22. *(Resolved: racecheck-behaviour-deltas T2 and T13)*
+23. *(Resolved: racecheck-behaviour-deltas T3, restored as `SignalProtocolError`)*
+24. *(Resolved: racecheck-behaviour-deltas T1)*

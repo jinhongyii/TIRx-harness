@@ -4,7 +4,7 @@ orphan: true
 
 # NumSim / Racecheck / Synccheck 重构方案
 
-状态：草案，2026-10-07。分支 `refactor/clean-core`。
+状态：实施中，2026-10-08 更新。分支 `refactor/clean-core`。第 0–3 步已完成：v2 在全部 corpus case 上与旧快照一致或有裁定的 delta（`v2-conformance-status.md`）。第 4 步的后端对比已出结论（`backend-comparison.md`：保留 `interp`，删除 `codegen`），删除尚未执行。第 5 步（删旧）由 `test-migration.md` 的退役计划驱动，尚未执行。
 
 本文是重构的工作合约：所有 worker 以此为准，分歧回到这里改文档再改代码。
 
@@ -75,7 +75,7 @@ pub struct Program {
 - `backend = "interp" | "codegen"`，运行期选择，默认先 `interp`。
 - Codegen 后端是 `Program` 的打印器：每条 `Instr` 打印成 `handlers::ld_f32(&mut ctx, dst, buf, off, SPACE, SEM, SITE)` 这类调用，寄存器编号、dtype、space 变成常量让 LLVM 内联折叠。**不允许**在生成代码里出现独立的语义实现。
 - 两个后端共享 Arena、SyncTable、OpLib、Observer、checker，差别只有分派。性能对比在 corpus 上做，按 kernel 分 NumSim / racecheck / synccheck 三个模式报告。
-- 对比结论出来后删掉输的那个。两个后端共存不是最终状态。
+- 对比结论出来后删掉输的那个。两个后端共存不是最终状态。结论：`interp` 胜出，`codegen` 待删（`backend-comparison.md`）。
 
 ### 2.4 内存与 shadow
 
@@ -139,18 +139,18 @@ pub struct Program {
 4. Lowering：断言 `Program` 内容，不断言 Rust 文本。
 5. 性能：criterion 微基准 + 端到端相对基线，`performance` marker opt-in，nightly 开 profile。
 
-补测试 CI。
+测试 CI：`.github/workflows/tests.yml`（旧引擎 + `core-rs` 的 `cargo test` + pytest，不含 GPU 与 performance marker）。
 
 ## 4. 迁移：旁路新建，按 kernel 切换
 
 不做原地九步手术。oracle 是 corpus 快照，旧代码一行不改。
 
-0. 冻结 corpus verdict 快照和位级输出；补测试 CI；建 criterion 基准骨架。
-1. 新引擎只跑 NumSim（解释器后端），按 corpus kernel 逐个切换，位级对照旧引擎。
-2. racecheck 核心，逐 kernel 切换，finding 集合对照。
-3. synccheck 与探索器。
-4. codegen 后端作为 `Program` 打印器；三模式性能对比；删掉输家。
-5. 删旧：`engine-rs/`、`frontend-rs/`、旧 Python 层、钉实现的测试。
+0. 冻结 corpus verdict 快照和位级输出；补测试 CI；建 criterion 基准骨架。（完成）
+1. 新引擎只跑 NumSim（解释器后端），按 corpus kernel 逐个切换，位级对照旧引擎。（完成）
+2. racecheck 核心，逐 kernel 切换，finding 集合对照。（完成）
+3. synccheck 与探索器。（完成）
+4. codegen 后端作为 `Program` 打印器；三模式性能对比；删掉输家。（对比完成，删除 `codegen` 待执行）
+5. 删旧：`engine-rs/`、`frontend-rs/`、旧 Python 层、钉实现的测试。（待执行；`scripts/numsim-v2/retire_legacy.py`、`retire_tests.py`）
 
 ### 4.1 并行分工
 
@@ -169,8 +169,9 @@ pub struct Program {
 
 ## 5. 代码位置
 
-- Rust：`tirx_harness/src/tirx_harness/numsim/core-rs/`（workspace：`numsim-core`、`numsim-engine`、`numsim-py`）。
-- Python：`tirx_harness/src/tirx_harness/numsim/v2/`，稳定后替换 `numsim/*.py`。
+- Rust：`tirx_harness/src/tirx_harness/numsim/core-rs/`（workspace：`numsim-types`、`numsim-core`、`numsim-oplib`、`numsim-py`、`numsim-sync-ref`、`numsim-race-core`；crate 划分见 `core-rs/README.md`）。
+- Python：`tirx_harness/src/tirx_harness/numsim/v2/`，第 5 步替换 `numsim/*.py`。
+- 测试：见 `test-migration.md`「Where tests live」。
 - 旧代码在第 5 步前不动。
 
 ## 6. 待决与风险
@@ -188,13 +189,13 @@ pub struct Program {
 - `sync-semantics.md`：六个同步协议的状态、命令、前提、转移、完成、错误；引擎模型与 strict 模型的全部不一致。参考状态机在 `core-rs/numsim-sync-ref/`。
 - `sync-isa-answers.md`：七个开放语义问题的 ISA 裁定。四个问题两边模型都错：`tcgen05.alloc` 应阻塞、cluster barrier 要排除已退出线程、elect 后单 lane 进 barrier 是 UB、async group 等待逐线程。
 - `sync-behaviour-deltas.md`：相对旧行为的变更清单，供快照 diff 审查。
-- `racecheck-semantics.md`：33 条 HB 边、冲突规则、时钟表示技巧与操作数论证、22 条旧有不合理行为。原型在 `core-rs/numsim-race-core/`。
+- `racecheck-semantics.md`：33 条 HB 边、冲突规则、时钟表示技巧与操作数论证、22 条旧有不合理行为。实现在 `numsim-core/src/racecheck/`；原型 `core-rs/numsim-race-core/` 仍在 workspace，但不被任何 crate 依赖。
 - `racecheck-isa-answers.md`：release sequence、moral strength、proxy 规则等的 ISA 裁定。
 - `synccheck-explorer.md`：两阶段算法、投影、证书、指纹、DFS 剪枝表与测量。实现在 `numsim-core/src/synccheck/`，剪枝基准在 `numsim-core/benches/synccheck.rs`。
 - `lowering-inventory.md`：194 个 corpus PrimFunc 的 IR 节点、builtin、dtype、layout、控制流统计；lowering 设计与三个 worked example。
 
 ## 8. 环境备忘
 
-- 本机 shell 的 `PYTHONPATH`、`TVM_HOME`、`TVM_LIBRARY_PATH`、`LD_LIBRARY_PATH` 指向本地 0.26 的 TVM 开发树，会让 frontend panic（`sym.Analyzer is not registered`）。运行测试前清掉这四个变量，用 `.venv`（`uv sync --locked --extra test`，Python 3.12）。
+- 本机 shell 的 `PYTHONPATH`、`TVM_HOME`、`TVM_LIBRARY_PATH`、`LD_LIBRARY_PATH` 指向本地 0.26 的 TVM 开发树，会让 frontend panic（`sym.Analyzer is not registered`）。运行测试前 `source scripts/dev-env.sh`（清掉这四个变量，设置 `$PY`），环境用 `uv sync --locked --extra test --group benchmark --inexact`（Python 3.12）。详见 `dev-loop.md`。
 - 测试从 `tirx_harness/` 目录运行，总是带 `-n`，设 `NUMSIM_WORKER_AFFINITY=off`。
-- 引擎改动跑 `cargo test --all-features`。
+- 旧引擎改动跑 `cargo test --all-features`（`engine-rs`）；新核心跑 `(cd core-rs && cargo test --workspace)`，改 Rust 后用 `core-rs/numsim-py/build_dev.sh` 重建扩展。

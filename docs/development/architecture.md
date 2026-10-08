@@ -42,7 +42,7 @@ legacy Python modules).
 
 | Component | Location | Owns |
 | --- | --- | --- |
-| Lowering (Python) | `numsim/v2/lowering/` | TIRx PrimFunc → `Module` (one `Program` per launch) |
+| Lowering (Python) | `numsim/v2/lowering/` ([README](../../tirx_harness/src/tirx_harness/numsim/v2/lowering/README.md)) | TIRx PrimFunc → `Module` (one `Program` per launch) |
 | Contract | `core-rs/numsim-core/src/{program,dtype,value,site,observe,report}.rs`, `numsim-types` | `Program`, `Instr`, `Dtype`, `SiteInfo`, the `Observer` trait, `Finding` |
 | Interpreter backend | `numsim-core/src/interp/` | `WarpState`, the mask stack, one handler per instruction family |
 | Codegen backend | `numsim-core/src/codegen/` | A printer from `Program` to Rust that calls the same handlers; one `rustc` per module |
@@ -76,7 +76,7 @@ pruning techniques; synccheck's are `numsim-core/benches/synccheck.rs`).
 
 ```text
 TIRx PrimFunc
-  │  lowering (Python): ir_walk, builtins, ptx_lower, TVM tile dispatch
+  │  lowering (Python): TVM tile dispatch + tile_forms, ir_walk, calls, ptx_lower
   ▼
 Module = [Program]                 cached as JSON under $NUMSIM_CACHE_DIR/v2-modules
   │  numsim_core_py.run(module, inputs, mode, backend, seed, workers)
@@ -115,7 +115,8 @@ partition. Results and observer streams never depend on the worker count.
 
 | Concept | Where |
 | --- | --- |
-| TIRx builtin → instruction family | `v2/lowering/builtins.py`; PTX decoding in `ptx_decode.py`, `ptx_lower.py` |
+| TIRx builtin → instruction family | [lowering-inventory.md B.0](lowering-inventory.md#b0-op-family-map-final-code) (op family → file:function) |
+| Tile ops (`tirx.tile.*`) | TVM dispatch first, then `v2/lowering/tile_forms/`; [lowering-inventory.md Part G](lowering-inventory.md#part-g-tile-forms-w12-2026-10-08) |
 | Half-precision expression chains | `v2/lowering/ir_walk.py` (`half_chain`) |
 | Instruction variants and validation | `numsim-core/src/program.rs` (`Instr`, `Program::validate`) |
 | Instruction semantics | `numsim-core/src/interp/handlers/*.rs`, one function per family |
@@ -246,7 +247,9 @@ fields, or absolute times.
 | Semantic conformance | Corpus verdicts, findings, and outputs against snapshots | `tests/conformance/` |
 | Differential and property | Interpreter vs. codegen bit equality; reference state machine vs. `step`; reduced vs. exhaustive Synccheck search on random logs | `numsim-core/tests/{codegen_equivalence,sync_differential,synccheck_equivalence}.rs` |
 | Pure core | Hand-written `Program`s and contract events fed to the engine and checkers, without Python | `numsim-core/tests/` |
-| Lowering | The contents of the lowered `Program`, not any generated text | `tests/numsim/v2/` |
+| Lowering | The contents of the lowered `Program`, not any generated text | `tests/numsim/v2/test_lowering_*.py` |
+| Kernel-level checks | Racecheck/Synccheck facts that contract events cannot express | `tests/numsim/v2/checkers/` |
+| Legacy copies | Public-API legacy tests ported to the v2 API, each citing its legacy test and delta row | `tests/numsim/v2/ports/`, `tests/numsim/v2/tile_forms/` |
 | Performance | Criterion microbenchmarks and end-to-end checks relative to a per-host baseline; opt-in `performance` marker | `numsim-core/benches/` (synccheck reduction guards: `benches/synccheck.rs`), `numsim-race-core`, `tests/perf/` |
 
 CI runs the Rust workspace tests and the Python suite without the GPU and
@@ -266,3 +269,4 @@ conformance run skip there).
 | [Synccheck explorer](synccheck-explorer.md) | Projection, certificates, fingerprints, DFS, budgets |
 | [Lowering inventory](lowering-inventory.md) | IR nodes, builtins, and layouts the corpus uses |
 | [Test migration](test-migration.md) | How the legacy test suite is retired |
+| [Backend comparison](backend-comparison.md) | Interpreter vs. codegen measurements and the backend decision |

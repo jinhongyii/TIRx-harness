@@ -6,10 +6,12 @@ Plan: `docs/development/numsim-redesign.md`. Worker inputs:
 `docs/development/synccheck-explorer.md` (W6),
 `docs/development/racecheck-semantics.md` (W5).
 
-Workspace members: `numsim-core` (everything below) and `numsim-py`
-(pyo3 bindings, feature `python`). The standalone crates
-`numsim-sync-ref`, `numsim-race-core`, `numsim-oplib`
-have their own `[workspace]` tables; the coordinator merges them.
+Workspace members (`Cargo.toml`): `numsim-types` (shared plain types),
+`numsim-core` (everything below), `numsim-oplib` (bit-exact numerics),
+`numsim-py` (pyo3 bindings, feature `python`), `numsim-sync-ref` (the
+independent sync reference state machine, compared by
+`numsim-core/tests/sync_differential.rs`), and `numsim-race-core` (the
+racecheck prototype; no crate depends on it).
 
 ```
 cargo build && cargo test && cargo doc --no-deps
@@ -25,12 +27,12 @@ PYO3_PYTHON=python3 cargo check -p numsim-py --features python
 | `site` | `SiteId`, `SiteInfo{kind, spans, op_name, text, dtype, buffer}` | complete |
 | `arena` | `Arena`, `Allocation`, `AllocId`, `View`, `ByteSpan`, `Space`, validity, address encodings (`arena::addr`) | implemented |
 | `observe` | `Observer`, `Access` (hot), `SyncEvent{actor, seq, site, frames, lanes, kind: SyncKind}` (cold), `NoopObserver`, `RecordingObserver` | complete |
-| `sync` | `SyncTable`, `ResourceId`, `Completion`, `AsyncOp`, `Payload`, per-protocol `State/Cmd/Outcome/Error` copied from `numsim-sync-ref` | types complete, `step` bodies W3 |
-| `interp` | `WarpState`, `MaskFrame`, `ExecCtx`, `Flow`, `StepResult`, `ExecError`, `step_warp`, **`interp::handlers`** (one fn per family + `dispatch`) | signatures; bodies W2 |
-| `sched` | `Scheduler`, `CtaState`, `Inbox`, `RunConfig`, `Inputs`/`Outputs`, `Backend`, `run`, `resolve_launch` | signatures; bodies W2 |
-| `oplib` | `Scalar`/`FloatScalar`, TIR ALU entry points, `PtxIo`/`PtxFn`/`resolve_ptx`, TMA/descriptor/MMA signatures, op registry -> SUPPORTED_OPS.md | signatures; bodies W4 |
+| `sync` | `SyncTable`, `ResourceId`, `Completion`, `AsyncOp`, `Payload`, per-protocol `State/Cmd/Outcome/Error` copied from `numsim-sync-ref` | implemented (W3/W6) |
+| `interp` | `WarpState`, `MaskFrame`, `ExecCtx`, `Flow`, `StepResult`, `ExecError`, `step_warp`, **`interp::handlers`** (one fn per family + `dispatch`) | implemented (W2) |
+| `sched` | `Scheduler`, `CtaState`, `Inbox`, `RunConfig`, `Inputs`/`Outputs`, `Backend`, `run`, `resolve_launch` | implemented (W2) |
+| `oplib` | `Scalar`/`FloatScalar`, TIR ALU entry points, `PtxIo`/`PtxFn`/`resolve_ptx`, TMA/descriptor/MMA, op registry -> SUPPORTED_OPS.md | implemented (W4) |
 | `report` | `Finding`, `FindingKind`, `Status`, `Verdict`, `Evidence`, `Report` | complete |
-| `racecheck`, `synccheck`, `codegen` | entry-point skeletons | W5, W6, W7 |
+| `racecheck`, `synccheck`, `codegen` | online race checker, offline sync explorer, `Program` printer | implemented (W5, W6, W7); `codegen` is slated for deletion (`docs/development/backend-comparison.md`) |
 | `testutil` | `ProgramBuilder` for handwritten tests | implemented |
 
 ## Ownership
@@ -100,10 +102,13 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
    counts, collectives, issued targets and observed parity are
    `SyncKind::Protocol` (W6 shape). `seq` counts committed protocol events
    only. No clocks or observed generations except W5's `Arrive/Wait.phase`.
-10. **Single-threaded scheduler, one Arena** for now; CTA parallelism is a
-    later internal change.
-11. **Tile ops** remain as a provisional `Instr::Tile` with W1's element-map
-    `TileLayout`; W1 prefers lowering through TVM's dispatch to PTX-level IR.
+10. **Scheduler workers.** One Arena per launch; CTAs run on
+    `RunConfig.workers` threads (`Engine(max_workers=...)`), and results and
+    observer streams do not depend on the worker count.
+11. **Tile ops** lower through TVM's dispatch to PTX-level IR; ops the
+    dispatch rejects use `v2/lowering/tile_forms/` (lowering-inventory.md
+    Part G). `Instr::Tile` with W1's element-map `TileLayout` stays in the
+    contract (W1 owns which forms still emit it).
 12. **Strict serde, `FORMAT_VERSION` 3** (2 until decision 15) (contract review item 7): every
     program type rejects unknown fields and every `Option` field must be
     present (`null`), so a misspelled or dropped field is a decode error, not
