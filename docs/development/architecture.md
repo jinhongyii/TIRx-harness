@@ -161,8 +161,8 @@ partition. Results and observer streams never depend on the worker count.
    with its inputs and an independent reference. Explain any expected
    non-clean verdict in `canonical_verdict_rationale.md`.
 2. Generate its three snapshots (numsim, racecheck, synccheck) and review
-   them (pending: generated from the legacy engine until it is deleted; the
-   policy for generating snapshots afterwards is not decided).
+   them. They are generated from the legacy engine until it is deleted;
+   after the legacy engine is deleted, v2 becomes the oracle: `--update-snapshots` regenerates from v2, every commit that changes a snapshot cites the justifying delta row id in its message, and CI enforces it (`scripts/numsim-v2/check_snapshot_deltas.py`); the deletion commit folds the delta files into the base snapshots (`scripts/numsim-v2/fold_snapshot_deltas.py`).
 
 ## Conformance snapshots and delta files
 
@@ -188,8 +188,10 @@ Snapshot policy:
 - Snapshots are regenerated with `--update-snapshots` only for an intentional,
   documented change, and the commit message explains each changed case.
 - Legacy snapshots are regenerated only from the legacy engine, never from the
-  new engine to make it pass (pending: the regeneration rule after the legacy
-  engine is deleted).
+  new engine to make it pass. After the legacy engine is deleted, v2 becomes
+  the oracle and `--update-snapshots` regenerates from v2; every commit that
+  changes a snapshot must cite the justifying delta row id in its message
+  (CI: `scripts/numsim-v2/check_snapshot_deltas.py`).
 - `--update-snapshots` never writes delta files; they are edited by hand with
   their delta row.
 

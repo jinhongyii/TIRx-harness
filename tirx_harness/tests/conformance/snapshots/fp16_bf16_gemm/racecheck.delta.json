@@ -1,0 +1,23 @@
+{
+ "case": "fp16_bf16_gemm",
+ "delta": "racecheck-behaviour-deltas B7 (racecheck-semantics.md section 11, TMEM teardown handshake): the qualifier-less remote mbarrier.arrive is .release.cta and the peer waits .acquire.cta, so scope_mismatch. No legacy result (legacy lowering raised UnsupportedTIRxError); this is the v2 oracle for the case.",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/gemm/fp16_bf16_gemm.py:638:1-638:45"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    }
+   ],
+   "verdict": "error"
+  }
+ ],
+ "schema": 4
+}

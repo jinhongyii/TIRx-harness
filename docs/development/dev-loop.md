@@ -196,8 +196,14 @@ NUMSIM_IMPL=legacy $PY -m pytest -q -n 32 --dist=worksteal tests/conformance --u
 git diff --stat tests/conformance/snapshots
 ```
 
-Review the diff and explain each changed case in the commit message. Never
-update snapshots from `NUMSIM_IMPL=v2` to make the new engine pass.
+Review the diff and explain each changed case in the commit message, citing
+the delta row id that justifies it (CI: `check_snapshot_deltas.py`). Never
+update snapshots from `NUMSIM_IMPL=v2` to make the new engine pass while the
+legacy engine exists; a ruling that legacy was wrong goes in a
+`<mode>.delta.json`. After the legacy engine is deleted, v2 is the oracle and
+`--update-snapshots` regenerates from it (the deletion commit folds the delta
+files with `scripts/numsim-v2/fold_snapshot_deltas.py`); see the conformance
+README, "Snapshot policy after the legacy engine is deleted".
 
 ## CI
 

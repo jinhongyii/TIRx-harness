@@ -36,7 +36,7 @@ TABLES = {
     "racecheck": REPO / "docs/development/racecheck-behaviour-deltas.md",
     "sync": REPO / "docs/development/sync-behaviour-deltas.md",
 }
-ROW_ID = re.compile(r"\b([A-Z]{1,2}\d{1,3})\b")
+ROW_ID = re.compile(r"(?<!ISA )\b([A-Z]{1,2}\d{1,3})\b(?!-\d)")
 
 
 def row_ids() -> dict[str, set[str]]:

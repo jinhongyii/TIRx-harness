@@ -54,6 +54,23 @@ by kind, status and source anchors only; their byte/column footprint is
 dropped (W5 note in CONTRACT_REQUESTS). Schema 4 regeneration: 173 s, 304
 passed.
 
+## Snapshot policy after the legacy engine is deleted (decided 2026-10-08)
+
+- v2 becomes the oracle. The deletion commit runs
+  `scripts/numsim-v2/fold_snapshot_deltas.py --apply`, which replaces each base
+  snapshot with its `.delta.json` content and removes the delta files; its
+  output table and `Snapshot-Regen:` trailer go into that commit message.
+- From then on `--update-snapshots` regenerates from v2 (`snapshot.oracle_impl_name()`;
+  `NUMSIM_IMPL` no longer selects anything, and `NUMSIM_IMPL=legacy` is an
+  error). The legacy-only no-oracle cases get v2 snapshots once their open
+  items are cleared; until then they stay skipped.
+- Every commit that changes a snapshot must cite a delta row id from the three
+  behaviour-delta tables in its message; a schema-only regeneration carries
+  `Snapshot-Regen: schema <reason>` instead. CI enforces this
+  (`scripts/numsim-v2/check_snapshot_deltas.py`, job `snapshot-deltas`).
+- `NUMSIM_SNAPSHOT_ROOT` points the suite at another snapshot tree (used to
+  verify a folded copy before the deletion commit).
+
 ## Delta snapshots
 
 When a behaviour-delta row rules that legacy was wrong, the corrected oracle
@@ -76,6 +93,7 @@ legacy engine is deleted.
 | `sm100_fp8_fp4_mega_moe` / racecheck | racecheck-behaviour-deltas T19, R4/B1, B7, X4 | true-positive race of non-elected-lane `lds128` TaskInfo reads vs remote `st.async` (T19), scope mismatches (R4/B1, B7), `cross_cta_async_order` (X4); the `alias_stale_read` grouping also follows the per-instruction-pair advisory rule |
 | `alphamoe_fp8_blockscale_qwen3next` / racecheck | racecheck-behaviour-deltas R3 | `undeclared_protocol_word` review instead of legacy's `data_race` |
 | `kda_backward_packed` / racecheck | racecheck-behaviour-deltas X4 | new `cross_cta_async_order` review advisory |
+| `fp16_bf16_gemm` / racecheck | racecheck-behaviour-deltas B7 (racecheck-semantics §11) | no legacy result (legacy lowering fails); the v2 `scope_mismatch` on the TMEM-teardown handshake is the oracle |
 | (removed) `msa_sparse_atten_fwd_nvfp4_kv_sm100` / racecheck | racecheck-behaviour-deltas T12 | subsumed by the schema-4 projection rule below (`tmem_lifetime_review` compared by kind + anchors) |
 
 ## What a snapshot contains (`snapshot.py`)

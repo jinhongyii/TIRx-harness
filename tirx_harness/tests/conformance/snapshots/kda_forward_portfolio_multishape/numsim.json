@@ -1,6 +1,26 @@
 {
  "case": "kda_forward_portfolio_multishape",
- "error": "NumSimExecutionError",
+ "diagnostics": [],
  "mode": "numsim",
- "schema": 4
+ "outputs": {
+  "final_state": {
+   "dtype": "float32",
+   "sha256": "b0cd46ffe368ab78616c66c4eaa46f9df4c779fa3e6d57a89b91b9726782c082",
+   "shape": [
+    2097152
+   ]
+  },
+  "output": {
+   "dtype": "uint16",
+   "sha256": "df8ce0607bf238d8e3213f9b991fe0ab9420c408a980cd3488a45112d6968792",
+   "shape": [
+    128,
+    128,
+    64
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
 }

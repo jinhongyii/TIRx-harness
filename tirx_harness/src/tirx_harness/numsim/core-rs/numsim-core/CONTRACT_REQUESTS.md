@@ -2811,3 +2811,50 @@ The 25 public-API functions with class `other-assertion` in `scripts/numsim-v2/c
 - **W11-4 [W4 oplib], new; the W11-2 fix uncovered it.** A narrow `cvt` into a 128-bit carrier now stops with `incomplete`: `cvt.s8.s8 ... destination carrier Ty { elem: B128 } cannot hold a 8-bit result`. Legacy sign- or zero-extends into `int128`/`uint128` carriers, and `test_cvt_carriers_*` uses them for every type. Before the W11-2 fix this was masked, because the first use's types were used for every use.
   - Reproducer: `ports/test_w11_reproducers.py::test_w11_4_narrow_cvt_extends_into_a_128_bit_carrier` (`v2_gap`). `cvt.s8.s8` of -1 into an `int128` local should give both u64 halves `0xFFFFFFFFFFFFFFFF`.
   - Port blocked on it: `ports/test_w11_cvt_carriers.py` (`v2_gap`).
+
+### V2C-31 (sweep 5 follow-up) [synccheck]: `kda_forward_portfolio_multishape` over budget
+
+With W9's fixture fix the case runs on both engines; legacy is clean in all modes and v2 matches in numsim and
+racecheck. v2 synccheck stops `incomplete` (`resource_limit`) under the corpus budget (`max_backtrack_nodes`
+100k, `max_loop_steps` 4M, 180 s wall, 32 MB diagnostics). Repro: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1
+tests/conformance -k "kda_forward_portfolio_multishape-synccheck"`.
+
+### Delta row needed [numsim, W2]: uninitialized-read reporting point
+
+`deepgemm_sm100_tf32_hc_prenorm_gemm/{numsim,racecheck,synccheck}.delta.json` cite CONTRACT_REQUESTS W2-20
+(register-space uninit reports), which is not a behaviour-delta row, so `fold_snapshot_deltas.py` refuses to
+fold them and `check_snapshot_deltas.py` would reject a snapshot commit citing only it. Please add a
+numsim-behaviour-deltas row for "v2 reports the uninitialized TMEM read where data moves into registers;
+legacy at the later register use"; W8 will repoint the three delta files.
+
+## W11-pin-message (2026-10-08): report gaps found while porting the public-API pin-message class (for W8; engine facts from W2)
+
+The 19 `pin-message` functions (25 items) all already had v2 copies. W11 tightened them so they assert observable facts instead of only the kind: the diagnostic's source anchor (the line of `source_span`), the structured `lanes`/`warp`, and for the delta rows H4, M15 and B8 the `incomplete` status with its reason token. The copies are `tests/numsim/v2/ports/test_error_kinds.py`, `test_messages_tmem_artifact.py`, `test_p6b_scheduler_polling_artifact.py`, `test_p6c_mbarrier_lane_semantics.py`, `test_p6c_ordering_calls.py` and `test_deltas_pointer_slot_arrays.py`. In five places the legacy message carried a fact that v2 exposes only in engine wording or not at all.
+
+1. **Faulting lane of `invalid_operand`.** Covers `test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane` and `test_ptx_signed_division_overflow_fails_closed`.
+   - Only lane 7 divides by zero (`rhs[7] = 0`), but the stopping diagnostic has `lanes: WarpMask(0xffffffff)`.
+   - The operands appear only in the message text ("integer div has an undefined operand: 29 / 0").
+   - Legacy said "lane 7: 29 / 0".
+   - Request: `lanes` names only the faulting lanes (W2: the per-lane ALU check knows them), and `details` carries the operation and the operand values.
+2. **`sync_protocol_error` renders Rust `Debug`.**
+   - `message`/`detail` are `RegPool(MissingWarpgroupSync { wg: 0 })` and `Mbarrier(InvalidStateToken { gen: 0, current: 2 })`. That is internal plumbing (CLAUDE.md: reports expose actionable evidence).
+   - Legacy said "setmaxnreg ... without an explicit warpgroup sync" and "state token names generation 0, but the current generation is 2".
+   - Request: a readable message owned by the report renderer, plus structured `details` (`protocol`, `error`, and fields such as `wg`, `gen`, `current`). The copies currently match the variant name inside `message`.
+3. **`bad_address` loses the state-space fact.** Covers `test_if_then_else_mixed_pointer_spaces_fail_closed`.
+   - A generic shared-window pointer used by `ld.global` reports "Global address 0xfffe00000004 is not mapped".
+   - Legacy said the pointer "does not match PTX state space global".
+   - Request: when an address misses its space but decodes into another aperture, name that aperture, for example "shared::cta window of CTA 0, offset 4".
+4. **Address facts appear only in message text.**
+   - `misaligned` ("8-byte access at offset 4 of source"), `out_of_bounds` ("byte 16, alloc alloc5") and TMEM `bad_address` ("tmem column 7") have no structured `buffer`, `byte_offset`, `width`, `alignment` or `tmem_column` fields on the run-status diagnostic. Checker findings do have byte spans.
+   - Request: the same structured fields on run-status stops, so tests and users need not parse engine text.
+5. **Incomplete stops have no location fields.**
+   - `analysis_incomplete` run-status stops (reasons `Budget: ...` and `divergent_block: ...`) have no `lanes`/`warp`.
+   - The budget value appears only in the reason text; legacy said "configured native loop iteration budget 5".
+   - Request: `warp`, `lanes` and, for `Budget`, a structured `budget` field.
+
+New delta rows written for this class:
+- numsim-behaviour-deltas **H4**: an exhausted loop budget is `incomplete`.
+- sync-behaviour-deltas **M15**: a mixed-readiness blocking wait is `incomplete`.
+- sync-behaviour-deltas **B8**: a divergent default-mask `__syncwarp` is `incomplete`.
+
+These replace three expected-to-fail "is an error" copies, which now assert the v2 status.

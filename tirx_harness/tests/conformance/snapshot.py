@@ -40,7 +40,9 @@ import numpy as np
 
 SCHEMA_VERSION = 4  # 2: no window alloc ids; 3: register reads -> presence; 4: tmem_lifetime_review -> kind + anchors
 MODES = ("numsim", "racecheck", "synccheck")
-SNAPSHOT_ROOT = Path(__file__).resolve().parent / "snapshots"
+# ``NUMSIM_SNAPSHOT_ROOT`` points the suite at another snapshot tree (e.g. a
+# scratch copy folded with scripts/numsim-v2/fold_snapshot_deltas.py).
+SNAPSHOT_ROOT = Path(os.environ.get("NUMSIM_SNAPSHOT_ROOT") or Path(__file__).resolve().parent / "snapshots")
 IMPL_ENV = "NUMSIM_IMPL"
 IMPLS = ("legacy", "v2")
 
@@ -82,7 +84,7 @@ def load_expected(case_name: str, mode: str, impl_name: str, root: Path = SNAPSH
     legacy snapshot corrected by a behaviour-delta row (its ``delta`` field
     names the row and is not part of the comparison)."""
 
-    if impl_name != "legacy":
+    if impl_name != "legacy" and legacy_available():
         path = delta_snapshot_path(case_name, mode, root)
         if path.exists():
             data = json.loads(path.read_text())
@@ -491,11 +493,38 @@ class ImplementationUnavailable(RuntimeError):
     pass
 
 
+def legacy_available() -> bool:
+    """Whether the legacy engine is still installed.
+
+    After step 5 (``retire_legacy.py --apply``) the legacy package is gone: v2
+    is the oracle, ``--update-snapshots`` regenerates from v2, delta files
+    have been folded into the base snapshots, and ``NUMSIM_IMPL`` no longer
+    selects anything. ``dump_rust`` exists only on the legacy public surface.
+    """
+
+    try:
+        from tirx_harness import numsim
+    except ImportError:
+        return False
+    return hasattr(numsim, "dump_rust") and hasattr(numsim, "Engine")
+
+
 def selected_impl_name() -> str:
+    if not legacy_available():
+        value = os.environ.get(IMPL_ENV, "").strip()
+        if value == "legacy":
+            raise ValueError(f"{IMPL_ENV}=legacy but the legacy engine has been deleted")
+        return "v2"
     value = os.environ.get(IMPL_ENV, "legacy").strip() or "legacy"
     if value not in IMPLS:
         raise ValueError(f"{IMPL_ENV} must be one of {IMPLS}, got {value!r}")
     return value
+
+
+def oracle_impl_name() -> str:
+    """The implementation ``--update-snapshots`` regenerates from."""
+
+    return "legacy" if legacy_available() else "v2"
 
 
 def load_implementation(name: str | None = None) -> Implementation:
@@ -518,6 +547,11 @@ def load_implementation(name: str | None = None) -> Implementation:
     try:
         from tirx_harness.numsim import v2  # type: ignore[attr-defined]
     except ImportError as error:
+        if not legacy_available():
+            # Post-deletion layout: v2 is promoted to ``tirx_harness.numsim``.
+            from tirx_harness import numsim as promoted
+
+            return Implementation("v2", promoted)
         raise ImplementationUnavailable(
             f"NUMSIM_IMPL=v2 but tirx_harness.numsim.v2 is not importable: {error}"
         ) from error
@@ -660,7 +694,9 @@ __all__ = [
     "diff_snapshots",
     "load_implementation",
     "load_expected",
+    "legacy_available",
     "load_snapshot",
+    "oracle_impl_name",
     "normalize_analysis_phase",
     "normalize_numsim",
     "relax_unanchored",

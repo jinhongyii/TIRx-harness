@@ -4,7 +4,7 @@ orphan: true
 
 # v2 conformance status
 
-Generated 2026-10-08 at 8fba7e1 + a3c4df9 (fifth sweep); R3/X4 delta rows re-run at ea185df by the W8 sweep: every canonical case
+Generated 2026-10-08 at 8fba7e1 + a3c4df9 (fifth sweep); rows re-run at ea185df: R3/X4 deltas, fp16_bf16_gemm, kda_forward_portfolio_multishape by the W8 sweep: every canonical case
 (`tests/numsim/corpus/canonical_cases.py`) x {numsim, racecheck, synccheck} run under
 `NUMSIM_IMPL=v2` and compared with the legacy snapshots in `tirx_harness/tests/conformance/`
 (v2 may add source anchors to diagnostics legacy recorded without one; see
@@ -21,31 +21,23 @@ fail-closed reason); **crash** (engine runtime error or binder exception); **no 
 
 | mode | match | differs | incomplete | crash | no oracle |
 | --- | --- | --- | --- | --- | --- |
-| numsim | 98 | 0 | 0 | 0 | 3 |
-| racecheck | 98 | 0 | 0 | 0 | 3 |
-| synccheck | 98 | 0 | 0 | 0 | 3 |
+| numsim | 99 | 0 | 0 | 0 | 2 |
+| racecheck | 100 | 0 | 0 | 0 | 1 |
+| synccheck | 98 | 0 | 1 | 0 | 2 |
 
 ## Issues by root cause
 
 | issue | owner | cause | cases (modes) |
 | --- | --- | --- | --- |
-| V2C-TF1 (open) | W1 (gemm_async, copy_async), W12 (copy, permute_layout, fill, reduce) | Coverage regression: TVM's `TilePrimitiveDispatch` rejects tile ops in 58 public-API kernels that legacy compiled. Per amended Decision 6, v2 ports legacy's tile forms in `v2/lowering/tile_forms/`. | 58 kernels: gemm 18, copy 13, copy_async 10, permute 10, fill 4, reduce 3 (`tests/numsim/v2/tile_forms/legacy_compiled.tsv`) |
+| V2C-31 | synccheck | synccheck exhausts its state/transition budget where legacy completed within the same ResourceLimits | 1: `kda_forward_portfolio_multishape` (s) |
 
-## No-oracle cases (legacy cannot run them)
+## Cases without a legacy result
 
-These three snapshots record only the legacy exception, so the conformance test skips them under v2.
-After the legacy engine is deleted they are regenerated from v2 under the post-deletion policy.
-v2 results below are from a direct run at ea185df.
-
-| case | why there is no legacy result | v2 numsim | v2 racecheck | v2 synccheck |
-| --- | --- | --- | --- | --- |
-| `fp16_bf16_gemm` | Legacy lowering raises `UnsupportedTIRxError: unsupported host statement before tirx.device_entry: Evaluate` (host prelude), in all three modes. | clean; outputs match the independent reference | **error**: `scope_mismatch` (release `.cta` on warp 8 vs acquire `.cta` on warp 0, a cluster-2 kernel). Likely racecheck-behaviour-deltas B7 (default-`.cta` remote arrive); W5 to confirm before it becomes the v2 oracle. | clean |
-| `mla_dsv4_multishape` | Same legacy host-prelude `UnsupportedTIRxError`. | clean; outputs match the reference | clean | clean since ea185df (was `incomplete` at the 100k-state budget; sync-behaviour-deltas M14) |
-| `kda_forward_portfolio_multishape` | Neither engine runs it. The case (`prepare_native_kda_forward_case`) binds `cu` and `nseq`, but the installed `tirx_kernels` `kda_fwd` signature takes `items`/`item_counts` instead. Legacy and v2 both reject the unknown binding `cu` (`NumSimExecutionError` / `InputError`). This is a stale case, not a binder bug. | not run | not run | not run |
-
-`kda_forward_portfolio_multishape` needs its case updated to the current kernel signature (derive
-`items`/`item_counts` from the packed sequences) before it can be snapshotted from v2. Owner: corpus
-fixture (W9), not the binder.
+| case | legacy | v2 status |
+| --- | --- | --- |
+| `fp16_bf16_gemm` | Legacy lowering raises `UnsupportedTIRxError: unsupported host statement before tirx.device_entry: Evaluate` (host prelude) in all three modes. | numsim clean, outputs match the reference; synccheck clean (both still skipped: no oracle until the post-deletion regeneration). Racecheck has a v2 oracle now: `racecheck.delta.json`, racecheck-behaviour-deltas B7 (TMEM-teardown handshake, racecheck-semantics §11). |
+| `mla_dsv4_multishape` | Same legacy host-prelude `UnsupportedTIRxError`. | numsim clean, outputs match the reference; racecheck clean; synccheck clean since ea185df (M14). Skipped until the post-deletion regeneration from v2. |
+| `kda_forward_portfolio_multishape` | Runs since W9's fixture fix (binds `items`/`item_counts` from `packed_schedule`); legacy snapshots regenerated (clean in all modes). | numsim and racecheck match. Synccheck is `incomplete` (`resource_limit`) under the corpus budget (100k states, 180 s, 32 MB diagnostics), where legacy is clean: V2C-31 (synccheck budget). |
 
 ## Public-API legacy tests under v2
 
@@ -315,7 +307,7 @@ rest are v2 bugs for the named owner unless a delta row is added.
 | `flashinfer_rmsnorm` | match | match | match |
 | `flashinfer_rmsnorm_fp4quant` | match | match | match |
 | `flashinfer_rmsnorm_quant` | match | match | match |
-| `fp16_bf16_gemm` | no oracle | no oracle | no oracle |
+| `fp16_bf16_gemm` | no oracle | match | no oracle |
 | `gdn_cp_prefill_sm100` | match | match | match |
 | `gdn_decode_bf16_ilp4` | match | match | match |
 | `gdn_decode_bf16_wide_vec_mtp` | match | match | match |
@@ -325,7 +317,7 @@ rest are v2 bugs for the named owner unless a delta row is added.
 | `grouped_gemm_masked_rubin` | match | match | match |
 | `kda_backward_packed` | match | match | match |
 | `kda_decode_multishape` | match | match | match |
-| `kda_forward_portfolio_multishape` | no oracle | no oracle | no oracle |
+| `kda_forward_portfolio_multishape` | match | match | incomplete [V2C-31] |
 | `merge_state` | match | match | match |
 | `mla_dsv4_multishape` | no oracle | no oracle | no oracle |
 | `msa_decode_multishape` | match | match | match |
