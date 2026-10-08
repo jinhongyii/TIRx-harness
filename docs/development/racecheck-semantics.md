@@ -1245,6 +1245,39 @@ per-arrival sites); `checker_readers` went from 2.77 ms to 2.93 ms.
   - sites come from a per-warp `(epoch, site)` table, pruned by GC, and from
     the async slot.
 
+### Corpus true positive: TaskInfo read by a non-leader lane (`sm100_fp8_fp4_mega_moe`, deltas T19)
+
+One traced instance (CTA pair 2/3, stage 0):
+
+1. All 32 lanes of the load-A warp (warp 52, CTA3) read the published
+   TaskInfo with `lds128` (kernel.py:1795, `consumer_get_next_task`), after the
+   stage's full barrier. The finding's witness is lane 1 at epoch 841.
+2. Only the elected lane 0 then issues the task's TMA loads and arrives on the
+   leader CTA's smem-full barrier (kernel.py:2204, epoch 1121).
+   `warp_sync()` comes *after* that arrive (kernel.py:3152). The only lane
+   join before it is `elect.sync` (kernel.py:3118).
+3. Lane 0's chain: arrive → MMA warp's wait → MMAs → `tcgen05.commit` →
+   accumulator-full barrier → the epilogue threads' wait →
+   `scheduler_release_task_info` arrive on `task_info_empty[stage ^ 1]`
+   (kernel.py:1815) → the scheduler's wait (kernel.py:2029/3485) → the
+   remote `st.async` into the same TaskInfo bytes (warp 39,
+   `producer_publish_task`).
+4. Lane 1's read is in none of these releases. No warp barrier joins lane 1
+   to lane 0 before lane 0's arrive. The `warp_sync()` after the arrive feeds
+   only the next task's chain. That chain releases stage `k` when the
+   epilogue starts task `k + 1`, which needs task `k`'s accumulator but
+   nothing from the load-A warp's task `k + 1`.
+
+So no happens-before edge orders lane 1's read before the overwrite. The
+kernel relies on the lanes reaching `elect.sync` together. PTX defines
+`elect.sync` as an execution rendezvous only ("causes the executing thread to
+wait until all threads in the membermask execute the elect instruction"). Its
+description, unlike `bar.warp.sync`'s, gives no memory-ordering guarantee among
+the participating threads. The race stays after restoring every B7/R4
+scope-mismatch edge in a scratch build (20 of 25 occurrences), so it is not
+downstream of those edges. Fix in the kernel: `__syncwarp()` (bar.warp.sync)
+before the elected arrive, or have every lane arrive.
+
 ### Benchmarks
 
 `numsim-race-core/benches/core.rs`, same machine. "Before" is the phase-2
