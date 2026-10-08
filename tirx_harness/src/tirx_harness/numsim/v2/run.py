@@ -584,8 +584,15 @@ class Engine:
         raw = self._checker_run(module, bound, mode, extra)
         report_started = time.perf_counter()
         span_of_kernel = _kernel_span_resolver(module)
-        launches = {int(p.get("launch", i)): p for i, p in enumerate(raw.get("payloads") or ())}
+        payloads = list(raw.get("payloads") or ())
         reports = [json.loads(r) for r in raw.get("reports") or ()]
+        # Payloads and reports come one per launch, in launch order. A
+        # payload's own `launch` field is used only when it is consistent
+        # (a launch without sync events cannot name its kernel).
+        numbers = [int(r.get("launch", i)) for i, r in enumerate(reports)] or list(range(len(payloads)))
+        if len(set(numbers)) != len(numbers):
+            numbers = list(range(len(payloads)))
+        launches = dict(zip(numbers, payloads))
         base = launches.get(phase_index)
         if base is None:
             report = next((r for r in reports if int(r.get("launch", -1)) == phase_index), None)
@@ -596,10 +603,22 @@ class Engine:
                              for f in report.get("findings", ())],
                     status={}, diagnostics=[], coverage=report.get("coverage", ()),
                 )
-            else:
+            elif raw["status"].get("kind") not in (None, "completed"):
+                # Only the engine's own stop (RunStatus) prevents later
+                # launches; a checker verdict on an earlier launch never does.
+                stop = next((d for d in raw["diagnostics"] if d.get("source") == "run_status"), {})
+                failed = stop.get("kernel_index")
+                cause = f"{stop.get('kind')}: {stop.get('message') or stop.get('reason') or ''}".strip(": ")
                 base = {"verdict": "incomplete", "incomplete": [{
                     "kind": "analysis_incomplete", "status": "incomplete", "reason": "launch_not_executed",
-                    "message": f"launch {phase_index} did not run (an earlier launch stopped the module)",
+                    "stopped_kernel_index": failed,
+                    "message": (f"launch {phase_index} did not run: the engine stopped the module at "
+                                f"launch {failed} ({cause})"),
+                }]}
+            else:
+                base = {"verdict": "incomplete", "incomplete": [{
+                    "kind": "analysis_incomplete", "status": "incomplete", "reason": "no_checker_report",
+                    "message": f"the {mode} checker produced no report for launch {phase_index}",
                 }]}
         last_launch = max(launches) if launches else len(reports) - 1
         diagnostics = []

@@ -282,7 +282,19 @@ def normalize_records(
         key_fields["anchors"] = sorted(collect_anchors(record, resolver))
         key = json.dumps(key_fields, sort_keys=True)
         group = groups.setdefault(key, {**key_fields, "_bytes": {}})
+        columns = record.get("tmem_columns")
+        explicit_columns = (
+            isinstance(columns, (list, tuple)) and len(columns) == 2
+            and all(isinstance(c, int) and not isinstance(c, bool) for c in columns)
+        )
+        if explicit_columns:
+            # numsim-core states TMEM footprints as lane/column ranges
+            # (`tmem_columns`, in 4-byte columns); its byte spans are
+            # taddr-encoded and not comparable to legacy's lane*2048+col*4.
+            group["_bytes"].setdefault("tmem-columns", []).append((columns[0] * 4, columns[1] * 4))
         for region, start, end in _intervals(record):
+            if region.startswith("tmem") and explicit_columns:
+                continue
             if region.startswith("tmem"):
                 # TMEM offsets are lane * row + column. Which warp (lane
                 # quadrant) witnesses a conflict depends on the schedule, so

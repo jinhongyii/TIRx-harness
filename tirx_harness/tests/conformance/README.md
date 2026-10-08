@@ -47,8 +47,11 @@ any v2 run that raises `NotImplementedError` (unfinished numsim-core bodies).
   engines) and just the space for per-CTA windows (`shared`, `tmem`, `local`,
   `register`, `param`), whose allocation numbering is engine-internal
   (snapshot schema 2).
-  TMEM ranges are projected to column bytes (`tmem-columns#N`) because the lane
-  quadrant of the witnessing warp depends on the schedule.
+  TMEM ranges are projected to column bytes (`tmem-columns`) because the lane
+  quadrant of the witnessing warp depends on the schedule: legacy byte offsets
+  (`lane * 2048 + col * 4`) are reduced modulo the 2048-byte row; numsim-core
+  records carry `tmem_columns = [lo, hi)` (columns, x4 for bytes), which is
+  used instead of its taddr-encoded byte spans.
 - **exception**: `{"error": "<ExceptionType>"}` when the implementation raises
   before producing a payload.
 

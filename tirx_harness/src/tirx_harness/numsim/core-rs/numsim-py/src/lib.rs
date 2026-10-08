@@ -461,7 +461,7 @@ pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result
                 let mut reports = Vec::new();
                 // One check per launch; the kernel index flows from
                 // `SyncEvent.kernel` into `Report.launch` / `Evidence.kernel`.
-                for (_kernel, log) in &recorder.launches {
+                for (kernel, log) in &recorder.launches {
                     let mut sc = SynccheckConfig::default();
                     if let Some(budget) = request.state_budget {
                         sc.state_budget = budget;
@@ -480,7 +480,11 @@ pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result
                             _ => {}
                         }
                     }
-                    reports.push(synccheck::check(log, &sc));
+                    let mut report = synccheck::check(log, &sc);
+                    // A launch with no synchronization events has no kernel
+                    // index to infer `launch` from; the recorder knows it.
+                    report.launch = *kernel;
+                    reports.push(report);
                 }
                 let payloads = reports.iter().map(synccheck::serialize).collect();
                 Ok((outcome_result(outcome, reports.iter().map(Report::to_json).collect(), payloads), check_started))
@@ -703,7 +707,7 @@ mod py {
             let arg = arg_value(&name, &value)?;
             args.insert(name, arg);
         }
-        let inputs = Inputs { args };
+        let inputs = Inputs { args, ..Default::default() };
         let mut request = RunRequest::new(mode);
         request.backend = backend;
         request.workers = workers;
