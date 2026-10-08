@@ -98,6 +98,8 @@ pub fn issue_async(ctx: &mut ExecCtx<'_>, lanes: WarpMask, is: Issue) -> AsyncId
             strong: is.strong,
             bit_frags: Vec::new(),
             dead: Vec::new(),
+            a_reads: Vec::new(),
+            is_a_read: false,
         },
     );
     if is.queue {
@@ -247,6 +249,7 @@ pub fn cp_async(
             },
         );
         ctx.aux.groups.issue(group_res(ctx, l, Domain::CpAsync), op);
+        ctx.aux.cp_async_unpublished.entry((ctx.warp.id, l as u8)).or_default().push(op);
     }
     support::protocol(ctx, active, cmds, ProtoExtra::default());
     Ok(Flow::Next)
@@ -345,6 +348,9 @@ pub fn cp_async_mbar_arrive(ctx: &mut ExecCtx<'_>, mbar: Operand, space: AddrSpa
         let c = SyncCmd::AsyncGroup(async_group::Cmd::ArriveOn);
         let out = support::step(ctx, gres, c)?;
         all_cmds.push((gres, c));
+        // W5-11: when the arrive fires, every prior cp.async of this lane
+        // is published to that phase (AsyncComplete{Write, Phase}).
+        let prior = ctx.aux.cp_async_unpublished.remove(&(ctx.warp.id, l as u8)).unwrap_or_default();
         match out {
             Step::Done(Outcome::AsyncGroup(async_group::Outcome::ArriveOn { group: Some(ord) })) => {
                 if ctx.aux.groups.open.get(&gres).is_some_and(|v| !v.is_empty()) {
@@ -353,8 +359,16 @@ pub fn cp_async_mbar_arrive(ctx: &mut ExecCtx<'_>, mbar: Operand, space: AddrSpa
                     ctx.sync.completions.extend(due);
                 }
                 ctx.aux.groups.arrivals.entry((gres, ord)).or_default().push(arrival);
+                ctx.aux.cp_arrive_publish.entry((gres, ord)).or_default().push((res, gen, prior));
             }
-            Step::Done(_) => ctx.sync.completions.push_back(arrival),
+            Step::Done(_) => {
+                ctx.sync.completions.push_back(arrival);
+                // Nothing pending: the prior copies already landed.
+                for op in prior {
+                    let target = PublishTarget::Phase { obj: res, phase: gen };
+                    support::async_event(ctx, op, SyncKind::AsyncComplete { op, milestone: Side::Write, target });
+                }
+            }
             Step::Blocked(r) => return Ok(Flow::Blocked(r)),
         }
         targets.push(AsyncTarget { res, bytes: 0, arrivals: 1 });
@@ -682,6 +696,7 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
             }
             TmaDir::Reduce(op) => {
                 let dtype = desc.elem.ok_or_else(|| ctx.error(ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid), "tensor map without element type"))?;
+                crate::oplib::tma_reduce_valid(op, dtype).map_err(|e| support::op_err(ctx, e))?;
                 let src = plan.smem.iter().map(|s| (smem_alloc, *s)).collect();
                 (AsyncKind::TmaReduce, Payload::Reduce { op, dtype, src, dst: global })
             }
@@ -773,7 +788,12 @@ pub fn st_async(ctx: &mut ExecCtx<'_>, args: StAsyncArgs) -> HResult {
     let mut cmds = Vec::new();
     let mut all_targets = Vec::new();
     for l in active.lanes() {
-        let loc = support::resolve(ctx, AddrSpace::SharedCluster, lane_val(ctx, args.addr, l), l, n)?;
+        // `st.async` / `red.async` target `.shared::cluster` (32-bit
+        // window address) or, in the `.release.<scope>.global` form, global
+        // memory (a 64-bit address): never resolve a global address as shared.
+        let a = lane_val(ctx, args.addr, l);
+        let space = if a >> 32 != 0 { AddrSpace::Generic } else { AddrSpace::SharedCluster };
+        let loc = support::resolve(ctx, space, a, l, n)?;
         super::mem::check_align(ctx, loc, n, l)?;
         let mut b = [0u8; 32];
         lane_bytes(ctx, args.value, args.ty, l, &mut b);

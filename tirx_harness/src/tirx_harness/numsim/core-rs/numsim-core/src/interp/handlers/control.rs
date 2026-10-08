@@ -315,12 +315,17 @@ pub fn exit(ctx: &mut ExecCtx<'_>) -> HResult {
         support::step(ctx, res, cmd)?;
         support::protocol(ctx, lanes, vec![(res, cmd)], ProtoExtra::default());
     }
-    // Bulk issues are committed implicitly at exit.
+    // Bulk issues are committed implicitly at exit (logged as one Protocol
+    // event, W6-4 item 3).
+    let mut exit_cmds = Vec::new();
+    let mut exit_lanes = WarpMask::NONE;
     for lane in lanes.lanes() {
         let res = ResourceId::AsyncGroup { warp: ctx.warp.id, lane: lane as u8, domain: async_group::Domain::Bulk };
         if ctx.aux.groups.open.get(&res).is_some_and(|v| !v.is_empty()) {
             let cmd = SyncCmd::AsyncGroup(async_group::Cmd::Exit);
             support::step(ctx, res, cmd)?;
+            exit_cmds.push((res, cmd));
+            exit_lanes = exit_lanes.or(WarpMask::lane(lane));
             if let Some(crate::sync::Resource::AsyncGroup(s)) = ctx.sync.get(res) {
                 if let Some(g) = s.groups.back() {
                     let due = ctx.aux.groups.commit(res, g.ordinal);
@@ -328,6 +333,9 @@ pub fn exit(ctx: &mut ExecCtx<'_>) -> HResult {
                 }
             }
         }
+    }
+    if !exit_cmds.is_empty() {
+        support::protocol(ctx, exit_lanes, exit_cmds, ProtoExtra::default());
     }
     if ctx.warp.live.is_empty() {
         ctx.aux.exited_warps += 1;

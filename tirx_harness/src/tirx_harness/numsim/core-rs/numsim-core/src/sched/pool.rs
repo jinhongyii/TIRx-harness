@@ -51,6 +51,7 @@ impl Pool {
 
     /// Body of a pool thread (spawn it `workers` times inside a scope).
     pub(crate) fn worker(&self) {
+        let _fp = FpEnvGuard::enter();
         let mut seen = 0u64;
         loop {
             let task = {
@@ -102,6 +103,63 @@ impl Pool {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.quit = true;
         self.work.notify_all();
+    }
+}
+
+/// The engine's floating-point environment for the current thread
+/// (round-to-nearest-even, FTZ/DAZ off, as legacy `fp-env`), restoring the
+/// thread's previous environment when dropped: a run never inherits the
+/// caller's rounding mode or flush-to-zero, and never leaks its own.
+pub(crate) struct FpEnvGuard {
+    #[cfg(target_os = "linux")]
+    round: core::ffi::c_int,
+    #[cfg(target_arch = "x86_64")]
+    mxcsr: u32,
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn fegetround() -> core::ffi::c_int;
+    fn fesetround(round: core::ffi::c_int) -> core::ffi::c_int;
+}
+
+impl FpEnvGuard {
+    pub(crate) fn enter() -> FpEnvGuard {
+        #[cfg(target_os = "linux")]
+        // SAFETY: plain libc calls on the calling thread's environment.
+        let round = unsafe { fegetround() };
+        #[cfg(target_arch = "x86_64")]
+        #[allow(deprecated)]
+        // SAFETY: reading / writing MXCSR of the calling thread.
+        let mxcsr = unsafe {
+            let m = core::arch::x86_64::_mm_getcsr();
+            // FTZ (bit 15) and DAZ (bit 6) off.
+            core::arch::x86_64::_mm_setcsr(m & !((1 << 15) | (1 << 6)));
+            m
+        };
+        let _ = numsim_oplib::fpenv::set_round_to_nearest();
+        FpEnvGuard {
+            #[cfg(target_os = "linux")]
+            round,
+            #[cfg(target_arch = "x86_64")]
+            mxcsr,
+        }
+    }
+}
+
+impl Drop for FpEnvGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        // SAFETY: restores the value read in `enter`.
+        unsafe {
+            fesetround(self.round);
+        }
+        #[cfg(target_arch = "x86_64")]
+        #[allow(deprecated)]
+        // SAFETY: restores the value read in `enter`.
+        unsafe {
+            core::arch::x86_64::_mm_setcsr(self.mxcsr);
+        }
     }
 }
 

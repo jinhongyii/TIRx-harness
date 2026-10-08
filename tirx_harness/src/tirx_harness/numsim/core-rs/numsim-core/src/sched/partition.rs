@@ -463,8 +463,25 @@ impl Partition {
     /// Apply enabled sync completions in FIFO order until none is enabled.
     pub(crate) fn apply_completions(&mut self, env: &Env<'_>) -> Result<bool, ExecError> {
         let mut any = false;
+        // Passes over the queue (not a rescan from the head after every
+        // application, which was quadratic in the number of pending
+        // milestones): each pass applies enabled completions in queue
+        // order; another pass runs while the previous one applied any (an
+        // application can enable an earlier entry).
+        let mut start = 0usize;
+        let mut applied_in_pass = false;
         loop {
-            let Some(i) = self.sync.completions.iter().position(|c| self.sync.enabled(c)) else { break };
+            let found = self.sync.completions.iter().skip(start).position(|c| self.sync.enabled(c)).map(|k| k + start);
+            let Some(i) = found else {
+                if applied_in_pass {
+                    start = 0;
+                    applied_in_pass = false;
+                    continue;
+                }
+                break;
+            };
+            start = i;
+            applied_in_pass = true;
             let c = self.sync.completions.remove(i).expect("index valid");
             match self.sync.apply_completion(c) {
                 Ok(Step::Done(out)) => {
@@ -477,6 +494,25 @@ impl Partition {
                     {
                         if let Some(arr) = self.aux.groups.arrivals.remove(&(res, ordinal)) {
                             self.sync.completions.extend(arr);
+                        }
+                        // W5-11: the fired cp.async.mbarrier.arrive publishes
+                        // every prior cp.async of its lane to that phase.
+                        if let Some(pubs) = self.aux.cp_arrive_publish.remove(&(res, ordinal)) {
+                            if env.observing {
+                                for (mbar, gen, ops) in pubs {
+                                    for op in ops {
+                                        self.events.sync(&SyncEvent {
+                                            kernel: env.kernel,
+                                            actor: Actor::Async { op, side: Side::Write },
+                                            seq: 0,
+                                            site: SiteId::NONE,
+                                            frames: Vec::new(),
+                                            lanes: WarpMask::NONE,
+                                            kind: SyncKind::AsyncComplete { op, milestone: Side::Write, target: PublishTarget::Phase { obj: mbar, phase: gen } },
+                                        });
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -646,8 +682,32 @@ impl Partition {
                 _ => None,
             };
             let mut acc = Accesses::default();
-            acc.items = reads.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
-            support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, mk(Side::Read, AccessKind::Read), &mut acc);
+            // W5-10: the MMA's shared-A reads belong to its separate
+            // shared-A read op (reported when that op lands).
+            let a_reads: &[(AllocId, ByteSpan)] = meta.as_ref().map(|m| m.a_reads.as_slice()).unwrap_or(&[]);
+            let is_a_read = meta.as_ref().is_some_and(|m| m.is_a_read);
+            let reads: Vec<(AllocId, ByteSpan)> = if is_a_read {
+                a_reads.to_vec()
+            } else if a_reads.is_empty() {
+                reads.clone()
+            } else {
+                subtract_spans(&reads, a_reads)
+            };
+            // MMA / tcgen05.cp operand reads of shared memory are async-proxy
+            // reads (legacy reports a missing proxy fence there); TMEM stays
+            // in the tcgen proxy.
+            let tc_op = matches!(op.kind, crate::sync::AsyncKind::TcgenMma | crate::sync::AsyncKind::TcgenCp);
+            let (shared_reads, other_reads): (Vec<_>, Vec<_>) =
+                reads.iter().copied().partition(|&(a, _)| tc_op && arena.get(a).space == Space::Shared);
+            for (group, prox) in [(shared_reads, Proxy::Async), (other_reads, proxy)] {
+                if group.is_empty() {
+                    continue;
+                }
+                acc.items = group.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
+                let mut sp = mk(Side::Read, AccessKind::Read);
+                sp.proxy = prox;
+                support::emit_accesses(&mut self.events, &mut self.counters, &mut self.aux, arena, sp, &mut acc);
+            }
             let reduce_elem = match &op.payload {
                 Payload::Reduce { dtype, .. } | Payload::ReduceData { dtype, .. } => Some(dtype.mem_bytes() as u64),
                 _ => None,
@@ -747,6 +807,33 @@ impl Partition {
     }
 }
 
+/// `spans` minus every byte of `minus` (per allocation).
+fn subtract_spans(spans: &[(AllocId, ByteSpan)], minus: &[(AllocId, ByteSpan)]) -> Vec<(AllocId, ByteSpan)> {
+    let mut out = Vec::new();
+    for &(a, s) in spans {
+        let mut pieces = vec![s];
+        for &(ma, m) in minus.iter().filter(|(ma, _)| *ma == a) {
+            let _ = ma;
+            let mut next = Vec::new();
+            for p in pieces {
+                if !p.overlaps(m) {
+                    next.push(p);
+                    continue;
+                }
+                if p.start < m.start {
+                    next.push(ByteSpan::new(p.start, m.start - p.start));
+                }
+                if m.end() < p.end() {
+                    next.push(ByteSpan::new(m.end(), p.end() - m.end()));
+                }
+            }
+            pieces = next;
+        }
+        out.extend(pieces.into_iter().map(|p| (a, p)));
+    }
+    out
+}
+
 fn actor_warp(a: Actor) -> WarpId {
     match a {
         Actor::Warp { warp, .. } => warp,
@@ -760,6 +847,14 @@ fn copy_spans(arena: &mut Arena, src: &[(AllocId, ByteSpan)], dst: &[(AllocId, B
     let total = |v: &[(AllocId, ByteSpan)]| v.iter().map(|s| s.1.len).sum::<u64>();
     if total(src) != total(dst) {
         return Err(format!("copy length mismatch: {} vs {}", total(src), total(dst)));
+    }
+    // Common case (every source byte valid): gather once, scatter once.
+    if src.iter().all(|&(a, s)| arena.first_invalid(support::whole(arena, a), s).is_none() && !arena.get(a).metadata_only) {
+        let mut bytes = Vec::with_capacity(total(src) as usize);
+        for &(a, s) in src {
+            bytes.extend(arena.read_raw(a, s));
+        }
+        return scatter_bytes(arena, dst, &bytes);
     }
     let (mut si, mut so, mut di, mut doff) = (0usize, 0u64, 0usize, 0u64);
     while si < src.len() && di < dst.len() {
@@ -829,13 +924,38 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
     let reads: RefCell<Spans> = RefCell::new(Vec::new());
     let mut writes: Spans = Vec::new();
     let options = crate::oplib::TcMmaOptions { arch, ti16: p.args.kind == crate::program::TcMmaKind::Ti16, lut_b, ..Default::default() };
+    // oplib reads/writes one small piece at a time: record them merged with
+    // the previous piece when contiguous (most are), and read/write private
+    // (non-overlaid) allocations directly when every byte is valid.
+    fn note(v: &mut Spans, al: AllocId, span: ByteSpan) {
+        if let Some((la, ls)) = v.last_mut() {
+            if *la == al && ls.end() == span.start {
+                ls.len += span.len;
+                return;
+            }
+        }
+        v.push((al, span));
+    }
+    fn fast_read(ar: &Arena, al: AllocId, span: ByteSpan, out: &mut [u8]) -> bool {
+        if ar.is_overlaid(al) {
+            return false;
+        }
+        let a = ar.get(al);
+        if a.metadata_only || span.end() > a.size || a.valid.first_clear(span.start, span.len).is_some() {
+            return false;
+        }
+        out.copy_from_slice(&a.bytes[span.start as usize..span.end() as usize]);
+        true
+    }
     let smem = |cta: u32, a: u32, out: &mut [u8]| -> crate::oplib::OpResult {
         let al = *p.smem.get(cta as usize).ok_or_else(|| OpError::invalid("mma smem operand of a CTA outside the group"))?;
         let off = addr::decode_shared(a).1 as u64;
         let ar = cell.borrow();
         let span = ByteSpan::new(off, out.len() as u64);
-        ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
-        reads.borrow_mut().push((al, span));
+        if !fast_read(&ar, al, span, out) {
+            ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
+        }
+        note(&mut reads.borrow_mut(), al, span);
         Ok(())
     };
     let tmem_of = |cta: u32, lane: u32, col: u32| -> crate::oplib::OpResult<(AllocId, u64)> {
@@ -849,17 +969,25 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
         let (al, off) = tmem_of(cta, lane, col)?;
         let ar = cell.borrow();
         let span = ByteSpan::new(off, out.len() as u64);
-        ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
-        reads.borrow_mut().push((al, span));
+        if !fast_read(&ar, al, span, out) {
+            ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
+        }
+        note(&mut reads.borrow_mut(), al, span);
         Ok(())
     };
     let mut tmem_write = |cta: u32, lane: u32, col: u32, data: &[u8]| -> crate::oplib::OpResult {
         let (al, off) = tmem_of(cta, lane, col)?;
         let mut ar = cell.borrow_mut();
         let span = ByteSpan::new(off, data.len() as u64);
-        let v = support::whole(&ar, al);
-        ar.write(v, &[span], data).map_err(|e| OpError::invalid(e.to_string()))?;
-        writes.push((al, span));
+        if !ar.is_overlaid(al) && !ar.get(al).metadata_only && span.end() <= ar.get(al).size {
+            let a = ar.get_mut(al);
+            a.bytes[span.start as usize..span.end() as usize].copy_from_slice(data);
+            a.valid.set_range(span.start, span.len, true);
+        } else {
+            let v = support::whole(&ar, al);
+            ar.write(v, &[span], data).map_err(|e| OpError::invalid(e.to_string()))?;
+        }
+        note(&mut writes, al, span);
         Ok(())
     };
     crate::oplib::tc_mma_ctas(p, &options, &smem, &tmem_read, &mut tmem_write)?;

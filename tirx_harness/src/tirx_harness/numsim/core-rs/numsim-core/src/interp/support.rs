@@ -421,22 +421,45 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
                 None => (0, base_col),
             };
             let b = byte.ok_or_else(|| err(ctx, ExecErrorKind::OutOfBounds, lanes, "tmem offset overflows"))?;
-            if b < 0 || b % 4 != 0 || len % 4 != 0 {
+            // 8/16-bit elements pack `32 / bits` per 32-bit cell: element
+            // `idx` is in cell `idx / per_cell` at byte `(idx % per_cell) *
+            // bits / 8` (contract batch 4); the access must stay in its cell
+            // (a sub-word store is then a read-modify-write of the cell).
+            let bits = decl.dtype.elem.bits();
+            if matches!(bits, 8 | 16) && len > 4 {
+                return Err(unsupported(ctx, &format!("{}[{idx}]: a sub-word tmem vector spanning cells is not modelled", decl.name)));
+            }
+            if !matches!(bits, 8 | 16 | 32) {
+                return Err(unsupported(ctx, &format!("{}[{idx}]: {bits}-bit tmem elements are not modelled", decl.name)));
+            }
+            let packed = matches!(bits, 8 | 16) && len < 4;
+            let sub = if packed { b.rem_euclid(4) as u64 } else { 0 };
+            let bad = if packed { b < 0 || sub + len > 4 } else { b < 0 || b % 4 != 0 || len % 4 != 0 };
+            if bad {
                 return Err(err(ctx, ExecErrorKind::Misaligned, lanes, format!("{}[{idx}]: tmem access is not 32-bit aligned", decl.name)));
             }
             let word = (b / 4) as u64;
+            // `cols` is the row length in 32-bit cells (the view's last
+            // dimension, contract batch 4): element `idx` of an 8/16-bit view
+            // is lane `idx / (cols * per_cell)`, cell `(idx % (cols *
+            // per_cell)) / per_cell` — the byte offset `b` / 4 already is
+            // that linear cell index.
             let cols = cols.max(1) as u64;
             let tl = ((base_lane as u64 + word / cols) % addr::TMEM_LANES as u64) as u32;
             let col = base_col as u64 + word % cols;
-            let ncols = len / 4;
+            let ncols = len.div_ceil(4).max(1);
             if word % cols + ncols > cols || col + ncols > addr::TMEM_COLS as u64 {
                 return Err(unsupported(ctx, &format!("{}[{idx}]: tmem access crosses a lane row", decl.name)));
             }
+            // A warp accesses only the 32 TMEM lanes of its sub-partition
+            // (warp id % 4): anything else is a kernel bug.
             if tl / 32 != ctx.warp.warp_in_cta % 4 {
-                return Err(unsupported(ctx, &format!(
-                    "{}[{idx}]: tmem lane {tl} is outside warp {}'s sub-partition",
-                    decl.name, ctx.warp.warp_in_cta
-                )));
+                return Err(err(
+                    ctx,
+                    ExecErrorKind::BadAddress,
+                    lanes,
+                    format!("{}[{idx}]: tmem lane {tl} is outside warp {}'s sub-partition", decl.name, ctx.warp.warp_in_cta),
+                ));
             }
             if !tmem_live(ctx, col as u32, ncols as u32) {
                 // A TMEM access outside every live tcgen05 allocation is a
@@ -448,7 +471,7 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
                     format!("{}[{idx}]: tmem column {col} is not in a live tcgen05 allocation", decl.name),
                 ));
             }
-            let off = addr::tmem_byte_offset(tl, col as u32);
+            let off = addr::tmem_byte_offset(tl, col as u32) + sub;
             bounds(ctx, ctx.cta.tmem, off, len, lane)?;
             Ok(Loc { alloc: ctx.cta.tmem, offset: off, window: None, remote: None })
         }
@@ -739,6 +762,24 @@ pub fn sync_event(ctx: &mut ExecCtx<'_>, lanes: WarpMask, kind: SyncKind) {
         site: ctx.site(),
         frames: ctx.warp.loop_frames(ctx.program),
         lanes,
+        kind,
+    };
+    ctx.observer.sync(&e);
+}
+
+/// Emit a sync event on behalf of async op `op` (write side), as its
+/// landing does.
+pub fn async_event(ctx: &mut ExecCtx<'_>, op: crate::sync::AsyncId, kind: SyncKind) {
+    if !ctx.observing {
+        return;
+    }
+    let e = SyncEvent {
+        kernel: ctx.aux.kernel,
+        actor: Actor::Async { op, side: crate::observe::Side::Write },
+        seq: 0,
+        site: ctx.site(),
+        frames: Vec::new(),
+        lanes: WarpMask::NONE,
         kind,
     };
     ctx.observer.sync(&e);

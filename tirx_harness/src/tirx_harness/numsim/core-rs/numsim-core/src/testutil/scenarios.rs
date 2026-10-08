@@ -2887,10 +2887,207 @@ pub fn multicast_outside_cluster() -> Scenario {
     scenario("multicast_outside_cluster", b.build_module(), Inputs::default())
 }
 
+/// Contract batch 4: a 16-bit TMEM view (`implicit_tmem`) packs two
+/// elements per 32-bit cell: lane l stores u16 `l * 100 + j` to elements
+/// j = 0..4 of its row (cells 0..2) and reads them back; then lane l
+/// overwrites element 1 only (a cell read-modify-write) and reads the cell.
+pub fn tmem_subword() -> Scenario {
+    let mut b = ProgramBuilder::new("tmem_subword", 32);
+    let out = b.global("out", Dtype::U16);
+    let cells = b.global("cells", Dtype::U32);
+    let tm = b.per_lane("h_tmem", crate::arena::Space::Tmem, Dtype::U16, 128 * 4);
+    let tw = b.per_lane("w_tmem", crate::arena::Space::Tmem, Dtype::U32, 128 * 2);
+    let lane = b.reg(Ty::U32);
+    let idx = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    let h = b.reg(Ty::U16);
+    let c = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k2 = b.k_u32(2);
+    let k4 = b.k_u32(4);
+    let k100 = b.k_u32(100);
+    for j in 0..4u32 {
+        let kj = b.k_u32(j);
+        b.mul(Ty::U32, idx, lane, k4);
+        b.add_u32(idx, idx, kj);
+        b.mul(Ty::U32, v, lane, k100);
+        b.add_u32(v, v, kj);
+        b.cast(Ty::U32, Ty::U16, h, v);
+        b.st(Ty::U16, tm, idx, h);
+    }
+    b.push(Instr::TcgenWait { st: true });
+    for j in 0..4u32 {
+        let kj = b.k_u32(j);
+        b.mul(Ty::U32, idx, lane, k4);
+        b.add_u32(idx, idx, kj);
+        b.ld(Ty::U16, h, tm, idx);
+        b.st(Ty::U16, out, idx, h);
+    }
+    // Overwrite element 1 (high half of cell 0) with 0xBEEF.
+    let k1 = b.k_u32(1);
+    let kbeef = b.konst(Ty::U16, 0xbeef);
+    b.mul(Ty::U32, idx, lane, k4);
+    b.add_u32(idx, idx, k1);
+    b.st(Ty::U16, tm, idx, kbeef);
+    b.push(Instr::TcgenWait { st: true });
+    b.mul(Ty::U32, idx, lane, k2);
+    b.ld_u32(c, tw, idx);
+    b.st_u32(cells, lane, c);
+    b.exit();
+    let mut prog = b.build();
+    for d in prog.buffers.iter_mut() {
+        // TMEM view shapes count 32-bit cells per row: 4 u16 = 2 cells.
+        if d.name == "h_tmem" {
+            d.shape = vec![DimExpr::Const(128), DimExpr::Const(2)];
+        }
+        if d.name == "w_tmem" {
+            d.shape = vec![DimExpr::Const(128), DimExpr::Const(2)];
+        }
+    }
+    prog.requirements.implicit_tmem = true;
+    scenario(
+        "tmem_subword",
+        Module::new(vec![prog]),
+        inputs(vec![("out", ArgValue::Buffer { bytes: vec![0; 256], valid: None }), ("cells", u32_buf(vec![0; 32]))]),
+    )
+}
+
+/// W1 batch 4 repro: a 16-bit TMEM view with rows of 4 cells (8 elements);
+/// thread t of 2 warps writes elements `t*8 .. t*8+8` (TMEM lane t, warp 1
+/// in lanes 32..64) and reads them back.
+pub fn tmem_f16_rows() -> Scenario {
+    let mut b = ProgramBuilder::new("tmem_f16_rows", 64);
+    let out = b.global("out", Dtype::U16);
+    let tm = b.per_lane("physical", crate::arena::Space::Tmem, Dtype::F16, 128 * 8);
+    let tid = b.reg(Ty::U32);
+    let idx = b.reg(Ty::U32);
+    let h = b.reg(Ty::U16);
+    let v = b.reg(Ty::U32);
+    b.thread_rank(tid);
+    let k8 = b.k_u32(8);
+    for j in 0..8u32 {
+        let kj = b.k_u32(j);
+        b.mul(Ty::U32, idx, tid, k8);
+        b.add_u32(idx, idx, kj);
+        b.add_u32(v, idx, kj);
+        b.cast(Ty::U32, Ty::U16, h, v);
+        b.st(Ty::U16, tm, idx, h);
+    }
+    b.push(Instr::TcgenWait { st: true });
+    for j in 0..8u32 {
+        let kj = b.k_u32(j);
+        b.mul(Ty::U32, idx, tid, k8);
+        b.add_u32(idx, idx, kj);
+        b.ld(Ty::U16, h, tm, idx);
+        b.st(Ty::U16, out, idx, h);
+    }
+    b.exit();
+    let mut prog = b.build();
+    for d in prog.buffers.iter_mut() {
+        if d.name == "physical" {
+            d.shape = vec![DimExpr::Const(128), DimExpr::Const(4)];
+        }
+    }
+    prog.requirements.implicit_tmem = true;
+    scenario("tmem_f16_rows", Module::new(vec![prog]), inputs(vec![("out", ArgValue::Buffer { bytes: vec![0; 64 * 16], valid: None })]))
+}
+
+/// W5-11: warp 0's lanes `cp.async` a word each into shared memory and
+/// `cp.async.mbarrier.arrive.noinc` on `bar` (count 32); warp 1 waits on
+/// the phase and reads the words: the arrive publishes the copies to that
+/// phase (race-free).
+pub fn cp_async_mbar_publish() -> Scenario {
+    let mut b = ProgramBuilder::new("cp_async_mbar_publish", 64);
+    let input = b.global("in", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let sm = b.shared("s", Dtype::U32, 32);
+    let tid = b.reg(Ty::U32);
+    let w = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let barr = b.reg(Ty::U32);
+    let sa = b.reg(Ty::U32);
+    let ga = b.reg(Ty::U64);
+    let v = b.reg(Ty::U32);
+    b.thread_rank(tid);
+    b.warp_id(w);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    b.smem_addr(barr, bar, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, tid, k0);
+    b.if_(p);
+    b.mbar_init(barr, 32);
+    b.end_if();
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    b.bar_sync(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b.if_(p);
+    b.smem_addr(sa, sm, lane);
+    b.addr_of(ga, input, lane);
+    b.site("cp_async", 1);
+    b.push(Instr::CpAsync { dst: sa.into(), src: ga.into(), cp_size: 4, src_size: None, ignore_src: None, mods: MemMods::default() });
+    b.site("cp_async_mbar_arrive", 2);
+    b.push(Instr::CpAsyncMbarArrive { mbar: barr.into(), space: AddrSpace::Shared, noinc: true });
+    b.no_site();
+    b.else_();
+    b.site("consumer_wait", 3);
+    b.mbar_wait_parity(barr, k0);
+    b.no_site();
+    b.ld_u32(v, sm, lane);
+    b.st_u32(out, lane, v);
+    b.end_if();
+    b.exit();
+    scenario("cp_async_mbar_publish", b.build_module(), inputs(vec![("in", u32_buf((0..32).map(|i| i * 11 + 1))), ("out", u32_buf([0; 32]))]))
+}
+
+/// Contract batch 4 / W1: [`tma_load`] with its tensor map encoded by the
+/// host prelude from a spec whose box rows are a runtime `DimExpr`
+/// (`0 - neg_rows`, `neg_rows` an int32 -4: also checks scalar sign
+/// extension). Same output as [`tma_load`].
+pub fn tma_load_param_box() -> Scenario {
+    let mut s = tma_load();
+    let prog = &mut s.module.kernels[0];
+    let pid = ParamId(prog.host_abi.len() as u32);
+    prog.host_abi.push(ParamSlot {
+        name: "neg_rows".into(),
+        local_name: "neg_rows".into(),
+        aliases: vec![],
+        kind: ParamKind::Scalar,
+        dtype: Some(Ty::S32),
+        shape: vec![],
+        tensor_map: None,
+        implicit_base: None,
+        buf: None,
+    });
+    let src = ParamId(prog.host_abi.iter().position(|p| p.name == "src").expect("src") as u32);
+    let slot = prog.host_abi.iter_mut().find(|p| p.name == "tmap").expect("tmap");
+    slot.tensor_map = Some(TensorMapSpec {
+        dtype: Dtype::F32,
+        rank: 2,
+        global_dim: vec![DimExpr::Const(TMA_COLS as i64), DimExpr::Const(TMA_ROWS as i64)],
+        global_stride: vec![DimExpr::Const(TMA_COLS as i64 * 4)],
+        box_dim: vec![DimExpr::Const(TMA_COLS as i64), DimExpr::Sub(Box::new(DimExpr::Const(0)), Box::new(DimExpr::Param(pid)))],
+        element_stride: vec![DimExpr::Const(1), DimExpr::Const(1)],
+        interleave: 0,
+        swizzle: 0,
+        l2_promotion: 0,
+        oob_fill: 0,
+        base_offset: DimExpr::Const(0),
+        force_cu_dtype: None,
+    });
+    slot.implicit_base = Some(src);
+    prog.validate().expect("valid");
+    s.inputs.args.remove("tmap");
+    s.inputs.args.insert("neg_rows".into(), ArgValue::Scalar((-(TMA_BOX_ROWS as i32)) as u32 as u64));
+    s.name = "tma_load_param_box";
+    s
+}
+
 /// Scenarios that are deliberately racy or only meaningful with a specific
 /// configuration (each test states its expectation): not in [`all`].
 pub fn special() -> Vec<Scenario> {
-    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE)]
+    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), tmem_subword(), tmem_f16_rows(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE)]
 }
 
 /// Writes in [`word_history_overflow`] past `MAX_WORD_HISTORY`.
@@ -2950,6 +3147,8 @@ pub fn all() -> Vec<Scenario> {
         tcgen_exclusive_576("sm_100a"),
         reg_buffer_uninit(),
         mapa_cluster_arrive(),
+        tma_load_param_box(),
+        cp_async_mbar_publish(),
         fp4_tma_store(),
         physical_sregs(),
         multicast_outside_cluster(),

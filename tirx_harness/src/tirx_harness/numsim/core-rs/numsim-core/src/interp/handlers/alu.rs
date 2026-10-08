@@ -159,6 +159,23 @@ pub fn unary(ctx: &mut ExecCtx<'_>, op: UnOp, ty: Ty, dst: Reg, a: Operand) -> H
     Ok(Flow::Next)
 }
 
+/// An ALU error names the lanes that fault (e.g. the divide-by-zero lane),
+/// not the whole active mask: re-run lane by lane (error path only).
+#[cold]
+fn narrow(ctx: &ExecCtx<'_>, e: oplib::OpError, mask: WarpMask, mut f: impl FnMut(WarpMask) -> oplib::OpResult) -> crate::interp::ExecError {
+    let mut bad = 0u32;
+    for l in mask.lanes() {
+        if f(WarpMask::lane(l)).is_err() {
+            bad |= 1 << l;
+        }
+    }
+    let mut err = support::op_err(ctx, e);
+    if bad != 0 {
+        err.lanes = WarpMask(bad);
+    }
+    err
+}
+
 #[inline]
 pub fn binary(ctx: &mut ExecCtx<'_>, op: BinOp, ty: Ty, dst: Reg, a: Operand, b: Operand) -> HResult {
     active_or_next!(ctx);
@@ -168,7 +185,10 @@ pub fn binary(ctx: &mut ExecCtx<'_>, op: BinOp, ty: Ty, dst: Reg, a: Operand, b:
         let sa = [ctx.read_slot(a, 0)];
         let sb = [ctx.read_slot(b, 0)];
         let mut out = [[0u64; 32]];
-        oplib::binary(op, ty, &sa, &sb, &mut out, mask).map_err(|e| support::op_err(ctx, e))?;
+        if let Err(e) = oplib::binary(op, ty, &sa, &sb, &mut out, mask) {
+            let mut tmp = [[0u64; 32]];
+            return Err(narrow(ctx, e, mask, |m| oplib::binary(op, ty, &sa, &sb, &mut tmp, m)));
+        }
         let s = ctx.slot(dst);
         support::write_masked(ctx.warp.regs.get_mut(s), &out[0], mask);
         return Ok(Flow::Next);
@@ -178,8 +198,10 @@ pub fn binary(ctx: &mut ExecCtx<'_>, op: BinOp, ty: Ty, dst: Reg, a: Operand, b:
     support::gather(ctx, a, n, &mut sa);
     support::gather(ctx, b, n, &mut sb);
     let mut out = zero_slots();
-    oplib::binary(op, ty, &sa[..n as usize], &sb[..n as usize], &mut out[..n as usize], mask)
-        .map_err(|e| support::op_err(ctx, e))?;
+    if let Err(e) = oplib::binary(op, ty, &sa[..n as usize], &sb[..n as usize], &mut out[..n as usize], mask) {
+        let mut tmp = zero_slots();
+        return Err(narrow(ctx, e, mask, |m| oplib::binary(op, ty, &sa[..n as usize], &sb[..n as usize], &mut tmp[..n as usize], m)));
+    }
     support::scatter(ctx, dst, reg_ty(ctx, dst).slots().min(n), &out, mask);
     Ok(Flow::Next)
 }
@@ -194,7 +216,10 @@ pub fn ternary(ctx: &mut ExecCtx<'_>, op: TerOp, ty: Ty, dst: Reg, a: Operand, b
         let sb = [ctx.read_slot(b, 0)];
         let sc = [ctx.read_slot(c, 0)];
         let mut out = [[0u64; 32]];
-        oplib::ternary(op, ty, &sa, &sb, &sc, &mut out, mask).map_err(|e| support::op_err(ctx, e))?;
+        if let Err(e) = oplib::ternary(op, ty, &sa, &sb, &sc, &mut out, mask) {
+            let mut tmp = [[0u64; 32]];
+            return Err(narrow(ctx, e, mask, |m| oplib::ternary(op, ty, &sa, &sb, &sc, &mut tmp, m)));
+        }
         let s = ctx.slot(dst);
         support::write_masked(ctx.warp.regs.get_mut(s), &out[0], mask);
         return Ok(Flow::Next);
@@ -207,7 +232,10 @@ pub fn ternary(ctx: &mut ExecCtx<'_>, op: TerOp, ty: Ty, dst: Reg, a: Operand, b
     support::gather(ctx, c, n, &mut sc);
     let mut out = zero_slots();
     let k = n as usize;
-    oplib::ternary(op, ty, &sa[..k], &sb[..k], &sc[..k], &mut out[..k], mask).map_err(|e| support::op_err(ctx, e))?;
+    if let Err(e) = oplib::ternary(op, ty, &sa[..k], &sb[..k], &sc[..k], &mut out[..k], mask) {
+        let mut tmp = zero_slots();
+        return Err(narrow(ctx, e, mask, |m| oplib::ternary(op, ty, &sa[..k], &sb[..k], &sc[..k], &mut tmp[..k], m)));
+    }
     support::scatter(ctx, dst, reg_ty(ctx, dst).slots().min(n), &out, mask);
     Ok(Flow::Next)
 }

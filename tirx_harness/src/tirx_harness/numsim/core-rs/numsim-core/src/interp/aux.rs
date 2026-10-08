@@ -42,6 +42,11 @@ pub struct AsyncMeta {
     /// Sub-byte TMA stores (FP4/U6 maps, oplib `TmaPlan::global_bits`):
     /// masked partial-byte writes applied after the byte spans.
     pub bit_frags: Vec<BitFrag>,
+    /// tcgen05.mma with a shared-memory A: the MMA op excludes these A
+    /// spans from its read accesses; the separate shared-A read op
+    /// (`MmaSharedARead`, `is_a_read`) reports them (W5-10).
+    pub a_reads: Vec<(AllocId, ByteSpan)>,
+    pub is_a_read: bool,
     /// `cp.async.bulk .ignore_oob` dead destination bytes: written as zero
     /// and left *uninitialized* (legacy `raw_bulk_copy_g2s_cta_ignore_oob`
     /// writes `0` with validity `false`), so a later read reports.
@@ -86,6 +91,13 @@ impl GroupTracker {
     /// completions that are due immediately (every member already landed).
     pub fn commit(&mut self, res: ResourceId, ordinal: u64) -> Vec<Completion> {
         let ops = self.open.remove(&res).unwrap_or_default();
+        if ops.is_empty() {
+            // An empty group is born complete in the protocol state
+            // (`async_group::close`): no milestone completion to queue (one
+            // would never be enabled and would sit in the queue forever).
+            self.members.insert((res, ordinal), ops);
+            return Vec::new();
+        }
         let mut pending = 0u32;
         for &op in &ops {
             if self.landed_open.remove(&op) {
@@ -291,6 +303,8 @@ pub struct PairRendezvous {
     pub epoch: u64,
     /// Result of each committed instance (alloc base), by epoch.
     pub results: BTreeMap<u64, u32>,
+    /// Member warps of each committed instance, by epoch.
+    pub participants: BTreeMap<u64, Vec<WarpId>>,
 }
 
 /// Cooperative grid barrier.
@@ -332,8 +346,8 @@ pub struct LaunchAux {
     pub tcgen_pairs: HashMap<(CtaId, u8), PairRendezvous>,
     /// Last tcgen05 pipelined op issued by each CTA (pipeline order).
     pub tcgen_last: HashMap<CtaId, AsyncId>,
-    /// tcgen05 mma/cp ops per issuing thread that may still be in flight
-    /// (a commit tracks every one of them that has not landed).
+    /// tcgen05 mma/cp ops per issuing thread issued since its last
+    /// unrestricted commit.
     pub tcgen_uncommitted: HashMap<(WarpId, u8), Vec<AsyncId>>,
     /// tcgen05.ld/st ops not yet waited, per warp: (op, lanes, is_store).
     pub tcgen_ldst: HashMap<WarpId, Vec<(AsyncId, WarpMask, bool)>>,
@@ -365,6 +379,22 @@ pub struct LaunchAux {
     /// Protocol event, logged at completion, carries that contribution even
     /// if exits shrank the count-less barrier meanwhile).
     pub named_registered: HashMap<WarpId, u64>,
+    /// Shared-A read ops (`MmaSharedARead`) per issuing thread that a
+    /// `tcgen05.commit.sync_restrict` tracks (W5-10).
+    pub tcgen_shared_reads: HashMap<(WarpId, u8), Vec<AsyncId>>,
+    /// Ops already tracked by an earlier (unrestricted / restricted) commit
+    /// of the thread that may still be in flight (pruned when they land).
+    pub tcgen_inflight: HashMap<(WarpId, u8), Vec<AsyncId>>,
+    pub tcgen_inflight_shared: HashMap<(WarpId, u8), Vec<AsyncId>>,
+    /// Cache of shared-A footprints per (A descriptor, B descriptor, idesc,
+    /// cta_group): window (cta, address, len) reads.
+    pub mma_a_footprints: HashMap<(u64, u64, u32, u8), Vec<(u32, u32, u32)>>,
+    /// cp.async ops per issuing thread not yet covered by a
+    /// `cp.async.mbarrier.arrive` (W5-11).
+    pub cp_async_unpublished: HashMap<(WarpId, u8), Vec<AsyncId>>,
+    /// Deferred `cp.async.mbarrier.arrive`s per (group, ordinal): the
+    /// (mbarrier, phase, prior cp.async ops) published when it fires.
+    pub cp_arrive_publish: HashMap<(ResourceId, u64), Vec<(ResourceId, u64, Vec<AsyncId>)>>,
     /// Next collective instance id.
     pub next_collective: u64,
     /// Next async op id (partition-scoped: high bits name the partition).

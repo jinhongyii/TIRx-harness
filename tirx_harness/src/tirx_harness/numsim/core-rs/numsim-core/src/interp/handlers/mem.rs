@@ -42,6 +42,21 @@ fn note_load_poll(ctx: &mut ExecCtx<'_>, sem: Sem, alloc: crate::arena::AllocId,
     }
 }
 
+/// `ld.global.nc ... ldu`-style uniform loads (`MemMods::uniform`): every
+/// active lane must read the same address (PTX `ldu`).
+#[inline]
+fn check_uniform(ctx: &ExecCtx<'_>, mods: &MemMods, first: Loc, loc: Loc, lane: usize) -> Result<(), ExecError> {
+    if mods.uniform && (first.alloc != loc.alloc || first.offset != loc.offset) {
+        return Err(support::err(
+            ctx,
+            ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+            WarpMask::lane(lane),
+            "ldu: the address is not uniform across the active lanes",
+        ));
+    }
+    Ok(())
+}
+
 #[inline]
 fn load_proxy(mods: &MemMods) -> Proxy {
     if mods.nc {
@@ -100,7 +115,7 @@ fn fast_offset(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, n: u64, len: u64, abs_base
 pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, sem: Sem, scope: Scope, mods: MemMods) -> HResult {
     active_or_next!(ctx);
     let n = ty.mem_bytes() as u64;
-    if n <= 8 && ty.slots() == 1 {
+    if n <= 8 && ty.slots() == 1 && !mods.uniform {
         if let Some((alloc, base, len, window)) = fast_target(ctx, buf) {
             let active = ctx.warp.active;
             let mut vals = [0u64; 32];
@@ -156,7 +171,7 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
         check_align(ctx, loc, n, l)?;
         support::mem_read(ctx, loc, l, &mut bytes[..n as usize])?;
         write_lane_bytes(ctx, dst, l, &bytes[..n as usize]);
-        first.get_or_insert(loc);
+        check_uniform(ctx, &mods, *first.get_or_insert(loc), loc, l)?;
         if ctx.observing {
             acc.push(loc, l as u8, n);
         }
@@ -244,7 +259,7 @@ pub fn load_addr(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, a: Operand, space: Add
         check_align(ctx, loc, n, l)?;
         support::mem_read(ctx, loc, l, &mut bytes[..n as usize])?;
         write_lane_bytes(ctx, dst, l, &bytes[..n as usize]);
-        first.get_or_insert(loc);
+        check_uniform(ctx, &mods, *first.get_or_insert(loc), loc, l)?;
         if ctx.observing {
             acc.push(loc, l as u8, n);
         }

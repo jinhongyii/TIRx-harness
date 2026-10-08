@@ -1066,3 +1066,103 @@ fn ignore_oob_count_range_is_checked() {
         other => panic!("expected an ignore_oob range error, got {other:?}"),
     }
 }
+
+/// Contract batch 4: sub-word TMEM cells.
+#[test]
+fn tmem_subword_cells_pack_and_rmw() {
+    let o = run(&scenarios::tmem_subword());
+    completed(&o);
+    let out: Vec<u16> = o.outputs.buffers["out"].0.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let want: Vec<u16> = (0..128u32).map(|i| ((i / 4) * 100 + i % 4) as u16).collect();
+    assert_eq!(out, want);
+    let cells = u32s(&o, "cells");
+    for l in 0..32u32 {
+        assert_eq!(cells[l as usize], (0xbeefu32 << 16) | (l * 100), "lane {l}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn fegetround() -> i32;
+    fn fesetround(round: i32) -> i32;
+}
+
+/// W4-14: a run does not inherit the caller's rounding mode, and restores
+/// it afterwards (workers 1 and 4).
+#[cfg(target_os = "linux")]
+#[test]
+fn run_uses_its_own_fp_environment_and_restores_the_callers() {
+    use numsim_core::dtype::{Dtype, Ty};
+    use numsim_core::program::BinOp;
+    use numsim_core::testutil::ProgramBuilder;
+    const FE_DOWNWARD: i32 = 0x400;
+    let mut b = ProgramBuilder::new("fp_env", 32);
+    b.grid(4, 1, 1);
+    let x = b.global("x", Dtype::F32);
+    let out = b.global("out", Dtype::F32);
+    let lane = b.reg(Ty::U32);
+    let v = b.reg(Ty::F32);
+    let w = b.reg(Ty::F32);
+    b.lane_id(lane);
+    b.ld_f32(v, x, lane);
+    let k3 = b.k_f32(3.0);
+    b.binary(BinOp::Div, Ty::F32, w, v, k3);
+    b.add_f32(w, w, v);
+    b.st_f32(out, lane, w);
+    b.exit();
+    let module = b.build_module();
+    let inputs = scenarios::inputs(vec![("x", scenarios::f32_buf((0..32).map(|i| 1.0 + i as f32 * 0.1))), ("out", scenarios::f32_buf([0.0; 32]))]);
+    let run_it = |workers| {
+        let cfg = RunConfig { workers, ..RunConfig::default() };
+        sched::run_with_config(&module, &inputs, &mut numsim_core::observe::NoopObserver, &Backend::Interp, &cfg).unwrap().outputs
+    };
+    let reference = run_it(1);
+    for workers in [1, 4] {
+        // SAFETY: test-thread rounding mode, restored below.
+        unsafe { fesetround(FE_DOWNWARD) };
+        let o = run_it(workers);
+        let mode = unsafe { fegetround() };
+        unsafe { fesetround(0) };
+        assert_eq!(mode, FE_DOWNWARD, "caller's rounding mode restored");
+        assert_eq!(o, reference, "workers={workers}: results independent of the caller's rounding");
+    }
+}
+
+/// W1 batch 4: 16-bit TMEM view rows map to the right lanes (warp 1 in
+/// lanes 32..64).
+#[test]
+fn tmem_f16_view_lanes() {
+    let o = run(&scenarios::tmem_f16_rows());
+    completed(&o);
+    let out: Vec<u16> = o.outputs.buffers["out"].0.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let want: Vec<u16> = (0..512u32).map(|i| (i + i % 8) as u16).collect();
+    assert_eq!(out, want);
+}
+
+/// W5-11: cp.async published through cp.async.mbarrier.arrive.
+#[test]
+fn cp_async_mbarrier_arrive_publishes_copies() {
+    for seed in 0..4 {
+        let s = scenarios::cp_async_mbar_publish();
+        let mut log = RecordingObserver::new();
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut log, &Backend::Interp, &RunConfig { seed, ..s.config.clone() }).unwrap();
+        completed(&o);
+        assert_eq!(u32s(&o, "out"), (0..32).map(|i| i * 11 + 1).collect::<Vec<_>>());
+        let published = all_events(&log)
+            .iter()
+            .filter(|e| matches!(e.kind, SyncKind::AsyncComplete { target: numsim_core::observe::PublishTarget::Phase { .. }, .. }))
+            .count();
+        assert_eq!(published, 32, "every lane's copy is published to the phase");
+    }
+}
+
+/// Contract batch 4: a host-prelude tensor map with a runtime box gives the
+/// same result as the bound static map.
+#[test]
+fn param_dependent_tensor_map_box() {
+    let a = run(&scenarios::tma_load());
+    let b = run(&scenarios::tma_load_param_box());
+    completed(&a);
+    completed(&b);
+    assert_eq!(a.outputs.buffers["out"], b.outputs.buffers["out"]);
+}

@@ -1018,6 +1018,9 @@ impl<'p> Scheduler<'p> {
             }
         }
         let workers = self.config.workers.max(1);
+        // Deterministic numerics: the engine's FP environment on this
+        // thread for the whole run, the caller's restored afterwards.
+        let _fp = pool::FpEnvGuard::enter();
         let result = if workers > 1 && !self.single {
             // A launch-lifetime pool; the calling thread is one of the workers.
             let pool = pool::Pool::new(workers - 1);
@@ -1496,7 +1499,19 @@ pub fn resolve_launch(program: &Program, inputs: &Inputs) -> Result<LaunchShape,
 fn scalar_param(program: &Program, inputs: &Inputs, p: crate::program::ParamId) -> Option<i64> {
     let slot = program.host_abi.get(p.0 as usize)?;
     match lookup(inputs, slot) {
-        Some(ArgValue::Scalar(v)) => return Some(*v as i64),
+        // Scalar bits are the parameter's raw bits: sign- or zero-extend by
+        // its declared type (an int32 -7 arrives as 0xFFFF_FFF9).
+        Some(ArgValue::Scalar(v)) => {
+            let v = *v;
+            return Some(match slot.dtype {
+                Some(t) if t.elem.is_signed_int() && t.elem.bits() < 64 => {
+                    let sh = 64 - t.elem.bits();
+                    ((v << sh) as i64) >> sh
+                }
+                Some(t) if t.elem.bits() < 64 => (v & ((1u64 << t.elem.bits()) - 1)) as i64,
+                _ => v as i64,
+            });
+        }
         Some(_) => return None,
         None => {}
     }
@@ -1727,17 +1742,21 @@ fn encode_spec(spec: &crate::program::TensorMapSpec, va: u64, scalar: &dyn Fn(cr
     for (i, e) in spec.global_stride.iter().enumerate().take(5) {
         d.global_stride[i] = ev(e)? as u64;
     }
-    for (i, &b) in spec.box_dim.iter().enumerate().take(5) {
-        d.box_dim[i] = b;
+    let ev32 = |e: &crate::program::DimExpr, what: &str| -> Result<u32, String> {
+        let v = ev(e)?;
+        u32::try_from(v).map_err(|_| format!("tensor-map {what} {v} out of range"))
+    };
+    for (i, b) in spec.box_dim.iter().enumerate().take(5) {
+        d.box_dim[i] = ev32(b, "box dim")?;
     }
-    for (i, &b) in spec.element_stride.iter().enumerate().take(5) {
-        d.element_stride[i] = b;
+    for (i, b) in spec.element_stride.iter().enumerate().take(5) {
+        d.element_stride[i] = ev32(b, "element stride")?;
     }
     d.interleave = spec.interleave;
     d.swizzle = spec.swizzle;
     d.l2_promotion = spec.l2_promotion;
     d.oob_fill = spec.oob_fill;
-    Ok(d.encode().to_vec())
+    d.try_encode().map(|b| b.to_vec()).map_err(|e| format!("host tensor-map encode failed: {}", e.message))
 }
 
 /// Run every kernel of `module` in order. Host buffers are allocated once

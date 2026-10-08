@@ -750,6 +750,15 @@ impl Arena {
         }
         let n = sspan.len as usize;
         let mut bytes = vec![0u8; n];
+        // Common case: every source byte valid -> one bulk store.
+        if self.first_clear(sid, sspan).is_none() {
+            self.pieces(sid, sspan, |b, _, at, off, len| {
+                let d = (off - sspan.start) as usize;
+                bytes[d..d + len as usize].copy_from_slice(&b[at as usize..(at + len) as usize]);
+            });
+            self.put(did, ByteSpan::new(doff, sspan.len), Put::Bytes(&bytes));
+            return Ok(());
+        }
         let mut valid = vec![false; n];
         self.pieces(sid, sspan, |b, v, at, off, len| {
             let d = (off - sspan.start) as usize;

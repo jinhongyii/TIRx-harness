@@ -103,8 +103,15 @@ fn pair_rendezvous(ctx: &mut ExecCtx<'_>, kind: u8) -> Pair {
 
 fn pair_committed(ctx: &mut ExecCtx<'_>, kind: u8, epoch: u64, value: u32) {
     let pair = pair_cta(ctx);
+    let me = ctx.warp.id;
     let rv = ctx.aux.tcgen_pairs.entry((pair, kind)).or_default();
     rv.results.insert(epoch, value);
+    // Both member warps of the instance (W6-4: every record lists the full
+    // participant set).
+    let mut members: Vec<crate::observe::WarpId> = rv.first.map(|f| f.1).into_iter().chain(std::iter::once(me)).collect();
+    members.sort();
+    members.dedup();
+    rv.participants.insert(epoch, members);
     rv.epoch = epoch + 1;
     rv.first = None;
     ctx.warp.resume = None;
@@ -112,7 +119,13 @@ fn pair_committed(ctx: &mut ExecCtx<'_>, kind: u8, epoch: u64, value: u32) {
 
 fn pair_collective(ctx: &ExecCtx<'_>, epoch: u64, kind: u8) -> Collective {
     let pair = pair_cta(ctx);
-    Collective { id: (1u64 << 63) | ((pair.0 as u64) << 24) | ((kind as u64) << 20) | epoch, participants: vec![ctx.warp.id] }
+    let participants = ctx
+        .aux
+        .tcgen_pairs
+        .get(&(pair, kind))
+        .and_then(|rv| rv.participants.get(&epoch).cloned())
+        .unwrap_or_else(|| vec![ctx.warp.id]);
+    Collective { id: (1u64 << 63) | ((pair.0 as u64) << 24) | ((kind as u64) << 20) | epoch, participants }
 }
 
 #[inline]
@@ -146,10 +159,14 @@ pub fn tcgen_alloc(ctx: &mut ExecCtx<'_>, dst: Operand, ncols: Operand, cta_grou
     match support::step(ctx, res, cmd)? {
         Step::Blocked(r) => Ok(Flow::Blocked(r)),
         Step::Done(Outcome::Tcgen(tcgen::Outcome::Allocated { base })) => {
-            if let Some((e, _)) = &collective {
-                pair_committed(ctx, 0, *e, base);
-            }
-            let extra = ProtoExtra { collective: collective.map(|c| c.1), ..Default::default() };
+            let collective = match collective {
+                Some((e, _)) => {
+                    pair_committed(ctx, 0, e, base);
+                    Some(pair_collective(ctx, e, 0))
+                }
+                None => None,
+            };
+            let extra = ProtoExtra { collective, ..Default::default() };
             support::protocol(ctx, active, vec![(res, cmd)], extra);
             write_taddr(ctx, dst, base)?;
             Ok(Flow::Next)
@@ -275,14 +292,31 @@ pub fn tcgen_commit(
         // operations of this thread, not only those since its last commit:
         // every one still in flight (a second commit right after a first
         // must not complete before the mma ops the first one tracks).
-        let tracked: Vec<AsyncId> = match ctx.aux.tcgen_uncommitted.get_mut(&(ctx.warp.id, l as u8)) {
-            Some(v) => {
-                let live = &ctx.sync.async_ops;
-                v.retain(|id| live.iter().any(|o| o.id == *id));
-                v.clone()
-            }
-            None => Vec::new(),
+        // `.sync_restrict` (W5-10): only the shared-A reads are tracked;
+        // the MMA itself stays for a later unrestricted commit.
+        // Tracked = every op issued since the previous commit of this kind
+        // (landed or not: the commit's preds name them) plus earlier
+        // committed ops still in flight.
+        let restricted = sync_restrict && multicast.is_none();
+        let key = (ctx.warp.id, l as u8);
+        let fresh = if restricted {
+            ctx.aux.tcgen_shared_reads.remove(&key).unwrap_or_default()
+        } else {
+            ctx.aux.tcgen_uncommitted.remove(&key).unwrap_or_default()
         };
+        let inflight = if restricted { &mut ctx.aux.tcgen_inflight_shared } else { &mut ctx.aux.tcgen_inflight };
+        let earlier = inflight.entry(key).or_default();
+        {
+            let live = &ctx.sync.async_ops;
+            earlier.retain(|id| live.iter().any(|o| o.id == *id));
+        }
+        let mut tracked = earlier.clone();
+        for id in fresh {
+            if !tracked.contains(&id) {
+                tracked.push(id);
+            }
+            earlier.push(id);
+        }
         let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
         if sync_restrict && multicast.is_none() {
             if let ResourceId::Mbarrier { cta, .. } = res {
@@ -532,6 +566,7 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
 #[inline]
 pub fn tcgen_wait(ctx: &mut ExecCtx<'_>, st: bool) -> HResult {
     active_or_next!(ctx);
+    full_warp(ctx, if st { "tcgen05.wait::st" } else { "tcgen05.wait::ld" })?;
     let active = ctx.warp.active;
     let w = if st { tcgen::WorkCmd::WaitSt } else { tcgen::WorkCmd::WaitLd };
     let cmds: Vec<_> = active.lanes().map(|l| (work_res(ctx, l), SyncCmd::TcgenWork(w))).collect();
@@ -627,6 +662,7 @@ pub fn tcgen_cp(ctx: &mut ExecCtx<'_>, args: TcgenCpArgs) -> HResult {
     Ok(Flow::Next)
 }
 
+
 #[inline]
 pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
     active_or_next!(ctx);
@@ -672,7 +708,20 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
             scale_taddrs: args.block_scale.map(|(sa, sb, _)| (v(sa) as u32, v(sb) as u32)),
             scale_input_d: args.scale_input_d.map(|o| v(o) as u32),
             sparse_meta: args.sparse_meta.map(|o| v(o) as u32),
-            disable_output_lane: args.disable_output_lane.iter().map(|&o| v(o) as u32).collect(),
+            // A `.ws` zero-column mask is one 64-bit operand: pass it as
+            // [low, high] words (oplib reads both; W4-15).
+            disable_output_lane: args
+                .disable_output_lane
+                .iter()
+                .flat_map(|&o| {
+                    let x = v(o);
+                    if args.ws && support::operand_ty(ctx, o).bits() == 64 {
+                        vec![x as u32, (x >> 32) as u32]
+                    } else {
+                        vec![x as u32]
+                    }
+                })
+                .collect(),
             smem,
             tmem,
         };
@@ -683,6 +732,7 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
         support::step_all(ctx, &batch)?;
         all.extend(batch);
         let after: Vec<AsyncId> = ctx.aux.tcgen_last.get(&ctx.cta.id).copied().into_iter().collect();
+        let mma_payload = matches!(args.a, TcA::Smem(_)).then(|| payload.clone());
         let op = issue_async(
             ctx,
             WarpMask::lane(l),
@@ -704,9 +754,95 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
         );
         ctx.aux.tcgen_last.insert(ctx.cta.id, op);
         ctx.aux.tcgen_uncommitted.entry((ctx.warp.id, l as u8)).or_default().push(op);
+        if let (TcA::Smem(_), Some(p)) = (args.a, mma_payload) {
+            shared_a_read(ctx, l, op, &p)?;
+        }
     }
     support::protocol(ctx, active, all, ProtoExtra::default());
     Ok(Flow::Next)
+}
+
+/// Shared-memory A footprint of an MMA: run oplib's MMA twice on recording
+/// closures (no memory), the second time with A's descriptor start moved by
+/// 1024 bytes (a swizzle-atom multiple, so swizzling is unchanged); reads
+/// that moved are A's, the others B's. Cached per descriptor set.
+fn mma_a_footprint(ctx: &mut ExecCtx<'_>, p: &TcgenMmaPayload) -> Result<Vec<(u32, u32, u32)>, ExecError> {
+    let key = (p.a, p.b_desc, p.idesc, p.args.cta_group);
+    if let Some(v) = ctx.aux.mma_a_footprints.get(&key) {
+        return Ok(v.clone());
+    }
+    let arch = match ctx.program.arch.as_deref() {
+        Some(a) if a.starts_with("sm_103") => oplib::TcArch::Sm103,
+        Some(a) if a.starts_with("sm_107") => oplib::TcArch::Sm107,
+        _ => oplib::TcArch::Sm100,
+    };
+    let options = oplib::TcMmaOptions { arch, ti16: p.args.kind == TcMmaKind::Ti16, ..Default::default() };
+    let out = mma_a_footprint_probe(p, &options);
+    ctx.aux.mma_a_footprints.insert(key, out.clone());
+    Ok(out)
+}
+
+/// The MMA's shared-A read as its own async op (legacy `MmaSharedARead`,
+/// W5-10): `preds: []` in its AsyncIssue, lands right after the MMA (so the
+/// MMA has read A when it completes), and is what a `.sync_restrict`
+/// commit tracks.
+fn shared_a_read(ctx: &mut ExecCtx<'_>, l: usize, mma: AsyncId, p: &TcgenMmaPayload) -> Result<(), ExecError> {
+    if !ctx.observing {
+        // Numerics and sync never depend on the split: only the commit
+        // bookkeeping does, which tracks the MMA itself without it.
+        let rec = ctx.aux.tcgen_shared_reads.entry((ctx.warp.id, l as u8)).or_default();
+        rec.push(mma);
+        return Ok(());
+    }
+    let reads = mma_a_footprint(ctx, p)?;
+    let mut spans: Vec<(crate::arena::AllocId, ByteSpan)> = reads
+        .iter()
+        .filter_map(|&(cta, a, n)| p.smem.get(cta as usize).map(|&al| (al, ByteSpan::new(addr::decode_shared(a).1 as u64, n as u64))))
+        .collect();
+    spans.sort();
+    let mut merged: Vec<(crate::arena::AllocId, ByteSpan)> = Vec::new();
+    for (a, s) in spans {
+        match merged.last_mut() {
+            Some((la, ls)) if *la == a && s.start <= ls.end() => {
+                let end = ls.end().max(s.end());
+                ls.len = end - ls.start;
+            }
+            _ => merged.push((a, s)),
+        }
+    }
+    let op = issue_async(
+        ctx,
+        WarpMask::lane(l),
+        Issue {
+            kind: AsyncKind::TcgenMma,
+            class: AsyncClass::TcgenPipelined,
+            proxy: Proxy::Async,
+            payload: Payload::None,
+            signals: Vec::new(),
+            after: Vec::new(),
+            targets: Vec::new(),
+            queue: true,
+            fill_pattern: Vec::new(),
+            tf32_round: false,
+            report: None,
+            lut_b: None,
+            strong: None,
+        },
+    );
+    // Lands after the MMA (whose landing performs the read).
+    if let Some(o) = ctx.sync.async_ops.iter_mut().rev().find(|o| o.id == op) {
+        o.after.push(mma);
+    }
+    if let Some(m) = ctx.aux.async_meta.get_mut(&op) {
+        m.a_reads = merged.clone();
+        m.is_a_read = true;
+    }
+    if let Some(m) = ctx.aux.async_meta.get_mut(&mma) {
+        m.a_reads = merged;
+    }
+    ctx.aux.tcgen_uncommitted.entry((ctx.warp.id, l as u8)).or_default().push(op);
+    ctx.aux.tcgen_shared_reads.entry((ctx.warp.id, l as u8)).or_default().push(op);
+    Ok(())
 }
 
 #[inline]
@@ -719,4 +855,95 @@ pub fn tile(ctx: &mut ExecCtx<'_>, args: &TileArgs) -> HResult {
         ctx,
         &format!("Instr::Tile ({:?}): tile ops must be lowered through TVM dispatch to PTX-level IR", args.op),
     ))
+}
+
+/// Window reads `(cta, address, len)` of the MMA's shared-memory A operand
+/// (see [`mma_a_footprint`]); pure, no memory.
+pub(crate) fn mma_a_footprint_probe(p: &TcgenMmaPayload, options: &oplib::TcMmaOptions) -> Vec<(u32, u32, u32)> {
+    use std::cell::RefCell;
+    let probe = |payload: &TcgenMmaPayload| -> Vec<(u32, u32, u32)> {
+        let reads: RefCell<Vec<(u32, u32, u32)>> = RefCell::new(Vec::new());
+        let smem = |cta: u32, a: u32, out: &mut [u8]| -> oplib::OpResult {
+            out.fill(0);
+            reads.borrow_mut().push((cta, a, out.len() as u32));
+            Ok(())
+        };
+        let tr = |_: u32, _: u32, _: u32, out: &mut [u8]| -> oplib::OpResult {
+            out.fill(0);
+            Ok(())
+        };
+        let mut tw = |_: u32, _: u32, _: u32, _: &[u8]| -> oplib::OpResult { Ok(()) };
+        let _ = oplib::tc_mma_ctas(payload, options, &smem, &tr, &mut tw);
+        reads.into_inner()
+    };
+    let first = probe(p);
+    let start = p.a & 0x3fff;
+    let delta: i64 = if start + 64 < 0x4000 { 64 } else { -64 };
+    let mut moved = p.clone();
+    moved.a = (p.a & !0x3fff) | ((start as i64 + delta) as u64 & 0x3fff);
+    let second = probe(&moved);
+    let mut out = Vec::new();
+    if first.len() == second.len() {
+        for (x, y) in first.iter().zip(&second) {
+            if x.0 == y.0 && y.1 as i64 == x.1 as i64 + delta * 16 {
+                out.push(*x);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arena::AllocId;
+    use numsim_oplib::tcgen05::encode::{encode_dense_instr_descriptor_fields, encode_matrix_descriptor};
+
+    #[test]
+    fn shared_a_footprint_excludes_b() {
+        let k = 16usize;
+        let (m, n) = (128usize, 16usize);
+        // K-major no-swizzle: 8x16-byte core matrices, lbo 128, sbo 256.
+        let desc = |start: u32| encode_matrix_descriptor(start, 128 >> 4, 256 >> 4, 0);
+        let idesc = encode_dense_instr_descriptor_fields("float32", "bfloat16", "bfloat16", m as i64, n as i64, k as i64, false, false, 1, false, false, false, false).unwrap() as u32;
+        let c = Operand::Const(ConstId(0));
+        let p = TcgenMmaPayload {
+            args: TcgenMmaArgs {
+                kind: TcMmaKind::F16,
+                cta_group: 1,
+                d: c,
+                a: TcA::Smem(c),
+                b_desc: c,
+                idesc: c,
+                enable_input_d: c,
+                ws: false,
+                ws_b_buffer: 0,
+                block_scale: None,
+                scale_input_d: None,
+                sparse_meta: None,
+                disable_output_lane: Vec::new(),
+                collector_a: CollectorOp::None,
+                collector_b: CollectorOp::None,
+                ashift: false,
+                lut_b: false,
+                lut_b_addr: None,
+            },
+            d_taddr: 0,
+            a: desc(0x1000),
+            b_desc: desc(0x8000),
+            idesc,
+            enable_input_d: false,
+            scale_taddrs: None,
+            scale_input_d: None,
+            sparse_meta: None,
+            disable_output_lane: Vec::new(),
+            smem: vec![AllocId(0)],
+            tmem: vec![AllocId(1)],
+        };
+        let a = mma_a_footprint_probe(&p, &oplib::TcMmaOptions::default());
+        assert!(!a.is_empty());
+        let bytes: u32 = a.iter().map(|x| x.2).sum();
+        assert_eq!(bytes as usize, m * k * 2, "every A byte, once");
+        assert!(a.iter().all(|&(_, addr, len)| addr >= 0x1000 && addr + len <= 0x8000), "{a:?}");
+    }
 }

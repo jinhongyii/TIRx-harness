@@ -1980,3 +1980,67 @@ No racecheck change is needed.
     lowers, but synccheck reports `invalid_operand: NumSim TensorMap image
     has invalid magic`. That is W2's bind-time encode of a map whose
     `box_dim` is a runtime `DimExpr`.
+
+## W2 phase 4 (2026-10-08)
+
+### W2-18: arch-dependent `.exclusive` TMEM limit (W6)
+
+The engine creates each CTA pair's tcgen05 lifecycle state with
+`tcgen::State::new(exclusive_max)`: 576 columns when `Program.arch` starts with
+`sm_107`, 512 otherwise (PTX Table 58). Synccheck builds `State::default()`
+(512), so it rejects a legal sm_107f 576-column `.exclusive` alloc. **W6:** take
+the limit from the arch, or the coordinator adds it to `ResourceInit`. The
+`tcgen_exclusive_576_sm107` scenario is in `scenarios::special()` until then.
+
+### W2-19: buffer-form TMEM accesses under racecheck (W5)
+
+`implicit_tmem` / `tmem_subword` (scenarios) access TMEM through `Space::Tmem`
+buffers: warp actor, `Proxy::Tcgen`, synchronous in the engine. Racecheck
+reports a same-lane write/read conflict (`missing_same_warp_lane_order`) even
+across `tcgen05.wait::st`. **W5:** rule how buffer-form TMEM Load/Store (legacy
+`TensorLoad` on a TMEM view) orders against itself.
+
+### W2-20: reassigned conformance / public-API items (evidence)
+
+| item | owner | evidence |
+| --- | --- | --- |
+| `sparse_flashmla_prefill_head128_small_topk_phase1` never ends | **W1** | Guarded `clusterlaunchcontrol.query_cancel.get_first_ctaid` (`pred=canceled`) is lowered as `Ptx{pred, keep_dst: false}` (pc 1087 of the dumped module), so a not-cancelled response writes 0 instead of keeping the 0xFFFF_FFFF sentinel; `jobs.valid` never clears. With `keep_dst: true` on every guarded Ptx the kernel completes in 82 rounds / 0.6 s (legacy 0.9 s). The engine also now writes the legacy "no cluster" response (first word 0xFFFF_FFFF). |
+| `flash_attention_backward_sm100:1277` | **W1** | Source says `mbarrier.arrive.expect_tx.shared__cluster.b64(remote_mbar, ..)`; the module has `AddrSpace::Shared`, so the explicit-shared::cta rule (sync-semantics §2.1) rejects the remote rank. |
+| tcgen05 ops with a PTX `pred=` (10 `test_tcgen_inactive_boundaries` params) | **W1** | `Instr::TcgenMma` has no guard; a guarded `T.ptx[mma](.., pred=...)` must be lowered inside an `If` (as W1 did for atom/red, W4-12). The handler then never validates an off instruction. |
+| zero-step `For` | **W1** | The engine sees a structured loop with no step; emit an `Assert(step > 0)` for runtime steps. |
+| `cuda.__shfl_sync` width validation | **W1** | PTX `shfl` accepts any segment mask; the CUDA width rule belongs to the intrinsic's lowering (emit an `Assert`). |
+| `mxf8_cta2` uninitialized `smem[0..4)` | **W1** | The TMEM view's `allocated_addr=address[0]` (base_reg) is loaded at the `decl_buffer` (line 40), before `tcgen05.alloc` writes it. Load the base register at first use, or after the alloc. |
+| `host_prelude` box_dim | **W1** + W2 (fixed) | The engine now sign-extends scalar params by their declared type before evaluating DimExprs (an int32 -7 arrived as 0xFFFF_FFF9). Separately, the prelude's `T.truncdiv` is lowered as `FloorDiv` (31 instead of 32 for delta = -7). |
+| `sm100_fp8_fp4_mega_moe:70` | **W1/W8** | `st.global.u8` lowered as a `Store` into `symm_buffer` at element `-791038`: the symmetric-buffer pointer arithmetic produces an address outside that view (raw-pointer data; see W8-7 `plan_global_addresses`). |
+| `cudnn_*_amax`, `*_dsrelu_quant` | **W3** | `RegPool(IncompleteWarpgroup{wg:1})`: the CTA has 6 warps and warpgroup 1 runs setmaxnreg; the sync model rejects a partial warpgroup, legacy accepted it (V2C-14). |
+| `alphamoe_fp8_blockscale_qwen3next` | **W4** | `tirx.ptx.cp_async_bulk_prefetch` has no oplib entry. |
+| `st/red.async.release` racecheck `incomplete` | **W5** | The mbarrier-less release form has no completion event, so racecheck reports the op as never completed. Rule what publishes it (ISA: release semantics only). |
+| `tma_atomicity` (`Global address 0x2bfb81e0 is not mapped`) | **W8** | A raw host pointer inside a host tensor-map image (`ArgValue::TensorMap`); bind it as `TensorMapOf`. |
+| `readonly_proxy` | **W5** | The engine emits `.nc` loads as `Proxy::ReadOnly`; the rule "no write overlapping read-only-path bytes in the same kernel" is an observation over both orders, which racecheck already sees. Proposed: racecheck reports it. |
+| missing_proxy_bridge after W5-10 #2 | **W5** | The sampled finding (gdn_prefill_sm100) is TMA (line 1251) vs `tensormap.replace` (line 419) on the descriptor bytes, not an MMA operand. The kernel has `fence.proxy.tensormap::generic.release/acquire` (lines 1294/1245). Per R3 the MMA smem operand read IS async proxy, so the engine change stands. |
+| register-space uninit reports (V2C-19/20) | done (W2) / **W1** | `Space::Reg` buffers are now memory-backed per lane and report `space: register`; W1 flips `uninit.TRACKED_SPACE` to "Reg". Legacy reports at the register use; v2 reports a TMEM/shared read into registers at the memory read (tf32_hc_prenorm, ssu_mtp_vertical): a documented reporting-point delta. |
+| divergent blocking wait / divergent `__syncwarp` | delta | Both stay `divergent_block` incomplete. Neither is provable from engine state: lanes outside the arm can only run after the `If` (no Else), and on hardware they might still reach a matching wait or syncwarp. This is the documented divergent-switch limitation. |
+
+### W2-21: perf hot spots (Mega-MoE-sized corpus kernels, interp)
+
+`fp16_bf16_gemm` (16 CTAs x 256 threads, cluster 2, 200 rounds, 1.39M instrs).
+No oracle: legacy cannot lower it. Release build, instrumented timers.
+
+NoopObserver, 8.8 s -> 5.2 s after this phase's engine fixes:
+
+| # | hot spot | cost | owner |
+| --- | --- | --- | --- |
+| 1 | tcgen05.mma numerics `oplib::tc_mma_ctas` | 2.8 ms/MMA, 26%. Per-4-byte-cell closure calls (~100k per MMA) | W4: bulk operand/tile read API |
+| 2 | TMA handler (`tma_plan_dir` + per-span `resolve_global`) | 0.89 ms/op, 24% | W4 plan cost, W2 resolve |
+| 3 | TMA landing `copy_spans` | 0.66 ms/op (~1.7 us per 16-byte swizzled span: check_oob + overlay lookup per span) | W2 |
+| 4 | `tcgen05.ld` (`tcgen_ldst_map` + per-piece `mem_read`) | 167 us/op, 12% | W4 map, W2 per-piece reads |
+| 5 | Generic `Ptx` ops | 2.6 us/op over 151k ops | W4 PtxFn dispatch |
+
+Fixed in this phase (W2):
+- `apply_completions` (39%): empty async groups queued milestone completions that could never be enabled, about 10k per CTA, and the queue was rescanned from the head after every application.
+- MMA memory glue: direct cell access, and spans are merged as they are recorded instead of sorting 50M entries.
+- An all-valid bulk copy is now one store.
+
+RaceObserver: 147 s for the same 200 rounds (engine ~5 s). More than 95% is in RaceObserver callbacks, which are W5 internals and were not profiled per the rule. Engine-side under observation:
+- `tcgen05.mma` handler 1.37 ms: the W5-10 shared-A footprint probe runs oplib twice and is cached per descriptor; misses dominate (W2: amortize).
+- MMA landing 2.0 ms.
