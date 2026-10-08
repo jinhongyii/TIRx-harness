@@ -886,6 +886,7 @@ PTX §9.7.18.12.1: "The `tcgen05.commit` operation with `.sync_restrict::shared:
   - The barrier phase completed by a restricted commit's arrival releases, to its waiters, only the MMAs' operand-A shared-memory **reads**. That makes a later overwrite of the A tile race-free.
   - It does not release the accumulator: a `tcgen05.ld` of the MMA result ordered only by such a wait is unordered against the MMA's TMEM write.
   - The engine must step `WorkCmd::CommitSharedA` instead of `Commit` for the restricted form.
+  - Racecheck already implements this as delta T11 (`AsyncIssue.restricted`). It is pinned by `racecheck_tcgen.rs::{restricted_commit_publishes_only_shared_a_read, restricted_commit_does_not_imply_completed_ops}`.
 
 ## 7. setmaxnreg
 
