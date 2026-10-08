@@ -17,7 +17,7 @@ from tests.numsim.support.kernels import (
     raw_tma_sm100_barrier_address,
     raw_tma_transaction_mismatch,
 )
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness import numsim
 from tirx_harness.numsim import v2
 from tirx_harness.numsim.errors import UnsupportedTIRxError
@@ -91,17 +91,13 @@ def test_sm100_two_cta_barrier_address_targets_pair_base():
     np.testing.assert_array_equal(result.outputs["output"], np.concatenate([even, odd], axis=0))
 
 
-@v2_gap(
-    "a TMA under-delivering its expect_tx bytes (48 of 52) is not reported as an "
-    "error: the run stops with v2.ExecutionError 'NumSim execution incomplete: "
-    "analysis_incomplete: divergent_block: no progress while warp 0 is blocked' "
-    "(legacy: NumSimExecutionError 'transactions=48/52'); error->incomplete, no delta row"
-)
 def test_raw_tensor_map_under_delivery_reports_exact_bytes():
     """Port of ``tests/numsim/runtime/test_raw_tma_codegen.py::test_raw_tensor_map_under_delivery_reports_exact_bytes``.
 
-    Keeps the fail-closed error contract (an ``error`` stop, not
-    ``incomplete``). Dropped: the ``transactions=48/52`` wording."""
+    Delta sync-behaviour-deltas M17: the run fails closed as ``incomplete``
+    (``divergent_block``) instead of legacy's ``transactions=48/52`` error;
+    only the issuing lane waits, so the shortfall is not provable from engine
+    state."""
 
     source = np.arange(12, dtype=np.float32).reshape(3, 4)
     input_map = _tensor_map(source, global_shape=(4, 3), global_strides=(16,), box_shape=(4, 3))
@@ -110,4 +106,5 @@ def test_raw_tensor_map_under_delivery_reports_exact_bytes():
     with pytest.raises(v2.ExecutionError) as excinfo:
         v2.Engine().run(module, {"input_map": input_map})
     stops = [d for d in excinfo.value.diagnostics if d.get("status") in ("error", "incomplete")]
-    assert stops and stops[0]["status"] == "error", excinfo.value.diagnostics
+    assert stops and stops[0]["status"] == "incomplete", excinfo.value.diagnostics
+    assert "divergent_block" in stops[0].get("reason", ""), stops[0]

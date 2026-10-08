@@ -19,7 +19,7 @@ from tvm.script import tirx as T
 
 from tirx_harness.numsim import v2
 
-from ._runnable import DEADLOCK, assert_clean, assert_error_kind, requires_v2_engine, v2_gap
+from ._runnable import assert_clean, requires_v2_engine
 
 pytestmark = requires_v2_engine
 
@@ -155,22 +155,22 @@ def test_racecheck_subset_is_typed_incomplete():
 
     Running a strict subset of the launch can never support ``clean``: the
     verdict is ``incomplete`` with reason ``subset_execution``
-    (racecheck-semantics.md). v2 selects subsets by cluster only
-    (``cta_ids`` raises ``NotImplementedError``); with the default 1-CTA
-    cluster, cluster 0 is the legacy ``cta_ids=[0]``. v2 has no own
-    ``ExecutionSubset`` type, so a duck-typed one is passed. The legacy
-    ``analysis_scope`` warp counts are payload shape (C).
+    (racecheck-semantics.md). v2 accepts ``cta_ids`` when they cover whole
+    clusters (W8); v2 has no own ``ExecutionSubset`` type, so a duck-typed one
+    is passed. ``analysis_scope`` matches legacy exactly; the incomplete record
+    is a superset of the legacy one, so only the legacy keys are compared.
     """
 
     module = v2.transpile(native_racecheck_two_ctas)
-    subset = SimpleNamespace(cluster_ids=[0], cta_ids=None)
+    subset = SimpleNamespace(cta_ids=[0], cluster_ids=None)
     result = v2.Engine().run_racecheck_phase(module, {}, subset=subset)
-    report = v2.RaceReport([result])
-    assert report.verdict == "incomplete", report.format()
-    incomplete = [f for f in report.findings if f.status == "incomplete"]
-    assert any(
-        f.details.get("reason") == "subset_execution" or f.kind == "subset_execution" for f in incomplete
-    ), report.format()
+    assert result.verdict == "incomplete"
+    payload = result.to_dict()
+    assert payload["analysis_scope"] == {"kind": "subset", "selected_warp_count": 1, "total_warp_count": 2}
+    keys = ("kind", "reason", "selected_warp_count", "total_warp_count")
+    assert [{k: record[k] for k in keys} for record in payload["incomplete"]] == [
+        {"kind": "analysis_incomplete", "reason": "subset_execution", "selected_warp_count": 1, "total_warp_count": 2}
+    ]
 
 
 def test_bulk_g2s_cta_ignore_oob_does_not_bounds_check_the_ignored_bytes():
@@ -210,20 +210,19 @@ def test_racecheck_accepts_conditional_tmem_lifecycles(kernel):
     assert_clean(v2.racecheck(kernel, {}))
 
 
-@v2_gap(
-    "a single-lane wait_until that can never succeed is reported as incomplete "
-    "'divergent_block: no progress while warp 0 is blocked with a divergent mask', not deadlock "
-    "(and the synccheck payload says verdict=error with only that incomplete entry)"
-)
 @pytest.mark.parametrize("checker", ["synccheck", "racecheck"])
 def test_wait_without_any_possible_publisher_is_a_sync_deadlock(checker):
     """Replaces ``tests/analysis_tools/racecheck/test_signal_diagnostics.py::test_wait_without_any_possible_publisher_is_a_sync_deadlock`` (both params).
 
-    ``wait_until(flag == 7)`` with nobody ever writing ``flag``: error
-    ``deadlock`` from either checker, and every finding is an error.
+    ``wait_until(flag == 7)`` by lane 0 only, with nobody ever writing
+    ``flag``. Delta sync-behaviour-deltas M17: legacy reported an error
+    ``deadlock``; v2 reports the phase ``incomplete`` (``divergent_block``):
+    the other lanes run only after the ``If``, so engine state cannot prove
+    that nobody publishes. Never clean.
     """
 
     kernel = tvm.script.from_source(_BLOCKED_WAIT, {"T": T})
     report = getattr(v2, checker)(kernel, {"flag": np.zeros(1, dtype=np.int32)})
-    assert_error_kind(report, DEADLOCK)
-    assert all(f.status == "error" for f in report.findings), report.format()
+    assert report.verdict == "incomplete", report.format()
+    assert [f.kind for f in report.findings] == ["analysis_incomplete"], report.format()
+    assert "divergent_block" in report.findings[0].details.get("reason", ""), report.format()

@@ -3001,3 +3001,35 @@ Request: export a v2 `ExecutionSubset` (`cluster_ids`, `cta_ids`), and the `Exec
   - `test_p6c_cuda_ldg_overloads.py::test_cuda_ldg_packed_vectors_preserve_physical_bits[8 dtypes]`;
   - `test_p6c_cuda_packed_vector_forms.py::test_cuda_ldg_supports_float32x2_as_one_packed_64bit_load`.
 - **No lowering change is needed.** I did not paper over this in Python: dividing the offset by the lane count there would break once the handler is fixed.
+
+## W12-gaps (2026-10-08): open `v2_gap` xfails in tests/numsim/v2, by owner
+
+W12 triaged the remaining `v2_gap` marks with `--runxfail`. These need an owner fix or a ruling. Each test below is its own reproducer: run it with `--runxfail` to see the current behaviour.
+
+1. **[W2, ruling] Raw access through an integer address that names no binding.**
+   - Tests:
+     - `tests/numsim/v2/ports/test_p6b_raw_memory_artifact.py::test_raw_load_rejects_an_unmapped_integer_when_the_address_is_consumed_is_incomplete` (`ld.global` at 0x40);
+     - `tests/numsim/v2/ports/test_p6b_written_buffer_inference.py::test_dynamic_raw_write_requires_bound_address[unbound]` (`st.global` at 0x1000).
+   - v2: `error` `bad_address` ("Global address 0x40 is not mapped") in NumSim and both checkers.
+   - Legacy: `incomplete`, reason `integer_address_without_binding`, on the grounds that a missing binding is not proof of OOB. The null pointer is an `error` in both.
+   - Ask: either rule v2's `error` (all device memory of a launch is its bindings) and write a delta row, after which W12 flips the copies to expect `error`; or report `incomplete` for a non-null address outside every allocation.
+2. **[W4, oplib TMA overrides] Invalid `tensormap` override operands accepted.**
+   - Tests: `tests/numsim/v2/ports/test_p6c_tma_overrides.py::test_tma_override_rejects_invalid_operands[address_window]` and `[nonzero_coordinate]`.
+   - v2: verdict `clean` and the run completes.
+   - Legacy: `invalid_operand` error. The global address override must stay inside the 128 KiB window, and the override coordinates must be zero.
+   - The other three parameters (alignment, 8-bit dimension, upper stride bits) are already rejected.
+3. **[W2, tcgen issue rule; W6 for the sync side] Two lanes issuing one `tcgen05.mma` site (and its commit).**
+   - Tests: `tests/numsim/v2/ports/test_p8_tcgen_descriptor_dispatch.py::test_tcgen_runtime_descriptor_dispatch_rejects_multiple_issuers[select]` and `[input]`.
+   - sync-semantics.md §6.3 requires exactly one issuing lane.
+   - v2 runs both issues and stops later with `sync_protocol_error` "mbarrier completion after complete" instead of the multi-issuer error.
+4. **[W5, racecheck tcgen thread fences] Missing `tcgen05.fence::before_thread_sync` / `::after_thread_sync` not reported.**
+   - Tests: `tests/numsim/v2/ports/test_validshape_native_tcgen_thread_fence.py::test_cross_thread_cp_to_mma_requires_both_thread_fences[cta_barrier|mbarrier|relaxed_arrive_wait|relaxed_flag|relaxed_wait]` and `::test_empty_commit_does_not_republish_tcgen_imported_from_another_thread`.
+   - A cross-warp `tcgen05.cp` → `tcgen05.mma` handoff over overlapping TMEM columns, with either fence missing, is `clean`. Legacy reported a race.
+   - An empty `tcgen05.commit` in a warp with no local tcgen05 work republishes imported work (clean instead of a race).
+5. **[W1, lowering logical identity] A TMEM `rearrange`/`view` gets its own logical identity.**
+   - Tests: `tests/numsim/v2/checkers/test_alias_advisory.py::test_tmem_view_keeps_one_logical_identity`, `test_partitioned_tmem_views_keep_one_logical_identity`, `test_full_extent_tmem_subview_keeps_one_logical_identity`.
+   - Numerics now pass (V2C-24 is fixed).
+   - Racecheck reports `alias_stale_read` review for a store through `tmem` and a load through `tmem.rearrange(...)` of the same bytes. TMEM views should keep the root's logical identity, like same-dtype shared and global views (W5-9).
+6. **[scheduler / subset, coordinator] CLC task stealing under a cluster subset.**
+   - Test: `tests/numsim/v2/ports/test_p8_canonical_kernels.py::test_flashmla_small_topk_task_steal_matches_independent_numerical_oracle`.
+   - A subset run with only cluster 0 resident never claims the non-resident cluster's task through CLC. `out[1, 0, 0]` keeps its NaN sentinel; the full launch matches.

@@ -6,11 +6,11 @@ Replaces the seven ``gap_unportable`` rows of
 lowering must give every view/sub-view one logical identity, and the review
 advisory needs the site->buffer table.
 
-``alias_stale_read`` has no spec sentence and no delta row
-(test-migration.md, "Semantics in legacy tests that no new spec mentions"
-item 1). The tests that expect the advisory are therefore ``xfail(strict=False)``
-until the ruling; the ``keeps_one_logical_identity`` controls expect a clean
-verdict, which holds whichever way it is ruled.
+``alias_stale_read`` is ruled by racecheck-behaviour-deltas P7/T8. Identity
+rule W5-9: a view with the root's dtype shares the root's identity, so two
+same-dtype ``decl_buffer`` names over one pool word are one logical name, and
+the two legacy stale-name kernels are clean in v2. The
+``keeps_one_logical_identity`` controls expect a clean verdict too.
 """
 
 from __future__ import annotations
@@ -21,12 +21,14 @@ from tvm.tirx.layout import S, TCol, TileLayout, TLane
 
 from tirx_harness.numsim import v2
 
-from ._runnable import assert_clean, assert_no_incomplete, kinds_of, no_spec, requires_v2_engine, v2_gap
+from ._runnable import assert_clean, assert_no_incomplete, kinds_of, requires_v2_engine, v2_gap
 
 pytestmark = requires_v2_engine
 
-_NO_SPEC = no_spec(1, "alias_stale_read has no spec sentence or delta row")
-_TMEM_NUMERIC_GAP = v2_gap("NumSim reads 0 back from a TMEM buffer store/load (expected 1..32)")
+_TMEM_NUMERIC_GAP = v2_gap(
+    "numerics fixed (V2C-24); racecheck reports alias_stale_read for a TMEM view of the same "
+    "bytes (view gets its own logical identity): CONTRACT_REQUESTS W12-gaps 5 (W1)"
+)
 
 _TMEM_LAYOUT = TileLayout(S[(128, 4) : (1 @ TLane, 1 @ TCol)])
 _TMEM_WIDE_LAYOUT = TileLayout(S[(128, 8) : (1 @ TLane, 1 @ TCol)])
@@ -154,31 +156,34 @@ def _assert_numeric_then_clean(kernel) -> None:
     assert_clean(report)
 
 
-@_NO_SPEC
 def test_stale_logical_name_read_is_review():
     """Replaces ``tests/analysis_tools/racecheck/test_native_alias_advisory.py::test_public_native_stale_logical_name_read_is_review``.
 
-    Write A_shared, write B_shared (same pool word), read A_shared: review
-    ``alias_stale_read``, no error finding.
+    Write A_shared, write B_shared (same pool word), read A_shared. Delta
+    (racecheck-behaviour-deltas P7, identity rule W5-9): ``A_shared`` and
+    ``B_shared`` are int32 views of the int32 ``pool``, so both share the
+    pool's logical identity and there is no stale name: clean (legacy reported
+    a ``review`` ``alias_stale_read``). Only a dtype-changing view is a new name.
     """
 
     report = v2.racecheck(
         native_pool_alias_provenance,
         {"mode": np.int32(0), "output": np.zeros(1, dtype=np.int32)},
     )
-    _assert_alias_review(report)
+    assert_clean(report)
 
 
-@_NO_SPEC
 def test_raw_ptx_shared_address_retains_logical_alias_owner():
     """Replaces ``tests/analysis_tools/racecheck/test_native_alias_advisory.py::test_raw_ptx_shared_address_retains_logical_alias_owner``.
 
-    Raw ``st.shared``/``ld.shared`` through ``ptr_to`` of two pool aliases keep
-    their logical owner: review ``alias_stale_read``.
+    Raw ``st.shared``/``ld.shared`` through ``ptr_to`` of two pool aliases.
+    Delta (racecheck-behaviour-deltas P7, identity rule W5-9): both aliases
+    have the pool's dtype, so they are one logical identity: clean (legacy
+    reported a ``review`` ``alias_stale_read``).
     """
 
     report = v2.racecheck(native_raw_ptx_pool_alias_provenance, {"output": np.zeros(1, dtype=np.uint32)})
-    _assert_alias_review(report)
+    assert_clean(report)
 
 
 def test_explicit_view_keeps_one_logical_identity():

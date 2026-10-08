@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from tests.numsim.support.kernels import tma_copy_cluster_multicast, tma_copy_transaction_mismatch
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -58,15 +58,15 @@ def test_tma_transaction_under_delivery_reports_deterministic_deadlock():
     assert _stops(error), error.diagnostics
 
 
-@v2_gap(
-    "TMA transaction under-delivery (64 of 68 expected bytes) stops as incomplete "
-    "'analysis_incomplete: divergent_block: no progress while warp 1 is blocked with a "
-    "divergent mask' (legacy: NumSimExecutionError deadlock error); error->incomplete, "
-    "no delta row yet"
-)
 def test_tma_transaction_under_delivery_is_an_error():
-    """Second half of ``tests/numsim/runtime/test_tile_codegen.py::test_tma_transaction_under_delivery_reports_deterministic_deadlock``:
-    the stop is an ``error`` diagnostic, as legacy raised a deadlock error."""
+    """Second half of ``tests/numsim/runtime/test_tile_codegen.py::test_tma_transaction_under_delivery_reports_deterministic_deadlock``.
+
+    Delta sync-behaviour-deltas M17: legacy raised a deadlock error; v2 stops
+    the run ``incomplete`` (``divergent_block``), because only the elected
+    lane waits and the engine cannot prove the other lanes never deliver the
+    missing bytes. The run still fails closed (``ExecutionError``)."""
 
     error = _run_under_delivery()
-    assert _stops(error)[0]["status"] == "error", error.diagnostics
+    stop = _stops(error)[0]
+    assert stop["status"] == "incomplete", error.diagnostics
+    assert "divergent_block" in stop.get("reason", ""), stop

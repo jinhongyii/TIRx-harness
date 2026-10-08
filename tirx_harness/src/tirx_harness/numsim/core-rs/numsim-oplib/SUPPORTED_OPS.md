@@ -620,16 +620,16 @@ A listed operation may still reject modifier, dtype, shape, or layout values out
 
 ## Other operations v2 lowers
 
-Not in the legacy table: 49 op names the v2 lowering accepts (TIR math, structural calls, CUDA helpers), with how it runs them.
+Not in the legacy table: 46 op names the v2 lowering accepts (TIR math, structural calls, CUDA helpers), with how it runs them.
 
 | Operation | v2 | Deltas |
 | --- | --- | --- |
+| `prim.ceil` | `Instr::Unary` (oplib `unary`) |  |
+| `prim.clz` | `Instr::Unary` (oplib `unary`) |  |
 | `prim.log2` | `Instr::Unary` (oplib `unary`) |  |
 | `tirx.address_of` | engine instruction (`call_tirx_address_of`) |  |
 | `tirx.break_loop` | engine instruction (`call_tirx_break_loop`) |  |
 | `tirx.buffer_data` | engine instruction (`call_tirx_buffer_data`) |  |
-| `tirx.ceil` | `Instr::Unary` (oplib `unary`) | D3 |
-| `tirx.clz` | `Instr::Unary` (oplib `unary`) |  |
 | `tirx.continue_loop` | engine instruction (`call_tirx_continue_loop`) |  |
 | `tirx.cos` | `Instr::Unary` (oplib `unary`) | D3 |
 | `tirx.erf` | `Instr::Ptx` (oplib `resolve_ptx`) | D10 |
@@ -640,15 +640,12 @@ Not in the legacy table: 49 op names the v2 lowering accepts (TIR math, structur
 | `tirx.floor` | `Instr::Unary` (oplib `unary`) | D3 |
 | `tirx.fma` | engine instruction (`call_tirx_fma`) |  |
 | `tirx.handle_add_byte_offset` | engine instruction (`call_tirx_handle_add_byte_offset`) |  |
-| `tirx.if_then_else` | engine instruction (`call_tirx_if_then_else`) |  |
 | `tirx.isfinite` | `Instr::Unary` (oplib `unary`) |  |
 | `tirx.isinf` | `Instr::Unary` (oplib `unary`) |  |
 | `tirx.isnan` | `Instr::Unary` (oplib `unary`) |  |
 | `tirx.isnullptr` | engine instruction (`call_tirx_isnullptr`) |  |
-| `tirx.likely` | engine instruction (`call_tirx_likely`) |  |
 | `tirx.log` | `Instr::Unary` (oplib `unary`) |  |
 | `tirx.log10` | `Instr::Ptx` (oplib `resolve_ptx`) | D10 |
-| `tirx.log2` | `Instr::Unary` (oplib `unary`) |  |
 | `tirx.mma_fill` | engine instruction (`call_tirx_mma_fill`) |  |
 | `tirx.mma_fill_legacy` | engine instruction (`call_tirx_mma_fill_legacy`) |  |
 | `tirx.mma_store` | engine instruction (`call_tirx_mma_store`) |  |

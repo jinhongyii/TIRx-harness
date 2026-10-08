@@ -293,7 +293,7 @@ def test_raw_load_rejects_an_unmapped_integer_when_the_address_is_consumed():
     "(checkers: verdict 'error', finding 'bad_address'; NumSim: stop status 'error' kind "
     "'bad_address' 'Global address 0x40 is not mapped'); legacy: verdict 'incomplete' with one "
     "'analysis_incomplete' finding, reason 'integer_address_without_binding' (a missing binding "
-    "is not proof of OOB); no delta row"
+    "is not proof of OOB); ruling requested: CONTRACT_REQUESTS W12-gaps 1 (W2)"
 )
 def test_raw_load_rejects_an_unmapped_integer_when_the_address_is_consumed_is_incomplete():
     """Second half of ``tests/numsim/integration/test_raw_memory_artifact.py::test_raw_load_rejects_an_unmapped_integer_when_the_address_is_consumed``.

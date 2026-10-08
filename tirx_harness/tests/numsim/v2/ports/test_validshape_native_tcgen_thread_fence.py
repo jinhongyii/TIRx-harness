@@ -349,7 +349,7 @@ def _run(*, with_before: bool, with_after: bool, handoff: int):
     "with tcgen05.fence::before_thread_sync or ::after_thread_sync missing around the "
     "cross-warp tcgen05.cp -> tcgen05.mma handoff (overlapping TMEM columns 0..3), v2 "
     "racecheck reports clean; legacy reported a race (not clean). The both-fences run "
-    "is clean in both"
+    "is clean in both; CONTRACT_REQUESTS W12-gaps 4 (W5)"
 )
 @pytest.mark.parametrize(
     "handoff",
@@ -385,7 +385,7 @@ def _commit_inputs(with_local_work: int):
 @v2_gap(
     "an empty tcgen05.commit in warp 1 (no local tcgen05 work) after importing warp 0's "
     "tcgen05.cp: v2 racecheck reports clean for warp 2's overwriting tcgen05.cp; legacy "
-    "reported a race (the empty commit must not republish imported work)"
+    "reported a race (the empty commit must not republish imported work); CONTRACT_REQUESTS W12-gaps 4 (W5)"
 )
 def test_empty_commit_does_not_republish_tcgen_imported_from_another_thread() -> None:
     """Replaces ``tests/analysis_tools/racecheck/test_native_tcgen_thread_fence.py::test_empty_commit_does_not_republish_tcgen_imported_from_another_thread``.

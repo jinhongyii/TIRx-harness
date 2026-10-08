@@ -34,21 +34,14 @@ def _first_stop(error: v2.ExecutionError) -> dict:
 @pytest.mark.parametrize(
     "address_kind",
     [
-        pytest.param(
-            "bound",
-            marks=v2_gap(
-                "a raw host address (ctypes.data of the bound pointer_bits input) is not mapped: "
-                "bad_address error in NumSim/racecheck/synccheck; expected the store to land in "
-                "pointer_bits (test-migration.md: raw host addresses unportable until v2 exposes "
-                "a binding's engine address)"
-            ),
-        ),
+        "bound",
         "null",
         pytest.param(
             "unbound",
             marks=v2_gap(
                 "an integer address naming no binding (0x1000) is an error bad_address; "
-                "expected verdict incomplete (integer_address_without_binding)"
+                "expected verdict incomplete (integer_address_without_binding). Ruling "
+                "requested: CONTRACT_REQUESTS W12-gaps 1 (W2)"
             ),
         ),
     ],
@@ -64,8 +57,11 @@ def test_dynamic_raw_write_requires_bound_address(address_kind):
 
     module = v2.transpile(unresolved_raw_store)
     bits = np.zeros(1, np.uint64)
-    bits[0] = {"bound": bits.ctypes.data, "null": 0, "unbound": 0x1000}[address_kind]
     inputs = {"pointer_bits": bits}
+    # "bound": the ENGINE address of the pointer_bits binding (delta H1: device
+    # addresses are not host addresses; Engine.address_of, W8-7).
+    bits[0] = {"bound": v2.Engine().address_of(module, inputs, "pointer_bits") if address_kind == "bound" else 0,
+               "null": 0, "unbound": 0x1000}[address_kind]
     for checker in (v2.synccheck, v2.racecheck):
         report = checker(unresolved_raw_store, inputs)
         if address_kind == "bound":

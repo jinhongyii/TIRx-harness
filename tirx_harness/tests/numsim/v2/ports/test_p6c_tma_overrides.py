@@ -156,7 +156,7 @@ def override_inputs(form):
 
 _ACCEPTED_BY_V2 = (
     "v2 accepts a legacy rejection: synccheck/racecheck verdict clean and Engine.run completes "
-    "(legacy: invalid-operand error '{}')"
+    "(legacy: invalid-operand error '{}'); CONTRACT_REQUESTS W12-gaps 2 (W4)"
 )
 
 
