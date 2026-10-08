@@ -459,6 +459,81 @@ All of these are JSON-visible. `FORMAT_VERSION` is now **2**.
     host value. The engine encodes the map from `implicit_base` at bind
     time (W8-3; implementation W2).
 
+### Batch 2 (2026-10-08, lowering residuals, Part C.4)
+
+`FORMAT_VERSION` stays 2. All new `Option` fields are required, so emit
+`null` when absent.
+
+11. **mbarrier wait reports.** `MbarTestWait` gains `report: Option<Reg>`
+    (`_report`) and `report_value: Option<Reg>` (`_report_value`). Both come
+    from the same snapshot as `dst` (sync-semantics.md §2.4, copy-report /
+    conditional parity). Lower `mbarrier_{test,try}_wait*_report*` to these
+    fields. `MbarWait` has no report forms.
+12. **`StAsyncArgs.mbar` is `Option<Operand>`.** Use `null` for
+    `st.async.release` / `red.async.release` without an mbarrier.
+13. **`BulkCopyArgs` gains three fields:**
+    - `byte_mask: Option<Operand>` (`.cp_mask`, 16-bit per 16-byte chunk)
+    - `ignore_oob: bool`
+    - `report: Option<ReportMode>`, where `ReportMode` is `"PerElementFf"`
+      or `"Per16Bytes"`
+
+    **Deviation from the request:** `report` is a mode, not a register.
+    The `_report` copy forms have no register destination: they OR a
+    validity predicate into the completion mbarrier's report bit, which the
+    kernel reads back through `MbarTestWait.report`. `TmaArgs` gains the
+    same `report: Option<ReportMode>` for the `cp_async_bulk_tensor_*_report`
+    forms.
+
+    **TMA overrides:** `TmaArgs.overrides: Vec<TmapOverride{field, ord,
+    value, elem_bits}>` covers every override spelling in SUPPORTED_OPS:
+    | spelling | override |
+    | --- | --- |
+    | `override_address[_im2col]` | `GlobalAddress`, `ord: null` |
+    | `override_global_dim_b8/_b16` | one `GlobalDim` per `ord`, `elem_bits` 8/16 |
+    | `override_global_dim_stride_b8/_b16` | `GlobalDim` + `GlobalStride` per `ord` |
+    | `applypriority_*_override_*` | same overrides, `dir: Prefetch` (ordering-only) |
+14. **tcgen05:**
+    - `TcgenMmaArgs.variant: Option<StrId>` is removed. Use
+      `ti16: bool` and `lut_b: bool` instead; both are orthogonal to
+      `kind`, since block-scaled `lut_b` forms exist.
+    - `TcgenCommit` gains `sync_restrict: bool` and
+      `multicast_width: Option<u8>`.
+15. **`TensorMapSpec.force_cu_dtype: Option<u8>`** carries the raw
+    `CUtensorMapDataType` when it differs from what `dtype` implies (11, 13,
+    14, ...). Stop mapping 11 to TF32 or 13 to E2M1, and stop failing 14
+    closed. Emit the raw value and the engine decides.
+16. **`ParamKind::ImplicitShape { buffer: ParamId, axis: u8 }`** replaces
+    the `Scalar` slots named `<buf>.shape<axis>`. JSON:
+    `{"ImplicitShape":{"buffer":0,"axis":1}}`. `buffer` must name a `Buffer`
+    slot (`validate` checks this). The binder (W8/W2) reads the value from
+    the bound array.
+17. **TMEM buffers (C.4 row 1).** The ruling is in the `BufferDecl` doc. A
+    `Space::Tmem` buffer may be used with `Load`/`Store`. These execute as
+    `tcgen05.ld/st 32x32b` with dense addressing:
+    - lane = `(offset / cols) % 128`;
+    - column = `base_col + offset % cols`;
+    - 32-bit elements;
+    - each active lane addresses its own warp sub-partition.
+
+    Anything else fails closed. `AddrOf` / `LoadAddr` / `StoreAddr` on TMEM
+    are not allowed.
+
+**C.3 acks.**
+- **Accepted:** 1 (`numsim.pack`/`unpack`, W4), 2 (`<name>.value`, W4),
+  5, 6, 7, 8, 9 and 10.
+- **3 is superseded** by item 16.
+- **4 is superseded** by item 15.
+
+**Breakage in other owners' files** caused by batch 2. `program.rs` is
+clean, and the lib tests pass with minimal stand-in patches, since
+reverted:
+- **W2 / W7:** the patterns at `interp/handlers.rs:528,539`,
+  `codegen/emit.rs:130,150` and `interp/handlers/async_copy.rs:557` need
+  updating (`mbar` is now `Option`).
+- **W2:** add the new `BulkCopy` / `MbarTestWait` fields to
+  `testutil/scenarios.rs:297,443`, and handle `ImplicitShape` in
+  `sched/mod.rs:486,1551`.
+
 ## Review item 10 residue: requests for non-coordinator-file owners
 
 These are outside `program.rs`, `dtype.rs`, `value.rs`, `site.rs` and
@@ -508,3 +583,91 @@ These are outside `program.rs`, `dtype.rs`, `value.rs`, `site.rs` and
 it this way; its rendezvous key is a new local `pair_cta(ctx)`, unchanged.
 W6's `synccheck/build.rs::tmem(pair)` maps to `{cluster: pair, pair_rank: 0}`.
 `numsim-sync-ref` does not name the pair, so it needs no change.
+
+## W2 (2026-10-08): interpreter + scheduler
+
+Changes inside W2-owned modules that other workers see, plus requests.
+
+### W2-1: additions to `interp` / `sched` types (done, W2-owned)
+- `ExecCtx` gained `aux: &mut interp::LaunchAux` (async-group membership,
+  declared-word histories and verdict caches, collective rendezvous,
+  tcgen pipeline order, uninit diagnostics). Generated code only passes
+  `ctx` through, so W7's printer is unaffected (ABI fingerprint changes).
+- `Loaded` gained `op_errors`, `progress`, `param_offsets`, `param_bytes`,
+  `local_per_lane`, `uses_*`; build it with `Loaded::new(&program)`.
+- `MaskFrame.origin` (pc of the `If`/`LoopBegin`), `WarpState.suspended`
+  (`Suspension`: divergent-arm scheduling rule, review item 6),
+  `PollState.also/overflow` (every polled resource, review item 9),
+  `CtaCtx.cluster_tmem`, `LaunchCounters.progress`.
+- Shared step pieces for both backends: `interp::{begin_instr, end_instr,
+  fall_off_end, divergent_switch}`. The scheduler wraps every slice in
+  `codegen::rt::guard` (W7 request 1). Handlers never write `ctx.warp.pc`;
+  only `end_instr`/`divergent_switch` (dispatcher level) do.
+- `RunConfig` gained `workers` (parallel path designed, not implemented:
+  `> 1` runs the single-threaded path, results identical),
+  `max_resident_ctas` (default 1024; cooperative / `grid.sync` launches are
+  fully resident) and `subset` (W8-4). Default validity is
+  `ValidityPolicy::ZeroAndReport` (W8-5). `RunOutcome` gained
+  `failed_kernel`, `diagnostics`, `subset`; `ArgValue::TensorMapOf` (W8-3).
+- `testutil::scenarios` (W7 request 5): `Scenario { name, module, inputs,
+  config }` and `scenarios::all()`; expectations are in
+  `tests/interp_scenarios.rs`.
+
+### W2-2: shared-address encoding (review item 1, done in `arena::addr`)
+`shared_addr(rank, off) -> Option<u32>` = `rank << 24 | off`,
+`decode_shared(a) -> (rank, off)`; the old `shared_cluster` /
+`decode_shared_cluster` are removed. `.shared::cta` accesses require
+`rank == own` (else `BadAddress`); `.shared::cluster` and generic shared
+addresses route by rank (`GENERIC_SHARED_BASE + shared_addr` is the
+distributed-shared generic aperture). `cvta.to.shared` of an own-window
+generic pointer therefore yields `own_rank << 24 | off`, `mapa(p, own)
+== p`, and `p & 0xFEFF_FFFF` names the pair leader. Also added
+`addr::GENERIC_PARAM_BASE` / `Generic::Param` (generic addresses of
+`__grid_constant__` tensor maps).
+**W1:** shared addresses are no longer bare window offsets in clusters with
+`rank > 0`; offsets must be computed as differences of addresses (or with
+`decode_shared`), never by assuming `cvta(...)` < window size. Constants
+built by lowering for shared addresses must be rank-tagged (`rank 0` is
+correct only for the leader CTA).
+
+### W2-3: `may_block` for rendezvous instructions (applied by the
+coordinator in 8a0afff)
+`setmaxnreg.dec` and `cta_group::2` `tcgen05.dealloc/relinquish` block until
+the whole warpgroup / the peer CTA's warp has arrived (the handlers now
+return `Blocked`).
+
+### W2-4: `AsyncKind` has no `TcgenCommit`
+`tcgen05.commit` is queued as an `AsyncOp` with `Payload::None`,
+`after = tracked ops` and the deferred `MbarArrive` signals, so its arrival
+lands only after the committed mma/cp ops. Its `AsyncKind` is
+`TcgenMma` for lack of a variant (the observer sees
+`AsyncClass::TcgenCommit`). Request `AsyncKind::TcgenCommit`.
+
+### W2-5: protocol logging convention (W6-1 item 6)
+One `Protocol` event per *completed* instruction: a named `bar.sync`/`red`
+that registers and blocks logs its `Sync`/`Red` contribution command when
+it completes (immediately or at the successful `Resume`); `Resume` is never
+logged. `setmaxnreg` logs `Set` per warp at completion (after the grant
+poll for `inc`), with `Collective{id, participants}`. Failed polls and
+blocked attempts are not logged. Cross-CTA targets (remote / multicast
+arrive, expect_tx, complete_tx) are stepped synchronously in the same
+`step_all` (review item 2); the inbox carries nothing today but each drain
+still emits `Observer::inbox_drain`.
+
+### W2-6: oplib performance (for W4)
+`oplib::binary(Add, U32)` costs ~650 ns and `compare(Lt, U32)` ~300 ns per
+32-lane call (release build), which is ~90% of the interpreter's time on a
+scalar loop (`benches/interp.rs`: ~420 ns per warp instruction; the
+interpreter's own dispatch is ~30 ns per instruction). A per-type
+monomorphized fast path for 32-bit int/float ops would make the
+interpreter ~10x faster on ALU-bound kernels.
+
+### W2-7: open items
+- `TcgenLd/TcgenSt` other than `.32x32b` (and `.pack/.unpack/.red`),
+  `tcgen05.cp`, and `Tile` fail closed (`Unsupported`); `tcgen05.cp` needs
+  a smem-descriptor -> spans plan from oplib.
+- `tc_mma` closures address one CTA (W4-5); the scheduler maps rank-tagged
+  smem addresses and TMEM lanes >= 128 to the pair peer.
+- `wait_until` captures: registers cannot change while the warp waits, so
+  the register file is the snapshot; verdict caches reset per lane when
+  the capture values change.

@@ -555,7 +555,32 @@ pub struct BulkCopyArgs {
     pub multicast: Option<Operand>,
     #[serde(deserialize_with = "required")]
     pub reduce: Option<(AtomOp, Dtype)>,
+    /// `.cp_mask` 16-bit byte mask (s2g): byte `i` of every 16-byte chunk is
+    /// written only if bit `i` is set.
+    #[serde(deserialize_with = "required")]
+    pub byte_mask: Option<Operand>,
+    /// `.ignore_oob` (g2s): source bytes beyond the source allocation are
+    /// not read; the destination keeps its bytes there (tx still counts the
+    /// full size).
+    pub ignore_oob: bool,
+    /// `_report` forms (layout::v1 barriers): validity inspection mode whose
+    /// result is OR-ed into the completion mbarrier's primary-phase report
+    /// predicate. There is no register destination: the report is read back
+    /// with `MbarTestWait.report`.
+    #[serde(deserialize_with = "required")]
+    pub report: Option<ReportMode>,
     pub mods: MemMods,
+}
+
+/// Validity-inspection mode of `_report` copy forms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ReportMode {
+    /// `.per_element::ff`: every copied byte is inspected.
+    PerElementFf,
+    /// `.per_16bytes`: the lowest-addressed copied element of each 16-byte
+    /// source chunk is inspected.
+    Per16Bytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -632,6 +657,9 @@ pub struct TmaArgs {
     /// `.cta_group::1/2`, 0 = unspecified.
     pub cta_group: u8,
     pub overrides: Vec<TmapOverride>,
+    /// `_report` forms; see [`BulkCopyArgs::report`].
+    #[serde(deserialize_with = "required")]
+    pub report: Option<ReportMode>,
     pub mods: MemMods,
 }
 
@@ -642,7 +670,11 @@ pub struct StAsyncArgs {
     pub ty: Ty,
     pub value: Operand,
     pub addr: Operand,
-    pub mbar: Operand,
+    /// Completion mbarrier (`complete_tx`). `None` for the
+    /// `st.async.release` / `red.async.release` forms without an mbarrier:
+    /// the write is then ordered only by its `.release` semantics (`sem`).
+    #[serde(deserialize_with = "required")]
+    pub mbar: Option<Operand>,
     #[serde(deserialize_with = "required")]
     pub red: Option<AtomOp>,
     pub sem: Sem,
@@ -862,9 +894,11 @@ pub struct TcgenMmaArgs {
     pub collector_a: CollectorOp,
     pub collector_b: CollectorOp,
     pub ashift: bool,
-    /// `lut_b` / `ti16` qualifiers, interpreted by oplib.
-    #[serde(deserialize_with = "required")]
-    pub variant: Option<StrId>,
+    /// `_ti16` forms (`tcgen05_mma*_ti16_*`): 16-bit table-indexed A operand.
+    pub ti16: bool,
+    /// `_lut_b` forms (`tcgen05_mma*_lut_b_*`): B through a lookup table.
+    /// Orthogonal to `kind` (block-scaled `lut_b` forms exist).
+    pub lut_b: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,8 +1390,16 @@ pub enum Instr {
         scope: Scope,
         #[serde(deserialize_with = "required")]
         dst: Option<Reg>,
+        /// `_report` forms (layout::v1 copy-report / conditional parity,
+        /// sync-semantics.md §2.4): the barrier's report predicate, taken
+        /// from the same physical snapshot as `dst`.
+        #[serde(deserialize_with = "required")]
+        report: Option<Reg>,
+        /// `_report_value` forms: the reported value from that snapshot.
+        #[serde(deserialize_with = "required")]
+        report_value: Option<Reg>,
     },
-    /// Blocking wait (`cuda.mbarrier_wait*`).
+    /// Blocking wait (`cuda.mbarrier_wait*`; no report forms exist).
     MbarWait {
         mbar: Operand,
         space: AddrSpace,
@@ -1422,6 +1464,12 @@ pub enum Instr {
         cta_group: u8,
         #[serde(deserialize_with = "required")]
         multicast: Option<Operand>,
+        /// `.sync_restrict::*` form (the arrive is restricted to the
+        /// issuing CTA's / cluster's shared memory window).
+        sync_restrict: bool,
+        /// `.multicast::cluster.width::N` (`tcgen05_commit_multicast_width`).
+        #[serde(deserialize_with = "required")]
+        multicast_width: Option<u8>,
     },
     TcgenLd(Box<TcgenLdArgs>),
     TcgenSt(Box<TcgenStArgs>),
@@ -1654,6 +1702,18 @@ impl DimExpr {
 }
 
 /// A declared buffer.
+///
+/// **TMEM buffers (ruling).** A `Space::Tmem` buffer (a TIR `DeclBuffer` view
+/// of tensor memory) is addressed densely: element `offset` lives at TMEM
+/// lane `(offset / cols) % 128`, column `base_col + offset % cols`, i.e. the
+/// tcgen05 32-lane-per-warp datapath view with 32-bit columns. `Load` and
+/// `Store` on it are executed as the equivalent `tcgen05.ld` / `tcgen05.st`
+/// (`32x32b`) by a warp whose active lanes each address the TMEM lane of
+/// their own sub-partition (`warp_in_cta % 4`); any access that is not
+/// expressible that way (lane outside the warp's sub-partition, element not
+/// 32-bit aligned, a column outside a live allocation) fails closed
+/// (`Unsupported`/`Misaligned`), never silently. `AddrOf` and raw
+/// `LoadAddr`/`StoreAddr` on TMEM are not allowed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BufferDecl {
@@ -1777,6 +1837,13 @@ pub enum ParamKind {
     Pointer,
     Scalar,
     TensorMap,
+    /// A shape variable of buffer parameter `buffer` (axis `axis`, 0 =
+    /// outermost). No host value is bound: the binder takes it from the
+    /// bound array's shape. Replaces name matching on `<buf>.shape<axis>`.
+    ImplicitShape {
+        buffer: ParamId,
+        axis: u8,
+    },
 }
 
 /// Host-prelude tensor-map encoding facts (`tensormap_encode_tiled`).
@@ -1797,6 +1864,13 @@ pub struct TensorMapSpec {
     pub oob_fill: u8,
     /// Byte offset into the base buffer for the global address.
     pub base_offset: DimExpr,
+    /// Raw `CUtensorMapDataType` the host requested when it differs from
+    /// what `dtype` implies (e.g. 11 = TFLOAT32, 13 = 16U4_ALIGN8B,
+    /// 14 = 16U4_ALIGN16B, 15 = 16U6_ALIGN16B). The engine/oplib decides
+    /// the semantics and fails closed on values it does not model; lowering
+    /// passes it through unchanged instead of guessing.
+    #[serde(deserialize_with = "required")]
+    pub force_cu_dtype: Option<u8>,
 }
 
 /// One host parameter, in kernel signature order.
@@ -2084,6 +2158,17 @@ impl Program {
             }
         }
         for (i, slot) in self.host_abi.iter().enumerate() {
+            if let ParamKind::ImplicitShape { buffer, .. } = slot.kind {
+                let ok = self
+                    .host_abi
+                    .get(buffer.0 as usize)
+                    .is_some_and(|b| b.kind == ParamKind::Buffer);
+                if !ok {
+                    return Err(glob(format!(
+                        "param{i}: ImplicitShape.buffer is not a Buffer slot"
+                    )));
+                }
+            }
             if slot.dtype.is_some_and(|t| !ty_ok(t))
                 || slot.buf.is_some_and(|b| b.0 as usize >= self.buffers.len())
                 || slot.implicit_base.is_some_and(|p| p.0 as usize >= np)
@@ -2661,6 +2746,7 @@ impl Instr {
                 [a.dst, a.src, a.size].iter().for_each(|o| f(Use(*o)));
                 completion(&a.completion, f);
                 opt(&a.multicast, f);
+                opt(&a.byte_mask, f);
                 mods(&a.mods, f);
             }
             Tma(a) => {
@@ -2677,7 +2763,8 @@ impl Instr {
             }
             StAsync(a) => {
                 f(Ty(a.ty));
-                [a.value, a.addr, a.mbar].iter().for_each(|o| f(Use(*o)));
+                [a.value, a.addr].iter().for_each(|o| f(Use(*o)));
+                opt(&a.mbar, f);
             }
             TensorMapReplace { tmap, value, .. } => {
                 f(Use(*tmap));
@@ -2725,11 +2812,13 @@ impl Instr {
                 mbar,
                 phase: p,
                 dst,
+                report,
+                report_value,
                 ..
             } => {
                 f(Use(*mbar));
                 phase(p, f);
-                if let Some(d) = dst {
+                for d in [dst, report, report_value].into_iter().flatten() {
                     f(Def(*d, None));
                 }
             }
@@ -2809,9 +2898,6 @@ impl Instr {
                 opt(&a.scale_input_d, f);
                 opt(&a.sparse_meta, f);
                 a.disable_output_lane.iter().for_each(|o| f(Use(*o)));
-                if let Some(v) = a.variant {
-                    f(Str(v));
-                }
             }
             Tile(t) => {
                 for arg in &t.args {
