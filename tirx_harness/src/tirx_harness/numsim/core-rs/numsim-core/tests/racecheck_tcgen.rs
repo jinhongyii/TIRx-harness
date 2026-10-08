@@ -291,7 +291,9 @@ fn restricted_commit(reuse_b: bool, shape_ok: bool) -> Report {
         mma
     };
     k.aacc(mma, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, 0..64);
-    let c = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[ma], &[]);
+    // `AsyncIssue.restricted` (contract 4b9f9c2); the old engine shape
+    // (`shape_ok == false`) sent an unmarked commit.
+    let c = if shape_ok { k.issue_restricted_commit(0, 0, &[ma]) } else { k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[ma], &[]) };
     k.done_phase(c, Milestone::Write, 1, 0).wait(0, 1, 1, 0, true);
     k.fence(0, 1, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
     k.st(0, 0, SMEM, if reuse_b { B.start..B.start + 2 } else { A.start..A.start + 2 });
@@ -350,4 +352,26 @@ fn later_commit_implies_already_completed_mma() {
         k.run()
     };
     assert!(clean(&run(true)), "{:?}", run(true));
+}
+
+/// T15 does not apply to a `.sync_restrict` commit (AsyncIssue.restricted):
+/// waiting on it must not order an earlier, already-completed MMA's B read
+/// it never tracked.
+#[test]
+fn restricted_commit_does_not_imply_completed_ops() {
+    let run = |restricted: bool| {
+        let mut k = K::new(2, 1, 1);
+        let mma = k.issue(0, 0, AsyncKind::TcgenPipelined, Proxy::Async, &[], &[(SMEM, 0..64)]);
+        k.aacc(mma, Milestone::Read, AccessKind::Read, Proxy::Async, SMEM, 0..64);
+        let c1 = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[mma], &[]);
+        k.done_phase(c1, Milestone::Write, 1, 0);
+        let c2 = if restricted { k.issue_restricted_commit(0, 0, &[]) } else { k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[], &[]) };
+        k.done_phase(c2, Milestone::Write, 2, 0);
+        k.wait(1, 1, 2, 0, true);
+        k.fence(1, 1, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+        k.st(1, 0, SMEM, 0..4);
+        k.run()
+    };
+    assert!(clean(&run(false)));
+    assert!(has_race(&run(true)));
 }

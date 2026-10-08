@@ -393,7 +393,7 @@ impl Observer for RaceObserver {
                         };
                         ri::SyncEvent::Fence { warp, lanes, kind, site: e.site, epoch }
                     }
-                    SyncKind::AsyncIssue { op, class, proxy, preds, footprint, .. } => {
+                    SyncKind::AsyncIssue { op, class, proxy, preds, footprint, restricted, .. } => {
                         let preds: Vec<AsyncId> = preds
                             .iter()
                             .flat_map(|p| match self.subops.get(p) {
@@ -416,6 +416,7 @@ impl Observer for RaceObserver {
                                     proxy: *proxy,
                                     preds: preds.clone(),
                                     footprint: footprint.clone(),
+                                    restricted: *restricted,
                                     site: e.site,
                                     epoch,
                                 });
@@ -431,6 +432,7 @@ impl Observer for RaceObserver {
                             proxy: *proxy,
                             preds,
                             footprint,
+                            restricted: *restricted,
                             site: e.site,
                             epoch,
                         }

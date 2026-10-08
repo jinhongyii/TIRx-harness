@@ -370,7 +370,20 @@ fn merge_alias(fs: &[RaceFinding], lr: &LaunchResult) -> Vec<RaceFinding> {
     use std::collections::HashMap;
     let mut out: Vec<RaceFinding> = Vec::with_capacity(fs.len());
     let mut rep: HashMap<(Option<String>, Option<String>, Option<Space>, u32, u32), usize> = HashMap::new();
+    // Legacy `record_review_findings`: one TmemLifetimeReview per static
+    // (prior site, current site) pair across allocations, the first.
+    let mut review: HashMap<(u32, u32), usize> = HashMap::new();
     for f in fs {
+        if let (RK::TmemLifetimeReview { .. }, Some(p), Some(c)) = (&f.kind, &f.prior, &f.current) {
+            match review.get(&(p.site.0, c.site.0)) {
+                Some(&i) => out[i].occurrences += f.occurrences,
+                None => {
+                    review.insert((p.site.0, c.site.0), out.len());
+                    out.push(f.clone());
+                }
+            }
+            continue;
+        }
         let (RK::Advisory { kind: AdvisoryKind::AliasStaleRead }, Some(p), Some(c)) = (&f.kind, &f.prior, &f.current) else {
             out.push(f.clone());
             continue;

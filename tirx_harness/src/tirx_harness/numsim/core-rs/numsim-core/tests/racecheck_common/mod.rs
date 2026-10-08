@@ -335,8 +335,22 @@ impl K {
         self.sync_ev(
             a,
             LaneMask::lane(lane as usize),
-            SyncKind::AsyncIssue { op, class: kind, proxy, preds: preds.to_vec(), footprint, targets: vec![] },
+            SyncKind::AsyncIssue { op, class: kind, proxy, preds: preds.to_vec(), footprint, targets: vec![], restricted: false },
         );
+        op
+    }
+
+    /// A `.sync_restrict` tcgen05.commit tracking only `preds`.
+    pub fn issue_restricted_commit(&mut self, w: WarpId, lane: u8, preds: &[AsyncId]) -> AsyncId {
+        let op = self.issue(w, lane, AsyncKind::TcgenCommit, Proxy::Tcgen, preds, &[]);
+        for e in self.ev.iter_mut().rev() {
+            if let Ev::Sync(CSync { kind: SyncKind::AsyncIssue { op: o, restricted, .. }, .. }) = e {
+                if *o == op {
+                    *restricted = true;
+                    break;
+                }
+            }
+        }
         op
     }
 
@@ -347,7 +361,7 @@ impl K {
         self.next_op += 1;
         let a = self.wactor(w);
         let footprint = footprint.iter().map(|(a, r)| (*a, ByteSpan::new(r.start, r.end - r.start))).collect();
-        self.sync_ev(a, LaneMask(mask), SyncKind::AsyncIssue { op, class: kind, proxy, preds: vec![], footprint, targets: vec![] });
+        self.sync_ev(a, LaneMask(mask), SyncKind::AsyncIssue { op, class: kind, proxy, preds: vec![], footprint, targets: vec![], restricted: false });
         op
     }
 

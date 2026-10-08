@@ -2241,3 +2241,58 @@ needs a decision before more rows can be judged. New rows:
   ` [view <name>]` (W9).
 - Corpus sweep: 217,222 sites, 0 with empty text. The `tma_atomicity` `T.ptx.cp`
   sites carry their source line.
+
+## W5-12 (for W2, 2026-10-08): `tcgen05.alloc` writes the TMEM address with one lane
+
+On `sparse_flashmla_prefill_head128_phase1` (kernel.py:587/591), `tcgen05.alloc.cta_group::2.sync.aligned`
+writes `tmem_start_addr` in shared memory, and every lane then reads it with `ld.shared.u32`.
+The engine emits the write as a single-lane generic write. With no `__syncwarp`, every other lane's
+read is a `missing_same_warp_lane_order` race. The instruction is `.sync.aligned`, a warp-collective
+convergence point whose result all participating lanes may use. Request: emit the write with the
+active lane mask as writers (each lane writes the same word), or emit `SyncKind::WarpSync { mask: active }`
+right after the instruction. Racecheck needs no change.
+
+## W5 (2026-10-08): V2C-38 TMEM review footprints (for W8)
+
+`tmem_lifetime_review` keeps one representative per static (load site, store site) pair: the first
+one delivered (legacy `record_review_findings`; deltas T16). Which instance is delivered first
+depends on the schedule, so its column footprint can differ from legacy's. Examples:
+`cudnn_sm100_bsa_forward_blk{64,128}`, `cudnn_sm103_flex_attention_forward`, `flash_attention4`
+(v2 `256-512` vs legacy `256-320`). Request: compare `tmem_lifetime_review` by kind and anchors only,
+not by `tmem-columns`.
+
+## W2 (2026-10-08): V2C-35, W8-8, W4-16, W5 (c06149c), AsyncIssue.restricted
+
+1. **V2C-35 (reversed ruling).** A top-level buffer's synthetic base is a fresh 4096-aligned allocation, so it is at least 256-aligned like `cudaMalloc`. The host pointer's bits are ignored. `Inputs.host_addrs` is still accepted, but placement no longer uses it. A `View` keeps its byte offset in its region.
+   - `alloc_global_low_bits` was removed.
+   - Scenario: `global_bases_are_aligned_and_views_keep_offsets`.
+   - Corpus: 28 of the 36 rows of the 12 cases now pass. The misalignment crash is gone everywhere.
+   - The 8 remaining rows were unmasked by the crash:
+     - racecheck findings diffs (W5): `cudnn_sm100_gdn_bprop_f16`, `flash_mla_sparse_fwd`, `kda_backward_packed`, `sparse_flashmla_decode_head64`, `sparse_flashmla_prefill_head128_phase1`, `sparse_flashmla_prefill_head128_small_topk_phase1`;
+     - `sparse_flashmla_decode_head64` numsim and synccheck: `named_barrier_contract_mismatch` `PartialWarp { mask: 0xfffffffe }` at a non-`.aligned` `barrier.sync` (kernel line 1743). This is the sync-isa-answers Q3/Q5 model, and needs a ruling.
+   - Legacy `test_pointer_bits_preserve_binding_address_and_subview_offset` cannot pass under this rule.
+     - It binds `storage[offset:offset+32]` of an *unbound* `storage` and expects the absolute host pointer's low 8 bits.
+     - Only the first iteration (host-aligned offset) passes.
+     - Proposal: rewrite the test to bind `storage` too, or to assert offsets relative to the bound region. Coordinator/W8 to decide.
+   - `test_mapa_and_cvta_expose_the_device_validated_integer_bits` is unrelated: shared-window aperture bits, with no host pointers.
+2. **W8-8.** `allocate_host` places every `Buffer` / `View` argument after the referenced ones, in name order. Planned addresses of referenced buffers do not move. Unreferenced ones are returned unchanged in `Outputs`.
+   - Scenario: `unreferenced_buffer_arguments_are_allocated`.
+   - The `NotImplementedError` guard in `v2/run.py::_patch_descriptor_pointers` can now go (Python owner).
+3. **W4-16.**
+   - `tcgen05.ld/st` use `TcgenLdstMap::cell_runs()`. Each live, fully valid run is read once into an image. `st` patches the image and writes it back once; validity is unchanged.
+   - Every other piece takes the per-piece path, with the same errors and findings.
+   - The MMA TMEM closures accept multi-cell buffers and reject one that runs past the lane's last column.
+   - The two oplib NaN tests are **not** an FP-environment problem. They fail only in `--release`; the debug build passes 125/125. Each test runs on a fresh thread with the default MXCSR.
+   - In release, the scalar reference `mul_add` is inlined to a hardware FMA form whose operand order the compiler picks. With two NaN inputs, AMD EPYC 7763 then returns a different payload. Back to W4.
+   - `alphamoe_fp8_blockscale_qwen3next`: no `bad_address` at the current tree. numsim and synccheck pass; racecheck has a findings-only diff. Please send a reproduction command if it still happens.
+4. **W5 (c06149c) TMEM footprint.** Not a 39b678e regression.
+   - Rust builds of the core at 27b485c, aed5b1b and 39b678e were run under the current Python.
+   - `gdn_prefill_sm100` racecheck shows the same `tmem_lifetime_review` (`async_lifetime_not_drained`, columns 0-512) at aed5b1b and at 39b678e, with identical diffs. 27b485c has them as well. The current tree has fewer.
+   - Scenario `tcgen_ldst_spans_are_exact_on_both_paths` (`tcgen_ld_wide`) asserts that `tcgen05.ld/st` TMEM spans equal exactly each lane's cells, identically on the run path and the per-piece path.
+5. **Readonly proxy.** The engine rejects any global write overlapping bytes read through `ld.global.nc`, in either order, with "write overlaps readonly bytes".
+   - It covers sync stores, atomics, `st.bulk`, and async landings (TMA, bulk, reductions, `st.async`, dead bytes and bit fragments).
+   - A conflict between partitions in the same round is caught at merge.
+   - Tracking is per kernel launch, when the program has `nc` loads or `requirements.readonly_proxy` is set.
+   - Scenarios: `readonly_proxy(clean|disjoint|after|before|cross_cta)`, with 1 and 2 workers.
+   - `test_readonly_proxy.py` and the `test_needs_kernel_batch` readonly items pass; 2 of those were `xpassed`, so their xfail marks can go.
+6. **`SyncKind::AsyncIssue::restricted`.** Set from `Issue::restricted`: `true` only for the `tcgen05.commit .sync_restrict` issue, `false` everywhere else.

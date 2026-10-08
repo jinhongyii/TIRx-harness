@@ -1599,11 +1599,11 @@ impl Checker {
                 }
                 self.fence(warp, lanes, kind, site, epoch);
             }
-            SyncEvent::AsyncIssue { op, warp, lanes, kind, proxy: _, preds, footprint, site, epoch } => {
+            SyncEvent::AsyncIssue { op, warp, lanes, kind, proxy: _, preds, footprint, restricted, site, epoch } => {
                 if !self.tick(warp, epoch) {
                     return;
                 }
-                self.async_issue(op, warp, lanes, kind, preds, footprint, site, epoch);
+                self.async_issue(op, warp, lanes, kind, preds, footprint, restricted, site, epoch);
             }
             SyncEvent::AsyncComplete { op, milestone, target } => {
                 let Some(i) = self.async_idx(op) else { return };
@@ -1835,6 +1835,7 @@ impl Checker {
         kind: AsyncKind,
         preds: Vec<AsyncId>,
         footprint: Vec<(AllocId, Range<u64>)>,
+        restricted: bool,
         site: SiteId,
         epoch: Epoch,
     ) {
@@ -1875,16 +1876,15 @@ impl Checker {
             }
             pred_idx.push((pi, pa.gen_base));
         }
-        if kind == AsyncKind::TcgenCommit {
+        if kind == AsyncKind::TcgenCommit && !restricted {
             // PTX: the commit tracks ALL prior async tcgen05 ops of the
-            // thread. The engine names only those still in flight; an op
-            // whose completion was already delivered (through another
-            // commit's mbarrier the issuer never waited on) is complete
-            // before this commit is issued, so this commit's arrival
-            // implies it too (deltas T15).
+            // thread. The engine names only the ops it still has in flight
+            // (one that already landed, possibly behind an earlier commit
+            // whose arrival is not yet delivered, is omitted), so every
+            // earlier pipelined op of the thread the checker still holds
+            // is tracked here too (deltas T15).
             for (si, sa) in self.asyncs.iter().enumerate() {
                 if sa.in_use
-                    && sa.done >= 2
                     && sa.kind == AsyncKind::TcgenPipelined
                     && sa.warp == warp
                     && lanes.has(sa.lane)

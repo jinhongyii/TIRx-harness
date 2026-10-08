@@ -127,6 +127,8 @@ pub enum SyncEvent {
         proxy: Proxy,
         preds: Vec<AsyncId>,
         footprint: Vec<(AllocId, Range<u64>)>,
+        /// A `.sync_restrict` commit (tracks only its `preds`).
+        restricted: bool,
         site: SiteId,
         epoch: u32,
     },
