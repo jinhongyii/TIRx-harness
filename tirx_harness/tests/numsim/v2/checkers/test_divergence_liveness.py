@@ -17,11 +17,10 @@ from tirx_harness.numsim import v2
 
 from ._runnable import (
     WARP_COLLECTIVE_DIVERGENCE,
-    assert_clean,
     assert_error_kind,
     assert_no_incomplete,
     coverage_bounds,
-    no_spec,
+    kinds_of,
     requires_v2_engine,
     resource_limits,
 )
@@ -112,18 +111,22 @@ def test_lane_divergent_break_is_exact_collective_error():
     assert_no_incomplete(report)
 
 
-@no_spec(16, "TMEM access after an unordered cross-warp dealloc (legacy synchronization_collective_publication)")
 def test_synccheck_requires_cross_warp_tmem_quiescence_before_dealloc():
     """Replaces ``tests/analysis_tools/synccheck/test_native_kernel_contracts.py::test_native_synccheck_requires_cross_warp_tmem_quiescence_before_dealloc`` (unordered half; the ordered half is re-checked here as the control).
 
-    Ordered (warp 1's ``tcgen05.ld`` drained before warp 0 deallocates): clean.
-    Unordered (warp 1 loads after the dealloc): error, legacy kind
-    ``synchronization_collective_publication`` ("not covered by any live
-    allocation"). No new doc names this check, so any error kind is accepted
-    alongside the legacy one. (Observed in v2: the ordered half draws a
-    ``review`` ``uninitialized_read`` advisory for the fresh TMEM load.)
+    W6 ruling (sync-isa-answers Q8, sync delta T9): a cross-warp
+    ``tcgen05.dealloc`` is legal; a TMEM access to columns outside every live
+    allocation is a ``bad_address`` error in every mode (legacy kind
+    ``synchronization_collective_publication``).
+    Ordered (warp 1's ``tcgen05.ld`` drained before warp 0 deallocates): no
+    error; only the ``uninitialized_read`` review of the fresh TMEM load
+    (W8-5 ZeroAndReport). Unordered (warp 1 loads after the dealloc):
+    ``bad_address``.
     """
 
-    assert_clean(_sync(native_cross_warp_tmem_dealloc, {"ordered": np.int32(1)}, max_loop_steps=1_000))
+    ordered = _sync(native_cross_warp_tmem_dealloc, {"ordered": np.int32(1)}, max_loop_steps=1_000)
+    assert ordered.verdict in ("clean", "review"), ordered.format()
+    assert kinds_of(ordered) <= {"uninitialized_read"}, ordered.format()
     unordered = _sync(native_cross_warp_tmem_dealloc, {"ordered": np.int32(0)}, max_loop_steps=1_000)
     assert unordered.verdict == "error", unordered.format()
+    assert_error_kind(unordered, {"bad_address"})

@@ -25,7 +25,7 @@ from tirx_harness.numsim import v2
 
 from tests.numsim.v2.ports._racedeltas import assert_b7_scope_mismatch
 
-from ._runnable import assert_clean, race_access_pairs, requires_v2_engine
+from ._runnable import kinds_of, assert_clean, race_access_pairs, requires_v2_engine
 from ._tcgen_kernels import SPARSE_B16_CASES, lut_b_case, sparse_float_case
 
 pytestmark = requires_v2_engine
@@ -138,24 +138,18 @@ def multicast_barrier(out: T.Buffer(({ctas}, 2), "uint32")):
     )
 
 
-@_no_spec_unlisted(
-    "a multicast ctaMask bit naming a rank outside the cluster; the v2 interpreter drops it "
-    "(ranks_of) and the never-completed barrier ends incomplete divergent_block"
-)
 @pytest.mark.parametrize("checker", CHECKERS)
 def test_mbarrier_multicast_outside_cluster(checker):
     """Replaces ``tests/numsim/runtime/test_mbarrier_multicast.py::test_mbarrier_multicast_outside_cluster`` (its checker loop as a param).
 
     A 32-bit ``ctaMask`` selecting rank 20 of a 20-CTA cluster: verdict
-    ``error`` and the report says the target is "outside the cluster".
-    No new spec says how an out-of-cluster ``ctaMask`` bit is handled
-    (sync-semantics.md only says "multicast to the ``ctaMask`` CTAs"), and no
-    numbered no-spec item covers it yet.
+    ``error``, kind ``bad_address`` ("names ranks outside the 20-CTA cluster";
+    W6 ruling, sync-isa-answers Q9, sync delta M16).
     """
 
     report = _check(checker, _multicast_outside_cluster_kernel(), {"out": np.zeros((20, 2), np.uint32)})
     assert report.verdict == "error", report.format()
-    assert "outside the cluster" in report.format(), report.format()
+    assert "bad_address" in kinds_of(report), report.format()
 
 
 # -- cp_mask bulk store over readonly-read bytes ---------------------------------
