@@ -9,6 +9,8 @@ from tvm.script import tirx as T
 
 from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
+from tirx_harness.numsim.v2.lowering import lower
+from tirx_harness.numsim.v2.lowering import program_builder as pb
 
 pytestmark = requires_v2_engine
 
@@ -75,6 +77,10 @@ def test_uniform_loop_var_preserves_tir_dtype_in_select():
 
     expected = np.where(np.arange(32) < 16, 7, 2).astype(np.int32)
     np.testing.assert_array_equal(result.outputs["output"], expected)
+    # W11: the pinned fact on the lowered Program: the Select over the loop variable
+    # keeps the TIR int32 dtype (legacy: ``: i32 =`` in the generated Rust).
+    (select,) = [i for i in lower(loop_var_dtype_select).code if i.variant == "Select"]
+    assert select.ty == pb.Ty("S32"), select
 
 
 def test_lane_varying_min_extent_and_step_use_masked_native_loop():

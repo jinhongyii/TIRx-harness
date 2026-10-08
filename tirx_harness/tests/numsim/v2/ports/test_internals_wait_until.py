@@ -11,6 +11,7 @@ from tvm.script import tirx as T
 
 from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
+from tirx_harness.numsim.v2.lowering import lower
 
 pytestmark = requires_v2_engine
 
@@ -34,6 +35,33 @@ def _verdicts(kernel, inputs):
 # ``UndeclaredProtocolWord``. The raw spin loops below therefore report
 # ``review`` where legacy said ``clean`` (rendezvous) or ``error``/data_race
 # (packed). The legacy expectation is kept until the test is re-ruled.
+
+
+
+def _executed_memory_ops(kernel) -> list[tuple]:
+    """W11: Program-content analogue of the legacy ``_memory_variants(rust_source)``.
+
+    The memory instructions of the lowered Program in order, without the wait
+    itself: a ``WaitUntil`` is dropped, and so is everything inside a native
+    loop body (the raw spelling's spin). What the two spellings must agree on
+    is everything else (kind, semantics, scope, RMW op, type)."""
+
+    program = lower(kernel)
+    depth, ops = 0, []
+    for instr in program.code:
+        if instr.variant == "LoopBegin":
+            depth += 1
+        elif instr.variant == "LoopEnd":
+            depth -= 1
+        elif not depth and instr.variant in ("Load", "Store", "Atom", "LoadAddr", "StoreAddr"):
+            ops.append((instr.variant, getattr(instr, "sem", None), getattr(instr, "scope", None),
+                        getattr(instr, "op", None), getattr(instr, "ty", None)))
+    return ops
+
+
+def _wait_until_count(kernel) -> int:
+    """W11: Program-content analogue of the legacy ``_declared_wait_count(rust_source)``."""
+    return sum(instr.variant == "WaitUntil" for instr in lower(kernel).code)
 
 
 def _run(kernel, inputs):
@@ -335,6 +363,9 @@ def test_rendezvous_matches_raw_spelling():
         np.testing.assert_array_equal(outputs[name], raw_outputs[name])
     assert _verdicts(primitive, _rendezvous_inputs)["racecheck"] == ("clean", [])
     np.testing.assert_array_equal(outputs["observed"], np.array([7, 0], np.int32))
+    # W11: the pinned facts, on the lowered Program instead of generated Rust.
+    assert _executed_memory_ops(primitive) == _executed_memory_ops(raw)
+    assert (_wait_until_count(primitive), _wait_until_count(raw)) == (1, 0)
 
 
 def test_rendezvous_raw_spelling_racecheck_is_undeclared_word_review():
@@ -369,6 +400,8 @@ def test_packed_wait_matches_raw_spelling(dtype):
         np.testing.assert_array_equal(outputs[name], raw_outputs[name])
     assert _verdicts(primitive, inputs)["racecheck"] == ("clean", [])
     np.testing.assert_array_equal(outputs["observed"], np.array([7], dtype))
+    # W11: the pinned fact, on the lowered Program instead of generated Rust.
+    assert _executed_memory_ops(primitive) == _executed_memory_ops(raw)
 
 
 @pytest.mark.parametrize("dtype", sorted(_WORD_TYPES))
@@ -417,6 +450,8 @@ def test_bit_typed_word_matches_raw_spelling():
     outputs = _run(primitive, _packed_inputs("int32")).outputs
     np.testing.assert_array_equal(outputs["observed"], raw_outputs["observed"])
     np.testing.assert_array_equal(outputs["observed"], np.array([1], np.int32))
+    # W11: the pinned fact, on the lowered Program instead of generated Rust.
+    assert _executed_memory_ops(primitive) == _executed_memory_ops(raw)
 
 
 def test_a_backoff_is_the_cuda_loops_business_and_not_the_engines():
@@ -429,3 +464,14 @@ def test_a_backoff_is_the_cuda_loops_business_and_not_the_engines():
     outputs = _run(_backoff_spin(primitive=True), _backoff_inputs()).outputs
     np.testing.assert_array_equal(outputs["observed"], np.array([7], np.int32))
     v2.racecheck(_backoff_spin(primitive=True), _backoff_inputs()).require_clean()
+    # W11: the pinned fact on the lowered Program: the hand-written spin sleeps once
+    # per poll (one `nano_sleep` site), the primitive emits no sleep at all.
+    def sleeps(kernel):
+        program = lower(kernel)
+        return [
+            pc for pc, site in enumerate(program.code_sites)
+            if site < len(program.sites) and program.sites[site].op_name == "tirx.cuda.nano_sleep"
+        ]
+
+    assert len(sleeps(_backoff_spin(primitive=False))) == 1
+    assert sleeps(_backoff_spin(primitive=True)) == []

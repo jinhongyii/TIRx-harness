@@ -10,6 +10,7 @@ from tvm.script import tirx as T
 from tests.numsim.support.kernels import ordering_only_control_calls
 from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
+from tirx_harness.numsim.v2.lowering import lower
 
 pytestmark = requires_v2_engine
 
@@ -47,6 +48,14 @@ def test_ordering_only_calls_preserve_native_source_order():
     result = v2.Engine().run(module, {"output": output})
 
     np.testing.assert_array_equal(result.outputs["output"], np.arange(1, 33, dtype=np.int32))
+
+    # W11: the pinned facts, on the lowered Program. `griddepcontrol.wait` records
+    # the external grid-dependency assumption (legacy semantic_requirements), and
+    # the ordering-only calls keep their source order.
+    program = lower(ordering_only_control_calls)
+    assert program.requirements.grid_dependency
+    order = [i.variant for i in program.code if i.variant in ("MbarInit", "Fence", "GridDepControl", "Barrier")]
+    assert order == ["MbarInit", "Fence", "Fence", "GridDepControl", "Barrier"], order
 
 
 def test_griddep_token_crosses_sequential_kernel_phases():
