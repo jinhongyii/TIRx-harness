@@ -13,6 +13,7 @@ emitted in its place; ``lower(..., strict=True)`` then raises
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import tvm
@@ -27,6 +28,7 @@ from .dtypes import dtype_of, type_key
 from .host_prelude import PreludeMixin
 from .memory import MemoryMixin, MemRef, _Unsupported, escaped_locals, handle, promotable_locals
 from .owner_transport import OwnerTransportMixin, function_is_owner_transport
+from . import tile_forms
 from .tile_checks import tile_rejection
 from .uninit import maybe_uninit_locals
 
@@ -519,6 +521,14 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
     def stmt_tirx_Evaluate(self, node: Any) -> None:
         value = node.value
         kind = type_key(value)
+        if kind == "ir.Call" and str(getattr(value.op, "name", "")) == "tirx.call_extern" \
+                and value.args and getattr(value.args[0], "value", None) == tile_forms.PLACEHOLDER:
+            call, reason = tile_forms.PENDING[int(value.args[1].value)]
+            try:
+                tile_forms.lower(call, self)
+            except _Unsupported as error:
+                raise _Unsupported(call, f"{error.reason} (TVM: {reason})") from None
+            return
         if kind == "ir.Call":
             self.call(value, statement=True)
             return
@@ -923,13 +933,94 @@ def dispatch_tile_primitives(func: Any) -> Any:
         return func
     attrs = func.attrs
     arch = str(attrs["tirx.cuda_arch"]) if attrs is not None and "tirx.cuda_arch" in attrs else "sm_100a"
-    try:
-        with tvm.target.Target({"kind": "cuda", "arch": arch}):
-            module = tirx.transform.TilePrimitiveDispatch()(tvm.IRModule({"main": func}))
-    except Exception as error:  # noqa: BLE001 - dispatch rejection: keep the tile op, fail closed later
-        _DISPATCH_ERRORS[id(func)] = " ".join(str(error).split())[:300]
-        return func
-    return module["main"]
+    original, current, reasons = func, func, {}
+    # Amended Decision 6: TVM first; the ops TVM rejects go to the v2 tile
+    # forms (tile_forms/), swapped out for placeholders so TVM still lowers the
+    # rest of the function. Retried once per rejected op name.
+    for _ in range(8):
+        try:
+            with tvm.target.Target({"kind": "cuda", "arch": arch}):
+                module = tirx.transform.TilePrimitiveDispatch()(tvm.IRModule({"main": current}))
+        except Exception as error:  # noqa: BLE001 - dispatch rejection
+            message = " ".join(str(error).split())
+            match = re.search(r"op=(tirx\.tile\.\w+)", message)
+            if match is None or not tile_forms.handles(match.group(1)) or match.group(1) in reasons:
+                _DISPATCH_ERRORS[id(original)] = message[:300]
+                return original
+            reasons[match.group(1)] = message[:300]
+            repaired = _repair_tile_calls(current, match.group(1))
+            if repaired is not None:
+                try:
+                    with tvm.target.Target({"kind": "cuda", "arch": arch}):
+                        tirx.transform.TilePrimitiveDispatch()(tvm.IRModule({"main": repaired}))
+                    current = repaired
+                    continue
+                except Exception:  # noqa: BLE001 - the repair did not help this op
+                    current = repaired
+            current = _swap_out_tile_calls(current, match.group(1), message[:300], arch)
+            continue
+        return module["main"]
+    _DISPATCH_ERRORS[id(original)] = "TVM dispatch did not converge"
+    return original
+
+
+def _repair_tile_calls(func: Any, op_name: str) -> Any | None:
+    """Apply the tile forms' legacy-spelling repairs to every ``op_name`` call."""
+    from tvm_ffi import structural_mutate
+
+    changed = False
+
+    def on_call(node: Any, mutator: Any) -> Any:
+        nonlocal changed
+        if str(node.op.name) != op_name:
+            return mutator.default_mutate(node)
+        fixed = tile_forms.repair(node)
+        if fixed is None:
+            return node
+        changed = True
+        return fixed
+
+    body = structural_mutate(func.body, [(tirx.TilePrimitiveCall, on_call)])
+    return func.with_body(body) if changed else None
+
+
+def _swap_out_tile_calls(func: Any, op_name: str, reason: str, arch: str = "sm_100a") -> Any:
+    """Replace the ``op_name`` tile calls TVM cannot dispatch by v2 tile-form
+    placeholders. Each call is tried alone (every other tile call swapped out),
+    so a call of the same op that TVM does lower stays with TVM."""
+    from tvm_ffi import structural_mutate
+
+    calls: list[Any] = []
+    structural_visit(func.body, [(tirx.TilePrimitiveCall, lambda n, v: calls.append(n))])
+    rejected: set[int] = set()
+    for candidate in calls:
+        if str(candidate.op.name) != op_name:
+            continue
+
+        def keep_only(node: Any, mutator: Any, candidate: Any = candidate) -> Any:
+            if node.same_as(candidate):
+                return node
+            return tirx.Evaluate(tirx.call_extern("int32", "numsim_v2_probe", 0))
+
+        probe = func.with_body(structural_mutate(func.body, [(tirx.TilePrimitiveCall, keep_only)]))
+        try:
+            with tvm.target.Target({"kind": "cuda", "arch": arch}):
+                tirx.transform.TilePrimitiveDispatch()(tvm.IRModule({"main": probe}))
+        except Exception:  # noqa: BLE001 - TVM rejects this call
+            rejected.add(id(candidate))
+    if not rejected:  # the failure only shows in context: hand all of them over
+        rejected = {id(c) for c in calls if str(c.op.name) == op_name}
+    by_identity = [c for c in calls if id(c) in rejected]
+
+    def on_call(node: Any, mutator: Any) -> Any:
+        if not any(node.same_as(c) for c in by_identity):
+            return mutator.default_mutate(node)
+        key = len(tile_forms.PENDING)
+        tile_forms.PENDING[key] = (node, reason)
+        return tirx.Evaluate(tirx.call_extern("int32", tile_forms.PLACEHOLDER, key))
+
+    body = structural_mutate(func.body, [(tirx.TilePrimitiveCall, on_call)])
+    return func.with_body(body)
 
 
 _DISPATCH_ERRORS: dict[int, str] = {}
