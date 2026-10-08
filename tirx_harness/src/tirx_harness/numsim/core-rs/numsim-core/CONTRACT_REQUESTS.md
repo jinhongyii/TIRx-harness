@@ -2858,3 +2858,21 @@ New delta rows written for this class:
 - sync-behaviour-deltas **B8**: a divergent default-mask `__syncwarp` is `incomplete`.
 
 These replace three expected-to-fail "is an error" copies, which now assert the v2 status.
+
+## W11 legacy-import batch (2026-10-08): `tests/numsim/registry`, `tests/numsim/abi`, `tests/analysis_tools`
+
+There are 22 modules (175 functions: 120 C, 36 B, 19 A). Every function now has a v2 home:
+- 14 modules are all category C. They exercise only legacy internals (frontend registries, PTX dialect decoder, Rust emission, ABI metadata, legacy report classes) and are deleted with the legacy layer in wave 5b.
+- The remaining A functions have v2 copies. 5 new copies are in `tests/numsim/v2/ports/test_w11_registry.py`.
+- The B functions have Rust or v2-checker replacements (waves 1 and 2).
+
+The mapping is in `scripts/numsim-v2/coverage/deleted_modules_w11.tsv` and `v2_ports_w11.tsv`. Two new v2 gaps, both for W1:
+
+- **W11-5 [W1 lowering]: the register-owner `Assert` emitted for a dispatched tile op has no site.**
+  - Kernel: `Tx.wg.copy` local->local, which TVM dispatches to `copy/fallback`.
+  - Reproducer: `test_w11_registry.py::test_default_thread_owned_local_copy_trap_is_anchored_at_the_copy` (`v2_gap`).
+  - The trap stops with `site: None`, so the report has no `source_span` and cannot point at the copy.
+  - Expected: the `Assert` carries the tile op's site, as every other instruction lowered from the op does.
+- **W11-6 [W1 lowering]: `T.cuda.mov_sreg(32, "%laneid")` is rejected.**
+  - The error is `unsupported TIRx: special register %%laneid`. Legacy normalized the `%` prefix, so `"laneid"` and `"%laneid"` gave the same code.
+  - Reproducer: `test_w11_registry.py::test_fetch_register_alias_normalization_is_explicit` (`v2_gap`). It compares the lowered Program code and registers of the two spellings.
