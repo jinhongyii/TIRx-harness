@@ -383,6 +383,12 @@ pub struct LaunchAux {
     /// a `fence.proxy.tensormap::generic.release` of the modifying warp,
     /// keyed by (allocation, offset) -> modifying warp.
     pub tmap_dirty: HashMap<(AllocId, u64), WarpId>,
+    /// In-kernel publications of a tensor map in memory (generation per
+    /// descriptor) and the generation each CTA acquired with
+    /// `fence.proxy.tensormap::generic.acquire` (legacy "latest published
+    /// generation is not acquired within this CTA").
+    pub tmap_published: HashMap<(AllocId, u64), u64>,
+    pub tmap_acquired: HashMap<(CtaId, AllocId, u64), u64>,
     /// Lane-varying `mbarrier.wait` targets that already completed while
     /// another target of the same instruction blocks, per (warp, pc):
     /// (target, command, lanes, observed generation). Those lanes left the

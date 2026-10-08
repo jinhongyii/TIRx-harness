@@ -1274,3 +1274,47 @@ fn divergent_named_barrier_waits_for_the_warp() {
         }
     }
 }
+
+/// W5-12: lanes read the `tcgen05.alloc` result right after the collective.
+#[test]
+fn tcgen_alloc_result_is_read_by_every_lane() {
+    let o = run(&scenarios::tcgen_alloc_lanes_read());
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![0; 64]);
+}
+
+/// W2-8: `.per_16bytes` reports compare only the first element of each
+/// 16-byte source chunk with the pattern.
+#[test]
+fn copy_report_per_16bytes_samples_chunk_heads() {
+    for sampled in [false, true] {
+        let o = run(&scenarios::copy_report_16(sampled));
+        completed(&o);
+        assert_eq!(u32s(&o, "out"), vec![0, sampled as u32], "sampled={sampled}");
+    }
+}
+
+/// W5-14: a `sync_words` view is declared one word per element of its
+/// dtype (32 four-byte words for 128 bytes of u32), never one word.
+#[test]
+fn sync_words_are_declared_per_element() {
+    #[derive(Default)]
+    struct Words(Vec<numsim_core::arena::ByteSpan>);
+    impl Observer for Words {
+        fn wants_word_history(&self) -> bool {
+            true
+        }
+        fn sync(&mut self, e: &SyncEvent) {
+            if let SyncKind::DeclareWord { span, .. } = e.kind {
+                self.0.push(span);
+            }
+        }
+    }
+    let s = scenarios::polled_flag_words();
+    let mut obs = Words::default();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).expect("run starts");
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), (1..=32).collect::<Vec<u32>>());
+    assert_eq!(obs.0.len(), 32, "{:?}", obs.0);
+    assert!(obs.0.iter().all(|s| s.len == 4), "{:?}", obs.0);
+}

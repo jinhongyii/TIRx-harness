@@ -161,6 +161,9 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
             // Some lane needs the general path (error / uninit report).
         }
     }
+    if let Some(eb) = sub_byte(ctx, ty, buf) {
+        return load_sub_byte(ctx, dst, buf, offset, sem, scope, mods, eb);
+    }
     let n = ty.mem_bytes() as u64;
     let mut acc = Accesses::default();
     let mut bytes = [0u8; 32];
@@ -230,6 +233,9 @@ pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Op
             }
         }
     }
+    if let Some(eb) = sub_byte(ctx, ty, buf) {
+        return store_sub_byte(ctx, ty, buf, offset, value, sem, scope, eb);
+    }
     let n = ty.mem_bytes() as u64;
     let mut acc = Accesses::default();
     let mut bytes = [0u8; 32];
@@ -245,6 +251,68 @@ pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Op
     }
     let proxy = if matches!(ctx.buffers[buf.0 as usize], crate::interp::BufBinding::Tmem { .. }) { Proxy::Tcgen } else { Proxy::Generic };
     let sp = support::spec(ctx, AccessKind::Write, sem, scope, proxy);
+    support::emit(ctx, sp, &mut acc);
+    Ok(Flow::Next)
+}
+
+/// Element width of a scalar access to a sub-byte buffer (`float4`,
+/// `int4`, ...): legacy packs `8 / bits` elements per byte, element `i` at
+/// bit `i * bits` (low bits first). `None` for every other access.
+fn sub_byte(ctx: &ExecCtx<'_>, ty: Ty, buf: Buf) -> Option<u32> {
+    let eb = ctx.program.buffers[buf.0 as usize].dtype.elem.bits();
+    (eb < 8 && 8 % eb == 0 && ty.slots() == 1 && ty.elem.bits() == eb).then_some(eb)
+}
+
+/// The byte holding sub-byte element `idx` (resolved as the byte-aligned
+/// element that starts it) and the element's bit shift in it.
+fn sub_byte_loc(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, eb: u32) -> Result<(Loc, u32), ExecError> {
+    let per = (8 / eb) as i64;
+    let first = idx.div_euclid(per) * per;
+    let loc = support::resolve_buf(ctx, buf, first, lane, 1)?;
+    Ok((loc, (idx.rem_euclid(per) as u32) * eb))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_sub_byte(ctx: &mut ExecCtx<'_>, dst: Reg, buf: Buf, offset: Operand, sem: Sem, scope: Scope, mods: MemMods, eb: u32) -> HResult {
+    let mut acc = Accesses::default();
+    for l in ctx.warp.active.lanes() {
+        let idx = lane_int(ctx, offset, l);
+        let (loc, shift) = sub_byte_loc(ctx, buf, idx, l, eb)?;
+        let mut b = [0u8; 1];
+        support::mem_read(ctx, loc, l, &mut b)?;
+        if mods.nc {
+            support::readonly_read(ctx, loc.alloc, loc.span(1), l)?;
+        }
+        let v = (b[0] >> shift) & ((1u16 << eb) - 1) as u8;
+        write_lane_bytes(ctx, dst, l, &[v]);
+        if ctx.observing {
+            acc.push(loc, l as u8, 1);
+        }
+    }
+    let sp = support::spec(ctx, AccessKind::Read, sem, scope, load_proxy(&mods));
+    support::emit(ctx, sp, &mut acc);
+    Ok(Flow::Next)
+}
+
+/// Sub-byte store: read-modify-write of the holding byte, in lane order (two
+/// lanes storing elements of one byte both land).
+#[allow(clippy::too_many_arguments)]
+fn store_sub_byte(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Operand, sem: Sem, scope: Scope, eb: u32) -> HResult {
+    let mut acc = Accesses::default();
+    let mask = ((1u16 << eb) - 1) as u8;
+    for l in ctx.warp.active.lanes() {
+        let idx = lane_int(ctx, offset, l);
+        let (loc, shift) = sub_byte_loc(ctx, buf, idx, l, eb)?;
+        let old = ctx.arena.read_raw(loc.alloc, loc.span(1))[0];
+        let mut v = [0u8; 32];
+        lane_bytes(ctx, value, ty, l, &mut v);
+        let new = (old & !(mask << shift)) | ((v[0] & mask) << shift);
+        support::mem_write(ctx, loc, l, &[new])?;
+        if ctx.observing {
+            acc.push(loc, l as u8, 1);
+        }
+    }
+    let sp = support::spec(ctx, AccessKind::Write, sem, scope, Proxy::Generic);
     support::emit(ctx, sp, &mut acc);
     Ok(Flow::Next)
 }

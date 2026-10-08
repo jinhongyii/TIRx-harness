@@ -231,6 +231,7 @@ fn exec_error_kind(e: &ExecError) -> (String, &'static str) {
         K::Trap => "trap".to_string(),
         K::Unsupported => "unsupported".to_string(),
         K::Divergence => "divergence".to_string(),
+        K::WarpCollectiveDivergence => "warp_collective_divergence".to_string(),
         K::Budget => "budget_exhausted".to_string(),
         K::Internal => "internal_error".to_string(),
     };

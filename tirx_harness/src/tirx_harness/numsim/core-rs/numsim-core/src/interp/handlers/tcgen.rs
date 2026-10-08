@@ -42,7 +42,7 @@ fn pair_cta(ctx: &ExecCtx<'_>) -> crate::observe::CtaId {
 
 fn full_warp(ctx: &ExecCtx<'_>, what: &str) -> Result<(), ExecError> {
     if ctx.warp.active != ctx.warp.live {
-        return Err(support::err(ctx, ExecErrorKind::Divergence, ctx.warp.active, format!("{what}.sync.aligned with divergent lanes")));
+        return Err(support::err(ctx, ExecErrorKind::WarpCollectiveDivergence, ctx.warp.active, format!("{what}.sync.aligned with divergent lanes")));
     }
     Ok(())
 }
@@ -62,6 +62,11 @@ fn write_taddr(ctx: &mut ExecCtx<'_>, dst: Operand, base: u32) -> Result<(), Exe
     }
     let sp = support::spec(ctx, AccessKind::Write, Sem::Weak, Scope::Cta, Proxy::Generic);
     support::emit(ctx, sp, &mut acc);
+    // `tcgen05.alloc` is `.aligned` and warp-collective: the result write is
+    // the warp's, so every lane is ordered after it (W5-12;
+    // racecheck-semantics §3 row 3).
+    let active = ctx.warp.active;
+    support::sync_event(ctx, active, crate::observe::SyncKind::WarpSync { mask: active });
     Ok(())
 }
 
@@ -297,7 +302,8 @@ pub fn tcgen_commit(
         // Tracked = every op issued since the previous commit of this kind
         // (landed or not: the commit's preds name them) plus earlier
         // committed ops still in flight.
-        let restricted = sync_restrict && multicast.is_none();
+        // A multicast `.sync_restrict` commit is restricted too (W5-13).
+        let restricted = sync_restrict;
         let key = (ctx.warp.id, l as u8);
         let fresh = if restricted {
             ctx.aux.tcgen_shared_reads.remove(&key).unwrap_or_default()

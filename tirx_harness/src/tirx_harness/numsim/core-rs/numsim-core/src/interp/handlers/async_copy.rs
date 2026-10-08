@@ -553,18 +553,22 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
 }
 
 /// `_report` copy forms: completion must be an mbarrier; the pattern of
-/// `.per_16bytes` is not carried by `ReportMode` yet (W2-8), fail closed.
+/// pattern-less `.per_16bytes` fails closed (W2-8).
 fn check_report(ctx: &ExecCtx<'_>, report: Option<ReportMode>, completion: &BulkCompletion) -> Result<(), ExecError> {
     match (report, completion) {
         (None, _) => Ok(()),
         (Some(ReportMode::Per16Bytes), _) => {
-            Err(support::unsupported(ctx, "copy report .per_16bytes (pattern not in the contract, W2-8)"))
+            Err(support::unsupported(ctx, "copy report .per_16bytes without its pattern (lower to Per16BytesPattern, W2-8)"))
         }
+        (Some(ReportMode::Per16BytesPattern { bits, .. }), _) if !matches!(bits, 4 | 8 | 16 | 32) => Err(ctx.error(
+            ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+            format!("copy report .per_16bytes element width {bits} is not 4, 8, 16 or 32"),
+        )),
         (Some(_), BulkCompletion::Group) => Err(ctx.error(
             ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
             "copy report forms require an mbarrier completion",
         )),
-        (Some(ReportMode::PerElementFf), BulkCompletion::Mbarrier { .. }) => Ok(()),
+        (Some(ReportMode::PerElementFf | ReportMode::Per16BytesPattern { .. }), BulkCompletion::Mbarrier { .. }) => Ok(()),
     }
 }
 
@@ -636,12 +640,29 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
                 "tensor map modified by tensormap.replace is used before a fence.proxy.tensormap::generic.release published it (dirty descriptor)",
             ));
         }
+        // A descriptor published in this kernel must be acquired by the
+        // using CTA (fence.proxy.tensormap::generic.acquire) before use.
+        if let Some(&g) = ctx.aux.tmap_published.get(&(tloc.alloc, tloc.offset)) {
+            if ctx.aux.tmap_acquired.get(&(ctx.cta.id, tloc.alloc, tloc.offset)) != Some(&g) {
+                return Err(support::err(
+                    ctx,
+                    ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+                    WarpMask::lane(l),
+                    "tensormap descriptor: the latest published generation is not acquired within this CTA (missing fence.proxy.tensormap::generic.acquire)",
+                ));
+            }
+        }
         if !args.overrides.is_empty() {
             let ov: Vec<_> = args.overrides.iter().map(|o| (o.field, o.ord, lane_val(ctx, o.value, l))).collect();
             desc.apply_overrides(&ov).map_err(|e| support::op_err(ctx, e))?;
         }
         let coords: Vec<i64> = args.coords.iter().map(|&c| lane_int(ctx, c, l)).collect();
         let offs: Vec<i64> = args.im2col_offsets.iter().map(|&c| lane_int(ctx, c, l)).collect();
+        if args.dir == TmaDir::Prefetch {
+            // W4-17: a tensor prefetch only checks the rank (legacy), no plan.
+            crate::oplib::tma_prefetch_check(&desc, args.mode, &coords).map_err(|e| support::op_err(ctx, e))?;
+            continue;
+        }
         let sa = lane_val(ctx, args.smem, l);
         let sloc = support::resolve(ctx, args.smem_space, sa, l, 1)?;
         let pdir = match args.dir {
@@ -865,7 +886,18 @@ pub fn tensormap_replace(ctx: &mut ExecCtx<'_>, tmap: Operand, space: AddrSpace,
     let mut wacc = Accesses::default();
     for l in ctx.warp.active.lanes() {
         let (mut d, loc) = read_tmap(ctx, tmap, space, l, &mut racc)?;
-        d.replace(field, ord, lane_val(ctx, value, l)).map_err(|e| support::op_err(ctx, e))?;
+        let v = lane_val(ctx, value, l);
+        // A rank outside 1..=5 is an invalid operand (a kernel error, not an
+        // unmodelled form; legacy rejected it).
+        if field == TmapField::Rank && !(1..=5).contains(&v) {
+            return Err(support::err(
+                ctx,
+                ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+                WarpMask::lane(l),
+                format!("tensormap.replace rank {v} is outside 1..5"),
+            ));
+        }
+        d.replace(field, ord, v).map_err(|e| support::op_err(ctx, e))?;
         ctx.aux.tmap_dirty.insert((loc.alloc, loc.offset), ctx.warp.id);
         let b = d.try_encode().map_err(|e| support::op_err(ctx, e))?;
         support::mem_write(ctx, loc, l, &b)?;
@@ -883,23 +915,43 @@ pub fn tensormap_replace(ctx: &mut ExecCtx<'_>, tmap: Operand, space: AddrSpace,
 #[inline]
 pub fn tensormap_cp_fence(ctx: &mut ExecCtx<'_>, dst: Operand, src: Operand, size: u32, scope: Scope) -> HResult {
     active_or_next!(ctx);
+    // `.sync.aligned`: every non-exited lane of the warp executes it.
+    if ctx.warp.active != ctx.warp.live {
+        let m = ctx.warp.active;
+        return Err(support::err(
+            ctx,
+            ExecErrorKind::WarpCollectiveDivergence,
+            m,
+            format!("tensormap.cp_fenceproxy requires all 32 lanes, got mask {:#010x}", m.bits()),
+        ));
+    }
     let n = size as u64;
     let mut racc = Accesses::default();
     let mut wacc = Accesses::default();
-    for l in ctx.warp.active.lanes() {
-        let sa = lane_val(ctx, src, l);
-        let sspace = if sa >> 32 == 0 { AddrSpace::Shared } else { AddrSpace::Generic };
-        let sl = support::resolve(ctx, sspace, sa, l, n)?;
-        let dl = support::resolve(ctx, AddrSpace::Generic, lane_val(ctx, dst, l), l, n)?;
-        let mut b = vec![0u8; n as usize];
-        support::mem_read(ctx, sl, l, &mut b)?;
-        support::mem_write(ctx, dl, l, &b)?;
-        // `tensormap.cp_fenceproxy` publishes the copy (release).
-        ctx.aux.tmap_dirty.remove(&(dl.alloc, dl.offset));
-        if ctx.observing {
-            racc.push(sl, l as u8, n);
-            wacc.push(dl, l as u8, n);
-        }
+    // `.sync.aligned` warp-collective: ONE copy by the warp (W5-13), with
+    // warp-uniform operands.
+    let l = ctx.warp.active.first().unwrap_or(0);
+    let (sa, da) = (lane_val(ctx, src, l), lane_val(ctx, dst, l));
+    if let Some(o) = ctx.warp.active.lanes().find(|&o| lane_val(ctx, src, o) != sa || lane_val(ctx, dst, o) != da) {
+        return Err(support::err(
+            ctx,
+            ExecErrorKind::WarpCollectiveDivergence,
+            WarpMask::lane(o),
+            "tensormap.cp_fenceproxy operands differ across the warp (warp-collective)",
+        ));
+    }
+    let sspace = if sa >> 32 == 0 { AddrSpace::Shared } else { AddrSpace::Generic };
+    let sl = support::resolve(ctx, sspace, sa, l, n)?;
+    let dl = support::resolve(ctx, AddrSpace::Generic, da, l, n)?;
+    let mut b = vec![0u8; n as usize];
+    support::mem_read(ctx, sl, l, &mut b)?;
+    support::mem_write(ctx, dl, l, &b)?;
+    // `tensormap.cp_fenceproxy` publishes the copy (release).
+    ctx.aux.tmap_dirty.remove(&(dl.alloc, dl.offset));
+    *ctx.aux.tmap_published.entry((dl.alloc, dl.offset)).or_default() += 1;
+    if ctx.observing {
+        racc.push(sl, crate::observe::ALL_LANES, n);
+        wacc.push(dl, crate::observe::ALL_LANES, n);
     }
     let sp = support::spec(ctx, AccessKind::Read, Sem::Weak, scope, Proxy::Generic);
     support::emit(ctx, sp, &mut racc);

@@ -592,9 +592,15 @@ pub struct IgnoreOob {
 pub enum ReportMode {
     /// `.per_element::ff`: every copied byte is inspected.
     PerElementFf,
-    /// `.per_16bytes`: the lowest-addressed copied element of each 16-byte
-    /// source chunk is inspected.
+    /// `.per_16bytes` without its pattern (legacy lowering form): fails
+    /// closed. Superseded by `Per16BytesPattern` (W2-8).
     Per16Bytes,
+    /// `.per_16bytes::<hex>` (W2-8): the lowest-addressed copied element of
+    /// each 16-byte source chunk (16-byte aligned in the source address
+    /// space) is compared with `pattern`; any equal element sets the
+    /// report bit. `bits` = element width: 32, 16, 8 or 4 (the number of
+    /// hex digits x 4; a 4-bit element is the low nibble of its byte).
+    Per16BytesPattern { pattern: u32, bits: u8 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

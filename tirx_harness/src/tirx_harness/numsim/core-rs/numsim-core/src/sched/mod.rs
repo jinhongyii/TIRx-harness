@@ -848,9 +848,10 @@ impl<'p> Scheduler<'p> {
             if self.wants_history {
                 for (i, b) in self.program.buffers.iter().enumerate() {
                     if let (true, BufBinding::SharedWindow { offset, len }) = (b.sync_words, self.bindings[i]) {
-                        let span = ByteSpan::new(offset as u64, len);
-                        self.partitions[pi].aux.words.declare(arena, ctx.smem, span);
-                        self.host_event(observer, SyncKind::DeclareWord { alloc: ctx.smem, span });
+                        for span in sync_word_spans(b, offset as u64, len) {
+                            self.partitions[pi].aux.words.declare(arena, ctx.smem, span);
+                            self.host_event(observer, SyncKind::DeclareWord { alloc: ctx.smem, span });
+                        }
                     }
                 }
             }
@@ -1011,9 +1012,10 @@ impl<'p> Scheduler<'p> {
         if self.wants_history {
             for (i, b) in self.program.buffers.iter().enumerate() {
                 if let (true, BufBinding::View(v)) = (b.sync_words, self.bindings[i]) {
-                    let span = ByteSpan::new(v.offset, v.len);
-                    self.launch_words.declare(arena, v.alloc, span);
-                    self.host_event(observer, SyncKind::DeclareWord { alloc: v.alloc, span });
+                    for span in sync_word_spans(b, v.offset, v.len) {
+                        self.launch_words.declare(arena, v.alloc, span);
+                        self.host_event(observer, SyncKind::DeclareWord { alloc: v.alloc, span });
+                    }
                 }
             }
         }
@@ -1475,6 +1477,14 @@ fn blocked_cmd(r: ResourceId) -> SyncCmd {
         ResourceId::RegPool { .. } => SyncCmd::RegPool(setmaxnreg::Cmd::Poll { wg: 0 }),
         _ => SyncCmd::TcgenGroup(0),
     }
+}
+
+/// Declared sync words of a `sync_words` buffer (W5-14 ruling): one word
+/// per element of the polled view's dtype (`bits / 8` bytes, at least 1),
+/// each with its own history; never one word over the whole buffer.
+fn sync_word_spans(b: &crate::program::BufferDecl, offset: u64, len: u64) -> Vec<ByteSpan> {
+    let w = (b.dtype.bits() as u64 / 8).max(1);
+    (0..len.div_ceil(w)).map(|k| ByteSpan::new(offset + k * w, w.min(len - k * w))).collect()
 }
 
 fn write_param(arena: &mut Arena, params: AllocId, off: u64, bytes: &[u8]) {

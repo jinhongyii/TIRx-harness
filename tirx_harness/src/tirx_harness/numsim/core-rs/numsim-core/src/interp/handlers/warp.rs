@@ -23,7 +23,7 @@ pub fn members(ctx: &ExecCtx<'_>, membermask: Operand) -> Result<WarpMask, ExecE
     if !missing.is_empty() || !extra.is_empty() {
         return Err(support::err(
             ctx,
-            ExecErrorKind::Divergence,
+            ExecErrorKind::WarpCollectiveDivergence,
             active,
             format!("membermask {m} does not match the executing lanes {active} (live {})", ctx.warp.live),
         ));
@@ -110,7 +110,7 @@ pub fn warp_sync(ctx: &mut ExecCtx<'_>, membermask: Operand) -> HResult {
     let active = ctx.warp.active;
     let m = WarpMask(uniform_over(ctx, membermask, active)? as u32);
     if !active.and_not(m).is_empty() {
-        return Err(support::err(ctx, ExecErrorKind::Divergence, active, format!("__syncwarp({m}) executed by lanes outside the mask")));
+        return Err(support::err(ctx, ExecErrorKind::WarpCollectiveDivergence, active, format!("__syncwarp({m}) executed by lanes outside the mask")));
     }
     let required = m.and(ctx.warp.live);
     if !required.and_not(active).is_empty() {
@@ -145,7 +145,7 @@ pub fn warp_sync(ctx: &mut ExecCtx<'_>, membermask: Operand) -> HResult {
 
 fn full_warp(ctx: &ExecCtx<'_>, what: &str) -> Result<(), ExecError> {
     if ctx.warp.active != ctx.warp.live {
-        return Err(support::err(ctx, ExecErrorKind::Divergence, ctx.warp.active, format!("{what}.sync.aligned with divergent lanes")));
+        return Err(support::err(ctx, ExecErrorKind::WarpCollectiveDivergence, ctx.warp.active, format!("{what}.sync.aligned with divergent lanes")));
     }
     Ok(())
 }

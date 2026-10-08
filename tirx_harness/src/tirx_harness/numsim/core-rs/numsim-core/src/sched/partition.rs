@@ -781,10 +781,12 @@ impl Partition {
         }
         // layout::v1 copy reports: inspect the copied source bytes, OR the
         // result into every completion phase's report bit.
-        if let (Some(crate::program::ReportMode::PerElementFf), Payload::Copy { src, .. }) =
-            (meta.as_ref().and_then(|m| m.report), &op.payload)
-        {
-            let matched = src.iter().any(|&(a, s)| arena.read_raw(a, s).contains(&0xff));
+        if let (Some(mode), Payload::Copy { src, .. }) = (meta.as_ref().and_then(|m| m.report), &op.payload) {
+            let matched = match mode {
+                crate::program::ReportMode::PerElementFf => src.iter().any(|&(a, s)| arena.read_raw(a, s).contains(&0xff)),
+                crate::program::ReportMode::Per16BytesPattern { pattern, bits } => report_16(arena, src, pattern, bits),
+                crate::program::ReportMode::Per16Bytes => false,
+            };
             for c in &op.signals {
                 if let Completion::MbarTx { res, gen, .. } = *c {
                     *self.aux.mbar_reports.entry((res, gen)).or_default() |= matched;
@@ -852,6 +854,30 @@ fn actor_warp(a: Actor) -> WarpId {
         Actor::Warp { warp, .. } => warp,
         _ => WarpId(u32::MAX),
     }
+}
+
+/// `.per_16bytes` copy report (W2-8): in each 16-byte chunk of the source
+/// address space the copy reads, the lowest-addressed copied element of
+/// `bits` bits is compared with `pattern`.
+fn report_16(arena: &Arena, src: &[(AllocId, ByteSpan)], pattern: u32, bits: u8) -> bool {
+    let eb = (bits as u64).div_ceil(8).max(1);
+    let mut first: std::collections::BTreeMap<(AllocId, u64), u64> = std::collections::BTreeMap::new();
+    for &(a, s) in src {
+        let base = arena.get(a).base;
+        let mut off = s.start;
+        while off < s.end() {
+            let chunk = (base + off) / 16;
+            let e = first.entry((a, chunk)).or_insert(off);
+            *e = (*e).min(off);
+            off = (chunk + 1) * 16 - base;
+        }
+    }
+    first.into_iter().any(|((a, _), off)| {
+        let b = arena.read_raw(a, ByteSpan::new(off, eb));
+        let v = b.iter().rev().fold(0u32, |acc, &x| (acc << 8) | x as u32);
+        let v = if bits == 4 { v & 0xf } else { v };
+        v == pattern
+    })
 }
 
 /// Copy concatenated `src` spans onto concatenated `dst` spans (equal

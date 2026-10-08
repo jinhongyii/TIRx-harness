@@ -289,6 +289,11 @@ pub enum ExecErrorKind {
     /// Collective executed with an illegal active mask (e.g. `.aligned`
     /// with divergent lanes, membermask not a subset of active).
     Divergence,
+    /// A warp-collective instruction (`.aligned`, `__syncwarp`/shuffle
+    /// membermask, `setmaxnreg`, `grid.sync`, ...) executed by an illegal
+    /// subset of the warp (legacy kind `warp_collective_divergence`, W5-13).
+    /// `Divergence` stays for non-uniform operands.
+    WarpCollectiveDivergence,
     /// Loop / step budget exhausted (incomplete, never success).
     Budget,
     /// Engine bug.

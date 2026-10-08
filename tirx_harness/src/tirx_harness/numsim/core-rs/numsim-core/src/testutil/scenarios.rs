@@ -892,6 +892,91 @@ pub fn readonly_proxy(variant: &str) -> Scenario {
     scenario("readonly_proxy", b.build_module(), inputs(vec![("data", u32_buf(0..64)), ("out", u32_buf([0; 32]))]))
 }
 
+/// Non-`.aligned` `barrier.sync` reached by divergent lanes of one warp
+/// (Q3 ruling). Two warps; thread 0 stores 7 to shared `s[0]`, then:
+/// * `"same"`: thread 0 and the other lanes execute `barrier.sync 1, 64` at
+///   two different sites; every thread then copies `s[0]` to `out` (all 7);
+/// * `"other_id"`: the other lanes of warp 0 go to barrier 2 instead
+///   (error: `PartialWarp`);
+/// * `"exit"`: the other lanes exit instead (error: `PartialWarp`).
+pub fn divergent_named_barrier(variant: &str) -> Scenario {
+    let mut b = ProgramBuilder::new("divergent_named_barrier", 64);
+    let out = b.global("out", Dtype::U32);
+    let sm = b.shared("s", Dtype::U32, 1);
+    let tid = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    b.thread_rank(tid);
+    let k0 = b.k_u32(0);
+    let k7 = b.k_u32(7);
+    let k64 = b.k_u32(64);
+    let id1 = b.k_u32(1);
+    let id2 = b.k_u32(2);
+    let bar = |b: &mut ProgramBuilder, id: Operand| b.push(Instr::Barrier { kind: BarKind::Sync, id, count: Some(k64), aligned: false });
+    b.compare(CmpOp::Eq, Ty::U32, p, tid, k0);
+    b.if_(p);
+    b.st_u32(sm, k0, k7);
+    bar(&mut b, id1);
+    b.else_();
+    match variant {
+        "other_id" => {
+            // Warp 1 uses barrier 1 (full warp), warp 0's lanes barrier 2.
+            let q = b.reg(Ty::PRED);
+            let k32 = b.k_u32(32);
+            b.compare(CmpOp::Lt, Ty::U32, q, tid, k32);
+            b.if_(q);
+            bar(&mut b, id2);
+            b.else_();
+            bar(&mut b, id1);
+            b.end_if();
+        }
+        "exit" => {
+            b.exit();
+        }
+        _ => {
+            bar(&mut b, id1);
+        }
+    }
+    b.end_if();
+    b.ld_u32(v, sm, k0);
+    b.st_u32(out, tid, v);
+    b.exit();
+    scenario("divergent_named_barrier", b.build_module(), inputs(vec![("out", u32_buf([0; 64]))]))
+}
+
+/// W5-12: one warp's `tcgen05.alloc` writes the TMEM address to shared
+/// memory (one lane's store) and every lane reads it right away, without a
+/// barrier: the collective orders the warp after its result write (no
+/// same-warp race). `out[lane]` = the address (allocation base 0).
+pub fn tcgen_alloc_lanes_read() -> Scenario {
+    // `cta_group::2` (as in sparse_flashmla_prefill_head128_phase1): the
+    // address store happens on the retry after the peer rendezvous.
+    let mut b = ProgramBuilder::new("tcgen_alloc_lanes_read", 32);
+    b.grid(2, 1, 1);
+    b.cluster(2, 1, 1);
+    let out = b.global("out", Dtype::U32);
+    let slot = b.shared("taddr", Dtype::U32, 1);
+    let tid = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let gi = b.reg(Ty::U32);
+    let sa = b.reg(Ty::U32);
+    let t = b.reg(Ty::U32);
+    b.thread_rank(tid);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let k0 = b.k_u32(0);
+    let k32 = b.k_u32(32);
+    b.mul(Ty::U32, gi, cta, k32);
+    b.add_u32(gi, gi, tid);
+    b.smem_addr(sa, slot, k0);
+    b.push(Instr::TcgenAlloc { dst: sa.into(), ncols: k32, cta_group: 2, exclusive: false });
+    b.ld_u32(t, slot, k0);
+    b.st_u32(out, gi, t);
+    b.push(Instr::TcgenRelinquish { cta_group: 2 });
+    b.push(Instr::TcgenDealloc { taddr: t.into(), ncols: k32, cta_group: 2, exclusive: false });
+    b.exit();
+    scenario("tcgen_alloc_lanes_read", b.build_module(), inputs(vec![("out", u32_buf([7; 64]))]))
+}
+
 /// Rows x cols of the TMA scenario's f32 tensor, and its box.
 pub const TMA_ROWS: u32 = 8;
 pub const TMA_COLS: u32 = 16;
@@ -1048,6 +1133,24 @@ pub fn tma_load() -> Scenario {
 /// a 0xff byte. After each wait, `try_wait.parity` with a report register
 /// reads the phase's report bit into `out[phase]`.
 pub fn copy_report() -> Scenario {
+    let mut gbv: Vec<u32> = (0..32).collect();
+    gbv[5] = 0x00ff_0000;
+    copy_report_with(ReportMode::PerElementFf, gbv)
+}
+
+/// W2-8: `.per_16bytes::80000000` samples the first 32-bit element of each
+/// 16-byte source chunk: `gb[5]` (not sampled) never matches; with
+/// `sampled`, `gb[8]` (first of chunk 2) does. `out = [0, sampled]`.
+pub fn copy_report_16(sampled: bool) -> Scenario {
+    let mut gbv: Vec<u32> = (0..32).collect();
+    gbv[5] = 0x8000_0000;
+    if sampled {
+        gbv[8] = 0x8000_0000;
+    }
+    copy_report_with(ReportMode::Per16BytesPattern { pattern: 0x8000_0000, bits: 32 }, gbv)
+}
+
+fn copy_report_with(mode: ReportMode, gbv: Vec<u32>) -> Scenario {
     let mut b = ProgramBuilder::new("copy_report", 32);
     let ga = b.global("ga", Dtype::U32);
     let gb = b.global("gb", Dtype::U32);
@@ -1104,7 +1207,7 @@ pub fn copy_report() -> Scenario {
             reduce: None,
             byte_mask: None,
             ignore_oob: None,
-            report: Some(ReportMode::PerElementFf),
+            report: Some(mode),
             mods: MemMods::default(),
         }));
         b.no_site();
@@ -1135,8 +1238,6 @@ pub fn copy_report() -> Scenario {
     b.exit();
     let mut prog = b.build();
     mark_elect(&mut prog, e);
-    let mut gbv: Vec<u32> = (0..32).collect();
-    gbv[5] = 0x00ff_0000;
     scenario(
         "copy_report",
         Module::new(vec![prog]),
@@ -1936,6 +2037,46 @@ pub fn load_flag_spin(publish: bool) -> Scenario {
         b.build_module(),
         inputs(vec![("flag", u32_buf([0])), ("data", u32_buf([0; 32])), ("out", u32_buf([0; 32]))]),
     );
+    sc.config.loop_budget = 1 << 40;
+    sc
+}
+
+/// W5-14: a 128-byte `sync_words` shared view of 32 `u32` flags, polled
+/// per 4-byte element: warp 1 lane `l` stores `st.release.cta flags[l] =
+/// l + 1`; warp 0 lane `l` spins on `ld.acquire.cta flags[l]` and copies the
+/// value to `out[l]`. The engine declares 32 four-byte words.
+pub fn polled_flag_words() -> Scenario {
+    let mut b = ProgramBuilder::new("polled_flag_words", 64);
+    let out = b.global("out", Dtype::U32);
+    let flags = b.shared("flags", Dtype::U32, 32);
+    let w = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    b.warp_id(w);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let fill = b.k_u32(0);
+    b.st_u32(flags, lane, fill);
+    b.bar_sync(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k1);
+    b.if_(p);
+    b.add_u32(v, lane, k1);
+    st_sem(&mut b, flags, lane.into(), v.into(), Sem::Release, Scope::Cta);
+    b.else_();
+    b.mov(v, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Eq, Ty::U32, p, v, k0);
+    b.loop_if(p);
+    ld_sem(&mut b, v, flags, lane.into(), Sem::Acquire, Scope::Cta);
+    b.loop_end();
+    b.st_u32(out, lane, v);
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    prog.buffers[flags.0 as usize].sync_words = true;
+    let mut sc = scenario("polled_flag_words", Module::new(vec![prog]), inputs(vec![("out", u32_buf([0; 32]))]));
     sc.config.loop_budget = 1 << 40;
     sc
 }
@@ -3203,7 +3344,7 @@ pub fn tma_load_param_box() -> Scenario {
 /// Scenarios that are deliberately racy or only meaningful with a specific
 /// configuration (each test states its expectation): not in [`all`].
 pub fn special() -> Vec<Scenario> {
-    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), tmem_subword(), tmem_f16_rows(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE), readonly_proxy("after"), readonly_proxy("cross_cta"), tcgen_ld_wide(false)]
+    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), tmem_subword(), tmem_f16_rows(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE), readonly_proxy("after"), readonly_proxy("cross_cta"), tcgen_ld_wide(false), divergent_named_barrier("other_id"), divergent_named_barrier("exit")]
 }
 
 /// Writes in [`word_history_overflow`] past `MAX_WORD_HISTORY`.
@@ -3213,6 +3354,10 @@ pub const MAX_HISTORY_PROBE: u32 = (crate::interp::aux::MAX_WORD_HISTORY as u32)
 pub fn all() -> Vec<Scenario> {
     vec![
         vector_add(),
+        polled_flag_words(),
+        copy_report_16(true),
+        tcgen_alloc_lanes_read(),
+        divergent_named_barrier("same"),
         tcgen_ld_wide(true),
         readonly_proxy("clean"),
         readonly_proxy("disjoint"),

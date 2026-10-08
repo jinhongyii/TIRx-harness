@@ -1499,6 +1499,8 @@ impl Checker {
             self.warps[me as usize].acquire(lanes, &rel.k, memo);
         } else {
             self.report_scope_mismatch(rs, my_scope, rel.warp, me, rel.site, acq_site);
+            let memo = &self.memo; // SCRATCH
+            self.warps[me as usize].acquire(lanes, &rel.k, memo); // SCRATCH
         }
     }
 
@@ -1765,6 +1767,7 @@ impl Checker {
                     acquires.push(x.k.clone());
                 } else {
                     mismatches.push((a, s, x.warp, x.site));
+                    acquires.push(x.k.clone()); // SCRATCH
                 }
             } else {
                 pend.push(Arc::new(Rel { k: (*x.k).clone(), scope: Some(a), warp: x.warp, site: x.site }));

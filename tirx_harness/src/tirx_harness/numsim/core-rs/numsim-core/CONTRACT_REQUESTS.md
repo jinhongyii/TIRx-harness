@@ -2484,3 +2484,67 @@ Request: one `DeclareWord` per element, matching the verdict spans.
       poll width.
   - Lowering will add the field and a test as soon as (a) lands; (b) needs
     nothing from W1.
+
+## W2 (2026-10-08): engine-stops triage (26 functions / 29 items), W5-12, W5-13, W5-14, W6 items, W2-8
+
+### engine-stops triage (public-API set, `NUMSIM_IMPL=v2`, after this pass)
+
+| outcome | functions (items) | which |
+| --- | --- | --- |
+| pass now | 6 (6) | `test_dynamic_shared_tile_view_uses_its_static_parent_bounds`; `test_compose_layout_combines_tile_and_swizzle_into_physical_alias_bytes` and `test_local_view_exposes_raw_span_including_layout_gaps_and_offset` (fixed by later commits); `test_explicit_uint8_backing_supplies_two_float4_values_per_byte`, `test_odd_float4_logical_count_uses_a_ceiling_byte_span` (**engine fix: sub-byte buffer element load/store**); `test_global_alias_view_uses_layout_physical_span` |
+| delta, fail-closed by design | 17 (20) | see "Deltas" below |
+| lowering, W1 | 2 (2) | see "Hand-offs" below |
+| oplib, W4 | 1 (1) | `test_gate_intrinsics_match_float32_semantics`: `tirx.log1p` has no oplib implementation |
+
+**Engine fix.** Sub-byte buffer element access (`float4` / `int4`): `interp/handlers/mem.rs`, `load_sub_byte` and `store_sub_byte`.
+- Element `i` sits at bit `i * bits` of the packed bytes, low bits first.
+- A load extracts the element's bits.
+- A store is a read-modify-write of the holding byte, in lane order.
+
+**Deltas** (fail-closed by design):
+- **TMEM buffer access outside the warp's sub-partition (14 functions, 17 items).**
+  - Functions: `test_fp8_cta1_extended_shared_addresses` x2, `test_bf16_m64_tcgen_mma_uses_layout_f`, `test_cta_group2_banked_a_selects_matching_b_shard`, `test_dense_gemm_async_reads_tmem_a_and_transposed_b_storage`, `test_dense_gemm_async_starts_the_fma_chain_from_input_d`, `test_large_bf16_gemm_async_uses_one_engine_gemm`, `test_m64_tcgen_mma_infers_weight_stationary_from_packed_layout_e`, `test_m64_tcgen_mma_uses_layout_f_independently_of_declared_tmem_layout`, `test_raw_cta2_mma_matches_the_typed_gemm_async_exactly` x3, `test_raw_cta2_ts_m128_selects_the_matching_a_lane_bank`, `test_tmem_layout_f_maps_rows_to_half_slabs`, `test_tmem_tlane_tcol_coordinates_are_observable_through_a_physical_alias`, `test_tf32_layout_f_unwritten_holes_are_zero_filled_and_require_review`.
+  - All are single-warp kernels that read or write TMEM lanes 32..127 through a TMEM buffer.
+  - Contract item 17 (C.4 row 1) executes buffer `Load`/`Store` on TMEM as `tcgen05.ld/st 32x32b`, which can address only the warp's own 32-lane sub-partition. Legacy modelled TMEM buffers abstractly.
+  - Error: `bad_address: <buf>[i]: tmem lane L is outside warp W's sub-partition`.
+- **`setmaxnreg` direction (3 functions).**
+  - Functions: `test_setmaxnreg_is_an_ordering_call_not_a_tcgen_lifecycle_call`, `test_deleting_setmaxnreg_keeps_the_numerical_result` (it also runs the original kernel), `test_setmaxnreg_static_expressions_follow_public_parser_and_runtime`.
+  - The kernels issue `setmaxnreg.dec` to a count above the current one (256 after 24; 64 after 32). PTX leaves that undefined, and the model rejects it: `RegPool(InvalidDirection)`. Legacy treated `setmaxnreg` as ordering-only.
+- **Ordinary `tcgen05.alloc` while an `.exclusive` allocation is live (1).**
+  - Function: `test_exclusive_tmem_uses_cta_local_lifecycle_without_placement`, the 96-column case.
+  - The sync model (`sync/tcgen.rs::free_base`, copied from the reference) blocks any allocation while an exclusive one is live, so the run deadlocks. Legacy permitted it.
+  - **Needs a ruling (coordinator/W6).** If legacy is right, the model rule changes in numsim-sync-ref first.
+
+**Hand-offs**
+- **W1, `test_pointer_conversions_and_runtime_descriptor_patch`.** `v2/lowering/calls.py::convert_through_memory` unpacks `dst_ptr, src_ptr = args`, but `T.cuda.float8tohalf8(src, dst)` and `half8tofloat8(src, dst)` take the source first. The test passes `float8tohalf8(source, half)`. As a result the engine loads F32x8 (32 bytes) from `half` at row offset 16, which is misaligned. `float22half2(dst, src)` is right as is.
+- **W1, `test_copy_transports_unique_owners_across_warps`.** A cross-warp register-layout transport is not lowered: `v2/lowering/memory.py:517` asserts "register-layout element owned by another thread".
+- **W4, `test_gate_intrinsics_match_float32_semantics`.** `tirx.log1p` has no oplib implementation (incomplete).
+
+### W2-8, `.per_16bytes` copy reports (engine done; W1 lowering needed)
+
+- **Contract (additive).** New `ReportMode::Per16BytesPattern { pattern: u32, bits: u8 }`. The old unit `Per16Bytes` stays and still fails closed.
+- **Semantics.** For each 16-byte chunk of the source address space the copy reads, the lowest-addressed copied element (`bits` = 4, 8, 16 or 32; a 4-bit element is a low nibble) is compared with `pattern`. Any match sets the completion barrier's report bit.
+  - Implemented in `sched/partition.rs::report_16`.
+  - Scenario: `copy_report_16(sampled)`.
+- **W1 request.** `ptx_lower.py::_report` should emit `{"Per16BytesPattern": {"pattern": int(hex, 16), "bits": 4 * len(hex)}}` from `per_16bytes::<hex>`.
+- **Effect.** That clears the 4 `test_report_queries_and_phase_reset[per_16bytes::*]` items and the 2 `test_gather4_report_samples_only_selected_source_rows[*-per_16bytes::80000000]` items. They are incomplete until then.
+
+### W6 items
+
+1. **W2-8.** Engine side done, as above.
+2. **`test_tensor_map_predicates_retain_errors`: passes.**
+   - `tensormap.cp_fenceproxy...sync.aligned` requires the full warp (`warp_collective_divergence`, "requires all 32 lanes").
+   - In-kernel tensor-map publications are tracked per descriptor (cp_fenceproxy, or a release fence over the warp's dirty descriptors). A TMA through a published descriptor needs `fence.proxy.tensormap::generic.acquire` of that generation by the same CTA ("latest published generation is not acquired within this CTA"). This tracking is partition-local.
+   - A `tensormap.replace` rank outside 1..5 is an invalid operand, an error rather than incomplete. W4: `TensorMapDesc::replace` returns Unsupported for it.
+3. **`test_pointer_array_initialization_and_bounds`.** `[valid]` passes. `[uninitialized]` / `[oob]` keep the documented kind and message delta (`tests/numsim/v2/ports/test_deltas_pointer_slot_arrays.py`).
+
+### W5-12, W5-13, W5-14
+
+- **W5-12.** `tcgen05.alloc` emits a `WarpSync` after its result store, on both the plain and `cta_group::2` paths. Scenario `tcgen_alloc_lanes_read` (cta_group::2): racecheck reports the race without the fix and is clean with it. W8 can take the two B7 delta snapshots.
+- **W5-13.**
+  1. A multicast `.sync_restrict` commit is `restricted` too.
+  2. `tensormap.cp_fenceproxy` is ONE warp-collective copy (`ALL_LANES` access) with warp-uniform operands, followed by the release.
+  3. New `ExecErrorKind::WarpCollectiveDivergence` (`warp_collective_divergence`) for `.aligned` collectives with divergent lanes (`full_warp` sites, `ldmatrix`), membermask mismatches, `__syncwarp`, `grid.sync`, `setmaxnreg` and cp_fenceproxy. `divergence` stays for non-uniform operands.
+  - Passing: `test_tcgen05_restricted_commit.py` (all), `test_ldmatrix_b8.py`, `v2/checkers/test_warp_collectives.py`, `test_divergence_liveness.py`, `v2/ports/test_single_lane_participation.py`. 18 tests marked xfail now pass, so W8 can drop those marks.
+  - `test_tensor_map_predicate_effects`: the data race is gone. It still fails on a racecheck REVIEW `alias_stale_read`: the `tensormap.replace` read through `image.ptr_to(...)` is treated as a different logical buffer (W5 naming).
+- **W5-14.** A `sync_words` buffer declares one word per element of its dtype (`bits / 8` bytes, at least 1), both for shared windows and global views (`sched/mod.rs::sync_word_spans`). Scenario `polled_flag_words`: 128 bytes of u32 polled per element gives 32 four-byte words. W5: landed.

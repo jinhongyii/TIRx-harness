@@ -355,7 +355,7 @@ pub fn grid_sync(ctx: &mut ExecCtx<'_>) -> HResult {
     active_or_next!(ctx);
     let active = ctx.warp.active;
     if active != ctx.warp.live {
-        return Err(support::err(ctx, ExecErrorKind::Divergence, active, "grid.sync with divergent lanes"));
+        return Err(support::err(ctx, ExecErrorKind::WarpCollectiveDivergence, active, "grid.sync with divergent lanes"));
     }
     if let Some(g) = ctx.warp.resume {
         if ctx.aux.grid.gen > g {
@@ -760,7 +760,11 @@ pub fn fence(ctx: &mut ExecCtx<'_>, kind: FenceKind, sem: Sem, scope: Scope) -> 
         FenceKind::ProxyAlias => FenceEvent::ProxyAlias,
         FenceKind::TensormapRelease => {
             let w = ctx.warp.id;
-            ctx.aux.tmap_dirty.retain(|_, owner| *owner != w);
+            let mine: Vec<_> = ctx.aux.tmap_dirty.iter().filter(|(_, o)| **o == w).map(|(k, _)| *k).collect();
+            for k in mine {
+                ctx.aux.tmap_dirty.remove(&k);
+                *ctx.aux.tmap_published.entry(k).or_default() += 1;
+            }
             FenceEvent::TensormapRelease { scope }
         }
         FenceKind::TensormapAcquire { addr, space } => {
@@ -774,6 +778,9 @@ pub fn fence(ctx: &mut ExecCtx<'_>, kind: FenceKind, sem: Sem, scope: Scope) -> 
                 }
             }
             for (alloc, span, lanes) in seen {
+                if let Some(&g) = ctx.aux.tmap_published.get(&(alloc, span.start)) {
+                    ctx.aux.tmap_acquired.insert((ctx.cta.id, alloc, span.start), g);
+                }
                 support::sync_event(ctx, lanes, SyncKind::Fence(FenceEvent::TensormapAcquire { scope, alloc, span }));
             }
             return Ok(Flow::Next);
@@ -800,7 +807,7 @@ pub fn setmaxnreg(ctx: &mut ExecCtx<'_>, inc: bool, count: u32) -> HResult {
     active_or_next!(ctx);
     let active = ctx.warp.active;
     if active != ctx.warp.live {
-        return Err(support::err(ctx, ExecErrorKind::Divergence, active, "setmaxnreg.sync.aligned with divergent lanes"));
+        return Err(support::err(ctx, ExecErrorKind::WarpCollectiveDivergence, active, "setmaxnreg.sync.aligned with divergent lanes"));
     }
     let wg = ctx.warp.warp_in_cta / 4;
     let key = (ctx.cta.id, wg);
@@ -814,10 +821,10 @@ pub fn setmaxnreg(ctx: &mut ExecCtx<'_>, inc: bool, count: u32) -> HResult {
             let w = ctx.warp.warp_in_cta;
             let r = ctx.aux.setmax.entry(key).or_default();
             if !r.arrived.is_empty() && (r.inc != inc || r.count != count) {
-                return Err(support::err(ctx, ExecErrorKind::Divergence, active, "warps of a warpgroup execute different setmaxnreg"));
+                return Err(support::err(ctx, ExecErrorKind::WarpCollectiveDivergence, active, "warps of a warpgroup execute different setmaxnreg"));
             }
             if r.arrived.contains(&w) {
-                return Err(support::err(ctx, ExecErrorKind::Divergence, active, "warp executed setmaxnreg twice before its warpgroup"));
+                return Err(support::err(ctx, ExecErrorKind::WarpCollectiveDivergence, active, "warp executed setmaxnreg twice before its warpgroup"));
             }
             r.arrived.push(w);
             r.inc = inc;
