@@ -375,7 +375,7 @@ fn setmaxnreg_increase_without_release_deadlocks() {
     let mut log = LogBuilder::new();
     log.collective(&WG[0], 1, vec![(reg_pool(0), setmax(0, true, 232))]);
     for (name, r) in run_all(&log.build(), cta(12), Verdict::Error) {
-        assert_eq!(kind(&r), "deadlock", "{name}");
+        assert_eq!(kind(&r), "setmaxnreg_pool_deadlock", "{name}");
     }
 }
 
@@ -407,7 +407,10 @@ fn tmem_order_dependent_address_is_an_error() {
     log.cmd(0, 1, tmem(0), tmem_alloc(256)).cmd(0, 2, tmem(0), tmem_dealloc(0, 256));
     log.cmd(1, 1, tmem(0), tmem_alloc(256)).cmd(1, 2, tmem(0), tmem_dealloc(256, 256));
     for (name, r) in run_all(&log.build(), cta(2), Verdict::Error) {
-        assert_eq!(kind(&r), "tcgen_deallocation_mismatch", "{name}");
+        // Either the swapped allocation result itself (legacy "allocation
+        // result changed") or its consequence, the dealloc mismatch.
+        let k = kind(&r);
+        assert!(k == "tcgen_allocation_result_changed" || k == "tcgen_deallocation_mismatch", "{name}: {k}");
         let p = payload(&r, Status::Error);
         assert_eq!(p["protocol"], "TcgenLifecycle", "{name}");
     }

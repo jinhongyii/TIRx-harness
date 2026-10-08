@@ -416,6 +416,13 @@ The "Core" column names the unified-core event and rule.
 - `AllocEnd` while an op with a footprint in that allocation has reached no
   milestone → `AsyncLifetime` finding.
 - An op that never completes by `finish` → `AsyncNeverCompleted` incomplete.
+  An *uncommitted bulk* async op (`cp.async.bulk` / TMA store with no
+  `commit_group`) is not such an op: at warp exit it is committed implicitly
+  and lands before launch end (sync-semantics §5, async-group `Exit`), so it
+  completes normally. Uncommitted `cp.async` issues at exit are only the
+  Review lint `UncommittedAtExit` (sync-behaviour-deltas A3); their copies
+  still land. `AsyncNeverCompleted` is reserved for ops the engine never
+  landed (an aborted or budget-stopped launch).
 
 **OOB.**
 - Legacy: batch construction is all-or-nothing (PA:1096-1100). OOB is an

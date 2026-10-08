@@ -40,7 +40,7 @@ that a future change is caught.
 | P4 | Async witness evidence | Issuer warp/lane only | Issuer warp/lane plus the async op id | — |
 | P5 | Out-of-bounds access | `execution_error{oob}`. The report shows it only if no other error finding exists. | `OutOfBounds` finding; the access is skipped. | — |
 | P7 | `alias_stale_read` advisory | `review`: a read through one logical name of pooled smem/TMEM observes bytes last written through another name | Ported. The checker compares `SiteInfo::buffer` of the reading site with that of the last ordered write in the same cell (shared memory and TMEM only). It produces the same `review` advisory with the legacy keys (`reader_buffer`, `writer_buffer`, `space`, `allocation_id`, `overlaps`). This needs lowering to fill `SiteInfo::buffer` with the logical name; until `FindingKind` gains a variant it is `Other("alias_stale_read")` (CONTRACT_REQUESTS W5-7). | — |
-| P6 | Allocation end with an in-flight async footprint | An ordinary conflict, or `effect_commit_unobserved` at exit | `AsyncLifetime` finding at `AllocEnd`; `AsyncNeverCompleted` incomplete at launch end | §9.7.10.28.1.1 |
+| P6 | Allocation end with an in-flight async footprint | An ordinary conflict, or `effect_commit_unobserved` at exit | `AsyncLifetime` finding at `AllocEnd`; `AsyncNeverCompleted` incomplete at launch end, only for ops the engine never landed. An uncommitted bulk TMA store at exit is committed implicitly and lands (sync-semantics §5 `Exit`), so it is neither | §9.7.10.28.1.1 |
 
 ## Release/acquire, observation order, fences
 

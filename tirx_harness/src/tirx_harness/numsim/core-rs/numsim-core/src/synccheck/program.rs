@@ -36,6 +36,10 @@ pub struct Program {
     pub warp_programs: Vec<Vec<usize>>,
     pub commands: Vec<Command>,
     pub resources: Vec<ResourceId>,
+    /// Commands applied to the initial resource states before any warp runs:
+    /// host-side protocol events (e.g. the launch-bounds setmaxnreg
+    /// `Configure`) and every `Configure` wherever it was logged.
+    pub init_cmds: Vec<(usize, SyncCmd)>,
 }
 
 /// A failure the engine already hit in the concrete run (Phase A).
@@ -82,6 +86,13 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
     }
     let mut kernel = None::<u32>;
     let mut raws = Vec::<Raw>::new();
+    let mut init_cmds = Vec::<(usize, SyncCmd)>::new();
+    for event in &log.other {
+        if let SyncKind::Protocol { cmds, status: ProtocolStatus::Committed, .. } = &event.kind {
+            kernel.get_or_insert(event.kernel);
+            init_cmds.extend(cmds.iter().map(|pc| (intern(pc.res), pc.cmd)));
+        }
+    }
     for events in &log.per_warp {
         for event in events {
             let SyncKind::Protocol { cmds, collective, issued, status } = &event.kind else {
@@ -118,8 +129,19 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
             let conditional = cmds.iter().any(|pc| {
                 pc.observed_parity.is_some() || matches!(pc.cmd, SyncCmd::Mbarrier(mbarrier::Cmd::TestState { .. }))
             });
+            // The launch-bounds register budget precedes every warp; hoist it
+            // wherever it was logged (a per-warp copy would race with `Set`).
+            for pc in cmds {
+                if let SyncCmd::RegPool(setmaxnreg::Cmd::Configure { .. }) = pc.cmd {
+                    let r = intern(pc.res);
+                    if !init_cmds.contains(&(r, pc.cmd)) {
+                        init_cmds.push((r, pc.cmd));
+                    }
+                }
+            }
             let kept = cmds
                 .iter()
+                .filter(|pc| !matches!(pc.cmd, SyncCmd::RegPool(setmaxnreg::Cmd::Configure { .. })))
                 // `TcgenGroup` is checked statically; `TcgenWork` commands are
                 // total and never block, so they carry no protocol state the
                 // search needs (and would couple every commit's barriers).
@@ -227,7 +249,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
         }
         warp_programs.push(list.into_iter().map(|(_, c)| c).collect());
     }
-    Ok((Program { kernel: kernel.unwrap_or(0), warp_ids, warp_programs, commands, resources }, failures))
+    Ok((Program { kernel: kernel.unwrap_or(0), warp_ids, warp_programs, commands, resources, init_cmds }, failures))
 }
 
 impl Program {

@@ -102,6 +102,30 @@ impl LogBuilder {
         self.event(warp, site, vec![(res, cmd)], Vec::new(), None, None, ProtocolStatus::BlockedAtExit)
     }
 
+    /// A host-side `Protocol` event (`Actor::Host`), e.g. the launch-bounds
+    /// setmaxnreg `Configure` the scheduler applies before any warp runs.
+    pub fn host(&mut self, cmds: Vec<(ResourceId, SyncCmd)>) -> &mut Self {
+        let event = SyncEvent {
+            kernel: self.kernel,
+            actor: Actor::Host,
+            seq: 0,
+            site: SiteId::NONE,
+            frames: Vec::new(),
+            lanes: WarpMask(u32::MAX),
+            kind: SyncKind::Protocol {
+                cmds: cmds
+                    .into_iter()
+                    .map(|(res, cmd)| ProtocolCmd { res, cmd, counts: Counts::default(), observed_parity: None })
+                    .collect(),
+                collective: None,
+                issued: Vec::new(),
+                status: ProtocolStatus::Committed,
+            },
+        };
+        self.obs.sync(&event);
+        self
+    }
+
     /// Start a new launch: per-warp sequences and epochs restart.
     pub fn restart_seq(&mut self) -> &mut Self {
         self.seq.clear();
@@ -178,6 +202,9 @@ pub fn cl_wait(warp: u32) -> SyncCmd {
 }
 pub fn setmax(wg: u32, inc: bool, count: u32) -> SyncCmd {
     SyncCmd::RegPool(setmaxnreg::Cmd::Set { wg, inc, count })
+}
+pub fn configure(count: u32) -> SyncCmd {
+    SyncCmd::RegPool(setmaxnreg::Cmd::Configure { count })
 }
 pub fn wg_sync(wg: u32) -> SyncCmd {
     SyncCmd::RegPool(setmaxnreg::Cmd::WarpgroupSync { wg })

@@ -800,3 +800,12 @@ Mutation checks:
 - Reverting S8 makes the S8 unit test fail.
 
 **Bench after the fixes.** The sound independence rule keeps the earlier numbers: 16-warp ring 4,209 states with diamonds only, 1,180 with fingerprints, 9 with certificates. The UMMA row has been added (15 states certified).
+
+### 5.6 Test-migration follow-ups (2026-10-08)
+
+| Delta | Old behaviour (legacy) | New behaviour | Reason |
+| --- | --- | --- | --- |
+| tcgen05.alloc results are fixed by the run | Error `fixed_sync_protocol_error` (TcgenLifecycle, "allocation result changed") | Restored. The reference run records every `Allocated { base }`. Any explored schedule that returns another base for the same command is `fixed_sync_protocol_error`, with `protocol: "TcgenLifecycle"`, `source_kind: "tcgen_allocation_result_changed"`, and a source containing "allocation result changed". Both schedules are legal, so a differing base proves the program's addresses depend on the order, whichever of them the engine ran. | §1.1: allocation results are fixed facts of the run |
+| Stalled setmaxnreg pool | `setmaxnreg_pool_deadlock` | The same kind string. A deadlock where some warp is parked on a pool increase (`Poll` retry) keeps `kind: "setmaxnreg_pool_deadlock"`; `FindingKind::Deadlock` is unchanged | Legacy payload string |
+| Launch-bounds register budget | Applied by the engine | The scheduler logs `Configure { count }` as a host-side `Protocol` event. Synccheck applies every `Configure` (host or per-warp) to the initial pool state before any warp runs, so a per-warp copy cannot race with `Set`. `synccheck::resource_init(&LaunchShape)` derives `warps_per_cta` and the number of cluster participants | test-migration item 13 |
+| Uncommitted async work at exit | Error `CompletionSourceNotQuiescent` | Bulk (TMA / `cp.async.bulk`) issues are committed implicitly at warp exit and complete. Uncommitted `cp.async` issues are the Review lint `UncommittedAtExit` (W3 `exit_lint`). One rule for both checkers; `racecheck-semantics.md` / P6 now state the bulk case | sync-semantics §5 Exit, sync-isa-answers |

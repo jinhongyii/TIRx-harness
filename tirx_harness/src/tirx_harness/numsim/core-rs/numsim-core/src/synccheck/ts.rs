@@ -12,7 +12,7 @@ use super::explore::TransitionSystem;
 use super::program::Program;
 use super::projection::{ProjectionKey, ProjectionSpec};
 use super::reference::ReferenceRun;
-use crate::sync::{async_group, cluster, mbarrier, named, setmaxnreg, Outcome, ResourceId, ResourceInit, SyncCmd, SyncError};
+use crate::sync::{async_group, cluster, mbarrier, named, setmaxnreg, tcgen, Outcome, ResourceId, ResourceInit, SyncCmd, SyncError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Transition {
@@ -61,6 +61,9 @@ pub enum ErrKind {
     Protocol(SyncError),
     /// A situation the model does not cover (fail closed).
     Incomplete { reason: &'static str, detail: String },
+    /// A violation of the fixed-program contract itself (payload
+    /// `fixed_sync_protocol_error` with this protocol and `source_kind`).
+    Fixed { protocol: &'static str, kind: &'static str, detail: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +80,9 @@ pub struct Deadlock {
     pub blocked: Vec<usize>,
     pub pending_completions: usize,
     pub heads: Vec<String>,
+    /// A setmaxnreg pool increase can never be granted (legacy kind
+    /// `setmaxnreg_pool_deadlock`).
+    pub reg_pool: bool,
 }
 
 /// Causal side effects of one step (consumed by the reference run).
@@ -113,6 +119,9 @@ pub struct LocalCmd {
     /// Reference-run generations (gated projections only): the gates are
     /// justified only while the search reproduces them (review S5).
     pub ref_gens: Option<RefGens>,
+    /// Reference-run `tcgen05.alloc` bases per protocol command: the run
+    /// fixed them, and the program's data flow may depend on them.
+    pub ref_allocs: Option<Vec<Option<u64>>>,
 }
 
 /// Reference generations of a command: per protocol command, per issued target.
@@ -209,6 +218,7 @@ impl<'p> Ts<'p> {
                 conditional: c.conditional,
                 gate: Box::new([]),
                 ref_gens: None,
+                ref_allocs: None,
             });
         }
         let programs = warps
@@ -242,7 +252,21 @@ impl<'p> Ts<'p> {
                 resource_cmds[r].push(i);
             }
         }
+        for &(r, cmd) in &program.init_cmds {
+            if let Some(local) = resources.iter().position(|&g| g == r) {
+                backend::step(&mut initial_res[local], program.resources[r], cmd)
+                    .map_err(|e| format!("initial {cmd:?} on {:?} failed: {e:?}", program.resources[r]))?;
+            }
+        }
         let mut ts = Ts { program, key: spec.key, warps, programs, resources, cmds, initial_res, resource_cmds };
+        if let Some(reference) = reference {
+            for c in &mut ts.cmds {
+                let g = c.global;
+                if program.commands[g].cmds.iter().any(|(_, k)| matches!(k, SyncCmd::Tcgen(tcgen::Cmd::Alloc { .. }))) {
+                    c.ref_allocs = Some(reference.gens[g].clone());
+                }
+            }
+        }
         if spec.gated {
             if let Some(reference) = reference {
                 ts.compute_gates(reference);
@@ -405,6 +429,7 @@ impl<'p> Ts<'p> {
                     }
                     _ => None,
                 },
+                Outcome::Tcgen(tcgen::Outcome::Allocated { base }) => Some(u64::from(base)),
                 Outcome::RegPool(setmaxnreg::Outcome::Pending { .. }) => {
                     if let SyncCmd::RegPool(setmaxnreg::Cmd::Set { wg, .. }) = cmd {
                         retry = Some((r as u32, SyncCmd::RegPool(setmaxnreg::Cmd::Poll { wg })));
@@ -462,6 +487,21 @@ impl<'p> Ts<'p> {
         }
         pending.sort_by_key(|p| (p.cmd, p.ord));
         next.pending = pending.into_boxed_slice();
+        if let Some(allocs) = &lc.ref_allocs {
+            if *allocs != fx.gens {
+                return Tried::Error(TsError {
+                    cmd: Some(lc.global),
+                    kind: ErrKind::Fixed {
+                        protocol: "TcgenLifecycle",
+                        kind: "tcgen_allocation_result_changed",
+                        detail: format!(
+                            "allocation result changed: this schedule allocates TMEM column base {:?}, the reference run {allocs:?}; the program's control and addresses were fixed by the run",
+                            fx.gens
+                        ),
+                    },
+                });
+            }
+        }
         if let Some((gens, issued)) = &lc.ref_gens {
             if *gens != fx.gens || *issued != fx.issued_gens {
                 return Tried::Error(TsError {
@@ -685,7 +725,8 @@ impl<'p> Ts<'p> {
                 g.seq, g.site.0, g.cmds.iter().map(|(_, c)| c).collect::<Vec<_>>(), s.retry[w]
             ));
         }
-        Deadlock { domain: format!("{:?}", self.key), unfinished, blocked, pending_completions: s.pending.len(), heads }
+        let reg_pool = s.retry.iter().flatten().any(|(_, c)| matches!(c, SyncCmd::RegPool(setmaxnreg::Cmd::Poll { .. })));
+        Deadlock { domain: format!("{:?}", self.key), unfinished, blocked, pending_completions: s.pending.len(), heads, reg_pool }
     }
 
     /// Human-readable transition at `s` (witness evidence).

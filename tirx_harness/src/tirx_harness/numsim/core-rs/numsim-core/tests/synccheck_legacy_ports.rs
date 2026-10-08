@@ -300,7 +300,6 @@ fn named_barrier_count_mismatch_is_contract_mismatch() {
 /// changed"). `synccheck_scenarios::tmem_order_dependent_address_is_an_error`
 /// keeps the variant without the `cta_sync`s, which the new core rejects.
 #[test]
-#[ignore = "undocumented divergence: synccheck no longer fixes tcgen05.alloc results; the swapped order is Clean, legacy reported fixed_sync_protocol_error (TcgenLifecycle, allocation result changed)"]
 fn order_dependent_tcgen_allocations_with_cta_syncs_are_an_error() {
     let mut log = LogBuilder::new();
     log.cmd(0, 1, tmem(0), tmem_alloc(32)).cmd(1, 1, tmem(0), tmem_alloc(32));
@@ -310,7 +309,9 @@ fn order_dependent_tcgen_allocations_with_cta_syncs_are_an_error() {
     log.cmd(0, 3, tmem(0), tmem_relinquish());
     let r = run_all(&log.build(), cta(2), Verdict::Error);
     for (name, rep) in &r {
-        assert_eq!(payload(rep, Status::Error)["protocol"], "TcgenLifecycle", "{name}");
+        let p = payload(rep, Status::Error);
+        assert_eq!(p["protocol"], "TcgenLifecycle", "{name}");
+        assert!(p["source"].as_str().unwrap().contains("allocation result changed"), "{name}: {p:#}");
     }
 }
 
@@ -663,7 +664,6 @@ fn unconfigured_setmaxnreg_budget_deadlocks() {
 /// (synccheck half, exact kind): the legacy test requires a
 /// `setmaxnreg_pool_deadlock` finding.
 #[test]
-#[ignore = "undocumented divergence: a stalled setmaxnreg pool is reported as kind `deadlock`, never `setmaxnreg_pool_deadlock` (no delta row renames it)"]
 fn unconfigured_setmaxnreg_budget_is_setmaxnreg_pool_deadlock() {
     let r = run_all(&unconfigured_budget_log(), cta(12), Verdict::Error);
     assert!(r.iter().any(|(_, rep)| kind(rep) == "setmaxnreg_pool_deadlock"), "{:?}", kinds(&r));
@@ -672,12 +672,14 @@ fn unconfigured_setmaxnreg_budget_is_setmaxnreg_pool_deadlock() {
 /// `test_register_allocation.py::test_launch_bounds_allow_register_redistribution_above_initial_count`
 /// (synccheck half): `launch_bounds_min_blocks_per_sm = 2` starts the three
 /// warpgroups at 80 registers; WG 2 frees 32, covering +24 and +8. The
-/// scheduler steps `Configure { count: 80 }` into the live `SyncTable`
-/// without logging it, so the recorded log is just the three collectives.
+/// scheduler steps `Configure { count: 80 }` into the live `SyncTable` and
+/// logs it as a host-side `Protocol` event before any warp runs.
 #[test]
-#[ignore = "undocumented divergence: the launch-bounds register budget (setmaxnreg Configure) is not in the SyncEvent log or ResourceInit, so synccheck replays from the default 168 and reports `inc 104` as setmaxnreg_invalid_direction"]
 fn launch_bounds_register_redistribution_is_clean() {
     let mut log = LogBuilder::new();
+    // The scheduler logs the launch-bounds budget as a host-side Protocol
+    // event (W2); synccheck applies it to the initial pool.
+    log.host(vec![(reg_pool(0), configure(80))]);
     setmax_wg(&mut log, 1, 0, true, 104);
     setmax_wg(&mut log, 2, 1, true, 88);
     setmax_wg(&mut log, 3, 2, false, 48);

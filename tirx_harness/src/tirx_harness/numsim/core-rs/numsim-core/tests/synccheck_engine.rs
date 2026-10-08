@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use numsim_core::observe::RecordingObserver;
 use numsim_core::report::Verdict;
 use numsim_core::sched::{self, Backend, RunStatus};
-use numsim_core::synccheck::{check, serialize, SynccheckConfig};
+use numsim_core::synccheck::{check, resource_init, serialize, SynccheckConfig};
 use numsim_core::testutil::scenarios;
 
 fn coverage(r: &numsim_core::report::Report, key: &str) -> u64 {
@@ -27,10 +27,25 @@ fn cp_async_per_lane_groups_are_cheap() {
     let (status, log) = run(&scenarios::cp_async_copy());
     assert_eq!(status, RunStatus::Completed);
     let started = Instant::now();
-    let r = check(&log, &SynccheckConfig::default());
+    let s = scenarios::cp_async_copy();
+    let shape = sched::resolve_launch(&s.module.kernels[0], &s.inputs).unwrap();
+    let r = check(&log, &SynccheckConfig { init: resource_init(&shape), ..SynccheckConfig::default() });
     assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
     assert!(coverage(&r, "visited_state_count") <= 16, "{:?}", r.coverage);
     assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+}
+
+/// `setmaxnreg_launch_bounds`: the scheduler's host-side `Configure`
+/// (launch-bounds register budget) reaches the explorer.
+#[test]
+fn launch_bounds_configure_reaches_the_explorer() {
+    let s = scenarios::all().into_iter().find(|s| s.name == "setmaxnreg_launch_bounds").expect("scenario");
+    let (status, log) = run(&s);
+    assert_eq!(status, RunStatus::Completed);
+    assert!(log.other.iter().any(|e| format!("{:?}", e.kind).contains("Configure")), "no host Configure event logged");
+    let shape = sched::resolve_launch(&s.module.kernels[0], &s.inputs).unwrap();
+    let r = check(&log, &SynccheckConfig { init: resource_init(&shape), ..SynccheckConfig::default() });
+    assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
 }
 
 /// Every interpreter scenario's stream is checked within a small budget and
@@ -41,7 +56,13 @@ fn every_engine_scenario_is_checked_within_budget() {
     for s in scenarios::all() {
         let (status, log) = run(&s);
         let started = Instant::now();
-        let cfg = SynccheckConfig { state_budget: 20_000, transition_budget: 200_000, ..SynccheckConfig::default() };
+        let shape = sched::resolve_launch(&s.module.kernels[0], &s.inputs).unwrap();
+        let cfg = SynccheckConfig {
+            state_budget: 20_000,
+            transition_budget: 200_000,
+            init: resource_init(&shape),
+            ..SynccheckConfig::default()
+        };
         let r = check(&log, &cfg);
         let p = serialize(&r);
         assert_ne!(p["coverage"]["termination"]["kind"], "resource_limit", "{}: {p:#}", s.name);

@@ -1044,3 +1044,26 @@ allocation. An explicit view of one buffer must keep that buffer's name.
 Also for W1: a qualifier-less `mbarrier.arrive` keeps the PTX default
 `.release.cta`, including on a peer CTA's barrier (deltas B7). Do not
 default it to `.cluster`.
+
+## W6-2 (2026-10-08): test-migration follow-ups
+
+- **W2 `tcgen_cp_ld` synccheck error:** I could not reproduce it at or after
+  0c67a9e. The scenario's stream conforms to the contract: `Alloc`, `Init`,
+  `bar.sync`, `TcgenGroup` + `TcgenWork(Issue)`, then a commit with
+  `TcgenWork(Commit)` + `Mbarrier(Issue)` + `issued{arrivals: 1}`, waits,
+  per-lane `Load`/`WaitLd`, `Dealloc`. It is now Clean. The fault was in the
+  explorer: before 0c67a9e, `TcgenWork` commands joined every commit's barrier
+  into one projection, which was then searched. Nothing is needed from W2.
+- **Launch-bounds `Configure`:** consumed from host-side (`Actor::Host`)
+  `Protocol` events in `RecordingObserver::other`, and hoisted from any
+  per-warp copy.
+- **Request:** `RecordingObserver` should keep the `LaunchShape` from
+  `begin_launch` (or a ready `ResourceInit`). Synccheck needs `warps_per_cta`
+  (setmaxnreg pools) and the number of cluster participants, and today the
+  caller has to pass them in `SynccheckConfig.init`. Workaround:
+  `synccheck::resource_init(&LaunchShape)`.
+- **tcgen05.alloc result:** the restored check compares each schedule's base
+  with the reference run's. That is sound without engine data, because any
+  differing schedule proves the base depends on the order. Recording the
+  engine's observed base on the `Alloc` `ProtocolCmd` would let the finding
+  name the run's actual value; this is optional.

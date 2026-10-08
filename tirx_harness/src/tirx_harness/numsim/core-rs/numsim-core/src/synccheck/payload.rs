@@ -78,6 +78,7 @@ fn ts_error_message(e: &TsError) -> (String, Option<&'static str>) {
     match &e.kind {
         ErrKind::Protocol(err) => (format!("{err:?}"), Some(kinds::error_kind(err))),
         ErrKind::Incomplete { reason, detail } => (format!("{reason}: {detail}"), None),
+        ErrKind::Fixed { kind, detail, .. } => (detail.clone(), Some(kind)),
     }
 }
 
@@ -237,6 +238,23 @@ impl<'c> Builder<'c> {
                 });
                 self.push(kinds::finding_kind(err), Status::Error, message, evidence, payload);
             }
+            ErrKind::Fixed { protocol, .. } => {
+                let message = format!("fixed synchronization program rejected {transition:?}: {source}");
+                let payload = json!({
+                    "_slot": "findings",
+                    "kind": "fixed_sync_protocol_error",
+                    "protocol": protocol,
+                    "transition": transition.map(|t| format!("{t:?}")),
+                    "source": source,
+                    "source_kind": source_kind,
+                    "message": message.clone(),
+                    "operation": operation,
+                    "related_operations": [],
+                    "witness": names,
+                    "witness_evidence": steps,
+                });
+                self.push(kinds::protocol_finding_kind(protocol), Status::Error, message, evidence, payload);
+            }
             ErrKind::Incomplete { reason, .. } => {
                 let legacy = matches!(*reason, "cluster_barrier_rearrival_without_wait_unmodeled" | "cluster_barrier_warp_exit_unmodeled");
                 let message = format!("fixed synchronization verification is incomplete at {transition:?}: {source}");
@@ -262,9 +280,11 @@ impl<'c> Builder<'c> {
             "fixed synchronization domain {} can deadlock with unfinished warps {:?}, blocked warps {:?}, and unready heads {:?}",
             d.domain, d.unfinished, d.blocked, d.heads
         );
+        // A stalled setmaxnreg pool keeps today's kind string.
+        let kind = if d.reg_pool { "setmaxnreg_pool_deadlock" } else { "deadlock" };
         let payload = json!({
             "_slot": "findings",
-            "kind": "deadlock",
+            "kind": kind,
             "verification": "fixed_sync",
             "deadlock": format!("{d:?}"),
             "message": message.clone(),

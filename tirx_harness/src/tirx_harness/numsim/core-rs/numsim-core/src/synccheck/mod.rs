@@ -99,6 +99,17 @@ impl Default for SynccheckConfig {
     }
 }
 
+/// Resource parameters of a launch (what the scheduler gives its own
+/// `SyncTable`): warps per CTA and cluster-barrier participants.
+pub fn resource_init(shape: &crate::program::LaunchShape) -> ResourceInit {
+    let ctas_per_cluster = shape.cluster.iter().product::<u32>().max(1);
+    ResourceInit {
+        warps_per_cta: shape.warps_per_cta(),
+        cluster_warps: shape.warps_per_cta() * ctas_per_cluster,
+        ..ResourceInit::default()
+    }
+}
+
 /// Split a log by `SyncEvent::kernel` (one launch per kernel index).
 pub fn split_launches(log: &RecordingObserver) -> Vec<(u32, RecordingObserver)> {
     let mut out = std::collections::BTreeMap::<u32, RecordingObserver>::new();
