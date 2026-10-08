@@ -75,17 +75,19 @@ when the legacy engine is deleted (redesign step 5).
 
 v2 reads its environment in one place, `v2/options.py`:
 `NUMSIM_CACHE_DIR` (modules are cached under `<root>/v2-modules/`, keyed by
-TIRx source, format version and the lowering sources), `NUMSIM_V2_BACKEND`
-(`interp` default, `codegen`), `NUMSIM_V2_SEED`, `NUMSIM_V2_NO_CACHE=1`.
+TIRx source, format version and the lowering sources), `NUMSIM_V2_SEED`,
+`NUMSIM_V2_NO_CACHE=1`. There is one executor, the interpreter; the codegen
+backend was measured and deleted (`backend-comparison.md`).
 
 Python surface (`from tirx_harness.numsim import v2`): `transpile`,
 `Engine(max_workers=...)` with `.run`, `.run_racecheck_phase`,
 `.run_synccheck_phase`, `compare`, `racecheck`, `synccheck`,
 `CoverageBounds`, `ResourceLimits`, report types with
 `.verdict/.findings/.to_dict/.print/.require_clean`, and
-`v2.report.payload_json_schema()` (payload `schema_version` 5). Anything
-`numsim-core` has not implemented yet raises `NotImplementedError`; tests
-treat that as a skip, never as a pass.
+`v2.report.payload_json_schema()` (payload `schema_version` 5). A TIRx form
+the lowering does not support raises `UnsupportedTIRxError` at transpile, and
+an engine stop that cannot be modelled is an `incomplete` diagnostic; neither
+counts as a pass.
 
 ### v2 binder rules (`v2/run.py::canonicalize_inputs`)
 
@@ -123,24 +125,26 @@ treat that as a skip, never as a pass.
   (`missing_input_bindings` with the missing names, or
   `native_frontend_unsupported`) instead of raising, as legacy did;
   `Engine.run` and the `run_*_phase` methods still raise `InputError` /
-  `UnsupportedTIRxError`. `require_clean()` raises `CheckFailed`; a codegen
-  build failure raises `NumSimBuildError`.
-- Execution subsets: `ExecutionSubset(cluster_ids=...)` maps to
-  `RunConfig::subset`; `cta_ids` subsets are not supported. Host
-  `ExecutionAssumptions` are accepted and ignored (dropped in v2; no corpus
-  case sets one).
+  `UnsupportedTIRxError`. `require_clean()` raises `CheckFailed`.
+- Execution subsets: `ExecutionSubset` (exported by `numsim.v2`) maps to
+  `RunConfig::subset`. `cluster_ids` are linear cluster ids; `cta_ids` must
+  cover whole clusters of a static grid (`InputError` otherwise); both given
+  means their intersection. A `{phase: ExecutionSubset}` mapping must name
+  every launch with the same subset (numsim H6), and `Engine.run` on a
+  multi-kernel module needs that form. A subset run is at least `incomplete`
+  (`analysis_scope` kind `subset`). Host `ExecutionAssumptions` are accepted
+  and ignored (dropped in v2; no corpus case sets one).
 
-### Timing (for backend comparisons)
+### Timing
 
 `NumSimResult.timing` and each checker phase payload's `timing` hold
 wall-clock milliseconds: `lower` (transpile, or the module-cache load when
-`CompiledModule.cache_hit`), `bind` (Python input canonicalization), `build`
-(codegen print/build/load; 0 for `interp`), `run` (`sched::run_with_config`,
+`CompiledModule.cache_hit`), `bind` (Python input canonicalization), `run`
+(`sched::run_with_config`,
 including arena binding), `check` (checker finish or offline exploration plus
 serialization; 0 for NumSim) and `report` (Python result construction). One
 engine run serves all phases of a module, so phase payloads repeat its
-`build`/`run`/`check`. Select the backend with `Engine(backend="interp" |
-"codegen")` or `NUMSIM_V2_BACKEND`.
+`run`/`check`.
 
 ### v2 report decisions (`v2/report.py`)
 
@@ -225,3 +229,29 @@ $PY -m pytest -q -n 16 --dist=worksteal -m performance tests
 New relative checks use `tests/perf/perf_baseline.py` with per-host-class
 files in `tests/perf/baselines/` (see the README there). The two legacy
 absolute-threshold tests stay unchanged until the legacy engine is deleted.
+
+### Legacy vs v2 corpus comparison
+
+`scripts/numsim-v2/bench_backends.py` times every canonical case in each mode where v2
+matches legacy (`v2-conformance-status.md`). It runs legacy and v2 interp at
+`max_workers` 1/8/32, 3 interleaved repetitions each, keeping the minimum. Every run's
+normalized result is checked against the legacy conformance snapshot, and a row aborts on
+any difference. Each case runs in its own child process. The 1-minute load average is
+checked before each (case, mode) and the run waits while it exceeds `--max-load` (default
+40); samples taken above 40 are flagged `(L)`. Results are written per case under
+`$NUMSIM_CACHE_DIR/bench-backends/` and a rerun skips cases already present (`--force` redoes
+them). On a near-idle host, from `tirx_harness/`:
+
+```bash
+nproc; uptime; vmstat 1 3                     # preflight (tests/CLAUDE.md)
+$PY ../scripts/numsim-v2/bench_backends.py run --variants legacy,interp
+$PY ../scripts/numsim-v2/bench_backends.py mega            # Mega-MoE perf workloads, 900 s cap per run
+$PY ../scripts/numsim-v2/bench_backends.py render          # docs/development/backend-comparison.{md,json}
+$PY ../scripts/numsim-v2/bench_backends.py regressions --engine "$(git rev-parse --short HEAD)"
+                                              # scripts/numsim-v2/coverage/perf_regressions.tsv
+```
+
+A full corpus sweep takes about 4-6 h. To time a fixed engine while the tree keeps changing,
+copy `numsim/v2/` (with `numsim/dtype_registry.json` beside it) and `core-rs/`, build the
+extension from the copy, and pass `--v2-package <copy>/numsim_v2_snap`. Narrow a rerun with
+`--cases REGEX`, `--modes` and `--workers`.

@@ -35,8 +35,18 @@ Each class has one file, `baselines/<host-class>.json`:
 }
 ```
 
-A metric can override the file-wide `tolerance` with its own `tolerance`.
-`seconds` is the maximum of the recorded samples.
+A metric can override the file-wide `tolerance` with its own `tolerance`, and
+`min_slack_seconds` (file-wide or per metric) keeps sub-second metrics from
+failing on noise: the limit is `max(seconds * (1 + tolerance), seconds +
+min_slack_seconds)`. `seconds` is the maximum of the recorded samples.
+
+## Suites
+
+`baselines/<host-class>.json` holds the legacy engine's metrics. NumSim v2
+metrics live in suite `v2`, `baselines/v2/<host-class>.json`, written by
+`scripts/numsim-v2/perf_gate.py --record` from
+`tests/perf/test_corpus_perf.py` (tolerance 0.5, i.e. 1.5x; min slack 0.1 s).
+Pass `suite="v2"` to `assert_within_baseline` / `baseline`.
 
 ## Using a baseline in a test
 
@@ -63,7 +73,15 @@ at least one clean run (more samples are better), and write the file with the
 date, commit, and preflight readings. A baseline may only go up with a
 written justification, exactly like the absolute thresholds today.
 
-## Status
+## Status (v2)
+
+`perf_gate.py` runs the v2 workloads with `NUMSIM_PERF_ENFORCE=0` and decides:
+over the limit on a near-idle host (1-minute load average at most 10% of the
+CPU count throughout the run) fails; under load it only warns. A baseline
+recorded under load (`--record --force`) says so in its `preflight` field and
+must be re-recorded on a quiet host before it is tightened.
+
+## Status (legacy)
 
 The existing absolute-threshold tests
 (`tests/numsim/corpus/test_canonical_kernels.py::test_maximum_mega_moe_numsim_completes_within_performance_budget`

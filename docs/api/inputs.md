@@ -94,7 +94,9 @@ the selected and total warp counts.
 
 This type alias accepts an `ExecutionSubset` or a mapping from integer phase
 indices to `ExecutionSubset` objects. One engine run serves every launch of a
-module, so the mapped subsets must be equal.
+module, so the mapping must name every launch with the same subset
+(numsim-behaviour-deltas H6); `Engine.run` on a multi-kernel module needs the
+mapping form, since a bare subset is not broadcast.
 
 ```{eval-rst}
 .. autoapiclass:: tirx_harness.numsim.ExecutionAssumptions

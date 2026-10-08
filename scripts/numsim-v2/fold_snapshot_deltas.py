@@ -14,8 +14,9 @@ v2 becomes the oracle: each delta file replaces its base snapshot (minus its
 
 The run prints a Markdown table (case, mode, cited delta rows) and the
 ``Snapshot-Regen:`` trailer for the deletion commit's message, so
-``check_snapshot_deltas.py`` accepts the commit. Exits 1 when a delta file
-cites no known delta row (it would need a justification first).
+``check_snapshot_deltas.py`` accepts the commit; row ids are printed
+file-qualified (``racecheck B7``). Exits 1 when a delta file cites no known
+row, or a bare id that several tables share (``delta_rows.py``).
 """
 
 from __future__ import annotations
@@ -28,22 +29,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_ROOT = REPO / "tirx_harness/tests/conformance/snapshots"
-TABLES = {
-    "numsim": REPO / "docs/development/numsim-behaviour-deltas.md",
-    "racecheck": REPO / "docs/development/racecheck-behaviour-deltas.md",
-    "sync": REPO / "docs/development/sync-behaviour-deltas.md",
-}
-ROW_ID = re.compile(r"(?<!ISA )\b([A-Z]{1,2}\d{1,3})\b(?!-\d)")
-
-
-def known_rows() -> set[str]:
-    rows: set[str] = set()
-    for path in TABLES.values():
-        for line in path.read_text().splitlines():
-            match = re.match(r"\|\s*([A-Z]{1,2}\d{1,3})\s*\|", line)
-            if match:
-                rows.add(match.group(1))
-    return rows
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import delta_rows  # noqa: E402
 
 
 def dumps(snapshot: dict) -> str:
@@ -57,16 +44,18 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="rewrite the files (default: dry run)")
     args = parser.parse_args()
 
-    rows = known_rows()
+    ids = delta_rows.row_ids()
     folded, unjustified = [], []
     for delta_path in sorted(args.root.glob("*/*.delta.json")):
         case = delta_path.parent.name
         mode = delta_path.name[: -len(".delta.json")]
         data = json.loads(delta_path.read_text())
         reason = str(data.pop("delta", ""))
-        cited = sorted({r for r in ROW_ID.findall(reason) if r in rows})
-        if not cited:
-            unjustified.append((case, mode, reason))
+        citations = delta_rows.parse(reason, ids)
+        cited = sorted(citations.qualified)
+        if not citations.ok:
+            why = reason if not citations.ambiguous else f"ambiguous bare id(s) {sorted(citations.ambiguous)}: {reason}"
+            unjustified.append((case, mode, why))
             continue
         base = delta_path.with_name(f"{mode}.json")
         if not base.exists():

@@ -9,6 +9,10 @@ The host class defaults to ``<cpu-model-slug>-<nproc>c`` (for example
 ``amd-epyc-7763-64-core-processor-256c``) and can be overridden with
 ``NUMSIM_PERF_HOST_CLASS``. A host without a baseline file skips the check;
 see ``baselines/README.md`` for how to record one.
+
+A *suite* keeps separate files for separate engines: the default suite is
+``baselines/<host-class>.json`` (legacy engine metrics), suite ``v2`` is
+``baselines/v2/<host-class>.json`` (NumSim v2, one metric per backend).
 """
 
 from __future__ import annotations
@@ -51,20 +55,28 @@ class Baseline:
     name: str
     seconds: float
     tolerance: float
+    # Absolute slack for sub-second metrics, whose relative noise is large:
+    # the limit is never below ``seconds + min_slack``.
+    min_slack: float = 0.0
 
     @property
     def limit(self) -> float:
-        return self.seconds * (1.0 + self.tolerance)
+        return max(self.seconds * (1.0 + self.tolerance), self.seconds + self.min_slack)
 
 
 class BaselineMissing(LookupError):
     pass
 
 
-@lru_cache(maxsize=None)
-def load_baselines(host: str | None = None) -> dict[str, Any]:
+def baseline_path(host: str | None = None, suite: str | None = None) -> Path:
     host = host or host_class()
-    path = BASELINE_DIR / f"{host}.json"
+    return (BASELINE_DIR / suite if suite else BASELINE_DIR) / f"{host}.json"
+
+
+@lru_cache(maxsize=None)
+def load_baselines(host: str | None = None, suite: str | None = None) -> dict[str, Any]:
+    host = host or host_class()
+    path = baseline_path(host, suite)
     if not path.exists():
         raise BaselineMissing(f"no performance baseline file for host class {host!r} ({path})")
     data = json.loads(path.read_text())
@@ -73,8 +85,8 @@ def load_baselines(host: str | None = None) -> dict[str, Any]:
     return data
 
 
-def baseline(name: str, *, host: str | None = None) -> Baseline:
-    data = load_baselines(host)
+def baseline(name: str, *, host: str | None = None, suite: str | None = None) -> Baseline:
+    data = load_baselines(host, suite)
     try:
         entry = data["baselines"][name]
     except KeyError as error:
@@ -82,10 +94,12 @@ def baseline(name: str, *, host: str | None = None) -> Baseline:
             f"host class {data['host_class']!r} has no baseline named {name!r}"
         ) from error
     tolerance = float(entry.get("tolerance", data.get("tolerance", DEFAULT_TOLERANCE)))
-    return Baseline(name=name, seconds=float(entry["seconds"]), tolerance=tolerance)
+    min_slack = float(entry.get("min_slack_seconds", data.get("min_slack_seconds", 0.0)))
+    return Baseline(name=name, seconds=float(entry["seconds"]), tolerance=tolerance, min_slack=min_slack)
 
 
-def assert_within_baseline(name: str, elapsed: float, *, host: str | None = None) -> Baseline:
+def assert_within_baseline(name: str, elapsed: float, *, host: str | None = None,
+                           suite: str | None = None) -> Baseline:
     """Assert ``elapsed <= baseline * (1 + tolerance)``; skip without a baseline.
 
     Call this from a ``performance``-marked test after measuring only the
@@ -95,12 +109,13 @@ def assert_within_baseline(name: str, elapsed: float, *, host: str | None = None
     import pytest
 
     try:
-        expected = baseline(name, host=host)
+        expected = baseline(name, host=host, suite=suite)
     except BaselineMissing as error:
         pytest.skip(str(error))
     assert elapsed <= expected.limit, (
         f"{name}: {elapsed:.3f}s exceeds the {host or host_class()} baseline "
-        f"{expected.seconds:.3f}s x (1 + {expected.tolerance:.2f}) = {expected.limit:.3f}s"
+        f"{expected.seconds:.3f}s x (1 + {expected.tolerance:.2f}) (min slack {expected.min_slack:.2f}s) "
+        f"= {expected.limit:.3f}s"
     )
     return expected
 
@@ -112,6 +127,7 @@ __all__ = [
     "BaselineMissing",
     "assert_within_baseline",
     "baseline",
+    "baseline_path",
     "host_class",
     "load_baselines",
 ]

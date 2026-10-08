@@ -1,6 +1,6 @@
 {
  "case": "sm100_fp8_fp4_mega_moe",
- "delta": "racecheck-behaviour-deltas T19: the lds128 TaskInfo read by non-elected lanes races the remote st.async (true positive); R4/B1: release.cluster arrive vs acquire.cta wait scope_mismatch; B7: default-.cta remote arrives; X4: cross_cta_async_order advisory",
+ "delta": "racecheck-behaviour-deltas T19: the lds128 TaskInfo read by non-elected lanes races the remote st.async (true positive); racecheck R4/racecheck B1: release.cluster arrive vs acquire.cta wait scope_mismatch; racecheck B7: default-.cta remote arrives; racecheck X4: cross_cta_async_order advisory",
  "mode": "racecheck",
  "phases": [
   {
