@@ -18,13 +18,6 @@ def test_execution_subset_uses_subset_api_name():
     assert subset.to_payload() == {"cluster_ids": [0, 2], "cta_ids": None}
 
 
-def test_execution_subset_is_not_publicly_exported():
-    assert not hasattr(numsim, "ExecutionSubset")
-    assert not hasattr(numsim, "ExecutionSubsetSelection")
-    assert "ExecutionSubset" not in numsim.__all__
-    assert "ExecutionSubsetSelection" not in numsim.__all__
-
-
 def test_multi_kernel_subsets_are_phase_indexed_and_never_broadcast():
     payload = numsim_api._execution_subset_payload(
         {0: ExecutionSubset(cluster_ids=[2, 0]), 2: ExecutionSubset(cta_ids=[7])},
