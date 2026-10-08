@@ -180,6 +180,133 @@ fn h3() -> Scenario {
     Scenario { name: "serial_atom_reads_same_round_write", module: b.build_module(), inputs: inputs(vec![("x", u32_buf([0]))]), config: RunConfig::default() }
 }
 
+/// H1 in a replay cycle (milestone 2 review). In round 0:
+/// - CTA 0 stores `data = 5`, `st.release flag = 1`, then plainly reads `x`
+///   (round-start 0).
+/// - CTA 1 does `ld.acquire flag` first (round-start 0, before any strong
+///   write of its own, so a fork/join child may resolve it), then plainly
+///   stores `x = 1`, then reads `data`.
+///
+/// Each read what the other wrote, so the engine reports
+/// `cross_cluster_same_round_cycle` and replays in partition order (CTA 0
+/// first). The serial checker then resolves CTA 1's acquire against CTA 0's
+/// release (the latest write in `seq`), so the data read is ordered. A child
+/// resolving against round-start state would not order it.
+fn sb_with_data() -> Scenario {
+    let mut b = ProgramBuilder::new("sb_with_data", 32);
+    b.grid(2, 1, 1);
+    let flag = b.global("flag", Dtype::U32);
+    let x = b.global("x", Dtype::U32);
+    let data = b.global("data", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let cta = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    let f = b.reg(Ty::U32);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k5 = b.k_u32(5);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.compare(CmpOp::Eq, Ty::U32, p, cta, k0);
+    b.if_(p);
+    b.site("data_store", 1);
+    st(&mut b, data, k0, k5, Sem::Weak);
+    b.site("flag_release", 2);
+    st(&mut b, flag, k0, k1, Sem::Release);
+    b.site("x_load", 3);
+    b.ld_u32(v, x, k0);
+    b.no_site();
+    b.st_u32(out, k0, v);
+    b.else_();
+    b.site("flag_acquire", 4);
+    b.push(Instr::Load { ty: Ty::U32, dst: f, buf: flag, offset: k0, sem: Sem::Acquire, scope: Scope::Gpu, mods: MemMods::default() });
+    b.site("x_store", 5);
+    st(&mut b, x, k0, k1, Sem::Weak);
+    b.site("data_load", 6);
+    b.ld_u32(v, data, k0);
+    b.no_site();
+    b.add_u32(v, v, f);
+    b.st_u32(out, k1, v);
+    b.end_if();
+    b.end_if();
+    b.exit();
+    Scenario {
+        name: "sb_with_data",
+        module: b.build_module(),
+        inputs: inputs(vec![("flag", u32_buf([0])), ("x", u32_buf([0])), ("data", u32_buf([0])), ("out", u32_buf([0, 0]))]),
+        config: RunConfig::default(),
+    }
+}
+
+/// A ring of `n` single-CTA clusters (milestone 2 review; W5's suggestion).
+/// Lane 0 of CTA c first does `ld.acquire flag[(c+1) % n]` and reads
+/// `data[(c+1) % n]` (round-start values, before any strong write of its
+/// own), then stores `data[c]` and `st.release flag[c] = 1`. Each CTA reads
+/// what the next one writes: a cycle, so the round replays in partition order
+/// and serially. With `bystander`, an extra CTA n (not in the ring) resolves
+/// `ld.acquire flag[0]` and reads `data[0]` in the same round.
+fn ring(n: u32, bystander: bool) -> Scenario {
+    let total = n + u32::from(bystander);
+    let mut b = ProgramBuilder::new("ring", 32);
+    b.grid(total, 1, 1);
+    let flag = b.global("flag", Dtype::U32);
+    let data = b.global("data", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let cta = b.reg(Ty::U32);
+    let next = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let f = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let kn = b.k_u32(n);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.compare(CmpOp::Lt, Ty::U32, p, cta, kn);
+    b.if_(p);
+    // next = (cta + 1) % n
+    b.add_u32(next, cta, k1);
+    b.compare(CmpOp::Eq, Ty::U32, p, next, kn);
+    b.if_(p);
+    b.mov(next, k0);
+    b.end_if();
+    b.site("flag_acquire", 1);
+    b.push(Instr::Load { ty: Ty::U32, dst: f, buf: flag, offset: next.into(), sem: Sem::Acquire, scope: Scope::Gpu, mods: MemMods::default() });
+    b.site("data_load", 2);
+    b.ld_u32(v, data, next);
+    b.site("data_store", 3);
+    b.st_u32(data, cta, cta);
+    b.site("flag_release", 4);
+    st(&mut b, flag, cta.into(), k1, Sem::Release);
+    b.no_site();
+    b.add_u32(v, v, f);
+    b.st_u32(out, cta, v);
+    b.else_();
+    b.site("bystander_acquire", 5);
+    b.push(Instr::Load { ty: Ty::U32, dst: f, buf: flag, offset: k0, sem: Sem::Acquire, scope: Scope::Gpu, mods: MemMods::default() });
+    b.site("bystander_load", 6);
+    b.ld_u32(v, data, k0);
+    b.no_site();
+    b.add_u32(v, v, f);
+    b.st_u32(out, cta, v);
+    b.end_if();
+    b.end_if();
+    b.exit();
+    Scenario {
+        name: if bystander { "ring_with_bystander" } else { "ring" },
+        module: b.build_module(),
+        inputs: inputs(vec![("flag", u32_buf(vec![0; total as usize])), ("data", u32_buf(vec![0; total as usize])), ("out", u32_buf(vec![0; total as usize]))]),
+        config: RunConfig::default(),
+    }
+}
+
 /// W6-P1 under racecheck: two clusters each `st.release flag = cta+1` and
 /// then `wait_until(flag == cta+1)` (same round). Each verdict must acquire
 /// the waiter's own write.
@@ -323,6 +450,44 @@ fn h6_store_buffering_serial_is_worker_independent() {
 }
 
 #[test]
+fn h1_cycle_sb_with_data_serial_is_worker_independent() {
+    let (status, report) = serial_is_worker_independent(&sb_with_data(), &RacecheckConfig::default());
+    assert_eq!(status, format!("{:?}", RunStatus::Completed));
+    // The engine's stream-cycle diagnostic is a run diagnostic, not a
+    // racecheck finding; the payload here is the serial checker's.
+    let _ = report;
+}
+
+/// Milestone 2 (§14): in a replay cycle, a child would resolve
+/// `flag_acquire` against round-start state although CTA 0, replayed
+/// earlier (partition-order fallback), wrote it. Since W5-17b (784e2df) a
+/// cycle round replays serially with no fork offers; this guards that.
+#[test]
+fn h1_cycle_sb_with_data_fork_join_matches_serial() {
+    fork_join_matches_serial(&sb_with_data(), &RacecheckConfig::default());
+}
+
+#[test]
+fn h1_ring3_serial_is_worker_independent() {
+    serial_is_worker_independent(&ring(3, false), &RacecheckConfig::default());
+}
+
+#[test]
+fn h1_ring3_fork_join_matches_serial() {
+    fork_join_matches_serial(&ring(3, false), &RacecheckConfig::default());
+}
+
+#[test]
+fn h1_cycle_with_bystander_serial_is_worker_independent() {
+    serial_is_worker_independent(&ring(2, true), &RacecheckConfig::default());
+}
+
+#[test]
+fn h1_cycle_with_bystander_fork_join_matches_serial() {
+    fork_join_matches_serial(&ring(2, true), &RacecheckConfig::default());
+}
+
+#[test]
 fn all_scenarios_serial_is_worker_independent() {
     for s in scenarios::all() {
         serial_is_worker_independent(&s, &RacecheckConfig::default());
@@ -447,6 +612,9 @@ fn review_scenarios() -> Vec<(Scenario, RacecheckConfig)> {
         (turnover(), d()),
         (many_races(), capped()),
         (scenarios::cross_cluster_sb(), d()),
+        (sb_with_data(), d()),
+        (ring(3, false), d()),
+        (ring(2, true), d()),
     ];
     v.extend(scenarios::all().into_iter().map(|s| (s, d())));
     v.extend(corpus().into_iter().map(|s| (s, d())));
@@ -495,5 +663,23 @@ fn race_observer_does_not_change_the_run() {
                 );
             }
         }
+    }
+}
+
+/// The cycle scenarios really are replay cycles (otherwise their fork/join
+/// arms would not exercise W5-17b): the engine reports
+/// `cross_cluster_same_round_cycle` at 8 workers.
+#[test]
+fn cycle_scenarios_are_replay_cycles() {
+    for s in [sb_with_data(), ring(3, false), ring(2, true)] {
+        let cfg = RunConfig { workers: 8, ..s.config.clone() };
+        let mut obs = RaceObserver::new(RacecheckConfig::default());
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &cfg).expect("run starts");
+        assert!(
+            o.diagnostics.iter().any(|d| d.attrs.get("reason").and_then(|r| r.as_str()) == Some("cross_cluster_same_round_cycle")),
+            "{}: no replay cycle reported: {:?}",
+            s.name,
+            o.diagnostics
+        );
     }
 }
