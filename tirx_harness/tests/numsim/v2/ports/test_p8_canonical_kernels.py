@@ -18,7 +18,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from tests.numsim.corpus.kernels.flashmla import prepare_sparse_prefill_case
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -45,13 +45,6 @@ def _cluster_zero_cta_ids(module) -> list[int]:
     )
 
 
-@v2_gap(
-    "subset run with only cluster 0 (CTAs 0,1 of a 4-CTA, 2x1x1-cluster launch) resident "
-    "completes but never claims the non-resident cluster's task through CLC: query row 1 "
-    "of out/max_logits/lse keeps its NaN sentinel (out[1,0,0] nan vs -0.0871); the full "
-    "launch matches the oracle. Same failure for the legacy test under NUMSIM_IMPL=v2 and "
-    "for subset=cluster_ids=[0] CONTRACT_REQUESTS W12-gaps 6 (scheduler/subset)"
-)
 def test_flashmla_small_topk_task_steal_matches_independent_numerical_oracle():
     """Port of ``tests/numsim/corpus/test_canonical_kernels.py::test_flashmla_small_topk_task_steal_matches_independent_numerical_oracle``."""
 
@@ -80,5 +73,10 @@ def test_flashmla_small_topk_task_steal_matches_independent_numerical_oracle():
     report = v2.compare(result, expected, tolerances=case.comparisons)
 
     report.require_ok()
-    assert report.verdict == "clean"
-    assert report.diagnostics == []
+    # A subset run is never "clean": W8-4 records the non-resident clusters as
+    # one analysis_incomplete/subset_execution diagnostic, and nothing else.
+    assert report.verdict == "incomplete"
+    assert [(d.get("kind"), d.get("status"), d.get("reason")) for d in report.diagnostics] == [
+        ("analysis_incomplete", "incomplete", "subset_execution")
+    ]
+    assert report.diagnostics[0].get("resident_cluster_ids") == [0]
