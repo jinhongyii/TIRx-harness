@@ -656,6 +656,47 @@ warp in a CTA using the Tensor Memory Allocation and Management Instructions."
 
 ---
 
+## Q12. Which mbarrier phase publishes a `complete_tx` copy (racecheck per-phase async actors, W5)
+
+Context: W5 proposes stamping a copy whose only completion is `Phase{B, p}` with one actor per barrier phase instead of one per op.
+
+**(1) A waiter never acquires phase p before p's copies have landed: confirmed, with one engine-side condition.**
+- Model: `Issue` binds each copy to `gen = s.gen + complete`, so a copy issued after p completes but before roll-over binds to p+1. Each copy then delivers its own `CompleteTx { gen, bytes }`.
+- A phase completes only when `arrived == required()` and `tx_completed == tx_expected` (production `complete_if_ready`; the reference crate uses the same predicate, and `sync_differential` checks equality).
+- Completion does not wait for `outstanding[p]` to reach 0. If `expect_tx` under-declares, p can complete while a copy bound to p is still in flight. That copy's later landing is then a protocol error: `CompletionAfterComplete` while p is still current, `StaleCompletion` after roll-over. A 0-byte copy lands silently but writes nothing.
+- Rule for racecheck: stamp a copy's witnesses with `(B, p)` only if its landing contributed to p before p completed. The engine's `AsyncComplete{Phase}` names the copy's bound generation (`op.signals`, `partition.rs`), which is p+1 for a buffered copy. A copy whose landing fails keeps its per-op actor; the run is an error anyway.
+
+**(2) Only the Write milestone: confirmed for bulk/TMA `mbarrier::complete_tx` copies.**
+- The engine emits exactly one `AsyncComplete { milestone: Write, target: Phase{res, gen} }` per `MbarTx` signal at landing (`partition.rs`). `Side::Read` is emitted only by `cp.async.bulk.wait_group.read` (`async_copy.rs`), and only for bulk-group ops with a `Warp` target.
+- Exception: `cp.async.mbarrier.arrive[.noinc]` publishes the lane's earlier non-bulk `cp.async` copies to `Phase{res, gen}` (W5-11). Those copies are also members of async groups and can later receive a `Warp` completion from `cp.async.wait_group`. At landing, their "only target is a Phase" property cannot be decided. Keep them on per-op actors.
+- Multicast: one `MbarTx`, hence one Phase event, per destination CTA. Per-op actors, as W5 proposes.
+
+**(3) Per-barrier actor with epoch = phase: NOT justified. Keep per-(B, p).**
+- The ISA's guarantee for an acquiring wait is scoped to the phase it observes. It covers bulk operations "requested prior … to mbarrier.arrive having release semantics **during the completed phase**".
+- Phase-skipping transitivity would need the mbarrier's own operations to form an RMW chain in observation order (§8.9.2). The chain must run from an earlier phase's complete-tx to the later phase's acquiring wait. PTX does not classify `mbarrier.arrive`, `expect_tx` or the implicit complete-tx as atomic read-modify-write operations on one location for the memory model. §8.9.2's "optional sequence of atomic read-modify-write operations" therefore cannot be applied to them. **The ISA is silent**, and silence means no edge.
+- In the common pipeline, phase p's arriving thread acquired p−1 first, so the edge exists through that thread's arrive and the per-(B, p) model already finds it. Only a waiter that skips a phase, with arrivers that did not wait for the previous phase, would differ. Racecheck keeps today's behaviour for it, so no delta row is needed.
+
+**(4) Relaxed waits:** agreed. A relaxed `test_wait`/`try_wait` that returns True observes the same phase object. The later `fence.acquire` makes it an acquire pattern on that phase (R4). Parking the `(B, p)` stamp until the fence is equivalent to parking the phase payload.
+
+**QUOTE** (§9.7.15.16.19, *mbarrier.test_wait / mbarrier.try_wait*):
+
+> "All cp.async.bulk asynchronous operations using the same mbarrier object
+> requested prior, in program order, to mbarrier.arrive having release
+> semantics during the completed phase by the participating threads of the CTA
+> are performed and made visible to the executing thread."
+
+**QUOTE** (§8.9.2, *Observation Order*):
+
+> "Observation order relates a write W to a read R through an optional sequence
+> of atomic read-modify-write operations."
+
+**QUOTE** (§9.7.10.28.4.1, *cp.async.bulk*):
+
+> "The complete-tx operation on the mbarrier has .release semantics at the
+> .cluster scope as described in the Memory Consistency Model."
+
+---
+
 ## Additional limits and forms
 
 ### Expected-arrival, pending and tx-count ranges
