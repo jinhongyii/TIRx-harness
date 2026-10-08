@@ -1001,7 +1001,18 @@ impl<'p> Scheduler<'p> {
                 }
             }
         }
-        let workers = self.config.workers.max(1);
+        // Never more threads than partitions that can be resident at once
+        // (W13): a pool thread with no partition still wakes and joins every
+        // round (kda_backward_packed, 3 partitions: 0.18 s at 8 workers,
+        // 0.11 s at 3). The worker count never changes results.
+        let max_partitions = if self.single {
+            1
+        } else {
+            let per = self.shape.ctas_per_cluster().max(1);
+            let cap = if self.all_resident() { usize::MAX } else { (self.config.max_resident_ctas / per).max(1) as usize };
+            self.pending.len().min(cap).max(1)
+        };
+        let workers = self.config.workers.max(1).min(max_partitions);
         // Deterministic numerics: the engine's FP environment on this
         // thread for the whole run, the caller's restored afterwards.
         let _fp = pool::FpEnvGuard::enter();

@@ -411,6 +411,23 @@ fn observed_overhead(c: &mut Criterion) {
     }
 }
 
+/// Worker-count cap (W13): corpus runs at the Python default of 8 workers on
+/// kernels with fewer partitions than workers (kda_backward_packed: 3,
+/// radix_topk_multi_cta: 2).
+fn few_partitions(c: &mut Criterion) {
+    let dir = fixtures::dir();
+    for case in ["kda_backward_packed", "radix_topk_multi_cta"] {
+        if !fixtures::exists(&dir, case) {
+            eprintln!("few_partitions: fixture {dir}/{case}.* missing, skipped");
+            continue;
+        }
+        let (module, inputs, mut config) = fixtures::load(&dir, case);
+        config.workers = 8;
+        let s = Scenario { name: "few_partitions", module, inputs, config };
+        group(c, "few_partitions_w8", case, &s);
+    }
+}
+
 fn corpus(c: &mut Criterion) {
     let dir = fixtures::dir();
     for case in ["rmsnorm", "deepgemm_sm100_fp8_gemm_1d1d", "fp16_bf16_gemm", "kda_backward_packed"] {
@@ -425,5 +442,5 @@ fn corpus(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench, corpus, observed_overhead);
+criterion_group!(benches, bench, corpus, observed_overhead, few_partitions);
 criterion_main!(benches);
