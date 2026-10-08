@@ -397,6 +397,9 @@ pub struct RecordingObserver {
     pub other: Vec<SyncEvent>,
     /// Total delivery order as (warp index or u32::MAX, index in its list).
     pub order: Vec<(u32, u32)>,
+    /// `(kernel_index, shape)` of every launch observed, in order (W6-2), so
+    /// consumers can rebuild per-CTA resources without re-supplying the shape.
+    pub launches: Vec<(u32, LaunchShape)>,
 }
 
 impl RecordingObserver {
@@ -409,6 +412,9 @@ impl RecordingObserver {
 }
 
 impl Observer for RecordingObserver {
+    fn begin_launch(&mut self, info: &LaunchInfo<'_>) {
+        self.launches.push((info.kernel_index, info.shape));
+    }
     fn sync(&mut self, e: &SyncEvent) {
         match e.actor {
             Actor::Warp { warp, .. } => {
