@@ -4,7 +4,7 @@ orphan: true
 
 # NumSim / Racecheck / Synccheck 重构方案
 
-状态：实施中，2026-10-08 更新。分支 `refactor/clean-core`。第 0–3 步已完成：v2 在全部 corpus case 上与旧快照一致或有裁定的 delta（`v2-conformance-status.md`）。第 4 步已完成：后端对比结论为保留 `interp`，`codegen` 已删除（`backend-comparison.md`）。第 5 步（删旧）由 `test-migration.md` 的退役计划驱动，尚未执行。
+状态：全部步骤完成，2026-10-08 更新。分支 `refactor/clean-core`。第 0–3 步：v2 在全部 corpus case 上与旧快照一致或有裁定的 delta（`v2-conformance-status.md`）。第 4 步：后端对比结论为保留 `interp`，`codegen` 已删除（`backend-comparison.md`）。第 5 步（删旧）已在 `79f04eb` 完成：删除 240 个旧文件、140 个测试文件、467 个测试函数和 12 个迁移工具，17 个 delta 快照折叠进基础快照，v2 成为实现兼 conformance oracle。删旧前的最后一轮：`tests/numsim/v2` 1277 passed / 2 xfail（T18 已记录的限制）；conformance numsim 99、racecheck 100、synccheck 99；公共测试集 761/761 通过或已被覆盖。
 
 本文是重构的工作合约：所有 worker 以此为准，分歧回到这里改文档再改代码。
 
@@ -165,7 +165,7 @@ pub struct Program {
 2. racecheck 核心，逐 kernel 切换，finding 集合对照。（完成）
 3. synccheck 与探索器。（完成）
 4. codegen 后端作为 `Program` 打印器；三模式性能对比；删掉输家。（完成：保留 `interp`，`codegen` 已删除；数据见 `backend-comparison.md`）
-5. 删旧：`engine-rs/`、`frontend-rs/`、旧 Python 层、钉实现的测试。（待执行；`scripts/numsim-v2/retire_legacy.py`、`retire_tests.py`）
+5. 删旧：`engine-rs/`、`frontend-rs/`、旧 Python 层、钉实现的测试。（完成：`79f04eb`；迁移工具随之删除，保留清单见 `scripts/numsim-v2/RETIREMENT.md`）
 
 ### 4.1 并行分工
 
@@ -184,10 +184,9 @@ pub struct Program {
 
 ## 5. 代码位置
 
-- Rust：`tirx_harness/src/tirx_harness/numsim/core-rs/`（workspace：`numsim-types`、`numsim-core`、`numsim-oplib`、`numsim-py`、`numsim-sync-ref`、`numsim-race-core`；crate 划分见 `core-rs/README.md`）。
-- Python：`tirx_harness/src/tirx_harness/numsim/v2/`，第 5 步替换 `numsim/*.py`。
+- Rust：`tirx_harness/src/tirx_harness/numsim/core-rs/`（workspace：`numsim-types`、`numsim-core`、`numsim-oplib`、`numsim-py`、`numsim-sync-ref`；crate 划分见 `core-rs/README.md`）。
+- Python：`tirx_harness/src/tirx_harness/numsim/v2/`；`numsim/__init__.py` 直接导出 v2 的公共名字。
 - 测试：见 `test-migration.md`「Where tests live」。
-- 旧代码在第 5 步前不动。
 
 ## 6. 待决与风险
 
@@ -204,13 +203,13 @@ pub struct Program {
 - `sync-semantics.md`：六个同步协议的状态、命令、前提、转移、完成、错误；引擎模型与 strict 模型的全部不一致。参考状态机在 `core-rs/numsim-sync-ref/`。
 - `sync-isa-answers.md`：七个开放语义问题的 ISA 裁定。四个问题两边模型都错：`tcgen05.alloc` 应阻塞、cluster barrier 要排除已退出线程、elect 后单 lane 进 barrier 是 UB、async group 等待逐线程。
 - `sync-behaviour-deltas.md`：相对旧行为的变更清单，供快照 diff 审查。
-- `racecheck-semantics.md`：33 条 HB 边、冲突规则、时钟表示技巧与操作数论证、22 条旧有不合理行为。实现在 `numsim-core/src/racecheck/`；原型 `core-rs/numsim-race-core/` 仍在 workspace，但不被任何 crate 依赖。
+- `racecheck-semantics.md`：33 条 HB 边、冲突规则、时钟表示技巧与操作数论证、22 条旧有不合理行为。实现在 `numsim-core/src/racecheck/`；原型 `numsim-race-core` 已删除。
 - `racecheck-isa-answers.md`：release sequence、moral strength、proxy 规则等的 ISA 裁定。
 - `synccheck-explorer.md`：两阶段算法、投影、证书、指纹、DFS 剪枝表与测量。实现在 `numsim-core/src/synccheck/`，剪枝基准在 `numsim-core/benches/synccheck.rs`。
 - `lowering-inventory.md`：194 个 corpus PrimFunc 的 IR 节点、builtin、dtype、layout、控制流统计；lowering 设计与三个 worked example。
 
 ## 8. 环境备忘
 
-- 本机 shell 的 `PYTHONPATH`、`TVM_HOME`、`TVM_LIBRARY_PATH`、`LD_LIBRARY_PATH` 指向本地 0.26 的 TVM 开发树，会让 frontend panic（`sym.Analyzer is not registered`）。运行测试前 `source scripts/dev-env.sh`（清掉这四个变量，设置 `$PY`），环境用 `uv sync --locked --extra test --group benchmark --inexact`（Python 3.12）。详见 `dev-loop.md`。
-- 测试从 `tirx_harness/` 目录运行，总是带 `-n`，设 `NUMSIM_WORKER_AFFINITY=off`。
-- 旧引擎改动跑 `cargo test --all-features`（`engine-rs`）；新核心跑 `(cd core-rs && cargo test --workspace)`，改 Rust 后用 `core-rs/numsim-py/build_dev.sh` 重建扩展。
+- 本机 shell 的 `PYTHONPATH`、`TVM_HOME`、`TVM_LIBRARY_PATH`、`LD_LIBRARY_PATH` 指向本地 0.26 的 TVM 开发树，会混入错误版本的 TVM。运行测试前 `source scripts/dev-env.sh`（清掉这四个变量，设置 `$PY`），环境用 `uv sync --locked --extra test --group benchmark --inexact`（Python 3.12）。详见 `dev-loop.md`。
+- 测试从 `tirx_harness/` 目录运行，总是带 `-n`。
+- 核心跑 `(cd core-rs && cargo test --workspace)`，改 Rust 后用 `core-rs/numsim-py/build_dev.sh` 重建扩展。

@@ -10,10 +10,11 @@ detailed specifications are linked [at the end](#specifications). Day-to-day
 build, test, and environment commands are in the
 [development loop](dev-loop.md).
 
-The redesign replaces the legacy engine (`numsim/engine-rs`, the Rust frontend
+The redesign replaced the legacy engine (`numsim/engine-rs`, the Rust frontend
 `frontend-rs`, and the legacy Python layer) kernel by kernel, with corpus
-snapshots as the oracle. Until the migration completes, both engines are in the
-tree and the public entry points still run the legacy one.
+snapshots as the oracle. The legacy engine was deleted in `79f04eb`; v2 is now
+both the implementation behind the public entry points and the conformance
+oracle.
 
 ## Design rules
 
@@ -179,8 +180,9 @@ on the observer; tests check both (numsim-redesign.md §2.3).
    with its inputs and an independent reference. Explain any expected
    non-clean verdict in `canonical_verdict_rationale.md`.
 2. Generate its three snapshots (numsim, racecheck, synccheck) and review
-   them. They are generated from the legacy engine until it is deleted;
-   after the legacy engine is deleted, v2 becomes the oracle: `--update-snapshots` regenerates from v2, every commit that changes a snapshot cites the justifying delta row id in its message, and CI enforces it (`scripts/numsim-v2/check_snapshot_deltas.py`); the deletion commit folds the delta files into the base snapshots (`scripts/numsim-v2/fold_snapshot_deltas.py`).
+   them. `--update-snapshots` regenerates them from v2; every commit that
+   changes a snapshot cites the justifying delta row id in its message, and CI
+   enforces it (`scripts/numsim-v2/check_snapshot_deltas.py`).
 
 ## Rendered report text
 
@@ -224,20 +226,20 @@ Every intended behavior change is documented in one of three delta files:
 [NumSim numerics](numsim-behaviour-deltas.md),
 [synchronization](sync-behaviour-deltas.md), and
 [Racecheck](racecheck-behaviour-deltas.md). Each row states the legacy and the
-new behavior and the PTX ISA basis or ruling. When a row rules that legacy was
-wrong for a corpus case, the corrected oracle is stored beside the legacy
-snapshot as `<mode>.delta.json`, naming the row. The new engine is compared
-with the delta file when one exists.
+new behavior and the PTX ISA basis or ruling. While both engines were in the
+tree, a row that ruled legacy wrong for a corpus case stored the corrected
+oracle beside the legacy snapshot as `<mode>.delta.json`; `79f04eb` folded those
+17 files into the base snapshots (`scripts/numsim-v2/fold_snapshot_deltas.py`),
+so each snapshot is now the single oracle for its case and mode.
 
 Snapshot policy:
 
 - Snapshots are regenerated with `--update-snapshots` only for an intentional,
   documented change, and the commit message explains each changed case.
-- Legacy snapshots are regenerated only from the legacy engine, never from the
-  new engine to make it pass. After the legacy engine is deleted, v2 becomes
-  the oracle and `--update-snapshots` regenerates from v2; every commit that
-  changes a snapshot must cite the justifying delta row id in its message
-  (CI: `scripts/numsim-v2/check_snapshot_deltas.py`).
+- `--update-snapshots` regenerates from v2; every commit that changes a
+  snapshot must cite the justifying delta row id in its message (CI:
+  `scripts/numsim-v2/check_snapshot_deltas.py`). Never regenerate a snapshot
+  just to make a failing case pass.
 - `--update-snapshots` never writes delta files; they are edited by hand with
   their delta row.
 
@@ -259,7 +261,7 @@ fields, or absolute times.
 | Lowering | The contents of the lowered `Program`, not any generated text | `tests/numsim/v2/test_lowering_*.py` |
 | Kernel-level checks | Racecheck/Synccheck facts that contract events cannot express | `tests/numsim/v2/checkers/` |
 | Legacy copies | Public-API legacy tests ported to the v2 API, each citing its legacy test and delta row | `tests/numsim/v2/ports/`, `tests/numsim/v2/tile_forms/` |
-| Performance | Criterion microbenchmarks and end-to-end checks relative to a per-host baseline; opt-in `performance` marker | `numsim-core/benches/` (synccheck reduction guards: `benches/synccheck.rs`), `numsim-race-core`, `tests/perf/` |
+| Performance | Criterion microbenchmarks and end-to-end checks relative to a per-host baseline; opt-in `performance` marker | `numsim-core/benches/` (synccheck reduction guards: `benches/synccheck.rs`), `tests/perf/` |
 
 CI runs the Rust workspace tests and the Python suite without the GPU and
 performance markers, so snapshot drift fails CI.
@@ -275,5 +277,5 @@ performance markers, so snapshot drift fails CI.
 | [Racecheck ISA answers](racecheck-isa-answers.md) | PTX memory-model rulings |
 | [Synccheck explorer](synccheck-explorer.md) | Projection, certificates, fingerprints, DFS, budgets |
 | [Lowering inventory](lowering-inventory.md) | IR nodes, builtins, and layouts the corpus uses |
-| [Test migration](test-migration.md) | How the legacy test suite is retired |
+| [Test migration](test-migration.md) | How the legacy test suite was retired |
 | [Backend comparison](backend-comparison.md) | Interpreter vs. codegen measurements behind the decision to keep only the interpreter |

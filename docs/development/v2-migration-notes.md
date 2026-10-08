@@ -99,9 +99,7 @@ long cold builds), while the interpreter is 2.3–3.0x faster than legacy
 | `Engine(max_workers=...)` | Scheduler threads (`"auto"` = CPU count). Results do not depend on it. | `8` |
 | `Engine(native_loop_iteration_budget=..., native_loop_reschedule_quantum=...)` | Loop budget and slice quantum: positive integers or `None`. Invalid values raise at construction. | engine default |
 
-- **Rename:** the `NUMSIM_` prefix becomes `NUMSIM_` when the legacy engine is deleted. Until then only the `NUMSIM_*` spellings are read; no alias exists yet.
-- **`NUMSIM_WORKER_AFFINITY`** is read only by the legacy engine, and v2 ignores it.
-- **`NUMSIM_IMPL=v2`** is a test-suite switch (`tests/conftest.py`) that points the public names at v2. Library users call `tirx_harness.numsim` directly.
+- **Legacy deleted in `79f04eb`:** `tirx_harness.numsim` is v2; `NUMSIM_IMPL` and `NUMSIM_WORKER_AFFINITY` are gone, and the old `NUMSIM_V2_*` spellings remain accepted as aliases of `NUMSIM_*` for one release.
 
 ## 3. Reading the new report fields
 

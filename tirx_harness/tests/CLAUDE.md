@@ -12,7 +12,7 @@ package. Then from `tirx_harness/`:
 
 ```bash
 python -m pip install --no-deps --no-build-isolation ..
-(cd src/tirx_harness/numsim/engine-rs && cargo build --all-features)  # engine changes
+bash src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh  # core-rs changes; see dev-loop.md for a private build
 python -m pytest -q -n 16 --dist=worksteal
 ```
 
@@ -39,18 +39,11 @@ python -m pytest -q -n 16 --dist=worksteal -m "not numsim_gpu"
     legacy test and any delta row;
   - `tile_forms/`: tile-op kernels that TVM's dispatch rejects.
 - `tests/conformance/`: every canonical corpus case in three modes against
-  `snapshots/` (plus hand-edited `*.delta.json` for ruled deltas).
+  `snapshots/`, the v2 oracle (a change cites its delta row).
 - `tests/perf/`: relative performance baselines (`performance` marker).
 
-The retirement ledger is `scripts/numsim-v2/coverage/`:
-- `test_classification.csv` with `category_overrides.tsv` gives each legacy
-  test's category;
-- `v2_ports_*.tsv` maps a legacy test to the v2 tests that replace it;
-- `v2_xfail_inventory.tsv` lists the `v2_gap` marks still holding a
-  replacement back.
-
-`scripts/numsim-v2/retire_tests.py` deletes a legacy test once every listed
-replacement passes.
+The legacy tests these replaced, and the retirement ledger and tools, were
+deleted in `79f04eb`; `docs/development/test-migration.md` records the history.
 
 ## Judging a Full-Suite Run
 
