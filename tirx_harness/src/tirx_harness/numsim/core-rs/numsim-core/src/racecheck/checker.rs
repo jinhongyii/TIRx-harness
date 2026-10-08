@@ -1594,9 +1594,22 @@ impl Checker {
                 // it until the CTA's outstanding bulk copies are done (ruling
                 // S7: no final `cp.async.bulk.wait_group` is not an error).
                 let shared = self.allocs.get(&alloc).is_some_and(|al| al.space == Space::Shared);
+                let exiting_cta = self.allocs.get(&alloc).map(|al| al.cta);
+                let topo = self.topo;
                 let mut lifetime = Vec::new();
                 for a in self.asyncs.iter_mut() {
                     if a.in_use && a.done == 0 {
+                        // The CTA exits: its in-flight bulk copies with no
+                        // shared footprint here (e.g. a TMA store whose box is
+                        // entirely out of bounds: no bytes, empty footprint)
+                        // drain with it too (S7).
+                        if shared
+                            && a.kind == AsyncKind::Copy
+                            && a.footprint.is_empty()
+                            && Some(topo.cta_of(a.warp)) == exiting_cta
+                        {
+                            a.drained = true;
+                        }
                         if let Some((_, r)) = a.footprint.iter().find(|(al, _)| *al == alloc) {
                             if shared && a.kind == AsyncKind::Copy {
                                 a.drained = true;

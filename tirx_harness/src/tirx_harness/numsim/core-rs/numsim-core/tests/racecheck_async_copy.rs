@@ -298,3 +298,14 @@ fn bulk_store_in_flight_at_cta_exit_is_drained() {
     assert!(r.findings.is_empty() && r.incomplete.is_empty(), "{r:?}");
     assert!(has_race(&run(true)));
 }
+
+/// S7: a bulk copy with an empty footprint (TMA store whose box is entirely
+/// out of bounds) still in flight at CTA exit drains with the CTA.
+#[test]
+fn empty_footprint_bulk_copy_drains_at_cta_exit() {
+    let mut k = K::one_warp();
+    let _op = k.issue(0, 0, AsyncKind::Copy, Proxy::Async, &[], &[]);
+    k.alloc_end(SMEM);
+    let r = k.run();
+    assert!(r.incomplete.is_empty(), "{r:?}");
+}

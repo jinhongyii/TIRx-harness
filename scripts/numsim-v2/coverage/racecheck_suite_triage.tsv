@@ -107,7 +107,7 @@ tests/analysis_tools/racecheck/corpus/test_canonical_kernels_racecheck.py::test_
 tests/analysis_tools/racecheck/corpus/test_canonical_kernels_racecheck.py::test_real_mega_moe_racecheck_completes_within_performance_budget[large_moe]	infra: hang (>600 s, native; not finished)	-
 tests/analysis_tools/racecheck/corpus/test_canonical_kernels_racecheck.py::test_native_racecheck_validates_flashmla_small_topk_task_steal	verdict differs: v2 right (delta) + v2 wrong (event shape)	B7; W5-12 (W2)
 tests/analysis_tools/racecheck/test_declared_word_regressions.py::test_a_relaxed_publication_leaves_the_payload_unordered	infra: hang (>600 s, native; not finished)	-
-tests/analysis_tools/racecheck/test_declared_word_shapes.py::test_declared_word_shape_gets_the_verdict_it_earns[read_once_no_retry]	verdict differs: open ruling	T18 (read before publication not observable; #677)
+tests/analysis_tools/racecheck/test_declared_word_shapes.py::test_declared_word_shape_gets_the_verdict_it_earns[read_once_no_retry]	documented limitation	T18 (strict xfail)
 tests/analysis_tools/racecheck/test_declared_word_shapes.py::test_declared_word_shape_gets_the_verdict_it_earns[raw_shared_cluster_poll]	verdict differs: v2 right (delta)	R3/R9 (undeclared_protocol_word review)
 tests/analysis_tools/racecheck/test_native_alias_advisory.py::test_public_native_stale_logical_name_read_is_review	verdict differs: v2 right (delta)	P7 / W5-9 (same-dtype views share root identity)
 tests/analysis_tools/racecheck/test_native_async_lifetime_contracts.py::test_tcgen_transfer_requires_the_directional_wait[0-read_write-review]	pins legacy internals (payload keys / native engine / journal parity)	W9: retire or port
