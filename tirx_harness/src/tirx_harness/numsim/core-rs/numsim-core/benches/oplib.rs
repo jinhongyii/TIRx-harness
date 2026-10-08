@@ -274,6 +274,16 @@ fn tma(c: &mut Criterion) {
     g.bench_function("load_bf16_64x128_sw128_oob_uncached", |b| {
         b.iter(|| black_box(oplib::tma_plan_dir(&map, oplib::TmaPlanDir::Load, TmaMode::Tile, &[4064, 256], &[], 0x400).unwrap()))
     });
+    // FP4 (e2m1) interior box, the Mega MoE weight loads: bypasses the plan
+    // cache (sub-byte elements), so it measures the layout cache.
+    let fp4 = oplib::TensorMapDesc { elem: Some(Dtype::E2M1), box_dim: [128, 64, 1, 1, 1], global_stride: [2048, 0, 0, 0, 0], ..map.clone() };
+    let mut fp4_k = 0i64;
+    g.bench_function("load_e2m1_128x64_sw128", |b| {
+        b.iter(|| {
+            fp4_k = (fp4_k + 128) % 4096;
+            black_box(oplib::tma_plan_dir(&fp4, oplib::TmaPlanDir::Load, TmaMode::Tile, &[fp4_k, 256], &[], 0x400).unwrap())
+        })
+    });
     let bytes = map.encode();
     g.bench_function("descriptor_decode", |b| b.iter(|| oplib::TensorMapDesc::decode(black_box(&bytes)).unwrap()));
     g.bench_function("descriptor_encode", |b| b.iter(|| black_box(&map).try_encode().unwrap()));

@@ -733,6 +733,61 @@ pub(super) fn plan(
     cache::plan(map, dir, mode, coords, im2col_offsets, smem_offset)
 }
 
+/// The materialized layout of `map` for `im2col_mode`: a pure function of
+/// both (no coordinates), compiled once per thread and shared by every
+/// transfer through the descriptor (perf, W4 Mega MoE profile: FP4 and
+/// partially out-of-bounds boxes bypass the plan cache, and recompiling the
+/// transfer template per instruction was ~2.6% of a worker). Errors are not
+/// cached; a failing descriptor recomputes and fails the same way.
+fn materialized_layout(
+    map: &TensorMapDesc,
+    im2col_mode: Option<Im2colMode>,
+) -> OpResult<std::rc::Rc<TensorMapLayout>> {
+    type Key = (TensorMapDesc, Option<Im2colMode>);
+    thread_local! {
+        static LAYOUTS: std::cell::RefCell<std::collections::HashMap<Key, std::rc::Rc<TensorMapLayout>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (map.clone(), im2col_mode);
+    if let Some(hit) = LAYOUTS.with(|cache| cache.borrow().get(&key).cloned()) {
+        return Ok(hit);
+    }
+    let layout = std::rc::Rc::new(materialize_uncached(map, im2col_mode)?);
+    LAYOUTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key, layout.clone());
+    });
+    Ok(layout)
+}
+
+fn materialize_uncached(map: &TensorMapDesc, im2col_mode: Option<Im2colMode>) -> OpResult<TensorMapLayout> {
+    let mut image = desc_to_image(map)?;
+    if let Some(im2col_mode) = im2col_mode {
+        let wide = im2col_mode != Im2colMode::Spatial;
+        match &image.im2col {
+            None => {
+                image.im2col = Some(TensorMapIm2col {
+                    lower: [0; 3],
+                    upper: [0; 3],
+                    wide,
+                })
+            }
+            Some(config) if config.wide != wide => {
+                return Err(OpError::invalid(
+                    "im2col instruction/descriptor layout mismatch (wide)",
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    image.host_address = false;
+    image.allocation_id = 0;
+    Ok(image.materialize(image.rank, usize::MAX, map.global_address)?)
+}
+
 /// [`plan`] without the translation cache.
 fn plan_uncached(
     map: &TensorMapDesc,
@@ -756,28 +811,8 @@ fn plan_uncached(
             )))
         }
     };
-    let mut image = desc_to_image(map)?;
-    if let Some(im2col_mode) = im2col_mode {
-        let wide = im2col_mode != Im2colMode::Spatial;
-        match &image.im2col {
-            None => {
-                image.im2col = Some(TensorMapIm2col {
-                    lower: [0; 3],
-                    upper: [0; 3],
-                    wide,
-                })
-            }
-            Some(config) if config.wide != wide => {
-                return Err(OpError::invalid(
-                    "im2col instruction/descriptor layout mismatch (wide)",
-                ))
-            }
-            Some(_) => {}
-        }
-    }
-    image.host_address = false;
-    image.allocation_id = 0;
-    let layout = image.materialize(image.rank, usize::MAX, map.global_address)?;
+    let layout = materialized_layout(map, im2col_mode)?;
+    let layout = &*layout;
     let base =
         usize::try_from(smem_offset).map_err(|_| OpError::invalid("TMA shared offset overflow"))?;
     let element_type = layout.element_type;
@@ -794,26 +829,26 @@ fn plan_uncached(
     match (dir, mode, im2col_mode) {
         (TmaPlanDir::Load, TmaMode::TileGather4, _) => {
             check_rank(5)?;
-            let plan = plan_gather4_g2s(&layout, coords[0], &coords[1..], base)?;
+            let plan = plan_gather4_g2s(layout, coords[0], &coords[1..], base)?;
             load_plan(plan, element_type, address, smem_offset)
         }
         (TmaPlanDir::Store, TmaMode::TileScatter4, _) => {
             check_rank(5)?;
-            let plan = plan_scatter4_s2g(&layout, coords[0], &coords[1..], base)?;
+            let plan = plan_scatter4_s2g(layout, coords[0], &coords[1..], base)?;
             store_plan(plan, address, smem_offset)
         }
         (TmaPlanDir::Load, _, None) => {
             check_rank(layout.rank())?;
-            let plan = plan_tiled_g2s(&layout, coords, base)?;
+            let plan = plan_tiled_g2s(layout, coords, base)?;
             load_plan(plan, element_type, address, smem_offset)
         }
         (TmaPlanDir::Store, _, None) => {
             check_rank(layout.rank())?;
-            store_plan(plan_tiled_s2g(&layout, coords, base)?, address, smem_offset)
+            store_plan(plan_tiled_s2g(layout, coords, base)?, address, smem_offset)
         }
         (TmaPlanDir::Load, _, Some(im2col_mode)) => {
             check_rank(layout.rank())?;
-            let plan = plan_im2col_g2s(&layout, coords, im2col_mode, im2col_offsets, base)?;
+            let plan = plan_im2col_g2s(layout, coords, im2col_mode, im2col_offsets, base)?;
             load_plan(plan, element_type, address, smem_offset)
         }
         (TmaPlanDir::Store, _, Some(im2col_mode)) => {
@@ -821,7 +856,7 @@ fn plan_uncached(
             if !im2col_offsets.is_empty() {
                 return Err(OpError::invalid("im2col TMA store takes no im2col offsets"));
             }
-            let plan = plan_im2col_s2g(&layout, coords, im2col_mode, base)?;
+            let plan = plan_im2col_s2g(layout, coords, im2col_mode, base)?;
             store_plan(plan, address, smem_offset)
         }
     }

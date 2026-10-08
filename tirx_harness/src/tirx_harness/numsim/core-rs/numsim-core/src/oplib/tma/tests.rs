@@ -813,3 +813,70 @@ fn tma_overrides_reject_short_address_window_and_nonzero_coordinates() {
         assert!(err.to_string().contains("zero coordinates"), "{err}");
     }
 }
+
+/// The per-thread materialized-layout cache is invisible: every plan (FP4,
+/// packed and padded, and byte types; interior and out-of-bounds boxes; loads
+/// and stores) equals the plan a fresh thread with an empty cache computes,
+/// and a failing descriptor keeps failing the same way.
+#[test]
+fn materialized_layout_cache_is_invisible() {
+    use super::super::{TensorMapDesc, TmaPlanDir};
+    let mut seed = 0x51ed_270b_u64;
+    let mut next = move |bound: u64| {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % bound
+    };
+    let mut cases = Vec::new();
+    for (elem, padded, bits) in [
+        (Dtype::E2M1, false, 4_u64),
+        (Dtype::E2M1, true, 4),
+        (Dtype::U8, false, 8),
+        (Dtype::BF16, false, 16),
+    ] {
+        for swizzle in [0_u8, 3] {
+            let row_bytes = 512 * bits / 8 + 256;
+            let mut map = TensorMapDesc {
+                global_address: 0x1_0000_0000,
+                rank: 2,
+                elem: Some(elem),
+                global_dim: [512, 64, 1, 1, 1],
+                global_stride: [row_bytes, 0, 0, 0, 0],
+                box_dim: [(if swizzle == 0 { 64 } else { 128 } * 8 / bits.max(8)) as u32, 8, 1, 1, 1],
+                element_stride: [1; 5],
+                swizzle,
+                ..Default::default()
+            };
+            map.fp4_padded = padded;
+            for dir in [TmaPlanDir::Load, TmaPlanDir::Store] {
+                for _ in 0..6 {
+                    let coords = vec![next(560) as i64 - 24, next(72) as i64 - 4];
+                    cases.push((map.clone(), dir, coords, 0x400 * next(4)));
+                }
+            }
+        }
+    }
+    // Warm this thread's cache, then compare every plan with a cold thread.
+    let render = |r: super::super::OpResult<TmaPlan>| r.map(|p| format!("{p:?}")).map_err(|e| e.to_string());
+    let warm: Vec<_> = cases
+        .iter()
+        .map(|(m, d, c, s)| {
+            let _ = super::plan_uncached(m, *d, TmaMode::Tile, c, &[], *s);
+            render(super::plan_uncached(m, *d, TmaMode::Tile, c, &[], *s))
+        })
+        .collect();
+    let cold: Vec<_> = std::thread::spawn(move || {
+        cases
+            .iter()
+            .map(|(m, d, c, s)| {
+                let fresh = std::thread::scope(|scope| {
+                    scope.spawn(|| render(super::plan_uncached(m, *d, TmaMode::Tile, c, &[], *s))).join().unwrap()
+                });
+                fresh
+            })
+            .collect()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(warm, cold);
+    assert!(warm.iter().filter(|r| r.is_ok()).count() > 20, "{warm:?}");
+}
