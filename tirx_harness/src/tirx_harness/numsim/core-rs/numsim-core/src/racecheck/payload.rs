@@ -174,7 +174,7 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
                 "declared word bytes [{}..{}) of allocation {} are accessed by wait_until and a plain operation without a happens-before relationship",
                 f.bytes.start, f.bytes.end, f.alloc.0
             );
-            (FindingKind::Other("signal_protocol_error".into()), Status::Error, msg)
+            (FindingKind::SignalProtocolError, Status::Error, msg)
         }
         RK::DataRace { class, failure } | RK::TmemLifetimeReview { class, failure } => {
             let review = matches!(f.kind, RK::TmemLifetimeReview { .. });
