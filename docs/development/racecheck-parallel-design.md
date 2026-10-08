@@ -534,3 +534,324 @@ the same round-start release clocks (Arc'd chunks, groups and lane vectors),
 so refcounts bounce between cores. The cap of 2.7 s needs that cost cut, for
 example a per-worker allocator, or borrowing instead of cloning in
 `Clock::join` when the incoming side dominates.
+
+## 15. The main checker's serial segment (W14, 2026-10-08)
+
+Status: measured; parallel phase-end GC prototyped (scratch, bit-identical);
+address sharding and offline analysis evaluated, not built. Owner for
+implementation: W5. Numbers are from a scratch copy of 6cfabec with
+wall-clock timers on the main thread, the recorded e24 stream
+(`mega_moe_t8_h1024_i512_e24_k2_g1`), `FORK_JOIN` on, phase-end GC on.
+Host: 256 CPUs, load average 7.5–15.8 throughout (never quiet), so walls
+are given as min of 3 with the spread.
+
+### 15.1 Where the serial segment goes
+
+The main checker runs on the scheduler thread between the children's
+`par_for`s. Per-phase counts are over 174 parallel phases (12,876 forks) and
+350 `phase_end`s.
+
+| Part (main thread) | count | 16 workers (s) | 1 worker (s) | Notes |
+| --- | --- | --- | --- | --- |
+| `fork`: `Checker::split` (incl. `lend_globals`, 174×) | 12,876 | 0.27–0.37 | 0.21 | HashMap moves of warps, pools, allocs, words, phases |
+| `join` (queue only) | 12,876 | 0.01 | 0.01 | |
+| `settle` total | 174 | 1.00–1.33 | 0.75 | |
+| – release + `reclaim_globals` | 174 | 0.001 | 0.001 | `Arc::try_unwrap`, map extend |
+| – `absorb`: move state back | 12,876 | 0.15–0.18 | 0.10 | |
+| – `absorb`: build + sort items | 12,876 | 0.03 | 0.02 | |
+| – `absorb`: merge findings / incompletes | 1,647 | 0.001 | 0.001 | |
+| – `absorb`: `apply_deferred` (global shadow) | 268,550 (54,802 resolved strong reads) | 0.59–0.64 | 0.39 | ≈2.3 µs each |
+| – `absorb`: stash replay | 139,365 (136,685 accesses, 2,676 syncs) | 0.21–0.22 | 0.17 | events after a child's first suspension |
+| – `absorb`: drop the child shell | 12,876 | 0.09–0.10 | 0.05 | |
+| `phase_end` → `gc` | 19 runs | 1.36–1.88 | 1.28 | |
+| – meets | 20 | 0.12–0.15 | 0.09 | |
+| – shadow walk | 20 | 1.47–1.71 | 1.22 | shared 85%, global 11%, TMEM 4% of the walk; 98,136 alloc visits, 14.6M cell visits; the largest single allocation is ≤ 5 ms per run |
+| – declared-word history | 20 | 0.20–0.21 | 0.17 | ~250 live entries per run, ~40 µs each (`leq` of large release clocks) |
+| – slot reclaim + site tables | 20 | 0.04–0.06 | 0.04 | |
+| serial-phase / drain events into main (`access` / `sync`) | 1,583 / 7,849 | 0.49–0.70 | 0.42 | global atomics, H3 |
+| `finish_launch` | 1 | 0.62–1.24 | 0.55 | final `gc` 0.23–0.27, `Checker::finish` + drop 0.27–0.44 |
+| **Serial segment (sum)** | | **4.52–5.35** | **3.95** | matches §14's 4.6–5.4 s |
+| children `par_for` wall (for scale) | 174 | 4.9–6.3 | 17.4 | children CPU 43.7–51.2 s at 16 vs 17.4 s at 1 (§14 contention) |
+| engine parallel run | 174 | 0.59–0.82 | 2.68 | |
+
+### 15.2 What is inherently serial, and what is not
+
+| Part | s @16 | Class | Ruling |
+| --- | --- | --- | --- |
+| GC shadow walk | 1.5–1.7 | **(a) parallel** | Per allocation, reads only the meets. Merge is a sum (retired), a min per actor (site-table floor), a union (live actors). **Prototyped, §15.5.** |
+| GC final `finish` drop | 0.3–0.4 | **(c) cheaper** | Free the checker on a detached thread. **Prototyped.** |
+| GC word history | 0.2 | **(a) parallel** | Per entry, `leq` never touches the memo. **Prototyped.** It cannot be made incremental: the global meet is not monotone (turnover admits warps with fresh knowledge), so an entry that was useful may become useless and vice versa only forward. |
+| GC meets | 0.12–0.15 | (a) parallel | Per cluster; not prototyped (≤ 0.13 s to gain). |
+| `apply_deferred` | 0.6 | (a) only with address sharding | One mutable global shadow, applied in tag order. Tree-reducing child results pairwise does not reduce this work, it only pre-sorts the lists. Parallelises across stripes (§15.7); the hottest 4 KiB stripe holds 11% of e24's global accesses, so ≤ 9x. |
+| `split` + `absorb` moves | 0.4–0.55 | (c) cheaper | Keep cluster-owned state (warps, pools, shared/TMEM allocs, words, phases) in one `Box<ClusterState>` per cluster key, moved by pointer, instead of per-entry HashMap remove/insert. Not prototyped. |
+| stash replay | 0.2 | (b) fewer suspensions | 141 alloc/declare first suspensions (§13) carry 139K events into main. Let a child process `DeclareWord`/`AllocBegin` of its own cluster's shared allocation. W5 territory. |
+| serial-phase events | 0.5 | **inherently serial** | Global RMWs in partition order (H3), the engine's own serial cut. |
+| `fork`/`join`/release/reclaim bookkeeping | 0.03 | serial, negligible | |
+| tree reduction of child results | — | **ruled out** | Child results are (findings: 1.6K, trivial) + (deferred global accesses: need the one shadow) + (state moves: pointer work). Pairwise pre-merging on workers removes at most the 0.03 s sort. |
+
+### 15.3 Prototype: parallel phase-end GC
+
+**Algorithm** (`Checker::gc`, scratch diff `w14_parallel_gc.diff`).
+1. Compute the meets as today (serial; 0.12 s).
+2. Build one job per allocation: `(&mut Alloc, its meet, its liveness)`.
+   Shared/TMEM allocations take their cluster's meet, global ones the global
+   meet, exactly as the serial loop selects them.
+3. Run `gc_walk` per job on `gc_threads` threads, largest shadow first
+   (atomic work index). `gc_walk` retains/retires witnesses and returns
+   `(retired count, folded witnesses, per-actor min epoch)`.
+4. Merge in the allocation map's iteration order (the order the serial
+   loop used): sum `retired`, min-merge `min_epoch`, union live actors; fold
+   each allocation's `folded` witnesses into its retired summary on the main
+   thread (it decodes witnesses through `&self`, whose `JoinMemo` is not
+   `Sync`).
+5. Word histories: collect entries that still carry a payload; test each
+   with `leq` on `gc_threads` threads (a fresh `JoinMemo` per call; `leq`
+   does not read it).
+6. Slot reclaim and site tables: unchanged, serial.
+7. `Checker::finish` moves the report out and, when `gc_threads > 1`,
+   drops the rest on a detached thread.
+
+Below 16K live cells (32 history entries) the walk stays inline, so small
+launches spawn nothing.
+
+**Invariants.**
+- I1. A job touches only its own `Alloc`. Shared inputs (meets, liveness)
+  are immutable during the walk.
+- I2. Every merged quantity is order-free: `retired` is a sum, `min_epoch`
+  a per-key min, live actors a set; the retired-summary folds are per
+  allocation and run in the serial order.
+- I3. The decision per witness is the serial decision: same meet, same
+  `seen` mask, same `future_proxies`, same pinning of the latest
+  head-carrying write.
+- I4. The observer never selects an execution path: `gc_threads` only
+  changes which thread walks an allocation. `phase_end` timing (D7) is
+  unchanged.
+- I5. Detached drop: the report and stats are moved out first; nothing
+  reads the dropped checker.
+
+**Gates.**
+- `racecheck_parallel_review` (release, corpus fixtures, 1/8/32 workers):
+  20/20 with the parallel path forced on everywhere (`gc_threads` 16,
+  thresholds 0).
+- racecheck Rust suites (`racecheck_*`, `sched_partition_review`, lib):
+  all pass with the same forcing.
+- Racecheck conformance (private extension, forced): 101/101.
+- e24 payload hash equal to HEAD (`a35995f721d7c1e1`) at 1 and 16 workers
+  in every run (instrumented and clean builds).
+- Keep: a criterion row for the walk on a recorded e24 phase (W5).
+
+**Results.** Instrumented build, 16 workers, same binary with
+`gc_threads` 1 vs 16, three interleaved runs each (load 7.5–13):
+
+| | `gc_threads` 1 | `gc_threads` 16 | ratio |
+| --- | --- | --- | --- |
+| `phase_end` GC | 1.36–1.88 s | 0.39–0.42 s | 3.5–4.5x |
+| `finish_launch` | 1.06–1.24 s | 0.12–0.14 s | 8x |
+| **serial segment** | **4.52–5.35 s** | **2.56–2.79 s** | **1.77x (min/min)** |
+| e24 wall | 11.35–12.79 s | 8.87–9.63 s | 1.28x (min/min) |
+
+Clean builds (HEAD vs HEAD + prototype, no timers), interleaved, min of 3:
+
+| workers | HEAD | prototype | ratio |
+| --- | --- | --- | --- |
+| 1 | 22.96 s (22.96–24.98) | 22.93 s (22.93–23.51) | 1.00 (path unchanged at 1 worker) |
+| 16 | 8.72 s (8.72–12.57) | 7.45 s (7.45–10.03) | 1.17x |
+
+Verdict: clears the 1.5x serial-segment bar (1.77x). It does not reliably
+clear 1.3x on wall at 16 workers (1.17–1.28x): the children's `par_for`
+(4.9–6.3 s, CPU-inflated 2.5–2.9x by contention, §14) now dominates.
+Recommended as the first step: small, local, no semantic surface. Landing it
+needs CONTRACT_REQUESTS "W14 1" (the pool at `phase_end`/`end_launch`) or,
+interim, `RaceObserver::gc_threads` set from `RunConfig::workers` by
+`numsim-py` (the prototype's `std::thread::scope` costs ≈ 19 × 16 spawns
+per launch, negligible).
+
+After it, the serial segment is: `settle` 1.0–1.3 (of which
+`apply_deferred` 0.6), serial-phase events 0.5, `split` 0.3, `phase_end`
+0.4 (meets 0.13, slot reclaim, the residual walk), `finish` 0.13.
+
+### 15.4 Premise check: does an `Access` mutate anything but its location's shadow?
+
+Coordinator's candidate (§15.7): shard the shadow by address; a sync pass
+per partition produces each actor's clock trajectory; access shards apply
+their buckets against it. Correct only if an access reads its actor's clock
+and mutates only its location. Every place `access` / `access_core` /
+`defer_access_as` reads or writes something else:
+
+| # | Effect of an `Access` | Where | Class | Consequence for address sharding / offline two-pass |
+| --- | --- | --- | --- | --- |
+| R1 | **Read-from of a strong read / RMW**: the latest morally strong write's `effective_heads` are acquired into the warp (`acquire_rel`, `push_pending`, `tcgen_in`) | `access_core` → `apply_read_from` | **cross-location** (shadow → actor) | The actor's clock after the read depends on the location's write history. Needs the engine's `reads_from` (CONTRACT_REQUESTS W14 2) or stays a suspension point. Milestone 2 resolves it against round-start state today. e24: 64,770 strong reads (54,802 child-resolved). |
+| R2 | **Declared-word poll stash**: a strong read of a declared word holds its heads in `poll_stash`; the next event of the warp flushes them (`flush_polls`), a following `WaitVerdicts` replaces them | `access_core`, `access`/`defer_access_as` prelude | cross-location (as R1) | Same as R1. |
+| R3 | `WaitVerdicts` (a sync event) reads the word history (`rel`, `is_async`, `mixed_size`, `consumed`, the own-write floor `own`) and **`pred_reads_stable` reads the shadow** of the predicate inputs; unstable ⇒ no acquire | `sync` → `wait_verdicts`, `pred_reads_stable` | **cross-location** (shadow and word state → actor) | The writer of the accepted entry can be recorded by the engine (`accepted_writer`). Predicate stability is an HB judgement, not an engine fact: the actor pass must speculate "stable" and the word's shard must confirm it; a refuted speculation needs a serial re-run of the launch (it is `incomplete` anyway, but the later payload must still equal serial). e24: 18,068 verdicts, 0 unstable. |
+| R4 | Word history append (`history.push`, `own.insert`, `last`) | `access_core` | per-location (the word's shard) | Stays with the word's stripe. Its readers are R3. |
+| R5 | `tick` (warp epoch), site table push | `access` prelude | per-actor | Actor pass. |
+| R6 | `asyncs[i].drained = true` (st.async/red.async `.release` generic) | `access_core` | per-actor (async slot) | Actor pass must see it; it is decidable from the access record alone. |
+| R7 | TensorMap view: `asyncs[i].k.g2t` / `lane_g2t` from the actor's acquired ranges | `access` | per-actor, read-only of its own ranges | Actor pass computes the per-access view; travels with the HB handle (as `Deferred::lane_g2t`). |
+| R8 | Prior decoding: `slot_of_w` (`warp`, `site`, `kind`, `gen_base`, `completed_ctas` with `as_of_seq`) of **another** actor | `ordered`, `morally_strong`, `cross_cta_async`, `info`, `classify`, TcgenLd read retain | per-actor **read-only, time-varying** | The shard needs every async actor's metadata as of the access: an `op_reg`-style registry keyed `(actor, epoch)` (exists for globals), and `completed_ctas` with seq stamps (exists). Generation reuse (T22 milestone epoch) is GC-dependent, so slot reclaim must be a barrier reduction (R12). |
+| R9 | `register_global`: `site_reg`, `op_reg` inserts | `access_core` | per-actor evidence, insert-only | Commutative. |
+| R10 | `Witness::pack` appends to the allocation's `wide` table; `seen` proxy bits; `check_retired_generic` reads the allocation's retired summary | `access_core` | **per-allocation, not per-address** | A shard boundary inside one allocation needs per-shard wide tables (fine: witnesses never leave their cell), an OR-reduction of `seen` before GC, and retired-summary hulls split at shard boundaries (a hull can span pages). |
+| R11 | Alias tracker (`alias_writers`), `alias_dedup` | `alias_access` | per-location (shared/TMEM only) | Range map per allocation; dedup key global (merge by first seq). |
+| R12 | Frontier eviction (`EVICT_WINDOW`), plain-write reader supersession | `cell.writes.record`, `cell.reads.retain` | per-location | Needs the current actor's `ordered` only. Clean. |
+| R13 | Collective tcgen05.ld/st lane meet | `AsyncIssue` (a sync event) | per-actor | Actor pass. Not an access effect. |
+| R14 | Findings: `dedup` maps, `push_finding` order, `max_findings`, occurrence counts | `report_race`, `report_advisory`, `report_scope_mismatch` | global, mergeable | Merge by (key, first seq) as D4/D5 already do. `report_scope_mismatch` comes from R1 and lands in the actor pass. |
+| R15 | Counters (`stats.accesses`, `since_gc`, `last_seq`) | prelude | global, commutative | Sum/max. |
+| R16 | GC: slot reclaim needs every shard's live actors; the meets need every actor | `gc` | **global reduction** | A barrier between phases: shards report live actors and `seen`; the actor side computes meets. Slot reuse feeds the next phase's `AsyncIssue` (R8), so it must complete before the next actor pass. |
+
+**Verdict.** The premise holds for weak accesses (≈ 99% of e24's 7.27M core
+accesses and of the shadow work). It fails for R1–R3: three effects feed
+location state back into an actor's clock, and R3's predicate check is an HB
+question no engine field can answer. R8/R10/R16 are satisfiable with
+registries, per-shard tables and a phase barrier. So address sharding is
+exact only with (i) the engine recording `reads_from`/`accepted_writer`
+(W14 2), (ii) speculation on `pred_reads_stable` with a serial-rerun
+fallback, or (iii) today's milestone-2 round-start resolution plus
+suspension. (iii) exists and is exact (I11/I12); (i)+(ii) is new contract
+and a fallback path. Per the brief, no address-shard prototype was built.
+
+### 15.5 Cost model of address sharding (e24 measured, medium where noted)
+
+| Quantity | e24 | medium | Source |
+| --- | --- | --- | --- |
+| contract `Access` records | 152,933 | 3,038,486 | EventBuffer counters |
+| lane spans (core accesses before async coalescing) | 12.75M | 374.9M | EventBuffer counters |
+| core accesses after async span merge | 7.27M (lane 0.62M, async 6.66M) | 244.8M (lane 7.2M, async 237.6M) | recorder at the checker input |
+| global / shared / TMEM (core accesses) | 0.29M / 3.74M / 3.24M | 8.87M / 121.2M / 114.7M | |
+| clock-table entries, lane actors: distinct (phase, warp, version) with an access, version bumped at every sync event naming the warp and every strong read (upper bound) | 73,939 total; per phase mean 211, max 10,736 | 921,766 total; per phase mean 193, max 40,761 | recorder |
+| …of which used by global accesses | 65,743 | 843,346 | |
+| async actors with accesses (one entry each; `k` fixed at issue except `g2t`) | 15,328 (4,792 global) | 484,200 (169,024 global) | |
+| bucketing cost (32-byte record into 64 address shards) | 7.2 ns/access → 52 ms CPU total | 7.8 ns/access → 1.9 s CPU total | microbenchmark over the recorded accesses |
+| HB handle cost (today's `Warp::snapshot`) | 16 Arc clones + one allocation (≈0.2–0.5 µs uncontended; the §14 contention applies) | | |
+
+Address distribution (all lane spans, by `(allocation, 64 KiB range)`):
+
+| Case | ranges (global / shared / TMEM) | top range share | 16 shards: hash / LPT max÷mean | 64 shards: hash / LPT | global only, 16 shards LPT |
+| --- | --- | --- | --- | --- | --- |
+| mega_moe e24 | 3,634 (233 / 572 / 2,829) | 0.6% | 1.14 / 1.00 | 1.42 / 1.00 | 3.91 |
+| mega_moe medium | 11,173 (7,512 / 592 / 3,069) | 0.2% | 1.26 / 1.00 | 1.42 / 1.00 | 1.50 |
+| gdn_decode | 665 (25 / 128 / 512) | 7.8% | 2.78 / 1.25 | 6.47 / 5.02 | 4.57 |
+| recurrent_kda | 74 (74 / 0 / 0) | 19.3% | 3.47 / 3.08 | 12.7 / 12.3 | 3.08 |
+| radix_topk | 13 (7 / 6 / 0) | 32.4% | 5.18 / 5.18 | 20.7 / 20.7 | 3.30 |
+| fp16_bf16_gemm | 342 (21 / 64 / 257) | 0.7% | 1.09 / 1.00 | 1.76 / 1.01 | 1.03 |
+
+At 4 KiB stripes, e24's global accesses (0.29M) touch 3,427 stripes; the
+hottest holds 11.2% (LPT over 16 shards: 1.80, 64 shards: 7.2). Medium's
+8.87M touch 119,624 stripes; the hottest holds 6.7% (LPT 16: 1.07,
+64: 4.27). Shared/TMEM, 96% of e24's
+accesses, are cluster-private, so the cluster is already the natural address
+shard and the children already process it in parallel. Address sharding adds
+parallelism only for the global 4%: `apply_deferred` (0.6 s) and the GC walk
+(1.5–1.7 s, already parallel by §15.3).
+
+### 15.6 Estimate: e24 wall at 16 workers
+
+Starting from the measured parts (min runs): engine 0.6–0.7 s, children
+`par_for` 4.9–5.6 s, serial 2.6 s after §15.3.
+
+| Design | Serial left | Children | Estimate | vs HEAD 8.7 s |
+| --- | --- | --- | --- | --- |
+| HEAD | 4.5 | 5.0 | 8.7 (measured) | 1.0 |
+| §15.3 parallel GC | 2.6 | 5.0 | 7.45 (measured) | 1.17 |
+| + per-cluster state boxes, child-side alloc/declare (§15.2 (b)(c)) | ≈ 1.9 | 5.0 | ≈ 6.8 | ≈ 1.28 |
+| tree reduction of child results (instead of the above) | ≈ 2.55 | 5.0 | ≈ 7.4 | ≈ 1.18 |
+| address-sharded checker: actor pass per partition + global stripe shards, phase barrier, milestone-2 resolution for R1–R3 | ≈ 1.0 (serial-phase events 0.5, barrier/GC reduction ≈ 0.2, finish 0.13, sort) | ≈ 5.2 (+ handles for every global access; bucketing 0.05 CPU) | ≈ 6.5–6.9 | ≈ 1.3 |
+| offline two-pass over a recorded trace (§15.8) | ≈ 0.7 + recording 0.2 | pass 1 + pass 2 ≈ 5.0–5.5 at 16 shards (LPT 1.00 by 64 KiB range) | ≈ 6.3–6.8 | ≈ 1.3–1.4 |
+
+Every design is bounded by the children (43–51 s CPU for 17.4 s of work at
+1 worker, §14). Without W5's contention fix the best serial-segment design
+moves e24 from 7.45 s to ≈ 6.5 s; with a 2x cut in child CPU inflation,
+the children fall to ≈ 2.5 s and the serial residual decides between
+≈ 4.9 s (§15.3 alone) and ≈ 3.8 s (address sharding).
+
+Recommendation, in order:
+1. Land §15.3 (parallel GC + detached drop). 1.77x on the serial segment,
+   bit-identical, ≈ 150 lines, one small contract addition.
+2. W5's child contention work (the dominant term).
+3. Cheap serial cuts (§15.2: per-cluster boxes 0.3–0.4 s, child-side
+   alloc/declare 0.2 s).
+4. Address sharding of the global shadow only when 1–3 are in and the
+   serial residual (≈ 1.9 s) is again ≥ 40% of wall. Shared/TMEM stay with
+   the cluster's child; global accesses go to stripe shards at the round
+   merge (§5), R1–R3 stay on milestone-2 resolution.
+
+### 15.7 Address-sharded checker (design sketch, not built)
+
+**Pass 1 (per partition, parallel; today's child).** Process sync events and
+weak cluster-local accesses as today. Global accesses are deferred with an
+HB handle (today's `Deferred`), and each child buckets them by 4 KiB stripe
+into `Vec<Deferred>` per stripe shard (≈ 7 ns per record). Strong reads and
+`WaitVerdicts` resolve against the lent round-start state (milestone 2) or
+suspend.
+**Barrier.** No state merge: children return their buckets, findings and
+live-actor sets.
+**Pass 2 (per stripe shard, parallel).** Each shard owns its stripes'
+shadow, wide table and retired summaries across rounds and applies its
+buckets k-way merged by tag (= seq) order, using each record's handle
+(`cur_override`, `as_of_seq`). Findings carry their first seq; the merge
+sorts by (key, seq) (D4, D5).
+**GC.** Per shard at `phase_end`, with the meets from the actor side, and
+live actors / `seen` reduced at the barrier (R10, R16).
+**Residual serial.** Serial-phase events (atomics, H3), the barrier, the
+finding sort, slot reclaim.
+
+Invariants to keep: D1–D7, H1–H6, W1–W4 as in §11; one cell is owned by one
+shard; a shard applies records in seq order; a record's ordering test reads
+only its handle and as-of registries; nothing in pass 2 changes an actor.
+
+### 15.8 Offline analysis of a recorded trace
+
+**Trace volume** (scratch counters in `EventBuffer::replay`, summed over
+every replay call; "as buffered" = `size_of::<Event>()` 168 B per event +
+16 B per `LaneSpan` + the heap of sync-event vectors; "encoded" = a
+delta/varint, site-run, alloc-run estimate per access and span):
+
+| Case | Access records | lane spans | SyncEvents | other | bytes as buffered | encoded estimate | peak buffered per parallel phase |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| mega_moe e24 | 152,933 | 12.75M | 180,695 | 28,120 | 497 MiB | 121 MiB | 27.5 MiB |
+| mega_moe medium | 3,038,486 | 374.9M | 2,289,047 | 356,236 | 14,141 MiB | 3,631 MiB | 32.1 MiB |
+| gdn_decode | 56,576 | 1.67M | 1,536 | 1,792 | 47.9 MiB | 5.3 MiB | 14.2 MiB |
+| recurrent_kda | 53,248 | 1.36M | 2,048 | 12,288 | 42.0 MiB | 4.4 MiB | 8.4 MiB |
+| radix_topk | 20,903 | 0.67M | 21,628 | 330 | 23.8 MiB | 3.2 MiB | 1.6 MiB |
+| fp16_bf16_gemm | 3,240 | 1.22M | 6,440 | 736 | 36.2 MiB | 7.5 MiB | 3.2 MiB |
+
+e24 sync events by kind: protocol 67,438, wait 28,032, arrive 27,212,
+`WaitVerdicts` 18,068, async issue 15,840, warp sync 9,206, async complete
+8,664, fence 6,000, declare 235. Spans dominate the bytes (59% on e24, 61% on
+medium; TMA/MMA fragments before the checker's span merge), then sync heap
+(protocol command vectors, 30–33%).
+
+**Recording overhead on the engine** (the EventBuffer path: an enabled
+observer that wants word history and does nothing, vs `NoopObserver`; min
+of 3; includes the serial replay into the observer):
+
+| Case | 1 worker noop / recording | 16 workers noop / recording |
+| --- | --- | --- |
+| mega_moe e24 | 1.64 / 2.32 s (+0.68) | 0.34 / 0.53 s (+0.19) |
+| mega_moe medium | — | 7.18 / 11.05 s (+3.87, min of 2) |
+| gdn_decode | 0.21 / 0.27 s | 0.029 / 0.057 s |
+| recurrent_kda | 0.58 / 0.96 s | 0.11 / 0.55 s |
+| radix_topk | 0.047 / 0.18 s | 0.054 / 0.22 s |
+| fp16_bf16_gemm | 0.038 / 0.055 s | 0.050 / 0.071 s |
+
+(`examples/record_race_fixtures.py` records engine inputs, not events, so it
+is not the recording path.)
+
+**Correctness.** Offline analysis needs the §15.4 premise. R1–R3 have no
+round-start lend to fall back on offline, so it needs CONTRACT_REQUESTS
+W14 2 (`reads_from`, `accepted_writer`, `observed_writer`) and speculation on
+`pred_reads_stable` with a serial-rerun fallback. With those, pass 1 is a
+scan of the 0.18M (e24) / 2.3M (medium) sync events plus the per-access
+handle table; pass 2 is 16–64 address shards that balance perfectly on e24,
+medium and the GEMM (LPT 1.00) and poorly on kda/topk/gdn (3–5x at 16;
+those are sub-second cases).
+
+**Where the trace lives.**
+- In-memory full trace: 0.5 GiB for e24 (0.12 GiB encoded), **14 GiB for
+  medium (3.6 GiB encoded)**. Ruled out for medium-size launches.
+- Per-round flush to shard threads: peak 27–32 MiB per parallel phase on
+  both mega_moe sizes, independent of launch length. Pass 2 overlaps the
+  next round's engine work. This is the fork/join design with the shards
+  moved off the scheduler thread. **Recommended** if offline analysis is
+  pursued.
+- On disk: 3.6 GiB written and read back for medium (encoded), plus
+  encoding. Only worth it for re-analysis without re-running the engine
+  (e.g. trying checker versions on a fixed trace), not for speed.
