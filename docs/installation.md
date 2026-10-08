@@ -15,13 +15,10 @@ To run an exported kernel with `tvm-ffi`, follow
 - Linux x86_64, Python 3.12 or 3.13, and pip 25.1 or later.
 - The CUDA Toolkit (`nvcc`, `ptxas`) where GPU kernels are compiled, and a
   compatible NVIDIA driver where they are run.
-- Cargo, **Rust 1.89.0 or later**, and a C linker. The NumSim engine is built
-  once, when the package is built; it does not compile each kernel. A Rust
-  toolchain is therefore needed to build from source and to use the optional
-  codegen backend, but not to run NumSim, Synccheck, or Racecheck with the
-  default interpreter (pending: until the migration completes, the legacy
-  engine compiles each kernel with Cargo at run time, so every installation
-  still needs the toolchain).
+- To build from source: Cargo, **Rust 1.89.0 or later**, and a C linker. The
+  NumSim engine (`numsim_core_py`) is compiled once, when the package is
+  built; it does not compile each kernel, so running NumSim, Synccheck, or
+  Racecheck needs no Rust toolchain.
 
 ## Install Python packages
 
@@ -35,41 +32,39 @@ Install the released package without cloning this repository:
 python -m pip install tirx-harness
 ```
 
-Wheels include the native components. If pip builds from a source
+Wheels include the compiled NumSim engine. If pip builds from a source
 distribution, the build tools below are required.
 
 ### Build from source
 
-Source builds require Git, C/C++ build tools, Python development headers, and
-the Rust toolchain listed above.
+Source builds require Git, a C linker, Python development headers, and the
+Rust toolchain listed above.
 
 ```bash
 git clone https://github.com/mlc-ai/TIRx-harness.git
 cd TIRx-harness
-git submodule update --init thirdparty/tvm-rust-ext
 python -m pip install .
 ```
 
-The `thirdparty/tvm-rust-ext` submodule builds the legacy TIRx frontend. The
-redesigned engine lowers TIRx in Python and does not use it (pending: drop
-the submodule step when the legacy engine and frontend are deleted).
+`pip install .` compiles the NumSim engine, the Rust workspace
+`tirx_harness/src/tirx_harness/numsim/core-rs`, into the Python extension
+`tirx_harness.numsim.v2.numsim_core_py` (`cargo build --release --locked`; the
+first build takes a few minutes).
 
-#### Build the NumSim engine extension
+#### Rebuild the engine in an editable checkout
 
-The redesigned engine is the Rust workspace
-`tirx_harness/src/tirx_harness/numsim/core-rs`. Its Python extension,
-`numsim_core_py`, is built once and serves every kernel. With the
-environment's Python active, build it into the source tree of an editable
-checkout, such as one created with uv below:
+An editable checkout, such as the uv one below, does not run that build step.
+Build the extension into the source tree, and rerun the script after changing
+anything under `core-rs`:
 
 ```bash
 bash tirx_harness/src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh
 ```
 
-Pass `--debug` for a debug build. Set `PY` to choose another Python
-interpreter. Rerun the script after changing anything under `core-rs`.
-`python -m pip install .` does not build this extension yet (pending: build
-`numsim_core_py` in `setup.py` and ship it in wheels).
+Pass `--debug` for a debug build, and set `PY` to choose another Python
+interpreter. To keep a private build next to a shared checkout, pass
+`--out <dir>` with `CARGO_TARGET_DIR=<dir>/target`
+([development loop](development/dev-loop.md)).
 
 #### Optional: install with uv
 
@@ -82,15 +77,11 @@ source .venv/bin/activate
 
 ### Verify the installation
 
-After any of these methods, check imports (this does not run checks or GPU kernels):
+After any of these methods, check imports and that the engine loads (this
+does not run checks or GPU kernels):
 
 ```bash
 python -c "import tvm.tirx, tvm_ffi, tirx_kernels.tirx_lite, tirx_harness; print('Core imports OK')"
-```
-
-If you built the engine extension, check that it loads:
-
-```bash
 python -c "from tirx_harness.numsim.v2.compile import native; native(); print('Engine OK')"
 ```
 

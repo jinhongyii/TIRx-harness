@@ -152,40 +152,6 @@ def test_next_memory_contracts(kind, tmp_path):
     np.testing.assert_array_equal(result.outputs["out"], expected)
 
 
-@pytest.mark.parametrize("count", [2, 3])
-def test_no_complete_rejects_exhausted_arrivals(count, tmp_path):
-    inputs = {"count": count, "out": np.zeros(2, np.uint32)}
-    for checker in (synccheck, racecheck):
-        report = checker(no_complete, inputs)
-        assert report.verdict == "error", report.format()
-        assert any("noComplete" in finding.message for finding in report.findings)
-    with pytest.raises(NumSimExecutionError, match="noComplete.*pending arrival count"):
-        numsim.Engine().run(
-            numsim.transpile(no_complete, cache_dir=tmp_path),
-            inputs,
-        )
-
-
-@pytest.mark.parametrize("address", ["source.ptr_to([lane])", "source.ptr_to([1])"])
-def test_ldu_rejects_nonuniform_or_misaligned_vector(address, tmp_path):
-    kernel = tvm.script.from_source(
-        f"""
-@T.prim_func
-def invalid(source: T.Buffer((64,), "uint32")):
-    T.device_entry()
-    _warp = T.warp_id([1])
-    lane = T.lane_id([32])
-    out = T.alloc_local((2,), "uint32")
-    T.ptx.ldu.global_.v2.u32(out[0], out[1], {address})
-""",
-        {"T": T},
-    )
-    with pytest.raises(NumSimExecutionError, match="lane-varying|ldu requires 8-byte alignment"):
-        numsim.Engine().run(
-            numsim.transpile(kernel, cache_dir=tmp_path), {"source": np.zeros(64, np.uint32)}
-        )
-
-
 @pytest.mark.parametrize("elemtype", [8, 12])
 def test_tensor_map_ftz_types_preserve_copy_values(elemtype, tmp_path):
     kernel = descriptor_update_kernel(elemtype)

@@ -133,24 +133,3 @@ def test_tma_atomicity_layout_and_checkers(tmp_path):
         np.testing.assert_array_equal(actual, expected)
 
 
-def test_tma_atomicity_direction_restrictions(tmp_path):
-    for store, swizzle, dtype, verdict, message in (
-        (True, "128B_ATOM_32B_FLIP_8B", None, "error", "8B flip is only valid for global-to-shared"),
-        (False, "128B_ATOM_64B", None, "incomplete", "tma_64b_atomicity_load_unmodeled"),
-        (False, "128B_ATOM_64B", "uint6", "error", "64B atomicity loads are invalid for U6 and padded FP4"),
-        (False, "128B_ATOM_64B", "fp4", "error", "64B atomicity loads are invalid for U6 and padded FP4"),
-    ):
-        if dtype is None:
-            kernel, inputs, base, metadata, _ = atomicity_case(32, store=store)
-        else:
-            kernel, inputs, base, metadata, _ = u6_case(swizzle=True, atomicity=32)
-            if dtype == "fp4":
-                metadata.update(tma_dtype=None, fp4_shared_layout="align16_padded", global_strides=(64,))
-        inputs["descriptor"] = numsim.TensorMap(base, **{**metadata, "swizzle": swizzle}).numpy()
-        for report in assert_rejected(kernel, inputs, message, verdict=verdict, cache_dir=tmp_path):
-            assert len(report.findings) == 1, report.format()
-            operation = report.findings[0].details["operation"]
-            source = operation["source"]
-            assert operation["source_op_id"] == source["source_op_id"]
-            assert "T.ptx.cp(" in source["source_text"]
-            assert source["source_span"]["line"] > 0

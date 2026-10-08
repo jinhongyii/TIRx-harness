@@ -4,8 +4,6 @@ import numpy as np
 import pytest
 
 from tirx_harness import numsim
-from tirx_harness.numsim.transpiler.frontend import analyze
-from tirx_harness.numsim.transpiler.artifact_template import emit_rust_module
 from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 
@@ -258,13 +256,6 @@ def wider_dynamic_view_used_only_for_address(
     output[0] = T.cuda.cvta_generic_to_shared(wide.ptr_to([0]))
 
 
-def test_address_storage_has_no_program_visible_pointer_sidecars():
-    source = emit_rust_module(analyze(integer_address_alias), integer_address_alias)
-    assert "PhysicalPtrSlot" not in source
-    assert "MappedSharedAddressSlot" not in source
-    assert "RuntimePointerTokenRegistry" not in source
-
-
 def test_integer_address_aliases_resolve_to_the_same_runtime_bytes(tmp_path):
     source = np.array([0x12345678], dtype=np.uint32)
 
@@ -304,21 +295,6 @@ def test_integer_address_space_checks_ignore_inactive_lane_values(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-def test_typed_pointer_load_rejects_active_lane_from_another_space(tmp_path):
-    module = numsim.transpile(integer_address_mixed_spaces_active_typed_load, cache_dir=tmp_path)
-    with pytest.raises(
-        numsim.NumSimExecutionError,
-        match="resolved address.*does not match PTX state space global",
-    ):
-        numsim.Engine().run(
-            module,
-            {
-                "source": np.arange(32, dtype=np.uint32),
-                "output": np.zeros(32, dtype=np.uint32),
-            },
-        )
-
-
 def test_predicated_store_resolves_only_lanes_that_access_memory(tmp_path):
     result = numsim.Engine().run(
         numsim.transpile(
@@ -331,12 +307,6 @@ def test_predicated_store_resolves_only_lanes_that_access_memory(tmp_path):
     expected = np.zeros(32, dtype=np.uint32)
     expected[0::2] = np.arange(1, 33, 2, dtype=np.uint32)
     np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_pointer_arithmetic_uses_ordinary_integer_storage():
-    source = emit_rust_module(analyze(integer_address_arithmetic), integer_address_arithmetic)
-    assert "PhysicalPtrSlot" not in source
-    assert "physical_pointer_slot" not in source
 
 
 def test_address_derived_integer_is_non_null(tmp_path):
@@ -370,12 +340,6 @@ def test_integer_handle_reinterpret_round_trips_bits_without_resolution(tmp_path
     np.testing.assert_array_equal(
         result.outputs["output"], np.array([0x1000], dtype=np.uint64)
     )
-
-
-def test_loops_and_multiple_stores_do_not_create_pointer_sidecars():
-    source = emit_rust_module(analyze(loop_and_multiple_stores), loop_and_multiple_stores)
-    assert "PhysicalPtrSlot" not in source
-    assert "RuntimePointerTokenRegistry" not in source
 
 
 def test_leading_null_initializer_does_not_poison_integer_address_resolution(tmp_path):

@@ -8,7 +8,6 @@ from tvm.tirx import Stmt
 from tvm_ffi import structural_walk
 
 from tirx_harness import numsim
-from tests.numsim.support.manifest import emitted_calls
 
 _PZO_CALL_IDS = {
     "f16": "tirx.ptx.cvt_pzo_scalar_f32",
@@ -87,21 +86,6 @@ def kernel():
     structural_walk(function.body, ((Expr, Stmt), visit))
     assert len(calls) == 1
     return function, calls[0]
-
-
-def test_all_forty_pzo_forms_resolve_to_distinct_reviewed_semantics():
-    seen = set()
-    for destination in ("f16", "bf16", "f16x2", "bf16x2", "tf32"):
-        for rounding in ("rn", "rz"):
-            for relu in (False, True):
-                for satfinite in (False, True):
-                    spelling = _pzo_spelling(destination, rounding, relu, satfinite)
-                    function, call = _decoded_call(spelling, destination)
-                    assert call.op.name == _PZO_CALL_IDS[destination]
-                    (emitted,) = emitted_calls(function, str(call.op.name))
-                    assert emitted.head == _pzo_head(destination, rounding, relu, satfinite)
-                    seen.add(emitted.head)
-    assert len(seen) == 40
 
 
 @T.prim_func

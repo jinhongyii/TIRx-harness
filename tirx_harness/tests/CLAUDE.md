@@ -5,7 +5,6 @@
 A fresh worktree first needs the Rust frontend dependency:
 
 ```bash
-git submodule update --init thirdparty/tvm-rust-ext  # repo root
 ```
 
 Tests load canonical kernels from the environment's installed `tirx-kernels`

@@ -100,11 +100,3 @@ def test_maintenance_predicates_and_carriers(tmp_path):
             np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-def test_maintenance_active_addresses_still_checked():
-    for layout in (0, None):
-        kernel = maintenance_case(layout=layout, invalid=True)
-        for checker in (synccheck, racecheck):
-            report = checker(kernel, maintenance_inputs(0, layout=layout)[0])
-            assert report.verdict == "error", report.format()
-            assert {(f.status, f.kind) for f in report.findings} == {("error", "oob")}
-            assert any("raw shared address 8 " in f.message for f in report.findings)

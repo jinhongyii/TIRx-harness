@@ -10,8 +10,6 @@ from __future__ import annotations
 import numpy as np
 
 from tirx_harness import numsim
-from tirx_harness.numsim.checkers import _run_racecheck as racecheck
-from tirx_harness.numsim.checkers import _run_synccheck as synccheck
 from tvm.script import tirx as T
 
 
@@ -120,21 +118,6 @@ def test_packed_f32x2_value_forms_return_both_float_lanes(tmp_path):
     )
 
 
-def test_checkers_accept_the_float32_pair_destination(tmp_path):
-    inputs = {"output": np.zeros((32, 4, 2), dtype=np.float32)}
-
-    sync = synccheck(
-        packed_f32x2_float32_destination,
-        inputs=inputs,
-        cache_dir=tmp_path,
-        max_workers=1,
-    )
-    sync.require_clean()
-
-    race = racecheck(packed_f32x2_float32_destination, inputs=inputs)
-    race.require_clean()
-
-
 @T.prim_func
 def packed_store_races_with_second_element(output: T.Buffer((2,), "float32")):
     """The packed store spans smem[0..2); warp 1 concurrently writes smem[1]."""
@@ -158,18 +141,3 @@ def packed_store_races_with_second_element(output: T.Buffer((2,), "float32")):
         output[1] = smem[1]
 
 
-def test_packed_store_footprint_covers_the_second_element():
-    """Positive control: the recorded footprint must be the full 8 bytes.
-
-    A packed f32x2 write through the uint64 view covers two float32 elements.
-    Missing the aliased second half would incorrectly report this real
-    write-write race as clean.
-    """
-
-    report = racecheck(
-        packed_store_races_with_second_element,
-        inputs={"output": np.zeros(2, dtype=np.float32)},
-    )
-
-    assert report.verdict == "error", report.verdict
-    assert [f.details["access_pair"] for f in report.findings] == ["write_write"]

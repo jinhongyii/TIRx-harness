@@ -2,7 +2,9 @@
  "case": "flashinfer_rmsnorm",
  "diagnostics": [
   {
-   "anchors": [],
+   "anchors": [
+    "tirx_kernels/ported/flashinfer/norm/rmsnorm.py:205:1-205:34"
+   ],
    "bytes": {
     "shared": "256-2048"
    },

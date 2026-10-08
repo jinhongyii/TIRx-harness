@@ -2,7 +2,9 @@
  "case": "flashinfer_rmsnorm_fp4quant",
  "diagnostics": [
   {
-   "anchors": [],
+   "anchors": [
+    "tirx_kernels/ported/flashinfer/norm/rmsnorm_fp4quant.py:800:1-800:38"
+   ],
    "bytes": {
     "shared": "128-2048"
    },

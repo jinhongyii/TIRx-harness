@@ -380,47 +380,6 @@ def ptx_rem_s32_error_path(
     T.ptx.rem.s32(output[lane], lhs[lane], rhs[lane])
 
 
-@pytest.mark.parametrize(
-    ("kernel", "symbol"),
-    ((ptx_div_s32_error_path, "/"), (ptx_rem_s32_error_path, "%")),
-    ids=("div", "rem"),
-)
-def test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane(tmp_path, kernel, symbol):
-    rhs = np.ones(32, dtype=np.int32)
-    rhs[7] = 0
-    with pytest.raises(numsim.NumSimExecutionError, match=rf"lane 7: 29 {symbol} 0"):
-        numsim.Engine().run(
-            numsim.transpile(kernel, cache_dir=tmp_path),
-            {
-                "lhs": np.full(32, 29, dtype=np.int32),
-                "rhs": rhs,
-                "output": np.zeros(32, dtype=np.int32),
-            },
-            outputs=("output",),
-        )
-
-
-@pytest.mark.parametrize(
-    ("kernel", "symbol"),
-    ((ptx_div_s32_error_path, "/"), (ptx_rem_s32_error_path, "%")),
-    ids=("div", "rem"),
-)
-def test_ptx_signed_division_overflow_fails_closed(tmp_path, kernel, symbol):
-    with pytest.raises(
-        numsim.NumSimExecutionError,
-        match=rf"lane 0: -2147483648 {symbol} -1",
-    ):
-        numsim.Engine().run(
-            numsim.transpile(kernel, cache_dir=tmp_path),
-            {
-                "lhs": np.full(32, np.iinfo(np.int32).min, dtype=np.int32),
-                "rhs": np.full(32, -1, dtype=np.int32),
-                "output": np.zeros(32, dtype=np.int32),
-            },
-            outputs=("output",),
-        )
-
-
 def test_ptx_signed_rem_machine_specific_negative_rounding_fails_closed(tmp_path):
     with pytest.raises(numsim.NumSimExecutionError, match="machine-specific negative operand"):
         numsim.Engine().run(

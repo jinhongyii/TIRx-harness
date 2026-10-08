@@ -7,7 +7,6 @@ from tvm.script import tirx as T
 
 from tests.numsim.runtime.test_tcgen05_ti16 import ti16_kernel
 from tests.numsim.support.execution import assert_rejected, run_checked
-from tirx_harness.numsim.transpiler.ptx_dialect import decode_ptx_call
 
 
 def block_tmem_case(
@@ -103,51 +102,6 @@ def block_tmem_case(
         columns = n // 2 if m == 128 else n
         expected[m // 2 + 1, :columns] = seed[m // 2 + 1, :columns]
     return kernel, args, expected
-
-
-@pytest.mark.parametrize(
-    "cta_group,a_format,b_format",
-    [(1, 0, 1), (2, 1, 3), (1, 3, 4), (2, 4, 5), (1, 5, 0)],
-)
-def test_block_scaled_tmem_a(cta_group, a_format, b_format, tmp_path):
-    kernel, args, expected = block_tmem_case(cta_group, a_format, b_format)
-    actual = run_checked(kernel, args, cache_dir=tmp_path).outputs["out"]
-    np.testing.assert_array_equal(actual.view(np.float32), expected)
-
-    if (cta_group, a_format, b_format) != (1, 0, 1):
-        return
-    # Keep the exact K-major control above. Bit 15 alone does not establish
-    # a transposed TMEM layout; reserved bit 6 remains an error even with it.
-    for extra_bits, verdict, message in (
-        (1 << 15, "error", "TMEM A must be K-major"),
-        (1 << 6, "error", "valid K/reserved bits"),
-        ((1 << 15) | (1 << 6), "error", "valid K/reserved bits"),
-    ):
-
-        def replace_descriptor(node):
-            if type(node).__name__ != "Call" or not str(node.op.name).startswith(
-                "tirx.ptx.tcgen05_mma"
-            ):
-                return node
-            descriptor = decode_ptx_call(node).scalar_operand("idesc")
-            operands = [
-                T.uint32(int(arg.value) | extra_bits) if arg.same_as(descriptor) else arg
-                for arg in node.args
-            ]
-            return type(node)(
-                node.op,
-                operands,
-                attrs=node.attrs,
-                ty_args=node.ty_args,
-                span=node.span,
-                ret_ty=node.ty,
-            )
-
-        changed = kernel.with_body(
-            structural_map(kernel.body, replace_descriptor)
-        )
-        for report in assert_rejected(changed, args, message, verdict=verdict, cache_dir=tmp_path):
-            assert "test_tcgen05_ti16.py:" in report.format()
 
 
 def fp4_tmem_case(tmem_a):

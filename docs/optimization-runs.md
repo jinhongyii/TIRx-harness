@@ -30,7 +30,6 @@ into the Python environment used to launch setup:
 ```bash
 git clone https://github.com/mlc-ai/TIRx-harness.git
 cd TIRx-harness
-git submodule update --init thirdparty/tvm-rust-ext
 python -m pip install -r evolution/preparation/requirements.txt
 ```
 

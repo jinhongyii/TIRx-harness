@@ -1898,3 +1898,54 @@ fn clc_claims_non_resident_tasks_under_a_subset() {
     completed(&o);
     assert_eq!(u32s(&o, "out"), vec![1, 1, 1, 1]);
 }
+
+/// Hash of every access and sync callback (word history on).
+#[derive(Default)]
+struct ViewsHash(u64, u64);
+impl Observer for ViewsHash {
+    fn wants_word_history(&self) -> bool {
+        true
+    }
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.0, format!("{:?}{:?}{:?}{:?}{:?}{:?}{}", a.actor, a.site, a.alloc, a.kind, a.proxy, a.spans, a.operand)).hash(&mut h);
+        self.0 = h.finish();
+        self.1 += 1;
+    }
+    fn sync(&mut self, e: &SyncEvent) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.0, format!("{e:?}")).hash(&mut h);
+        self.0 = h.finish();
+        self.1 += 1;
+    }
+}
+
+/// W2/W4 MMA views: tcgen05.mma operand I/O through borrowed views gives
+/// the same status, outputs, diagnostics and access/sync stream as the
+/// per-piece callbacks, for every scenario (MMA forms included), every
+/// validity policy, at 1 and 16 workers.
+#[test]
+fn mma_views_match_the_callback_path() {
+    let mut all = scenarios::all();
+    all.push(scenarios::tcgen_mma_f16(
+        scenarios::MmaSpec { accumulate: true, init_d: None, two_issuers: false, collectors: &[], sparse: false },
+        &mma_operands().0,
+        &mma_operands().1,
+    ));
+    for s in &all {
+        for policy in [ValidityPolicy::Error, ValidityPolicy::Allow, ValidityPolicy::ZeroAndReport] {
+            for workers in [1usize, 16] {
+                let run_with = |views: bool| {
+                    let cfg = RunConfig { workers, validity: policy, mma_views: views, ..s.config.clone() };
+                    let mut h = ViewsHash::default();
+                    let o = sched::run_with_config(&s.module, &s.inputs, &mut h, &cfg).unwrap();
+                    let plain = sched::run_with_config(&s.module, &s.inputs, &mut numsim_core::observe::NoopObserver, &cfg).unwrap();
+                    (format!("{:?}", o.status), format!("{:?}", o.outputs), format!("{:?}", o.diagnostics), h.0, h.1, format!("{:?}{:?}", plain.status, plain.outputs))
+                };
+                assert_eq!(run_with(true), run_with(false), "{} {policy:?} {workers} workers", s.name);
+            }
+        }
+    }
+}

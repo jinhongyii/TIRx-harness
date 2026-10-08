@@ -4,9 +4,7 @@ import numpy as np
 import pytest
 
 from tests.numsim.runtime.test_tile_codegen import _typed_tma_reduce_kernel
-from tests.numsim.support.manifest import call_op_names
 from tirx_harness import numsim
-from tirx_harness.numsim.checkers import _run_racecheck as racecheck
 from tvm.script import tirx as T
 
 
@@ -166,39 +164,6 @@ def bulk_reduce_relaxed_gpu_f32_analysis_probe(destination: T.Buffer((4,), "floa
         )
 
 
-def test_bulk_reduce_former_rejects_preserve_type_and_scope(tmp_path):
-    # Original compile-only probes: shared data is intentionally uninitialized.
-    for kernel, dtype, scope in (
-        (bulk_reduce_add_u32_analysis_probe, "U32", "Sys"),
-        (bulk_reduce_relaxed_gpu_f32_analysis_probe, "F32", "Gpu"),
-    ):
-        module = numsim.transpile(kernel, cache_dir=tmp_path)
-        assert (
-            f"BulkS2gReduce<v2::reg::variant::{dtype}, v2::async_copy::variant::ReduceAdd, "
-            f"v2::mem::variant::{scope}>"
-        ) in module.rust_source
-
-
-def test_bulk_reduce_is_atomic_captures_source_and_publishes_only_at_full_wait(tmp_path):
-    source = np.arange(1, 9, dtype=np.float32)
-    destination = np.full(4, np.float32(10), dtype=np.float32)
-    initial_destination = destination.copy()
-    module = numsim.transpile(bulk_reduce_add_f32_read_then_full_wait, cache_dir=tmp_path)
-
-    result = numsim.Engine().run(
-        module,
-        {"source": source, "destination": destination, "observed": np.zeros(2, np.float32)},
-    )
-
-    np.testing.assert_array_equal(
-        result.outputs["destination"], initial_destination + source[:4] + source[4:]
-    )
-    np.testing.assert_array_equal(result.outputs["observed"], np.array([10, 16], np.float32))
-    assert result.verdict == "clean"
-    assert result.diagnostics == []
-    assert "tirx.ptx.cp_reduce_async_bulk_s2g" in call_op_names(module.spec.kernels[0])
-
-
 def test_bulk_reduce_preserves_f32_subnormals(tmp_path):
     smallest_normal = np.float32(np.finfo(np.float32).tiny)
     smallest_subnormal = np.nextafter(np.float32(0), np.float32(1), dtype=np.float32)
@@ -242,20 +207,6 @@ def test_bulk_reduce_is_atomic_across_ctas_without_lost_updates(tmp_path):
     np.testing.assert_array_equal(result.outputs["destination"], expected)
     assert result.verdict == "clean"
     assert result.diagnostics == []
-
-
-def test_bulk_reduce_partial_overlap_is_elementwise_atomic(tmp_path):
-    report = racecheck(
-        bulk_reduce_add_f32_partially_overlapping_ctas,
-        inputs={"destination": np.zeros(8, dtype=np.float32)},
-        cache_dir=tmp_path,
-        max_workers=2,
-    )
-
-    assert report.native_payload["execution_error"] is None, report.native_payload
-    assert report.native_payload.get("incomplete", []) == [], report.native_payload
-    assert report.verdict == "clean", report.format()
-    assert report.findings == []
 
 
 def test_bulk_reduce_reads_destination_at_full_completion(tmp_path):

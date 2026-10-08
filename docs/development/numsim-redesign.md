@@ -76,7 +76,7 @@ pub struct Program {
 
 - 原计划：`interp` 与 `codegen`（`Program` → Rust 打印器，每条 `Instr` 调用同一 handler，rustc 一次）并存，在 corpus 上按 NumSim / racecheck / synccheck 三模式对比后删掉输家。
 - 结论（`backend-comparison.md`）：codegen 在任何 case 上都不比解释器快，核心时间中位数为解释器的 0.87–0.94x，每次调用多约 117 ms，冷构建最长达数小时；解释器比旧引擎快 2.3–3.0x。
-- 已执行：`numsim-core/src/codegen/`、`Backend` 枚举、`NUMSIM_V2_BACKEND`、`Engine(backend=...)`、codegen 等价测试与 bench 均已删除。解释器是唯一执行器，每条指令的语义只在 `interp::handlers` 中。
+- 已执行：`numsim-core/src/codegen/`、`Backend` 枚举、`NUMSIM_BACKEND`、`Engine(backend=...)`、codegen 等价测试与 bench 均已删除。解释器是唯一执行器，每条指令的语义只在 `interp::handlers` 中。
 
 **调度器（`sched/`，分区协议，W6 评审通过，2026-10-08）。**
 

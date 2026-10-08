@@ -68,16 +68,6 @@ def test_explicit_uint8_backing_supplies_two_float4_values_per_byte(four_float4_
     np.testing.assert_array_equal(result.outputs["output"], [1.0, 2.0, 3.0, 4.0])
 
 
-def test_direct_one_byte_per_value_float4_array_is_rejected(four_float4_module):
-    unpacked = np.array([1.0, 2.0, 3.0, 4.0], dtype=ml_dtypes.float4_e2m1fn)
-
-    with pytest.raises(numsim.NumSimExecutionError, match="contiguous uint8 array"):
-        numsim.Engine().run(
-            four_float4_module,
-            {"source": unpacked, "output": np.zeros(4, dtype=np.float32)},
-        )
-
-
 def test_odd_float4_logical_count_uses_a_ceiling_byte_span(tmp_path):
     packed = np.array([0x42, 0xF5], dtype=np.uint8)
     output = np.zeros(3, dtype=np.float32)

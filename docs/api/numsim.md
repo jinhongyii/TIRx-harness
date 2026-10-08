@@ -7,9 +7,7 @@ outputs with an independent reference. See the [runnable example and
 supported-model limitations](../components/tools.md#numsim).
 
 The signatures below are those of the redesigned engine, which lives in
-`tirx_harness.numsim.v2` until the migration completes (pending: the public
-`tirx_harness.numsim` names switch to these objects when the legacy engine is
-deleted). Import them through `tirx_harness.numsim` as shown in the examples.
+`tirx_harness.numsim.v2` until the migration completes. Import them through `tirx_harness.numsim` as shown in the examples.
 
 ## Compile and execute
 
@@ -44,7 +42,7 @@ or loading took.
 | Parameter | Meaning |
 | --- | --- |
 | `max_workers=1` | Threads that run independent clusters in parallel. Results and checker findings do not depend on it. `"auto"` currently selects one thread (pending: `"auto"` should use the detected CPU count). |
-| `seed=None` | Scheduler seed for warp rotation and asynchronous-completion timing. `None` reads `NUMSIM_V2_SEED`, default `0`. A fixed module, inputs, and seed always give the same result. |
+| `seed=None` | Scheduler seed for warp rotation and asynchronous-completion timing. `None` reads `NUMSIM_SEED`, default `0`. A fixed module, inputs, and seed always give the same result. |
 | `native_loop_iteration_budget=None` | Maximum iterations of one loop instance per warp before the run stops as `incomplete`. `None` uses the engine default, 2^24. |
 | `native_loop_reschedule_quantum=None` | Maximum instructions a warp runs before the scheduler moves to the next warp. `None` uses the engine default, 256. |
 
@@ -124,11 +122,10 @@ precedence.
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `NUMSIM_CACHE_DIR` | Cache root. Lowered modules are stored under `v2-modules/`. Delete the directory to force re-lowering. | `~/.cache/tirx-harness/numsim` |
-| `NUMSIM_V2_SEED` | Default scheduler seed. | `0` |
-| `NUMSIM_V2_NO_CACHE` | `1` disables the module cache. | unset |
+| `NUMSIM_SEED` | Default scheduler seed. | `0` |
+| `NUMSIM_NO_CACHE` | `1` disables the module cache. | unset |
 
-(pending: the `NUMSIM_V2_` prefix may be shortened when the legacy engine is
-deleted.)
+The former `NUMSIM_V2_` names are still accepted as aliases for one release.
 
 ## Exceptions
 

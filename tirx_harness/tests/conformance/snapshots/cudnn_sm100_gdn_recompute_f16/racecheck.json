@@ -9,7 +9,9 @@
   {
    "diagnostics": [
     {
-     "anchors": [],
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_recompute_f16.py:914:1-914:27"
+     ],
      "bytes": {
       "shared": "11264-19456,27648-35840"
      },

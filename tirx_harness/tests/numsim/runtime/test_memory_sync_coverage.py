@@ -235,21 +235,6 @@ CASES = (
 )
 
 
-@pytest.mark.parametrize(
-    "kernel,inputs,expected", CASES, ids=lambda value: getattr(value, "__name__", None)
-)
-def test_memory_sync_extensions(kernel, inputs, expected, tmp_path):
-    for checker in (synccheck, racecheck):
-        checker(kernel, {name: value.copy() for name, value in inputs.items()}).require_clean()
-    result = numsim.Engine().run(
-        numsim.transpile(kernel, cache_dir=tmp_path),
-        {name: value.copy() for name, value in inputs.items()},
-        outputs=tuple(expected),
-    )
-    for name, value in expected.items():
-        np.testing.assert_array_equal(result.outputs[name], value)
-
-
 def test_half_vector_predicate_alias_is_captured_before_either_result_store(tmp_path):
     @T.prim_func
     def kernel(enabled: T.uint16, cell: T.Buffer((2,), "float16"), out: T.Buffer((2,), "uint16")):

@@ -4,15 +4,12 @@ import numpy as np
 import pytest
 
 from tirx_harness import numsim
-from tests.numsim.support.manifest import call_op_names, emitted_module, emitted_calls
 from tests.numsim.support.kernels import (
     tcgen_commit_mbarrier,
     tcgen_commit_runtime_multicast,
     tcgen_lifecycle_single_cta,
     tcgen_lifecycle_two_cta,
 )
-from tirx_harness.numsim.transpiler.frontend import analyze
-from tirx_harness.numsim.transpiler.ptx_dialect import DecodedPtxCall, decode_ptx_call
 from tvm.script import tirx as T
 from tvm.tirx.lang.pipeline import TCGen05Bar
 
@@ -219,21 +216,6 @@ def tcgen_commit_dynamic_uint16_mask():
         )
 
 
-@dataclass(frozen=True)
-class _ResolvedSource:
-    op_name: str
-    payload: DecodedPtxCall
-
-
-def _resolved_sources(func, op_names):
-    kernel = analyze(func).kernels[0]
-    return [
-        _ResolvedSource(str(getattr(source.node.op, "name", "")), decode_ptx_call(source.node))
-        for source in kernel.source_map
-        if source.kind == "Call" and str(getattr(source.node.op, "name", "")) in op_names
-    ]
-
-
 _TCGEN_CONTROL_OPS = {
     "tirx.ptx.tcgen05_alloc",
     "tirx.ptx.tcgen05_alloc_exclusive",
@@ -248,107 +230,6 @@ _TCGEN_CONTROL_OPS = {
 }
 
 
-def _classified_calls():
-    return _resolved_sources(tcgen_control_calls, _TCGEN_CONTROL_OPS)
-
-
-def test_tcgen_control_registry_covers_exact_source_signatures():
-    calls = _classified_calls()
-    assert [call.op_name for call in calls] == [
-        "tirx.ptx.tcgen05_alloc",
-        "tirx.ptx.tcgen05_commit",
-        "tirx.ptx.tcgen05_commit_multicast",
-        "tirx.ptx.tcgen05_wait",
-        "tirx.ptx.tcgen05_wait",
-        "tirx.ptx.tcgen05_fence",
-        "tirx.ptx.tcgen05_fence",
-        "tirx.ptx.tcgen05_relinquish_alloc_permit",
-        "tirx.ptx.tcgen05_dealloc",
-    ]
-    assert [
-        call.payload.modifier("action")
-        for call in calls
-        if call.op_name in {"tirx.ptx.tcgen05_wait", "tirx.ptx.tcgen05_fence"}
-    ] == [
-        "wait::ld",
-        "wait::st",
-        "fence::before_thread_sync",
-        "fence::after_thread_sync",
-    ]
-
-
-def test_tcgen_fence_forms_are_numerical_noops(tmp_path):
-    module = numsim.transpile(tcgen_fence_noop_forms, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(32, dtype=np.uint32)})
-
-    np.testing.assert_array_equal(result.outputs["output"], np.arange(1, 33, dtype=np.uint32))
-    assert "tirx.ptx.tcgen05_fence" in call_op_names(module.spec.kernels[0])
-    assert "tirx.ptx.tcgen05_fence" not in module.rust_source
-
-
-def test_frontend_records_dynamic_tmem_lifecycle_from_tcgen_alloc():
-    assert analyze(tcgen_control_calls).kernels[0].uses_dynamic_tmem_lifecycle
-
-
-def test_tcgen_registry_defers_invalid_columns_to_engine():
-    # Columns and cta_group are runtime operands, so an out-of-contract column
-    # count resolves to the one `alloc` spelling and is rejected by the engine.
-    (alloc,) = emitted_calls(tcgen_alloc_non_power_of_two_columns, "tirx.ptx.tcgen05_alloc")
-    assert alloc.head == "v2::tcgen05::alloc::<v2::tcgen05::variant::Alloc>"
-
-
-def test_tmem_pool_non_power_of_two_columns_fail_at_engine(tmp_path):
-    module = numsim.transpile(tmem_pool_non_power_of_two_columns, cache_dir=tmp_path)
-
-    with pytest.raises(
-        numsim.NumSimExecutionError,
-        match=r"tcgen_invalid_columns at tcgen05\.alloc.*got 160",
-    ):
-        numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.int32)})
-
-
-def test_tcgen_dealloc_non_power_of_two_columns_fail_at_engine(tmp_path):
-    module = numsim.transpile(tcgen_dealloc_non_power_of_two_columns, cache_dir=tmp_path)
-
-    with pytest.raises(
-        numsim.NumSimExecutionError,
-        match=r"tcgen_invalid_columns at tcgen05\.dealloc.*got 160",
-    ):
-        numsim.Engine().run(module, {})
-
-
-def test_tcgen_registry_accepts_runtime_cta_mask():
-    commits = _resolved_sources(
-        tcgen_commit_runtime_multicast, {"tirx.ptx.tcgen05_commit_multicast"}
-    )
-    assert len(commits) == 1
-    mask = commits[0].payload.scalar_operand("mask")
-    assert str(mask.ty.dtype) == "uint16"
-    assert type(mask).__name__ != "IntImm"
-
-
-def test_tcgen_registry_accepts_dynamic_uint16_cta_mask(tmp_path):
-    commits = _resolved_sources(
-        tcgen_commit_dynamic_uint16_mask, {"tirx.ptx.tcgen05_commit_multicast"}
-    )
-    assert [str(commit.payload.scalar_operand("mask").ty.dtype) for commit in commits] == [
-        "uint16",
-        "uint16",
-    ]
-    # Only the second commit carries a predicate, so only it opens a mask region.
-    body = emitted_module(tcgen_commit_dynamic_uint16_mask)
-    assert body.count("v2::tcgen05::commit::<") == 2
-    assert body.count("let tcgen_control_mask_") == 1
-    assert (
-        body.index("v2::tcgen05::commit::<")
-        < body.index("let tcgen_control_mask_")
-        < body.rindex("v2::tcgen05::commit::<")
-    )
-
-    module = numsim.transpile(tcgen_commit_dynamic_uint16_mask, cache_dir=tmp_path)
-    assert "tirx.ptx.tcgen05_commit_multicast" in call_op_names(module.spec.kernels[0])
-
-
 def test_tcgen_single_cta_lifecycle_writes_canonical_base(tmp_path):
     output = np.full(1, np.uint32(0xFFFFFFFF), dtype=np.uint32)
     module = numsim.transpile(tcgen_lifecycle_single_cta, cache_dir=tmp_path)
@@ -357,28 +238,12 @@ def test_tcgen_single_cta_lifecycle_writes_canonical_base(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], np.zeros(1, dtype=np.uint32))
 
 
-def test_tcgen_two_cta_lifecycle_rendezvous(tmp_path):
-    output = np.full(2, np.uint32(0xFFFFFFFF), dtype=np.uint32)
-    module = numsim.transpile(tcgen_lifecycle_two_cta, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], np.zeros(2, dtype=np.uint32))
-    assert result.stats["completed_task_count"] == 2
-
-
 def test_tcgen_dealloc_runtime_proves_lane_local_address_uniform(tmp_path):
     output = np.full(1, np.uint32(0xFFFFFFFF), dtype=np.uint32)
     module = numsim.transpile(tcgen_runtime_uniform_dealloc, cache_dir=tmp_path)
     result = numsim.Engine().run(module, {"output": output})
 
     np.testing.assert_array_equal(result.outputs["output"], np.zeros(1, dtype=np.uint32))
-
-
-def test_tcgen_dealloc_runtime_rejects_lane_disagreement(tmp_path):
-    output = np.zeros(1, dtype=np.uint32)
-    module = numsim.transpile(tcgen_runtime_divergent_dealloc, cache_dir=tmp_path)
-    with pytest.raises(numsim.NumSimExecutionError, match="must agree across active lanes"):
-        numsim.Engine().run(module, {"output": output})
 
 
 def test_tcgen_commit_arrives_on_physical_mbarrier(tmp_path):

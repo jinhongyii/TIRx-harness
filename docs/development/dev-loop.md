@@ -66,8 +66,7 @@ $PY -m pytest -q -n 8 tests/numsim/v2
 ```
 
 The extension lands at `src/tirx_harness/numsim/v2/numsim_core_py.abi3.so`
-(git-ignored). Without it the v2 tests skip and `NUMSIM_IMPL=v2` conformance
-runs skip with "numsim_core_py is not built". The hand-built Module fixture
+(git-ignored). Without it NumSim raises "numsim_core_py is not built". The hand-built Module fixture
 `tests/numsim/v2/fixtures/vector_add.module.json` is generated from
 `ProgramBuilder`; refresh it after a `program.rs` change with
 `UPDATE_FIXTURES=1 cargo test -p numsim-py`.
@@ -99,13 +98,13 @@ gain, so it is not used.
 generated case by default (5 s debug). Set `SYNCCHECK_EQUIV_FULL=1` to check
 every case (45 s debug, 13 s release) after changing a synccheck reduction rule.
 
-The `NUMSIM_V2_*` prefix is temporary: these variables become `NUMSIM_*`
+The `NUMSIM_*` prefix is temporary: these variables become `NUMSIM_*`
 when the legacy engine is deleted (redesign step 5).
 
 v2 reads its environment in one place, `v2/options.py`:
 `NUMSIM_CACHE_DIR` (modules are cached under `<root>/v2-modules/`, keyed by
-TIRx source, format version and the lowering sources), `NUMSIM_V2_SEED`,
-`NUMSIM_V2_NO_CACHE=1`. There is one executor, the interpreter; the codegen
+TIRx source, format version and the lowering sources), `NUMSIM_SEED`,
+`NUMSIM_NO_CACHE=1`. There is one executor, the interpreter; the codegen
 backend was measured and deleted (`backend-comparison.md`).
 
 Python surface (`from tirx_harness.numsim import v2`): `transpile`,
@@ -200,43 +199,34 @@ engine run serves all phases of a module, so phase payloads repeat its
 
 `tests/conformance/` replays every canonical corpus case
 (`tests/numsim/corpus/canonical_cases.py`) in three modes and compares the
-normalized result with `tests/conformance/snapshots/<case>/<mode>.json`. These
-snapshots are the oracle for the migration; see
-`tirx_harness/tests/conformance/README.md` for what they contain.
+normalized result with `tests/conformance/snapshots/<case>/<mode>.json`, the
+NumSim oracle; see `tirx_harness/tests/conformance/README.md` for what a
+snapshot contains.
 
 ```bash
-# legacy engine (default)
 $PY -m pytest -q -n 32 --dist=worksteal tests/conformance
-# new engine; cases skip while numsim-core bodies are unimplemented
-NUMSIM_IMPL=v2 $PY -m pytest -q -n 32 --dist=worksteal tests/conformance
-# one kernel, one mode
-$PY -m pytest -q -n 2 tests/conformance -k "rmsnorm and racecheck"
+$PY -m pytest -q -n 2 tests/conformance -k "rmsnorm and racecheck"   # one kernel, one mode
+$PY ../scripts/numsim-v2/status.py --run -n 16                         # per-mode matrix
 ```
 
-A mismatch prints a unified diff of the normalized snapshot. For non-legacy
-implementations, diagnostics legacy recorded without any source anchor are
-compared without anchors (`snapshot.relax_unanchored`); kinds, statuses and
-byte footprints are still exact. The per-case v2 status lives in
-`docs/development/v2-conformance-status.md`.
+A mismatch prints a unified diff of the normalized snapshot.
 
 ### Updating snapshots
 
-Only regenerate from the legacy engine, and only for an intentional change of
-legacy behavior (or a corpus change such as a new canonical case):
+Regenerate only for an intentional, documented behaviour change (or a corpus
+change such as a new canonical case):
 
 ```bash
-NUMSIM_IMPL=legacy $PY -m pytest -q -n 32 --dist=worksteal tests/conformance --update-snapshots
+$PY -m pytest -q -n 32 --dist=worksteal tests/conformance --update-snapshots
 git diff --stat tests/conformance/snapshots
 ```
 
-Review the diff and explain each changed case in the commit message, citing
-the delta row id that justifies it (CI: `check_snapshot_deltas.py`). Never
-update snapshots from `NUMSIM_IMPL=v2` to make the new engine pass while the
-legacy engine exists; a ruling that legacy was wrong goes in a
-`<mode>.delta.json`. After the legacy engine is deleted, v2 is the oracle and
-`--update-snapshots` regenerates from it (the deletion commit folds the delta
-files with `scripts/numsim-v2/fold_snapshot_deltas.py`); see the conformance
-README, "Snapshot policy after the legacy engine is deleted".
+Review the diff. The commit message explains each changed case and cites the
+behaviour-delta row that justifies it, file-qualified (`racecheck B7`,
+`numsim H5`, `sync S1`); a regeneration that changes no verdict or finding
+carries `Snapshot-Regen: schema <reason>` instead. CI checks this
+(`scripts/numsim-v2/check_snapshot_deltas.py`). A changed snapshot without a
+row is a regression.
 
 ## CI
 

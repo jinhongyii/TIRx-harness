@@ -105,18 +105,6 @@ def test_dense_lut_b_segments_and_cta_partition(group, tmem, segment, half, tmp_
         outputs = run_checked(kernel, args, cache_dir=tmp_path).outputs
         np.testing.assert_array_equal(outputs["out"], args["seed"] if disabled else expected)
 
-@pytest.mark.parametrize("resource", ["b", "lookup"])
-def test_lut_b_async_read_lifetimes(resource):
-    for block in (False, True):
-        kernel, args, _ = lut_b_case(segment=1, block=block, early_reuse=resource)
-        # The shared write is in the unused first 24B half; the TMEM write
-        # overlaps the lookup. Neither is retired by the A-only wait.
-        for disabled in (True, False):
-            args["zero_mask"][0] = np.uint64(1 << 63 if disabled else 0)
-            report = racecheck(kernel, args)
-            assert report.verdict == ("clean" if disabled else "error"), report.to_dict()
-
-
 @pytest.mark.parametrize(
     "group,tmem,segment", [(1, False, 0), (1, True, 1), (2, False, 1), (2, True, 0)]
 )

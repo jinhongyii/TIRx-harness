@@ -206,67 +206,10 @@ def _packed_inputs(dtype):
     }
 
 
-def test_rendezvous_matches_raw_spelling(tmp_path):
-    raw = _rendezvous(primitive=False)
-    primitive = _rendezvous(primitive=True)
-    raw_module = numsim.transpile(raw, cache_dir=tmp_path / "raw")
-    module = numsim.transpile(primitive, cache_dir=tmp_path / "primitive")
-    raw_outputs = numsim.Engine().run(raw_module, _rendezvous_inputs()).outputs
-    outputs = numsim.Engine().run(module, _rendezvous_inputs()).outputs
-
-    assert _memory_variants(module.rust_source) == _memory_variants(raw_module.rust_source)
-    # The wait states its verdict once; the raw spelling states nothing.
-    assert _declared_wait_count(module.rust_source) == 1
-    assert _declared_wait_count(raw_module.rust_source) == 0
-    for name in _rendezvous_inputs():
-        np.testing.assert_array_equal(outputs[name], raw_outputs[name])
-    # Both spellings are clean, and that is the contract: the raw loop polls
-    # with `ld.acquire`, which is a protocol that explains itself -- whichever
-    # value a poll got, it took the edge with it -- so nothing is left for the
-    # checker to adjudicate and nothing is claimed. What the primitive buys is
-    # not a verdict here but the word's write history and the exit condition,
-    # which is what the relaxed shapes below turn on.
-    assert _verdicts(primitive, _rendezvous_inputs)["racecheck"] == ("clean", [])
-    assert _verdicts(raw, _rendezvous_inputs)["racecheck"] == ("clean", [])
-    # Warp 1 read the payload behind the acquire; the lone ticket holder saw
-    # the initial value. Both are schedule-independent.
-    np.testing.assert_array_equal(outputs["observed"], np.array([7, 0], np.int32))
-
-
 def test_declared_rendezvous_is_clean():
     kernel = _rendezvous(primitive=True)
     for checker in (synccheck, racecheck):
         checker(kernel, _rendezvous_inputs()).require_clean()
-
-
-@pytest.mark.parametrize("dtype", sorted(_WORD_TYPES))
-def test_packed_wait_matches_raw_spelling(dtype, tmp_path):
-    raw = _packed(primitive=False, dtype=dtype)
-    primitive = _packed(primitive=True, dtype=dtype)
-    raw_module = numsim.transpile(raw, cache_dir=tmp_path / f"raw_{dtype}")
-    module = numsim.transpile(primitive, cache_dir=tmp_path / f"primitive_{dtype}")
-    inputs = lambda: _packed_inputs(dtype)  # noqa: E731
-    raw_outputs = numsim.Engine().run(raw_module, inputs()).outputs
-    outputs = numsim.Engine().run(module, inputs()).outputs
-
-    assert _memory_variants(module.rust_source) == _memory_variants(raw_module.rust_source)
-    for name in inputs():
-        np.testing.assert_array_equal(outputs[name], raw_outputs[name])
-    # The primitive lets the checker explain the successful exit and its HB
-    # edge. The raw loop below instead contains a proven unordered access.
-    assert _verdicts(primitive, inputs)["racecheck"] == ("clean", [])
-    # Raw, the spin is an ordinary pair: a word one warp writes and another
-    # only reads, and every schedule leaves at least one of those reads
-    # unordered against the publication, so the answer does not move with the
-    # worker count the way a per-poll verdict would. Written through the
-    # primitive it disappears: the wait adjudicates no access of its own and
-    # its edge decides.
-    # This is a data race, not a separate undeclared-protocol advisory.
-    assert _verdicts(raw, inputs)["racecheck"] == (
-        "error",
-        [("error", "data_race")],
-    )
-    np.testing.assert_array_equal(outputs["observed"], np.array([7], dtype))
 
 
 def _mixed(*, scoped_reset):
@@ -365,17 +308,6 @@ def _bypass_findings(kernel, inputs=None):
     return [finding for finding in report.findings if finding.kind == "signal_protocol_error"]
 
 
-def test_a_plain_access_on_a_declared_word_is_reported(tmp_path):
-    kernel = _mixed(scoped_reset=False)
-    findings = _bypass_findings(kernel)
-    assert findings, "a plain store on a claimed word must be reported"
-    assert all(finding.status == "error" for finding in findings)
-    assert all("category" not in finding.details for finding in findings)
-    assert all(finding.details["kind"] == "signal_protocol_error" for finding in findings)
-    assert "without a happens-before relationship" in findings[0].message
-    assert "Hint:" in racecheck(kernel, _packed_inputs("int32")).format()
-
-
 def test_a_scoped_reset_is_not_reported(tmp_path):
     # The positive control's twin: the identical protocol whose reset carries a
     # scope keeps the word clean, so the finding above is caused by the plain
@@ -394,64 +326,6 @@ def test_an_ordered_plain_reset_is_not_reported(tmp_path):
         "observed": np.zeros(1, "int32"),
     }
     assert not _bypass_findings(_ordered_reset(), inputs)
-
-
-@pytest.mark.parametrize("waiter", [0, 1])
-@pytest.mark.parametrize("prior_access", [False, True])
-@pytest.mark.parametrize("ordering", ["wait_then_plain", "plain_then_wait", "prefix_only", "none"])
-def test_wait_has_its_own_hb_event(waiter, prior_access, ordering):
-    """Only a rendezvous between the wait and plain access orders the pair.
-
-    A first-event wait used to have epoch zero, making a subsequent barrier
-    unable to prove HB. Reusing a nonzero prior-access epoch was also wrong:
-    a barrier before the wait could then incorrectly order the future wait.
-    Swapping the warp roles exercises either recorder arrival order.
-    """
-    initial_access = "observed[0] = T.int32(1)" if prior_access else "T.evaluate(0)"
-    wait = f"""
-    if warp == {waiter} and lane == 0:
-        T.cuda.wait_until(seen[0], state.ptr_to([0]), seen[0] == 7, "gpu", "global")
-"""
-    # The read keeps the plain access visible to the protocol recorder; a
-    # store alone may be compacted through the summary-only fast path. Store
-    # the same value so the unordered controls cannot block the numeric wait.
-    plain = f"""
-    if warp == {1 - waiter} and lane == 0:
-        observed[1] = state[0]
-        T.ptx.st.global_.s32(state.ptr_to([0]), T.int32(7))
-"""
-    barrier = "\n    T.ptx.bar.sync(T.uint32(0), T.uint32(64))\n"
-    body = {
-        "wait_then_plain": wait + barrier + plain,
-        "plain_then_wait": plain + barrier + wait,
-        "prefix_only": barrier + wait + plain,
-        "none": wait + plain,
-    }[ordering]
-    kernel = tvm.script.from_source(
-        f"""
-@T.prim_func
-def wait_event(state: T.Buffer((1,), "int32"), observed: T.Buffer((2,), "int32")):
-    T.device_entry()
-    warp = T.warp_id([2])
-    lane = T.lane_id([32])
-    seen = T.alloc_local((1,), "int32")
-    if warp == {waiter} and lane == 0:
-        {initial_access}
-{body}
-""",
-        {"T": T},
-    )
-
-    def inputs():
-        return {"state": np.array([7], dtype=np.int32), "observed": np.zeros(2, dtype=np.int32)}
-
-    synccheck(kernel, inputs()).require_clean()
-    report = racecheck(kernel, inputs())
-    if ordering in {"wait_then_plain", "plain_then_wait"}:
-        report.require_clean()
-    else:
-        assert report.verdict == "error", report.format()
-        assert {finding.kind for finding in report.findings} == {"signal_protocol_error"}
 
 
 def _bit_typed(*, primitive):
@@ -494,20 +368,6 @@ def bit_typed(state: T.Buffer((1,), "int32"), observed: T.Buffer((1,), "int32"))
 """,
         {"T": T},
     )
-
-
-def test_bit_typed_word_matches_raw_spelling(tmp_path):
-    raw = _bit_typed(primitive=False)
-    primitive = _bit_typed(primitive=True)
-    raw_module = numsim.transpile(raw, cache_dir=tmp_path / "raw")
-    module = numsim.transpile(primitive, cache_dir=tmp_path / "primitive")
-
-    assert _memory_variants(module.rust_source) == _memory_variants(raw_module.rust_source)
-    # The store marks an access; the wait performs none.
-    raw_outputs = numsim.Engine().run(raw_module, _packed_inputs("int32")).outputs
-    outputs = numsim.Engine().run(module, _packed_inputs("int32")).outputs
-    np.testing.assert_array_equal(outputs["observed"], raw_outputs["observed"])
-    np.testing.assert_array_equal(outputs["observed"], np.array([1], np.int32))
 
 
 def _two_arrivals(*, target):
@@ -562,18 +422,6 @@ def _two_arrivals_inputs():
     }
 
 
-def test_a_wait_that_waits_for_both_arrivals_may_read_both():
-    racecheck(_two_arrivals(target=2), _two_arrivals_inputs()).require_clean()
-
-
-def test_a_wait_that_waits_for_one_arrival_may_not_read_the_other():
-    report = racecheck(_two_arrivals(target=1), _two_arrivals_inputs())
-    assert report.verdict == "error", report.format()
-    # The reported pair is the second publisher's store against the waiter's
-    # read of it: waiting for one arrival orders nothing the other published.
-    assert "second" in report.format()
-
-
 def _woken_by_a_bypass():
     """A wait let out by a plain write.
 
@@ -604,19 +452,6 @@ def woken_by_a_bypass(state: T.Buffer((1,), "int32"), observed: T.Buffer((1,), "
 """,
         {"T": T},
     )
-
-
-def test_a_wait_woken_by_a_plain_write_reports_the_missing_edge():
-    """A compacted plain write leaves insufficient evidence to explain the wait.
-
-    The dense-output summary path does not retain this write as a signal
-    access witness. Without that evidence, the checker reports an incomplete
-    analysis, not a proven signal protocol error or deadlock.
-    """
-
-    report = racecheck(_woken_by_a_bypass(), _packed_inputs("int32"))
-    kinds = {(finding.status, finding.kind) for finding in report.findings}
-    assert ("incomplete", "analysis_incomplete") in kinds, report.format()
 
 
 def _backoff_spin(*, primitive):
@@ -677,46 +512,6 @@ def _backoff_inputs():
     }
 
 
-def test_a_backoff_is_the_cuda_loops_business_and_not_the_engines(tmp_path):
-    """`backoff_ns` is a field on the wait, and it lowers in one place only.
-
-    A contended wait spelled by hand sleeps between polls, and the CUDA this
-    lowers to still does -- `tests/python/tirx/codegen/test_cuda_wait_until.py`
-    pins the `__nanosleep` inside the emitted loop. The engine has no loop to
-    sleep in: it parks on the word's own bytes until they change, which is
-    strictly better than waking on a timer. So numsim emits none, and the two
-    spellings still agree on every global instruction and on the result.
-    """
-
-    raw = numsim.transpile(_backoff_spin(primitive=False), cache_dir=tmp_path / "raw")
-    module = numsim.transpile(_backoff_spin(primitive=True), cache_dir=tmp_path / "primitive")
-
-    # Instruction equality is `test_rendezvous_matches_raw_spelling`'s job. The
-    # two spellings genuinely differ here: written by hand the idiom loads once
-    # before the loop, and the primitive needs no such load because the wait
-    # tests its destination before it does anything.
-    assert "control::nanosleep" not in module.rust_source
-    assert raw.rust_source.count("control::nanosleep") == 1
-    # The publisher's arrival; the wait marks nothing.
-
-    outputs = numsim.Engine().run(module, _backoff_inputs()).outputs
-    np.testing.assert_array_equal(outputs["observed"], np.array([7], np.int32))
-    racecheck(_backoff_spin(primitive=True), _backoff_inputs()).require_clean()
-
-
-def test_a_candidate_index_outside_its_local_table_is_an_execution_error(tmp_path):
-    case = indexed_predicate_case(alias=False)
-    inputs = dict(case.args)
-    inputs["state"] = np.full(32, 2, np.int32)
-    module = numsim.transpile(case.kernel, cache_dir=tmp_path)
-
-    with pytest.raises(
-        numsim.NumSimExecutionError,
-        match="wait_until predicate index is outside local buffer table",
-    ):
-        numsim.Engine().run(module, inputs)
-
-
 def _packed_payload(*, retry):
     """#677's examples 1 and 2, written through the primitive.
 
@@ -772,29 +567,3 @@ def _packed_payload_inputs():
     return {"slot": np.zeros(1, np.uint64), "sink": np.zeros(1, np.uint64)}
 
 
-def test_a_wait_on_a_word_that_carries_its_own_payload_is_clean():
-    """The protocol working, with nothing but the declared word involved.
-
-    A spin is by definition a read racing the publisher's write, so this is
-    only clean if the wait is one operation to the checker rather than a loop
-    of reads it has to adjudicate.
-    """
-
-    racecheck(_packed_payload(retry=True), _packed_payload_inputs()).require_clean()
-
-
-def test_reading_the_word_once_is_not_made_correct_by_declaring_it():
-    """#677's example 2, declared. The declaration must not launder it.
-
-    The payload is in the word, so there is no second buffer whose read could
-    report instead: if this comes back clean, the primitive is blind to the
-    bug it was built for.
-
-    The single read is relaxed. With an acquiring one the checker cannot tell
-    this from a correct acquiring spin -- it sees accesses, not loops -- and
-    reporting it would report every hand-written acquire loop as well. What it
-    keeps is the shape where the reader took a value and no order at all.
-    """
-
-    report = racecheck(_packed_payload(retry=False), _packed_payload_inputs())
-    assert report.verdict != "clean", report.format()

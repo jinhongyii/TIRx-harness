@@ -2,7 +2,9 @@
  "case": "deepgemm_sm100_fp4_paged_mqa_logits",
  "diagnostics": [
   {
-   "anchors": [],
+   "anchors": [
+    "tirx_kernels/ported/deepgemm/paged_mqa_logits_fp4.py:688:1-688:39"
+   ],
    "bytes": {
     "shared": "143616-143872,145152-145408"
    },

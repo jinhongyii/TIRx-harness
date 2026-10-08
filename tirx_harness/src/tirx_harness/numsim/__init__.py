@@ -1,26 +1,9 @@
-"""NumSim: native-Rust numerical simulation for specialized TIRx kernels."""
+"""NumSim: TIRx -> ``Program`` bytecode executed by the Rust engine (``core-rs``).
 
-from .api import (
-    CompiledModule,
-    CoverageBounds,
-    Engine,
-    NativeAnalysisResult,
-    NumSimResult,
-    ResourceLimits,
-    compare,
-    dump_rust,
-    dump_semantic_manifest,
-    run_case,
-    transpile,
-)
-from .cases import (
-    ComparisonRegion,
-    ComparisonSpec,
-    ExecutionAssumptions,
-    NumSimCase,
-    Im2col,
-    TensorMap,
-)
+The public names are the v2 implementation (``tirx_harness.numsim.v2``).
+"""
+
+from .cases import ComparisonRegion, ComparisonSpec, Im2col, NumSimCase, TensorMap
 from .errors import (
     NumSimBuildError,
     NumSimError,
@@ -28,28 +11,21 @@ from .errors import (
     UnmodeledTIRxFormError,
     UnsupportedTIRxError,
 )
+from .v2 import *  # noqa: F403
+from .v2 import __all__ as _v2_all
 
-__all__ = [
-    "ComparisonRegion",
-    "ComparisonSpec",
-    "CompiledModule",
-    "CoverageBounds",
-    "Engine",
-    "ExecutionAssumptions",
-    "NativeAnalysisResult",
-    "NumSimBuildError",
-    "NumSimCase",
-    "NumSimError",
-    "NumSimExecutionError",
-    "NumSimResult",
-    "ResourceLimits",
-    "TensorMap",
-    "Im2col",
-    "UnmodeledTIRxFormError",
-    "UnsupportedTIRxError",
-    "compare",
-    "dump_rust",
-    "dump_semantic_manifest",
-    "run_case",
-    "transpile",
-]
+__all__ = sorted(
+    {
+        *_v2_all,
+        "ComparisonRegion",
+        "ComparisonSpec",
+        "Im2col",
+        "NumSimBuildError",
+        "NumSimCase",
+        "NumSimError",
+        "NumSimExecutionError",
+        "TensorMap",
+        "UnmodeledTIRxFormError",
+        "UnsupportedTIRxError",
+    }
+)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 
 from tirx_harness import numsim
-from tirx_harness.numsim.transpiler.frontend import analyze
 from tvm.script import tirx as T
 
 
@@ -61,40 +60,6 @@ def cuda_shuffles_bfloat16x2(
     output_bits[lane, 1] = T.reinterpret("uint32", T.cuda.__shfl_up_sync(full, packed, 1, 32))
     output_bits[lane, 2] = T.reinterpret("uint32", T.cuda.__shfl_down_sync(full, packed, 1, 32))
     output_bits[lane, 3] = T.reinterpret("uint32", T.cuda.__shfl_xor_sync(full, packed, 1, 32))
-
-
-def test_cuda_ldg_supports_float32x2_as_one_packed_64bit_load(tmp_path):
-    source_bits = (np.arange(64, dtype=np.uint32) * np.uint32(0x01020305)) ^ np.uint32(0xA55AA55A)
-    source = source_bits.view(np.uint64)
-
-    spec = analyze(cuda_ldg_float32x2)
-    assert spec.unsupported == ()
-    module = numsim.transpile(cuda_ldg_float32x2, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "source": source,
-            "output_bits": np.zeros(32, dtype=np.uint64),
-        },
-    )
-
-    np.testing.assert_array_equal(result.outputs["output_bits"], source_bits.view(np.uint64))
-
-
-def test_cuda_shfl_sync_preserves_float16x2_payload_bits(tmp_path):
-    low = np.arange(32, dtype=np.uint32) * np.uint32(0x0211) + np.uint32(0x7C01)
-    high = np.arange(32, dtype=np.uint32) * np.uint32(0x0103) + np.uint32(0x8000)
-    source_bits = (high << np.uint32(16)) | (low & np.uint32(0xFFFF))
-
-    spec = analyze(cuda_shfl_sync_float16x2)
-    assert spec.unsupported == ()
-    module = numsim.transpile(cuda_shfl_sync_float16x2, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {"source_bits": source_bits, "output_bits": np.zeros(32, dtype=np.uint32)},
-    )
-
-    np.testing.assert_array_equal(result.outputs["output_bits"], source_bits[::-1])
 
 
 def test_cuda_directional_shuffles_preserve_float16x2_payload_bits(tmp_path):

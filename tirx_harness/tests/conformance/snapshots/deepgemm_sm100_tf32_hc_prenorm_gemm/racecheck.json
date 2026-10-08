@@ -3,8 +3,21 @@
  "mode": "racecheck",
  "phases": [
   {
-   "diagnostics": [],
-   "verdict": "clean"
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/tf32_hc_prenorm_gemm.py:630:1-630:66"
+     ],
+     "bytes": {
+      "tmem-columns": "512-640"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "tmem",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
   }
  ],
  "schema": 4

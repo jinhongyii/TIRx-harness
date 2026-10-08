@@ -69,60 +69,6 @@ def _case(module_name: str, index: int):
     return family.prepare(**config_params(family.configs[index]))
 
 
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_mqa_numsim_inputs_have_valid_bindings(module_name):
-    family = _case_family(module_name)
-
-    for index in range(len(family.configs)):
-        case = _case(module_name, index)
-        v2.canonicalize_inputs(v2.transpile(case.kernel), case.args)
-
-
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_mqa_shared_pointer_views_keep_their_physical_scope(module_name):
-    # Asserts a legacy-frontend diagnostic; retires with the legacy frontend.
-    from tirx_harness.numsim.transpiler.frontend import analyze
-
-    spec = analyze(_case(module_name, 0).kernel)
-
-    assert not any(
-        "declared global view disagrees with shared pointer origin" in item
-        for item in spec.unsupported
-    )
-
-
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_dense_mqa_numsim_corpus_covers_dense_compressed_and_cooperative(module_name):
-    configs = _case_family(module_name).configs
-
-    assert len(configs) == 4
-    assert any(not config["compressed_logits"] for config in configs)
-    assert any(config["compressed_logits"] for config in configs)
-    assert any(not config["disable_cp"] for config in configs)
-    assert any(not config["compressed_logits"] and not config["disable_cp"] for config in configs)
-    assert {config["logits_dtype"] for config in configs} == {"float32", "bfloat16"}
-    assert {config["num_sms"] for config in configs} == {2}
-
-
-@pytest.mark.parametrize(
-    ("module_name", "config_index"),
-    [
-        (_DENSE_KERNELS[0], 2),
-        (_DENSE_KERNELS[1], 1),
-    ],
-)
-def test_mqa_numsim_cases_are_deterministic_and_full_launch(module_name, config_index):
-    first = _case(module_name, config_index)
-    second = _case(module_name, config_index)
-
-    topology = launch_topology(first.kernel)
-    assert topology.clusters == 2
-    assert topology.ctas_per_cluster == 1
-    assert topology.warps_per_cta == 12
-    np.testing.assert_array_equal(first.reference()["logits"], second.reference()["logits"])
-    assert _host_identity(first.args) == _host_identity(second.args)
-
-
 def test_dense_mqa_numpy_reference_matches_independent_scalar_reference():
     q = np.array(
         [[[1.0, -2.0, 0.5], [0.0, 1.0, 2.0]], [[-1.0, 0.5, 1.5], [2.0, -1.0, 0.0]]],
@@ -163,39 +109,3 @@ def test_mqa_low_precision_packing_round_trips_physical_codes():
     )
 
 
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_compressed_mqa_comparison_regions_map_prefix_to_kv_range(module_name):
-    case = _case(module_name, 1)
-    starts = case.args["cu_seq_len_k_start"]
-    ends = case.args["cu_seq_len_k_end"]
-    logits_stride = int(case.args["logits_stride"])
-    seq_len_kv = case.reference()["logits"].size // len(starts)
-    regions = case.comparisons["logits"].regions
-
-    for row, (start, end) in enumerate(zip(starts, ends)):
-        region = regions[row]
-        assert region.actual == (
-            slice(row * logits_stride, row * logits_stride + int(end - start)),
-        )
-        assert region.expected == (
-            slice(row * seq_len_kv + int(start), row * seq_len_kv + int(end)),
-        )
-
-
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_dense_mqa_comparison_regions_exclude_unspecified_columns(module_name):
-    case = _case(module_name, 0)
-    starts = case.args["cu_seq_len_k_start"]
-    ends = case.args["cu_seq_len_k_end"]
-    logits_stride = int(case.args["logits_stride"])
-    seq_len_kv = case.reference()["logits"].size // len(starts)
-    regions = case.comparisons["logits"].regions
-
-    for row, (start, end) in enumerate(zip(starts, ends)):
-        region = regions[row]
-        assert region.actual == (
-            slice(row * logits_stride + int(start), row * logits_stride + int(end)),
-        )
-        assert region.expected == (
-            slice(row * seq_len_kv + int(start), row * seq_len_kv + int(end)),
-        )

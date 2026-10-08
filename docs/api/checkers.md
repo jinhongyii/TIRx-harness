@@ -26,8 +26,7 @@ Returns a {py:class}`~tirx_harness.numsim.v2.report.SyncCheckReport`.
 Returns a {py:class}`~tirx_harness.numsim.v2.report.RaceReport`.
 
 The signatures and report classes on this page are those of the redesigned
-engine (pending: the root entry points switch from the legacy engine to
-`tirx_harness.numsim.v2` when the migration completes).
+engine.
 
 ### Synccheck budgets
 
@@ -64,9 +63,7 @@ preemption or completion-deviation bound.
 
 Inspect `report.verdict` and `report.findings`, save `report.to_dict()`, or call
 `report.print()` for readable evidence. `report.require_clean()` raises unless
-the verdict is `clean` (pending: the redesigned reports raise
-`AssertionError`; the legacy reports raised `CheckFailed`, a `RuntimeError`
-subclass).
+the verdict is `clean`.
 
 | Verdict | Meaning |
 | --- | --- |

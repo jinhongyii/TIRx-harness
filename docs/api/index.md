@@ -16,8 +16,7 @@ integrating checks, simulation, or generated-code inspection into your own loop.
 The reference focuses on callable tools and the objects their callers supply
 or receive. NumSim and the checkers are documented for the redesigned engine,
 whose implementation lives in `tirx_harness.numsim.v2` until the migration
-completes (pending: the public names switch to v2 when the legacy engine is
-deleted). Generated pages link to that module path.
+completes. Generated pages link to that module path.
 
 ```{toctree}
 :maxdepth: 1

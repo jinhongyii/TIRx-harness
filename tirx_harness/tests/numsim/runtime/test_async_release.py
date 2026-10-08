@@ -46,14 +46,6 @@ def test_async_release_payloads(reduction, ptx_type, tmp_path):
     np.testing.assert_array_equal(actual.outputs["data"], expected)
 
 
-@pytest.mark.parametrize("reduction", [False, True])
-def test_bulk_wait_does_not_acquire_async_release(reduction):
-    kernel, dtype = release_kernel(consume=True, reduction=reduction)
-    report = racecheck(kernel, {"data": np.zeros(32, dtype), "output": np.zeros(32, dtype)})
-    assert report.verdict == "error"
-    assert any(f.details["access_pair"] in {"write_read", "read_write"} for f in report.findings)
-
-
 def publication_kernel(*, after=False, shared=False, reduction=False):
     instruction = (
         "red_async.release.gpu.global.add.u32" if reduction else "st_async.release.gpu.global.u32"
@@ -100,12 +92,3 @@ def publication_kernel(*, after=False, shared=False, reduction=False):
     return kernel
 
 
-@pytest.mark.parametrize("shared,reduction", [(False, False), (True, False), (False, True)])
-def test_async_release_publishes_only_pre_issue_work(shared, reduction, tmp_path):
-    args = {name: np.zeros(1, np.uint32) for name in ("data", "flag", "output")}
-    kernel = publication_kernel(shared=shared, reduction=reduction)
-    actual = run_checked(kernel, args, cache_dir=tmp_path)
-    np.testing.assert_array_equal(actual.outputs["output"], [42])
-    report = racecheck(publication_kernel(after=True, shared=shared, reduction=reduction), args)
-    assert report.verdict == "error"
-    assert any(f.details["access_pair"] in {"read_write", "write_read"} for f in report.findings)

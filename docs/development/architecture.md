@@ -13,9 +13,7 @@ build, test, and environment commands are in the
 The redesign replaces the legacy engine (`numsim/engine-rs`, the Rust frontend
 `frontend-rs`, and the legacy Python layer) kernel by kernel, with corpus
 snapshots as the oracle. Until the migration completes, both engines are in the
-tree and the public entry points still run the legacy one (pending: switch the
-public entry points to v2 and delete `engine-rs`, `frontend-rs`, and the
-legacy Python modules).
+tree and the public entry points still run the legacy one.
 
 ## Design rules
 
@@ -264,9 +262,7 @@ fields, or absolute times.
 | Performance | Criterion microbenchmarks and end-to-end checks relative to a per-host baseline; opt-in `performance` marker | `numsim-core/benches/` (synccheck reduction guards: `benches/synccheck.rs`), `numsim-race-core`, `tests/perf/` |
 
 CI runs the Rust workspace tests and the Python suite without the GPU and
-performance markers, so snapshot drift fails CI (pending: CI does not build
-`numsim_core_py` yet, so the v2 Python tests and the `NUMSIM_IMPL=v2`
-conformance run skip there).
+performance markers, so snapshot drift fails CI.
 
 ## Specifications
 

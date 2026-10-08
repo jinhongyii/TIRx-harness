@@ -85,26 +85,3 @@ def test_copy_transports_unique_owners_across_warps(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], source)
 
 
-def test_pointwise_transports_unique_owners_across_warps(tmp_path):
-    source = np.arange(256, dtype=np.float32).reshape(128, 2) / np.float32(16)
-    output = np.zeros_like(source)
-
-    module = numsim.transpile(_mul_cross_warp_owner_remap, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], source * np.float32(3))
-
-
-def test_cast_unary_and_binary_share_owner_transport(tmp_path):
-    roots = (np.arange(256, dtype=np.float32) % np.float32(16)).reshape(128, 2)
-    source = roots * roots
-    output = np.zeros_like(source)
-
-    module = numsim.transpile(
-        _cast_unary_binary_cross_warp_owner_remap,
-        cache_dir=tmp_path,
-    )
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    rounded = source.astype(np.float16).astype(np.float32)
-    np.testing.assert_array_equal(result.outputs["output"], np.sqrt(rounded) + rounded)

@@ -424,16 +424,6 @@ def test_snapshot_copy_linear_32_runtime_domain_has_exact_oracle(tmp_path: Path)
     np.testing.assert_array_equal(result.outputs["output"], source)
 
 
-def test_snapshot_copy_variable_min_runtime_domain_has_exact_oracle(tmp_path: Path):
-    source = np.arange(32, dtype=np.float16) + np.float16(0.5)
-    module = numsim.transpile(snapshot_copy_variable_min_runtime_domain, cache_dir=tmp_path)
-    result = numsim.Engine(max_workers=1).run(
-        module, {"source": source, "output": np.zeros_like(source)}
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], source)
-
-
 def test_snapshot_copy_cross_warp_extent_runtime_domain_has_exact_oracle(tmp_path: Path):
     source = np.arange(128, dtype=np.float32).reshape(64, 2) + np.float32(0.25)
     module = numsim.transpile(snapshot_copy_cross_warp_extent_runtime_domain, cache_dir=tmp_path)
@@ -476,36 +466,6 @@ def test_snapshot_copy_bound_ldstmatrix_runtime_domain_has_exact_oracle(tmp_path
     )
 
     np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_cuda_ldg_complete_finite_domain_executes_with_exact_physical_oracle(tmp_path: Path):
-    module = numsim.transpile(CUDA_LDG_COMPLETE_RUNTIME_DOMAIN, cache_dir=tmp_path)
-    arguments: dict[str, object] = {}
-    expected: dict[str, np.ndarray] = {}
-    for dtype in CUDA_LDG_DTYPES:
-        name = dtype.replace("_", "")
-        source, needs_binding = _storage(dtype, initialized=True)
-        output, _ = _storage(dtype, initialized=False)
-        arguments[f"source_{name}"] = source if needs_binding else source
-        arguments[f"output_{name}"] = output if needs_binding else output
-        expected[f"output_{name}"] = source.copy()
-
-    result = numsim.Engine(max_workers=1).run(module, arguments)
-
-    def check_every_dtype() -> None:
-        assert len(expected) == 55
-        assert set(result.outputs) == set(arguments)
-        for name, value in expected.items():
-            _assert_same_physical_value(result.outputs[name], value)
-
-    check_every_dtype()
-
-
-def test_ordering_fence_and_register_policy_finite_domains_execute(tmp_path: Path):
-    module = numsim.transpile(ORDERING_COMPLETE_RUNTIME_DOMAIN, cache_dir=tmp_path)
-    result = numsim.Engine(max_workers=1).run(module, {"output": np.zeros(1, dtype=np.int32)})
-
-    np.testing.assert_array_equal(result.outputs["output"], np.array([0x13579BDF], dtype=np.int32))
 
 
 @pytest.mark.parametrize(

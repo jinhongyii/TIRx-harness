@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from tirx_harness import numsim
-from tirx_harness.numsim.transpiler.frontend import analyze, verify
 import tvm
 from tvm import tirx
 from tvm.script import tirx as T
@@ -99,59 +98,6 @@ def _stmatrix_chain(count, space, shape, dtype, transpose):
         chain += f".{space}"
     chain += dtype
     return chain
-
-
-def _analyze_stmatrix_form(count, space, shape, dtype, transpose):
-    chain = _stmatrix_chain(count, space, shape, dtype, transpose)
-    parameters = ", ".join(f"value_{index}: T.uint32" for index in range(count))
-    operands = ", ".join(f"value_{index}" for index in range(count))
-    source = f'''
-@T.prim_func
-def store_matrix({parameters}):
-    T.device_entry()
-    _warp = T.warp_id([1])
-    lane = T.lane_id([32])
-    shared = T.alloc_buffer((32, 16), "uint8", scope="shared")
-    T.ptx["{chain}"](T.address_of(shared[lane, 0]), {operands})
-'''
-    return analyze(tvm.script.from_source(source, extra_vars={"T": T}))
-
-
-@pytest.mark.parametrize("count", [1, 2, 4])
-@pytest.mark.parametrize("space", ["shared", "shared::cta"])
-@pytest.mark.parametrize(
-    ("shape", "dtype", "transpose"),
-    [("m8n8", ".b16", False), ("m8n8", ".b16", True), ("m16n8", ".b8", True)],
-)
-def test_stmatrix_registry_accepts_reviewed_shared_forms(count, space, shape, dtype, transpose):
-    assert _analyze_stmatrix_form(count, space, shape, dtype, transpose).unsupported == ()
-
-
-def test_stmatrix_analyze_rejects_a_pointer_without_backing():
-    pointer = tirx.Var("pointer", "handle")
-    value = tirx.Var("value", "uint32")
-    call = T.ptx.stmatrix.sync.aligned.m8n8.x1.shared.b16(pointer, value)
-    spec = analyze(tirx.PrimFunc([pointer, value], tirx.Evaluate(call)))
-    assert any("Unbound TIRx variable" in reason for reason in spec.unsupported)
-    with pytest.raises(numsim.UnsupportedTIRxError, match="Unbound TIRx variable"):
-        verify(spec)
-
-
-@pytest.mark.parametrize(
-    ("shape", "dtype", "transpose"),
-    [("m8n8", ".b8", False), ("m8n8", ".b8", True), ("m16n8", ".b16", True)],
-)
-def test_stmatrix_parser_rejects_invalid_ptx_shape_type_pairs(shape, dtype, transpose):
-    pointer = tirx.Var("pointer", "handle")
-    value = tirx.Var("value", "uint32")
-    chain = _stmatrix_chain(1, "shared", shape, dtype, transpose)
-    with pytest.raises(KeyError, match="not a valid modifier"):
-        T.ptx[chain](pointer, value)
-
-
-def test_stmatrix_registry_accepts_repository_and_x2_forms():
-    assert analyze(raw_stmatrix_layout).unsupported == ()
-    assert analyze(raw_stmatrix_x2_forms).unsupported == ()
 
 
 def test_stmatrix_native_layout_matches_blackwell_gpu_microtest(tmp_path):

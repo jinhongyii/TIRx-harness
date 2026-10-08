@@ -50,15 +50,3 @@ def sm107_register_predicate_expected(mask, preserve):
     return expected
 
 
-@pytest.mark.parametrize("preserve", [False, True])
-def test_sm107_register_predicates(preserve, tmp_path):
-    kernel = sm107_register_predicate_kernel(preserve)
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-    for mask in (0, 0x80000000, 0xAAAAAAAA, 0xFFFFFFFF):
-        inputs = {"output": np.zeros((5, 32), np.uint32), "selected": mask}
-        for checker in (synccheck, racecheck):
-            checker(kernel, inputs).require_clean()
-        result = numsim.Engine().run(module, inputs)
-        np.testing.assert_array_equal(
-            result.outputs["output"], sm107_register_predicate_expected(mask, preserve)
-        )

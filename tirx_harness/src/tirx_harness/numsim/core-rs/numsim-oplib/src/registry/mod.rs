@@ -1,13 +1,12 @@
-//! Static op table: every legacy NumSim operation with its family, fidelity
-//! and notes, plus the OpLib functions that implement its numerics.
+//! Static op table: every registered NumSim operation with its family,
+//! fidelity and notes, plus the OpLib functions that implement its numerics.
 //!
-//! `ops_table.rs` is generated from the legacy `engine-rs/SUPPORTED_OPS.md`
-//! (itself rendered by `numsim/transpiler/support_matrix.py` from the frontend
-//! registry: `ir_name`, `family`, `support`, `reason`, plus the tile-op list)
-//! by `tools/gen_registry.py`. [`render_supported_ops`] reproduces that file
-//! byte-for-byte, so `SUPPORTED_OPS.md` can be regenerated without Python,
-//! TVM, or the frontend. Each family module contributes `BINDINGS` that tie
-//! op names to OpLib entry points.
+//! `ops_table.rs` is the hand-maintained source of truth (seeded at step 5 from
+//! the deleted legacy `engine-rs/SUPPORTED_OPS.md`). [`render_supported_ops`]
+//! renders it in the legacy matrix layout; the published
+//! `numsim-oplib/SUPPORTED_OPS.md` is generated from it by
+//! `numsim-core`'s `supported_ops` example. Each family module contributes
+//! `BINDINGS` that tie op names to OpLib entry points.
 
 mod ops_table;
 
@@ -191,19 +190,6 @@ registered operations; GPU parity is tested where the required hardware is avail
 mod tests {
     use super::*;
     use std::collections::HashSet;
-
-    #[test]
-    fn render_matches_legacy_supported_ops_byte_for_byte() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../engine-rs/SUPPORTED_OPS.md"
-        );
-        let Ok(legacy) = std::fs::read_to_string(path) else {
-            // The legacy engine is deleted in migration step 5; the table is the source then.
-            return;
-        };
-        assert_eq!(render_supported_ops(LEGACY_ABI_VERSION), legacy);
-    }
 
     #[test]
     fn op_names_are_unique_and_sections_are_consistent() {

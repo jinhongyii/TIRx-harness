@@ -89,13 +89,3 @@ def test_half_reinterpret_preserves_storage_payloads(gpu_runner, tmp_path):
         np.testing.assert_array_equal(gpu, expected)
 
 
-def test_selp_does_not_make_source_evaluation_lazy(tmp_path):
-    @T.prim_func
-    def kernel(source: T.Buffer((32,), "uint32"), output: T.Buffer((32,), "uint32")):
-        T.device_entry()
-        _warp = T.warp_id([1])
-        lane = T.lane_id([32])
-        T.ptx.selp.b32(output[lane], source[32], source[lane], T.bool(False))
-
-    inputs = dict(source=np.arange(32, dtype=np.uint32), output=np.zeros(32, np.uint32))
-    assert_rejected(kernel, inputs, "out-of-bounds", cache_dir=tmp_path)

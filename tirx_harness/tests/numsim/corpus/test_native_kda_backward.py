@@ -27,8 +27,3 @@ def test_backward_oracle_rejects_exp_of_log2_gate(backward_case):
         )
 
 
-@NUMSIM_GPU_MARK
-def test_backward_matches_gpu_and_reference(pytestconfig, backward_case):
-    require_numsim_gpu(pytestconfig)
-    report = run_three_way_case(backward_case, cache_dir=None)
-    report.require_ok()

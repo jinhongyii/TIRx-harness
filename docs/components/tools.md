@@ -35,8 +35,7 @@ components for contributors.
 This page describes the redesigned engine. Until the migration completes,
 `tirx_harness.numsim`, `tirx_harness.synccheck`, and
 `tirx_harness.racecheck` still run the legacy engine, and the redesigned
-engine is importable under the same names from `tirx_harness.numsim.v2`
-(pending: switch the public entry points to v2 and delete the legacy engine).
+engine is importable under the same names from `tirx_harness.numsim.v2`.
 ```
 
 ## NumSim
@@ -154,9 +153,7 @@ See the [NumSim API reference](../api/numsim.md) for full signatures.
   `UnsupportedTIRxError` instead of guessing. Opaque CUDA bodies are
   unsupported, and so is a tile operation that TVM's tile dispatch cannot
   lower. Consult the
-  {repo}`operation coverage table <tirx_harness/src/tirx_harness/numsim/engine-rs/SUPPORTED_OPS.md>`
-  (pending: the table moves next to the new engine when the legacy engine is
-  deleted; the new engine renders it from the same operation registry).
+  {repo}`operation coverage table <tirx_harness/src/tirx_harness/numsim/engine-rs/SUPPORTED_OPS.md>`.
 - Hardware timing and some instruction results use deterministic
   representatives. Simulation time is not GPU latency. Transcendental math
   that the legacy simulator did not model (for example `sin`, `cos`, `tanh`,
@@ -164,7 +161,7 @@ See the [NumSim API reference](../api/numsim.md) for full signatures.
   can differ in the last bits. Matrix multiply-accumulate operations sum each
   output as one increasing-K chain of fused multiply-adds.
 - One run follows one seeded schedule. Change the seed (`Engine(seed=...)` or
-  `NUMSIM_V2_SEED`) to see other asynchronous-completion timings; the
+  `NUMSIM_SEED`) to see other asynchronous-completion timings; the
   checkers below cover the other orders.
 - Clusters run in parallel only when the launch has no launch-wide state. A
   launch that uses grid synchronization or a cooperative launch, polls memory
@@ -424,8 +421,7 @@ shape, strides, dtype, and swizzle parameters.
 
 A verdict covers the supplied specialization, launch, and inputs. A
 multi-kernel invocation is checked launch by launch, and the report's verdict
-is the worst launch verdict (pending: the legacy entry points accept a single
-launch only). Unsupported effects and coverage limits produce
+is the worst launch verdict. Unsupported effects and coverage limits produce
 `incomplete`; `review` indicates an advisory, and `error` indicates a
 detected violation. A clean report does not establish correctness for other
 inputs or replace an independent GPU correctness test. The
@@ -433,9 +429,7 @@ inputs or replace an independent GPU correctness test. The
 own these signatures.
 
 Missing bindings, and forms that lowering rejects, also produce `incomplete`
-in the legacy entry points (pending: the v2 entry points raise `InputError`
-and `UnsupportedTIRxError` for these instead of returning an `incomplete`
-report).
+in the legacy entry points.
 
 ## Inspecting generated code
 

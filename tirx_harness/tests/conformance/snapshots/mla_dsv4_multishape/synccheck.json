@@ -1,6 +1,11 @@
 {
  "case": "mla_dsv4_multishape",
- "error": "UnsupportedTIRxError",
  "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
  "schema": 4
 }

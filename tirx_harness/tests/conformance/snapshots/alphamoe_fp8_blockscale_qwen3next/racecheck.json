@@ -5,39 +5,20 @@
   {
    "diagnostics": [
     {
-     "access_pair": "read_write",
      "anchors": [
       "tirx_kernels/moe/alphamoe_fp8_blockscale_qwen3next.py:1579:1-1579:149",
       "tirx_kernels/moe/alphamoe_fp8_blockscale_qwen3next.py:474:1-474:148"
      ],
      "bytes": {
-      "global#2": "8192-16384"
+      "global#5": "20480-20488,45056-45064"
      },
-     "category": "findings",
-     "kind": "data_race",
-     "ordering_domain": "memory",
-     "ordering_failure": "missing_release_acquire",
+     "category": "advisories",
+     "kind": "undeclared_protocol_word",
      "space": "global",
-     "status": "error"
-    },
-    {
-     "access_pair": "write_read",
-     "anchors": [
-      "tirx_kernels/moe/alphamoe_fp8_blockscale_qwen3next.py:1579:1-1579:149",
-      "tirx_kernels/moe/alphamoe_fp8_blockscale_qwen3next.py:474:1-474:148"
-     ],
-     "bytes": {
-      "global#2": "3072-4096,6144-8192,17408-131072"
-     },
-     "category": "findings",
-     "kind": "data_race",
-     "ordering_domain": "memory",
-     "ordering_failure": "missing_release_acquire",
-     "space": "global",
-     "status": "error"
+     "status": "review"
     }
    ],
-   "verdict": "error"
+   "verdict": "review"
   }
  ],
  "schema": 4

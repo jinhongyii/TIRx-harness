@@ -22,7 +22,6 @@ from tests.numsim.support.kernels import (
     shared_virtual_backing_addresses,
     shared_virtual_swizzled_backing_alignment,
 )
-from tirx_harness.numsim.transpiler.frontend import analyze
 from tvm.script import tirx as T
 
 
@@ -531,38 +530,6 @@ def test_v2_and_v8_destination_loads_move_every_element(tmp_path):
     np.testing.assert_array_equal(result.outputs["out_v2_64"], source64)
 
 
-def test_ordered_v2_destination_loads_keep_their_memory_semantics(tmp_path):
-    """`.relaxed`, `.acquire` and `.volatile` all take `.vec` in PTX.
-
-    The vector spelling must select the same ordering specialization the
-    scalar spelling does, not silently fall back to a plain load.
-    """
-
-    source = (np.arange(64, dtype=np.uint32) * np.uint32(0x9E3779B1)) ^ np.uint32(0x1234_5678)
-    module = numsim.transpile(raw_shared_v2_ordered_destination_loads, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "source": source,
-            "relaxed": np.zeros(64, dtype=np.uint32),
-            "acquired": np.zeros(64, dtype=np.uint32),
-        },
-    )
-
-    for name in ("relaxed", "acquired"):
-        np.testing.assert_array_equal(result.outputs[name], source)
-
-    assert "v2::mem::variant::Relaxed<v2::mem::variant::Cta>" in module.rust_source
-    assert "v2::mem::variant::Acquire<v2::mem::variant::Cta>" in module.rust_source
-
-    volatile_module = numsim.transpile(raw_shared_v2_volatile_destination_load, cache_dir=tmp_path)
-    volatile_result = numsim.Engine().run(
-        volatile_module, {"source": source, "output": np.zeros(64, dtype=np.uint32)}
-    )
-    np.testing.assert_array_equal(volatile_result.outputs["output"], source)
-    assert "v2::mem::variant::Volatile" in volatile_module.rust_source
-
-
 def test_ordered_b128_load_preserves_both_64_bit_halves(tmp_path):
     source = (
         np.arange(32 * 4, dtype=np.uint32).reshape(32, 4) * np.uint32(0x1020_4081)
@@ -574,28 +541,6 @@ def test_ordered_b128_load_preserves_both_64_bit_halves(tmp_path):
     )
 
     np.testing.assert_array_equal(result.outputs["output"], source)
-
-
-def test_ordered_b128_load_retains_16_byte_alignment_contract(tmp_path):
-    module = numsim.transpile(raw_shared_misaligned_ordered_b128_load, cache_dir=tmp_path)
-
-    with pytest.raises(numsim.NumSimExecutionError, match="b128 requires 16-byte alignment"):
-        numsim.Engine().run(module, {"output": np.zeros(4, dtype=np.uint32)})
-
-
-def test_volatile_b128_load_preserves_uninitialized_review(tmp_path):
-    # Keep the original formerly unsupported fixture, including uninitialized
-    # shared bytes: supporting the load must not turn REVIEW into clean.
-    for checker in (synccheck, racecheck):
-        report = checker(raw_volatile_b128_uninitialized, {"output": np.zeros(4, np.uint32)})
-        assert report.verdict == "review", report.format()
-        assert {finding.kind for finding in report.findings} == {"uninitialized_read"}
-    module = numsim.transpile(raw_volatile_b128_uninitialized, cache_dir=tmp_path)
-    assert "v2::mem::variant::Volatile" in module.rust_source
-    result = numsim.Engine().run(module, {"output": np.full(4, 0xDEADBEEF, np.uint32)})
-    np.testing.assert_array_equal(result.outputs["output"], np.zeros(4, np.uint32))
-    assert result.verdict == "review"
-    assert {item["kind"] for item in result.diagnostics} == {"uninitialized_read"}
 
 
 def test_global_nc_v2_destination_load_moves_both_elements(tmp_path):
@@ -700,36 +645,6 @@ def test_raw_memory_hint_forms_preserve_loaded_and_stored_values(tmp_path):
     np.testing.assert_array_equal(result.outputs["stored"], np.repeat(source[:, None], 3, axis=1))
 
 
-def test_pointer_derived_shared_views_raw_memory_and_cvta_preserve_aliasing(
-    tmp_path, expect_harness_surface
-):
-    source = (np.arange(32, dtype=np.uint32) * np.uint32(17)) ^ np.uint32(0xA5A55A5A)
-    loaded = np.zeros(32, dtype=np.uint32)
-    aliased = np.zeros(32, dtype=np.uint32)
-    addresses = np.zeros(32, dtype=np.uint32)
-
-    spec = analyze(pointer_derived_shared_raw_roundtrip)
-    assert spec.unsupported == ()
-    module = numsim.transpile(pointer_derived_shared_raw_roundtrip, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module, {"source": source, "loaded": loaded, "aliased": aliased, "addresses": addresses}
-    )
-
-    np.testing.assert_array_equal(result.outputs["loaded"], source)
-    np.testing.assert_array_equal(result.outputs["aliased"], source)
-    np.testing.assert_array_equal(
-        result.outputs["addresses"], np.arange(48, 48 + 32 * 4, 4, dtype=np.uint32)
-    )
-
-    def check_pointer_identity(value):
-        np.testing.assert_array_equal(value, np.arange(48, 48 + 32 * 4, 4, dtype=np.uint32))
-
-    expect_harness_surface(
-        lambda: result.outputs["addresses"],
-        check_pointer_identity,
-    )
-
-
 def test_cvta_assigns_distinct_aligned_virtual_bases_to_shared_backings(tmp_path):
     addresses = np.zeros(2, dtype=np.uint32)
 
@@ -748,25 +663,6 @@ def test_cvta_aligns_each_shared_backing_to_its_declared_alignment(tmp_path):
     np.testing.assert_array_equal(
         result.outputs["addresses"], np.array([4, 128, 140], dtype=np.uint32)
     )
-
-
-def test_get_tmem_addr_packs_wrapped_row_and_column_offsets_per_lane(tmp_path):
-    output = np.zeros(64, dtype=np.uint32)
-
-    module = numsim.transpile(get_tmem_addr_lane_values, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": output})
-
-    lanes = np.arange(32, dtype=np.uint32)
-    expected = np.empty(64, dtype=np.uint32)
-    expected[:32] = (np.uint32(0x0010) << np.uint32(16)) | (
-        (np.uint32(0xFFF0) + lanes * np.uint32(3)) & np.uint32(0xFFFF)
-    )
-    expected[32:] = (np.uint32(0xFFF0) << np.uint32(16)) | (
-        (np.uint32(0x0010) - lanes) & np.uint32(0xFFFF)
-    )
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-    assert "get_tmem_addr(" in module.rust_source
-    assert "fn get_tmem_addr(" not in module.rust_source
 
 
 def test_get_tmem_addr_accepts_unsigned_row_offsets(tmp_path):
@@ -1030,25 +926,3 @@ def test_raw_subword_vector_stores_preserve_each_element(tmp_path):
     np.testing.assert_array_equal(result.outputs["output_v4"], source)
 
 
-def test_raw_load_rejects_an_unmapped_integer_when_the_address_is_consumed(tmp_path):
-    from tirx_harness.numsim.transpiler.artifact_template import emit_rust_module
-    spec = analyze(raw_load_rejects_integer_address)
-    assert spec.unsupported == ()
-    source = emit_rust_module(spec, raw_load_rejects_integer_address)
-    assert "physical_ptr_from_generic_addresses_u64" in source
-    module = numsim.transpile(raw_load_rejects_integer_address, cache_dir=tmp_path)
-    from tirx_harness import racecheck, synccheck
-
-    inputs = {"output": np.zeros(32, dtype=np.uint32)}
-    for checker in (synccheck, racecheck):
-        report = checker(raw_load_rejects_integer_address, inputs)
-        # Missing binding is not proof of OOB. Like an unbound store, this
-        # load must fail closed at the consumer, not during integer transport.
-        assert report.verdict == "incomplete", report.format()
-        assert [finding.kind for finding in report.findings] == ["analysis_incomplete"]
-        assert [finding.details["reason"] for finding in report.findings] == [
-            "integer_address_without_binding"
-        ]
-        assert "T.ptx.ld" in report.format()
-    with pytest.raises(numsim.NumSimExecutionError, match="integer_address_without_binding"):
-        numsim.Engine().run(module, {"output": np.zeros(32, dtype=np.uint32)})

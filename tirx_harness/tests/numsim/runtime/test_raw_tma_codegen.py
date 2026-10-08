@@ -17,7 +17,6 @@ from tests.numsim.support.kernels import (
     raw_tma_transaction_mismatch,
     raw_tma_zero_fill,
 )
-from tirx_harness.numsim.transpiler.frontend import analyze
 from tvm.script import tirx as T
 
 
@@ -1044,18 +1043,6 @@ def test_raw_tensor_map_element_stride_controls_transfer_count(tmp_path):
     np.testing.assert_array_equal(result.outputs["roundtrip"], expected_roundtrip)
 
 
-def test_tensor_map_numpy_rejects_invalid_descriptor_metadata():
-    source = np.arange(12, dtype=np.float32).reshape(3, 4)
-
-    with pytest.raises(ValueError, match="box dimensions must be in 1..256"):
-        _tensor_map(
-            source,
-            global_shape=(4, 3),
-            global_strides=(16,),
-            box_shape=(4, 257),
-        )
-
-
 def test_raw_tma_s2g_returns_the_tensor_map_output(tmp_path):
     source = np.arange(12, dtype=np.float32).reshape(3, 4) + np.float32(0.25)
     output = np.zeros_like(source)
@@ -1244,58 +1231,6 @@ def test_raw_fp4_align16_tensor_map_store_is_rejected(tmp_path):
         match="align16 padded FP4 TensorMap does not support shared-to-global Tensor Copy",
     ):
         numsim.Engine().run(module, {"output_map": output_map})
-
-
-def test_raw_fp4_tensor_map_keeps_align8_shared_bytes_packed(tmp_path):
-    source = np.arange(128, dtype=np.uint8).reshape(2, 64)
-    output = np.zeros_like(source)
-    input_map, _ = _tensor_map(
-        source,
-        global_shape=(128, 2),
-        global_strides=(64,),
-        box_shape=(128, 2),
-        fp4_shared_layout="align8_packed",
-        swizzle="64B",
-    )
-    output_map, _ = _tensor_map(
-        output,
-        global_shape=(128, 2),
-        global_strides=(64,),
-        box_shape=(128, 2),
-        fp4_shared_layout="align8_packed",
-        swizzle="64B",
-    )
-
-    module = numsim.transpile(raw_tma_fp4_align8_roundtrip, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module, {"input_map": input_map, "output_map": output_map}, outputs={"output": "output_map"}
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], source)
-
-
-def test_static_bulk_wait_group_immediates_execute_in_source_order(tmp_path):
-    output = np.zeros(2, dtype=np.int32)
-
-    spec = analyze(raw_tma_dynamic_wait_group_loop)
-    assert spec.unsupported == ()
-    module = numsim.transpile(raw_tma_dynamic_wait_group_loop, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], np.array([10, 11], dtype=np.int32))
-
-
-def test_bulk_wait_group_rejects_runtime_count_during_numsim_transpilation(tmp_path):
-    source = """
-@T.prim_func
-def invalid(pending: T.Buffer((1,), "int32")):
-    T.device_entry()
-    T.ptx.cp.async_.bulk.wait_group.read(pending[0])
-"""
-
-    kernel = tvm.script.from_source(source, {"T": T})
-    with pytest.raises(numsim.UnsupportedTIRxError, match="pending_group_count must be static"):
-        numsim.transpile(kernel, cache_dir=tmp_path)
 
 
 def test_raw_rank3_tensor_map_uses_descriptor_strides(tmp_path):
@@ -1501,47 +1436,3 @@ def test_raw_tensor_map_swizzle_matches_canonical_shared_atom(tmp_path, swizzle_
     np.testing.assert_array_equal(result.outputs["output"], source)
 
 
-def test_sm100_two_cta_barrier_address_targets_pair_base(tmp_path):
-    spec = analyze(raw_tma_sm100_barrier_address)
-    assert spec.unsupported == ()
-
-    even = np.arange(4, dtype=np.float32).reshape(1, 4) + np.float32(10)
-    odd = np.arange(4, dtype=np.float32).reshape(1, 4) + np.float32(20)
-    even_map, _ = _tensor_map(
-        even,
-        global_shape=(4, 1),
-        global_strides=(16,),
-        box_shape=(4, 1),
-    )
-    odd_map, _ = _tensor_map(
-        odd,
-        global_shape=(4, 1),
-        global_strides=(16,),
-        box_shape=(4, 1),
-    )
-
-    module = numsim.transpile(raw_tma_sm100_barrier_address, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "input_map_even": even_map,
-            "input_map_odd": odd_map,
-            "output": np.zeros((2, 4), dtype=np.float32),
-        },
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], np.concatenate([even, odd], axis=0))
-
-
-def test_raw_tensor_map_under_delivery_reports_exact_bytes(tmp_path):
-    source = np.arange(12, dtype=np.float32).reshape(3, 4)
-    input_map, _ = _tensor_map(
-        source,
-        global_shape=(4, 3),
-        global_strides=(16,),
-        box_shape=(4, 3),
-    )
-    module = numsim.transpile(raw_tma_transaction_mismatch, cache_dir=tmp_path)
-
-    with pytest.raises(numsim.NumSimExecutionError, match="transactions=48/52"):
-        numsim.Engine().run(module, {"input_map": input_map})

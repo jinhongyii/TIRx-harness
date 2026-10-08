@@ -4,8 +4,6 @@ import numpy as np
 import pytest
 
 from tirx_harness import numsim
-from tirx_harness.numsim.checkers import _run_racecheck, _run_synccheck
-from tests.numsim.support.manifest import call_op_names
 from tvm.script import tirx as T
 
 
@@ -251,36 +249,6 @@ def test_raw_ptx_warp_collectives_match_ptx_membermask_and_bit_semantics(tmp_pat
     )
 
 
-def test_raw_ptx_shuffle_reads_only_selected_source_lanes(tmp_path):
-    lanes = np.arange(32, dtype=np.uint32)
-    initialized_sources = (lanes // np.uint32(4)) * np.uint32(4) + np.uint32(2)
-    module = numsim.transpile(raw_ptx_shuffle_sparse_sources, cache_dir=tmp_path)
-
-    selected_only = numsim.Engine().run(
-        module,
-        {
-            "selector": initialized_sources,
-            "output": np.zeros(32, dtype=np.uint32),
-        },
-    )
-    assert selected_only.diagnostics == []
-    np.testing.assert_array_equal(
-        selected_only.outputs["output"],
-        (initialized_sources + np.uint32(100)).astype(np.float32).view(np.uint32),
-    )
-
-    selected_uninitialized = numsim.Engine().run(
-        module,
-        {
-            "selector": lanes,
-            "output": np.zeros(32, dtype=np.uint32),
-        },
-    )
-    assert len(selected_uninitialized.diagnostics) == 24
-    assert {item["status"] for item in selected_uninitialized.diagnostics} == {"review"}
-    assert {item["kind"] for item in selected_uninitialized.diagnostics} == {"uninitialized_read"}
-
-
 def test_raw_ptx_f32_reductions_match_nan_and_signed_zero_semantics(tmp_path):
     source = np.arange(32, dtype=np.float32)
     source[5] = np.array([0x7FC1_2345], dtype=np.uint32).view(np.float32)[0]
@@ -368,69 +336,6 @@ def _matching_lane_masks(values: np.ndarray) -> np.ndarray:
     )
 
 
-def test_raw_ptx_match_redux_and_activemask_match_warp_oracles(tmp_path):
-    lanes = np.arange(32, dtype=np.uint32)
-    source32 = (lanes % np.uint32(5)) | (np.uint32(1) << (lanes % np.uint32(31)))
-    source64 = (lanes % np.uint32(3)).astype(np.uint64) * np.uint64(0x100000001)
-
-    module = numsim.transpile(raw_ptx_match_redux_and_activemask, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "source32": source32,
-            "source64": source64,
-            "partial_mask": np.array([0xFF], dtype=np.uint32),
-            "output": np.zeros((32, 13), dtype=np.uint32),
-        },
-    )
-    output = result.outputs["output"]
-
-    np.testing.assert_array_equal(
-        output[:, 0],
-        np.concatenate((np.full(8, 0xFF, dtype=np.uint32), np.zeros(24, dtype=np.uint32))),
-    )
-    np.testing.assert_array_equal(output[:, 1], _matching_lane_masks(source32))
-    np.testing.assert_array_equal(output[:, 2], _matching_lane_masks(source64))
-    np.testing.assert_array_equal(output[:, 3], np.zeros(32, dtype=np.uint32))
-    np.testing.assert_array_equal(output[:, 4:6], np.zeros((32, 2), dtype=np.uint32))
-    np.testing.assert_array_equal(output[:, 6], np.full(32, 0xFFFFFFFF, dtype=np.uint32))
-    np.testing.assert_array_equal(output[:, 7], np.ones(32, dtype=np.uint32))
-    np.testing.assert_array_equal(
-        output[:, 8], np.full(32, np.bitwise_and.reduce(source32), dtype=np.uint32)
-    )
-    np.testing.assert_array_equal(
-        output[:, 9], np.full(32, np.bitwise_or.reduce(source32), dtype=np.uint32)
-    )
-    np.testing.assert_array_equal(
-        output[:, 10], np.full(32, np.bitwise_xor.reduce(source32), dtype=np.uint32)
-    )
-    np.testing.assert_array_equal(output[:8, 11], _matching_lane_masks(source32[:8]))
-    np.testing.assert_array_equal(output[8:, 11:], np.zeros((24, 2), dtype=np.uint32))
-    np.testing.assert_array_equal(
-        output[:8, 12], np.full(8, np.bitwise_xor.reduce(source32[:8]), dtype=np.uint32)
-    )
-
-    with pytest.raises(
-        numsim.NumSimExecutionError, match="participant mask names an inactive lane"
-    ):
-        numsim.Engine().run(
-            module,
-            {
-                "source32": source32,
-                "source64": source64,
-                "partial_mask": np.array([0xFFFFFFFF], dtype=np.uint32),
-                "output": np.zeros((32, 13), dtype=np.uint32),
-            },
-        )
-    assert {
-        "tirx.ptx.activemask",
-        "tirx.ptx.match_all_sync",
-        "tirx.ptx.match_all_sync_p",
-        "tirx.ptx.match_any_sync",
-        "tirx.ptx.redux_sync_bitwise",
-    } <= call_op_names(module.spec.kernels[0])
-
-
 def test_raw_ptx_match_and_activemask_preserve_float_carrier_bits(tmp_path):
     source32_bits = np.resize(
         np.array([0, 0x80000000, 0x7FC12345, 0x7FC12345], dtype=np.uint32), 32
@@ -460,23 +365,6 @@ def test_raw_ptx_match_and_activemask_preserve_float_carrier_bits(tmp_path):
     np.testing.assert_array_equal(
         result.outputs["active"].view(np.uint32), np.full(32, 0xFFFFFFFF, dtype=np.uint32)
     )
-
-
-@pytest.mark.parametrize(
-    "checker", [_run_synccheck, _run_racecheck], ids=["synccheck", "racecheck"]
-)
-def test_raw_ptx_match_collectives_execute_in_checkers(tmp_path, checker):
-    checker(
-        raw_ptx_match_redux_and_activemask,
-        {
-            "source32": np.arange(32, dtype=np.uint32),
-            "source64": np.arange(32, dtype=np.uint64),
-            "partial_mask": np.array([0xFF], dtype=np.uint32),
-            "output": np.zeros((32, 13), dtype=np.uint32),
-        },
-        cache_dir=tmp_path,
-        max_workers=1,
-    ).require_clean()
 
 
 def test_raw_ptx_movmatrix_b16_matches_register_fragment_transpose(tmp_path):

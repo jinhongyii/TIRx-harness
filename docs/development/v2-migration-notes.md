@@ -17,7 +17,7 @@ Each bullet names the behaviour-delta row that rules it:
 
 Each bullet reads: change: before → now. Why.
 
-**One executor.** v2 had an optional `codegen` backend (`NUMSIM_V2_BACKEND`,
+**One executor.** v2 had an optional `codegen` backend (`NUMSIM_BACKEND`,
 `Engine(backend=...)`) → it is deleted; the interpreter is the only executor,
 and every instruction's semantics live in one handler. Why: codegen was never
 faster (median 0.87–0.94x of interpreter core time, plus ~117 ms per call and
@@ -94,12 +94,12 @@ long cold builds), while the interpreter is 2.3–3.0x faster than legacy
 | Variable / argument | Meaning | Default |
 | --- | --- | --- |
 | `NUMSIM_CACHE_DIR` | Cache root: lowered modules in `v2-modules/`. Delete the directory to force re-lowering. | `~/.cache/tirx-harness/numsim` |
-| `NUMSIM_V2_SEED` / `Engine(seed=...)` | Scheduler seed. Results are reproducible for a fixed module, inputs and seed. | `0` |
-| `NUMSIM_V2_NO_CACHE` | `1` disables the module cache. | unset |
+| `NUMSIM_SEED` / `Engine(seed=...)` | Scheduler seed. Results are reproducible for a fixed module, inputs and seed. | `0` |
+| `NUMSIM_NO_CACHE` | `1` disables the module cache. | unset |
 | `Engine(max_workers=...)` | Scheduler threads (`"auto"` = CPU count). Results do not depend on it. | `8` |
 | `Engine(native_loop_iteration_budget=..., native_loop_reschedule_quantum=...)` | Loop budget and slice quantum: positive integers or `None`. Invalid values raise at construction. | engine default |
 
-- **Rename:** the `NUMSIM_V2_` prefix becomes `NUMSIM_` when the legacy engine is deleted. Until then only the `NUMSIM_V2_*` spellings are read; no alias exists yet.
+- **Rename:** the `NUMSIM_` prefix becomes `NUMSIM_` when the legacy engine is deleted. Until then only the `NUMSIM_*` spellings are read; no alias exists yet.
 - **`NUMSIM_WORKER_AFFINITY`** is read only by the legacy engine, and v2 ignores it.
 - **`NUMSIM_IMPL=v2`** is a test-suite switch (`tests/conftest.py`) that points the public names at v2. Library users call `tirx_harness.numsim` directly.
 

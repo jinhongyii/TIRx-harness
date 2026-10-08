@@ -3,8 +3,237 @@
  "mode": "racecheck",
  "phases": [
   {
-   "diagnostics": [],
-   "verdict": "clean"
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1241:1-1241:62",
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1277:1-1277:39"
+     ],
+     "bytes": {
+      "shared": "132096-148480"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_proxy_bridge",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:616:1-616:69",
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:649:1-649:34"
+     ],
+     "bytes": {
+      "tmem-columns": "256-512,1280-1536"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_release_acquire",
+     "space": "tmem",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1235:1-1235:62",
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:649:1-649:34"
+     ],
+     "bytes": {
+      "shared": "181248-214016"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_proxy_bridge",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1277:1-1277:39",
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:649:1-649:34"
+     ],
+     "bytes": {
+      "shared": "181248-197632"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:621:1-621:69",
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:649:1-649:34"
+     ],
+     "bytes": {
+      "tmem-columns": "0-256,1024-1280"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "execution",
+     "ordering_failure": "missing_inter_actor_sync",
+     "space": "tmem",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_write",
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1277:1-1277:39"
+     ],
+     "bytes": {
+      "shared": "181248-197632"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_write",
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:621:1-621:69",
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:649:1-649:34"
+     ],
+     "bytes": {
+      "tmem-columns": "0-256,1024-1280"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_release_acquire",
+     "space": "tmem",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1010:1-1010:60"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1012:1-1012:51"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1017:1-1017:60"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1022:1-1022:41"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1037:1-1037:53",
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1274:1-1274:75"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:1277:1-1277:39",
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:649:1-649:34"
+     ],
+     "bytes": {
+      "shared": "197632-199680"
+     },
+     "category": "advisories",
+     "kind": "cross_cta_async_order",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:626:1-626:50",
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:649:1-649:34"
+     ],
+     "bytes": {
+      "shared": "1024-1056,82944-82976,99328-101376,115712-117760"
+     },
+     "category": "advisories",
+     "kind": "cross_cta_async_order",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:915:1-915:62"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:934:1-934:55"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:991:1-991:55"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention_backward.py:993:1-993:70"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    }
+   ],
+   "verdict": "error"
   }
  ],
  "schema": 4

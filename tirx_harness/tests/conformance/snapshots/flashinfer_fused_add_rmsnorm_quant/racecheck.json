@@ -5,7 +5,9 @@
   {
    "diagnostics": [
     {
-     "anchors": [],
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/norm/_tirx_lite_helpers.py:152:1-152:38"
+     ],
      "bytes": {
       "shared": "256-2048,2304-4096"
      },

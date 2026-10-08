@@ -5,7 +5,9 @@
   {
    "diagnostics": [
     {
-     "anchors": [],
+     "anchors": [
+      "tirx_kernels/ported/cudnn/bsa/block_sparse_attention_forward_combine_sm100_blk64.py:446:1-446:41"
+     ],
      "bytes": {
       "shared": "2688-2944,6784-7040"
      },

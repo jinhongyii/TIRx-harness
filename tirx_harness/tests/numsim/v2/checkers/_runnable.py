@@ -8,7 +8,7 @@ interpreter. They only use the public v2 surface (``tirx_harness.numsim.v2``).
 Every test carries :data:`requires_v2_engine`. It skips until the v2 engine
 runs end to end, which :func:`v2_engine_runnable` probes once per process by
 transpiling a vector add and running NumSim, Racecheck and Synccheck on it.
-Set ``NUMSIM_V2_FORCE_CHECKERS=1`` to run the tests regardless (dev check:
+Set ``NUMSIM_FORCE_CHECKERS=1`` to run the tests regardless (dev check:
 shows how far each one gets today).
 """
 
@@ -21,7 +21,7 @@ from collections.abc import Iterable
 import numpy as np
 import pytest
 
-FORCE_ENV = "NUMSIM_V2_FORCE_CHECKERS"
+FORCE_ENV = "NUMSIM_FORCE_CHECKERS"
 
 _VECTOR_ADD = '''
 @T.prim_func

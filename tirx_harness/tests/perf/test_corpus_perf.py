@@ -176,7 +176,7 @@ def test_checker_phase_on_canonical_case(mode: str, name: str, workers: int, rec
         metrics[f"{prefix}.check.w{workers}"] = timing["check"] / 1e3
     _record(record_property, metrics)
     assert payload["execution_error"] is None, payload
-    expected = snap.load_expected(name, mode, "v2")
+    expected = snap.load_snapshot(name, mode)
     if expected and expected.get("phases"):
         assert result.verdict == expected["phases"][0]["verdict"], payload
     _enforce_baselines(metrics)

@@ -283,21 +283,6 @@ def test_complete_if_then_else_domain_executes_both_branches(tmp_path: Path):
     check()
 
 
-def test_if_then_else_mixed_pointer_spaces_fail_closed(tmp_path: Path):
-    module = numsim.transpile(IF_THEN_ELSE_MIXED_POINTER_SPACES, cache_dir=tmp_path)
-    with pytest.raises(
-        numsim.NumSimExecutionError,
-        match="does not match PTX state space global",
-    ):
-        numsim.Engine(max_workers=1).run(
-            module,
-            {
-                "source": np.full(32, 0x35, dtype=np.uint32),
-                "output": np.zeros(32, dtype=np.uint32),
-            },
-        )
-
-
 def test_complete_tvm_shuffle_payload_domain_executes(tmp_path: Path):
     module = numsim.transpile(DYNAMIC_TVM_SHUFFLE_RUNTIME_DOMAIN, cache_dir=tmp_path)
     arguments = {f"output_{_name(dtype)}": _empty_output(dtype, (32, 4)) for dtype in SCALAR_DTYPES}

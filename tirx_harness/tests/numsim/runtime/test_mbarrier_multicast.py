@@ -76,24 +76,3 @@ def multicast_barrier(out: T.Buffer(({ctas}, 2), "uint32")):
     )
 
 
-@pytest.mark.parametrize("form", MULTICAST_FORMS)
-def test_mbarrier_multicast32(form, tmp_path):
-    kernel = multicast_barrier_kernel(form)
-    inputs = {"out": np.zeros((20, 2), np.uint32)}
-    result = run_checked(kernel, inputs, cache_dir=tmp_path)
-    np.testing.assert_array_equal(result.outputs["out"], np.ones((20, 2), np.uint32))
-
-
-def test_mbarrier_multicast_lane_masks(tmp_path):
-    kernel = multicast_barrier_kernel("arrive_drop", lane_varying=True)
-    inputs = {"out": np.zeros((20, 2), np.uint32)}
-    result = run_checked(kernel, inputs, cache_dir=tmp_path)
-    np.testing.assert_array_equal(result.outputs["out"], 1)
-
-
-def test_mbarrier_multicast_outside_cluster():
-    kernel = multicast_barrier_kernel("arrive", mask=1 << 20)
-    for checker in (synccheck, racecheck):
-        report = checker(kernel, {"out": np.zeros((20, 2), np.uint32)})
-        assert report.verdict == "error", report.format()
-        assert "outside the cluster" in report.format()

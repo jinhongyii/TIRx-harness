@@ -348,30 +348,6 @@ def test_host_encoded_fp4_tensor_map_preserves_packed_bytes(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], source[:64])
 
 
-def test_dynamic_tensor_map_expressions_run_in_the_loaded_artifact_prologue(tmp_path):
-    module = numsim.transpile(host_encoded_dynamic_integer_tensor_map, cache_dir=tmp_path)
-
-    # Loading imports and validates the Rust extension without any runtime
-    # bindings.  The implicit descriptor is constructed only by ``run`` below.
-    module.load()
-    source = np.arange(1, 33, dtype=np.uint8)
-    inputs = {
-        "source": source,
-        "output": np.zeros(16, dtype=np.uint8),
-        "delta": np.int32(-7),
-    }
-    result = numsim.Engine().run(module, inputs)
-
-    # The independent descriptor oracles are global_shape=32 and box_shape=16:
-    # -7/2 truncates to -3 while floor division is -4. Reading at coordinate
-    # 16 makes the distinction observable: an incorrect global_shape=31 would
-    # zero-fill the final element as out of bounds.
-    trunc_oracle = -(abs(-7) // abs(2))
-    assert trunc_oracle == -3
-    assert int(np.floor_divide(np.int64(-7), np.int64(2))) == -4
-    np.testing.assert_array_equal(result.outputs["output"], source[16:])
-
-
 def test_dynamic_tensor_map_prologue_is_shared_by_native_checkers():
     inputs = {
         "source": np.arange(1, 33, dtype=np.uint8),
@@ -384,11 +360,6 @@ def test_dynamic_tensor_map_prologue_is_shared_by_native_checkers():
 
     assert sync_report.verdict == "clean", sync_report.format()
     assert race_report.verdict == "clean", race_report.format()
-
-
-def test_host_tensor_map_integer_expressions_fail_closed_on_unregistered_nodes(tmp_path):
-    with pytest.raises(UnsupportedTIRxError, match="unsupported integer operation BitwiseAnd"):
-        numsim.transpile(host_encoded_unregistered_integer_tensor_map, cache_dir=tmp_path)
 
 
 def test_direct_cuda_launch_coordinates_match_numsim_topology(tmp_path):

@@ -1,4 +1,4 @@
-"""Build commands must carry the native frontend's companion files and the skills."""
+"""Build commands must build the NumSim engine extension and carry the skills."""
 
 import runpy
 import subprocess
@@ -8,38 +8,34 @@ import setuptools
 from setuptools import Distribution, Extension
 
 
-def test_editable_frontend_copies_identity_and_licenses(tmp_path, monkeypatch):
+def test_editable_core_extension_is_copied_to_source(tmp_path, monkeypatch):
+    """Post-deletion setup.py builds only ``numsim_core_py`` (no legacy frontend
+    extension, identity file or tvm-rust-ext licenses); an editable build copies
+    it next to the v2 package."""
     monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
     definitions = runpy.run_path(str(Path(__file__).resolve().parents[2] / "setup.py"))
+    assert "RustBuildExt" not in definitions
     source = tmp_path / "src"
-    package = source / "tirx_harness" / "numsim"
+    package = source / "tirx_harness" / "numsim" / "v2"
     package.mkdir(parents=True)
-    extension = Extension("tirx_harness.numsim._tvm_rust_ext", sources=[], py_limited_api=True)
+    extension = Extension("tirx_harness.numsim.v2.numsim_core_py", sources=[], py_limited_api=True)
     distribution = Distribution({
-        "packages": ["tirx_harness.numsim"],
+        "packages": ["tirx_harness.numsim.v2"],
         "package_dir": {"": str(source)},
         "ext_modules": [extension],
     })
-    command = definitions["RustBuildExt"](distribution)
+    command = definitions["CoreBuildExt"](distribution)
     command.build_lib = str(tmp_path / "build")
     command.ensure_finalized()
     library = Path(command.get_ext_fullpath(extension.name))
     library.parent.mkdir(parents=True)
-    library.write_bytes(b"native frontend")
-    identity = library.with_name("_tvm_rust_ext.identity")
-    identity.write_text("test-build:revision\n")
-    licenses = library.parent / "_thirdparty_licenses" / "tvm-rust-ext"
-    licenses.mkdir(parents=True)
-    for name in ("LICENSE", "NOTICE"):
-        (licenses / name).write_text(name)
+    library.write_bytes(b"numsim core")
 
     # Setuptools' editable build copies extensions from build_lib to src.
     command.copy_extensions_to_source()
 
     assert (package / library.name).read_bytes() == library.read_bytes()
-    assert (package / identity.name).read_text() == identity.read_text()
-    for name in ("LICENSE", "NOTICE"):
-        assert (package / "_thirdparty_licenses" / "tvm-rust-ext" / name).read_text() == name
+    assert not list(package.parent.glob("_tvm_rust_ext*"))
 
 
 def _setup_definitions(monkeypatch):

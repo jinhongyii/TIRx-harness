@@ -19,9 +19,15 @@ transition counts, occurrence counts, warp ids, per-warp sequence numbers,
 loop iteration ordinals, internal op ids (they are resolved to source spans
 first) and anonymous buffer names.
 
-An implementation failure (exception before any payload is produced) is
-recorded as ``{"error": "<ExceptionType>"}`` so a later change in behavior
-shows up as a diff rather than as a silent skip.
+An engine failure (exception before any payload is produced) is recorded as
+``{"error": "<ExceptionType>"}`` so a later change in behavior shows up as a
+diff rather than as a silent skip.
+
+The snapshots are the NumSim oracle (``tirx_harness.numsim``): ``pytest
+tests/conformance --update-snapshots`` regenerates them, and every commit that
+changes one cites a behaviour-delta row (``scripts/numsim-v2/
+check_snapshot_deltas.py``) or carries a ``Snapshot-Regen: schema <reason>``
+trailer (see README.md).
 """
 
 from __future__ import annotations
@@ -30,9 +36,7 @@ import copy
 import hashlib
 import json
 import os
-import re
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -40,11 +44,8 @@ import numpy as np
 
 SCHEMA_VERSION = 4  # 2: no window alloc ids; 3: register reads -> presence; 4: tmem_lifetime_review -> kind + anchors
 MODES = ("numsim", "racecheck", "synccheck")
-# ``NUMSIM_SNAPSHOT_ROOT`` points the suite at another snapshot tree (e.g. a
-# scratch copy folded with scripts/numsim-v2/fold_snapshot_deltas.py).
+# ``NUMSIM_SNAPSHOT_ROOT`` points the suite at another snapshot tree.
 SNAPSHOT_ROOT = Path(os.environ.get("NUMSIM_SNAPSHOT_ROOT") or Path(__file__).resolve().parent / "snapshots")
-IMPL_ENV = "NUMSIM_IMPL"
-IMPLS = ("legacy", "v2")
 
 # Payload lists that carry diagnostics, by mode. ``sync`` is Racecheck's
 # embedded synchronization-protocol sub-report.
@@ -70,27 +71,6 @@ def load_snapshot(case_name: str, mode: str, root: Path = SNAPSHOT_ROOT) -> dict
     if not path.exists():
         return None
     return json.loads(path.read_text())
-
-
-def delta_snapshot_path(case_name: str, mode: str, root: Path = SNAPSHOT_ROOT) -> Path:
-    return root / case_name / f"{mode}.delta.json"
-
-
-def load_expected(case_name: str, mode: str, impl_name: str, root: Path = SNAPSHOT_ROOT) -> dict[str, Any] | None:
-    """The oracle for ``impl_name``.
-
-    Legacy always compares with ``<mode>.json`` (legacy output). A new
-    implementation compares with ``<mode>.delta.json`` when present: the
-    legacy snapshot corrected by a behaviour-delta row (its ``delta`` field
-    names the row and is not part of the comparison)."""
-
-    if impl_name != "legacy" and legacy_available():
-        path = delta_snapshot_path(case_name, mode, root)
-        if path.exists():
-            data = json.loads(path.read_text())
-            data.pop("delta", None)
-            return data
-    return load_snapshot(case_name, mode, root)
 
 
 def write_snapshot(
@@ -152,41 +132,23 @@ def format_span(span: Any) -> str | None:
 
 
 class SourceResolver:
-    """Maps legacy ``(kernel_index, source_op_id)`` pairs to source anchors."""
+    """Maps ``(kernel_index, site)`` pairs (a record's ``source_op_id``) to the
+    site's source anchor. A site without a span adds no anchor."""
 
     def __init__(self, module: Any):
         self._sites: dict[tuple[int, int], str] = {}
-        self._v2: set[int] = set()
-        spec = getattr(module, "spec", None)
-        for kernel_index, kernel in enumerate(getattr(spec, "kernels", ()) or ()):
-            sites = getattr(kernel, "sites", None)
-            if sites and not getattr(kernel, "source_map", ()):
-                # v2: `source_op_id` is a SiteId; its anchor is the site's source
-                # span (the same anchor the record's `source_span` gives). A
-                # site without a span adds no anchor: its text is additive.
-                for site in range(len(sites)):
-                    anchor = format_span(kernel.source_span(site))
-                    if anchor is not None:
-                        self._sites[(kernel_index, site)] = anchor
-                self._v2.add(kernel_index)
-                continue
-            for entry in getattr(kernel, "source_map", ()) or ():
-                span = getattr(entry, "span", None)
-                anchor = format_span(span.to_dict()) if span is not None else None
-                if anchor is None:
-                    # No span: fall back to the bounded IR text, which is
-                    # still independent of internal op numbering.
-                    anchor = f"<{entry.kind}> {entry.text}"
-                self._sites[(kernel_index, entry.op_id)] = anchor
+        for kernel in getattr(getattr(module, "spec", None), "kernels", ()) or ():
+            for site in range(len(kernel.sites)):
+                anchor = format_span(kernel.source_span(site))
+                if anchor is not None:
+                    self._sites[(kernel.index, site)] = anchor
 
     def resolve(self, kernel_index: Any, source_op_id: Any) -> str | None:
         if not isinstance(kernel_index, int) or isinstance(kernel_index, bool):
             return None
         if not isinstance(source_op_id, int) or isinstance(source_op_id, bool):
             return None
-        if kernel_index in self._v2:
-            return self._sites.get((kernel_index, source_op_id))
-        return self._sites.get((kernel_index, source_op_id), f"<unmapped op {source_op_id}>")
+        return self._sites.get((kernel_index, source_op_id))
 
 
 def collect_anchors(value: Any, resolver: SourceResolver | None, *, kernel_index: int | None = None) -> set[str]:
@@ -244,7 +206,7 @@ def _intervals(value: Any) -> Iterable[tuple[str, int, int]]:
         yield _region(space, alloc), start, start + int(value["byte_len"])
 
 
-# numsim-core space names that legacy spelled differently.
+# Canonical space spellings in snapshots (numsim-core says ``reg``).
 _SPACE_ALIASES = {"reg": "register"}
 
 
@@ -262,9 +224,8 @@ def record_space(value: Mapping[str, Any]) -> str | None:
 
 
 # Spaces with one window per CTA: the allocation id is an engine-internal
-# numbering (legacy counts per space, numsim-core counts globally), so only
-# the space is kept. Global allocations keep their id (host parameter order
-# in both engines).
+# numbering, so only the space is kept. Global allocations keep their id
+# (host parameter order).
 _WINDOW_SPACES = frozenset({"shared", "tmem", "local", "register", "param"})
 
 
@@ -338,9 +299,8 @@ def normalize_records(
             continue
         columns = record.get("tmem_columns")
         # numsim-core states TMEM footprints as exact column ranges
-        # (`tmem_columns = [[lo, hi], ...]` in 4-byte columns; an older single
-        # `[lo, hi]` is accepted too); its byte spans are taddr-encoded and
-        # not comparable to legacy's lane*2048+col*4.
+        # (`tmem_columns = [[lo, hi], ...]` in 4-byte columns; a single
+        # `[lo, hi]` is accepted too); its byte spans are taddr-encoded.
         if isinstance(columns, (list, tuple)) and len(columns) == 2 and all(isinstance(c, int) for c in columns):
             columns = [columns]
         explicit_columns = isinstance(columns, (list, tuple)) and bool(columns) and all(
@@ -423,149 +383,6 @@ def normalize_numsim(
     }
 
 
-def _regroup(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[str, dict[str, Any]] = {}
-    for group in groups:
-        key_fields = {k: v for k, v in group.items() if k != "bytes"}
-        key = json.dumps(key_fields, sort_keys=True)
-        target = merged.setdefault(key, {**key_fields, "_bytes": {}})
-        for region, text in (group.get("bytes") or {}).items():
-            for part in filter(None, text.split(",")):
-                start, end = part.split("-")
-                target["_bytes"].setdefault(region, []).append((int(start), int(end)))
-    out = []
-    for key in sorted(merged):
-        group = merged[key]
-        footprint = {r: merge_intervals(items) for r, items in sorted(group.pop("_bytes").items())}
-        if footprint:
-            group["bytes"] = footprint
-        out.append(group)
-    return out
-
-
-def relax_unanchored(expected: dict[str, Any], actual: dict[str, Any]) -> dict[str, Any]:
-    """Drop source anchors the legacy oracle could not record.
-
-    Legacy NumSim/Racecheck emitted some diagnostics (notably
-    ``uninitialized_read`` without a source op) with no source evidence, so
-    their snapshot groups have ``anchors == []``. A new implementation that
-    attaches the real source site is not wrong. For every
-    (category, kind, status, space) whose expected groups are all
-    unanchored, the actual groups lose their anchors and are re-merged;
-    everything else (kinds, statuses, byte footprints) is still compared.
-    Used only for non-legacy implementations.
-    """
-
-    def unanchored_keys(groups: list[dict[str, Any]]) -> set[tuple]:
-        keys: dict[tuple, bool] = {}
-        for g in groups:
-            key = (g.get("category"), g.get("kind"), g.get("status"), g.get("space"))
-            keys[key] = keys.get(key, True) and not g.get("anchors")
-        return {k for k, unanchored in keys.items() if unanchored}
-
-    def relax(exp_groups: list[dict[str, Any]], act_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        keys = unanchored_keys(exp_groups)
-        changed = [
-            {**g, "anchors": []} if (g.get("category"), g.get("kind"), g.get("status"), g.get("space")) in keys else g
-            for g in act_groups
-        ]
-        return _regroup(changed)
-
-    actual = copy.deepcopy(actual)
-    if "diagnostics" in expected and "diagnostics" in actual:
-        actual["diagnostics"] = relax(expected["diagnostics"], actual["diagnostics"])
-    for exp_phase, act_phase in zip(expected.get("phases") or (), actual.get("phases") or ()):
-        act_phase["diagnostics"] = relax(exp_phase["diagnostics"], act_phase["diagnostics"])
-    return actual
-
-
-# --------------------------------------------------------------------------
-# Implementations
-
-
-@dataclass(frozen=True)
-class Implementation:
-    name: str
-    numsim: Any  # module exposing ``transpile``, ``Engine``, ``CoverageBounds``...
-
-
-class ImplementationUnavailable(RuntimeError):
-    pass
-
-
-def legacy_available() -> bool:
-    """Whether the legacy engine is still installed.
-
-    After step 5 (``retire_legacy.py --apply``) the legacy package is gone: v2
-    is the oracle, ``--update-snapshots`` regenerates from v2, delta files
-    have been folded into the base snapshots, and ``NUMSIM_IMPL`` no longer
-    selects anything. ``dump_rust`` exists only on the legacy public surface.
-    """
-
-    try:
-        from tirx_harness import numsim
-    except ImportError:
-        return False
-    return hasattr(numsim, "dump_rust") and hasattr(numsim, "Engine")
-
-
-def selected_impl_name() -> str:
-    if not legacy_available():
-        value = os.environ.get(IMPL_ENV, "").strip()
-        if value == "legacy":
-            raise ValueError(f"{IMPL_ENV}=legacy but the legacy engine has been deleted")
-        return "v2"
-    value = os.environ.get(IMPL_ENV, "legacy").strip() or "legacy"
-    if value not in IMPLS:
-        raise ValueError(f"{IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    return value
-
-
-def oracle_impl_name() -> str:
-    """The implementation ``--update-snapshots`` regenerates from."""
-
-    return "legacy" if legacy_available() else "v2"
-
-
-def load_implementation(name: str | None = None) -> Implementation:
-    """Return the NumSim implementation selected by ``NUMSIM_IMPL``.
-
-    ``v2`` must expose the legacy public surface (``transpile``, ``Engine``
-    with ``run``/``run_racecheck_phase``/``run_synccheck_phase``,
-    ``CoverageBounds``, ``ResourceLimits``) per the redesign plan; payload
-    diagnostics may reference source either through legacy
-    ``(kernel_index, source_op_id)`` pairs resolvable via
-    ``module.spec.kernels[i].source_map`` or through embedded serialized
-    ``source_span`` dicts.
-    """
-
-    name = name or selected_impl_name()
-    if name == "legacy":
-        from tirx_harness import numsim
-
-        return Implementation("legacy", numsim)
-    try:
-        from tirx_harness.numsim import v2  # type: ignore[attr-defined]
-    except ImportError as error:
-        if not legacy_available():
-            # Post-deletion layout: v2 is promoted to ``tirx_harness.numsim``.
-            from tirx_harness import numsim as promoted
-
-            return Implementation("v2", promoted)
-        raise ImplementationUnavailable(
-            f"NUMSIM_IMPL=v2 but tirx_harness.numsim.v2 is not importable: {error}"
-        ) from error
-    missing = [name for name in _REQUIRED_SURFACE if not hasattr(v2, name)]
-    if missing:
-        raise ImplementationUnavailable(
-            f"tirx_harness.numsim.v2 does not expose the conformance surface yet: missing {missing}"
-        )
-    return Implementation("v2", v2)
-
-
-_REQUIRED_SURFACE = ("transpile", "Engine", "compare", "CoverageBounds", "ResourceLimits")
-
-
 def _synccheck_limits(numsim: Any, max_diagnostic_bytes: int) -> Any:
     # Same budget as the synccheck corpus gate
     # (tests/analysis_tools/synccheck/corpus/test_tirx_kernels_synccheck.py).
@@ -581,32 +398,22 @@ def _synccheck_limits(numsim: Any, max_diagnostic_bytes: int) -> Any:
 
 
 def _run_numsim_case(numsim: Any, entry: Any) -> dict[str, Any]:
-    """Mirror ``numsim.run_case`` but keep the raw outputs for hashing."""
+    """Mirror ``numsim.run_case`` but keep the raw outputs for hashing.
+
+    The reference is computed before the run; ``Engine.run`` never mutates
+    its inputs (v2 binder rule), so the arguments it sees are unchanged."""
 
     case = entry.prepare()
     engine = numsim.Engine(max_workers=entry.engine_max_workers)
     module = numsim.transpile(case.kernel)
-    if hasattr(engine, "_prepare_execution"):
-        from dataclasses import replace
-
-        execution = engine._prepare_execution(
-            module, case.args, outputs=case.outputs, assumptions=case.assumptions
-        )
-        execution = replace(execution, bindings=execution.bindings.freeze())
-        try:
-            expected = copy.deepcopy(case.reference())
-        finally:
-            execution.bindings.restore_host_buffers()
-        result = engine._execute_prepared(module, execution, subset=case.subset)
-    else:
-        expected = copy.deepcopy(case.reference())
-        result = engine.run(
-            module,
-            case.args,
-            subset=case.subset,
-            assumptions=case.assumptions,
-            outputs=case.outputs,
-        )
+    expected = copy.deepcopy(case.reference())
+    result = engine.run(
+        module,
+        case.args,
+        subset=case.subset,
+        assumptions=case.assumptions,
+        outputs=case.outputs,
+    )
     reference_ok = bool(numsim.compare(result, expected, tolerances=case.comparisons).ok)
     return normalize_numsim(
         result.outputs,
@@ -617,16 +424,10 @@ def _run_numsim_case(numsim: Any, entry: Any) -> dict[str, Any]:
 
 
 def _run_analysis_case(numsim: Any, entry: Any, mode: str) -> dict[str, Any]:
-    # Transpile/run options mirror the corpus gates:
-    # tests/analysis_tools/{racecheck,synccheck}/corpus/.
+    # Synccheck limits mirror the former corpus gate budget.
     case = entry.prepare()
     engine = numsim.Engine(max_workers=entry.engine_max_workers)
-    if mode == "racecheck":
-        module = numsim.transpile(case.kernel, _analysis_capable=True, _analysis_checker="racecheck")
-    else:
-        module = numsim.transpile(
-            case.kernel, _analysis_capable=True, _default_generated_opt_level=3
-        )
+    module = numsim.transpile(case.kernel)
     resolver = SourceResolver(module)
     phases = []
     for phase_index in range(len(module.spec.kernels)):
@@ -636,7 +437,6 @@ def _run_analysis_case(numsim: Any, entry: Any, mode: str) -> dict[str, Any]:
                 case.args,
                 phase_index=phase_index,
                 subset=case.subset,
-                advance_prefix=True,
             )
         else:
             result = engine.run_synccheck_phase(
@@ -644,7 +444,6 @@ def _run_analysis_case(numsim: Any, entry: Any, mode: str) -> dict[str, Any]:
                 case.args,
                 phase_index=phase_index,
                 subset=case.subset,
-                advance_prefix=True,
                 coverage_bounds=numsim.CoverageBounds(
                     max_warp_preemptions=0,
                     max_completion_schedule_deviations=0,
@@ -658,23 +457,24 @@ def _run_analysis_case(numsim: Any, entry: Any, mode: str) -> dict[str, Any]:
 def collect_snapshot(
     entry: Any,
     mode: str,
-    impl: Implementation,
+    numsim: Any = None,
     *,
     reraise: tuple[type[BaseException], ...] = (),
 ) -> dict[str, Any]:
     """Run one canonical case in one mode and return its normalized snapshot.
 
-    Exceptions are recorded as ``{"error": type}`` except those in
-    ``reraise`` (v2 re-raises ``NotImplementedError`` so unfinished engine
-    bodies skip instead of failing).
+    ``numsim`` defaults to ``tirx_harness.numsim``. Exceptions are recorded
+    as ``{"error": type}`` except those in ``reraise``.
     """
 
+    if numsim is None:
+        from tirx_harness import numsim
     header = {"schema": SCHEMA_VERSION, "case": entry.name, "mode": mode}
     try:
         if mode == "numsim":
-            body = _run_numsim_case(impl.numsim, entry)
+            body = _run_numsim_case(numsim, entry)
         elif mode in ("racecheck", "synccheck"):
-            body = _run_analysis_case(impl.numsim, entry, mode)
+            body = _run_analysis_case(numsim, entry, mode)
         else:
             raise ValueError(f"unknown conformance mode {mode!r}")
     except reraise:
@@ -685,21 +485,15 @@ def collect_snapshot(
 
 
 __all__ = [
-    "IMPL_ENV",
     "MODES",
+    "SCHEMA_VERSION",
     "SNAPSHOT_ROOT",
-    "ImplementationUnavailable",
     "SourceResolver",
     "collect_snapshot",
     "diff_snapshots",
-    "load_implementation",
-    "load_expected",
-    "legacy_available",
+    "dumps",
     "load_snapshot",
-    "oracle_impl_name",
     "normalize_analysis_phase",
     "normalize_numsim",
-    "relax_unanchored",
-    "selected_impl_name",
     "write_snapshot",
 ]

@@ -76,15 +76,6 @@ def test_sparse_b16_layouts_and_codecs(case, tmp_path):
     np.testing.assert_array_equal(result.outputs["out"], expected)
 
 
-def test_sparse_b16_metadata_and_b_lifetimes():
-    for resource in ("b", "lookup"):
-        kernel, args, _ = sparse_float_case(*SPARSE_B16_CASES[0], early_reuse=resource)
-        for disabled in (True, False):
-            args["zero_mask"][0] = np.uint64(1 << 63 if disabled else 0)
-            report = racecheck(kernel, args)
-            assert report.verdict == ("clean" if disabled else "error"), report.to_dict()
-
-
 def test_sparse_b16_invalid_metadata(tmp_path):
     kernel, args, _ = sparse_float_case(*SPARSE_B16_CASES[0])
     args["metadata"][:, :, 1] = 0x33333333

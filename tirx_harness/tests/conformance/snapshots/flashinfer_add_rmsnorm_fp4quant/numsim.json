@@ -2,9 +2,23 @@
  "case": "flashinfer_add_rmsnorm_fp4quant",
  "diagnostics": [
   {
-   "anchors": [],
+   "anchors": [
+    "tirx_kernels/ported/flashinfer/norm/add_rmsnorm_fp4quant.py:912:1-912:38"
+   ],
    "bytes": {
-    "shared": "128-2048,2176-4096"
+    "shared": "128-2048"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "shared",
+   "status": "review"
+  },
+  {
+   "anchors": [
+    "tirx_kernels/ported/flashinfer/norm/add_rmsnorm_fp4quant.py:919:1-919:38"
+   ],
+   "bytes": {
+    "shared": "2176-4096"
    },
    "category": "diagnostics",
    "kind": "uninitialized_read",

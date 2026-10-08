@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from tirx_harness.numsim.transpiler.frontend import analyze
 
 import numpy as np
 
@@ -396,11 +395,6 @@ def _expand_sparse_m16n8k16(packed: np.ndarray, codes: np.ndarray) -> np.ndarray
     return dense
 
 
-def test_matrix_family_supports_dense_and_sparse_ptx():
-    assert analyze(ptx_mma_tf32_m16n8k8).unsupported == ()
-    assert analyze(ptx_mma_sp_f16_m16n8k16).unsupported == ()
-
-
 def test_mma_fragment_fill_and_store_observe_lane_register_layout(tmp_path):
     module = numsim.transpile(mma_fragment_fill_and_store, cache_dir=tmp_path)
     result = numsim.Engine().run(
@@ -462,18 +456,6 @@ def test_ptx_mma_mixed_accumulator_and_literal_zero_c(tmp_path):
     result = numsim.Engine().run(module, {"output": np.zeros((4, 32), np.float32)})
     expected = np.full((4, 32), 32, np.float32)  # 16 products of 1 * 2.
     expected[0] += 5
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_ptx_mma_legacy_executes_actual_pointer_offset_abi(tmp_path):
-    a = (np.arange(16 * 16, dtype=np.float16).reshape(16, 16) % 5) / np.float16(2)
-    b = (np.arange(16 * 8, dtype=np.float16).reshape(16, 8) % 7) / np.float16(4)
-    c = np.arange(16 * 8, dtype=np.float32).reshape(16, 8) / 32
-    module = numsim.transpile(ptx_mma_legacy_f16_m16n8k16, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module, {"a": a, "b": b, "c": c, "output": np.zeros((16, 8), dtype=np.float32)}
-    )
-    expected = a.astype(np.float32) @ b.astype(np.float32) + c
     np.testing.assert_array_equal(result.outputs["output"], expected)
 
 

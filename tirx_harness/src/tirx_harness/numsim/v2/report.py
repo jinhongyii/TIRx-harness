@@ -592,7 +592,7 @@ def compare(
     (``numsim.api.compare``) until step 5 of the migration moves it here.
     """
 
-    from tirx_harness.numsim.api import compare as legacy_compare
+    from ._compare import compare as legacy_compare
 
     legacy = legacy_compare(result, expected, tolerances=tolerances)
     return NumSimReport(legacy.ok, legacy.mismatches, list(getattr(result, "diagnostics", ())))

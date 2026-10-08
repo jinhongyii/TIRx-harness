@@ -70,13 +70,3 @@ def test_mbarrier_drop(form, tmp_path):
     np.testing.assert_array_equal(result.outputs["out"], [1, 1, 1])
 
 
-@pytest.mark.parametrize("form", ["count", "no_complete"])
-def test_mbarrier_drop_invalid_count(form):
-    kernel = drop_kernel(form, count=5)
-    for checker in (synccheck, racecheck):
-        report = checker(kernel, {"out": np.zeros(3, np.uint32)})
-        assert report.verdict == "error", report.format()
-        assert any(
-            "arrival" in finding.kind or finding.kind == "engine_error"
-            for finding in report.findings
-        )

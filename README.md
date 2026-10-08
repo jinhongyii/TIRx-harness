@@ -44,7 +44,7 @@ python -m pip install tirx-harness
 To develop the harness, follow
 [Build from source](https://tirxharness.mlc.ai/docs/installation.html#build-from-source)
 for the build prerequisites, repository checkout, and the native build steps:
-the TIRx frontend submodule (pending: not needed once the legacy NumSim engine is deleted)
+the TIRx frontend submodule
 and the one-time build of the NumSim engine extension.
 
 See the [documentation](https://tirxharness.mlc.ai/docs/) for details:

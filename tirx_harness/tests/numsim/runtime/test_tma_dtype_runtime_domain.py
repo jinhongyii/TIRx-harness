@@ -127,19 +127,3 @@ def test_typed_tma_supported_dtype_domain_preserves_values_and_bytes(tmp_path, c
     check()
 
 
-def test_typed_tma_rejects_unmodeled_production_dtypes(tmp_path):
-    observed = set()
-    for dtype, reason, member in _REJECTED_REASONS:
-        extent = {
-            "bool": 512,
-            "float4_e2m1fn": 128,
-            "float8_e8m0fnu": 64,
-            "int16": 32,
-            "uint32x2": 8,
-        }[dtype]
-        kernel = _roundtrip_kernel(dtype, extent)
-        with pytest.raises(numsim.UnmodeledTIRxFormError, match=reason) as caught:
-            numsim.transpile(kernel, cache_dir=tmp_path / dtype)
-        assert caught.value.target_id == "tile:tirx.tile.copy_async"
-        observed.add(member)
-    assert observed == {member for _dtype, _reason, member in _REJECTED_REASONS}

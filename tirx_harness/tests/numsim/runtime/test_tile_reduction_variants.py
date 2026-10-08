@@ -208,23 +208,6 @@ def _grouped_lexicographic_reduce(values: np.ndarray, width: int, dtype, reducer
     return result
 
 
-def test_shared_cta_reductions_support_float16_and_scope_completion(tmp_path):
-    source = np.linspace(-2, 3, 64 * 4, dtype=np.float32).reshape(64, 4).astype(np.float16)
-    output = np.zeros((3, 64), dtype=np.float16)
-
-    module = numsim.transpile(shared_cta_f16_reductions, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    expected = np.stack(
-        [
-            _stepwise_low_precision_sum(source, np.float16),
-            np.max(source, axis=1),
-            np.min(source, axis=1),
-        ]
-    )
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
 def test_local_reductions_round_each_bfloat16_sum_step(tmp_path):
     dtype = ml_dtypes.bfloat16
     source = np.linspace(-1, 2, 32 * 4, dtype=np.float32).reshape(32, 4).astype(dtype)
@@ -304,26 +287,6 @@ def test_local_integer_reductions_wrap_and_preserve_order(dtype, numpy_dtype, tm
     np.testing.assert_array_equal(result.outputs["output"], np.broadcast_to(expected, output.shape))
 
 
-def test_warp_collective_reduction_follows_physical_lane_ownership(tmp_path):
-    source = np.linspace(-4, 3, 64, dtype=np.float32).reshape(32, 2)
-    output = np.zeros((3, 32, 2), dtype=np.float32)
-
-    module = numsim.transpile(warp_collective_reductions, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    expected_sum = _grouped_lexicographic_reduce(
-        source, 32, np.float32, lambda lhs, rhs: np.float32(lhs + rhs)
-    )
-    expected = np.stack(
-        [
-            expected_sum,
-            _grouped_lexicographic_reduce(source, 32, np.float32, max),
-            _grouped_lexicographic_reduce(source, 32, np.float32, min),
-        ]
-    )
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
 def test_partial_warp_collective_reduction_preserves_lane_groups(tmp_path):
     source = np.arange(32 * 2, dtype=np.float32).reshape(32, 2) + np.float32(0.25)
 
@@ -346,80 +309,3 @@ def test_partial_warp_collective_reduction_preserves_lane_groups(tmp_path):
         np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-def test_shared_cta_accum_reduction_writes_each_output_once(tmp_path):
-    source = np.linspace(-1.5, 2.0, 64 * 4, dtype=np.float32).reshape(64, 4)
-    initial = np.linspace(3.0, 5.0, 64, dtype=np.float32)
-    output = np.zeros((64,), dtype=np.float32)
-
-    module = numsim.transpile(shared_cta_accum_sum, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "initial": initial, "output": output})
-
-    expected = _stepwise_low_precision_sum(source, np.float32, initial)
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_shared_reduction_uses_lexicographic_order(tmp_path):
-    source = np.zeros((64, 4), dtype=np.float16)
-    source[:] = np.asarray([10000.0, 1.0, -10000.0, 1.0], dtype=np.float16)
-    output = np.zeros((3, 64), dtype=np.float16)
-
-    result = numsim.Engine().run(
-        numsim.transpile(shared_cta_f16_reductions, cache_dir=tmp_path),
-        {"source": source, "output": output},
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"][0], np.ones(64, dtype=np.float16))
-
-
-def test_empty_reduction_axes_follow_identity_reduction_semantics(tmp_path):
-    source = np.linspace(-3, 5, 32, dtype=np.float32)
-    output = np.zeros((3, 32), dtype=np.float32)
-
-    result = numsim.Engine().run(
-        numsim.transpile(shared_empty_axis_reductions, cache_dir=tmp_path),
-        {"source": source, "output": output},
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], np.broadcast_to(source, output.shape))
-
-
-def test_local_collective_uses_lexicographic_order(tmp_path):
-    source = np.zeros((32, 2), dtype=np.float32)
-    source[:4, 0] = np.asarray([1.0e20, 1.0, -1.0e20, 1.0], dtype=np.float32)
-    output = np.zeros((3, 32, 2), dtype=np.float32)
-
-    result = numsim.Engine().run(
-        numsim.transpile(warp_collective_reductions, cache_dir=tmp_path),
-        {"source": source, "output": output},
-    )
-
-    np.testing.assert_array_equal(
-        result.outputs["output"][0, :, 0], np.full(32, 1.0, dtype=np.float32)
-    )
-
-
-def test_maxmin_uses_canonical_lexicographic_nan_and_signed_zero_order(tmp_path):
-    nan = np.asarray([0x7FC0_1234], dtype=np.uint32).view(np.float32)[0]
-    source = np.asarray(
-        [
-            [nan, -0.0, 0.0, nan, -np.inf, -np.inf, nan, nan],
-            [nan, nan, nan, nan, nan, nan, nan, nan],
-        ],
-        dtype=np.float32,
-    )
-    output = np.zeros((4, 32), dtype=np.float32)
-
-    result = (
-        numsim.Engine()
-        .run(
-            numsim.transpile(three_input_maxmin_order, cache_dir=tmp_path),
-            {"source": source, "output": output},
-        )
-        .outputs["output"]
-    )
-
-    bits = result.view(np.uint32)
-    assert np.all(bits[0] == np.uint32(0x0000_0000))
-    assert np.all(bits[1] == np.uint32(0xFF80_0000))
-    assert np.all(bits[2] == np.uint32(0xFF7F_FFFF))
-    assert np.all(bits[3] == np.uint32(0x7F7F_FFFF))

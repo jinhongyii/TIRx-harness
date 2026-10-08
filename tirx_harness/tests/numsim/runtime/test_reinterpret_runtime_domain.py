@@ -11,7 +11,6 @@ import tvm
 from tvm.script import tirx as T
 
 from tirx_harness import numsim
-from tirx_harness.numsim.transpiler.frontend import analyze
 
 
 _SCALAR_BITS = {
@@ -342,45 +341,6 @@ def _identity_arguments() -> tuple[dict[str, object], dict[str, np.ndarray]]:
 def _assert_identity_bytes(outputs: dict[str, object], expected: dict[str, np.ndarray]) -> None:
     for name, expected_bytes in expected.items():
         np.testing.assert_array_equal(np.asarray(outputs[name]).view(np.uint8), expected_bytes)
-
-
-@pytest.mark.parametrize("shard", _REINTERPRET_SHARDS, ids=lambda shard: shard.name)
-def test_complete_reinterpret_public_domain_preserves_physical_bits(
-    tmp_path: Path, shard: _ReinterpretShard
-):
-    kernel = _make_kernel(shard)
-    spec = analyze(kernel)
-    assert spec.unsupported == ()
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-
-    if shard.kind == "raw":
-        arguments, expected = _raw_arguments(shard)
-        result = numsim.Engine(max_workers=1).run(module, arguments)
-
-        def check() -> None:
-            np.testing.assert_array_equal(result.outputs["output_bits"], expected)
-
-    elif shard.kind == "identity":
-        arguments, expected = _identity_arguments()
-        result = numsim.Engine(max_workers=1).run(module, arguments)
-
-        def check() -> None:
-            _assert_identity_bytes(result.outputs, expected)
-
-    else:
-        source = np.asarray([0xA5C31F07], dtype=np.uint32)
-        result = numsim.Engine(max_workers=1).run(
-            module,
-            {
-                "source": source,
-                "output": np.zeros(1, dtype=np.uint32),
-            },
-        )
-
-        def check() -> None:
-            np.testing.assert_array_equal(result.outputs["output"], source)
-
-    check()
 
 
 def test_uint16_payload_reinterpret_decodes_float16_values(tmp_path):

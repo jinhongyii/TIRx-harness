@@ -127,18 +127,6 @@ def test_ptx_ldmatrix_x1_x2_domain_matches_independent_lane_byte_mapping(tmp_pat
     np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-def test_legacy_ldmatrix_x1_domain_matches_independent_fragment_mapping(tmp_path):
-    module = numsim.transpile(legacy_ldmatrix_x1_domain, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(64, dtype=np.uint16)})
-
-    expected = np.empty((32, 2), dtype=np.uint16)
-    for lane in range(32):
-        fragment = lane % 4
-        expected[lane, 0] = fragment * 2 + 1
-        expected[lane, 1] = fragment * 2 + 2
-    np.testing.assert_array_equal(result.outputs["output"], expected.reshape(-1))
-
-
 def test_stmatrix_b16_x1_domain_matches_independent_lane_half_mapping(tmp_path):
     module = numsim.transpile(stmatrix_b16_x1_domain, cache_dir=tmp_path)
     result = numsim.Engine().run(module, {"output": np.zeros(64, dtype=np.uint16)})

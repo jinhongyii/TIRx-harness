@@ -1,23 +1,22 @@
-"""One-command NumSim v2 migration status.
+"""One-command NumSim conformance status.
 
 Usage (repository root)::
 
-    python scripts/numsim-v2/status.py --run [-n 32]      # run the v2 conformance suite, then report
+    python scripts/numsim-v2/status.py --run [-n 32]      # run the conformance suite, then report
     python scripts/numsim-v2/status.py --junit results.xml   # report from an existing junit file
 
 Prints, as Markdown:
 
 * the conformance matrix per mode (``numsim``, ``racecheck``, ``synccheck``):
-  ``match`` (v2 equals the legacy snapshot), ``delta-match`` (v2 equals a
-  ``<mode>.delta.json`` naming a behaviour-delta row), ``no-oracle`` (the
-  snapshot records a legacy exception; skipped under v2) and ``fail``;
+  ``match`` (NumSim equals the snapshot), ``delta-match`` (equals a
+  ``<mode>.delta.json``; none remain after step 5), ``no-oracle`` (a skipped
+  case whose snapshot records an exception) and ``fail``;
 * the public-API set from ``scripts/numsim-v2/coverage/v2_public_status.tsv``
-  (functions and parametrized items passing under ``NUMSIM_IMPL=v2``).
+  while that migration record exists.
 
-``--run`` executes ``NUMSIM_IMPL=v2 pytest tests/conformance`` from
-``tirx_harness/`` with the current interpreter (source scripts/dev-env.sh
-first). The per-case triage in docs/development/v2-conformance-status.md is
-produced separately; this script is the headline numbers.
+``--run`` executes ``pytest tests/conformance`` from ``tirx_harness/`` with
+the current interpreter (source scripts/dev-env.sh first).
+docs/development/v2-conformance-status.md is the per-case view.
 """
 
 from __future__ import annotations
@@ -41,11 +40,14 @@ MODES = ("numsim", "racecheck", "synccheck")
 NODE = re.compile(r"test_conformance_snapshot\[(?P<case>.+)-(?P<mode>numsim|racecheck|synccheck)\]")
 
 
-def run_suite(workers: int) -> Path:
+def run_suite(workers: int, pythonpath: str | None = None) -> Path:
     junit = Path(tempfile.mkstemp(prefix="numsim-v2-conformance-", suffix=".xml")[1])
-    env = {**os.environ, "NUMSIM_IMPL": "v2"}
+    env = dict(os.environ)
     cmd = [sys.executable, "-m", "pytest", "-q", "-n", str(workers), "--dist=worksteal",
            "-p", "no:cacheprovider", "tests/conformance", f"--junitxml={junit}"]
+    if pythonpath:
+        # A private extension build (dev-loop.md): its package copy goes first.
+        cmd += ["-o", f"pythonpath={pythonpath} ."]
     subprocess.run(cmd, cwd=REPO / "tirx_harness", env=env, check=False)
     return junit
 
@@ -98,11 +100,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--run", action="store_true", help="run the v2 conformance suite first")
-    source.add_argument("--junit", type=Path, help="junit xml of a NUMSIM_IMPL=v2 conformance run")
+    source.add_argument("--junit", type=Path, help="junit xml of a conformance run")
     parser.add_argument("-n", type=int, default=32, help="pytest workers for --run")
+    parser.add_argument("--pythonpath", help="private build package dir (build_dev.sh --out <dir>: <dir>/pkg)")
     args = parser.parse_args()
 
-    junit = run_suite(args.n) if args.run else args.junit
+    junit = run_suite(args.n, args.pythonpath) if args.run else args.junit
     states = outcomes(junit)
     cases = sorted(p.name for p in SNAPSHOTS.iterdir() if p.is_dir())
     table = {mode: collections.Counter() for mode in MODES}
@@ -115,7 +118,9 @@ def main() -> int:
                 failing.append(f"{case}/{mode}: {label}")
 
     columns = ("match", "delta-match", "no-oracle", "fail")
-    print(f"## Conformance (NUMSIM_IMPL=v2, {len(cases)} cases)\n")
+    if not any(SNAPSHOTS.glob("*/*.delta.json")):
+        columns = ("match", "fail")  # after step 5: no delta files, no legacy exceptions
+    print(f"## Conformance ({len(cases)} cases)\n")
     print("| mode | " + " | ".join(columns) + " |")
     print("| --- | " + " | ".join("---" for _ in columns) + " |")
     for mode in MODES:
@@ -124,6 +129,8 @@ def main() -> int:
         print(f"| {mode} | " + " | ".join(cells) + " |")
     if failing:
         print("\nNot matching: " + ", ".join(failing))
+    if not PUBLIC_TSV.exists():
+        return 0
     passing, funcs, items_pass, items = public_counts()
     print("\n## Public-API legacy tests under v2\n")
     print(f"{items_pass} of {items} items pass ({passing} of {funcs} functions fully), "

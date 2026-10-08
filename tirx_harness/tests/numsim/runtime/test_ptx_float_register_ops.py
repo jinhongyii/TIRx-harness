@@ -11,7 +11,6 @@ from tvm.backend.cuda.ptx.table import canonical_dtypes, mods, variants
 from tvm.script import tirx as T
 
 from tirx_harness import numsim
-from tirx_harness.numsim.transpiler.ptx_dialect import PTX_SCHEMA_BY_OP_NAME
 
 COPYSIGN = "tirx.ptx.copysign"
 MAD_F = "tirx.ptx.mad_f"
@@ -32,70 +31,8 @@ class _RuntimeForm:
     output_row: int
 
 
-def _runtime_forms() -> tuple[_RuntimeForm, ...]:
-    rows: dict[str, int] = {}
-    forms = []
-    for op_name in _OPS:
-        entry = PTX_SCHEMA_BY_OP_NAME[op_name]
-        for tokens in variants(entry):
-            modifier_map = mods(entry, tokens)
-            dtypes = canonical_dtypes(entry, tokens)
-            row = rows.get(dtypes[0], 0)
-            rows[dtypes[0]] = row + 1
-            forms.append(
-                _RuntimeForm(
-                    op_name,
-                    ".".join((entry.ptx_name, *(token for token in tokens if token))),
-                    tuple(modifier_map.items()),
-                    dtypes,
-                    row,
-                )
-            )
-    return tuple(forms)
-
-
-_FORMS = _runtime_forms()
-
-
 def _slug(op_name: str) -> str:
     return op_name.rsplit(".", 1)[-1]
-
-
-def _make_kernel():
-    inputs = sorted(
-        {
-            (_slug(form.op_name), index, dtype)
-            for form in _FORMS
-            for index, dtype in enumerate(form.dtypes[1:])
-        }
-    )
-    output_rows: dict[str, int] = {}
-    for form in _FORMS:
-        output_rows[form.dtypes[0]] = max(output_rows.get(form.dtypes[0], 0), form.output_row + 1)
-    parameters = [
-        *(f'input_{op}_{index}_{dtype}: T.Buffer((32,), "{dtype}")' for op, index, dtype in inputs),
-        *(
-            f'output_{dtype}: T.Buffer(({rows}, 32), "{dtype}")'
-            for dtype, rows in sorted(output_rows.items())
-        ),
-    ]
-    lines = [
-        "@T.prim_func",
-        "def ptx_float_register_ops(",
-        *(f"    {parameter}," for parameter in parameters),
-        "):",
-        "    T.device_entry()",
-        "    _warp = T.warp_id([1])",
-        "    lane = T.lane_id([32])",
-    ]
-    for form in _FORMS:
-        arguments = [f"output_{form.dtypes[0]}[{form.output_row}, lane]"]
-        arguments.extend(
-            f"input_{_slug(form.op_name)}_{index}_{dtype}[lane]"
-            for index, dtype in enumerate(form.dtypes[1:])
-        )
-        lines.append(f'    T.ptx["{form.spelling}"]({", ".join(arguments)})')
-    return tvm.script.from_source("\n".join(lines), {"T": T})
 
 
 def _resize(values: list[float], dtype: np.dtype) -> np.ndarray:
@@ -220,61 +157,12 @@ def _input(op_name: str, index: int, dtype: str) -> np.ndarray:
     return words.view(getattr(np, dtype))
 
 
-@pytest.fixture(scope="module")
-def _execution(tmp_path_factory):
-    inputs = {
-        (form.op_name, index, dtype): _input(form.op_name, index, dtype)
-        for form in _FORMS
-        for index, dtype in enumerate(form.dtypes[1:])
-    }
-    output_rows: dict[str, int] = {}
-    for form in _FORMS:
-        output_rows[form.dtypes[0]] = max(output_rows.get(form.dtypes[0], 0), form.output_row + 1)
-    arguments = {
-        **{
-            f"input_{_slug(op_name)}_{index}_{dtype}": value
-            for (op_name, index, dtype), value in inputs.items()
-        },
-        **{
-            f"output_{dtype}": np.zeros((rows, 32), dtype=getattr(np, dtype))
-            for dtype, rows in output_rows.items()
-        },
-    }
-    result = numsim.Engine().run(
-        numsim.transpile(
-            _make_kernel(), cache_dir=tmp_path_factory.mktemp("ptx-float-register-ops")
-        ),
-        arguments,
-        outputs=tuple(f"output_{dtype}" for dtype in output_rows),
-    )
-    return result, inputs
-
-
-def _forms_for(op_name: str) -> tuple[_RuntimeForm, ...]:
-    return tuple(form for form in _FORMS if form.op_name == op_name)
-
-
 def _actual(result, form: _RuntimeForm) -> np.ndarray:
     return result.outputs[f"output_{form.dtypes[0]}"][form.output_row]
 
 
 def _float_bits(values: np.ndarray) -> np.ndarray:
     return values.view(np.uint32 if values.dtype == np.float32 else np.uint64)
-
-
-def test_copysign_copies_only_the_sign_bit(_execution):
-    result, inputs = _execution
-    for form in _forms_for(COPYSIGN):
-        sign, magnitude = (
-            inputs[form.op_name, index, dtype] for index, dtype in enumerate(form.dtypes[1:])
-        )
-        sign_bits = _float_bits(sign)
-        magnitude_bits = _float_bits(magnitude)
-        sign_mask = np.asarray(
-            1 << (31 if form.dtypes[0] == "float32" else 63), dtype=magnitude_bits.dtype
-        )
-        expected = (magnitude_bits & ~sign_mask) | (sign_bits & sign_mask)
-        np.testing.assert_array_equal(_float_bits(_actual(result, form)), expected)
 
 
 def _neg_half_oracle(values: np.ndarray, *, packed: bool, ftz: bool) -> np.ndarray:
@@ -288,17 +176,6 @@ def _neg_half_oracle(values: np.ndarray, *, packed: bool, ftz: bool) -> np.ndarr
             lane = np.where((magnitude != 0) & (magnitude < 0x0400), lane & 0x8000, lane)
         result |= ((lane ^ 0x8000) & 0xFFFF) << shift
     return result.astype(values.dtype)
-
-
-def test_neg_half_models_finite_values_and_chooses_the_documented_nan_representative(_execution):
-    result, inputs = _execution
-    for form in _forms_for(NEG_HALF):
-        source = inputs[form.op_name, 0, form.dtypes[1]]
-        modifiers = dict(form.modifiers)
-        expected = _neg_half_oracle(
-            source, packed=modifiers["type"].endswith("x2"), ftz=bool(modifiers["ftz"])
-        )
-        np.testing.assert_array_equal(_actual(result, form), expected)
 
 
 def _flush_f32(value: np.float32) -> np.float32:
@@ -359,17 +236,6 @@ def _mad_oracle(form: _RuntimeForm, sources: tuple[np.ndarray, ...]) -> np.ndarr
     return np.asarray(expected, dtype=getattr(np, dtype))
 
 
-def test_mad_f_reuses_exact_fused_arithmetic_for_every_supported_modifier(_execution):
-    result, inputs = _execution
-    for form in _forms_for(MAD_F):
-        sources = tuple(
-            inputs[form.op_name, index, dtype] for index, dtype in enumerate(form.dtypes[1:])
-        )
-        np.testing.assert_array_equal(
-            _float_bits(_actual(result, form)), _float_bits(_mad_oracle(form, sources))
-        )
-
-
 def _sqrt_oracle(value, dtype: str, mode: str, ftz: bool):
     scalar = np.float32 if dtype == "float32" else np.float64
     if ftz:
@@ -388,42 +254,3 @@ def _sqrt_oracle(value, dtype: str, mode: str, ftz: bool):
     return _flush_f32(nearest) if ftz else nearest
 
 
-def test_sqrt_all_rounding_modes_and_ftz_forms_match_an_exact_square_oracle(_execution):
-    result, inputs = _execution
-    for form in _forms_for(SQRT):
-        source = inputs[form.op_name, 0, form.dtypes[1]]
-        modifiers = dict(form.modifiers)
-        expected = np.asarray(
-            [
-                _sqrt_oracle(value, form.dtypes[0], modifiers["mode"], bool(modifiers["ftz"]))
-                for value in source
-            ],
-            dtype=getattr(np, form.dtypes[0]),
-        )
-        actual = _actual(result, form)
-        assert np.array_equal(np.isnan(actual), np.isnan(expected))
-        finite = ~np.isnan(expected)
-        np.testing.assert_array_equal(_float_bits(actual[finite]), _float_bits(expected[finite]))
-
-
-@pytest.mark.parametrize("op_name", (SIN, COS), ids=("sin", "cos"))
-def test_trigonometric_approximations_obey_special_values_ftz_and_error_bound(
-    _execution, op_name: str
-):
-    result, inputs = _execution
-    operation = math.sin if op_name == SIN else math.cos
-    for form in _forms_for(op_name):
-        source = inputs[form.op_name, 0, form.dtypes[1]]
-        ftz = bool(dict(form.modifiers)["ftz"])
-        expected = []
-        for value in source:
-            value = _flush_f32(value) if ftz else value
-            computed = np.float32(np.nan if not np.isfinite(value) else operation(float(value)))
-            expected.append(_flush_f32(computed) if ftz else computed)
-        expected = np.asarray(expected, dtype=np.float32)
-        actual = _actual(result, form)
-        assert np.array_equal(np.isnan(actual), np.isnan(expected))
-        finite = ~np.isnan(expected)
-        np.testing.assert_allclose(actual[finite], expected[finite], rtol=0.0, atol=2**-20.5)
-        zero = finite & (expected == 0.0)
-        np.testing.assert_array_equal(_float_bits(actual[zero]), _float_bits(expected[zero]))

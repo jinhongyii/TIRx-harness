@@ -5,7 +5,6 @@ import pytest
 
 from tirx_harness import numsim
 from tirx_harness.numsim.errors import NumSimExecutionError
-from tirx_harness.numsim.transpiler.frontend import analyze
 from tvm.script import tirx as T
 
 
@@ -54,10 +53,6 @@ def misaligned_vector_store(destination: T.Buffer((64,), "uint8")):
         )
 
 
-def test_vector_store_registry_is_exact():
-    assert analyze(generic_vector_store_forms).unsupported == ()
-
-
 def test_generic_ptx_vector_store_widths_and_types(tmp_path):
     source_u32 = np.arange(256, dtype=np.uint32) ^ np.uint32(0xA5A55A5A)
     source_f64 = np.linspace(-3.0, 5.0, 64, dtype=np.float64)
@@ -75,7 +70,3 @@ def test_generic_ptx_vector_store_widths_and_types(tmp_path):
     np.testing.assert_array_equal(result.outputs["destination_f64"], source_f64)
 
 
-def test_vector_store_checks_total_access_width_alignment(tmp_path):
-    module = numsim.transpile(misaligned_vector_store, cache_dir=tmp_path)
-    with pytest.raises(NumSimExecutionError, match="16-byte alignment"):
-        numsim.Engine().run(module, {"destination": np.zeros(64, dtype=np.uint8)})

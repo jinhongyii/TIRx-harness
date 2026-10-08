@@ -105,5 +105,4 @@ mapping form, since a bare subset is not broadcast.
 ```
 
 The redesigned engine accepts `ExecutionAssumptions` and ignores it: grid
-dependencies on an earlier launch are satisfied at the launch boundary
-(pending: remove the type when the legacy engine is deleted).
+dependencies on an earlier launch are satisfied at the launch boundary.

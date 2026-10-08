@@ -2,7 +2,9 @@
  "case": "deepgemm_sm100_fp8_gemm_1d1d",
  "diagnostics": [
   {
-   "anchors": [],
+   "anchors": [
+    "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1393:1-1393:67"
+   ],
    "bytes": {
     "shared": "217152-217600"
    },

@@ -1,2 +1,0 @@
-legacy_test	v2_tests	note
-tests/numsim/runtime/test_gate_intrinsics.py::test_gate_intrinsics_match_float32_semantics	tests/numsim/v2/ports/test_w4_gate_intrinsics.py::test_gate_intrinsics_match_float32_semantics;tests/numsim/v2/ports/test_w4_gate_intrinsics.py::test_gate_intrinsics_special_values_follow_the_host_rule	dropped module.rust_source .abs()/.ln_1p() pins; replaced by exact abs bits, log1p <=1 ulp / sigmoid <=2 ulp vs a binary64 reference, and pinned special-value bits (delta D9); legacy allclose kept

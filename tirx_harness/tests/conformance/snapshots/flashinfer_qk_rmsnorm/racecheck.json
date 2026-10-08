@@ -5,20 +5,22 @@
   {
    "diagnostics": [
     {
-     "anchors": [],
-     "category": "advisories",
-     "kind": "uninitialized_read",
-     "space": "register",
-     "status": "review"
-    },
-    {
-     "anchors": [],
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/norm/qk_rmsnorm.py:166:1-166:34"
+     ],
      "bytes": {
       "shared": "32-512"
      },
      "category": "advisories",
      "kind": "uninitialized_read",
      "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [],
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "register",
      "status": "review"
     }
    ],

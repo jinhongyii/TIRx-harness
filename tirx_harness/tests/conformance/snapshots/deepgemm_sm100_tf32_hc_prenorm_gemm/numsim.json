@@ -1,6 +1,19 @@
 {
  "case": "deepgemm_sm100_tf32_hc_prenorm_gemm",
- "diagnostics": [],
+ "diagnostics": [
+  {
+   "anchors": [
+    "tirx_kernels/ported/deepgemm/tf32_hc_prenorm_gemm.py:630:1-630:66"
+   ],
+   "bytes": {
+    "tmem-columns": "512-640"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "tmem",
+   "status": "review"
+  }
+ ],
  "mode": "numsim",
  "outputs": {
   "D": {
@@ -20,5 +33,5 @@
  },
  "reference_ok": true,
  "schema": 4,
- "verdict": "clean"
+ "verdict": "review"
 }

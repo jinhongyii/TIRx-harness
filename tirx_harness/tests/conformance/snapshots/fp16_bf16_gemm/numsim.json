@@ -1,6 +1,18 @@
 {
  "case": "fp16_bf16_gemm",
- "error": "UnsupportedTIRxError",
+ "diagnostics": [],
  "mode": "numsim",
- "schema": 4
+ "outputs": {
+  "D": {
+   "dtype": "float16",
+   "sha256": "d1de214936e15c8be922d81ae62e913d2a20cff0c5c6d5725243bd2999d029aa",
+   "shape": [
+    256,
+    2048
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
 }

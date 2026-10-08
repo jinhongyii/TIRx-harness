@@ -6,7 +6,6 @@ import tvm
 from tvm.script import tirx as T
 
 from tests.numsim.support.execution import run_checked
-from tirx_harness.numsim.transpiler.frontend import analyze
 
 DTYPES = [f"{sign}int{bits}" for sign in ("", "u") for bits in (8, 16, 32, 64)]
 
@@ -43,16 +42,6 @@ def bitwise_nodes(values: T.Buffer((32,), "{dtype}"), output: T.Buffer((32, 6), 
                 value -= 1 << bits
             expected[lane, column] = value
     return kernel, {"values": values, "output": np.zeros_like(expected)}, expected
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_bitwise_nodes_match_integer_oracle(dtype, tmp_path):
-    kernel, inputs, expected = bitwise_case(dtype)
-    spec = analyze(kernel).kernels[0]
-    kinds = {entry.kind for entry in spec.source_map}
-    assert {"BitwiseAnd", "BitwiseOr", "BitwiseXor", "BitwiseNot", "LShift", "RShift"} <= kinds
-    result = run_checked(kernel, inputs, outputs=("output",), cache_dir=tmp_path)
-    np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
 @T.prim_func

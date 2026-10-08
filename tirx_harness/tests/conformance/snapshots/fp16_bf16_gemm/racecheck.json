@@ -1,6 +1,22 @@
 {
  "case": "fp16_bf16_gemm",
- "error": "UnsupportedTIRxError",
  "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/gemm/fp16_bf16_gemm.py:638:1-638:45"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    }
+   ],
+   "verdict": "error"
+  }
+ ],
  "schema": 4
 }

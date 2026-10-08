@@ -1,2 +1,0 @@
-legacy_test	v2_tests	note
-tests/numsim/integration/test_api.py::test_execution_subset_uses_subset_api_name	tests/numsim/v2/ports/test_w8_execution_subset_api.py::test_execution_subset_uses_subset_api_name;tests/numsim/v2/ports/test_w8_execution_subset_api.py::test_execution_subset_selects_clusters	W8: public-API check (v2 exports ExecutionSubset by design); name/export, to_payload, cluster selection

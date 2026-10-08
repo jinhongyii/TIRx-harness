@@ -5,9 +5,73 @@
   {
    "diagnostics": [
     {
+     "access_pair": "read_write",
      "anchors": [
       "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:132:1-132:101",
-      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:2459:1-2459:39"
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:326:1-326:74"
+     ],
+     "bytes": {
+      "shared": "227584-227632"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_release_acquire",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:132:1-132:101",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:335:1-335:81"
+     ],
+     "bytes": {
+      "shared": "227600-227648"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_release_acquire",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:3431:1-3431:45",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:3692:1-3692:83"
+     ],
+     "bytes": {
+      "tmem-columns": "0-32"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_release_acquire",
+     "space": "tmem",
+     "status": "error"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:3431:1-3431:45",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:3695:1-3695:83"
+     ],
+     "bytes": {
+      "tmem-columns": "0-32"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_release_acquire",
+     "space": "tmem",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:132:1-132:101",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:2506:1-2506:57"
      ],
      "bytes": {
       "shared": "0-8"
@@ -16,9 +80,66 @@
      "kind": "alias_stale_read",
      "space": "shared",
      "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:140:1-140:54",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:2204:1-2204:83"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:171:1-171:37",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:218:1-218:36"
+     ],
+     "bytes": {
+      "global#2": "326768-326896"
+     },
+     "category": "advisories",
+     "kind": "cross_cta_async_order",
+     "space": "global",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:1818:1-1818:83",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:2077:1-2077:55"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:1999:1-1999:71",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:2077:1-2077:55"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:2077:1-2077:55",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:2082:1-2082:83"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
     }
    ],
-   "verdict": "review"
+   "verdict": "error"
   }
  ],
  "schema": 4
