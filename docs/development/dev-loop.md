@@ -257,6 +257,58 @@ New relative checks use `tests/perf/perf_baseline.py` with per-host-class
 files in `tests/perf/baselines/` (see the README there). The two legacy
 absolute-threshold tests stay unchanged until the legacy engine is deleted.
 
+### v2 performance gate
+
+`tests/perf/test_corpus_perf.py` (marker `performance`, interp backend) times the Mega
+MoE workloads of the legacy gates and six canonical checker cases. Each canonical case
+runs at 1 and 32 engine workers: synccheck records `run` and `check`, and racecheck
+records `run`, because it checks inside the run. `scripts/numsim-v2/perf_gate.py`
+runs the module with `NUMSIM_PERF_ENFORCE=0` and compares each metric with
+`tests/perf/baselines/v2/<host-class>.json`. The limit is `max(1.5 x baseline,
+baseline + 0.1 s)`. The gate fails on a regression only when the host is near idle
+(1-minute load average at most 10% of the CPU count, sampled every 15 s through the
+run). Under load it only warns, and it always prints the load. A correctness failure
+always fails the gate.
+
+```bash
+$PY scripts/numsim-v2/perf_gate.py --run -n 1                 # check
+$PY scripts/numsim-v2/perf_gate.py --run -n 1 --record        # (re)record, near idle only
+$PY scripts/numsim-v2/perf_gate.py --run -n 1 -k checker_phase # one group
+```
+
+The first baselines were recorded on 2026-10-08 at 8b204f4 plus the working tree, on
+the 256-CPU EPYC 7763 host. The host was never quiet that day: the load average ran
+20.9-81.8 during the run, and the file says so in `preflight`. They were recorded with
+`--record --force`; re-record them on a quiet host before tightening anything.
+
+| metric (seconds) | w1 | w32 |
+| --- | --- | --- |
+| synccheck check, `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 0.20 | 0.21 |
+| synccheck check, `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 0.25 | 0.26 |
+| synccheck check, `flash_attention4` | 0.22 | 0.23 |
+| synccheck run, the same three | 0.31 / 0.20 / 1.70 | 0.28 / 0.12 / 0.77 |
+| racecheck run, `recurrent_kda_decode_one_warp` | 1.89 | 1.41 |
+| racecheck run, `gdn_decode_bf16_wide_vec_mtp` | 1.19 | 1.02 |
+| racecheck run, `selective_state_update_stp_simple` | 0.02 | 0.02 |
+
+The Mega MoE workloads ran with 16 engine workers. For each one, the table gives the v2
+time first, then the legacy baseline from the same host class.
+
+| workload | v2 interp | legacy |
+| --- | --- | --- |
+| numsim max config (`t8192_m8192_h7168_i3072_e384_k6_g1`), `Engine.run` | 402.0 s | 216.4 s |
+| racecheck `two_tokens` | 4.43 s | 1.94 s |
+| racecheck `sixteen_tokens` | 4.91 s | 2.00 s |
+| racecheck `twenty_four_experts` | 21.92 s | 2.75 s |
+| racecheck `shared_expert` | 5.46 s | 2.04 s |
+| racecheck `medium_moe`, `large_moe` | known slow: more than 42 min, serial checker | 22.3 s, 38.0 s |
+
+The v2 Mega MoE racecheck verdict is `error`, not legacy's `review`: the findings are
+racecheck B1/R4, B7 and T19, and the advisories X4 and P7. The gate asserts these
+kinds. `medium_moe` and `large_moe` are skipped unless `NUMSIM_PERF_SLOW=1`, because
+the racecheck checker replays serially on the calling thread (racecheck-semantics.md,
+"Merge design and the serial-checker limit"; W5 is working on the actor space).
+
 ### Legacy vs v2 corpus comparison
 
 `scripts/numsim-v2/bench_backends.py` times every canonical case in each mode where v2

@@ -41,7 +41,8 @@ jobs:
         run: |
           core=tirx_harness/src/tirx_harness/numsim/core-rs
           if [ -f "$core/Cargo.toml" ]; then
-            (cd "$core" && cargo test)
+            # A hung test fails fast instead of eating the 60-minute job.
+            (cd "$core" && timeout 1800 cargo test)
             # Every criterion bench must keep compiling (benches guard kept
             # optimizations); build them without running.
             (cd "$core" && cargo bench --workspace --no-run)

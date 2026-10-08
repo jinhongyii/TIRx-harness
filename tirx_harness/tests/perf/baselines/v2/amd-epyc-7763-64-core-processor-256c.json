@@ -1,0 +1,197 @@
+{
+  "host_class": "amd-epyc-7763-64-core-processor-256c",
+  "cpu_model": "AMD EPYC 7763 64-Core Processor",
+  "nproc": 256,
+  "recorded": "2026-10-08",
+  "commit": "8b204f4 + working tree",
+  "preflight": "1-min load average min/max 20.9/81.8 over the run",
+  "pytest": "-n 1 -m performance tests/perf/test_corpus_perf.py -k 'not medium_moe and not large_moe'",
+  "tolerance": 0.5,
+  "min_slack_seconds": 0.1,
+  "baselines": {
+    "v2.interp.numsim.mega_moe.max_config": {
+      "seconds": 402.002,
+      "samples": [
+        402.002
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.gdn_decode_bf16_wide_vec_mtp.run.w1": {
+      "seconds": 1.191,
+      "samples": [
+        1.191
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.gdn_decode_bf16_wide_vec_mtp.run.w32": {
+      "seconds": 1.022,
+      "samples": [
+        1.022
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.mega_moe.shared_expert": {
+      "seconds": 5.457,
+      "samples": [
+        5.457
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.mega_moe.sixteen_tokens": {
+      "seconds": 4.91,
+      "samples": [
+        4.91
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.mega_moe.twenty_four_experts": {
+      "seconds": 21.925,
+      "samples": [
+        21.925
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.mega_moe.two_tokens": {
+      "seconds": 4.433,
+      "samples": [
+        4.433
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.recurrent_kda_decode_one_warp.run.w1": {
+      "seconds": 1.891,
+      "samples": [
+        1.891
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.recurrent_kda_decode_one_warp.run.w32": {
+      "seconds": 1.407,
+      "samples": [
+        1.407
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.selective_state_update_stp_simple.run.w1": {
+      "seconds": 0.017,
+      "samples": [
+        0.017
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.racecheck.selective_state_update_stp_simple.run.w32": {
+      "seconds": 0.015,
+      "samples": [
+        0.015
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias.check.w1": {
+      "seconds": 0.201,
+      "samples": [
+        0.201
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias.check.w32": {
+      "seconds": 0.206,
+      "samples": [
+        0.206
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias.run.w1": {
+      "seconds": 0.307,
+      "samples": [
+        0.307
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias.run.w32": {
+      "seconds": 0.278,
+      "samples": [
+        0.278
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.cudnn_sm100_moe_grouped_gemm_dglu_dbias.check.w1": {
+      "seconds": 0.248,
+      "samples": [
+        0.248
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.cudnn_sm100_moe_grouped_gemm_dglu_dbias.check.w32": {
+      "seconds": 0.259,
+      "samples": [
+        0.259
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.cudnn_sm100_moe_grouped_gemm_dglu_dbias.run.w1": {
+      "seconds": 0.197,
+      "samples": [
+        0.197
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.cudnn_sm100_moe_grouped_gemm_dglu_dbias.run.w32": {
+      "seconds": 0.115,
+      "samples": [
+        0.115
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.flash_attention4.check.w1": {
+      "seconds": 0.224,
+      "samples": [
+        0.224
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.flash_attention4.check.w32": {
+      "seconds": 0.231,
+      "samples": [
+        0.231
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.flash_attention4.run.w1": {
+      "seconds": 1.702,
+      "samples": [
+        1.702
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    },
+    "v2.interp.synccheck.flash_attention4.run.w32": {
+      "seconds": 0.768,
+      "samples": [
+        0.768
+      ],
+      "preflight": "1-min load average min/max 20.9/81.8 over the run",
+      "recorded": "2026-10-08"
+    }
+  }
+}

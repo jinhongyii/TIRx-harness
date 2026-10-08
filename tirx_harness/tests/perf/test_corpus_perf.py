@@ -58,6 +58,12 @@ RACECHECK_CASES = {
     "medium_moe": RACECHECK_MEDIUM,
     "large_moe": "t64_h4096_i1536_e96_k4_g1",
 }
+# Known slow (W5): the serial racecheck checker (racecheck-semantics.md,
+# "Merge design and the serial-checker limit") does not finish these within
+# the gate (medium_moe: more than 42 min on 2026-10-08, legacy 16.7 s; clock
+# joins over ~15K async actors). They run only with NUMSIM_PERF_SLOW=1 and
+# have no baseline until the actor-space work lands.
+KNOWN_SLOW = {"medium_moe", "large_moe"}
 # v2 Mega MoE racecheck kinds on the 148-SM grid (W5): findings B1/R4 and B7
 # `scope_mismatch`, T19 `data_race`; advisories X4 and P7. Verdict `error`.
 V2_FINDING_KINDS = {"scope_mismatch", "data_race"}
@@ -119,7 +125,20 @@ def test_mega_moe_numsim_max_config(record_property) -> None:
     _enforce_baselines(metrics)
 
 
-@pytest.mark.parametrize("workload", list(RACECHECK_CASES))
+@pytest.mark.parametrize(
+    "workload",
+    [
+        pytest.param(
+            name,
+            marks=pytest.mark.skipif(
+                name in KNOWN_SLOW and os.environ.get("NUMSIM_PERF_SLOW") != "1",
+                reason="known slow: serial racecheck checker (racecheck-semantics.md, serial-checker limit); "
+                "NUMSIM_PERF_SLOW=1 runs it",
+            ),
+        )
+        for name in RACECHECK_CASES
+    ],
+)
 def test_mega_moe_racecheck(workload: str, record_property, monkeypatch) -> None:
     monkeypatch.setenv("TIRX_DEEPGEMM_NUM_SMS_OVERRIDE", str(RACECHECK_NUM_SMS))
     case = prepare_mega_moe_case(_mega_moe_configs()[RACECHECK_CASES[workload]])

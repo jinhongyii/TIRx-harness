@@ -1,6 +1,6 @@
 {
  "case": "sm100_fp8_fp4_mega_moe",
- "delta": "racecheck-behaviour-deltas T19: the lds128 TaskInfo read by non-elected lanes races the remote st.async (true positive); racecheck R4/racecheck B1: release.cluster arrive vs acquire.cta wait scope_mismatch; racecheck B7: default-.cta remote arrives; racecheck X4: cross_cta_async_order advisory",
+ "delta": "racecheck-behaviour-deltas T19: the lds128 TaskInfo read by non-elected lanes races the remote st.async (true positive); racecheck R4/racecheck B1: release.cluster arrive vs acquire.cta wait scope_mismatch; racecheck B7: default-.cta remote arrives; racecheck X4: cross_cta_async_order advisory; footprints re-caught at a different dynamic instance after engine commit f1d920d (racecheck T19, racecheck X4; same site pairs and kinds)",
  "mode": "racecheck",
  "phases": [
   {
@@ -44,7 +44,7 @@
       "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:3692:1-3692:83"
      ],
      "bytes": {
-      "tmem-columns": "0-32,64-96"
+      "tmem-columns": "0-32"
      },
      "category": "findings",
      "kind": "data_race",
@@ -60,7 +60,7 @@
       "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:3695:1-3695:83"
      ],
      "bytes": {
-      "tmem-columns": "0-32,64-96"
+      "tmem-columns": "0-32"
      },
      "category": "findings",
      "kind": "data_race",
@@ -99,7 +99,7 @@
       "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_mega_moe/kernel.py:218:1-218:36"
      ],
      "bytes": {
-      "global#2": "326896-327024"
+      "global#2": "326768-326896"
      },
      "category": "advisories",
      "kind": "cross_cta_async_order",
