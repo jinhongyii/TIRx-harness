@@ -16,7 +16,7 @@ from tvm.script.tirx import tile as Tx
 
 from tirx_harness.numsim import v2
 from tirx_harness.numsim.errors import UnsupportedTIRxError
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 
 pytestmark = requires_v2_engine
 
@@ -261,11 +261,6 @@ def test_typed_tma_reduce_reuses_raw_tensor_map_reduction_abi(
     np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-@v2_gap(
-    "v2 lowering accepts cp.reduce.async.bulk op/dtype pairs PTX does not define "
-    "(add.s64, add.f64, min.f32, inc.s32) and the run completes; legacy rejected them "
-    "at transpile with UnsupportedTIRxError"
-)
 @pytest.mark.parametrize(
     ("reduction", "dtype"),
     [

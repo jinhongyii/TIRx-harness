@@ -370,6 +370,23 @@ are mapped in `coverage/v2_ports_messages.tsv` (21 rows) and
 the delta-R3 behaviour (`review` `undeclared_protocol_word`), not the
 legacy clean or data-race verdict.
 
+**W4-12 reduction ruling.** `ports/test_tile_reduction_dispatch.py`
+(mapped in `coverage/v2_ports_reductions.tsv`) ports three tests from
+`test_tile_reduction_variants.py`. The legacy versions pinned the legacy
+frontend's sequential, identity-seeded reductions. The ports assert what the
+TVM-dispatched code computes instead, and all 3 pass:
+
+- **Warp sum.** Checked against an independent `shfl.bfly` model (xor 16, 8,
+  4, 2, 1). `[1e20, 1, -1e20, 1]` gives 2.0 where legacy gave 1.0.
+- **Unseeded `3input_maxmin`.** An all-NaN input gives `0x7FFFFFFF` for both
+  max and min (legacy: `0xFF7FFFFF` / `0x7F7FFFFF`).
+
+The tests cite the numsim-behaviour-deltas rows W4 is adding.
+
+**`test_atomic_f32_noftz`.** The port already dropped the `rust_source` pin
+in phase 4. Its 6 width-1 cases pass numerically. The 6 `.v2`/`.v4` cases
+stay `v2_gap`: predicated-off lanes are still updated.
+
 Further legacy expectations v2 does not meet (not xfailed, because the
 legacy assertion admitted the v2 behaviour):
 
