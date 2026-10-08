@@ -425,3 +425,32 @@ def test_explicit_alignment_places_a_swizzled_shared_backing(lower_source):
     bases = {b.name: (b.base, b.align) for b in program.buffers if b.space == "Shared"}
     assert bases["first"][0] == 0
     assert bases["second"] == (128, 128)
+
+
+def test_pool_max_bytes_sizes_a_zero_extent_pool_and_fails_closed_when_malformed(lower_source):
+    """``AttrStmt(<alloc>.data, "tirx.pool_max_bytes", N)`` (legacy analyze/memory.rs):
+    a zero-extent pool is exactly N bytes (no growth from its views); a negative or
+    conflicting capacity is rejected."""
+    head = '''
+@T.prim_func
+def k(output: T.Buffer((1,), "uint32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    T.warp_id([1])
+    storage = T.alloc_buffer((0,), "uint8", scope="shared")
+'''
+    sized = lower_source(head + '''    T.attr(storage.data, "tirx.pool_max_bytes", 16)
+    alias = T.decl_buffer((8,), "uint32", data=storage.data, scope="shared")
+    output[0] = alias[0]
+''')
+    pool = next(b for b in sized.buffers if b.name == "storage")
+    assert pool.byte_len == pb.DimExpr.const(16) and sized.topology.static_smem_bytes == 16
+    for body, reason in (
+        ('    T.attr(storage.data, "tirx.pool_max_bytes", -1)\n    output[0] = 0\n', "cannot be negative"),
+        (
+            '    T.attr(storage.data, "tirx.pool_max_bytes", 16)\n'
+            '    T.attr(storage.data, "tirx.pool_max_bytes", 32)\n    output[0] = 0\n',
+            "conflicting capacities 16 and 32",
+        ),
+    ):
+        program = lower_source(head + body, strict=False)
+        assert any(reason in u for u in program.unsupported), program.unsupported

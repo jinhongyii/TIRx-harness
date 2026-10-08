@@ -327,6 +327,28 @@ class MemoryMixin:
             self.dyn_pools.add(buf)
         self.refs[handle(var)] = MemRef(buf=buf, space=space, info=info)
 
+    def declare_pool_capacity(self: Lowerer, target: Any, value: Any) -> str | None:
+        """``AttrStmt(<alloc>.data, "tirx.pool_max_bytes", N)``: the pool's byte
+        capacity (legacy frontend ``analyze/memory.rs``). Returns the fail-closed
+        reason, or None."""
+        if type_key(value) != "ir.IntImm":
+            return "AttrStmt(tirx.pool_max_bytes) must bind a buffer root to a non-negative IntImm"
+        size = int(value.value)
+        if size < 0:
+            return "tirx.pool_max_bytes cannot be negative"
+        # The node is the allocation's data (`tirx.buffer_data(<alloc buffer>)`).
+        if type_key(target) == "ir.Call" and str(target.op.name) == "tirx.buffer_data":
+            target = target.args[0]
+        ref = self.refs.get(handle(target)) if hasattr(target, "__chandle__") else None
+        buf = ref.buf if isinstance(ref, MemRef) else None
+        if buf is None:
+            return "AttrStmt(tirx.pool_max_bytes) must bind a buffer root to a non-negative IntImm"
+        previous = self.pool_capacity.get(buf)
+        if previous is not None and previous != size:
+            return f"tirx.pool_max_bytes has conflicting capacities {previous} and {size}"
+        self.pool_capacity[buf] = size
+        return None
+
     def declare_view(self: Lowerer, node: Any) -> None:
         var = node.buffer
         ty = var.ty
@@ -609,6 +631,11 @@ class MemoryMixin:
             ):
                 # The committed `tirx.dyn_smem_bytes` is the CTA's dynamic shared memory.
                 size = max(size, self.dyn_smem_bytes)
+            elif size == 0 and index in self.pool_capacity:
+                # A zero-extent pool owner with `tirx.pool_max_bytes` is exactly that
+                # big; a view past it fails as out_of_bounds (legacy
+                # `test_pool_capacity_attr_sizes_owner_without_opportunistic_growth`).
+                size = self.pool_capacity[index]
             elif size == 0:
                 # A zero-extent pool owner is sized by its views' static spans
                 # (legacy `test_zero_extent_pool_owner_uses_only_concrete_view_span_evidence`).

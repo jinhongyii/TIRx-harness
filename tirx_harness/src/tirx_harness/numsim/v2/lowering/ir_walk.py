@@ -111,7 +111,6 @@ _IGNORED_ATTRS = frozenset(
         "tirx.required_block_size",
         "tirx.max_registers",
         "tirx.dyn_smem_bytes",
-        "tirx.pool_max_bytes",
     }
 )
 
@@ -156,6 +155,7 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         self.host_binds: dict[int, Any] = {}
         self.layout_exprs: dict[int, Any] = {}
         self.dyn_pools: set[int] = set()
+        self.pool_capacity: dict[int, int] = {}  # pool buffer -> `tirx.pool_max_bytes`
         self.loop_scopes: list[Any] = []
         self.tmem_roots: dict[int, int] = {}  # TMEM view buffer -> its logical root buffer
         self.tmem_records: list[Any] = []  # memory.TmemView, in declaration order
@@ -631,6 +631,12 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
             reg = self.builder.reg(pb.Ty("S32"), name=tag, uniform=base != "threadIdx")
             self.builder.emit("ReadSpecial", dst=reg, sreg={sreg: axis.upper()})
             self.vars[handle(iter_var.var)] = self.cast_to(reg, dtype_of(iter_var.var))
+            self.stmt(node.body)
+            return
+        if key == "tirx.pool_max_bytes":
+            reason = self.declare_pool_capacity(node.node, node.value)
+            if reason is not None:
+                self.unsupported(node, reason)
             self.stmt(node.body)
             return
         if key == TILE_OP_MARK:
