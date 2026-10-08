@@ -1278,6 +1278,32 @@ scope-mismatch edge in a scratch build (20 of 25 occurrences), so it is not
 downstream of those edges. Fix in the kernel: `__syncwarp()` (bar.warp.sync)
 before the elected arrive, or have every lane arrive.
 
+### Corpus B7 instance: TMEM teardown handshake (`fp16_bf16_gemm`, no legacy oracle)
+
+The one finding is a `scope_mismatch` (16 occurrences): release `.cta`
+(warp 8 = CTA1 warp 0) against acquire `.cta` (warp 0 = CTA0 warp 0). The
+kernel has 256 threads per CTA, i.e. 8 warps per CTA, and clusters of 2. Traced:
+
+1. Teardown (kernel.py:631-638): `warpgroup_sync`, then warp 0 lane 0 of
+   each CTA calls `tmem_fin.full.arrive(0, remote=1 - cbx)`. The helper
+   (`tvm/backend/cuda/lang/pipeline.py` `_mbarrier_arrive_remote`) emits
+   `mapa` plus a qualifier-less `mbarrier.arrive.shared::cluster.b64` on the
+   **peer** CTA's barrier (release site 325, no source span: helper-inlined).
+2. The peer's warp 0 then calls `tmem_fin.full.wait(0, 0)`, i.e.
+   `mbarrier.try_wait` with the default `.acquire.cta` (kernel.py:638).
+3. The ISA defaults are `.release` / `.acquire` at `.cta` scope. A `.cta`
+   release by a thread of CTA1, observed by a thread of CTA0, does not
+   synchronise: neither scope includes the other thread (§8.7, morally
+   strong). The kernel has no `.cluster` fence or barrier on this path. The
+   handshake exists so the peer's TMEM reads finish before the `cta_group::2`
+   dealloc (kernel.py:654-658), and it does not provide that ordering at
+   `.cta` scope.
+
+This is a genuine B7 instance (deltas B7), not a missed cluster-scope edge.
+The ISA-correct spelling is `mbarrier.arrive.release.cluster.shared::cluster`
+with an `.acquire.cluster` wait. Snapshot the v2 `error` as the oracle,
+citing B7.
+
 ### Benchmarks
 
 `numsim-race-core/benches/core.rs`, same machine. "Before" is the phase-2

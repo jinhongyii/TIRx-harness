@@ -542,6 +542,8 @@ pub struct Checker {
     /// Logical buffer name per site (`SiteInfo::buffer`), for
     /// `AliasStaleRead`. Empty = advisory off.
     pub site_buffer: HashMap<SiteId, Arc<str>>,
+    /// Declared space of each site's named buffer (see `alias_access`).
+    pub site_buffer_space: HashMap<SiteId, Space>,
     /// Sites of `wait_until` polls (lowering's `tirx.cuda.wait_until`).
     pub poll_sites: HashSet<SiteId>,
     wide: WideSpans,
@@ -646,6 +648,7 @@ impl Checker {
             alias_dedup: HashMap::new(),
             site_buffer: HashMap::new(),
             poll_sites: HashSet::new(),
+            site_buffer_space: HashMap::new(),
             wide: WideSpans::default(),
             report: Report::default(),
             dedup: HashMap::new(),
@@ -1004,6 +1007,13 @@ impl Checker {
         let Some(buf) = self.site_buffer.get(&site).filter(|b| !b.is_empty()).cloned() else {
             return;
         };
+        // A site names one operand's buffer; an access in another space
+        // (e.g. tensormap.cp_fenceproxy's shared-memory source, named after
+        // its global destination) has no known logical name (deltas P7).
+        let space = self.allocs.get(&alloc).map(|a| a.space);
+        if self.site_buffer_space.get(&site).is_some_and(|s| Some(*s) != space) {
+            return;
+        }
         if cw.kind() != AccessKind::Write {
             let mut hits: Vec<(Range<u64>, AliasSeg)> = Vec::new();
             if let Some(segs) = self.alias_writers.get(&alloc) {

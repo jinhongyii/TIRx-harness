@@ -222,6 +222,17 @@ impl Observer for RaceObserver {
             .collect();
         self.set_site_buffers(names);
         if let Some(c) = &mut self.checker {
+            // The site's buffer names ONE operand (the first pointer of a
+            // multi-operand op such as tensormap.cp_fenceproxy): record its
+            // space so an access in another space is not given that name.
+            let space_of: HashMap<&str, Space> = info.program.buffers.iter().map(|b| (b.name.as_str(), b.space)).collect();
+            c.site_buffer_space = info
+                .program
+                .sites
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.buffer.as_deref().and_then(|b| space_of.get(b)).map(|sp| (crate::site::SiteId(i as u32), *sp)))
+                .collect();
             c.poll_sites = info
                 .program
                 .sites
