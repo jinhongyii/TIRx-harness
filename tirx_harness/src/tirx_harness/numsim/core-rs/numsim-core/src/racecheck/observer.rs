@@ -84,6 +84,12 @@ pub struct RaceObserver {
     /// Collect only at the scheduler's `phase_end` (review D7; on whenever
     /// `fork_join` is).
     pub phase_gc: bool,
+    /// Joined children of the current phase, absorbed (in join order) at
+    /// the next event that reaches the main checker: only once every child
+    /// has dropped the lent global state can the main checker take it back.
+    pending: Vec<(Checker, Vec<Stashed>)>,
+    /// Global state is lent to children (`Checker::lend_globals`).
+    lent: bool,
 }
 
 impl RaceObserver {
@@ -102,12 +108,15 @@ impl RaceObserver {
             fork_join,
             // D7: collect at the scheduler's phase ends in both modes.
             phase_gc: true,
+            pending: Vec::new(),
+            lent: false,
         }
     }
 
     /// Start a launch from an explicit topology (tests and replay; the
     /// engine path uses `begin_launch`).
     pub fn start_launch(&mut self, topo: ri::Topology, kernel: u32) {
+        self.settle();
         if self.checker.is_some() {
             self.finish_launch();
         }
@@ -138,6 +147,7 @@ impl RaceObserver {
 
     /// Register an allocation (normally via `begin_launch` or `AllocBegin`).
     pub fn register_alloc(&mut self, alloc: AllocId, space: Space, size: u64, name: &str) {
+        self.settle();
         self.buffers.insert(alloc, (name.to_string(), space));
         if let Some(c) = &mut self.checker {
             c.sync(ri::SyncEvent::AllocBegin { alloc, space, size, cta: 0 });
@@ -146,6 +156,7 @@ impl RaceObserver {
 
     /// Finalise the current launch (also called by `end_launch`).
     pub fn finish_launch(&mut self) {
+        self.settle();
         let Some(mut c) = self.checker.take() else { return };
         c.gc();
         let mut stats = c.stats;
@@ -163,6 +174,33 @@ impl RaceObserver {
             buffers: self.buffers.clone(),
             buffer_of_site: std::mem::take(&mut self.buffer_of_site),
         });
+    }
+
+    /// Take the lent global state back and absorb the joined children of
+    /// the phase, in join order (decision 17 `join`, deferred to here).
+    #[inline]
+    fn settle(&mut self) {
+        if self.lent || !self.pending.is_empty() {
+            self.settle_slow();
+        }
+    }
+
+    #[cold]
+    fn settle_slow(&mut self) {
+        if !self.lent && self.pending.is_empty() {
+            return;
+        }
+        self.lent = false;
+        let pending = std::mem::take(&mut self.pending);
+        let Some(c) = self.checker.as_mut() else { return };
+        let mut pending = pending;
+        for (child, _) in pending.iter_mut() {
+            child.release_globals();
+        }
+        c.reclaim_globals();
+        for (child, stash) in pending {
+            c.absorb(child, stash);
+        }
     }
 
     /// The live checker (tests).
@@ -529,6 +567,7 @@ impl Observer for RaceObserver {
     }
 
     fn end_launch(&mut self, info: &LaunchInfo<'_>) {
+        self.settle();
         for (id, a) in info.arena.iter() {
             self.buffers.entry(id).or_insert_with(|| (a.name.clone(), a.space));
         }
@@ -536,6 +575,7 @@ impl Observer for RaceObserver {
     }
 
     fn access(&mut self, a: &CAccess<'_>) {
+        self.settle();
         let Some(c) = self.checker.as_mut() else {
             self.outside_launch += 1;
             return;
@@ -544,6 +584,7 @@ impl Observer for RaceObserver {
     }
 
     fn sync(&mut self, e: &CSync) {
+        self.settle();
         if let SyncKind::AllocBegin { alloc, space, .. } = &e.kind {
             self.buffers.entry(*alloc).or_insert_with(|| (format!("{alloc}"), *space));
         }
@@ -563,12 +604,14 @@ impl Observer for RaceObserver {
     }
 
     fn warp_done(&mut self, warp: CWarpId, _end: WarpEnd) {
+        self.settle();
         if let Some(c) = &mut self.checker {
             c.warp_done(warp.0);
         }
     }
 
     fn round_boundary(&mut self, _cta: CtaId, _round: u64) {
+        self.settle();
         // Single-threaded scheduler: the global shadow is always merged
         // (module doc). The drain is a safe point for the collectors.
         if let Some(c) = &mut self.checker {
@@ -580,10 +623,14 @@ impl Observer for RaceObserver {
         if !self.fork_join {
             return None;
         }
+        // Joins came: a new phase (every fork of a phase precedes its joins).
+        if !self.pending.is_empty() {
+            self.settle();
+        }
         let c = self.checker.as_mut()?;
+        self.lent = true;
         let ctas: Vec<u32> = part.ctas.iter().map(|c| c.0).collect();
-        let meta = std::sync::Arc::new(c.global_meta());
-        let child = c.split(part.key, &ctas, meta, FORK_RESERVE);
+        let child = c.split(part.key, &ctas, FORK_RESERVE);
         let mut subops = Subops::default();
         if let Some(m) = self.subops.0.remove(&(part.key + 1)) {
             subops.0.insert(part.key + 1, m);
@@ -601,12 +648,11 @@ impl Observer for RaceObserver {
             self.buffers.entry(a).or_insert(b);
         }
         self.outside_launch += outside_launch;
-        if let Some(c) = self.checker.as_mut() {
-            c.absorb(checker, stash);
-        }
+        self.pending.push((checker, stash));
     }
 
     fn phase_end(&mut self, _round: u64) {
+        self.settle();
         if let Some(c) = &mut self.checker {
             c.phase_end();
         }

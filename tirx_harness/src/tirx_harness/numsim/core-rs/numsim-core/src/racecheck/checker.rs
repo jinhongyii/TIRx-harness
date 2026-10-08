@@ -830,6 +830,18 @@ pub struct Checker {
     /// While a deferred access runs: its seq (completions after it are not
     /// visible to it).
     as_of_seq: Option<u64>,
+    /// While a deferred strong read runs: its read-from was already applied
+    /// by the child that resolved it (milestone 2).
+    skip_read_from: bool,
+    /// Main checker, during a parallel phase: the global allocations and
+    /// their declared words, lent read-only to the children.
+    lent: Option<Arc<partition::Globals>>,
+    /// Debug safety net (milestone 2): global ranges written by the
+    /// partitions already joined in this batch.
+    batch_writes: HashMap<AllocId, Vec<Range<u64>>>,
+    /// Main checker, during a parallel phase: barrier objects per cluster
+    /// (built once per phase; what each fork moves).
+    phase_index: HashMap<u32, Vec<SyncObjId>>,
 }
 
 /// Insert `r` into sorted, disjoint, non-adjacent `spans` (bounded: past
@@ -935,6 +947,10 @@ impl Checker {
             register_global: false,
             collect_at_phase_end: false,
             as_of_seq: None,
+            skip_read_from: false,
+            lent: None,
+            batch_writes: HashMap::new(),
+            phase_index: HashMap::new(),
         }
     }
 
@@ -1833,6 +1849,9 @@ impl Checker {
                 }
             }
         }
+        if self.skip_read_from {
+            return;
+        }
         if let Cur::Lane { w: wi, lane, .. } = cur {
             // A pure strong read of a declared word may be a `wait_until`
             // poll. Its read-from edge (the run's latest write) is held back:
@@ -2705,7 +2724,7 @@ impl Checker {
     /// (for every waiting lane).
     fn pred_reads_stable(&self, warp: WarpId, lanes: LaneMask, epoch: Epoch, reads: &[(AllocId, Range<u64>)]) -> bool {
         reads.iter().all(|(alloc, r)| {
-            let Some(a) = self.allocs.get(alloc) else { return false };
+            let Some(a) = self.alloc_ref(*alloc) else { return false };
             let mut ok = true;
             a.shadow.visit(r.clone(), |_, cell| {
                 for p in cell.writes.as_slice() {
@@ -2721,10 +2740,10 @@ impl Checker {
 
     #[allow(clippy::too_many_arguments)]
     fn wait_verdicts(&mut self, warp: WarpId, lanes: LaneMask, alloc: AllocId, range: Range<u64>, scope: Scope, accepted: &[u64], observed: u32, site: SiteId) {
-        let exact = self.words.get(&alloc).and_then(|ws| ws.exact(&range));
+        let exact = self.words_ref(alloc).and_then(|ws| ws.exact(&range));
         // A declared region polled element by element (a `sync_words`
         // buffer declared whole): the launch value needs no history.
-        let within = self.words.get(&alloc).and_then(|ws| ws.first_within(&range));
+        let within = self.words_ref(alloc).and_then(|ws| ws.first_within(&range));
         let Some(wi) = exact.or(within) else {
             self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
@@ -2740,7 +2759,7 @@ impl Checker {
         // but never coherence-before the waiting lanes' own latest write of
         // the word (CoWR; deltas W7): a grid-sync counter accepts stale
         // values of earlier rounds that the waiter can no longer read.
-        let floor = self.words[&alloc].list[wi].own.iter().filter(|((w, l), _)| *w == warp && lanes.has(*l)).map(|(_, i)| *i).max().unwrap_or(0);
+        let floor = self.words_ref(alloc).unwrap().list[wi].own.iter().filter(|((w, l), _)| *w == warp && lanes.has(*l)).map(|(_, i)| *i).max().unwrap_or(0);
         // If no accepted entry is at or after it (the predicate's history
         // view is coarser than the waiter's own writes), keep the earliest.
         let all = || accepted.iter().enumerate().flat_map(|(i, b)| (0..64u32).filter(move |k| b >> k & 1 != 0).map(move |k| i as u32 * 64 + k));
@@ -2752,7 +2771,7 @@ impl Checker {
         if idx == 0 {
             return; // the launch value satisfied the predicate: no edge owed
         }
-        let word = &self.words[&alloc].list[wi];
+        let word = &self.words_ref(alloc).unwrap().list[wi];
         let Some(e) = word.history.get(idx as usize - 1) else {
             self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
@@ -2770,7 +2789,7 @@ impl Checker {
                 return;
             }
         }
-        let word = &self.words[&alloc].list[wi];
+        let word = &self.words_ref(alloc).unwrap().list[wi];
         let Some(e) = word.history.get(idx as usize - 1) else {
             self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;

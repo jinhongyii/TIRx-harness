@@ -325,7 +325,8 @@ Implemented: `RaceObserver::fork`/`join`/`phase_end` (decision 17) on W2's
 **Result: 1.1x on e24 at 16 workers (19.8–20.8 s serial vs 18.3–19.1 s
 fork/join), below the 1.5x bar for a default-on second path.** The path
 lands as infrastructure with `tuning::FORK_JOIN` default **off**; it stays
-off until milestone 2 shows the gain. `phase_gc` stays default on (D7-gated,
+off until milestone 2 shows the gain. (Milestone 2 showed it; the default
+is now on, §14.) `phase_gc` stays default on (D7-gated,
 findings unchanged). The review tests run both arms explicitly. Profile at
 16 workers: join/absorb 68% of samples, `wait_verdicts` 52%.
 
@@ -435,3 +436,101 @@ and atomics run in serial-phase batches. A partition reads only round-start
 values plus its own writes (I11/I12), so child-side resolution against the
 round-start state is exact by construction. The join-time overlap check is a
 safety net, not a policy.
+
+## 14. Milestone 2 status (child-side strong reads and `WaitVerdicts`)
+
+Implemented in `racecheck/checker/partition.rs` and `observer.rs`.
+
+**Lent globals.** At the first fork of a phase, the main checker moves its
+global allocations (shadow, wide table, retired summary) and their declared
+words into an `Arc<Globals>`. Every child gets a read-only handle.
+
+- During the parallel replay the main checker processes no event: every fork
+  of a phase precedes its joins.
+- `join` only queues the child. The queue is absorbed, in join order, at the
+  next call that reaches the main checker: `phase_end`, the next fork batch,
+  an event, `end_launch` or `finish`.
+- Before absorbing, every queued child drops its handle and the main checker
+  takes the globals back with `Arc::try_unwrap`. It panics if a handle
+  survives.
+- Barrier objects are indexed by cluster once per phase, so a fork no longer
+  scans every phase record.
+
+**Strong global reads in the child.** This covers lane reads with a scope,
+not atomic, generic proxy, in bounds and at most 4 KiB.
+
+- The child computes the read-from exactly as `access_core` does: the latest
+  non-sibling write per segment, if it is morally strong, then
+  `effective_heads`. It uses the lent shadow, then applies the read-from (or
+  holds it as a poll) on its live warp.
+- The shadow check and record are deferred to the join with the warp
+  snapshot, like a weak access. The main checker skips the read-from there
+  (`skip_read_from`).
+- The child suspends instead when:
+  - the range overlaps the partition's own deferred writes of the phase
+    (`dwrites`);
+  - the prior's performing warp cannot be decoded in the child (an async
+    slot it does not hold);
+  - the access is wide.
+
+**`WaitVerdicts` in the child.**
+
+- `wait_verdicts` and `pred_reads_stable` read the lent words and shadow
+  through `words_ref`/`alloc_ref`.
+- The child suspends instead when:
+  - the entry it would acquire lies beyond the lent history (an entry of this
+    phase), including the observed index of an async entry;
+  - the word or a `pred_reads` range overlaps the partition's own writes of
+    the phase;
+  - an allocation is neither held nor lent.
+- Alloc/declare events, SC/tensormap fences, strong writes and atomics still
+  suspend.
+
+**Safety net.** Debug builds assert at the join that no range a child resolved
+against round-start state was written by a partition joined earlier in the
+phase (I11/I12).
+
+**Validation (FORK_JOIN on)**
+- All 20 tests in `racecheck_parallel_review.rs` pass in release (185 s) and
+  debug. That covers the 9 scenario pairs at 1/8/32 workers, the recorded
+  corpus and the streams, plus D7.
+- Payload hashes are bit-identical to serial at 1 and 16 workers on
+  fp16_bf16_gemm, deepgemm_1d1d, gdn_decode, kda, stp, radix_topk and e24.
+- Racecheck conformance passes 101/101, and `cargo test --workspace` (debug)
+  passes.
+
+**e24, recorded stream, three runs each (host load 3 to 17)**
+
+| workers | serial | fork/join |
+| --- | --- | --- |
+| 1 | 20.6–21.0 s | 23.0–23.5 s |
+| 16 | 19.8–21.1 s | 9.8–12.0 s (1.7–2.1x) |
+
+**Perf gate (`tests/perf/test_corpus_perf.py -k racecheck`), back to back:
+10 passed, 2 skipped in both arms.**
+
+| case | serial | fork/join |
+| --- | --- | --- |
+| twenty_four_experts | 22.58 s | 13.32 s |
+| shared_expert | 7.45 s | 6.73 s |
+| sixteen_tokens | 7.08 s | 6.49 s |
+| two_tokens | 7.13 s | 6.07 s |
+| kda w1 / w32 | 2.07 / 1.53 s | 2.46 / 1.82 s |
+| gdn w1 / w32 | 1.54 / 1.27 s | 1.69 / 1.09 s |
+| stp w1 / w32 | 0.28 / 0.14 s | 0.33 / 0.16 s |
+
+e24 clears the 1.5x bar, so `FORK_JOIN` now defaults on.
+
+**Regressions.** Single-worker runs pay the fork overhead with no
+parallelism: e24 +12%, radix_topk +15%, kda +19%. kda also loses at 32
+workers (many small partitions).
+
+**Next lever: contention, not serial work.** The main checker's share of e24
+wall time at 16 workers is now 4.6–5.4 s; the rest is children. The children
+spend 18.3 s of total CPU at 1 worker, but 39.5 s at 4 workers and 43–53 s
+at 8–16. Self-time samples show atomic refcount add/sub at about 17%, plus
+glibc malloc (`_int_malloc`, `unlink_chunk`, `mprotect`). Every child joins
+the same round-start release clocks (Arc'd chunks, groups and lane vectors),
+so refcounts bounce between cores. The cap of 2.7 s needs that cost cut, for
+example a per-worker allocator, or borrowing instead of cloning in
+`Clock::join` when the incoming side dominates.

@@ -166,6 +166,8 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
       which child. `NoopObserver`, synccheck and the observer pair keep
       `fork` → `None`; the pair forwards `phase_end`.
     - `RaceObserver` implements `fork` behind `fork_join` (default
-      `tuning::FORK_JOIN`, **off**: 1.1x on e24 in milestone 1, below the
-      1.5x bar). `phase_gc` (GC only at `phase_end`, D7) defaults on in both
-      modes.
+      `tuning::FORK_JOIN`, on since milestone 2: children also resolve strong
+      global reads and `WaitVerdicts` against the round-start global state,
+      lent read-only for the phase; joined children are absorbed at the next
+      event that reaches the main checker). `phase_gc` (GC only at
+      `phase_end`, D7) defaults on in both modes.

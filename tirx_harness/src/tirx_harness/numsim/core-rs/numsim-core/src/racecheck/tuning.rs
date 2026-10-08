@@ -28,9 +28,10 @@ switches! {
 }
 
 /// Decision 17: `RaceObserver`s fork a child checker per scheduling
-/// partition (default for new observers: off until milestone 2 shows the
-/// gain; 1.1x on e24 in milestone 1. Not a pruning switch).
-pub static FORK_JOIN: AtomicBool = AtomicBool::new(false);
+/// partition (default for new observers: on since milestone 2, 1.7-2.1x on
+/// mega_moe e24 at 16 workers; findings identical either way. Not a pruning
+/// switch).
+pub static FORK_JOIN: AtomicBool = AtomicBool::new(true);
 
 #[inline(always)]
 pub fn on(s: &AtomicBool) -> bool {
