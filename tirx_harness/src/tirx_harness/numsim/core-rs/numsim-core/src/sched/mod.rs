@@ -1238,12 +1238,17 @@ impl<'p> Scheduler<'p> {
         // its events go first (Arena::shard_replay_order). Without such
         // conflicts this is partition order. A cycle (each read what the
         // other wrote) has no faithful sequential stream: partition order is
-        // used and an `incomplete` diagnostic says so.
+        // used and an `incomplete` diagnostic says so. Such a round is also
+        // replayed without fork offers: a forked child resolves against
+        // round-start state, which is only exact under a faithful order
+        // (W5-17b).
+        let mut faithful = true;
         let order = if self.observing {
             match Arena::shard_replay_order(&shards[..kept]) {
                 Ok(o) => o,
                 Err((a, b)) => {
                     self.stream_cycle(a, b);
+                    faithful = false;
                     (0..kept).collect()
                 }
             }
@@ -1269,7 +1274,7 @@ impl<'p> Scheduler<'p> {
         // its events are about to be delivered; buffered verdicts are
         // renumbered to the merged (delivery-order) history first (W6-P1).
         self.merge_words(&order);
-        self.replay_partitions(&order, observer, pool);
+        self.replay_partitions(&order, observer, if faithful { pool } else { None });
         let mut progress = false;
         let mut first_err = None;
         for (k, result) in results.iter_mut().enumerate().take(kept) {

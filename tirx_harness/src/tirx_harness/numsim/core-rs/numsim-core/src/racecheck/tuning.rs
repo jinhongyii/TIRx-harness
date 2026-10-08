@@ -31,7 +31,12 @@ switches! {
 /// partition (default for new observers: on since milestone 2, 1.7-2.1x on
 /// mega_moe e24 at 16 workers; findings identical either way. Not a pruning
 /// switch).
-pub static FORK_JOIN: AtomicBool = AtomicBool::new(true);
+pub static FORK_JOIN: AtomicBool = AtomicBool::new(false);
+
+/// Decision 17 / W5-17a: a partition with fewer accesses than this is
+/// buffered and replayed by the main checker at the merge instead of being
+/// given a child checker (cost only; results are identical either way).
+pub static FORK_MIN_ACCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[inline(always)]
 pub fn on(s: &AtomicBool) -> bool {

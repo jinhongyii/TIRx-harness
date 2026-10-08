@@ -3273,3 +3273,49 @@ all-`None` case entirely; the buffer child covers the mixed case.
 - `accesses` is a property of the partition's buffered events, which are
   themselves worker-count independent. Only whether a pool exists depends on
   the worker count, and that changes delivery, never content.
+
+## W5-17b (2026-10-08, for the coordinator): no fork offers for an unfaithful replay order
+
+**Bug.** W6's `h1_cycle_sb_with_data_fork_join_matches_serial` fails in
+release at df280f3. A child resolves `flag_acquire` against round-start
+state while CTA 0, replayed earlier in the same phase, wrote the flag.
+
+**Cause.** Milestone 2's child-side resolution relies on the replay-order
+guarantee of `Arena::shard_replay_order`: a shard that read bytes another
+shard wrote this round is replayed first. So no partition earlier in the
+order wrote bytes a later partition read, and every byte a partition reads
+from another partition is round-start state. When the order has a cycle,
+`run_round` falls back to partition order (`stream_cycle`), the guarantee no
+longer holds, and the child's answer differs from serial replay.
+
+**Request.** In `run_round`, when `shard_replay_order` returns `Err` (the
+`stream_cycle` branch), call `replay_partitions` with `pool = None`. With
+W5-17a that means no `fork` offers: the round replays serially into the
+observer, exactly as at one worker.
+
+Sketch, verified in a scratch copy of HEAD:
+
+```rust
+let mut faithful = true;
+let order = if self.observing {
+    match Arena::shard_replay_order(&shards[..kept]) {
+        Ok(o) => o,
+        Err((a, b)) => { self.stream_cycle(a, b); faithful = false; (0..kept).collect() }
+    }
+} else { (0..kept).collect() };
+// ...
+self.replay_partitions(&order, observer, if faithful { pool } else { None });
+```
+
+With this, `h1_cycle_sb_with_data_fork_join_matches_serial` passes in
+release; without it, it fails.
+
+**Why results stay worker-count independent.** This is the W5-17a argument:
+only the delivery changes (forked vs serial). The `Access`/`SyncEvent` stream,
+its order and the verdict indices do not, and observers that ignore `fork`
+are unaffected. A cycle round is already reported `incomplete` by
+`stream_cycle`. Serial replay of that round is what racecheck does at one
+worker, so its payload equals the serial checker's by construction.
+
+**Racecheck side.** The debug assert at join stays. With this change it
+checks the `shard_replay_order` guarantee and should never fire.
