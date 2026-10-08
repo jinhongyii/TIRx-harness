@@ -291,11 +291,11 @@ for `WaitBatch`, `Invalidate`, or an arrive with `drop`. Otherwise:
   `unified:1997-2066`). For conditional waits, the successor generation comes
   from `conditional_wait_successor` (`unified:4100-4132`).
 
-> **Found while prototyping:** the overtaking check also fires when `g + 1` is
+> **Found during implementation:** the overtaking check also fires when `g + 1` is
 > a terminal generation that never completes. In that case nothing can
 > overtake the wait, and the exhaustive search accepts the program. The
-> prototype only applies the check when `g + 1` completes
-> (`certificate.rs`, found by `tests/equivalence.rs`).
+> implementation applies the check only when `g + 1` completes
+> (`certificate.rs`, found by `tests/synccheck_equivalence.rs`).
 
 ### 2.4 Fingerprint dedup
 
@@ -514,14 +514,14 @@ errors, for example the cluster exit-membership incomplete at
 
 ## 3. Operation-count arguments for each pruning
 
-The numbers come from the prototype's bench, `cargo bench --bench pipeline`.
+The numbers come from `cargo bench -p numsim-core --bench synccheck` (§5.9 has the current table).
 The benchmark is a ring of 1 producer + 15 consumers, 4 stages, 32 iterations:
 1,020 events, budget 100k states. The TMA variant has 1,076 events.
 
 | pruning | what it saves | when it applies | count argument | measured (16x4x32) |
 | --- | --- | --- | --- | --- |
 | **Per-resource projection + HB gates** | The cross product of independent resources' states, and the interleavings of commands on other resources | Always. Commands that change several resources atomically are joined into one projection | Whole program: about the product of per-warp cursor offsets inside the K-stage window, exponential in the number of consumers. With projection, each resource keeps only its own commands. HB gates collapse rounds, so generation `g + 1` cannot start before `g` is consumed | whole + every reduction: >100k states (budget hit). Per-resource + diamonds: 1,062 states, clean |
-| **Warp/resource components** (prototype, plan §2.6) | Interleavings between disconnected subsystems | Only when warps and resources really partition | Sound without clocks, but a pipeline is one component, so this saves nothing here | Same as whole: >100k |
+| **Warp/resource components** (plan §2.6) | Interleavings between disconnected subsystems | Only when warps and resources really partition | Sound without clocks, but a pipeline is one component, so this saves nothing here | Same as whole: >100k |
 | **Strong diamonds** | `n` independent ready transitions (consumer waits on a completed phase, arrivals before the last one) go from `2^n` states to `n + 1` | Every pair of enabled transitions commutes, and no first step exposes or disables another transition | A generation with C ready consumers takes C + 1 states instead of 2^C | per-resource: plain >100k, diamond-only 1,062 |
 | **Sleep sets** | Re-exploring commuting transitions: `n·2^(n-1)` transitions become `2^n − 1`. **States are not reduced** | Whenever two enabled transitions commute (the state-local check) | Each state is still visited (unit test: 1,024 states, 5,120 → 1,023 transitions) | per-resource sleep-only: >100k states. "16 warps may break sleep sets" (plan §6) holds |
 | **Persistent transition** | Orders of a terminal TMA completion against waiters and unrelated work | A pending transaction completion whose barrier has no conflicting future command (§2.5) | W waiters × completion: the completion moves to the front, so waiters see a ready phase and become a diamond chain | TMA-many-waiters test (16 warps): ≤ 32 + 18 states (`tests/scenarios.rs`) |
@@ -633,8 +633,8 @@ Vec<SyncEvent> ──► Program (per-warp sequences, collectives joined)
 
 ### 5.2 What changes compared with legacy
 
-* **No clocks or generations in the log.** The prototype recomputes them from
-  one complete schedule of the whole program (`program::reference_run`). Any
+* **No clocks or generations in the log.** Synccheck recomputes them from
+  one complete schedule per connected component (`reference::run`). Any
   complete schedule is acceptable, because the certificates and the per-resource
   searches prove the annotations do not depend on the schedule. Phase A's
   online causal tracker (`sync_causality.rs`, about 1.6K lines, plus the clock
