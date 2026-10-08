@@ -18,6 +18,8 @@
 //! * `reg_indexed` — a loop reading and writing a 64-element register array
 //!   at a warp-uniform index (unrolled-accumulator access):
 //!   `alu::load_reg_indexed` / `store_reg_indexed`.
+//! * `store_v4` — 16-byte vector stores into shared memory (a GEMM
+//!   epilogue's staging): `mem::store`.
 //! * `corpus_numsim` — whole corpus kernels (NumSim mode, 1 worker) from the
 //!   recorded fixtures: `examples/record_race_fixtures.py OUT rmsnorm
 //!   deepgemm_sm100_fp8_gemm_1d1d fp16_bf16_gemm` into `$RACE_FIXTURES` or
@@ -322,12 +324,44 @@ pub fn reg_indexed(iters: u32) -> Scenario {
     s
 }
 
+/// 4 warps, `iters` iterations of a `u32x4` store into shared memory.
+pub fn store_v4(iters: u32) -> Scenario {
+    let v4 = Ty::vector(Dtype::U32, 4);
+    let mut b = ProgramBuilder::new("store_v4", 128);
+    let inp = b.global("inp", Dtype::U32);
+    let sh = b.shared("sh", Dtype::U32, 128 * 4);
+    let tid = b.reg(Ty::U32);
+    let i4 = b.reg(Ty::U32);
+    let k = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(v4);
+    b.thread_rank(tid);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k4 = b.k_u32(4);
+    let kn = b.k_u32(iters);
+    b.mul(Ty::U32, i4, tid, k4);
+    b.ld(v4, v, inp, i4);
+    b.mov(k, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, kn);
+    b.loop_if(p);
+    b.st(v4, sh, i4, v);
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.exit();
+    let mut s = Scenario { name: "store_v4", module: b.build_module(), inputs: inputs(vec![("inp", u32_buf(0..512))]), config: Default::default() };
+    s.config.completions = CompletionPolicy::Eager;
+    s
+}
+
 fn bench(c: &mut Criterion) {
     group(c, "spin_wait_regs", "pad768_iters4096", &spin_wait(768, 4096));
     group(c, "admit_regs", "ctas64_pad256", &admit(64, 256));
     group(c, "read_special", "iters256", &read_special(256));
     group(c, "tcgen_ld", "x64_iters64", &tcgen_ld(64));
     group(c, "reg_indexed", "iters2048", &reg_indexed(2048));
+    group(c, "store_v4", "iters2048", &store_v4(2048));
 }
 
 fn corpus(c: &mut Criterion) {

@@ -470,6 +470,16 @@ fn piece_offset(p: &oplib::TcgenLdstPiece) -> u64 {
     addr::tmem_byte_offset(p.tmem_lane, p.column) + p.cell_byte as u64
 }
 
+/// Record a fast-path read of piece `p` for a wait_until predicate that
+/// captures its reads (what `support::mem_read` records on the per-piece
+/// path).
+#[inline]
+fn capture_piece(ctx: &mut ExecCtx<'_>, tmem: crate::arena::AllocId, p: &oplib::TcgenLdstPiece) {
+    if let Some(c) = ctx.aux.capture_reads.as_mut() {
+        c.push((tmem, ByteSpan::new(piece_offset(p), p.len as u64)));
+    }
+}
+
 /// Byte images of the live, fully valid cell runs of a `tcgen05.ld/st`
 /// map (W4-16), read once per op. `locate` maps a piece to its image byte.
 struct RunImages<'m> {
@@ -571,15 +581,28 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
     let mut bytes = vec![0u8; nregs * 4];
     // W4-16: each live, fully valid cell run is read once into `image`;
     // pieces of other runs take the per-piece path (same errors / findings).
-    let runs = RunImages::load(ctx, tmem, map.cell_runs(), ctx.aux.capture_reads.is_none())?;
-    if compress.is_none() && red.is_none() && !ctx.observing && runs.at.iter().all(Option::is_some) {
+    let runs = RunImages::load(ctx, tmem, map.cell_runs(), true)?;
+    if compress.is_none() && red.is_none() && runs.at.iter().all(Option::is_some) {
         let key = (args.shape, args.num, args.pack, ctx.warp.warp_in_cta, taddr);
         if let Some(offs) = word_offsets(key, &map, &runs) {
             if args.dsts.len() == nregs && args.dsts.iter().all(|&d| support::reg_ty(ctx, d).mem_bytes() == 4) {
                 // W13: every register is one 4-byte piece of a live, valid
-                // run and nothing observes the read: copy register-major
+                // run (chosen by data shape only): copy register-major
                 // straight from the run images (same values as the per-lane
                 // path, which is taken whenever any of this does not hold).
+                // The read spans are the per-lane path's, in its order.
+                if ctx.observing || ctx.aux.capture_reads.is_some() {
+                    for t in active.lanes() {
+                        for r in 0..nregs {
+                            for p in map.pieces(r, t) {
+                                capture_piece(ctx, tmem, p);
+                                if ctx.observing {
+                                    tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) });
+                                }
+                            }
+                        }
+                    }
+                }
                 for (r, &d) in args.dsts.iter().enumerate() {
                     let ty = support::reg_ty(ctx, d);
                     let m = if ty.bits() < 64 { (1u64 << ty.bits()) - 1 } else { u64::MAX };
@@ -617,6 +640,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
                     let at = 4 * r + p.reg_byte as usize;
                     let n = p.len as usize;
                     if let Some(k) = runs.locate(p, &mut hint) {
+                        capture_piece(ctx, tmem, p);
                         if n == 4 {
                             let w: [u8; 4] = runs.image[k..k + 4].try_into().unwrap();
                             bytes[at..at + 4].copy_from_slice(&w);
@@ -661,6 +685,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
                     let at = 4 * r + p.reg_byte as usize;
                     let n = p.len as usize;
                     if let Some(k) = runs.locate(p, &mut hint) {
+                        capture_piece(ctx, tmem, p);
                         bytes[at..at + n].copy_from_slice(&runs.image[k..k + n]);
                     } else {
                         check_piece_live(ctx, p, t, "tcgen05.ld")?;
@@ -783,8 +808,8 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
     // W4-16: live, fully valid cell runs are patched in `image` and written
     // back once (validity is unchanged: already valid); other pieces take
     // the per-piece path. The images are flushed before any error returns.
-    let fast = !(ctx.aux.wants_history && ctx.aux.words.has(tmem));
-    let mut runs = RunImages::load(ctx, tmem, map.cell_runs(), fast)?;
+    let mut runs = RunImages::load(ctx, tmem, map.cell_runs(), true)?;
+    let log = ctx.aux.wants_history && !ctx.aux.words.is_empty();
     let mut bytes = Vec::with_capacity(nregs * 4);
     let res = (|| -> Result<(), crate::interp::ExecError> {
         for t in active.lanes() {
@@ -803,6 +828,10 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
                     let n = p.len as usize;
                     if let Some(k) = runs.locate(p, &mut hint) {
                         runs.image[k..k + n].copy_from_slice(&bytes[at..at + n]);
+                        if log {
+                            // Declared-word history, as `mem_write` logs it.
+                            ctx.aux.words.log_lane(tmem, ByteSpan::new(piece_offset(p), p.len as u64), &bytes[at..at + n]);
+                        }
                     } else {
                         check_piece_live(ctx, p, t, "tcgen05.st")?;
                         let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
@@ -1202,7 +1231,7 @@ pub(crate) fn mma_a_footprint_probe(p: &TcgenMmaPayload, options: &oplib::TcMmaO
             Ok(())
         };
         let mut tw = |_: u32, _: u32, _: u32, _: &[u8]| -> oplib::OpResult { Ok(()) };
-        let _ = oplib::tc_mma_ctas(payload, options, &smem, &tr, &mut tw);
+        let _ = oplib::tc_mma_ctas(payload, options, &smem, &tr, &mut tw, None);
         reads.into_inner()
     };
     let first = probe(p);

@@ -82,9 +82,10 @@ fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<(crate::arena::AllocId, u6
         BufBinding::SharedWindow { offset, len } => (ctx.cta.smem, offset as u64, len),
         _ => return None,
     };
-    // Overlaid allocations and wait_until predicate evaluation (which
-    // records the bytes it read) take the general path.
-    if ctx.arena.is_overlaid(alloc) || ctx.aux.capture_reads.is_some() {
+    // Overlaid allocations take the general path. (A wait_until predicate's
+    // capture of the bytes it reads is recorded by the fast path too, so the
+    // choice does not depend on whether anyone observes.)
+    if ctx.arena.is_overlaid(alloc) {
         return None;
     }
     let a = ctx.arena.get(alloc);
@@ -144,6 +145,14 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
             if ok {
                 let s = ctx.slot(dst);
                 support::write_masked(ctx.warp.regs.get_mut(s), &vals, active);
+                if ctx.aux.capture_reads.is_some() {
+                    for l in active.lanes() {
+                        let off = fast_offset(ctx, buf, lane_int(ctx, offset, l), n, len, base).expect("checked");
+                        if let Some(c) = ctx.aux.capture_reads.as_mut() {
+                            c.push((alloc, crate::arena::ByteSpan::new(off, n)));
+                        }
+                    }
+                }
                 if sem != Sem::Weak {
                     let l0 = active.lanes().next().expect("active");
                     let off = fast_offset(ctx, buf, lane_int(ctx, offset, l0), n, len, base).expect("checked");
@@ -199,10 +208,11 @@ pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Op
     active_or_next!(ctx);
     let _ = mods;
     let n = ty.mem_bytes() as u64;
-    if n <= 8 && ty.slots() == 1 && !ctx.arena.readonly_tracking() {
-        // A store into an allocation holding declared words logs per lane
-        // (`mem_write`); other allocations log nothing and stay fast.
-        if let Some((alloc, base, len, window)) = fast_target(ctx, buf).filter(|t| !(ctx.aux.wants_history && ctx.aux.words.has(t.0))) {
+    // Up to 32 bytes (vector values, W13); sub-byte buffers keep their path.
+    if n <= 32 && (n <= 8 || sub_byte(ctx, ty, buf).is_none()) && !ctx.arena.readonly_tracking() {
+        // Declared-word history is logged per lane in lane order, as
+        // `mem_write` does, so the path does not depend on the observer.
+        if let Some((alloc, base, len, window)) = fast_target(ctx, buf) {
             let active = ctx.warp.active;
             let mut offs = [0u64; 32];
             let mut ok = true;
@@ -217,13 +227,32 @@ pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Op
                 }
             }
             if ok {
-                let vals = ctx.read(value);
+                // Each lane's bytes: the value's slots little-endian
+                // (`support::lane_bytes`).
+                let slots = ty.slots().min(4) as usize;
+                let mut vals = [[0u64; 32]; 4];
+                for (i, v) in vals.iter_mut().enumerate().take(slots) {
+                    *v = ctx.read_slot(value, i as u32);
+                }
+                let lane = |l: usize| -> [u8; 32] {
+                    let mut b = [0u8; 32];
+                    for (i, v) in vals.iter().enumerate().take(slots) {
+                        b[8 * i..8 * i + 8].copy_from_slice(&v[l].to_le_bytes());
+                    }
+                    b
+                };
                 {
                     let a = ctx.arena.get_mut(alloc);
                     for l in active.lanes() {
                         let off = offs[l] as usize;
-                        a.bytes[off..off + n as usize].copy_from_slice(&vals[l].to_le_bytes()[..n as usize]);
+                        a.bytes[off..off + n as usize].copy_from_slice(&lane(l)[..n as usize]);
                         a.valid.set_range(offs[l], n, true);
+                    }
+                }
+                if ctx.aux.wants_history && !ctx.aux.words.is_empty() {
+                    for l in active.lanes() {
+                        let span = crate::arena::ByteSpan::new(offs[l], n);
+                        ctx.aux.words.log_lane(alloc, span, &lane(l)[..n as usize]);
                     }
                 }
                 if ctx.observing {

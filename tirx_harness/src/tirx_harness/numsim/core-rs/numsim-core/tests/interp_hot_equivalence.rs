@@ -186,9 +186,11 @@ fn register_file_starts_zeroed() {
 }
 
 /// `tcgen05.ld.32x32b.x64` with a distinct value per (thread, column),
-/// loaded back twice (into fresh and into overwritten registers): the
-/// register-major fast path (no observer) and the per-lane path (recording
-/// observer) produce the same registers, equal to what was stored.
+/// loaded back twice (into fresh and into overwritten registers) through the
+/// register-major fast path (chosen by data shape, with or without an
+/// observer): the registers equal what was stored and the run does not
+/// depend on whether anyone observes it. (Observer-stream identity with the
+/// per-lane path is checked by the before/after digest of W13's report.)
 #[test]
 fn tcgen_ld_fast_path_matches_per_lane_path() {
     use numsim_core::observe::RecordingObserver;
@@ -385,5 +387,63 @@ fn reg_indexed_uniform_and_per_lane() {
     match o.status {
         RunStatus::Error(e) => assert_eq!(e.lanes, WarpMask::lane(0), "{e:?}"),
         other => panic!("expected an out-of-bounds error, got {other:?}"),
+    }
+}
+
+/// Vector (`u32x4`, 16-byte) stores take the store fast path (W13): values,
+/// element order and the untouched bytes of inactive lanes match the
+/// definition, through shared and global memory.
+#[test]
+fn vector_store_fast_path() {
+    let v4 = Ty::vector(Dtype::U32, 4);
+    let mut b = ProgramBuilder::new("vec_store", 64);
+    let inp = b.global("inp", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let sh = b.shared("sh", Dtype::U32, 64 * 4);
+    let tid = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let bit = b.reg(Ty::U32);
+    let odd = b.reg(Ty::PRED);
+    let i4 = b.reg(Ty::U32);
+    let j4 = b.reg(Ty::U32);
+    let v = b.reg(v4);
+    let w = b.reg(v4);
+    b.thread_rank(tid);
+    b.lane_id(lane);
+    let k1 = b.k_u32(1);
+    let k4 = b.k_u32(4);
+    let k63 = b.k_u32(63);
+    b.binary(BinOp::And, Ty::U32, bit, lane, k1);
+    b.compare(CmpOp::Eq, Ty::U32, odd, bit, k1);
+    b.mul(Ty::U32, i4, tid, k4);
+    b.ld(v4, v, inp, i4);
+    // Reverse thread order through shared memory.
+    b.binary(BinOp::Sub, Ty::U32, j4, k63, tid);
+    b.mul(Ty::U32, j4, j4, k4);
+    b.st(v4, sh, j4, v);
+    b.bar_sync(0);
+    b.ld(v4, w, sh, i4);
+    b.st(v4, out, i4, w);
+    // Odd lanes overwrite their slot with their own input (even lanes keep
+    // the reversed value).
+    b.if_(odd);
+    b.st(v4, out, i4, v);
+    b.end_if();
+    b.exit();
+    let input: Vec<u32> = (0..256u32).map(|x| x.wrapping_mul(2654435761)).collect();
+    let o = sched::run_with_config(
+        &b.build_module(),
+        &inputs(vec![("inp", u32_buf(input.clone())), ("out", u32_buf(vec![0; 256]))]),
+        &mut NoopObserver,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(o.status, RunStatus::Completed, "{:?}", o.status);
+    let got: Vec<u32> = o.outputs.buffers["out"].0.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for t in 0..64usize {
+        let src = if t % 2 == 1 { t } else { 63 - t };
+        for e in 0..4 {
+            assert_eq!(got[t * 4 + e], input[src * 4 + e], "thread {t} element {e}");
+        }
     }
 }
