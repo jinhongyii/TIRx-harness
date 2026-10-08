@@ -572,6 +572,13 @@ fn successor_scenario_reclaims_slots() {
 /// The consumer fences `proxy.async` before arriving on `empty` (its stage
 /// reads are generic; the next write is async-proxy).
 fn tma_stage_pipeline(iters: u32, chain: bool) -> Scenario {
+    tma_stage_pipeline_src(iters, chain, true)
+}
+
+/// `fresh_src`: iteration i copies `w[i * 32 ..]` (distinct global bytes
+/// each time, as a GEMM mainloop walks K); otherwise every iteration copies
+/// `w[0..32]`.
+fn tma_stage_pipeline_src(iters: u32, chain: bool, fresh_src: bool) -> Scenario {
     let mut b = ProgramBuilder::new("tma_stage_pipeline", 64);
     let w = b.global("w", Dtype::U32);
     let out = b.global("out", Dtype::U32);
@@ -641,7 +648,11 @@ fn tma_stage_pipeline(iters: u32, chain: bool) -> Scenario {
         multicast: None,
         state: None,
     }));
-    b.mul(Ty::U32, off, i, kw);
+    if fresh_src {
+        b.mul(Ty::U32, off, i, kw);
+    } else {
+        b.mov(off, k0);
+    }
     b.addr_of(ga, w, off);
     b.site("tma_stage_write", 11);
     b.push(Instr::BulkCopy(BulkCopyArgs {
@@ -738,18 +749,39 @@ fn tma_stage_reuse_without_chain_races() {
     );
 }
 
-/// With the chain, each stage's TMA write witness is superseded by the next
-/// one: under `gc_every = 1`, the live async-slot peak (`async_slots`) must
-/// not grow with the iteration count. Today it does (4 at 4 iterations, 32
-/// at 32): the stage's previous TMA write witness is never evicted. That is
-/// the mega_moe medium blow-up W5 is diagnosing.
+/// Live async-slot peak of the chained pipeline under `gc_every = 1`.
+fn pipeline_peak(iters: u32, fresh_src: bool) -> u64 {
+    let s = tma_stage_pipeline_src(iters, true, fresh_src);
+    coverage(&run_gc(&s, 1, Some(1)).1, "async_slots")
+}
+
+/// Stage writes are evicted by the chain. With every iteration copying the
+/// same `w` bytes (each copy's global read witness replaces the previous
+/// one), slots are reclaimed during the run: the live peak stays far below
+/// the iteration count. It still grows slowly, because the collector's
+/// period adapts (about 20 collections whatever the length); measured 21 at
+/// 128 iterations.
 #[test]
-#[ignore = "xfail: W5 TMA stage-reuse eviction (mega_moe medium); remove when the eviction rule lands"]
-fn tma_stage_reuse_with_chain_keeps_witnesses_bounded() {
-    let peak = |iters| {
-        let s = tma_stage_pipeline(iters, true);
-        coverage(&run_gc(&s, 1, Some(1)).1, "async_slots")
-    };
-    let (short, long) = (peak(4), peak(32));
-    assert!(long <= short + 1, "async-slot peak grows with stage reuse: {short} at 4 iterations, {long} at 32");
+fn tma_stage_reuse_same_source_reclaims_during_the_run() {
+    let peak = pipeline_peak(128, false);
+    assert!(peak <= 128 / 4, "async-slot peak {peak} at 128 iterations: slots are not reclaimed during the run");
+}
+
+/// With a fresh source slice per iteration (a mainloop walking K), each copy
+/// leaves an async read witness on global `w` that nothing replaces.
+/// - The producer learns only `hb` (through the consumer's generic `empty`
+///   release), never the global `a2g` view, so the global GC meet never
+///   covers the witness.
+/// - Every slot then stays live until the launch ends: peak 4 at 4
+///   iterations, 32 at 32, 128 at 128. This is the mega_moe medium pin
+///   (about 55K of 59K live slots held only by global witnesses).
+///
+/// It is fixed by re-attributing completed ops' witnesses to their
+/// observers, not by an eviction rule. Once fixed, the fresh-source peak
+/// must match the same-source one.
+#[test]
+#[ignore = "xfail: global read witnesses pin async slots (mega_moe medium); remove when W5's re-attribution lands"]
+fn tma_stage_reuse_fresh_source_reclaims_like_same_source() {
+    let (fresh, same) = (pipeline_peak(128, true), pipeline_peak(128, false));
+    assert!(fresh <= same + 2, "fresh-source peak {fresh} vs same-source {same} at 128 iterations: global read witnesses pin slots");
 }
