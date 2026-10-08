@@ -1684,6 +1684,23 @@ identity-seeded reductions instead. `test_warp_collective_reduction_follows_phys
 legacy-frontend semantics, and the v2 results are what the dispatched code
 computes on hardware. These are expectation deltas, not oplib bugs.
 
+W4-12 landed in 65bec68, including the edits to W2's files. The coordinator
+ruled on the reduction tests: v2's behaviour stands. See rows R1/R2 (and D7)
+in `docs/development/numsim-behaviour-deltas.md`.
+
+## W4-13 (2026-10-08): `cp.reduce.async.bulk.tensor` op/dtype validation
+
+- oplib: `tma_reduce_valid(AtomOp, Dtype)` implements the PTX table, the same
+  as legacy `RawTmaReductionOp::resolve`. A unit test cross-checks it
+  against that `resolve`. **W2**: `async_copy.rs` (`TmaDir::Reduce`) calls it
+  and returns `Invalid` at runtime for undefined pairs.
+- lowering (W1's `ptx_lower.py`, `lower_tma`): when the `tmap` operand names
+  a host-encoded TensorMap and no raw `force_cu_dtype` is set, the same table
+  is checked at transpile time and fails with `UnsupportedTIRxError`, as
+  legacy did. Maps that are not static fall back to the runtime check.
+  `test_partial_tile_forms::test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs`
+  is no longer marked xfail.
+
 ## W5-10 (for W2, 2026-10-08): restricted commit and tcgen smem operand proxy
 
 Found with `test_tcgen05_restricted_commit` (a racecheck false negative) and
@@ -1720,3 +1737,11 @@ V2C-5.
 3. **Done, no action:** `tcgen_commit` now tracks all in-flight tcgen ops, so
    the commit `preds` gap found on `nvfp4_gemm` is fixed. The checker's
    transitive closure (delta T7) stays as a guard.
+
+## W6-4 (2026-10-08): round-2 conformance (V2C-4 / V2C-28 / V2C-31)
+
+1. **`Collective.participants` (W2).** For cta_group::2 tcgen05 operations (`bmm_fp8_rubin`), each record of a collective lists only its recording warp. The contract (`observe.rs`) says participants is the full member set. Local workaround: synccheck takes the union, over records with the same id, of the declared participants and the recording warps. A record that is genuinely missing is still `fixed_sync_program_build`, and the message names the missing warps. Request: list every member in each record, or document "self only" as allowed.
+2. **Public-API payload rows are not synccheck gaps.** Of the 19 rows (status doc, "bug | synccheck | 19"), none comes from the explorer:
+   - `test_payload_runtime[*]`: the `incomplete` is `launch_not_executed`. The shim runs the whole module up to `phase_index`, and launch 26 (`scalar_warp_intrinsics`) stops on `Unsupported: tirx.cuda.sm100_2sm_leader_smem_addr` (oplib/lowering). Every later phase then inherits that `incomplete`. Owner: Python shim (run only the requested phase, or keep going after an `incomplete` launch) plus oplib for the intrinsic. Separately, 26 more params fail with `KeyError: 'task_count'`: the shim's `stats` lacks `task_count` (it has `completed_task_count`). Owner: Python shim.
+   - `test_shared_descriptor_choices[False-*]`: `Op(Unsupported): raw tcgen05.cp descriptor uses unsupported reserved/base/LBO-mode bits`. Legacy reported an error ("reserved"). The oplib should report reserved descriptor bits as an operation error, not `Unsupported`. Owner: W4.
+   - `test_reported_instruction_support[red_vec_packed_bf16]`: `Unsupported: numsim.pack ["ty=BF16x4"]: pieces [BF16, BF16] do not tile bf16x4`. Owner: lowering (W1).

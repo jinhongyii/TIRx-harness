@@ -614,3 +614,44 @@ fn fp4_tma_store_matches_the_legacy_planner_packed_and_padded() {
     let err = tma_plan_dir(&d, TmaPlanDir::Store, TmaMode::Tile, &[0, 0], &[], 0).unwrap_err();
     assert!(err.message.contains("padded FP4"), "{err}");
 }
+
+#[test]
+fn tma_reduce_validation_matches_the_legacy_ptx_table() {
+    use crate::program::AtomOp as A;
+    use numsim_oplib::tma::{RawTmaReductionOp as R, TensorMapElementType as T};
+    let pairs: [(A, R); 8] = [
+        (A::Add, R::Add),
+        (A::Min, R::Min),
+        (A::Max, R::Max),
+        (A::Inc, R::Inc),
+        (A::Dec, R::Dec),
+        (A::And, R::And),
+        (A::Or, R::Or),
+        (A::Xor, R::Xor),
+    ];
+    let types: [(Dtype, T); 11] = [
+        (Dtype::U8, T::U8),
+        (Dtype::U16, T::U16),
+        (Dtype::U32, T::U32),
+        (Dtype::S32, T::I32),
+        (Dtype::U64, T::U64),
+        (Dtype::S64, T::I64),
+        (Dtype::F16, T::F16),
+        (Dtype::BF16, T::Bf16),
+        (Dtype::F32, T::F32),
+        (Dtype::F64, T::F64),
+        (Dtype::TF32, T::Tf32),
+    ];
+    for (op, raw) in pairs {
+        for (dtype, elem) in types {
+            assert_eq!(
+                super::super::tma_reduce_valid(op, dtype).is_ok(),
+                raw.resolve(elem).is_ok(),
+                "{op:?} {dtype:?}"
+            );
+        }
+    }
+    for op in [A::Exch, A::Cas] {
+        assert!(super::super::tma_reduce_valid(op, Dtype::U32).is_err());
+    }
+}

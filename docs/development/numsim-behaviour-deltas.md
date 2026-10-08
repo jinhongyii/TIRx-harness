@@ -27,6 +27,7 @@ that matches no row here is a regression.
 | D4 | Open | `Cast.sat` | Legacy never set it. | Float destinations saturate to finite: ±inf becomes ±max finite and NaN stays NaN. Int destinations clamp to range. This is not PTX `.sat` (clamp to [0,1]). | None needed until lowering emits `sat`. Then settle which meaning lowering intends. |
 | D5 | New | Casts to e5m2 / e2m3 / e3m2 / e2m1 with `Rounding::Default` | Legacy had no cast to these types and rejected them. | Round to nearest even, saturate to finite. This is believed to match the CUDA `__nv_fp8_e5m2` / `__nv_fp4_e2m1` constructors. | Cast `{448, 1e6, NaN, ±tie values}` through `T.Cast` to each type and store the bytes. |
 | D6 | New | Explicit-rounding casts to fp8/fp6/fp4 | Rejected | Only `Rn` from sources that fit f32 exactly; e5m2 also requires `sat`. Everything else is `Unsupported`. | Already covered by the PTX `cvt` goldens. |
+| D7 | Confirmed (W4-12, 2026-10-08) | f64 `BinOp::Min/Max` signed zeros | The scalar TIR `min`/`max` in legacy used Rust `f64::min/max`, where the result for `(-0, +0)` is unspecified (`+0` on x86). Legacy tile reductions used PTX `min/max.f64` instead. | `cuda_f64_min/max`: NaN-ignoring, with `-0 < +0` (device `min.f64`/`max.f64`). f32 already followed this rule. | Covered by `test_local_float64_reductions_match_b200_edge_bits`, whose B200 edge bits require `min(-0, +0) = -0`. |
 
 ## CUDA helper and PTX value ops (`resolve_ptx`)
 
@@ -39,6 +40,15 @@ that matches no row here is a regression.
 | P5 | Confirmed | `shfl.sync` whose resolved source lane is not an active participant | Error: "warp shuffle reads a non-participant lane" | The same error from `oplib::shfl_sync` and from `tirx.ptx.shfl_sync*`. The infallible compatibility `oplib::shfl` returns the source value with predicate false. | — |
 | P6 | Open (W2) | `prefetch.L1::32B.valid_addr` | Validated that the address names one addressable global byte | No-op in OpLib; the check needs engine memory (CONTRACT_REQUESTS W4-9). | — |
 | P7 | Open (W2) | `applypriority.async.bulk*` with `completion=bulk_group` | Joined the thread's bulk async group | No-op in OpLib unless the handler registers it with the group (CONTRACT_REQUESTS W4-9). Values never change; only group counting would differ. | — |
+
+## Tile reductions (`tirx.tile.*` lowered through TVM dispatch, Decision 6)
+
+v2 runs the code TVM's tile dispatch emits for the GPU (`ir_walk.dispatch_tile_primitives`). The legacy frontend (`frontend-rs/src/emit/tile.rs`) emitted its own sequential reductions seeded with an identity value. Legacy's order and seed were a simulator artefact (coordinator ruling, 2026-10-08), and the tests that pinned them are being ported to the new values (W9).
+
+| ID | Status | Change | Legacy | New | What a GPU golden would settle |
+| --- | --- | --- | --- | --- | --- |
+| R1 | Confirmed (coordinator ruling, 2026-10-08) | Summation order of warp-collective reductions (`Tx.warp.sum/max/min` with `dispatch="local"`, and partial-warp widths) | Lexicographic in lane order: `acc = identity; acc = acc ⊕ v[lane]` for lane 0..width. | The dispatched `shfl.bfly` butterfly tree with offsets 16, 8, 4, 2, 1 (`Shfl` + `Binary` in the lowered program). Lane 0's sum of `[1e20, 1, -1e20, 1]` (rest 0) is `(1e20 + -1e20) + (1 + 1) = 2.0`. Legacy gave `1.0`. | The dispatched code is what runs on hardware, so no golden is needed. Affects `test_warp_collective_reduction_follows_physical_lane_ownership` and `test_local_collective_uses_lexicographic_order`. |
+| R2 | Confirmed (coordinator ruling, 2026-10-08) | `Tx.max/min(..., dispatch="3input_maxmin")` on f32 | Legacy ignored the dispatch: a sequential `max.f32`/`min.f32` chain seeded with `∓FLT_MAX`, so all-NaN input gave `0xFF7FFFFF` (max) and `0x7F7FFFFF` (min). | The dispatched code: pairwise `Binary Max/Min` partials with no identity seed, then `tirx.ptx.max3`/`min3`. These ignore NaN, but an all-NaN input gives the canonical NaN `0x7FFFFFFF`. Mixed rows are unchanged, for example `max(NaN, -0, +0, ...) = +0` and `min = -inf`. | Same as R1. Affects `test_maxmin_uses_canonical_lexicographic_nan_and_signed_zero_order`. |
 
 ## Async / tensor-core numerics
 

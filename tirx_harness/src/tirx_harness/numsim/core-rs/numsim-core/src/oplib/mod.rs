@@ -620,6 +620,30 @@ pub fn tma_tf32_round(bits: u32) -> u32 {
     numsim_oplib::tma::tma_f32_to_tf32(f32::from_bits(bits)).to_bits()
 }
 
+/// `cp.reduce.async.bulk.tensor`: is `.redOp` defined for the TensorMap
+/// element type? The PTX table, as legacy `RawTmaReductionOp::resolve`:
+/// `.add` u32/s32/u64/f32(tf32)/f16/bf16; `.min/.max` u32/s32/u64/s64/f16/
+/// bf16; `.inc/.dec` u32; `.and/.or/.xor` any 32- or 64-bit type.
+/// Undefined pairs are `Invalid`.
+pub fn tma_reduce_valid(op: crate::program::AtomOp, dtype: Dtype) -> OpResult<()> {
+    use crate::program::AtomOp as A;
+    use Dtype as D;
+    let ok = match op {
+        A::Add => matches!(dtype, D::U32 | D::S32 | D::U64 | D::F32 | D::TF32 | D::F16 | D::BF16),
+        A::Min | A::Max => matches!(dtype, D::U32 | D::S32 | D::U64 | D::S64 | D::F16 | D::BF16),
+        A::Inc | A::Dec => dtype == D::U32,
+        A::And | A::Or | A::Xor => matches!(dtype.bits(), 32 | 64),
+        A::Exch | A::Cas => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(OpError::invalid(format!(
+            "cp.reduce.async.bulk.tensor operation {op:?} is invalid for TensorMap dtype {dtype:?}"
+        )))
+    }
+}
+
 /// Decoded tcgen05/wgmma shared-memory matrix descriptor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SmemDesc {
