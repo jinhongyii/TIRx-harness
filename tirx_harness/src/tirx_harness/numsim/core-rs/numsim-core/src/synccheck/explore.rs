@@ -22,15 +22,6 @@ pub trait TransitionSystem {
         -> Result<Self::State, Self::Error>;
     fn is_complete(&self, state: &Self::State) -> bool;
     fn describe_deadlock(&self, state: &Self::State) -> Self::Deadlock;
-    /// An enabled transition that can be moved to the front of every complete
-    /// execution without losing errors, deadlocks or distinct terminal states.
-    fn persistent_transition(
-        &self,
-        _state: &Self::State,
-        _enabled: &[Self::Transition],
-    ) -> Option<Self::Transition> {
-        None
-    }
     /// A transition that forms a persistent set on its own in the strict
     /// sense (it commutes with every transition that can run before it
     /// and none of them can disable it), so it may be combined with sleep
@@ -84,8 +75,6 @@ pub struct Options {
 /// Switches for the model-level reductions of `ts::Ts`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rules {
-    /// Terminal transaction-completion persistent rule (`persistent_transition`).
-    pub tx_terminal: bool,
     /// Singleton: warp-private async-group issue/commit.
     pub private_issue: bool,
     /// Singleton: ready mbarrier wait/test with only observers before it.
@@ -97,8 +86,8 @@ pub struct Rules {
 }
 
 impl Rules {
-    pub const ALL: Self = Self { tx_terminal: true, private_issue: true, ready_observer: true, deferred_completion: true, twin_landings: true };
-    pub const NONE: Self = Self { tx_terminal: false, private_issue: false, ready_observer: false, deferred_completion: false, twin_landings: false };
+    pub const ALL: Self = Self { private_issue: true, ready_observer: true, deferred_completion: true, twin_landings: true };
+    pub const NONE: Self = Self { private_issue: false, ready_observer: false, deferred_completion: false, twin_landings: false };
 }
 
 impl Options {
@@ -282,10 +271,10 @@ pub fn explore<M: TransitionSystem>(
         };
         let active = enabled.iter().filter(|t| !sleep.contains(*t)).count();
 
-        let persistent = (options.persistent && sleep.is_empty())
-            .then(|| model.persistent_transition(&state, &enabled))
+        let persistent = options
+            .persistent
+            .then(|| model.singleton_persistent(&state, &enabled))
             .flatten()
-            .or_else(|| options.persistent.then(|| model.singleton_persistent(&state, &enabled)).flatten())
             .and_then(|t| enabled.binary_search(&t).ok());
         let canonical = (options.strong_diamonds && persistent.is_none() && active > 1)
             .then(|| all_strong_diamonds(model, &enabled, &successors))

@@ -873,33 +873,49 @@ The CLAUDE.md rule is to keep pruning techniques guarded by their criterion benc
 **Bench.** `cargo bench -p numsim-core --bench synccheck` (`numsim-core/benches/synccheck.rs`).
 - It prints the table below, then times the "on" configuration of every row with criterion. `SYNCCHECK_TABLE_ONLY=1` prints only the table.
 - Each row runs one scenario generator from `synccheck::build` (`pipeline`, `umma_ring`, `tma_many_waiters`, `per_lane_arrivals`) twice: everything on, then the same configuration with that one technique off. "Off" runs are capped at 200k states.
-- The bench asserts that every "on" run is Clean. A reduction that breaks therefore fails the bench, and one that stops pruning shows as a criterion regression of the "off" ratio.
+- The bench asserts that every "on" run is Clean. A reduction that breaks therefore fails the bench, and one that stops pruning shows as a criterion regression.
 
-**Switches.** Individual techniques are switched by `explore::Options::rules` (`Rules { tx_terminal, private_issue, ready_observer, deferred_completion, twin_landings }`, default all on) and `SynccheckConfig::hb_gates` (default on).
+**Switches.** Individual techniques are switched by `explore::Options` (`sleep_sets`, `strong_diamonds`, `persistent`) and `Options::rules` (`Rules { private_issue, ready_observer, deferred_completion, twin_landings }`, default all on), plus `SynccheckConfig::hb_gates` (default on).
 
-Release build, one run:
+Release build, one run (after the tx-terminal removal below):
 
 | Technique | Scenario | States on / off | Transitions on / off | Time on / off | Time ratio | Verdict on / off |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| per-resource projection (off = whole program) | pipeline(6,2,8) | 153 / 79,038 | 163 / 179,445 | 1.5 ms / 2.4 s | 1574x | Clean / Clean |
+| per-resource projection (off = whole program) | pipeline(6,2,8) | 153 / 79,038 | 163 / 179,445 | 1.6 ms / 2.3 s | 1419x | Clean / Clean |
 | HB gates | pipeline(6,2,8) | 153 / 2 | 163 / 2 | — | (soundness) | Clean / **Error** (false alarm) |
-| sleep sets (alone vs none) | tma_many_waiters(16) | 196,616 / 196,616 | 262,149 / 1,572,876 | 5.2 s / 2.9 s | **0.5x** | Clean / Clean |
-| strong diamonds (with sleep, persistent off) | tma_many_waiters(16) | 75 / 196,616 | 75 / 262,149 | 5.2 ms / 4.9 s | 942x | Clean / Clean |
-| fingerprint dedup | pipeline(8,8,64,1024) | 218 / 1,569 | 230 / 1,665 | 8.7 ms / 19.3 ms | 2.2x | Clean / Clean |
-| causal certificates | umma_ring(6,16,16) | 15 / 3,860 | 1,453 / 4,376 | 18.9 ms / 33.3 ms | 1.8x (257x states) | Clean / Clean |
-| tx terminal persistent | pipeline(4,2,8,1024) | 143 / 147 | 151 / 157 | 1.0 ms / 1.1 ms | **1.1x** | Clean / Clean |
-| twin landings (deferred-completion singleton off) | per_lane_arrivals(1,2,2,1) | 2,334 / 200,000 (budget) | 2,368 / 200,032 | 121 ms / 21.6 s | 178x | Clean / Incomplete |
-| singleton: private async-group issue | per_lane_arrivals(4,1,1,4) | 546 / 10,898 | 545 / 10,897 | 92 ms / 1.7 s | 18.5x | Clean / Clean |
-| singleton: ready observer | per_lane_arrivals(1,8,2,1) | 118 / 7,171 | 117 / 7,170 | 9.1 ms / 525 ms | 57x | Clean / Clean |
-| singleton: deferred completion | per_lane_arrivals(4,2,2,1) | 2,805 / 200,000 (budget) | 2,804 / 200,511 | 763 ms / 59.3 s | 78x | Clean / Incomplete |
+| strong diamonds (with sleep, persistent off) | tma_many_waiters(16) | 75 / 196,616 | 75 / 262,149 | 4.4 ms / 4.9 s | 1109x | Clean / Clean |
+| fingerprint dedup | pipeline(8,8,64,1024) | 220 / 1,585 | 233 / 1,689 | 9.8 ms / 21.9 ms | 2.2x | Clean / Clean |
+| causal certificates | umma_ring(6,16,16) | 15 / 3,872 | 1,453 / 4,394 | 21.5 ms / 37.2 ms | 1.7x (258x states) | Clean / Clean |
+| twin landings (deferred-completion singleton off) | per_lane_arrivals(1,2,2,1) | 2,334 / 200,000 (budget) | 2,368 / 200,032 | 129 ms / 21.1 s | 164x | Clean / Incomplete |
+| singleton: private async-group issue | per_lane_arrivals(4,1,1,4) | 546 / 10,898 | 545 / 10,897 | 103 ms / 1.7 s | 16.7x | Clean / Clean |
+| singleton: ready observer | per_lane_arrivals(1,8,2,1) | 118 / 7,171 | 117 / 7,170 | 9.0 ms / 518 ms | 58x | Clean / Clean |
+| sleep sets (in combination with the singletons) | per_lane_arrivals(4,2,2,1) | 2,805 / 14,275 | 2,804 / 14,626 | 740 ms / 2.1 s | 2.8x | Clean / Clean |
+| singleton: deferred completion | per_lane_arrivals(4,2,2,1) | 2,805 / 200,000 (budget) | 2,804 / 200,511 | 726 ms / 58.0 s | 80x | Clean / Incomplete |
 
-**Findings.**
+**Removed: tx-terminal persistent rule.** This was the terminal transaction-completion rule (`persistent_transition`). Measured with everything else on, it never mattered across eight scenarios, and it is subsumed by the observer and deferred-completion singletons:
+
+| Scenario | States with / without | Time ratio |
+| --- | --- | --- |
+| pipeline(6,2,8) | 153 / 153 | 1.0x |
+| pipeline(8,8,64,1024) | 1,569 / 1,585 | 1.0x |
+| umma_ring(6,16,16) | 3,860 / 3,872 | 1.0x |
+| tma_many_waiters(16) | 73 / 75 | 1.0x |
+| per_lane_arrivals, all four shapes | unchanged | 1.0x |
+
+Its trait hook `TransitionSystem::persistent_transition`, `Ts::persistent_transition` and `Rules::tx_terminal` are deleted. After removal, the "on" runs keep their verdicts and states up to +2 states (fingerprint row 218 → 220).
+
+**Kept: sleep sets (the removal decision was reverted).** The earlier "alone" measurement showed 0.5x time and no state reduction, and was the wrong context. Measured in combination with the persistent singletons (all other techniques on), removing them leaves verdicts unchanged but costs states and time on exactly the V2C-31 per-lane shapes:
+
+| Scenario | States with / without | Time ratio |
+| --- | --- | --- |
+| per_lane_arrivals(4,2,2,1) | 2,805 / 14,275 | 2.9x |
+| per_lane_arrivals(4,1,1,4) | 546 / 2,115 | 2.1x |
+| per_lane_arrivals(1,8,2,1) | 118 / 185 | 1.1x |
+| per_lane_arrivals(1,2,2,1) | 88 / 155 | 1.2x |
+
+On the other shapes they cost 0.8-0.9x. Their guard row is "sleep sets (in combination)". The scenario test `four_producers_per_lane_arrivals_on_two_barriers_stay_small` (< 5,000 states) fails without them (14,275).
+
+**Other findings.**
 - **HB gates** are not a performance technique. They make per-resource projection sound against false alarms, so their guard is the Clean assertion.
-- **Twin landings** are subsumed by the deferred-completion singleton when both are on, so their row switches that singleton off. The same holds for `tx terminal persistent`: the observer and deferred-completion singletons cover it, and alone it fires only in shapes where it saves a few states.
-- **Two techniques have no ≥2x guard:**
-  - *Sleep sets* cut explored transitions 6x but are slower (0.5x). Cloning a sleep set per node costs more than the transitions save, and in every shape tried (whole and per-resource pipelines, many waiters) they never cut states.
-  - *tx terminal persistent* saves at most 3% of states.
-
-  Both are candidates for removal, or for sleep sets an optimization (shared or bitset sleep sets). The decision is the coordinator's; the switches make it a one-line change.
 - **`sync/` memoization:** there is none (no caches in `numsim-core/src/sync/`), so there is nothing to guard.
-- **Budget paths** have scenario tests: `budget_exhaustion_is_incomplete` (states → `fixed_sync_states`), `transition_budget_is_incomplete` (`fixed_sync_transitions`) and `wall_time_limit_is_incomplete` (`wall_time`).
+- **Budget paths** have scenario tests: `budget_exhaustion_is_incomplete` (`fixed_sync_states`), `transition_budget_is_incomplete` (`fixed_sync_transitions`) and `wall_time_limit_is_incomplete` (`wall_time`).

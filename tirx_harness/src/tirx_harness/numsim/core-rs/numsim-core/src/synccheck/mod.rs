@@ -15,8 +15,8 @@
 //! 4. **Projection** per resource group with happens-before gates
 //!    ([`projection`]), then per projection: causal certificate
 //!    ([`certificate`]), fingerprint reuse ([`fingerprint`]), or
-//!    explicit-state DFS with state hashing, sleep sets, strong diamonds and a
-//!    persistent-transition rule ([`explore`]).
+//!    explicit-state DFS with state hashing, sleep sets, strong diamonds and
+//!    persistent singletons ([`explore`]).
 //! 5. Budget exhaustion and unmodeled situations are `Status::Incomplete`.
 //!
 //! [`serialize`] renders a [`Report`] as today's native payload so the Python

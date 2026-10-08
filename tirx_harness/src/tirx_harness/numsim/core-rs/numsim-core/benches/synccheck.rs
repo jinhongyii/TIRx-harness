@@ -1,6 +1,11 @@
 //! Synccheck reduction guards (W6, CLAUDE.md "keep pruning techniques
 //! guarded by their criterion benchmarks").
 //!
+//! The terminal transaction-completion persistent rule was removed after
+//! these measurements (§5.9: 1.0-1.1x in every scenario, subsumed by the
+//! singletons). Sleep sets stay: alone they cost time (0.5x), but together
+//! with the persistent singletons they cut states 5x on the per-lane shapes.
+//!
 //! Every reduction of the explorer has one row: a scenario generator
 //! (`synccheck::build`), the configuration with everything on, and the same
 //! configuration with that one technique off. `cargo bench -p numsim-core
@@ -61,14 +66,11 @@ fn rows() -> Vec<Row> {
     rows.push(Row { technique: "HB gates", scenario: "pipeline(6,2,8)", log: pipe(), on: b.clone(), off: SynccheckConfig { hb_gates: false, ..b.clone() } });
     let t16 = base(16);
     let tma_only = |o: Options| SynccheckConfig { explore: o, ..t16.clone() };
-    rows.push(Row { technique: "sleep sets (alone)", scenario: "tma_many_waiters(16)", log: tma_many_waiters(16), on: tma_only(Options { sleep_sets: true, ..Options::NONE }), off: tma_only(Options::NONE) });
-    rows.push(Row { technique: "strong diamonds (with sleep, no persistent)", scenario: "tma_many_waiters(16)", log: tma_many_waiters(16), on: tma_only(Options { sleep_sets: true, strong_diamonds: true, ..Options::NONE }), off: tma_only(Options { sleep_sets: true, ..Options::NONE }) });
+    rows.push(Row { technique: "strong diamonds (with sleep, persistent off)", scenario: "tma_many_waiters(16)", log: tma_many_waiters(16), on: tma_only(Options { sleep_sets: true, strong_diamonds: true, ..Options::NONE }), off: tma_only(Options { sleep_sets: true, ..Options::NONE }) });
     let p8 = base(8);
     rows.push(Row { technique: "fingerprint dedup", scenario: "pipeline(8,8,64,1024)", log: pipeline(8, 8, 64, 1024), on: SynccheckConfig { fingerprints: true, ..p8.clone() }, off: p8.clone() });
     let umma = base(6);
     rows.push(Row { technique: "causal certificates", scenario: "umma_ring(6,16,16)", log: umma_ring(6, 16, 16), on: SynccheckConfig { certificates: true, ..umma.clone() }, off: umma.clone() });
-    let b4 = base(4);
-    rows.push(Row { technique: "tx terminal persistent", scenario: "pipeline(4,2,8,1024)", log: pipeline(4, 2, 8, 1024), on: b4.clone(), off: rules_off(&b4, |r| r.tx_terminal = false) });
     // Subsumed by the deferred-completion singleton when that is on.
     let one = rules_off(&base(3), |r| r.deferred_completion = false);
     rows.push(Row { technique: "twin landings (deferred singleton off)", scenario: "per_lane_arrivals(1,2,2,1)", log: per_lane_arrivals(1, 2, 2, 1), on: one.clone(), off: rules_off(&one, |r| r.twin_landings = false) });
@@ -76,6 +78,10 @@ fn rows() -> Vec<Row> {
     rows.push(Row { technique: "singleton: private async-group issue", scenario: "per_lane_arrivals(4,1,1,4)", log: per_lane_arrivals(4, 1, 1, 4), on: priv_.clone(), off: rules_off(&priv_, |r| r.private_issue = false) });
     let obs = base(9);
     rows.push(Row { technique: "singleton: ready observer", scenario: "per_lane_arrivals(1,8,2,1)", log: per_lane_arrivals(1, 8, 2, 1), on: obs.clone(), off: rules_off(&obs, |r| r.ready_observer = false) });
+    // Sleep sets measured in combination: alone they cut transitions but
+    // not states (and cost time); with the singletons they cut states.
+    let sl = base(6);
+    rows.push(Row { technique: "sleep sets (in combination)", scenario: "per_lane_arrivals(4,2,2,1)", log: per_lane_arrivals(4, 2, 2, 1), on: sl.clone(), off: SynccheckConfig { explore: Options { sleep_sets: false, ..Options::ALL }, ..sl.clone() } });
     let land = base(6);
     rows.push(Row { technique: "singleton: deferred completion", scenario: "per_lane_arrivals(4,2,2,1)", log: per_lane_arrivals(4, 2, 2, 1), on: land.clone(), off: rules_off(&land, |r| r.deferred_completion = false) });
     rows

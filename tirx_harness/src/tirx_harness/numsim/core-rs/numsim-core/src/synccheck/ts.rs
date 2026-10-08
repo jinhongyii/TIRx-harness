@@ -145,8 +145,6 @@ pub struct Ts<'p> {
     pub resources: Vec<usize>,
     pub cmds: Vec<LocalCmd>,
     initial_res: Vec<Res>,
-    /// Commands per local resource (persistent-transition rule).
-    resource_cmds: Vec<Vec<usize>>,
     /// Global command -> local command.
     global_local: HashMap<usize, usize>,
     /// Local commands whose completions some landing gate names by ordinal
@@ -295,7 +293,7 @@ impl<'p> Ts<'p> {
                     })
             })
             .collect();
-        let mut ts = Ts { program, key: spec.key, warps, programs, resources, cmds, initial_res, resource_cmds, global_local, landing_gated, private, rules: super::explore::Rules::ALL };
+        let mut ts = Ts { program, key: spec.key, warps, programs, resources, cmds, initial_res, global_local, landing_gated, private, rules: super::explore::Rules::ALL };
         if let Some(reference) = reference {
             for c in &mut ts.cmds {
                 let g = c.global;
@@ -1123,36 +1121,4 @@ impl TransitionSystem for Ts<'_> {
         None
     }
 
-    /// Today's terminal-completion rule (`sync_fixed_unified.rs:5304-5380`):
-    /// a pending transaction completion may run first when no other pending
-    /// completion targets its barrier on another generation and no
-    /// not-yet-issued command of the projection can observe the barrier
-    /// except parity waits/tests that this completion makes ready.
-    fn persistent_transition(&self, s: &State, enabled: &[Transition]) -> Option<Transition> {
-        if !self.rules.tx_terminal {
-            return None;
-        }
-        enabled.iter().copied().find(|t| {
-            let Transition::Complete(c, o) = *t else { return false };
-            let Some(p) = s.pending.iter().find(|p| (p.cmd, p.ord) == (c, o)) else { return false };
-            let PendingKind::Tx { gen, .. } = p.kind else { return false };
-            if s.pending.iter().any(|q| q.res == p.res && !matches!(q.kind, PendingKind::Tx { gen: g, .. } if g == gen)) {
-                return false;
-            }
-            let parity = gen & 1;
-            let conflicts = self.resource_cmds[p.res as usize].iter().any(|&lc| {
-                let cmd = &self.cmds[lc];
-                let issued = cmd.participants.iter().zip(&cmd.positions).all(|(&w, &pos)| s.cursors[w] as usize > pos);
-                if issued {
-                    return false;
-                }
-                cmd.issued.iter().any(|(r, _, _)| *r == p.res as usize)
-                    || cmd.cmds.iter().any(|&(r, ref k)| {
-                        r == p.res as usize
-                            && !matches!(k, SyncCmd::Mbarrier(mbarrier::Cmd::WaitParity { parity: q } | mbarrier::Cmd::TestParity { parity: q }) if *q == parity)
-                    })
-            });
-            !conflicts && self.step(s, t).is_ok()
-        })
-    }
 }
