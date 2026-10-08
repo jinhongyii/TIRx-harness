@@ -121,19 +121,6 @@ def k(a: T.Buffer((32,), "float32"), n: T.{dtype}):
     assert [s.name for s in single.kernels[0].host_abi][:2] == ["a", "n"]
 
 
-def test_vectorized_loop_lowers_as_serial_loop(lower_source):
-    program = lower_source('''
-@T.prim_func
-def k(out: T.Buffer((128,), "float32")):
-    T.attr({"tirx.device_entry": T.bool(True)})
-    lane = T.lane_id([32])
-    T.warp_id([1])
-    for v in T.vectorized(4):
-        out[lane * 4 + v] = T.float32(1)
-''')
-    assert not program.unsupported
-    assert [i.variant for i in program.code].count("LoopBegin") == 1
-
 
 def test_runtime_for_step_is_asserted_positive(lower_source):
     """W2-20: a zero/negative runtime step is a run-time error, not a budget stop."""
@@ -166,3 +153,43 @@ def k(out: T.Buffer((32,), "int32")):
     variants = [i.variant for i in program.code]
     head = variants.index("LoopBegin") + 1
     assert variants[head] == "Binary" and "Continue" in variants
+
+
+def test_launch_topology_folds_let_bound_extents_and_rejects_conflicts(lower_source):
+    """Legacy topology rules: statement-order `T.let` extents fold; conflicting or
+    non-static CTA-level extents and non-128-thread warpgroups fail closed."""
+    folded = lower_source('''
+@T.prim_func
+def k():
+    T.attr({"tirx.device_entry": T.bool(True)})
+    n: T.let = T.int32(4)
+    _cta = T.cta_id([T.Select(n > 3, T.min(n - 1, 3), 1)])
+    _warp = T.warp_id([2])
+    _lane = T.lane_id([32])
+''')
+    assert folded.topology.grid[0] == pb.DimExpr.const(3) and folded.topology.block[0] == 64
+    for body in ("_g = T.warpgroup_id([1])\n    _t = T.thread_id_in_wg([64])",
+                 "_g = T.warpgroup_id([1])\n    _w = T.warp_id_in_wg([3])\n    _l = T.lane_id([32])"):
+        program = lower_source(f'''
+@T.prim_func(check_well_formed=False)
+def k():
+    T.attr({{"tirx.device_entry": T.bool(True)}})
+    {body}
+''', strict=False)
+        assert any(u.startswith("topology:") for u in program.unsupported), program.unsupported
+
+
+def test_source_vectorized_loops_and_unknown_loop_annotations_fail_closed(lower_source):
+    program = lower_source('''
+@T.prim_func
+def k(output: T.Buffer((4,), "int32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    _w = T.warp_id([1])
+    _l = T.lane_id([32])
+    for i in T.vectorized(4):
+        output[i] = i
+    for j in T.serial(4, annotations={"numsim.unknown_loop": 1}):
+        output[j] = j
+''', strict=False)
+    reasons = " ".join(program.unsupported)
+    assert "VECTORIZED" in reasons and "numsim.unknown_loop" in reasons

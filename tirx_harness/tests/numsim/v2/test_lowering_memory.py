@@ -381,3 +381,39 @@ def test_shared_scope_view_over_a_mapa_result_reads_the_cluster_window():
     program = lower(kernel)
     reads = [i for i in all_of(program, "LoadAddr") if i.space != "Generic"]
     assert reads and all(i.space == "SharedCluster" for i in reads)
+
+
+def _window_kernel(arch: str | None, pool_bytes: int, view_offset: int, view_elems: int) -> str:
+    attr = f'T.func_attr({{"tirx.cuda_arch": "{arch}"}})\n    ' if arch else ""
+    return f'''
+@T.prim_func
+def k():
+    {attr}T.attr({{"tirx.device_entry": T.bool(True)}})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    pool = T.alloc_buffer(({pool_bytes},), "uint8", scope="shared.dyn", align=1024)
+    tile = T.decl_buffer(({view_elems},), "bfloat16", data=pool.data, elem_offset={view_offset}, scope="shared.dyn")
+    tile[lane] = T.bfloat16(1)
+'''
+
+
+def test_view_overrunning_its_pool_does_not_grow_the_shared_window(lower_source):
+    # cudnn_sm100_flex_attention_forward_hd256: a 230272-byte pool whose last
+    # bf16 staging view is declared 32768 elements at byte 196992 (ends at
+    # 262528) but only touches its first half. The CTA window is the allocation.
+    program = lower_source(_window_kernel("sm_100a", 230272, 98496, 32768))
+    pool = next(b for b in program.buffers if b.name == "pool")
+    assert pool.byte_len == pb.DimExpr.const(230272)
+    assert program.topology.static_smem_bytes == 230272
+
+
+def test_shared_window_above_the_sm100_per_cta_capacity_fails_closed(lower_source):
+    capacity = 227 * 1024
+    assert lower_source(_window_kernel("sm_100a", capacity, 0, 32)).topology.static_smem_bytes == capacity
+    for arch in ("sm_100a", "sm_103a", "sm_100f"):
+        program = lower_source(_window_kernel(arch, capacity + 16, 0, 32), strict=False)
+        assert any(f"above the {capacity}-byte per-CTA capacity of {arch}" in u for u in program.unsupported), \
+            program.unsupported
+    # Targets without a modeled capacity (sm_107a, no tirx.cuda_arch) are not checked.
+    for arch in ("sm_107a", None):
+        assert lower_source(_window_kernel(arch, 300000, 0, 32)).topology.static_smem_bytes == 300000

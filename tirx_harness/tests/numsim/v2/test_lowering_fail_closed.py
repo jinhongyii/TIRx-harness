@@ -76,3 +76,39 @@ def test_smem_desc_make_lo_uniform_is_a_lane_zero_shuffle():
     program = _lower(smem_descriptor_make_lo_uniform_helper)
     shfl = [i for i in program.code if i.variant == "Shfl"]
     assert len(shfl) == 1 and shfl[0].mode == "Idx" and shfl[0].ty.elem == "U32"
+
+
+def test_spdecompress_rejects_overlapping_or_unprovable_registers():
+    from tests.numsim.v2.ports.test_p6c_ptx_spdecompress_registry import (
+        spdecompress_aliased_register_views,
+        spdecompress_dynamic_register_index,
+    )
+
+    with pytest.raises(LoweringUnsupported, match="overlap"):
+        _lower(spdecompress_aliased_register_views)
+    # A dynamic index is not proof of overlap: the unproven pair becomes a
+    # run-time Assert on the concrete byte ranges (fails only when they overlap).
+    program = _lower(spdecompress_dynamic_register_index)
+    asserts = [i for i in program.code if i.variant == "Assert"]
+    messages = [program.strings[i.msg] for i in asserts]
+    assert sum("undefined register overlap" in m for m in messages) == 2, messages
+
+
+def test_spdecompress_register_disjointness_from_bounds_and_memory_operands():
+    """Global operands are not physical registers (legacy
+    ``test_ptx_spdecompress_matches_low_bit_first_sparse_scatter``); local
+    operands whose index bounds keep them apart need no check."""
+    from tests.numsim.runtime.test_ptx_spdecompress import ptx_spdecompress_b8_b4_2_4_x2
+    from tvm.script import tirx as T
+
+    @T.prim_func
+    def bounded(index: T.int32):
+        T.device_entry()
+        storage = T.alloc_buffer((8,), "uint32", scope="local")
+        for i in range(2):
+            T.ptx["spdecompress.b8.b4.sp::1:2.x2"](storage[i], storage[4 + T.min(T.max(index, 0), 3)], storage[2])
+
+    for kernel in (ptx_spdecompress_b8_b4_2_4_x2, bounded):
+        program = _lower(kernel)
+        messages = [program.strings[i.msg] for i in program.code if i.variant == "Assert" and i.msg is not None]
+        assert not any("register overlap" in m for m in messages), messages

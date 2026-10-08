@@ -140,3 +140,19 @@ def k(output: T.Buffer((128,), "uint32")):
     output[warp * 32 + lane] = rep[warp * 32 + lane]
 ''', strict=False)
     assert any("tmem_replicated_view: rep" in reason for reason in program.unsupported)
+
+
+def test_tcgen05_alloc_sets_the_dynamic_tmem_lifecycle_requirement():
+    from tests.numsim.v2.ports.test_p6c_tcgen_codegen import tcgen_control_calls
+    from tirx_harness.numsim.v2.lowering import lower
+
+    assert lower(tcgen_control_calls).requirements.dynamic_tmem_lifecycle is True
+
+
+def test_thread_scope_gemm_async_asserts_a_single_issuing_lane():
+    from tests.numsim.v2.ports.test_validshape_gemm_async_artifact import dense_gemm_async_two_thread_issuers_n16
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(dense_gemm_async_two_thread_issuers_n16)
+    messages = [program.strings[i.msg] for i in all_of(program, "Assert") if i.msg is not None]
+    assert any("exactly one active issuing lane" in m for m in messages)

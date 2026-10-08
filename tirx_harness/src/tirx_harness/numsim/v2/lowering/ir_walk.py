@@ -94,6 +94,10 @@ def _numpy_half(dtype: str) -> Any:
 _ELECT_OPS = frozenset({"tirx.cuda.elect_sync", "tirx.ptx.elect_sync"})
 
 WARPS_PER_WARPGROUP = 4
+# Per-CTA shared-memory capacity (static + dynamic, opt-in maximum) by target:
+# 227 KB on SM100/SM103 (CUDA Programming Guide, compute capability 10.0/10.3).
+# Other targets (sm_107a, no tirx.cuda_arch) are not checked.
+_SHARED_CAPACITY = (re.compile(r"sm_10[03][af]?"), 227 * 1024)
 U64 = pb.Ty("U64")
 
 
@@ -107,6 +111,7 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         self.host_binds: dict[int, Any] = {}
         self.layout_exprs: dict[int, Any] = {}
         self.dyn_pools: set[int] = set()
+        self.loop_scopes: list[Any] = []
         self.dyn_smem_bytes: int | None = None
         self.min_blocks_per_sm: int | None = None
         self.pred_args: dict[int, pb.Reg] = {}
@@ -237,6 +242,12 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         if program.topology is None:
             program.topology = pb.Launch(grid=(pb.DimExpr.const(1),) * 3)
         program.topology.static_smem_bytes = static_smem
+        pattern, capacity = _SHARED_CAPACITY
+        if program.arch is not None and pattern.fullmatch(program.arch) and static_smem > capacity:
+            # A CTA above the per-SM shared capacity cannot launch on hardware.
+            program.unsupported.append(
+                f"shared memory: the CTA needs {static_smem} bytes of shared memory, above the "
+                f"{capacity}-byte per-CTA capacity of {program.arch}")
         program.topology.dyn_smem_bytes = pb.DimExpr.const(0)
         program.topology.min_blocks_per_sm = self.min_blocks_per_sm
         if any(i.variant in ("TcgenAlloc", "TcgenDealloc") for i in program.code):
@@ -584,7 +595,12 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         cond = b.reg(pb.Ty("Pred"), uniform=uniform)
         b.emit("Compare", op="Lt", ty=ty, dst=cond, a=var, b=stop)
         loopif_pc = b.emit("LoopIf", cond=cond, end_pc=0)
-        self.stmt(node.body)
+        # Enclosing loop ranges, for static proofs over loop-variant indices.
+        self.loop_scopes.append(node)
+        try:
+            self.stmt(node.body)
+        finally:
+            self.loop_scopes.pop()
         if not head_increment:
             b.emit("Binary", op="Add", ty=ty, dst=var, a=var, b=step)
         end_pc = b.emit("LoopEnd", head_pc=head_pc)

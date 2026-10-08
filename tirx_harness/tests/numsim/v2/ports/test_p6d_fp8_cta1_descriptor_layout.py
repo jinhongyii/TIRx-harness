@@ -17,11 +17,10 @@ every output element and reported both checkers clean.
 
 The legacy tail (``sm_100a`` with the shared offset ``1 << 18``) raised
 ``UnsupportedTIRxError`` "exceeds the 18-bit descriptor address space" at
-transpile. v2 decodes the descriptor start-address field per arch at run time
-(``interp/handlers/tcgen.rs``, ``TcArch``), so ``v2.transpile`` accepts the
-kernel and the run fails closed instead: ``ss`` stops on the MMA descriptor
-(``invalid_operand``: reserved/base bits) and ``ts`` stops earlier on the T4
-``bad_address``. The copy asserts that run-time rejection.
+transpile. v2 also rejects it at transpile, for a different reason: its
+272384-byte shared window is above the 227 KB per-CTA capacity of ``sm_100a``
+(delta F5; such a CTA cannot launch). The descriptor start-address field is
+still decoded per arch at run time (``interp/handlers/tcgen.rs``, ``TcArch``).
 
 The kernel builder is copied verbatim from the legacy module.
 """
@@ -33,6 +32,7 @@ from tvm.tirx.layout import S, TCol, TLane, TileLayout
 
 from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
+from tirx_harness.numsim.errors import UnsupportedTIRxError
 
 pytestmark = requires_v2_engine
 
@@ -165,13 +165,7 @@ def test_fp8_cta1_extended_shared_addresses(a_in_tmem):
             assert [(f.status, f.kind) for f in report.findings] == [("error", "bad_address")]
             assert "outside warp 0's sub-partition" in report.findings[0].message
 
-    # The wider start field belongs to SM107: on sm_100a v2 accepts the kernel at
-    # transpile and fails closed at run time.
-    with pytest.raises(v2.ExecutionError) as excinfo:
-        v2.Engine(max_workers=1).run(
-            v2.transpile(kernel.with_attr("tirx.cuda_arch", "sm_100a")),
-            {"output": np.zeros((64, 8), dtype=np.uint32)},
-        )
-    stop = _first_stop(excinfo.value)
-    assert stop["status"] == "error", stop
-    assert stop["kind"] == ("bad_address" if a_in_tmem else "invalid_operand"), stop
+    # On sm_100a the 272384-byte shared window is above the per-CTA capacity:
+    # rejected at transpile (legacy also rejected it at transpile).
+    with pytest.raises(UnsupportedTIRxError, match="above the 232448-byte per-CTA capacity of sm_100a"):
+        v2.transpile(kernel.with_attr("tirx.cuda_arch", "sm_100a"))

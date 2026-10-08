@@ -1129,8 +1129,8 @@ def lower_ptx(lw: "Lowerer", node: Any) -> None:
         handler = handler_for(decoded.table_name)
     except KeyError:
         raise _Unsupported(node, f"{decoded.op_name} is rejected (not modeled for the SM100 target)") from None
-    if decoded.table_name.startswith("spdecompress"):
-        _check_distinct_registers(lw, node, decoded)
+    register_pairs = _check_distinct_registers(lw, node, decoded) \
+        if decoded.table_name.startswith("spdecompress") else []
     ctx = PtxCtx(lw, node, decoded)
     b = lw.builder
     if_pc = None
@@ -1144,6 +1144,8 @@ def lower_ptx(lw: "Lowerer", node: Any) -> None:
         guard, ctx.pred = ctx.pred, None
     start = len(b.code)
     try:
+        if register_pairs:
+            emit_register_checks(lw, node, decoded, register_pairs)
         handler(ctx)
     except (pb.UnrepresentableType, _Unsupported) as error:
         if if_pc is not None:
@@ -1158,12 +1160,30 @@ def lower_ptx(lw: "Lowerer", node: Any) -> None:
     del start
 
 
-def _check_distinct_registers(lw: "Lowerer", node: Any, decoded: ptx_decode.DecodedPtx) -> None:
+def _check_distinct_registers(lw: "Lowerer", node: Any, decoded: ptx_decode.DecodedPtx) -> list:
     """spdecompress register operands must be distinct physical registers (PTX:
-    overlapping data/metadata registers are undefined; legacy rejected them)."""
+    overlapping data/metadata registers are undefined; legacy rejected them).
+
+    Only register-backed operands (promoted locals, ``local`` buffers) name
+    physical registers; a global/shared element operand is copied through its
+    own register. Two operands over the same register root are rejected at
+    transpile only when they provably overlap; disjointness proven from the
+    index bounds needs nothing, and an unproven pair is returned for a run-time
+    ``Assert`` on the concrete byte ranges (emitted by ``emit_register_checks``).
+    """
+    from tvm.sym.analyzer import Analyzer
+
     from .memory import MemRef, RegArray, sum_bases
 
-    seen: dict[Any, str] = {}
+    analyzer = Analyzer()
+    import tvm
+
+    for loop in lw.loop_scopes:
+        try:
+            analyzer.bind(loop.loop_var, tvm.ir.Range.from_min_extent(loop.min, loop.extent))
+        except Exception:  # noqa: BLE001 - an unbindable range leaves the var unbounded
+            pass
+    operands: list[tuple] = []
     for info, values in zip(decoded.operands, decoded.values):
         for value in values:
             if value is ptx_decode.SINK or isinstance(value, str) or type_key(value) != "ir.TensorLoad":
@@ -1171,37 +1191,80 @@ def _check_distinct_registers(lw: "Lowerer", node: Any, decoded: ptx_decode.Deco
             ref = lw.ref_of(value.source)
             if isinstance(ref, RegArray):
                 root, base, elem_bytes = ("regs", id(ref.regs[0])), 0, 1
-                flat_static = lw.reg_array_slot(ref, value.indices)
-            elif isinstance(ref, MemRef):
+            elif isinstance(ref, MemRef) and ref.space in ("Local", "Reg"):
                 buffers = lw.builder.program.buffers
                 root_buf = ref.buf
                 while buffers[root_buf].view_of is not None:
                     root_buf = buffers[root_buf].view_of
                 root, base = ("buf", root_buf), sum_bases(buffers, ref.buf)
                 elem_bytes = max(1, buffers[ref.buf].dtype.bits // 8)
-                indices = [int(i.value) if type_key(i) == "ir.IntImm" else None for i in value.indices]
-                shape = ref.info.static_shape
-                flat_static = None
-                if None not in indices and shape is not None and not ref.info.strides and ref.info.layout is None:
-                    flat_static = 0
-                    for extent, index in zip(shape, indices):
-                        flat_static = flat_static * extent + index
             else:
                 continue
-            if not isinstance(flat_static, int):
-                if any(key[0] == root for key in seen):
-                    raise _Unsupported(node, f"{decoded.op_name}: cannot prove disjoint physical registers "
-                                             f"({info.name} has a dynamic index)")
-                seen[(root, None)] = info.name
+            shape = ref.info.static_shape
+            flat = None
+            if shape is not None and not ref.info.strides and getattr(ref.info, "layout", None) is None:
+                flat = 0
+                for extent, index in zip(shape, value.indices):
+                    flat = flat * extent + index
+                flat = analyzer.simplify(flat * elem_bytes + base) if not isinstance(flat, int) \
+                    else flat * elem_bytes + base
+            operands.append((root, flat, elem_bytes, ref, value.indices, info.name))
+
+    def bounds(flat: Any) -> tuple[int, int] | None:
+        if isinstance(flat, int):
+            return flat, flat
+        if type_key(flat) == "ir.IntImm":
+            return int(flat.value), int(flat.value)
+        bound = analyzer.const_int_bound(flat)
+        if abs(bound.min_value) >= 1 << 62 or abs(bound.max_value) >= 1 << 62:
+            return None
+        return int(bound.min_value), int(bound.max_value)
+
+    runtime: list = []
+    for i, (root_a, flat_a, size_a, ref_a, idx_a, name_a) in enumerate(operands):
+        for root_b, flat_b, size_b, ref_b, idx_b, name_b in operands[:i]:
+            if root_a != root_b:
                 continue
-            key = (root, base + flat_static * elem_bytes)
-            if (root, None) in seen:
-                raise _Unsupported(node, f"{decoded.op_name}: cannot prove disjoint physical registers "
-                                         f"({seen[(root, None)]} has a dynamic index)")
-            if key in seen:
-                raise _Unsupported(node, f"{decoded.op_name}: undefined register overlap: {info.name} and "
-                                         f"{seen.get(key, '?')} name the same physical register (aliased)")
-            seen[key] = info.name
+            if flat_a is not None and flat_b is not None:
+                diff = bounds(analyzer.simplify(flat_a - flat_b)) if not (
+                    isinstance(flat_a, int) and isinstance(flat_b, int)) else (flat_a - flat_b,) * 2
+                if diff is not None and diff[0] == diff[1] and -size_a < diff[0] < size_b:
+                    raise _Unsupported(node, f"{decoded.op_name}: undefined register overlap: {name_a} and "
+                                             f"{name_b} name the same physical register (aliased)")
+                range_a, range_b = bounds(flat_a), bounds(flat_b)
+                if range_a is not None and range_b is not None and (
+                        range_a[1] + size_a <= range_b[0] or range_b[1] + size_b <= range_a[0]):
+                    continue   # disjoint for every index value
+                if diff is not None and (diff[0] >= size_b or diff[1] <= -size_a):
+                    continue   # constant-sign separation
+            runtime.append(((ref_a, idx_a, size_a), (ref_b, idx_b, size_b), f"{name_a} and {name_b}"))
+    return runtime
+
+
+def emit_register_checks(lw: "Lowerer", node: Any, decoded: ptx_decode.DecodedPtx, pairs: list) -> None:
+    """Run-time ``Assert`` that each unproven operand pair names disjoint registers."""
+    from .memory import MemRef, sum_bases
+
+    i32 = pb.Ty("S32")
+
+    def byte_range(ref: Any, indices: Any, size: int) -> tuple[pb.Operand, pb.Operand]:
+        offset, _ = lw.flat_offset(ref, indices)
+        start = lw.binary("Mul", i32, lw.cast_to(offset, i32), lw.const("int32", size))
+        if isinstance(ref, MemRef):
+            base = sum_bases(lw.builder.program.buffers, ref.buf)
+            if base:
+                start = lw.binary("Add", i32, start, lw.const("int32", base))
+        return start, lw.binary("Add", i32, start, lw.const("int32", size))
+
+    for (ref_a, idx_a, size_a), (ref_b, idx_b, size_b), names in pairs:
+        start_a, end_a = byte_range(ref_a, idx_a, size_a)
+        start_b, end_b = byte_range(ref_b, idx_b, size_b)
+        before, after = lw.builder.reg(pb.Ty("Pred")), lw.builder.reg(pb.Ty("Pred"))
+        lw.builder.emit("Compare", op="Le", ty=i32, dst=before, a=end_a, b=start_b)
+        lw.builder.emit("Compare", op="Le", ty=i32, dst=after, a=end_b, b=start_a)
+        ok = lw.binary("Or", pb.Ty("Pred"), before, after)
+        lw.builder.emit("Assert", site=lw.site(node), cond=ok, msg=lw.builder.string(
+            f"{decoded.op_name}: undefined register overlap: {names} name the same physical register"))
 
 
 __all__ = ["lower_ptx", "handler_for"]

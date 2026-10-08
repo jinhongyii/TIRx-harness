@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 from tirx_harness.numsim.errors import UnsupportedTIRxError
 
@@ -35,11 +35,6 @@ def spdecompress_dynamic_register_index(index: T.int32):
     T.ptx["spdecompress.b8.b4.sp::1:2.x2"](storage[index], storage[1], storage[2])
 
 
-@v2_gap(
-    "v2 transpiles and completes spdecompress whose data register storage[1] "
-    "and mdata register alias[0] are the same physical register; legacy "
-    "rejected it ('undefined register overlap ... aliased')"
-)
 def test_spdecompress_rejects_same_physical_register_through_alias_views():
     """Port of ``tests/numsim/registry/test_ptx_spdecompress_registry.py::test_spdecompress_rejects_same_physical_register_through_alias_views``."""
 
@@ -47,12 +42,6 @@ def test_spdecompress_rejects_same_physical_register_through_alias_views():
         v2.Engine().run(v2.transpile(spdecompress_aliased_register_views), {})
 
 
-@v2_gap(
-    "v2 transpiles spdecompress with a dynamic register index and completes "
-    "the run even when index=1 makes data and mdata the same register; legacy "
-    "rejected the unprovable overlap at transpile ('cannot prove disjoint "
-    "physical register')"
-)
 def test_spdecompress_rejects_unknown_dynamic_register_overlap():
     """Port of ``tests/numsim/registry/test_ptx_spdecompress_registry.py::test_spdecompress_rejects_unknown_dynamic_register_overlap``.
 

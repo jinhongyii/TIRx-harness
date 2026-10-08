@@ -210,8 +210,9 @@ def test_shared_span_above_18_bits_is_checked_where_a_descriptor_addresses_it():
     Legacy rejected any kernel whose shared window exceeded the 18-bit SM100
     descriptor address space, even one that builds no descriptor. v2 checks
     the bound where a descriptor addresses shared memory (the run stops with
-    ``invalid_operand``; see the extended-span test below), so this kernel,
-    which only stores to its last byte, transpiles and runs.
+    ``invalid_operand``), so this kernel, which only stores to its last byte
+    and names no ``tirx.cuda_arch`` (no per-CTA capacity check), transpiles
+    and runs.
     """
 
     result = _run(shared_span_above_18_bits_without_sm107_descriptor)
@@ -222,20 +223,17 @@ def test_f8f6f4_cta2_k32_extended_shared_span_is_gated_by_arch_not_k_bit():
     """Port of ``tests/numsim/runtime/test_raw_tcgen_codegen.py::test_f8f6f4_cta2_k32_extended_shared_span_is_gated_by_arch_not_k_bit``.
 
     sm_100a: legacy rejected the extended (above 18-bit) shared span while
-    emitting Rust. v2 transpiles it and the run fails closed with an
-    ``invalid_operand`` error on the out-of-range descriptor (stage moved from
-    transpile to run; no delta row). sm_107a: legacy emitted the
+    emitting Rust. v2 also rejects it at transpile, because the 270336-byte
+    shared window is above the 227 KB per-CTA capacity of sm_100a (delta F5:
+    such a CTA cannot launch). sm_107a: legacy emitted the
     ``MatrixDescriptorSm107`` variant (generated-Rust pin dropped); v2 runs
     the same kernel to completion.
     """
 
     kernel = raw_tcgen_mma_f8f6f4_cta2_k32_extended_span_without_arch
 
-    with pytest.raises(v2.ExecutionError) as caught:
-        _run(kernel.with_attr("tirx.cuda_arch", "sm_100a"))
-    stop = _stop(caught.value)
-    assert stop["status"] == "error", stop
-    assert stop["kind"] == "invalid_operand", stop
+    with pytest.raises(UnsupportedTIRxError, match="270336 bytes of shared memory, above the 232448-byte"):
+        v2.transpile(kernel.with_attr("tirx.cuda_arch", "sm_100a"))
 
     result = _run(kernel.with_attr("tirx.cuda_arch", "sm_107a"))
     assert result.status.get("kind") == "completed", result.status

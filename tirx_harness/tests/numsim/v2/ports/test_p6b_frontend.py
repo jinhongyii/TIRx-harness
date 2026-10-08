@@ -305,7 +305,6 @@ def test_warpgroup_local_coordinate_does_not_imply_one_group_per_cta():
     assert _topology(module)["warps_per_cta"] == 8
 
 
-@v2_gap("bound_launch_topology: document grid is 1 CTA; the let-bound extent Select(4 > 3, min(3, 3), 1) is 3")
 def test_bound_launch_extent_is_resolved_in_statement_order():
     """Port of ``tests/numsim/integration/test_frontend.py::test_bound_launch_extent_is_resolved_in_statement_order``."""
 
@@ -339,7 +338,6 @@ def test_constant_if_then_else_launch_extent_only_evaluates_selected_branch():
     assert _topology(v2.transpile(_specialize(choose=False)))["warps_per_cta"] == 1
 
 
-@v2_gap("if_then_else(True, 2, 1) warp extent: document block is 32 threads (1 warp), expected 2 warps")
 def test_constant_if_then_else_launch_extent_only_evaluates_selected_branch_true():
     """Port of ``tests/numsim/integration/test_frontend.py::test_constant_if_then_else_launch_extent_only_evaluates_selected_branch`` (``choose=True, count=2`` half)."""
 
@@ -353,7 +351,6 @@ def test_constant_if_then_else_launch_extent_only_evaluates_selected_branch_true
         pytest.param({"count": 2}, id="choose-unbound"),
     ],
 )
-@v2_gap("launch extent that is not statically known is accepted (document block 32 threads), expected UnsupportedTIRxError")
 def test_constant_if_then_else_launch_extent_not_static_fails_closed(bindings):
     """Port of ``tests/numsim/integration/test_frontend.py::test_constant_if_then_else_launch_extent_only_evaluates_selected_branch`` (fail-closed half).
 
@@ -391,7 +388,6 @@ def test_cta_pair_rank_does_not_override_cluster_cta_extent():
         "conflicting_cluster_extents",
     ],
 )
-@v2_gap("conflicting/invalid launch-topology constraints are accepted (transpile and run succeed), expected a fail-closed rejection")
 def test_conflicting_or_invalid_topology_constraints_fail_closed(kernel):
     """Port of ``tests/numsim/integration/test_frontend.py::test_conflicting_or_invalid_topology_constraints_fail_closed``.
 
@@ -431,7 +427,6 @@ def test_serial_and_unrolled_loop_metadata_are_explicitly_supported():
     np.testing.assert_array_equal(result.outputs["output"], np.arange(8, dtype=np.int32))
 
 
-@v2_gap("for-loop with an unknown annotation 'numsim.unknown_loop' is accepted, expected UnsupportedTIRxError naming it")
 def test_unknown_loop_annotations_fail_closed():
     """Port of ``tests/numsim/integration/test_frontend.py::test_unknown_loop_annotations_fail_closed``."""
 
@@ -443,11 +438,7 @@ def test_unknown_loop_annotations_fail_closed():
 @pytest.mark.parametrize(
     "kernel",
     [
-        pytest.param(
-            vectorized_loop,
-            marks=v2_gap("T.vectorized loop is accepted and run sequentially, expected UnsupportedTIRxError"),
-            id="vectorized_loop-VECTORIZED",
-        ),
+        pytest.param(vectorized_loop, id="vectorized_loop-VECTORIZED"),
         pytest.param(parallel_loop, id="parallel_loop-PARALLEL"),
         pytest.param(thread_bound_loop, id="thread_bound_loop-THREAD_BINDING"),
     ],
