@@ -1367,3 +1367,135 @@ These are only out-of-scope or fail-closed-by-design rows:
   - a runtime TensorMap box dim (`TensorMapSpec.box_dim` is static);
   - `smem_desc_make_lo_uniform`, a warp-collective CUDA helper. It is not
     reviewed and fails closed.
+
+
+---
+
+## Part F: Residuals (2026-10-08, after the tile forms)
+
+Live tree (W12 sweep, `scripts/numsim-v2/lower_sweep.py` over the full
+capture set, `strict=False`; `program_builder.FORMAT_VERSION` 3):
+
+| scope | result |
+| --- | --- |
+| captured kernels | 2343 (2341 loadable; 2 need test-only node types, as in C.1) |
+| lower with no `Unsupported` | **2250** (E.2: 2196; before the tile forms: 2217) |
+| lowering exceptions | 0 |
+| Rust decode + `validate()` (`validate.sh`) | 2341/2341 loadable kernels |
+
+The 91 loadable kernels that still carry an `Unsupported` are listed below.
+Each has an owner ruling, and none is a finding (a kernel legacy compiled
+without a ruling). The "legacy" column comes from running legacy
+`numsim.transpile` on the same capture.
+
+- **Legacy compiled, v2 fails closed by ruling (43):**
+  - L1 replicated TMEM view (13; 3 of them also hit L5 in their `gemm_async`);
+  - L2 `ptx_legacy.*` (9);
+  - L4 tcgen05.mma shape that is invalid on hardware (14; L4's text says 13, and the 14th is `dense_fp8_gemm_async_cta1`, `kind::f8f6f4`, same rule);
+  - L6 TMA innermost box under 16 B (6);
+  - L7 TMA into a padded shared slice (1).
+- **Both reject (48):**
+  - L3 negative tile-form tests (11: 8 `UnsupportedTIRxError` and 3 `UnmodeledTIRxFormError` in legacy);
+  - other negative fail-closed tests that legacy rejects too (37: 34 `UnsupportedTIRxError` and 3 `UnmodeledTIRxFormError`). Three of these are tile ops TVM *would* dispatch: `float64_directed_rounding_is_unsupported`, `tile_unary_unknown_config` and `_warp_gemm_wrong_a_fragment_layout`. v2 keeps legacy's fail-closed rule for them (`tile_checks.py`).
+- **Open V2C-TF1 (legacy compiled, tile form not yet ported): none.** Of
+  W1's 28 `gemm_async`/`copy_async` kernels, the hint repairs lower 8. Every
+  other one is an L4/L5/L6/L7 ruling or a negative test. W12's 30 kernels
+  lower except `fp8_scale_permute_tmem_roundtrip` (L1).
+
+"Ruling" values: `Lx` = row of `numsim-behaviour-deltas.md` "Lowering
+fail-closed forms"; "legacy also rejects (E)" = a negative test whose legacy
+`transpile` raises E.
+
+| capture | kernel | test (first capturing node) | v2 reason (first) | class | ruling |
+| --- | --- | --- | --- | --- | --- |
+| `6c673522` | `_block_scaled_fp8_dynamic_shared_stage` | `test_fp8_snapshot_gather_honors_a_dynamic_shared_stage` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view | L1 |
+| `ce2d8cb9` | `_block_scaled_nvfp4_gemm_cta_group2_pair23` | `test_cta_group2_uses_the_issuing_ctas_pair_2_and_3` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view | L1 |
+| `3f0bffe8` | `_block_scaled_runtime_instruction_descriptor` | `test_block_scaled_desc_i_rejects_static_abi_mismatch_at_runtime` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view | L1 |
+| `b260fd72` | `_tcgen_cp_two_pairs_in_one_cluster` | `test_tcgen_cp_cta_group2_routes_each_pair_in_four_cta_cluster` | tmem_replicated_view: scale_tmem | direct access to a replicated TMEM view | L1 |
+| `08e6b09d` | `block_scaled_mxfp4_gemm` | `test_mxfp4_uses_ue8m0_scales_over_32_element_vectors` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view | L1 |
+| `37a1e22b` | `block_scaled_nvfp4_gemm` | `test_nvfp4_block_scaled_gemm_decodes_nibbles_and_e4m3_scales` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view | L1 |
+| `4776fa77` | `block_scaled_nvfp4_gemm_cta_group2_scale_rows` | `test_cta_group2_batched_gemm_accumulates_both_target_ctas` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view | L1 |
+| `afa1d772` | `fp8_scale_permute_tmem_roundtrip` | `test_fp8_scale_permute_and_sf_reuse_tmem_roundtrip` | tmem_replicated_view: scale_tmem | direct access to a replicated TMEM view | L1 |
+| `41a767bf` | `tcgen_scale_bitcast_cta_group2` | `test_tcgen_cp_cta_group2_reads_and_writes_each_cta_scale_backing` | tmem_replicated_view: scale_tmem | direct access to a replicated TMEM view | L1 |
+| `22072b4b` | `tcgen_scale_bitcast_shared_to_tmem` | `test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem` | tmem_replicated_view: scale_tmem | direct access to a replicated TMEM view | L1 |
+| `7c87de29` | `_block_scaled_interleaved_physical_streams` | `test_interleaved_block_scaled_calls_are_independent_of_prior_calls` | tmem_replicated_view: scale_1_a_tmem | direct access to a replicated TMEM view; its gemm_async also has SFA K extent 8 | L1 + L5 |
+| `6a205528` | `_block_scaled_scale_region_min` | `test_block_scale_region_min_selects_the_physical_scale_coordinates` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view; its gemm_async also has SFA K extent 8 | L1 + L5 |
+| `2bfa4404` | `block_scaled_fp8_gemm_packed_scales` | `test_block_scaled_gemm_normalizes_instruction_kind_and_shape` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view; its gemm_async also has SFA K extent 8 | L1 + L5 |
+| `8f0d3872` | `kernel` | `test_emitter_decodes_only_table_driven_ptx_calls` | builtin tirx.ptx_legacy.mma | legacy-only builtin `ptx_legacy.*` | L2 |
+| `f53174b8` | `legacy_ldmatrix_i8_transpose_fallback` | `test_legacy_ldmatrix_8bit_transpose_matches_tirx_manual_gather` | builtin tirx.ptx_legacy.ldmatrix | legacy-only builtin `ptx_legacy.*` | L2 |
+| `6c149258` | `legacy_ldmatrix_i8_transpose_two_warps` | `test_legacy_ldmatrix_8bit_transpose_uses_full_thread_index_across_warps` | builtin tirx.ptx_legacy.ldmatrix | legacy-only builtin `ptx_legacy.*` | L2 |
+| `6cebb99a` | `legacy_ldmatrix_i8_x4` | `test_legacy_ldmatrix_8bit_nontranspose_keeps_b16_fragment_abi` | builtin tirx.ptx_legacy.ldmatrix | legacy-only builtin `ptx_legacy.*` | L2 |
+| `ddf2b60a` | `legacy_ldmatrix_x1_domain` | `test_legacy_ldmatrix_x1_domain_matches_independent_fragment_mapping` | builtin tirx.ptx_legacy.ldmatrix | legacy-only builtin `ptx_legacy.*` | L2 |
+| `89f28510` | `legacy_ldmatrix_x2_trans` | `test_legacy_ldmatrix_transpose_preserves_b16_fragment_abi` | builtin tirx.ptx_legacy.ldmatrix | legacy-only builtin `ptx_legacy.*` | L2 |
+| `c0d006ee` | `ptx_mma_legacy_f16_m16n8k16` | `test_ptx_mma_legacy_executes_actual_pointer_offset_abi` | builtin tirx.ptx_legacy.mma | legacy-only builtin `ptx_legacy.*` | L2 |
+| `c9ff71fc` | `ptx_mma_legacy_s8_u8_m16n8k32` | `test_legacy_m16n8k32_int8_reuses_dense_form_and_engine` | builtin tirx.ptx_legacy.mma | legacy-only builtin `ptx_legacy.*` | L2 |
+| `8849573f` | `reused_legacy_mma_pointer_bindings` | `test_reused_legacy_mma_reuses_a_b_and_accumulator_bindings_across_calls` | builtin tirx.ptx_legacy.mma | legacy-only builtin `ptx_legacy.*` | L2 |
+| `0a97c1c1` | `dense_gemm_async_tf32_is_rejected` | `test_tile_tf32_gemm_async_fails_closed` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnmodeledTIRxFormError) |
+| `5feb0e62` | `dense_gemm_async_wrong_tmem_a_layout` | `test_dense_gemm_async_rejects_wrong_tmem_a_layout` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnmodeledTIRxFormError) |
+| `3cc1c18e` | `typed_tma_dtype_roundtrip_bool` | `test_typed_tma_rejects_unmodeled_production_dtypes` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnmodeledTIRxFormError) |
+| `39c10257` | `_block_scaled_invalid_scale_layout` | `test_block_scale_layout_that_violates_instruction_row_stride_fails_closed` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnsupportedTIRxError) |
+| `d1cd6f35` | `_tcgen_cp_wrong_declared_shape` | `test_tcgen_cp_rejects_declared_shape_that_disagrees_with_layout` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnsupportedTIRxError) |
+| `f3ad2430` | `_tcgen_cp_wrong_destination_lane_permutation` | `test_tcgen_cp_rejects_destination_lane_permutation` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnsupportedTIRxError) |
+| `bb2f011e` | `_tcgen_ldst_wrong_m64_tmem_layout` | `test_tcgen_ldst_rejects_tmem_layout_outside_fixed_instruction_abi` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnsupportedTIRxError) |
+| `f0800bfb` | `dense_gemm_async_declared_geometry_mismatch` | `test_dense_gemm_async_rejects_declared_geometry_that_disagrees_with_operands` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnsupportedTIRxError) |
+| `083d8740` | `kernel` | `test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs[unknown-uint32-unsup` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnsupportedTIRxError) |
+| `3a730827` | `tma_reduce_wrong_direction` | `test_typed_tma_reduce_rejects_non_store_direction` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnsupportedTIRxError) |
+| `a82a5aca` | `tma_unknown_cache_hint` | `test_typed_tma_rejects_unknown_cache_hint` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | negative tile-form test; TVM dispatch and legacy both reject | L3 (legacy UnsupportedTIRxError) |
+| `354eea5a` | `commit_forwards_only_issued_work` | `test_commit_republishes_causal_predecessors_of_local_work` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `016eda97` | `dense_fp8_gemm_async_cta1` | `test_dense_fp8_gemm_async_matches_numpy` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `e4d8a4a4` | `dense_gemm_async_cta1` | `test_dense_gemm_async_gathers_physical_operands_and_accumulates_tmem` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `ade818c4` | `dense_gemm_async_cta_group2` | `test_cta_group2_gathers_both_shared_shards_and_scatters_tmem` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `ae6de81e` | `dense_gemm_async_dynamic_right_index` | `test_dense_gemm_async_handles_repeated_dynamic_index_loads` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `f5034afe` | `dense_gemm_async_m64_cta2_layout_b` | `test_cta_group2_m64_tcgen_mma_uses_layout_b_independently_of_declared_layout` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `5501e406` | `dense_gemm_async_no_swizzle_shared` | `test_dense_gemm_async_no_swizzle_descriptor_matches_numpy` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `b0a8bc90` | `dense_gemm_async_tmem_a_cta_group2` | `test_cta_group2_gathers_both_tmem_a_shards` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `067520aa` | `dense_gemm_async_two_clusters` | `test_dense_gemm_async_runs_numpy_backend_on_two_cluster_workers` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `5aed5aa2` | `dense_gemm_async_two_cta_pairs_in_one_cluster` | `test_cta_group2_routes_each_pair_within_a_four_cta_cluster` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `8d2db317` | `dense_gemm_async_two_thread_issuers` | `test_thread_scope_gemm_async_requires_one_runtime_issuer` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `6e8be779` | `inactive_gemm_async_is_noop` | `test_all_inactive_gemm_async_is_a_noop` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `7e3d1cc8` | `repeated_tcgen_fence_handoff` | `test_repeated_thread_fence_handoff_keeps_full_frontier_ordered` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `d024eb22` | `tcgen_cp_to_mma_handoff` | `test_a_declared_wait_merges_its_tcgen_frontier_without_deadlocking` | tile op tirx.tile.gemm_async: v2 tile form 'gemm' not ported yet (TVM rejects) | tcgen05.mma shape invalid on hardware (TVM dispatch) | L4 |
+| `0e9b7884` | `kernel` | `test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair[max-bfloat16]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA innermost box under 16 B | L6 |
+| `14f16144` | `kernel` | `test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair[max-float16]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA innermost box under 16 B | L6 |
+| `4d6f137d` | `kernel` | `test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair[min-float16]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA innermost box under 16 B | L6 |
+| `77e30a85` | `kernel` | `test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair[add-bfloat16]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA innermost box under 16 B | L6 |
+| `810f07d0` | `kernel` | `test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair[min-bfloat16]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA innermost box under 16 B | L6 |
+| `e43b7b8c` | `kernel` | `test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair[add-float16]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA innermost box under 16 B | L6 |
+| `8960cb4a` | `tma_padded_narrow_rows` | `test_checkers_reject_a_misaligned_tma_shared_component[racecheck]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA into a padded shared slice | L7 |
+| `c41fc9ba` | `float64_directed_rounding_is_unsupported` | `test_float64_directed_rounding_fails_closed` | tile op tirx.tile.add: TilePrimitiveCall(add): directed float64 rounding is not implemented | negative test; legacy fail-closed rule kept in v2 `tile_checks` (TVM would dispatch) | legacy also rejects (UnmodeledTIRxFormError) |
+| `c24dc32f` | `fp8_identity_reinterpret_roundtrip` | `test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip[float8_e8m0fn` | tirx.reinterpret: raw payload reinterpret is not modeled for scalar low-precision/storage-only dtype | negative test of a fail-closed form | legacy also rejects (UnmodeledTIRxFormError) |
+| `ec7bbd85` | `fp8_identity_reinterpret_roundtrip` | `test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip[float8_e4m3fn` | tirx.reinterpret: raw payload reinterpret is not modeled for scalar low-precision/storage-only dtype | negative test of a fail-closed form | legacy also rejects (UnmodeledTIRxFormError) |
+| `1fa183ad` | `?` | `test_cuda_atomic_cas_classifier_rejects_non128_or_non_byte_addressable_vectors[b` | dtype 'boolx128' has no numsim_core::Ty | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `38b6aa34` | `?` | `test_ordinary_handle_address_is_not_classified_as_a_tensor_map` | address of variable descriptor_like_name | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `43d04f19` | `?` | `test_async_group_wait_count_rejects_negative_values[cp.async.wait_group]` | tirx.ptx.cp_async_wait_group: wait_group count -1 out of range | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `52434463` | `?` | `test_pure_call_form_strings_must_be_compile_time_static[form1]` | warp_reduce op None | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `602cd118` | `?` | `test_resolver_remains_closed_for_unknown_calls` | builtin tirx.tvm_stack_alloca | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `79c96872` | `?` | `test_resolver_rejects_opaque_cuda_helpers_at_the_single_boundary` | cuda.func_call of unreviewed or effectful helper 'arbitrary_helper' | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `98c392b4` | `?` | `test_async_group_wait_count_rejects_negative_values[cp.async.bulk.wait_group.rea` | tirx.ptx.cp_async_bulk_wait_group: wait_group count -1 out of range | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `e6baf144` | `?` | `test_pure_call_form_strings_must_be_compile_time_static[form2]` | mov_sreg register name must be a literal | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `e7a93836` | `?` | `test_async_group_wait_count_rejects_runtime_values` | tirx.ptx.cp_async_wait_group: group must be a constant | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `f7ee9326` | `?` | `test_pure_call_form_strings_must_be_compile_time_static[form0]` | cta_reduce op None | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `cd42c619` | `_warp_gemm_wrong_a_fragment_layout` | `test_warp_gemm_rejects_layout_that_disagrees_with_instruction_abi` | tile op tirx.tile.gemm: TilePrimitiveCall(gemm): no mma.sync.m16n8k{16,8} instruction matches M=16,  | negative test; legacy fail-closed rule kept in v2 `tile_checks` (TVM would dispatch) | legacy also rejects (UnsupportedTIRxError) |
+| `47e2290c` | `flashkda_rsqrtf_wrong_dtype` | `test_flashkda_math_helper_dtype_mismatch_fails_closed` | tirx.cuda.func_call helper 'flashkda_rsqrtf' requires ['float32'] -> float32 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `e07d5f51` | `host_encoded_unregistered_integer_tensor_map` | `test_host_tensor_map_integer_expressions_fail_closed_on_unregistered_nodes` | unsupported integer operation BitwiseAnd in a host extent expression (no DimExpr) | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `a94a1ef2` | `invalid` | `test_bulk_wait_group_rejects_runtime_count_during_numsim_transpilation` | tirx.ptx.cp_async_bulk_wait_group: group must be a constant | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `6adc14ce` | `invalid_vector_shuffle_extract` | `test_vector_shuffle_classifier_and_frontend_reject_out_of_range_extract` | Shuffle index outside the concatenated lanes | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `0f67083b` | `kernel` | `test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs[min-float32-invalid ` | cp.reduce.async.bulk.tensor operation .min is invalid for TensorMap dtype F32 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `8f859059` | `kernel` | `test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs[inc-int32-invalid fo` | cp.reduce.async.bulk.tensor operation .inc is invalid for TensorMap dtype S32 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `90d84e56` | `kernel` | `test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs[add-float64-invalid ` | cp.reduce.async.bulk.tensor operation .add is invalid for TensorMap dtype F64 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `aa0c2443` | `kernel` | `test_registry_rejects_wrong_arity_or_dtype[handle-tirx.reinterpret-arguments3]` | tirx.reinterpret: source and result must have identical bit widths | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `af4ab65a` | `kernel` | `test_registry_rejects_wrong_arity_or_dtype[uint64-tirx.reinterpret-arguments2]` | tirx.reinterpret: source and result must have identical bit widths | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `e303f0f8` | `kernel` | `test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs[add-int64-invalid fo` | cp.reduce.async.bulk.tensor operation .add is invalid for TensorMap dtype S64 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `ddb6a2f4` | `modified_combine_int_frac_ex2` | `test_modified_known_helper_remains_fail_closed` | tirx.cuda.func_call helper 'combine_int_frac_ex2' body does not match the validated bit-composition  | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `a163865f` | `modified_flashkda_fmaf_rn` | `test_flashkda_math_helper_semantic_mutations_fail_closed[modified_flashkda_fmaf_` | tirx.cuda.func_call helper 'flashkda_fmaf_rn' body does not match the validated fused round-to-neare | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `f372c489` | `modified_flashkda_rsqrtf` | `test_flashkda_math_helper_semantic_mutations_fail_closed[modified_flashkda_rsqrt` | tirx.cuda.func_call helper 'flashkda_rsqrtf' body does not match the validated float32 reciprocal-sq | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `1a4e7bcc` | `modified_flashkda_tanh_approx` | `test_flashkda_math_helper_semantic_mutations_fail_closed[modified_flashkda_tanh_` | tirx.cuda.func_call helper 'flashkda_tanh_approx' body does not match the validated tanh.approx.f32  | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `17f33096` | `modified_fma_scale_sub_f32x2` | `test_modified_packed_fma_helper_remains_fail_closed` | tirx.cuda.func_call helper 'tvm_builtin_fma_scale_sub_f32x2' body does not match the validated packe | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `e3591b3c` | `modified_gdn_lg2_approx_ftz` | `test_modified_gdn_lg2_helper_remains_fail_closed` | tirx.cuda.func_call helper 'gdn_lg2_approx_ftz' body does not match the validated lg2.approx.ftz.f32 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `41bb86ad` | `opaque_statement_helper` | `test_opaque_or_spoofed_cuda_helpers_are_rejected[opaque_statement_helper]` | cuda.func_call of unreviewed or effectful helper 'tvm_builtin_tcgen05_mma_mxf4_block32_ss' | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `ffd3c5a0` | `opaque_value_helper` | `test_opaque_or_spoofed_cuda_helpers_are_rejected[opaque_value_helper]` | cuda.func_call of unreviewed or effectful helper 'opaque_fdividef' | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `369bfe5c` | `parallel_loop` | `test_non_serial_loop_semantics_are_not_silently_sequentialized[parallel_loop-PAR` | for-loop kind 1 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `208ad05e` | `thread_bound_loop` | `test_non_serial_loop_semantics_are_not_silently_sequentialized[thread_bound_loop` | for-loop kind 4 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `3bb8d714` | `tile_unary_unknown_config` | `test_unary_tile_ops_fail_closed_on_unknown_config` | tile op tirx.tile.exp: TilePrimitiveCall(exp): unsupported config keys ['undocumented_mode'] | negative test; legacy fail-closed rule kept in v2 `tile_checks` (TVM would dispatch) | legacy also rejects (UnsupportedTIRxError) |
+| `e55f4a71` | `unknown_attr` | `test_unknown_attr_semantics_fail_closed` | attribute 'numsim.unknown_control' | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `fdb571e7` | `unsupported_local_layout` | `test_frontend_finding_points_at_the_offending_node[racecheck-rebuilt-root]` | host statements after tirx.device_entry | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
