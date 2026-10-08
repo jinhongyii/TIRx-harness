@@ -129,6 +129,8 @@ that a future change is caught.
 | V8 | Zero-length span (R7) | `OutOfBounds` | Skipped | — |
 | V9 | Events of another kernel | Merged | `KernelMismatch` (incomplete) | contract |
 | V10 | Repeated incompletes (R2) | One entry each | One entry with an occurrence count | — |
+| V11 | Sibling lanes of one warp instruction storing to the same bytes (V2C-16: every lane writes `s_g[t]`) | Clean | Clean. Before this fix: `missing_same_warp_lane_order` write/write. The CUDA Programming Guide defines this case: when a non-atomic warp instruction writes one location from several threads, the writes are serialised and one of them is the final value. So it is not reported as a race. Stores by *different* instructions still need a warp sync. | CUDA PG, "Shared Memory" / warp serialisation of same-address writes |
+| V12 | `alias_stale_read` with an unnamed buffer | — | No advisory when either site has no logical buffer name. An unnamed buffer has no identity to compare, so it is never a false "stale name". | — |
 
 ## Test-migration phase 2 rulings
 

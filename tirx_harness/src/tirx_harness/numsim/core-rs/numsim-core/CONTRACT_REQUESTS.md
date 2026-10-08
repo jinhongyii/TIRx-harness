@@ -1280,3 +1280,23 @@ variant reports `missing_proxy_bridge` on the descriptor bytes after
   `Dtype::U6` now maps to/from the `16U6_ALIGN16B` element type. W2/W8:
   host-side tensor maps built from a `CUtensorMap` data type 14 must set
   `fp4_padded = true` (the binder previously had no way to say so).
+
+## W5-9 (for W1): logical buffer identity for `alias_stale_read` (V2C-18)
+
+`stable_sort_topk_by_value` aliases one static shared array as `counters32`
+(u32) and `counters16 = counters32.view("uint16")`. Legacy reports
+`alias_stale_read` because the u32 reads observe bytes last written through
+the u16 view.
+
+v2 lowering defeats this in two ways:
+- the shared buffers are lowered with **empty names**;
+- the site identity is the **root of the view chain**, so `counters16` and
+  `counters32` are one identity.
+
+Requested rule: the logical identity is the root of the view chain, **but a
+dtype-changing view (`.view("uint16")`) starts a new identity**, as a union
+member does. Same-dtype reshapes and rearranges keep the root, which is what
+the legacy "explicit view keeps one logical identity" tests expect. Every
+buffer also needs a non-empty name. Racecheck now ignores unnamed sites (V12),
+so with names missing this kernel stays clean rather than producing a false
+advisory. No racecheck change is needed once lowering carries the names.

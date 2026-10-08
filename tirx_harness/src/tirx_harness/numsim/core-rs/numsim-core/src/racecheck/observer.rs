@@ -210,7 +210,7 @@ impl Observer for RaceObserver {
             .sites
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| s.buffer.clone().map(|b| (crate::site::SiteId(i as u32), b)))
+            .filter_map(|(i, s)| s.buffer.clone().filter(|b| !b.is_empty()).map(|b| (crate::site::SiteId(i as u32), b)))
             .collect();
         self.set_site_buffers(names);
         for (id, a) in info.arena.iter() {

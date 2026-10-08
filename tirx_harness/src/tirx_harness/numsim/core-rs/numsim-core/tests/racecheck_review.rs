@@ -357,3 +357,27 @@ fn declared_word_in_shared_cluster_window() {
     let r = k.run();
     assert!(clean(&r) && r.findings.is_empty(), "{r:?}");
 }
+
+/// V2C-16: sibling lanes of one warp instruction storing to the same bytes
+/// (e.g. every lane writes `s_g[t]`) are not a race (deltas V11); the same
+/// store by two different instructions without warp sync still is.
+#[test]
+fn sibling_lane_same_instruction_stores_are_not_a_race() {
+    let all: Vec<u8> = (0..32).collect();
+    let mut k = K::one_warp();
+    k.inst(0, &all, PLAIN_ST, |_| (SMEM, 3200..3204));
+    assert!(clean(&k.run()));
+    let mut k = K::one_warp();
+    k.st(0, 0, SMEM, 3200..3204).st(0, 1, SMEM, 3200..3204);
+    assert!(has_failure(&k.run(), |f| f == OrderingFailure::MissingSameWarpLaneOrder));
+}
+
+/// Unnamed buffers carry no logical identity: no `alias_stale_read`.
+#[test]
+fn alias_stale_read_ignores_unnamed_buffers() {
+    use numsim_core::site::SiteId;
+    let mut k = K::one_warp();
+    k.st(0, 0, SMEM, 0..4).ld(0, 0, SMEM, 0..4);
+    k.site_buffers = vec![(SiteId(1), String::new()), (SiteId(2), "A_shared".into())];
+    assert!(!has_advisory(&k.run(), AdvisoryKind::AliasStaleRead));
+}

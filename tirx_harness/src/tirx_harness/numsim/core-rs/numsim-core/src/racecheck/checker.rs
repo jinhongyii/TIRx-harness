@@ -1071,6 +1071,14 @@ impl Checker {
             shadow.update(a.range.clone(), |seg, cell| {
                 // 1. check
                 let mut check = |p: &Witness| {
+                    // Sibling lanes of ONE warp instruction storing to the
+                    // same bytes: CUDA defines the outcome (the writes are
+                    // serialised, one of them is the final value), so this is
+                    // not reported as a race (deltas V11). Reads are not
+                    // involved: one instruction is one access kind.
+                    if writes && p.writes() && p.stamp == w.stamp && p.lane() != w.lane() && matches!(cur, Cur::Lane { .. }) {
+                        return;
+                    }
                     let ordered = this.ordered(cur, p, a.proxy);
                     let ms = this.morally_strong(p, &w);
                     if !ordered && !ms {
@@ -1096,7 +1104,8 @@ impl Checker {
                     if let Some(last) = cell.writes.last() {
                         if this.ordered(cur, &last.w, a.proxy) {
                             if let (Some(rb), Some(wb)) = (this.site_buffer.get(&a.site), this.site_buffer.get(&this.site_of(&last.w))) {
-                                if rb != wb {
+                                // An unnamed buffer has no logical identity to compare.
+                                if rb != wb && !rb.is_empty() && !wb.is_empty() {
                                     advisories.push((overlap(last.w.span(wide), &seg), last.w, AdvisoryKind::AliasStaleRead));
                                 }
                             }
