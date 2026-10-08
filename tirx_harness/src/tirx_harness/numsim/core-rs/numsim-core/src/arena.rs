@@ -576,15 +576,6 @@ impl Arena {
         View { alloc: id, offset: 0, len: self.get(id).size }
     }
 
-    /// A sub-view; errors if it exceeds the allocation.
-    pub fn subview(&self, id: AllocId, offset: u64, len: u64) -> Result<View, ArenaError> {
-        let size = self.get(id).size;
-        if offset.checked_add(len).is_none_or(|e| e > size) {
-            return Err(ArenaError::OutOfBounds { alloc: id, span: ByteSpan::new(offset, len), size });
-        }
-        Ok(View { alloc: id, offset, len })
-    }
-
     /// Check every span lies inside the view and the view inside its allocation.
     pub fn check_oob(&self, view: View, spans: &[ByteSpan]) -> Result<(), ArenaError> {
         let size = self.get(view.alloc).size;

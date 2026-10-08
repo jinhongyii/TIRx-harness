@@ -56,3 +56,15 @@ fn isspacep_shared_cta_needs_the_own_rank_and_mapa_uses_the_hardware_window() {
         assert_eq!(r[7] >> 24, 1 - cta, "cta {cta}");
     }
 }
+
+/// W1 addendum: a generic null pointer faults as a null dereference (it is
+/// in no aperture), not as an out-of-bounds read of CTA 0's shared window.
+#[test]
+fn generic_null_pointer_is_a_null_dereference() {
+    let o = run(&scenarios::generic_load(false));
+    assert_eq!(o.status, RunStatus::Completed);
+    assert_eq!(u32s(&o, "out"), vec![6]);
+    let (kind, msg) = error(&run(&scenarios::generic_load(true)));
+    assert_eq!(kind, ExecErrorKind::BadAddress);
+    assert!(msg.contains("null"), "{msg}");
+}

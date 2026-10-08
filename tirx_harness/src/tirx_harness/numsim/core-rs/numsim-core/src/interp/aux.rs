@@ -423,8 +423,6 @@ pub struct LaunchAux {
     /// Deferred `cp.async.mbarrier.arrive`s per (group, ordinal): the
     /// (mbarrier, phase, prior cp.async ops) published when it fires.
     pub cp_arrive_publish: HashMap<(ResourceId, u64), Vec<(ResourceId, u64, Vec<AsyncId>)>>,
-    /// Next collective instance id.
-    pub next_collective: u64,
     /// Next async op id (partition-scoped: high bits name the partition).
     pub next_async: u64,
     /// Set by a handler that must run as a serial point (a global
@@ -440,9 +438,4 @@ impl LaunchAux {
         id
     }
 
-    pub fn next_collective_id(&mut self) -> u64 {
-        let id = self.next_collective;
-        self.next_collective += 1;
-        id
-    }
 }

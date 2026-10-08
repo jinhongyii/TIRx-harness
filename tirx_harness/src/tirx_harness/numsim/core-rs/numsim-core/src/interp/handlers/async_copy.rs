@@ -887,14 +887,15 @@ pub fn tensormap_replace(ctx: &mut ExecCtx<'_>, tmap: Operand, space: AddrSpace,
     for l in ctx.warp.active.lanes() {
         let (mut d, loc) = read_tmap(ctx, tmap, space, l, &mut racc)?;
         let v = lane_val(ctx, value, l);
-        // A rank outside 1..=5 is an invalid operand (a kernel error, not an
-        // unmodelled form; legacy rejected it).
-        if field == TmapField::Rank && !(1..=5).contains(&v) {
+        // The rank field holds rank - 1 (ranks 1..=5): any other value is an
+        // invalid operand (a kernel error, not an unmodelled form; legacy
+        // rejected it).
+        if field == TmapField::Rank && v > 4 {
             return Err(support::err(
                 ctx,
                 ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
                 WarpMask::lane(l),
-                format!("tensormap.replace rank {v} is outside 1..5"),
+                format!("tensormap.replace rank field {v} (rank - 1) is outside 0..4"),
             ));
         }
         d.replace(field, ord, v).map_err(|e| support::op_err(ctx, e))?;

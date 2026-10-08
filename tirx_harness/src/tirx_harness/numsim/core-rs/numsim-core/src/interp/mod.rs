@@ -146,8 +146,6 @@ pub struct WarpState {
     pub local: Option<AllocId>,
     /// Register-buffer allocation (lane-major, `Space::Reg`), if any.
     pub regbuf: Option<AllocId>,
-    /// Logical clock for `SpecialReg::Clock*`.
-    pub clock: u64,
     /// Arms of divergent `If`s suspended at a blocking instruction while
     /// the complementary arm runs (structured-SIMT scheduling rule, see
     /// [`divergent_switch`]).
@@ -225,7 +223,6 @@ impl WarpState {
             steps: 0,
             local: None,
             regbuf: None,
-            clock: 0,
             suspended: Vec::new(),
         }
     }
@@ -382,6 +379,15 @@ impl LaunchCounters {
     }
 }
 
+/// One operand-type signature of a multi-signature PTX op.
+#[derive(Clone)]
+pub struct OpVariant {
+    pub dst_tys: Vec<crate::dtype::Ty>,
+    pub src_tys: Vec<crate::dtype::Ty>,
+    pub f: PtxFn,
+    pub error: Option<String>,
+}
+
 /// Program-derived tables computed once per launch.
 pub struct Loaded {
     /// `Program::reg_slot_offsets()`.
@@ -391,6 +397,10 @@ pub struct Loaded {
     /// `Some(reason)` when `ops[i]` could not be resolved (the slot then
     /// holds a placeholder; executing it fails closed as `Unsupported`).
     pub op_errors: Vec<Option<String>>,
+    /// For an op used with more than one operand-type signature: every
+    /// signature's resolution (`ops` / `op_errors` hold the first one).
+    /// Empty for single-signature ops (the common case).
+    pub op_variants: Vec<Vec<OpVariant>>,
     /// `code[pc].is_progress()`, precomputed (spin parking / deadlock).
     pub progress: Vec<bool>,
     /// Byte offset of each host parameter in the launch's param block.
@@ -433,37 +443,47 @@ impl Loaded {
     pub fn new(program: &Program) -> Loaded {
         use crate::program::{Instr, ParamKind};
         let slots = program.reg_slot_offsets();
-        // Operand types of the first use of each op.
-        let mut first_use: Vec<Option<(Vec<crate::dtype::Ty>, Vec<crate::dtype::Ty>)>> = vec![None; program.ops.len()];
+        // Every distinct operand-type signature of each op, in first-use
+        // order: an op key used with different register types (e.g.
+        // `cvt.s8.s8` into an s8 and into an s32 register) resolves once per
+        // signature (W11-2), not once per op name.
+        type Sig = (Vec<crate::dtype::Ty>, Vec<crate::dtype::Ty>);
+        let mut sigs: Vec<Vec<Sig>> = vec![Vec::new(); program.ops.len()];
         let ty_of = |o: &Operand| match o {
             Operand::Reg(r) => program.regs[r.0 as usize].ty,
             Operand::Const(c) => program.consts[c.0 as usize].ty,
         };
         for ins in &program.code {
             if let Instr::Ptx { op, dsts, srcs, .. } = ins {
-                let slot = &mut first_use[op.0 as usize];
-                if slot.is_none() {
-                    *slot = Some((
-                        dsts.iter().map(|d| program.regs[d.0 as usize].ty).collect(),
-                        srcs.iter().map(ty_of).collect(),
-                    ));
+                let sig: Sig = (dsts.iter().map(|d| program.regs[d.0 as usize].ty).collect(), srcs.iter().map(ty_of).collect());
+                let v = &mut sigs[op.0 as usize];
+                if !v.contains(&sig) {
+                    v.push(sig);
                 }
             }
         }
+        let resolve = |key: &crate::program::OpKey, (d, s): &Sig| -> (PtxFn, Option<String>) {
+            match crate::oplib::resolve_ptx(key, d, s) {
+                Ok(f) => (f, None),
+                Err(e) => (PtxFn::new(support::unresolved_ptx), Some(e.message)),
+            }
+        };
         let mut ops: Vec<PtxFn> = Vec::with_capacity(program.ops.len());
         let mut op_errors = Vec::with_capacity(program.ops.len());
+        let mut op_variants = Vec::with_capacity(program.ops.len());
         for (i, key) in program.ops.iter().enumerate() {
-            let (d, s) = first_use[i].clone().unwrap_or_default();
-            match crate::oplib::resolve_ptx(key, &d, &s) {
-                Ok(f) => {
-                    ops.push(f);
-                    op_errors.push(None);
-                }
-                Err(e) => {
-                    ops.push(PtxFn::new(support::unresolved_ptx));
-                    op_errors.push(Some(e.message));
-                }
-            }
+            let first = sigs[i].first().cloned().unwrap_or_default();
+            let (f, e) = resolve(key, &first);
+            ops.push(f);
+            op_errors.push(e);
+            op_variants.push(if sigs[i].len() > 1 {
+                sigs[i].iter().map(|sg| {
+                    let (f, e) = resolve(key, sg);
+                    OpVariant { dst_tys: sg.0.clone(), src_tys: sg.1.clone(), f, error: e }
+                }).collect()
+            } else {
+                Vec::new()
+            });
         }
         let mut param_offsets = Vec::with_capacity(program.host_abi.len());
         let mut off = 0u64;
@@ -525,6 +545,7 @@ impl Loaded {
             slots,
             ops,
             op_errors,
+            op_variants,
             param_offsets,
             param_bytes: off.div_ceil(8) * 8,
             local_per_lane,
@@ -603,22 +624,6 @@ impl<'a> ExecCtx<'a> {
     pub fn read(&self, o: Operand) -> WarpValue<u64> {
         self.read_slot(o, 0)
     }
-    /// Value of a warp-uniform operand (first active lane), checking all
-    /// active lanes agree (`Divergence` error otherwise).
-    pub fn read_uniform(&self, o: Operand) -> Result<u64, ExecError> {
-        match o {
-            Operand::Const(c) => Ok(self.program.consts[c.0 as usize].bits as u64),
-            Operand::Reg(r) => {
-                let v = self.reg_slot(r, 0);
-                let mask = self.active();
-                let Some(first) = mask.first() else { return Ok(0) };
-                if mask.lanes().any(|l| v[l] != v[first]) {
-                    return Err(self.error(ExecErrorKind::Divergence, format!("operand {r} is not warp-uniform")));
-                }
-                Ok(v[first])
-            }
-        }
-    }
     /// Write slot `i` of `r` under the active mask.
     #[inline]
     pub fn write_slot(&mut self, r: Reg, i: u32, v: &WarpValue<u64>) {
@@ -664,11 +669,6 @@ impl<'a> ExecCtx<'a> {
                 }
             }
         }
-    }
-    /// Record that this iteration had an observable effect.
-    #[inline]
-    pub fn note_progress(&mut self) {
-        self.warp.poll.progressed = true;
     }
 }
 

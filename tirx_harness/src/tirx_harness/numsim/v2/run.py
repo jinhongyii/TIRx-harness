@@ -823,8 +823,12 @@ class Engine:
 
 def _timing(module: CompiledModule, bind_ms: float, raw: Mapping[str, Any], report_started: float) -> dict[str, float]:
     engine = raw.get("timing") or {}
+    # Lowering and module-cache loading are separate phases: exactly one of
+    # the two is non-zero (`CompiledModule.cache_hit`).
+    lower_ms = float(module.lower_ms)
     return {
-        "lower": float(module.lower_ms),
+        "lower": 0.0 if module.cache_hit else lower_ms,
+        "module_cache": lower_ms if module.cache_hit else 0.0,
         "bind": bind_ms,
         "build": float(engine.get("build", 0.0)),
         "run": float(engine.get("run", 0.0)),

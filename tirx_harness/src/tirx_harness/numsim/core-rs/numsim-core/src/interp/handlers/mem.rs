@@ -326,7 +326,7 @@ pub fn load_addr(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, a: Operand, space: Add
     let mut first = None;
     for l in ctx.warp.active.lanes() {
         let v = lane_val(ctx, a, l);
-        let loc = support::resolve(ctx, space, v, l, n)?;
+        let loc = support::resolve_data(ctx, space, v, l, n)?;
         check_align(ctx, loc, n, l)?;
         support::mem_read(ctx, loc, l, &mut bytes[..n as usize])?;
         if mods.nc {
@@ -355,7 +355,7 @@ pub fn store_addr(ctx: &mut ExecCtx<'_>, ty: Ty, a: Operand, space: AddrSpace, v
     let mut bytes = [0u8; 32];
     for l in ctx.warp.active.lanes() {
         let v = lane_val(ctx, a, l);
-        let loc = support::resolve(ctx, space, v, l, n)?;
+        let loc = support::resolve_data(ctx, space, v, l, n)?;
         check_align(ctx, loc, n, l)?;
         lane_bytes(ctx, value, ty, l, &mut bytes);
         support::mem_write(ctx, loc, l, &bytes[..n as usize])?;
@@ -503,7 +503,7 @@ pub fn atom(
     if ctx.arena.is_shard() {
         for l in ctx.warp.active.lanes() {
             let v = lane_val(ctx, a, l);
-            let loc = support::resolve(ctx, space, v, l, n)?;
+            let loc = support::resolve_data(ctx, space, v, l, n)?;
             if ctx.arena.is_overlaid(loc.alloc) {
                 ctx.aux.serial_request = true;
                 return Ok(Flow::Yield(ctx.pc()));
@@ -514,7 +514,7 @@ pub fn atom(
     let mut old = [0u8; 32];
     for l in ctx.warp.active.lanes() {
         let v = lane_val(ctx, a, l);
-        let loc = support::resolve(ctx, space, v, l, n)?;
+        let loc = support::resolve_data(ctx, space, v, l, n)?;
         check_align(ctx, loc, n, l)?;
         let k = n as usize;
         support::mem_read(ctx, loc, l, &mut old[..k])?;
@@ -569,7 +569,7 @@ pub fn st_bulk(ctx: &mut ExecCtx<'_>, a: Operand, space: AddrSpace, size: Operan
         if v % 8 != 0 {
             return Err(support::err(ctx, ExecErrorKind::Misaligned, WarpMask::lane(l), format!("st.bulk address {v:#x} is not 8-byte aligned on lane {l}")));
         }
-        let loc = support::resolve(ctx, space, v, l, n)?;
+        let loc = support::resolve_data(ctx, space, v, l, n)?;
         support::readonly_write(ctx, loc.alloc, loc.span(n), l)?;
         let view = support::whole(ctx.arena, loc.alloc);
         if let Err(e) = ctx.arena.fill(view, &[loc.span(n)], 0) {
@@ -602,7 +602,7 @@ pub fn discard(ctx: &mut ExecCtx<'_>, a: Operand, space: AddrSpace, size: u32) -
                 format!("discard requires a 128-byte aligned address (got {v:#x} on lane {l})"),
             ));
         }
-        let loc = support::resolve(ctx, space, v, l, size as u64)?;
+        let loc = support::resolve_data(ctx, space, v, l, size as u64)?;
         let view = support::whole(ctx.arena, loc.alloc);
         if let Err(e) = ctx.arena.invalidate(view, &[loc.span(size as u64)]) {
             return Err(support::arena_err(ctx, e, WarpMask::lane(l)));

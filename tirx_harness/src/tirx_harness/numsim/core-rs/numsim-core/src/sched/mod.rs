@@ -383,8 +383,9 @@ pub struct Scheduler<'p> {
     launch_words: crate::interp::aux::WordTable,
 }
 
-/// Linear cluster id and rank of a CTA (ctaid coordinates).
-#[allow(dead_code)]
+/// Linear cluster id and rank of a CTA (ctaid coordinates); the inverse
+/// of [`cta_coords`] (tests).
+#[cfg(test)]
 fn cluster_of(shape: &LaunchShape, c: [u32; 3]) -> (u32, u32) {
     let cl = shape.cluster.map(|x| x.max(1));
     let ncl = [shape.grid[0] / cl[0], shape.grid[1] / cl[1]];
@@ -1351,33 +1352,6 @@ impl<'p> Scheduler<'p> {
                 return Ok(RunStatus::Deadlock { blocked });
             }
         }
-    }
-
-    /// Fire async op `index` of the first partition (tests).
-    pub fn fire_completion(&mut self, index: usize, arena: &mut Arena, observer: &mut dyn Observer) -> Result<(), ExecError> {
-        let env = Env {
-            program: self.program,
-            loaded: &self.loaded,
-            shape: &self.shape,
-            config: &self.config,
-            kernel: self.kernel_index,
-            step_fn: step_warp,
-            round: self.round,
-            observing: self.observing,
-        };
-        let r = match self.partitions.first_mut() {
-            Some(p) => p.fire_op(index, &env, arena),
-            None => Err(sched_error(ExecErrorKind::Internal, self.kernel_index, WarpId(u32::MAX), SiteId::NONE, "no partition".into())),
-        };
-        if !self.partitions.is_empty() {
-            self.absorb(0, observer);
-        }
-        r
-    }
-
-    /// Why a warp ended, for `Observer::warp_done`.
-    pub fn end_reason(&self, warp: WarpId) -> Option<WarpEnd> {
-        self.ends.get(&warp).copied()
     }
 
     /// `SyncTable::quiescent` of every partition (retired and resident).

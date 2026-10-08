@@ -2758,3 +2758,43 @@ The 25 public-API functions with class `other-assertion` in `scripts/numsim-v2/c
 - **Actual:** the run completes, and racecheck and synccheck are clean. The lowered `pool_buf` has `byte_len = 33792`.
 - **Cause:** `lowering/memory.py::finish_shared` sizes a dynamic pool as `max(view extents, dyn_smem_bytes)`, so a view whose strided extent overruns the committed pool silently enlarges it.
 - **Fix:** when `tirx.dyn_smem_bytes` is present, use it as the pool size and let the view's accesses be bounds-checked against it. A view that is larger than the pool could also be flagged at lowering time.
+
+## W2 (2026-10-08): hygiene audit, incomplete/timing inventory, W1 null deref, W11-2, W8 generic tensormap.replace
+
+**Dead code removed (interp/, sched/, arena.rs).** The audit used `RUSTFLAGS="-W dead_code -W unused"` (no warnings), a workspace-wide caller scan of every `pub`/`pub(crate)` fn, and a field scan.
+- Removed functions, which had no callers anywhere:
+  - `sched::Scheduler::end_reason`;
+  - `sched::Scheduler::fire_completion` (documented "tests", unused);
+  - `LaunchAux::next_collective_id` and its field `next_collective`;
+  - `ExecCtx::note_progress`;
+  - `ExecCtx::read_uniform`;
+  - `Arena::subview`.
+- Removed field: `WarpState::clock`, dead since the "physical special registers read 0" ruling.
+- `sched::cluster_of` was `#[allow(dead_code)]`; it is now `#[cfg(test)]` (its only user is the module's test).
+- Nothing else found:
+  - no other `allow(dead_code/unused)`;
+  - no `TODO`/`SCRATCH`/`legacy-shim` markers (`PTX_SCRATCH` is a scratch buffer);
+  - no Cargo features or `cfg(feature)` in these modules.
+- `codegen/` was not touched (backend decision pending).
+
+**Inventories.** The tables were added to `docs/development/engine-review.md`: "Engine `incomplete` reasons" (12 reason families plus the 10 `support::unsupported` sites) and "`Report.meta.timing` phases".
+- Timing fix: `lower` no longer mixes in module-cache loads. The new key `module_cache` holds `lower_ms` on a cache hit (`v2/run.py::_timing`; `test_v2_layer` key sets updated).
+- Racecheck runs online, so its cost is part of `run`. Synccheck exploration and racecheck `finish` are in `check`. This is documented in the timing table.
+
+**W1 addendum, null dereference.** A data access through a null generic or global pointer is now `bad_address` "null pointer dereference: Generic address 0x0 is in no aperture".
+- It applies to `ld`/`st`/`atom`/`red`/`st.bulk`/`discard` via `support::resolve_data`.
+- Synchronization operands keep the W1 rule that a zero-extended shared::cluster address 0 names CTA 0's byte 0 (`mapa_value_as_cluster_and_generic_mbarrier_operand`).
+- Scenario: `generic_load(null)`.
+- `test_mov_pointer_identity_masks_and_nulls[dereference_null]` passes. Legacy checks only the "null" message substring, so no kind port is needed (W9).
+
+**W11-2.**
+- `Loaded::new` resolves each PTX op once per distinct operand-type signature (`Loaded::op_variants`). Single-signature ops keep the old fast path.
+- Scenario: `ptx_op_per_signature` (`cvt.s8.s8` into s16/s32/s64 gives -1 in each).
+- `test_w11_2_ptx_op_resolves_per_use_carrier_types` now XPASSes (W11 to flip).
+
+**W8, generic `tensormap.replace`.**
+- Lowering (`v2/lowering/ptx_lower.py::lower_tensormap_replace`, a one-line change; W1 please review) defaulted an unqualified address to `Global`. PTX: no state space means generic. The engine already resolves generic through the shared window.
+- Scenario: `tmap_replace_generic_shared`, a shared descriptor image replaced through its generic address.
+- **Found while testing:** the replace `rank` field holds rank - 1. My earlier guard (accepting 1..=5) was off by one; it is now `<= 4`.
+
+`cargo test --workspace`: 1032 passed, 1 failed. The failure is `synccheck_scenarios::four_producers_per_lane_arrivals_on_two_barriers_stay_small`, a pure-synccheck log test, against W6's uncommitted explorer edits. Codegen equivalence passes 4/4.

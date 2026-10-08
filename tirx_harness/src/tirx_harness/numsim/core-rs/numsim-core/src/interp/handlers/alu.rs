@@ -322,7 +322,18 @@ thread_local! {
 #[inline]
 pub fn ptx(ctx: &mut ExecCtx<'_>, op: OpId, dsts: &[Reg], srcs: &[Operand], pred: Option<Operand>, keep_dst: bool) -> HResult {
     active_or_next!(ctx);
-    if let Some(msg) = &ctx.loaded.op_errors[op.0 as usize] {
+    // Multi-signature ops pick the resolution of this site's operand types.
+    let variants = &ctx.loaded.op_variants[op.0 as usize];
+    let (f, error) = if variants.is_empty() {
+        (ctx.loaded.ops[op.0 as usize], ctx.loaded.op_errors[op.0 as usize].as_ref())
+    } else {
+        let v = variants
+            .iter()
+            .find(|v| v.dst_tys.iter().copied().eq(dsts.iter().map(|&d| reg_ty(ctx, d))) && v.src_tys.iter().copied().eq(srcs.iter().map(|&s| operand_ty(ctx, s))))
+            .expect("every Ptx site's signature is resolved at load");
+        (v.f, v.error.as_ref())
+    };
+    if let Some(msg) = error {
         let key = &ctx.program.ops[op.0 as usize];
         return Err(ctx.error(ExecErrorKind::Unsupported, format!("{} {:?}: {msg}", key.name, key.mods)));
     }
@@ -335,7 +346,6 @@ pub fn ptx(ctx: &mut ExecCtx<'_>, op: OpId, dsts: &[Reg], srcs: &[Operand], pred
         crate::interp::OpEffect::None => {}
         effect => op_effect(ctx, effect, srcs, exec)?,
     }
-    let f = ctx.loaded.ops[op.0 as usize];
     PTX_SCRATCH.with(|cell| {
         let mut sc = cell.borrow_mut();
         let sc = &mut *sc;

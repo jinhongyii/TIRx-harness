@@ -140,7 +140,7 @@ def test_numsim_vector_add(module):
     assert result.status["kind"] == "completed", result.status
     np.testing.assert_array_equal(result.outputs["c"], inputs["a"] + inputs["b"])
     assert result.verdict == "clean"
-    assert set(result.timing) == {"lower", "bind", "build", "run", "check", "report"}
+    assert set(result.timing) == {"lower", "module_cache", "bind", "build", "run", "check", "report"}
     assert result.timing["run"] > 0 and result.timing["build"] >= 0
     report = v2.compare(result, {"c": inputs["a"] + inputs["b"]})
     report.require_ok()
@@ -152,7 +152,7 @@ def test_checkers_vector_add_clean(module, checker):
     run_phase = getattr(engine, f"run_{checker}_phase")
     result = _skip_if_unimplemented(lambda: run_phase(module, _inputs(), phase_index=0))
     payload = result.to_dict()
-    assert set(payload["timing"]) == {"lower", "bind", "build", "run", "check", "report"}
+    assert set(payload["timing"]) == {"lower", "module_cache", "bind", "build", "run", "check", "report"}
     assert payload["schema_version"] == rep.SCHEMA_VERSION
     assert payload["verdict"] == "clean", payload
     assert payload["findings"] == [] and payload["advisories"] == []

@@ -1318,3 +1318,24 @@ fn sync_words_are_declared_per_element() {
     assert_eq!(obs.0.len(), 32, "{:?}", obs.0);
     assert!(obs.0.iter().all(|s| s.len == 4), "{:?}", obs.0);
 }
+
+/// W11-2: a PTX op key resolves per operand-type signature, not once per
+/// name: `cvt.s8.s8` sign-extends -1 into s16, s32 and s64 carriers.
+#[test]
+fn ptx_op_resolves_per_operand_signature() {
+    let o = run(&scenarios::ptx_op_per_signature());
+    completed(&o);
+    let v: Vec<i64> = o.outputs.buffers["out"].0.chunks(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(v, vec![-1, -1, -1]);
+}
+
+/// W8: a generic-address `tensormap.replace` on a shared-memory descriptor
+/// image resolves through the generic shared window.
+#[test]
+fn tensormap_replace_through_a_generic_shared_address() {
+    let o = run(&scenarios::tmap_replace_generic_shared());
+    completed(&o);
+    let bytes: [u8; 128] = o.outputs.buffers["out"].0[..128].try_into().unwrap();
+    let d = numsim_core::oplib::TensorMapDesc::decode(&bytes).expect("decodes");
+    assert_eq!(d.rank, 2);
+}

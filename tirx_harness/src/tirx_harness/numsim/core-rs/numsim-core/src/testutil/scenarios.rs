@@ -1078,6 +1078,121 @@ pub fn mapa_isspacep() -> Scenario {
     scenario("mapa_isspacep", b.build_module(), inputs(vec![("out", u32_buf([7; 16]))]))
 }
 
+/// W1 addendum: lane 0 loads `ld.b32` through a generic pointer. With
+/// `null`, the pointer is 0 (a null dereference: no aperture, not CTA 0's
+/// shared byte 0); otherwise it is `&data[1]`, and `out[0] = data[1]`.
+pub fn generic_load(null: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("generic_load", 32);
+    let data = b.global("data", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let _sm = b.shared("s", Dtype::U32, 4);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let g = b.reg(Ty::U64);
+    let v = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    if null {
+        b.cast(Ty::U32, Ty::U64, g, k0);
+    } else {
+        b.addr_of(g, data, k1);
+    }
+    b.push(Instr::LoadAddr { ty: Ty::U32, dst: v, addr: g.into(), space: AddrSpace::Generic, sem: Sem::Weak, scope: Scope::Cta, mods: MemMods::default() });
+    b.st_u32(out, k0, v);
+    b.end_if();
+    b.exit();
+    scenario("generic_load", b.build_module(), inputs(vec![("data", u32_buf([5, 6])), ("out", u32_buf([0]))]))
+}
+
+/// W11-2: one PTX op key (`cvt.s8.s8`) used with three destination
+/// carriers (s16, s32, s64): each site resolves with its own operand types,
+/// so the s8 value -1 sign-extends into every carrier. `out` (s64) =
+/// [-1, -1, -1].
+pub fn ptx_op_per_signature() -> Scenario {
+    let mut b = ProgramBuilder::new("ptx_op_per_signature", 32);
+    let out = b.global("out", Dtype::S64);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let src = b.reg(Ty::scalar(Dtype::S8));
+    let h = b.reg(Ty::scalar(Dtype::S16));
+    let w = b.reg(Ty::S32);
+    let q = b.reg(Ty::S64);
+    let wide = b.reg(Ty::S64);
+    b.lane_id(lane);
+    let m1 = b.konst(Ty::scalar(Dtype::S8), 0xff);
+    b.mov(src, m1);
+    for d in [h, w, q] {
+        b.ptx("tirx.ptx.cvt", &["dtype=s8", "atype=s8"], &[d], &[src.into()]);
+    }
+    let k0 = b.k_u32(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    for (i, (d, ty)) in [(h, Ty::scalar(Dtype::S16)), (w, Ty::S32), (q, Ty::S64)].into_iter().enumerate() {
+        b.cast(ty, Ty::S64, wide, d);
+        let ki = b.k_u32(i as u32);
+        b.st(Ty::S64, out, ki, wide);
+    }
+    b.end_if();
+    b.exit();
+    scenario(
+        "ptx_op_per_signature",
+        b.build_module(),
+        inputs(vec![("out", ArgValue::Buffer { bytes: vec![0; 24], valid: None })]),
+    )
+}
+
+/// The rank-1 u32 descriptor `tmap_replace_generic_shared` starts from.
+pub fn rank1_u32_desc() -> crate::oplib::TensorMapDesc {
+    crate::oplib::TensorMapDesc {
+        global_address: 0,
+        rank: 1,
+        elem: Some(Dtype::U32),
+        global_dim: [16, 1, 1, 1, 1],
+        global_stride: [64, 64, 64, 64, 0],
+        box_dim: [16, 1, 1, 1, 1],
+        element_stride: [1; 5],
+        ..Default::default()
+    }
+}
+
+/// W8: `tensormap.replace` with no state space (generic addressing) of a
+/// descriptor image in shared memory. The lanes copy the 128-byte image
+/// `desc` into shared `img`, lane 0 replaces `rank` with 2 (field value 1 =
+/// rank - 1) through the
+/// image's generic (shared-window) address, and the lanes copy the image to
+/// `out`.
+pub fn tmap_replace_generic_shared() -> Scenario {
+    let mut b = ProgramBuilder::new("tmap_replace_generic_shared", 32);
+    let desc = b.global("desc", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let img = b.shared("img", Dtype::U32, 32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    let g = b.reg(Ty::U64);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    b.ld_u32(v, desc, lane);
+    b.st_u32(img, lane, v);
+    b.bar_sync(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.addr_of(g, img, k0);
+    b.push(Instr::TensorMapReplace { tmap: g.into(), space: AddrSpace::Generic, field: TmapField::Rank, ord: None, value: k1 });
+    b.end_if();
+    b.bar_sync(0);
+    b.ld_u32(v, img, lane);
+    b.st_u32(out, lane, v);
+    b.exit();
+    let bytes = rank1_u32_desc().try_encode().expect("valid descriptor");
+    let words: Vec<u32> = bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    scenario("tmap_replace_generic_shared", b.build_module(), inputs(vec![("desc", u32_buf(words)), ("out", u32_buf([0; 32]))]))
+}
+
 /// Rows x cols of the TMA scenario's f32 tensor, and its box.
 pub const TMA_ROWS: u32 = 8;
 pub const TMA_COLS: u32 = 16;
@@ -3455,6 +3570,9 @@ pub const MAX_HISTORY_PROBE: u32 = (crate::interp::aux::MAX_WORD_HISTORY as u32)
 pub fn all() -> Vec<Scenario> {
     vec![
         vector_add(),
+        tmap_replace_generic_shared(),
+        ptx_op_per_signature(),
+        generic_load(false),
         discard_at(0),
         st_bulk_size(16),
         mapa_isspacep(),

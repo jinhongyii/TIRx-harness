@@ -163,3 +163,49 @@ The existing `workers_do_not_change_results_or_streams` test compares 1 worker w
     - more than 65 536 writes to a declared word followed by `wait_until` (M11);
     - `addr_of(smem, 1<<24)` (L6);
     - a loop that breaks out on iteration `budget+1` (L7).
+
+## Engine `incomplete` reasons (inventory, 2026-10-08)
+
+A run is `incomplete` when coverage cannot be established. This is never `clean`, and never an error, because nothing provable is wrong with the kernel. `sched::classify` turns every `ExecErrorKind::Budget`, `ExecErrorKind::Unsupported` and `Op(OpErrorKind::Unsupported)` into `RunStatus::Incomplete { reason: "<kind>: <message>", site }`. The scheduler also emits three reasons of its own.
+
+| reason (prefix / text) | emitted by | when |
+| --- | --- | --- |
+| `round budget of N exhausted` | `sched::Scheduler::run` | `RunConfig::max_rounds` reached |
+| `named_barrier_after_exit (G8): …` | deadlock classifier | no progress while a warp waits on a named barrier of a CTA with exited warps; explicit-count release by exit is not modelled |
+| `divergent_block: …` | deadlock classifier | no progress while a warp is blocked with a divergent mask that structured SIMT cannot interleave |
+| `cross_cluster_same_round_cycle` (finding attr `reason`) | `Scheduler::stream_cycle` | two clusters each read global bytes the other wrote in one round; the observer stream cannot be ordered faithfully, so checker verdicts are incomplete |
+| `Budget: loop exceeded its iteration budget of N (raise loop_budget)` | `control::loop_end` | per-loop `RunConfig::loop_budget` exceeded |
+| `Unsupported: <reason>` | `Instr::Unsupported` (`control::unsupported`) | the lowering emitted an explicit unsupported form; the reason string comes from the module |
+| `Unsupported: not modeled: <what>` | `support::unsupported` | see the next table |
+| `Unsupported: <op> <mods>: <msg>` | `alu::ptx` | an oplib generic op rejected at load or at run (`unresolved generic op`, unmodelled carrier/form) |
+| `Op(Unsupported): <msg>` | every `support::op_err` | an oplib form that is not modelled (W4 domain): tcgen/TMA/MMA descriptors, tensor-map fields, cvt forms, … |
+| `Unsupported: launch bounds cannot provide the minimum 24 registers per thread required by setmaxnreg` | `Scheduler::initial_regs_per_thread` | launch bounds too tight for the register pool model |
+| `Unsupported: declared-word history exceeded N writes; …` | `sync::wait_until` | `MAX_WORD_HISTORY` overflow under a history-consuming observer |
+| `subset_execution` | checkers (`RunOutcome::subset` echoed) | a `RunConfig::subset` run covers only part of the grid |
+
+`support::unsupported` call sites (`Unsupported: not modeled: …`):
+
+| what | site |
+| --- | --- |
+| `const state space` | `support::resolve_buf` |
+| `<buf>[i]: a sub-word tmem vector spanning cells is not modelled` / `<bits>-bit tmem elements are not modelled` / `tmem access crosses a lane row` | `support::resolve_buf` (TMEM buffer views) |
+| `address of a non-addressable buffer` / `… tensor-memory buffer` / `… register-space buffer` | `support::buf_generic_addr` (`AddrOf`) |
+| `sub-byte atomics` | `mem::atom` |
+| `cvta of const/tmem` / `cvta to const/tmem` | `mem::cvta` |
+| `mapa in this state space` | `mem::mapa` |
+| `copy report .per_16bytes without its pattern (lower to Per16BytesPattern, W2-8)` | `async_copy::check_report` |
+| `tcgen05.ld .spcompress without its max/min op` | `tcgen::tcgen_ld` |
+| `tcgen05.mma .lut_b address outside a live TMEM allocation` | `tcgen::tcgen_mma` |
+| `wait_until on a word wider than 64 bits` | `sync::wait_until` |
+
+## `Report.meta.timing` phases (milliseconds)
+
+| key | measured by | covers |
+| --- | --- | --- |
+| `lower` | `v2.compile` (`CompiledModule.lower_ms`, cache miss) | TIR -> module lowering + validation |
+| `module_cache` | `v2.compile` (`lower_ms`, `cache_hit`) | module load from the module cache (exactly one of `lower` / `module_cache` is non-zero) |
+| `bind` | `v2.run` | input canonicalization and binding (host prelude, descriptor patching, address planning) |
+| `build` | `numsim-py::execute` (`backend_for`) | backend selection, i.e. codegen build or cache load for `Backend::Codegen` (about 0 for the interpreter) |
+| `run` | `numsim-py::execute` | engine execution. **Includes online racecheck**: `RaceObserver` consumes events during the run |
+| `check` | `numsim-py::execute` | post-run checker work: synccheck exploration, racecheck `finish` |
+| `report` | `v2.run` | Python report assembly |

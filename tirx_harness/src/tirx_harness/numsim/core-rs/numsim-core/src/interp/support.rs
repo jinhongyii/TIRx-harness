@@ -263,6 +263,23 @@ pub fn own_shared(ctx: &ExecCtx<'_>, off: u64) -> u64 {
 
 /// Resolve an address value in `space` for `lane`, checking `len` bytes are
 /// in bounds.
+/// [`resolve`] for a data access (`ld`/`st`/`atom`/`red`/`st.bulk`/
+/// `discard`) through a raw pointer: a null generic or global pointer is in
+/// no aperture and faults as a null dereference before any window match.
+/// (Synchronization operands keep the W1 rule that a zero-extended 32-bit
+/// shared::cluster address, which may be 0, names that location.)
+pub fn resolve_data(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, len: u64) -> Result<Loc, ExecError> {
+    if a == 0 && matches!(space, AddrSpace::Generic | AddrSpace::Global) {
+        return Err(err(
+            ctx,
+            ExecErrorKind::BadAddress,
+            WarpMask::lane(lane),
+            format!("null pointer dereference: {space:?} address 0x0 is in no aperture"),
+        ));
+    }
+    resolve(ctx, space, a, lane, len)
+}
+
 pub fn resolve(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, len: u64) -> Result<Loc, ExecError> {
     let lanes = WarpMask::lane(lane);
     match space {
