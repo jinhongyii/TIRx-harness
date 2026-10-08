@@ -554,8 +554,8 @@ class TensorMapSpec:
     rank: int
     global_dim: tuple[DimExpr, ...]
     global_stride: tuple[DimExpr, ...]
-    box_dim: tuple[int, ...]
-    element_stride: tuple[int, ...]
+    box_dim: tuple[DimExpr, ...]          # contract item 30: DimExpr (runtime prologue values)
+    element_stride: tuple[DimExpr, ...]
     interleave: int
     swizzle: int
     l2_promotion: int
@@ -568,7 +568,8 @@ class TensorMapSpec:
             "dtype": self.dtype, "rank": self.rank,
             "global_dim": [d.to_json() for d in self.global_dim],
             "global_stride": [d.to_json() for d in self.global_stride],
-            "box_dim": list(self.box_dim), "element_stride": list(self.element_stride),
+            "box_dim": [d.to_json() for d in self.box_dim],
+            "element_stride": [d.to_json() for d in self.element_stride],
             "interleave": self.interleave, "swizzle": self.swizzle,
             "l2_promotion": self.l2_promotion, "oob_fill": self.oob_fill,
             "base_offset": self.base_offset.to_json(), "force_cu_dtype": self.force_cu_dtype,

@@ -252,12 +252,10 @@ class PreludeMixin:
         dims = [self.dim_expr(v) for v in values]
         box = dims[2 * rank - 1:3 * rank - 1]
         elem = dims[3 * rank - 1:]
-        if not all(d.is_const for d in box + elem):
-            raise _Unsupported(call, "TensorMap box/element strides must be static")
         spec = pb.TensorMapSpec(
             dtype=self.ty(dtype, call).elem, rank=rank, global_dim=tuple(dims[:rank]),
-            global_stride=tuple(dims[rank:2 * rank - 1]), box_dim=tuple(d.value for d in box),
-            element_stride=tuple(d.value for d in elem), interleave=interleave, swizzle=swizzle,
+            global_stride=tuple(dims[rank:2 * rank - 1]), box_dim=tuple(box),
+            element_stride=tuple(elem), interleave=interleave, swizzle=swizzle,
             l2_promotion=l2, oob_fill=fill, base_offset=base_offset,
             # Raw CUtensorMapDataType override (contract item 15): the engine decides.
             force_cu_dtype=None if force == -1 else force,

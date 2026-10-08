@@ -645,6 +645,11 @@ class CallsMixin:
         if args and _string(args[-1]) is not None:
             source = _string(args[-1]) or ""
             args = args[:-1]
+        if name is not None and name.startswith("tvm_builtin_cast_") and self.pair_cast_helper(node, name, source, args):
+            return None
+        if name == "smem_desc_make_lo_uniform":
+            self.smem_desc_make_lo_uniform(node, source, args)
+            return None
         if name is not None and name not in builtins.PURE_FUNC_CALLS:
             if self.single_asm_helper(node, source, args):
                 return None
@@ -654,6 +659,90 @@ class CallsMixin:
         self.check_reviewed_helper(node, name, digest, args)
         return self.pure_helper(node, f"tirx.cuda.func_call.{name}", "v*", args=args,
                                 extra_mods=(f"source_sha256={digest}",))
+
+    def pair_cast_helper(self: "Lowerer", node: Any, name: str, source: str, args: list[Any]) -> bool:
+        """TVM's ``tvm_builtin_cast_<s>x2_<d>x2(void* dst, void* src)`` pair converts (W4-14).
+
+        The body is TVM's generated ``((d2*)dst)[0] = __float22half2_rn(((s2*)src)[0])``
+        family; it must match TVM's generator text exactly. Lowered as two element
+        loads, round-to-nearest ``Cast``s and two element stores.
+        """
+        match = re.fullmatch(r"tvm_builtin_cast_(\w+?)x2_(\w+?)x2", name)
+        if match is None or len(args) != 2:
+            return False
+        src_dtype, dst_dtype = match.groups()
+        try:
+            from tvm.backend.cuda.tile_primitive.elementwise.vec_emit import cast_vec2
+        except ImportError:
+            return False
+        if (src_dtype, dst_dtype) not in cast_vec2._VEC2_CAST_INTRINSICS:
+            return False
+        expected = cast_vec2._intrinsic_source(src_dtype, dst_dtype)
+        if "".join(source.split()) != "".join(expected.split()):
+            raise _Unsupported(node, f"tirx.cuda.func_call helper {name!r} body does not match the validated "
+                                     f"TVM pair-cast implementation")
+        src_ty, dst_ty = self.ty(src_dtype, node), self.ty(dst_dtype, node)
+        site = self.site(node, op_name=f"tirx.cuda.func_call.{name}")
+        values = [self.element_at(args[1], src_dtype, i, src_ty, site) for i in range(2)]
+        converted = []
+        for value in values:
+            dst = self.builder.reg(dst_ty)
+            self.builder.emit("Cast", **{"from": src_ty}, to=dst_ty, dst=dst, src=value, rnd="Rn", sat=False)
+            converted.append(dst)
+        for i, value in enumerate(converted):
+            self.element_at(args[0], dst_dtype, i, dst_ty, site, store=value)
+        return True
+
+    def smem_desc_make_lo_uniform(self: "Lowerer", node: Any, source: str, args: list[Any]) -> None:
+        """Reviewed ``smem_desc_make_lo_uniform(uint64_t* desc)`` (W4-14): the descriptor's
+        low word becomes lane 0's, ``d->lo = __shfl_sync(0xffffffff, d->lo, 0)``."""
+        name = "smem_desc_make_lo_uniform"
+        digest = hashlib.sha256("".join(source.split()).encode()).hexdigest()[:16]
+        if digest != "344b73c0cc918023":
+            raise _Unsupported(node, f"tirx.cuda.func_call helper {name!r} body does not match the validated "
+                                     f"lane-zero low-32-bit descriptor broadcast")
+        if len(args) != 1 or _helper_dtype(args[0]) != "handle":
+            raise _Unsupported(node, f"tirx.cuda.func_call helper {name!r} requires ['handle'] -> void")
+        u32, u64 = pb.Ty("U32"), pb.Ty("U64")
+        site = self.site(node, op_name=f"tirx.cuda.func_call.{name}")
+        desc = self.element_at(args[0], "uint64", 0, u64, site)
+        low = self.builder.reg(u32)
+        self.builder.emit("Cast", **{"from": u64}, to=u32, dst=low, src=desc, rnd="Default", sat=False)
+        shuffled = self.builder.reg(u32)
+        self.builder.emit("Shfl", site=site, mode="Idx", ty=u32, dst=shuffled, dst_pred=None, src=low,
+                          lane=self.const("uint32", 0), clamp=self.const("uint32", 0x1F),
+                          membermask=self.const("uint32", 0xFFFFFFFF))
+        high = self.binary("And", u64, desc, self.const("uint64", 0xFFFFFFFF00000000))
+        wide = self.builder.reg(u64)
+        self.builder.emit("Cast", **{"from": u32}, to=u64, dst=wide, src=shuffled, rnd="Default", sat=False)
+        self.element_at(args[0], "uint64", 0, u64, site, store=self.binary("Or", u64, high, wide))
+
+    def element_at(self: "Lowerer", pointer: Any, dtype: str, index: int, ty: pb.Ty, site: int,
+                   store: pb.Operand | None = None) -> pb.Operand | None:
+        """Load (or store) element ``index`` past pointer ``pointer`` (``address_of(buf[i])`` or raw)."""
+        target = self.buffer_target(pointer)
+        if target is not None:
+            buf, offset = target
+            offset = self.binary("Add", self.operand_ty(offset), offset, self.const(self.operand_ty(offset), index))
+            if store is not None:
+                self.builder.emit("Store", site=site, ty=ty, buf=buf, offset=offset, value=store,
+                                  mods=pb.mem_mods(), sem="Weak", scope="Gpu")
+                return None
+            dst = self.builder.reg(ty)
+            self.builder.emit("Load", site=site, ty=ty, dst=dst, buf=buf, offset=offset,
+                              mods=pb.mem_mods(), sem="Weak", scope="Gpu")
+            return dst
+        addr = self.as_address(self.expr(pointer))
+        if index:
+            addr = self.binary("Add", pb.Ty("U64"), addr, self.const("uint64", index * dtypes.bits(dtype) // 8))
+        if store is not None:
+            self.builder.emit("StoreAddr", site=site, ty=ty, addr=addr, space="Generic", value=store,
+                              mods=pb.mem_mods(), sem="Weak", scope="Gpu")
+            return None
+        dst = self.builder.reg(ty)
+        self.builder.emit("LoadAddr", site=site, ty=ty, dst=dst, addr=addr, space="Generic",
+                          mods=pb.mem_mods(), sem="Weak", scope="Gpu")
+        return dst
 
     def check_reviewed_helper(self: "Lowerer", node: Any, name: str, digest: str, args: list[Any]) -> None:
         """Fail closed unless ``name`` is the reviewed helper (signature, then body)."""

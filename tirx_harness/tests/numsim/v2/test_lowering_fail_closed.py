@@ -57,3 +57,22 @@ def test_warp_gemm_fragment_layout_off_the_mma_abi_fails_closed():
 
     with pytest.raises(LoweringUnsupported, match=r"A fragment layout does not match fixed mma\.sync\.m16n8k16 ABI"):
         _lower(_warp_gemm_wrong_a_fragment_layout)
+
+
+def test_tvm_pair_cast_helper_lowers_to_round_to_nearest_casts():
+    """W4-14: `tvm_builtin_cast_float32x2_float16x2(dst, src)` -> 2 loads, 2 Rn casts, 2 stores."""
+    from tests.numsim.runtime.test_tile_general_semantics import right_aligned_elementwise_broadcast
+
+    program = _lower(right_aligned_elementwise_broadcast)
+    casts = [i for i in program.code if i.variant == "Cast" and i.fields["from"].elem == "F16"]
+    assert casts and all(i.rnd == "Rn" for i in casts)
+    assert not any(op.name.startswith("tirx.cuda.func_call.tvm_builtin_cast_") for op in program.ops)
+
+
+def test_smem_desc_make_lo_uniform_is_a_lane_zero_shuffle():
+    """W4-14: the reviewed broadcast lowers to Shfl(Idx, lane 0) of the low word."""
+    from tests.numsim.integration.test_opaque_helper_artifact import smem_descriptor_make_lo_uniform_helper
+
+    program = _lower(smem_descriptor_make_lo_uniform_helper)
+    shfl = [i for i in program.code if i.variant == "Shfl"]
+    assert len(shfl) == 1 and shfl[0].mode == "Idx" and shfl[0].ty.elem == "U32"

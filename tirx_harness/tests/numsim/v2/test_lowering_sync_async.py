@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from tirx_harness.numsim.v2.lowering import program_builder as pb
 
 from ._program import all_of, const, definition, only
@@ -45,7 +47,7 @@ def test_host_prelude_becomes_implicit_tensor_map_slot(lower_source):
     assert (spec.dtype, spec.rank, spec.swizzle, spec.l2_promotion) == ("F16", 2, 3, 2)
     assert spec.global_dim == (pb.DimExpr.const(64), pb.DimExpr.const(256))
     assert spec.global_stride == (pb.DimExpr.const(128),)
-    assert spec.box_dim == (64, 128) and spec.element_stride == (1, 1)
+    assert [d.value for d in spec.box_dim] == [64, 128] and [d.value for d in spec.element_stride] == [1, 1]
     assert program.host_abi[1].implicit_base == 0
     tmap_buf = program.buffers[program.host_abi[1].buf]
     assert (tmap_buf.space, tmap_buf.param_slot, tmap_buf.byte_len) == ("Param", 1, pb.DimExpr.const(128))
@@ -153,3 +155,15 @@ def k(a: T.Buffer((64,), "float32"), tensor_map: T.handle("tensormap")):
     a[lane] = T.float32(0)
 ''')
     assert [(s.name, s.kind) for s in program.host_abi][:2] == [("a", "Buffer"), ("tensor_map", "TensorMap")]
+
+
+def test_runtime_tensor_map_box_is_a_param_expression():
+    """Contract item 30: box_dim / element_stride are DimExprs; runtime prologue values stay symbolic."""
+    from tests.numsim.integration.test_host_prelude import host_encoded_dynamic_integer_tensor_map
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(host_encoded_dynamic_integer_tensor_map)
+    spec = next(s.tensor_map for s in program.host_abi if s.tensor_map is not None)
+    assert not spec.box_dim[0].is_const
+    assert "Param" in json.dumps(spec.box_dim[0].to_json())
+    assert spec.element_stride[0] == pb.DimExpr.const(1)

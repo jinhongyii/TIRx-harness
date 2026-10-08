@@ -106,3 +106,37 @@ def k(out: T.Buffer((128, 4), "uint32")):
     assert (row.op, const(program, row.b)) == ("Mul", 4)
     assert program.requirements.implicit_tmem      # views without tcgen05.alloc
     assert not all_of(program, "AddrOf")            # no addresses of TMEM
+
+
+def test_subword_tmem_view_packs_elements_per_cell(lower_source):
+    """Contract item 28: a u16 TMEM view counts its columns in cells; the offset is in elements."""
+    program = lower_source('''
+@T.prim_func
+def k(output: T.Buffer((128,), "uint32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    warp = T.warp_id([4])
+    lane = T.lane_id([32])
+    low = T.decl_buffer((128, 2), "uint16", scope="tmem", layout=T.TileLayout(T.S[(128, 2):(1 @ Axis.TLane, 1 @ Axis.TCol)]), allocated_addr=5)
+    word = T.decl_buffer((128, 2), "uint32", scope="tmem", layout=T.TileLayout(T.S[(128, 2):(1 @ Axis.TLane, 1 @ Axis.TCol)]), allocated_addr=5)
+    low[warp * 32 + lane, 1] = T.uint16(13124)
+    output[warp * 32 + lane] = word[warp * 32 + lane, 0]
+''')
+    by_name = {b.name: b for b in program.buffers}
+    assert by_name["low"].dtype == pb.Ty("U16") and by_name["low"].shape[1] == pb.DimExpr.const(1)
+    assert by_name["word"].shape[1] == pb.DimExpr.const(2)
+    store = next(i for i in all_of(program, "Store") if program.buffers[i.buf].name == "low")
+    assert store.ty == pb.Ty("U16")
+
+
+def test_replicated_tmem_view_access_names_the_contract_reason(lower_source):
+    """Contract item 29: `Unsupported { reason: "tmem_replicated_view: <buffer>" }`."""
+    program = lower_source('''
+@T.prim_func
+def k(output: T.Buffer((128,), "uint32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    warp = T.warp_id([4])
+    lane = T.lane_id([32])
+    rep = T.decl_buffer((128,), "uint32", scope="tmem", layout=T.TileLayout(T.S[(128,):(1 @ Axis.TLane)] + T.R[(2,):(1 @ Axis.TCol)]), allocated_addr=0)
+    output[warp * 32 + lane] = rep[warp * 32 + lane]
+''', strict=False)
+    assert any("tmem_replicated_view: rep" in reason for reason in program.unsupported)

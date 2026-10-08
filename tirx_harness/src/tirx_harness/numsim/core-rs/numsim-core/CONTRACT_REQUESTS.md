@@ -1870,3 +1870,68 @@ V2C-5.
   so do its destination write-backs. The `test_atomic_f32_noftz` numerics
   pass; the remaining failures assert the legacy `rust_source`.
 3. **Implicit bulk commit at exit is not logged (W2).** `interp/handlers/control.rs` (exit) steps `AsyncGroup(Exit)` on every open Bulk group but emits no `Protocol` event for it. The explorer then sees open bulk groups at exit and raised `UncommittedAtExit` on `flash_mla_sparse_fwd`, `bsa_backward_blk128` and `sparse_flashmla_prefill_head{64,128}_phase1`. Local workaround: `synccheck::backend::exit_lint` applies `Cmd::Exit` to bulk groups itself. Request: log the exit command like the cluster `Exit`, so the recording is complete.
+
+## W5-11 (for W2, 2026-10-08): `cp.async.mbarrier.arrive[.noinc]` must complete the tracked cp.async ops
+
+Cause of every `missing_inter_actor_sync` race on `cudnn_sm100_gdn_{prefill,recompute,bprop}_f16`,
+`cudnn_sm100_bsa_backward_blk64`, `cudnn_sm100_dsa_sparse_attention_backward`,
+`gdn_prefill_sm100` (V2C-5 rows). These kernels are exactly the corpus users of
+`cp.async.mbarrier.arrive`. Trace (`gdn_prefill_f16`, kernel 1): warp 8
+issues 32 per-lane `cp.async.ca.shared.global` ops (`AsyncIssue … class: Copy,
+targets: []`), then `cp.async.mbarrier.arrive.noinc` (site 4203: only
+`Mbarrier(Issue)`). The arrival later fires and warps 0–3 `Wait` phase 0 of
+that mbarrier and read the bytes, but **no `AsyncComplete` is ever delivered
+for the cp.async ops**. The checker therefore sees their writes as never
+published, and reports a race on the reads. `cp_async_mbar_arrive` pushes only
+the `MbarArrive` completion.
+
+Request: when the deferred arrive fires, deliver `AsyncComplete { op,
+milestone: Write, target: Phase { obj: <mbar>, phase } }` for every cp.async op
+of that lane that the arrive tracks (PTX: all prior `cp.async` operations
+initiated by the executing thread). Deliver them before (or with) the
+arrival that completes the phase, as `cp.async.bulk` complete_tx already does.
+The checker path is covered by `racecheck_async_copy::cp_async_mbarrier_arrive_pending_count`.
+No racecheck change is needed.
+
+## W1 (2026-10-08): contract batch 4 (items 28–30) and W4-14
+
+- **28, sub-word TMEM: done in lowering.**
+  - An 8- or 16-bit TMEM view now gets `shape = [lanes, cells]`, where
+    `cells = ceil(element columns / per_cell)`. TIR counts the TCol of these
+    views in element units.
+  - Offset = `lane * cells * per_cell + element column`.
+  - A static column origin must be cell-aligned; a runtime origin is divided
+    by `per_cell`.
+  - Engine results:
+    - `test_tmem_subword_views_alias_one_physical_cell` passes.
+    - Four tests stop with `bad_address: <buf>[idx]: tmem lane L is outside
+      warp W's sub-partition`, where L is twice the expected lane:
+      `test_tcgen_cp_cta_group2_supports_float16_payloads`,
+      `test_tcgen_cp_supports_rank3_multi_instruction_layout`, and two
+      left_tmem gemm/raw-cta2 tests.
+    - Example: `tcgen_float16_cta_group2`, `physical` is F16 with
+      `shape [128, 4]` (cells). `physical[256]` is row 32, col 0, i.e. TMEM
+      lane 32, but the engine reports 64.
+    - The lowered offsets follow item 28 exactly, so I am handing this to W2
+      to check the sub-word lane computation in the loaded binary.
+- **29: done.** Direct access to a replicated TMEM view emits
+  `Unsupported { reason: "tmem_replicated_view: <buffer>" }`. It applies to
+  4 tests (`scale_tmem` in 3 tcgen_cp tests and mxfp4).
+- **30: done.** `TensorMapSpec.box_dim` and `element_stride` are DimExprs.
+  - Example: `host_encoded_dynamic_integer_tensor_map` gives
+    `box_dim = [Add(FloorDiv(Param 2, 2), 20)]`.
+  - Both runtime-box tests now lower. What remains is the test port: one
+    calls the legacy `module.load()`.
+- **W4-14 (1): done.** `tvm_builtin_cast_<s>x2_<d>x2(dst, src)` no longer
+  goes through func_call.
+  - The body must equal TVM's own `cast_vec2._intrinsic_source` text.
+  - It lowers to two element `Load`/`LoadAddr`, two `Cast{rnd: Rn}` and two
+    `Store`/`StoreAddr`.
+  - `test_right_aligned_buffer_broadcast...` now runs. Its remaining mismatch
+    (64/1024 elements, 1 ulp) is in the division part, i.e. TVM-dispatch
+    division semantics, not the cast.
+- **W4-14 (2): done.** `smem_desc_make_lo_uniform(uint64_t*)` is checked
+  against the legacy digest (`344b73c0cc918023`) and signature
+  (`['handle'] -> void`). It lowers to: load the u64, then
+  `Shfl{Idx, lane 0, clamp 0x1f, full mask}` of the low word, then store
+  `(hi & 0xffffffff00000000) | lo`. Verified end to end on a 32-lane run.
