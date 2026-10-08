@@ -1101,6 +1101,22 @@ impl TransitionSystem for Ts<'_> {
                 return Some(t);
             }
         }
+        // A deferred mbarrier completion (transaction bytes or arrive-on)
+        // that the S8 proof shows independent of everything that can still
+        // run first: their contributions cannot complete the phase without
+        // it, and no observer it could disable exists. It stays enabled once
+        // enabled (async-group completion and FIFO order are monotone), so it
+        // is a persistent singleton (no-oracle `mla_dsv4_multishape`: 4
+        // producer warps x 32 per-lane arrivals on each of two barriers).
+        if let Some(t) = enabled.iter().copied().find(|t| {
+            matches!(*t, Transition::Complete(..))
+                && matches!(self.candidate(s, t), Some((r, backend::Class::Contributor(_), _)) if matches!(s.res[r], Res::Mbarrier(_)))
+                && self.independent_of_future(s, t)
+        }) {
+            if self.step(s, &t).is_ok() {
+                return Some(t);
+            }
+        }
         None
     }
 

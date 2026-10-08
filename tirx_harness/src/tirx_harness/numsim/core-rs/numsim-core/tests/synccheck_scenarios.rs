@@ -1045,3 +1045,34 @@ fn alloc_while_exclusive_is_an_error() {
         assert_eq!(kind(&r), "tcgen_alloc_while_exclusive", "{name}");
     }
 }
+
+/// No-oracle `mla_dsv4_multishape`: four producer warps each attach 32
+/// per-lane `cp.async.mbarrier.arrive.noinc` arrivals to two barriers
+/// (count 128). Deferred completions that cannot complete the phase without
+/// themselves and disable no observer are persistent singletons, so the two
+/// barriers' landings do not multiply.
+#[test]
+fn four_producers_per_lane_arrivals_on_two_barriers_stay_small() {
+    let producers = 4u32;
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, mbar(0, 0), init(128));
+    log.cmd(0, 1, mbar(0, 8), init(128));
+    cta_sync(&mut log, 0, &(0..producers + 2).collect::<Vec<_>>(), producers + 2);
+    for p in 0..producers {
+        let groups = (0..32u8).map(|l| async_group_res(p, l, async_group::Domain::CpAsync)).collect::<Vec<_>>();
+        for (site, bar) in [(2, mbar(0, 0)), (4, mbar(0, 8))] {
+            log.cmds(p, site, groups.iter().map(|&g| (g, group(async_group::Cmd::Issue))).collect());
+            let targets = (0..32).map(|_| AsyncTarget { res: bar, bytes: 0, arrivals: 1 }).collect();
+            log.event(p, site + 1, groups.iter().map(|&g| (g, group(async_group::Cmd::ArriveOn))).collect(), targets, None, None, numsim_core::observe::ProtocolStatus::Committed);
+        }
+    }
+    for w in producers..producers + 2 {
+        log.cmd(w, 6, mbar(0, 0), wait(0));
+        log.cmd(w, 7, mbar(0, 8), wait(0));
+    }
+    // Count budgets only: deterministic under load.
+    let cfg = SynccheckConfig { certificates: false, state_budget: 20_000, ..config(cta(producers + 2)) };
+    let r = check(&log.build(), &cfg);
+    assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+    assert!(stat(&r, "visited_state_count") < 5_000, "{:?}", r.coverage);
+}

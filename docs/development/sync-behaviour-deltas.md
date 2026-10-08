@@ -25,6 +25,7 @@ ISA cites use PTX 9.4 section numbers. Quotes are in `sync-isa-answers.md`.
 | M11 | `cp.async.mbarrier.arrive` increment on a completed, unobserved phase (F1) | S: raises the old phase, and the increment is then lost | Covered by M2 | §9.7.15.16.5.1, §9.7.15.16.18 |
 | M12 | `arrive_drop` atomicity (D5) | E and N: the drop is committed even if the arrival fails | Transactional | — |
 | M13 | Waiter registry (D7) | E and S: `DuplicateWaiter` | Impossible by construction. A parked waiter still consumes at completion. | — |
+| M14 | `mbarrier.pending_count` on a state token that was not produced by `mbarrier.arrive{.drop}.noComplete` (`test_pending_count_instruction_predicates`, invalid form) | Error whose text names `noComplete` | Same verdict (`error`). The finding is `sync_protocol_error` with the message `pending_count: NotNoComplete` (`sync::query::TokenError::NotNoComplete`); the lowercase PTX spelling `noComplete` no longer appears | §9.7.15.16.20 "The state operand … must be the result of a prior mbarrier.arrive.noComplete or mbarrier.arrive_drop.noComplete instruction. Otherwise, the behavior is undefined." (UB, so error) |
 
 ## Named barriers
 
