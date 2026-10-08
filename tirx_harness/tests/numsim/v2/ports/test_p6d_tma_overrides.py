@@ -1,7 +1,7 @@
 """v2 port of ``tests/numsim/runtime/test_tma_overrides.py::test_tma_override_data_and_descriptor_isolation``
 (all 35 ``route``/``form`` params).
 
-Triage class ``port`` (``scripts/numsim-v2/coverage/other_assertion_triage.tsv``).
+Triage class ``port`` (``other_assertion_triage.tsv``; ledger deleted at step 5; see docs/development/test-migration.md).
 Under ``NUMSIM_IMPL=v2`` the legacy function fails only on two harness pins,
 not on engine behaviour:
 

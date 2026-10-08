@@ -4,8 +4,8 @@
 //! legacy `file.py::test_name[param]` it reproduces; where the legacy
 //! expectation is overridden by a documented behaviour delta, the test asserts
 //! the new behaviour and cites the row of
-//! docs/development/racecheck-behaviour-deltas.md. The coverage map is
-//! scripts/numsim-v2/coverage/racecheck.tsv.
+//! docs/development/racecheck-behaviour-deltas.md. The coverage map
+//! (racecheck.tsv) was a migration ledger deleted at step 5; see docs/development/test-migration.md.
 //!
 //! Sections are prefixed g1_..g5_ after the port batches:
 //!   g1: racecheck_artifact, raw_async_copy_footprints
@@ -1394,7 +1394,7 @@ fn g5_bulk_reduction_element_width_and_boundary() {
 //
 // Checker-verdict tests outside tests/analysis_tools/racecheck (numsim/runtime,
 // numsim/integration, analysis_tools/shared), reviewed in the "unreviewed B"
-// batch. Coverage map: scripts/numsim-v2/coverage/other_b.tsv.
+// batch. Coverage map other_b.tsv: ledger deleted at step 5; see docs/development/test-migration.md.
 
 const G6_TMEM1: AllocId = AllocId(6); // second CTA's tensor memory
 const G6_ALL: u32 = u32::MAX;

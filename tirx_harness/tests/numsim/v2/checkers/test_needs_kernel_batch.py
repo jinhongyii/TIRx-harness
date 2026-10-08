@@ -1,7 +1,7 @@
 """Checker verdicts that only the interpreter can decide (``needs_kernel`` rows).
 
 Replaces the eight ``needs_kernel`` rows of
-``scripts/numsim-v2/coverage/other_b.tsv``: their contract cannot be written
+``other_b.tsv`` (ledger deleted at step 5; see docs/development/test-migration.md): their contract cannot be written
 as contract events because the verdict depends on interpreter behaviour
 (``griddepcontrol`` assumption, multicast ``ctaMask`` resolution, the
 readonly-bytes overlap check, ``mapa``/u32 address arithmetic, tcgen05 MMA

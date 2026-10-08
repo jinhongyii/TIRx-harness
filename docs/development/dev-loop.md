@@ -15,8 +15,8 @@ That TVM shadows the pinned `apache-tvm` wheel and the frontend panics with
 `sym.Analyzer is not registered`. Always start with:
 
 ```bash
-source scripts/dev-env.sh   # repo root; clears the TVM variables, sets $PY,
-                            # NUMSIM_CACHE_DIR and NUMSIM_WORKER_AFFINITY=off
+source scripts/dev-env.sh   # repo root; clears the TVM variables, sets $PY
+                            # and NUMSIM_CACHE_DIR
 ```
 
 and use `$PY` (the project `.venv`, Python 3.12) for every Python command.
@@ -24,7 +24,6 @@ and use `$PY` (the project `.venv`, Python 3.12) for every Python command.
 Create or refresh the environment with
 
 ```bash
-git submodule update --init thirdparty/tvm-rust-ext
 uv sync --locked --extra test --group benchmark --inexact
 ```
 
@@ -35,14 +34,11 @@ keeps packages other workers may have added.
 
 Other pitfalls:
 
-- Always pass `-n` to pytest, even for one test; set
-  `NUMSIM_WORKER_AFFINITY=off` (dev-env.sh does) or engine workers pile onto
-  the cores idle at launch time.
+- Always pass `-n` to pytest, even for one test.
 - Artifacts are cached under `$NUMSIM_CACHE_DIR`. dev-env.sh points it at a
   dedicated directory so refactor work does not reuse artifacts built by an
   older engine checkout; delete it to force rebuilds.
-- Engine changes: `(cd src/tirx_harness/numsim/engine-rs && cargo test --all-features)`.
-  New core: `(cd src/tirx_harness/numsim/core-rs && cargo test)`.
+- Core changes: `(cd src/tirx_harness/numsim/core-rs && cargo test --workspace)`.
 
 ## NumSim v2 (core-rs + Python layer)
 
@@ -230,8 +226,7 @@ row is a regression.
 
 ## CI
 
-`.github/workflows/tests.yml` runs `cargo test --all-features` in engine-rs,
-`cargo test` in core-rs (when present) and
+`.github/workflows/tests.yml` runs `cargo test` in core-rs and
 `pytest -n auto -m "not numsim_gpu and not performance"`. The conformance tests
 are part of that run, so snapshot drift fails CI.
 
@@ -312,8 +307,7 @@ Follow-up: re-record every v2 baseline on a quiet host
 `scripts/numsim-v2/bench_backends.py` times every canonical case in each mode where v2
 matches legacy (`v2-conformance-status.md`). It runs legacy and v2 interp at
 `max_workers` 1/8/32, 3 interleaved repetitions each, keeping the minimum. Every run's
-normalized result is checked against the legacy conformance snapshot, or against
-`<mode>.delta.json` for v2 when one exists. A row aborts on any difference. Each case runs in its own child process. The 1-minute load average is
+Each case runs in its own child process. The 1-minute load average is
 checked before each (case, mode) and the run waits while it exceeds `--max-load` (default
 40); samples taken above 40 are flagged `(L)`. Results are written per case under
 `$NUMSIM_CACHE_DIR/bench-backends/` and a rerun skips cases already present (`--force` redoes

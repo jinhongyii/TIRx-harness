@@ -6,7 +6,7 @@
 //! branches, lane guards and `elect.sync` already resolved). Where the legacy
 //! expectation contradicts a row of `docs/development/sync-behaviour-deltas.md`,
 //! the test asserts the new behaviour and cites the row.
-//! The coverage map is `scripts/numsim-v2/coverage/synccheck.tsv`.
+//! The coverage map (`synccheck.tsv`) was a migration ledger deleted at step 5; see docs/development/test-migration.md.
 
 mod synccheck_support;
 
@@ -832,7 +832,7 @@ fn drain_tail_ping_pong_is_clean() {
 // ---------------------------------------------------------------------------
 // Unreviewed-B batch: synccheck verdicts asserted outside
 // tests/analysis_tools/synccheck (racecheck/test_native_raw_async_copy_footprints.py,
-// shared/, numsim/runtime/). Coverage map: scripts/numsim-v2/coverage/other_b.tsv.
+// shared/, numsim/runtime/). Coverage map other_b.tsv: ledger deleted at step 5; see docs/development/test-migration.md.
 // ---------------------------------------------------------------------------
 
 /// One event of `warp` that delivers `bytes` to every barrier in `targets`

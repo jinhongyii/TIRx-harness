@@ -1656,7 +1656,7 @@ per family: `copy` (copy / cast / add), `fill`, `permute`, `reduce`, plus W1's
   `tests/numsim/v2/tile_forms/test_legacy_compiled_tile_forms.py` over
   `legacy_compiled.tsv` and the captures. `fp8_scale_permute_tmem_roundtrip`
   is a strict xfail under L1.
-- Public tests under `NUMSIM_IMPL=v2`: `test_copy_dispatch_contract.py`,
+- Public tests run against v2 (before step 5, under the then test switch `NUMSIM_IMPL=v2`): `test_copy_dispatch_contract.py`,
   `test_tile_codegen.py`, `test_tile_unary_codegen.py`,
   `test_permute_layout_artifact.py`, `test_tile_reduction_variants.py`,
   `test_tile_dispatch_invariance.py`, `test_reported_layout_regressions.py`,

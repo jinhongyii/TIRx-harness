@@ -7,7 +7,7 @@
 //!   arrive/wait phases, fences, async issue/complete, allocation lifetime,
 //!   declared words, wait verdicts).
 //!
-//! Consumers: Racecheck (W5, `numsim-race-core/src/input.rs`) and the
+//! Consumers: Racecheck (W5, `numsim-core/src/racecheck/input.rs`) and the
 //! Synccheck explorer (W6, ). Both map
 //! onto these types with a thin adapter; name mappings are noted inline.
 //!

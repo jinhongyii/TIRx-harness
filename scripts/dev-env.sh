@@ -13,7 +13,6 @@ unset PYTHONPATH TVM_LIBRARY_PATH TVM_HOME
 
 export PY="${PY:-$_numsim_repo/.venv/bin/python}"
 export NUMSIM_CACHE_DIR="${NUMSIM_CACHE_DIR:-$HOME/.cache/numsim-refactor}"
-export NUMSIM_WORKER_AFFINITY="${NUMSIM_WORKER_AFFINITY:-off}"
 
 # Runtime libraries come from the venv: the NVIDIA wheels (nvidia/*/lib), torch
 # and TVM. LD_LIBRARY_PATH itself is replaced, not extended, because the login

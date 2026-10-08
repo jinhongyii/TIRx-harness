@@ -33,7 +33,7 @@ if [[ -n "$out" ]]; then
   # regular package that shadows the source tree when placed first on the path.
   src_pkg="$(dirname "$(dirname "$v2dir")")"
   mkdir -p "$out/pkg/tirx_harness"
-  rsync -a --delete --exclude 'core-rs' --exclude 'engine-rs' --exclude '__pycache__' \
+  rsync -a --delete --exclude 'core-rs' --exclude '__pycache__' \
     --exclude '*.so' "$src_pkg/" "$out/pkg/tirx_harness/"
   dest="$out/pkg/tirx_harness/numsim/v2/numsim_core_py.abi3.so"
 else

@@ -10,9 +10,7 @@ Prints, as Markdown:
 * the conformance matrix per mode (``numsim``, ``racecheck``, ``synccheck``):
   ``match`` (NumSim equals the snapshot), ``delta-match`` (equals a
   ``<mode>.delta.json``; none remain after step 5), ``no-oracle`` (a skipped
-  case whose snapshot records an exception) and ``fail``;
-* the public-API set from ``scripts/numsim-v2/coverage/v2_public_status.tsv``
-  while that migration record exists.
+  case whose snapshot records an exception) and ``fail``.
 
 ``--run`` executes ``pytest tests/conformance`` from ``tirx_harness/`` with
 the current interpreter (source scripts/dev-env.sh first).
@@ -23,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import collections
-import csv
 import json
 import os
 import re
@@ -35,7 +32,6 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SNAPSHOTS = REPO / "tirx_harness/tests/conformance/snapshots"
-PUBLIC_TSV = REPO / "scripts/numsim-v2/coverage/v2_public_status.tsv"
 MODES = ("numsim", "racecheck", "synccheck")
 NODE = re.compile(r"test_conformance_snapshot\[(?P<case>.+)-(?P<mode>numsim|racecheck|synccheck)\]")
 
@@ -79,23 +75,6 @@ def classify(case: str, mode: str, state: str | None) -> str:
     return "fail" if state == "failed" else (state or "not-run")
 
 
-def public_counts() -> tuple[int, int, int, int]:
-    funcs = passing = items = items_pass = 0
-    with PUBLIC_TSV.open() as handle:
-        for row in csv.DictReader(handle, delimiter="\t"):
-            if row["v2_status"] == "skip":
-                continue
-            funcs += 1
-            passing += row["v2_status"] == "pass"
-            for part in (row.get("items") or "").split():
-                name, _, count = part.partition("=")
-                if name == "skip":
-                    continue
-                items += int(count or 0)
-                items_pass += int(count or 0) if name == "pass" else 0
-    return passing, funcs, items_pass, items
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     source = parser.add_mutually_exclusive_group(required=True)
@@ -129,12 +108,6 @@ def main() -> int:
         print(f"| {mode} | " + " | ".join(cells) + " |")
     if failing:
         print("\nNot matching: " + ", ".join(failing))
-    if not PUBLIC_TSV.exists():
-        return 0
-    passing, funcs, items_pass, items = public_counts()
-    print("\n## Public-API legacy tests under v2\n")
-    print(f"{items_pass} of {items} items pass ({passing} of {funcs} functions fully), "
-          f"from `{PUBLIC_TSV.relative_to(REPO)}`.")
     return 0
 
 

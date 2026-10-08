@@ -2,20 +2,16 @@
 
 Usage (from ``tirx_harness/``, after ``source ../scripts/dev-env.sh``)::
 
-    NUMSIM_IMPL=v2 CAPTURE_DIR=/tmp/capture PYTHONPATH=../scripts/numsim-v2 \\
+    CAPTURE_DIR=/tmp/capture PYTHONPATH=../scripts/numsim-v2 \\
         $PY -m pytest tests/numsim tests/analysis_tools -p capture_plugin -n 48 -q
 
-``NUMSIM_IMPL=v2`` routes the public ``numsim.transpile`` / ``racecheck`` /
-``synccheck`` names to v2 (``tests/conftest.py``). Until the legacy layer is
-deleted, kernels reached only through legacy internals are also captured at
-the legacy normalization hook (same file format). Every PrimFunc reaching
+Every PrimFunc reaching
 ``tirx_harness.numsim.v2.compile.transpile`` (directly, or through the v2
 checkers), as given by the caller, is written to
 ``$CAPTURE_DIR/<sha1-16>.json`` with ``tvm.ir.save_json``; a sequence of launches
 is captured one PrimFunc per file. ``index.<pid>.jsonl`` maps hashes to test
-node ids. The tests themselves are skipped right after capture. The format is
-the one the legacy-hooked plugin wrote, so ``lower_sweep.py`` and
-``inventory.py`` read either.
+node ids. The tests themselves are skipped right after capture.
+``lower_sweep.py`` and ``inventory.py`` read this format.
 """
 
 import hashlib
@@ -65,20 +61,3 @@ def pytest_configure(config):
     # `transpile` resolves `_functions` from its module globals on every call,
     # before the module cache lookup, so cache hits are captured too.
     v2_compile._functions = capture
-
-    # Until step 5, tests that reach a kernel only through legacy internals
-    # (`analyze`, `emit_rust_module`, the legacy `transpile`) are captured at the
-    # legacy normalization hook too, so the capture set stays the one
-    # lowering-inventory.md Part F was measured on. The legacy modules are
-    # deleted at step 5 and this block then does nothing.
-    try:
-        from tirx_harness.numsim.transpiler import frontend, host_prelude
-    except ImportError:
-        return
-
-    def capture_one(func):
-        record(func)
-        pytest.skip("captured")
-
-    host_prelude.normalize_host_tensor_map_prelude = capture_one
-    frontend.normalize_host_tensor_map_prelude = capture_one

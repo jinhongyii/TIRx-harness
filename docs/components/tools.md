@@ -153,7 +153,7 @@ See the [NumSim API reference](../api/numsim.md) for full signatures.
   `UnsupportedTIRxError` instead of guessing. Opaque CUDA bodies are
   unsupported, and so is a tile operation that TVM's tile dispatch cannot
   lower. Consult the
-  {repo}`operation coverage table <tirx_harness/src/tirx_harness/numsim/engine-rs/SUPPORTED_OPS.md>`.
+  {repo}`operation coverage table <tirx_harness/src/tirx_harness/numsim/core-rs/numsim-oplib/SUPPORTED_OPS.md>`.
 - Hardware timing and some instruction results use deterministic
   representatives. Simulation time is not GPU latency. Transcendental math
   that the legacy simulator did not model (for example `sin`, `cos`, `tanh`,

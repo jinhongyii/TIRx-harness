@@ -1042,7 +1042,9 @@ citing B7.
 
 ### Benchmarks
 
-`numsim-race-core/benches/core.rs`, same machine. "Before" is the phase-2
+Historical: measured with `numsim-race-core/benches/core.rs` (the prototype
+crate, since deleted; the benchmarks moved to `numsim-core/benches/racecheck.rs`),
+same machine. "Before" is the phase-2
 prototype with 48-byte witnesses; "after" is the phase-3 core (16-byte packed
 witnesses, `cell::Witness`).
 

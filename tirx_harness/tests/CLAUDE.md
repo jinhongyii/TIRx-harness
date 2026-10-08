@@ -2,13 +2,8 @@
 
 ## Running the Test Suites
 
-A fresh worktree first needs the Rust frontend dependency:
-
-```bash
-```
-
 Tests load canonical kernels from the environment's installed `tirx-kernels`
-package. Then from `tirx_harness/`:
+package. From `tirx_harness/`:
 
 ```bash
 python -m pip install --no-deps --no-build-isolation ..

@@ -6,7 +6,8 @@ are explained by Decision 6, "tile semantics are TVM's dispatch output"
 ``docs/development/numsim-behaviour-deltas.md``, section "Tile reductions ...
 Decision 6": "v2 runs the code TVM's tile dispatch emits for the GPU"; same
 ruling as the earlier ``test_triage_tile_general_semantics`` row of
-``scripts/numsim-v2/coverage/other_assertion_triage.tsv``). The legacy frontend
+``other_assertion_triage.tsv``; ledger deleted at step 5; see
+docs/development/test-migration.md). The legacy frontend
 emitted its own round-to-nearest, non-FTZ element loops; TVM's dispatch
 (``TilePrimitiveDispatch`` at ``sm_100a``) emits:
 

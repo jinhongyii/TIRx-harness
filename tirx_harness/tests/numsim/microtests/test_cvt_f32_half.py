@@ -17,8 +17,8 @@ from tests.numsim.support.cvt_cases import scalar_cvt_kernel
 from tests.numsim.support.execution import run_checked
 from tirx_harness import numsim
 
-# The v2 engine (NUMSIM_IMPL=v2 now; the only engine after step 5) keeps the
-# old value on guarded-off lanes (delta P8); legacy wrote 0.
+# The v2 engine keeps the old value on guarded-off lanes (delta P8); the
+# deleted legacy engine wrote 0.
 _KEEPS_GUARDED_OFF_DESTINATION = numsim.Engine.__module__.startswith("tirx_harness.numsim.v2")
 
 
