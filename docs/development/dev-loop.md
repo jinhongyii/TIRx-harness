@@ -70,6 +70,29 @@ runs skip with "numsim_core_py is not built". The hand-built Module fixture
 `ProgramBuilder`; refresh it after a `program.rs` change with
 `UPDATE_FIXTURES=1 cargo test -p numsim-py`.
 
+The release profile (`core-rs/Cargo.toml`) uses `lto = "thin"`. Criterion benches
+override it back (`[profile.bench] lto = false`) so recorded bench baselines stay
+comparable. Measured on 2026-10-08 (256-core host, load about 20-45, a HEAD snapshot, `numsim-py`
+release build with a private `CARGO_TARGET_DIR`):
+
+| profile | clean build | incremental (touch numsim-oplib) | incremental (touch numsim-core) |
+| --- | --- | --- | --- |
+| no LTO (before) | 38.2 s | 35.3 s | 33.1 s |
+| `lto = "thin"` (adopted) | 38.5 s | 33.4 s | 31.9 s |
+| `lto = "thin"`, `codegen-units = 1` (rejected) | 116.9 s | 100.6 s | 101.7 s |
+
+End to end with a private `--out` extension (1 worker, the interpreter, min of 3 interleaved runs):
+
+| kernel | no LTO | thin | thin + 1 CGU |
+| --- | --- | --- | --- |
+| `rmsnorm` | 1.01 ms | 0.88 ms | 0.88 ms |
+| `fp16_bf16_gemm` | 62.1 ms | 59.5 ms | 60.1 ms |
+| `deepgemm_sm100_fp8_gemm_1d1d` | 6.06 ms | 6.23 ms | 5.92 ms |
+
+Thin LTO costs nothing to build. It gains about 13% on the ALU-bound kernel and is within noise
+on the MMA-bound ones. One codegen unit triples the incremental build for no further
+gain, so it is not used.
+
 `numsim-core/tests/synccheck_equivalence.rs` explores only every 10th
 generated case by default (5 s debug). Set `SYNCCHECK_EQUIV_FULL=1` to check
 every case (45 s debug, 13 s release) after changing a synccheck reduction rule.

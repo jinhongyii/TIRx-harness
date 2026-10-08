@@ -15,3 +15,12 @@ pyo3 = { version = "=0.29.0" }
 
 [profile.release]
 debug = 1
+# Thin cross-crate LTO (W4, 2026-10-08; numbers in docs/development/dev-loop.md):
+# rmsnorm ~13% faster end to end, no measurable build-time cost. codegen-units = 1
+# was rejected: 3x the incremental release build for no further gain.
+lto = "thin"
+
+# Criterion benches keep the pre-LTO codegen (bench inherits release), so their
+# recorded baselines stay comparable.
+[profile.bench]
+lto = false
