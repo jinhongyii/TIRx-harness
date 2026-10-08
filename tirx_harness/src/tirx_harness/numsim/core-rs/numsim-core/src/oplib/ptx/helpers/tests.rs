@@ -277,19 +277,15 @@ fn matrix_descriptor() {
         one("tirx.cuda.tcgen05_encode_matrix_descriptor", Ty::U64, &neg),
         expected & !(7 << 61)
     );
-    let global = [
-        (Ty::U64, u128::from(addr::GLOBAL_VA_BASE)),
-        (Ty::S32, 1),
-        (Ty::S32, 64),
-        (Ty::S32, 3),
-    ];
-    let r = run(
-        "tirx.cuda.tcgen05_encode_matrix_descriptor",
-        &[],
-        &[Ty::U64],
-        &global,
-    );
-    assert_eq!(kind(r), Some(OpErrorKind::Invalid));
+    // V2C-10: no validity check at encode time. Address 0 (a template
+    // patched later) and any non-shared value encode `(addr & 0x3FFFF) >> 4`.
+    for raw in [0u128, u128::from(addr::GLOBAL_VA_BASE) + 0x1_2340] {
+        let args = [(Ty::U64, raw), (Ty::S32, 1), (Ty::S32, 64), (Ty::S32, 3)];
+        let r = run("tirx.cuda.tcgen05_encode_matrix_descriptor", &[], &[Ty::U64], &args);
+        let want = numsim_oplib::tcgen05::encode::encode_matrix_descriptor(raw as u32, 1, 64, 3);
+        assert_eq!(want & 0x3fff, ((raw as u64) & 0x3ffff) >> 4);
+        assert_eq!(r.unwrap()[0], want, "{raw:#x}");
+    }
 }
 
 #[test]

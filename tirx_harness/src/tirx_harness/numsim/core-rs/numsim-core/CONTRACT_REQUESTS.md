@@ -1363,3 +1363,16 @@ advisory. No racecheck change is needed once lowering carries the names.
   - `SiteInfo::buffer` walks the `view_of` chain only while the dtype is
     unchanged, and stops at the dyn-smem pool. A dtype-changing view is its
     own identity.
+
+## W4-10 (2026-10-08): CLC query decode, V2C-10
+
+- `tirx.ptx.clusterlaunchcontrol_query_cancel_{is_canceled,get_first_ctaid,
+  get_first_ctaid_v4}` resolve (`oplib/ptx/clc.rs`): bytes 0..4 of the
+  response are the linear base CTA id (x; y = z = 0, legacy linear launch
+  domain); `is_canceled = low32 != 0 && low32 != 0xFFFF_FFFF`, so both the v2
+  all-zero never-cancel representative and legacy's `0xFFFF_FFFF` decode as
+  not cancelled (a real cancel never yields base CTA 0). W2: keep the
+  all-zero response, or write `0xFFFF_FFFF` — both are "not cancelled".
+- V2C-10: `tcgen05_encode_matrix_descriptor` no longer validates its address:
+  a generic shared pointer contributes its window offset, anything else (0
+  included) its own bits, encoded as `(addr & 0x3FFFF) >> 4`.

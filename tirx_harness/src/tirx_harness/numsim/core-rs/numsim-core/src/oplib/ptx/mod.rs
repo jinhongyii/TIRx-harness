@@ -22,6 +22,7 @@
 //! operand layout; it is interned process-wide by (key, tys) and leaked so the
 //! returned `PtxFn` stays `Copy` (bounded by the number of distinct forms).
 
+mod clc;
 mod cvt;
 mod helpers;
 mod hints;
@@ -72,6 +73,8 @@ pub(super) fn resolve(key: &OpKey, dst_tys: &[Ty], src_tys: &[Ty]) -> OpResult<P
         found
     } else if let Some(found) = hints::resolve(name, &mods, &ops)? {
         found
+    } else if let Some(found) = clc::resolve(name, &mods, &ops)? {
+        found
     } else if let Some(found) = helpers::resolve(name, &mods, &ops)? {
         found
     } else if let Some(found) = cvt::resolve(name, &mods, &ops)? {
@@ -98,6 +101,7 @@ pub(in crate::oplib) fn known_ops() -> Vec<&'static str> {
     let mut names = Vec::new();
     names.extend_from_slice(vector::NAMES);
     names.extend_from_slice(hints::NAMES);
+    names.extend_from_slice(clc::NAMES);
     names.extend_from_slice(helpers::NAMES);
     names.extend_from_slice(cvt::NAMES);
     names.extend_from_slice(warp::NAMES);

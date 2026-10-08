@@ -456,16 +456,16 @@ fn encode_matrix_descriptor(name: &str, mods: &Mods, ops: &Operands) -> OpResult
                 continue;
             }
             let raw = ops.src(io, 0, lane);
-            // `__cvta_generic_to_shared(addr)`: a generic pointer must lie in
-            // the shared aperture; a 32-bit value already is a shared address.
+            // `__cvta_generic_to_shared(addr)` then `(addr & 0x3FFFF) >> 4`
+            // with no validity check at encode time (V2C-10): kernels encode
+            // a template from address 0 and patch the address field later,
+            // and a consumer validates the descriptor when it is used. A
+            // generic shared pointer contributes its window offset; any other
+            // value (0 included) contributes its own low bits.
             let shared = if address_bits == 64 {
                 match addr::classify_generic(raw) {
                     addr::Generic::Shared(offset) => offset,
-                    _ => {
-                        return Err(OpError::invalid(format!(
-                            "tirx.cuda.tcgen05_encode_matrix_descriptor: address {raw:#x} is not a generic shared-memory address"
-                        )))
-                    }
+                    _ => raw as u32,
                 }
             } else {
                 raw as u32
