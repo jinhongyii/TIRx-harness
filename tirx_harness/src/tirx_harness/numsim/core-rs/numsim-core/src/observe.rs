@@ -417,6 +417,9 @@ pub struct PartitionInfo<'a> {
     pub key: u32,
     /// Its CTAs.
     pub ctas: &'a [CtaId],
+    /// Number of hot `Access` records the partition replays this phase: a
+    /// size hint so an observer can keep a tiny partition's work serial.
+    pub accesses: u64,
 }
 
 /// A forked child observer (decision 17): sendable to a pool thread and

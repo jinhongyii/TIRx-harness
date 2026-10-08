@@ -156,8 +156,16 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
       final `seq` values and verdict indices), replays each forked
       partition's buffer into its child on the pool, then calls `join` (or
       replays a non-forked partition into the parent) in replay order.
+    - `fork` is offered only when the children can run in parallel: a pool
+      exists and the batch has more than one partition. Otherwise every
+      partition of the batch is replayed serially into the parent, so a
+      phase is never mixed between forked and non-forked partitions
+      (W5-17a). Results and the Access/SyncEvent streams do not depend on
+      this: `fork`/`join` are structural hooks on the same event sequence.
     - `PartitionInfo.key` is the partition's first cluster id (stable across
-      rounds; the `AsyncId` range uses the same value), `ctas` its CTAs.
+      rounds; the `AsyncId` range uses the same value), `ctas` its CTAs,
+      `accesses` its hot-record count this phase (a size hint; an observer
+      may keep a tiny partition's work serial, e.g. a buffering child).
     - `phase_end(round)` fires once per non-empty replay batch: after the
       parallel phase, the serial phase and the drain.
     - `ForkedObserver: Observer + Send` adds `into_any` so `join` recovers

@@ -1047,12 +1047,17 @@ impl<'p> Scheduler<'p> {
         let mut children: Vec<Option<Box<dyn ForkedObserver>>> = Vec::with_capacity(order.len());
         let mut starts: Vec<u64> = Vec::with_capacity(order.len());
         let mut seq = self.next_seq;
+        // Fork only when the children can actually run in parallel (a pool
+        // and more than one partition); otherwise serial replay below. Within
+        // a phase every partition is offered a fork or none is (W5-17a).
+        let parallel = pool.is_some() && order.len() > 1;
         for &k in order {
             let p = &self.partitions[k];
             let ctas = ctas_of(p);
-            children.push(observer.fork(&PartitionInfo { key: key_of(p), ctas: &ctas }));
+            let n = p.events.access_count();
+            children.push(if parallel { observer.fork(&PartitionInfo { key: key_of(p), ctas: &ctas, accesses: n }) } else { None });
             starts.push(seq);
-            seq += p.events.access_count();
+            seq += n;
         }
         if children.iter().any(Option::is_some) {
             let mut evs: Vec<Option<&mut partition::EventBuffer>> = self.partitions.iter_mut().map(|p| Some(&mut p.events)).collect();
@@ -1099,7 +1104,7 @@ impl<'p> Scheduler<'p> {
                 Some(child) => {
                     let p = &self.partitions[k];
                     let ctas = ctas_of(p);
-                    observer.join(&PartitionInfo { key: key_of(p), ctas: &ctas }, child);
+                    observer.join(&PartitionInfo { key: key_of(p), ctas: &ctas, accesses: p.events.access_count() }, child);
                 }
                 None => {
                     let mut s = starts[i];
