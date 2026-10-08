@@ -1122,3 +1122,40 @@ fn inval_racing_a_tma_landing_is_an_error() {
         assert!(kind(&r).contains("inval") || kind(&r).contains("outstanding") || !kind(&r).is_empty(), "{name}");
     }
 }
+
+/// sync-semantics §6.7: a restricted commit
+/// (`.sync_restrict::shared::read::mma::a`) lands when the operand-A reads of
+/// the prior MMAs are done, so it is not ordered after an earlier
+/// unrestricted commit; an unrestricted commit is ordered after an earlier
+/// restricted one.
+#[test]
+fn restricted_commit_orders_only_after_restricted_commits() {
+    let build = |first_restricted: bool| {
+        let (first, second) = if first_restricted {
+            (tcgen::WorkCmd::CommitSharedA, tcgen::WorkCmd::Commit)
+        } else {
+            (tcgen::WorkCmd::Commit, tcgen::WorkCmd::CommitSharedA)
+        };
+        let mut log = LogBuilder::new();
+        log.cmd(0, 1, mbar(0, 0), init(1));
+        log.cmd(0, 1, mbar(0, 8), init(1));
+        cta_sync(&mut log, 0, &[0, 1], 2);
+        log.cmd(0, 2, tcgen_work(0, 0), work(tcgen::WorkCmd::Issue));
+        log.issue(0, 3, mbar(0, 0), 0, 1, vec![(tcgen_work(0, 0), work(first))]);
+        log.cmd(0, 4, tcgen_work(0, 0), work(tcgen::WorkCmd::Issue));
+        log.issue(0, 5, mbar(0, 8), 0, 1, vec![(tcgen_work(0, 0), work(second))]);
+        // After the second commit's barrier completes, invalidate the
+        // first one's: fine only if the first commit has surely landed.
+        log.cmd(1, 6, mbar(0, 8), wait(0));
+        log.cmd(1, 7, mbar(0, 0), inval());
+        log.build()
+    };
+    let cfg = SynccheckConfig { certificates: false, ..config(cta(2)) };
+    // Restricted then unrestricted: the second lands after the first.
+    let r = check(&build(true), &cfg);
+    assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+    // Unrestricted then restricted: the restricted one may land first, and
+    // the inval then races the unrestricted commit's arrival.
+    let r = check(&build(false), &cfg);
+    assert_eq!(r.verdict, Verdict::Error, "{:#}", serialize(&r));
+}

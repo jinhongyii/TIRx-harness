@@ -154,6 +154,27 @@ The legacy engine used Rust Futures with wakers. The table below records what wo
 
 **Deadlock** is declared when no warp is runnable and a full completion-pump round makes no progress (`executor.rs:516-527`, 1464-1480; pump cadence `executor.rs:1301-1303`). In the redesign, a round with every live warp `Blocked` and no enabled completion is a deadlock. Per the numsim guide, a single spinning warp is not proof.
 
+### 1.5 Deadlock declaration (ruling 2026-10-08, consistent with delta M17)
+
+The scheduler's no-progress check (`sched::Scheduler::run`) decides as follows. It runs after force-landing every ready op, when no warp, completion, landing, inbox delivery or admission made progress in the round.
+
+1. **Full-warp waits.** Every blocked warp has a converged mask; its blocked lanes are all of its live lanes. Then the launch is quiescent: nothing can ever make progress, and that is a deadlock.
+   - Before returning `RunStatus::Deadlock { blocked }`, call `SyncTable::stuck(&blocked)` (§2.9) on each partition.
+   - If it returns a protocol error, report that error instead: `RunStatus::Error` with `ExecErrorKind::Protocol(SyncError::Mbarrier(TxUnderDelivered { .. }))`, at the blocked warp's site. It is a deadlock with a proof of why: kind `mbarrier_tx_underdelivered`, `FindingKind::Deadlock`.
+   - Otherwise report the plain deadlock.
+2. **Partial-warp waits** (delta M17). Some blocked warp has a divergent mask, so its other lanes sit at a reconvergence point that structured SIMT runs only after the blocked lanes leave. Engine state cannot prove that those lanes would never produce what the blocked lanes wait for. The result stays `incomplete` (`analysis_incomplete`, reason `divergent_block`).
+   - This covers a single-lane `wait_until` whose word nobody writes (`test_wait_without_any_possible_publisher_is_a_sync_deadlock`) and a TMA that under-delivers its `expect_tx` when the waiting lanes diverge (`test_raw_tensor_map_under_delivery_reports_exact_bytes`, `test_tma_transaction_under_delivery_is_an_error`).
+   - A lane-level static proof ("nothing anywhere can write this word") is not attempted.
+3. **Named barriers after exit** (G8) stay as they are: `incomplete`.
+
+**Possible extension (not required; it would retire M17).** Under Independent Thread Scheduling (PTX §3.2: "allows full concurrency between threads, regardless of warp … can yield execution at a per-thread granularity"), the suspended lanes S may run past the reconvergence point on hardware while the blocked lanes B wait. A scheduler could resume S as an independent lane group. It would run until:
+- S exits;
+- S blocks;
+- S reaches a warp collective whose members include B (`.aligned` forms, `*.sync` with B in the mask, `setmaxnreg`, `tcgen05` collectives); or
+- S reaches the reconvergence point of an enclosing construct that also contains B.
+
+If no lane group then makes progress, the launch is quiescent and rule 1 applies. Until that exists, rule 2 is the contract.
+
 **Eager numeric completion.** In the legacy NumSim (non-observing) mode, TMA transaction bytes and `tcgen05.commit` arrivals land at issue: `complete_numeric` → `complete_transactions_immediately` / `arrive_many` (RS:1045-1060, 1100-1111; KE:4732, 5410-5418). The redesign keeps one path for every mode:
 
 - **Issue** is `step(Issue)` and returns the bound generation.
@@ -447,6 +468,20 @@ The following untyped `EngineError` messages are also raised:
 - **G3.** `fence.mbarrier_init` coverage is a causality fact (racecheck and synccheck), not barrier state.
 - **G4.** Exit policy for under-delivered phases: keep the engine's "terminal reservation" tolerance (HB:2361-2373). It belongs in `quiescent`.
 
+### 2.9 Quiescent diagnosis: `stuck` (ruling 2026-10-08)
+
+`mbarrier::stuck(&State) -> Option<Error>` (production `sync/mbarrier.rs`, reference `numsim-sync-ref/src/mbarrier.rs`) is a pure query, not a step. The caller must have proven the launch quiescent (§1.5): no warp, completion, landing or delivery can make progress, and the async queues are drained. It returns `TxUnderDelivered { gen, expected, completed }` when all of the following hold:
+- the slot is live and the open phase is not complete;
+- no completion is outstanding (no issued token left to land) and nothing is buffered for the next phase;
+- every arrival is in (`arrived >= required`);
+- the delivered bytes fall short of the expected bytes (`tx_completed < tx_expected`).
+
+Nothing can ever deliver the rest, so the wait can never be satisfied. In every other case it returns `None`, and the blocked wait is an ordinary deadlock (for example, a missing arrival).
+- **Report kind:** `FindingKind::Deadlock`, synccheck/engine kind `mbarrier_tx_underdelivered`.
+- **Exit tolerance is separate.** `quiescent` (G4) still tolerates the same state at exit, because there no wait is blocked on it.
+- **Table hook:** `SyncTable::stuck(&[ResourceId]) -> Vec<(ResourceId, SyncError)>` runs it over the blocked resources.
+- **Tests:** differential coverage (`mbarrier_matches_reference` compares `stuck` after every step, and `coverage_reaches_every_variant` requires `TxUnderDelivered`), plus the reference test `mbarrier_stuck_reports_tx_under_delivery`.
+
 ## 3. Named barriers
 
 ### 3.1 PTX forms (ABI)
@@ -643,6 +678,22 @@ The strict kinds are 9: the five in the table, plus `ResumeWithoutRegistration`,
 - **Rearrival without a wait** is reported in `Outcome::Arrived` and treated as unmodeled by checkers; the ISA is silent.
 - **Exit check.** There is no exit error: at kernel exit every thread has exited, so every generation completes.
 
+### 4.6 Partial warps (ruling 2026-10-08, same as named barriers §3.6)
+
+PTX §9.7.15.3: "barrier.cluster instructions cause the executing thread to wait for all non-exited threads from its warp". Only `.aligned` requires every thread of the warp to execute the *same* instruction.
+
+**Rule.**
+- A **non-aligned** `barrier.cluster.arrive` or `.wait` executed by a strict subset of the warp's non-exited lanes waits for the rest of the warp to execute the same kind (arrive or wait, any site). The warp then makes its single `Arrive` or `Wait` with the full live mask.
+- The per-warp layer is `cluster::Gather` / `cluster::gather` (production `sync/cluster.rs`, reference `numsim-sync-ref/src/cluster.rs`). Its outcomes are `GatherOutcome::{Wait, Complete, Idle}`.
+- `PartialWarp` fires when:
+  - the missing lanes exit (`GatherCmd::Exit`);
+  - the missing lanes execute the other kind;
+  - an `.aligned` form runs with a partial mask.
+- A lane that executes the same kind twice before its warp completes is `EarlyArrival` ("each thread must arrive at the barrier only once").
+- The per-barrier `State` still sees one full-mask command per warp (C3/C4 for that layer).
+- **Engine (W2):** the `barrier.cluster` handler gathers lanes as `barrier_partial` does for named barriers, then steps `Cmd::Arrive` / `Cmd::Wait` once with `mask = live`.
+- **Corpus case:** `test_memory_artifact.py::test_cluster_barrier_unaligned_arrive_accumulates_divergent_lanes` (lanes < 16 and ≥ 16 arrive from the two arms of an `if/else`, then all wait) is then clean with output 2, as legacy.
+
 ## 5. Async groups
 
 ### 5.1 PTX forms (ABI)
@@ -816,6 +867,25 @@ The fixed verifier is SFU:3803-3955 and 4832-4986.
 - **`AllocAfterRelinquish`** is kept ("illegal").
 - **`cta_group` uniformity is kernel-wide.** It covers lifecycle, mma, cp, shift and commit: "All tcgen05 instructions within a kernel must specify the same value for the .cta_group qualifier". It lives in `tcgen::KernelState`. A commit or mma with the other group is `CtaGroupMismatch`, not ignored. `WorkState` therefore has a single uncommitted queue.
 - **Peer warp index.** The same-`warp_id_in_cta` requirement for `cta_group::2` (TG:757-759) is dropped. The ISA asks only for "one warp from each of the peer CTAs".
+
+### 6.7 Restricted commit (`.sync_restrict::shared::read::mma::a`, ruling 2026-10-08)
+
+PTX §9.7.18.12.1: "The `tcgen05.commit` operation with `.sync_restrict::shared::read::mma::a` performs an arrive-on operation on the barrier upon completion of read of A matrix from shared memory for all prior `tcgen05.mma` operations. This does not signal the overall completion of any prior `tcgen05.mma` operations."
+
+**Sync model.**
+- **Work tokens.** `WorkCmd::CommitSharedA` reports the uncommitted MMA tokens without draining them. The MMAs stay uncommitted, so a later unrestricted `Commit` still tracks their full completion. The production and reference `work_step` agree, and the differential test covers it.
+- **Arrive-on.** The arrive-on is still one deferred `mbarrier` arrival (`Issue` then `DeferredArrive { count: 1 }`). What it certifies differs:
+  - It certifies only that the shared-memory reads of operand A by every prior MMA of the issuing thread are done. That is enough to overwrite the A tile in shared memory.
+  - It does **not** certify the MMAs' TMEM/accumulator writes, their reads of B or of TMEM operands, or their completion.
+- **Landing order** (synccheck, `Pending.restricted`, reference landing clocks):
+  - Restricted commits of a thread land in issue order among themselves.
+  - An unrestricted commit lands after every earlier restricted commit: full completion implies the operand-A reads are done.
+  - A restricted commit is **not** ordered after an earlier unrestricted commit, because its A reads may finish before the earlier MMAs complete.
+  - Scenario: `restricted_commit_orders_only_after_restricted_commits`.
+- **Racecheck (W5) and engine (W2).** The engine already tracks restricted commits separately (`tcgen_shared_reads`, W5-10/13). What the arrive publishes:
+  - The barrier phase completed by a restricted commit's arrival releases, to its waiters, only the MMAs' operand-A shared-memory **reads**. That makes a later overwrite of the A tile race-free.
+  - It does not release the accumulator: a `tcgen05.ld` of the MMA result ordered only by such a wait is unordered against the MMA's TMEM write.
+  - The engine must step `WorkCmd::CommitSharedA` instead of `Commit` for the restricted form.
 
 ## 7. setmaxnreg
 
@@ -1031,6 +1101,7 @@ Error mapping: `SyncError::finding_kind` maps each error to a report kind. `Runt
 | `Issue` / `CompleteTx` / `DeferredArrive`: token and landing (`UnknownToken`, `StaleCompletion`, `CompletionAfterComplete`, `FutureNotBufferable`, `TxOverDelivery`) | `step` → `take_token`, `landing_target`, `complete_if_ready` | `apply` → `take_token`, `target`, `maybe_complete` | Q7 (deferred arrive-on); Limits: tx-count ranges |
 | `TestParity` / `WaitParity` / `TestState`: `InvalidPhase`, `InvalidStateToken`, `Blocked` | `step` → `parity_query` | `apply` → `query_parity` | Limits: `try_wait` vs `test_wait`, and parity |
 | Exit: `IncompleteAtExit` (outstanding tokens, buffered completions, or an unsettled tx-count) | `quiescent` | `quiescent` | PTX §9.7.14.7 |
+| Quiescent diagnosis: `TxUnderDelivered` (a blocked wait whose phase has every arrival and nothing in flight, but short bytes) | `stuck`; `SyncTable::stuck` | `stuck` | §2.9, §1.5 |
 | Multicast `ctaMask` outside the cluster (`bad_address`, raised before any target is touched) | `interp::handlers::async_copy::ranks_of` | — (engine addressing) | Q9 |
 | State token, `pending_count` (`NotNoComplete`), `check_layout` | `query.rs`: `encode`, `pending_count`, `check_layout` | `query.rs`: same names | PTX §9.7.15.16.20 |
 
@@ -1053,6 +1124,7 @@ Error mapping: `SyncError::finding_kind` maps each error to a report kind. `Runt
 | `Arrive`: `EarlyArrival`; generation roll | `step` → `roll_if_complete`, `complete` | `apply` | Q4 |
 | `Wait`: `WaitBeforeArrival`, `DuplicateWait` | `step` | `apply` | Q4 |
 | `Exit`: exited threads leave the expected set | `step` | `apply` | Q4 |
+| Non-aligned partial warps: gather to one arrive/wait; `PartialWarp` / `EarlyArrival` | `gather` | `gather` | §4.6, Q11 |
 
 ### Async groups (§5)
 
@@ -1074,6 +1146,7 @@ Error mapping: `SyncError::finding_kind` maps each error to a report kind. `Runt
 | TMEM access outside every live allocation (`bad_address`) | engine (`interp::handlers::tcgen`) | — | Q8 (delta T9) |
 | `cta_group` uniformity: `InvalidCtaGroup`, `CtaGroupMismatch` | `use_cta_group`, `participants` | `use_cta_group`, `Who::indices` | PTX §9.7.18 |
 | Work tokens and `commit` (`WorkCmd`) | `work_step` | `work_step` | PTX §9.7.18.6 |
+| Restricted commit (`WorkCmd::CommitSharedA`): tokens reported, not drained; landing order | `work_step`; synccheck `ts::pending_enabled`, `reference::run_component` | `work_step` | §6.7, Q10 |
 | Exit: `LiveAllocationsAtExit` | `quiescent` | `quiescent` | Q6 |
 
 ### setmaxnreg (§7)

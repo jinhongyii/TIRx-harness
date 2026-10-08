@@ -32,6 +32,7 @@ pub fn error_kind(e: &SyncError) -> &'static str {
             mbarrier::Error::CompletionAfterComplete { .. } => "mbarrier_completion_after_generation_complete",
             mbarrier::Error::FutureNotBufferable { .. } => "mbarrier_future_completion_not_bufferable",
             mbarrier::Error::IncompleteAtExit { .. } => "mbarrier_incomplete_at_exit", // NEW
+            mbarrier::Error::TxUnderDelivered { .. } => "mbarrier_tx_underdelivered", // NEW
         },
         SyncError::Named(e) => match e {
             named::Error::InvalidCount { .. } => "named_barrier_invalid_expected_arrivals",

@@ -179,6 +179,9 @@ proptest! {
         for (i, op) in ops.iter().enumerate() {
             let (rc, cc) = mbar_cmds(&rs, op);
             diff_step!(mbarrier, rs, cs, rc, cc, format!("#{i} {op:?}"));
+            let (rstuck, cstuck) = (spec::mbarrier::stuck(&rs), prod::mbarrier::stuck(&cs));
+            hit_option("mbarrier", "err", &dbg(&rstuck));
+            prop_assert_eq!(dbg(&rstuck), dbg(&cstuck), "stuck differs at #{}", i);
         }
     }
 }
@@ -280,6 +283,36 @@ proptest! {
     }
 }
 
+// ---------------------------------------------------------------- cluster gather
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(CASES))]
+
+    #[test]
+    fn cluster_gather_matches_reference(ops in prop::collection::vec((
+        0u8..5,
+        any::<bool>(),
+        prop::sample::select(vec![u32::MAX, 0xffff, 0xffff_0000, 0xff00_0000, 1, 0]),
+        prop::sample::select(vec![u32::MAX, u32::MAX, 0xffff]),
+        any::<bool>(),
+    ), 0..MAX_LEN)) {
+        let mut rg = spec::cluster::Gather { warp: 2, pending: None };
+        let mut cg = prod::cluster::Gather { warp: 2, pending: None };
+        for (i, &(kind, wait, mask, live, aligned)) in ops.iter().enumerate() {
+            let (rc, cc) = if kind == 0 {
+                (spec::cluster::GatherCmd::Exit { live }, prod::cluster::GatherCmd::Exit { live })
+            } else {
+                (spec::cluster::GatherCmd::Execute { wait, mask, live, aligned }, prod::cluster::GatherCmd::Execute { wait, mask, live, aligned })
+            };
+            hit("cluster", "gather_cmd", &dbg(&rc));
+            let r = spec::cluster::gather(&mut rg, rc);
+            hit_result("cluster", "gather_ok", &dbg(&r));
+            prop_assert_eq!(dbg(&r), dbg(&prod::cluster::gather(&mut cg, cc)), "#{} outcome", i);
+            prop_assert_eq!(dbg(&rg), dbg(&cg), "#{} state", i);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- async groups
 
 proptest! {
@@ -359,13 +392,13 @@ proptest! {
     }
 
     #[test]
-    fn tcgen_kernel_and_work_match_reference(ops in prop::collection::vec((0u8..7, 0u8..4), 0..MAX_LEN)) {
+    fn tcgen_kernel_and_work_match_reference(ops in prop::collection::vec((0u8..8, 0u8..4), 0..MAX_LEN)) {
         let mut rk = spec::tcgen::KernelState::default();
         let mut ck = prod::tcgen::KernelState::default();
         let mut rw = spec::tcgen::WorkState::default();
         let mut cw = prod::tcgen::WorkState::default();
         for &(kind, g) in &ops {
-            if kind == 6 {
+            if kind == 7 {
                 let r = spec::tcgen::use_cta_group(&mut rk, g);
                 hit_result("tcgen", "group_ok", &dbg(&r).replace("Ok(())", "Ok(Unit)"));
                 prop_assert_eq!(dbg(&r), dbg(&prod::tcgen::use_cta_group(&mut ck, g)));
@@ -378,7 +411,8 @@ proptest! {
                 2 => both!(tcgen, WorkCmd::Store),
                 3 => both!(tcgen, WorkCmd::Commit),
                 4 => both!(tcgen, WorkCmd::WaitLd),
-                _ => both!(tcgen, WorkCmd::WaitSt),
+                5 => both!(tcgen, WorkCmd::WaitSt),
+                _ => both!(tcgen, WorkCmd::CommitSharedA),
             };
             hit("tcgen", "work_cmd", &dbg(&rc));
             let r = spec::tcgen::work_step(&mut rw, rc);
@@ -650,6 +684,7 @@ fn coverage_reaches_every_variant() {
     named_gather_matches_reference();
     named_matches_reference();
     cluster_matches_reference();
+    cluster_gather_matches_reference();
     async_group_matches_reference();
     tcgen_matches_reference();
     tcgen_kernel_and_work_match_reference();
@@ -659,7 +694,7 @@ fn coverage_reaches_every_variant() {
         ("query", include_str!("../../numsim-sync-ref/src/query.rs"), &[("err", "TokenError")]),
         ("mbarrier", include_str!("../../numsim-sync-ref/src/mbarrier.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error")]),
         ("named", include_str!("../../numsim-sync-ref/src/named.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error"), ("lint", "Lint"), ("gather_cmd", "GatherCmd"), ("gather_ok", "GatherOutcome")]),
-        ("cluster", include_str!("../../numsim-sync-ref/src/cluster.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error")]),
+        ("cluster", include_str!("../../numsim-sync-ref/src/cluster.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error"), ("gather_cmd", "GatherCmd"), ("gather_ok", "GatherOutcome")]),
         ("async_group", include_str!("../../numsim-sync-ref/src/async_group.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error"), ("lint", "Lint")]),
         ("tcgen", include_str!("../../numsim-sync-ref/src/tcgen.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error"), ("work_cmd", "WorkCmd"), ("work_out", "WorkOutcome")]),
         ("setmaxnreg", include_str!("../../numsim-sync-ref/src/setmaxnreg.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error")]),

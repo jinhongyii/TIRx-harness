@@ -353,6 +353,12 @@ pub enum WorkCmd {
     /// `tcgen05.commit`. The arrive-on is
     /// `mbarrier::Cmd::{Issue, DeferredArrive { count: 1 }}`.
     Commit,
+    /// `tcgen05.commit.sync_restrict::shared::read::mma::a`: the arrive-on
+    /// fires when the shared-memory reads of operand A of every prior
+    /// `tcgen05.mma` are done, not their completion (PTX §9.7.18.12.1). The
+    /// MMAs stay uncommitted for a later unrestricted commit, so the token
+    /// count is reported without draining it (sync-semantics §6.7).
+    CommitSharedA,
     WaitLd,
     WaitSt,
 }
@@ -381,6 +387,7 @@ pub fn work_step(s: &mut WorkState, cmd: WorkCmd) -> WorkOutcome {
             WorkOutcome::Queued
         }
         WorkCmd::Commit => drain(&mut s.uncommitted),
+        WorkCmd::CommitSharedA => WorkOutcome::Drained { tokens: s.uncommitted },
         WorkCmd::WaitLd => drain(&mut s.loads),
         WorkCmd::WaitSt => drain(&mut s.stores),
     }

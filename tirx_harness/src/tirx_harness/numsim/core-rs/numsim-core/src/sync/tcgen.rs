@@ -306,6 +306,12 @@ pub enum WorkCmd {
     /// `tcgen05.commit`. The arrive-on is
     /// `mbarrier::Cmd::{Issue, DeferredArrive { count: 1 }}`.
     Commit,
+    /// `tcgen05.commit.sync_restrict::shared::read::mma::a`: the arrive-on
+    /// fires when the shared-memory reads of operand A of every prior
+    /// `tcgen05.mma` are done, not their completion (PTX §9.7.18.12.1). The
+    /// MMAs stay uncommitted for a later unrestricted commit, so the token
+    /// count is reported without draining it (sync-semantics §6.7).
+    CommitSharedA,
     WaitLd,
     WaitSt,
 }
@@ -317,8 +323,11 @@ pub enum WorkOutcome {
 }
 
 pub fn work_step(s: &mut WorkState, cmd: WorkCmd) -> WorkOutcome {
+    if cmd == WorkCmd::CommitSharedA {
+        return WorkOutcome::Drained { tokens: s.uncommitted };
+    }
     let counter = match cmd {
-        WorkCmd::Issue | WorkCmd::Commit => &mut s.uncommitted,
+        WorkCmd::Issue | WorkCmd::Commit | WorkCmd::CommitSharedA => &mut s.uncommitted,
         WorkCmd::Load | WorkCmd::WaitLd => &mut s.loads,
         WorkCmd::Store | WorkCmd::WaitSt => &mut s.stores,
     };
@@ -327,7 +336,9 @@ pub fn work_step(s: &mut WorkState, cmd: WorkCmd) -> WorkOutcome {
             *counter += 1;
             WorkOutcome::Queued
         }
-        WorkCmd::Commit | WorkCmd::WaitLd | WorkCmd::WaitSt => WorkOutcome::Drained { tokens: std::mem::take(counter) },
+        WorkCmd::Commit | WorkCmd::CommitSharedA | WorkCmd::WaitLd | WorkCmd::WaitSt => {
+            WorkOutcome::Drained { tokens: std::mem::take(counter) }
+        }
     }
 }
 

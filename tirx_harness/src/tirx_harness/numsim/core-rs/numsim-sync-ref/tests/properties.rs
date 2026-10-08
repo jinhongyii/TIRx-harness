@@ -1011,3 +1011,19 @@ fn tcgen_alloc_while_exclusive_is_an_error() {
     tcgen::step(&mut s, Cmd::Dealloc { who: Who::One(0), taddr: 0, columns: 96, exclusive: true }).unwrap();
     assert_eq!(tcgen::step(&mut s, alloc(0, 32, false)), Ok(Outcome::Allocated { base: 0 }));
 }
+
+/// sync-semantics §2.9: a quiescent launch whose open phase has every
+/// arrival but fewer bytes than `expect_tx`, with nothing in flight, is
+/// `TxUnderDelivered` (legacy "transactions=48/52").
+#[test]
+fn mbarrier_stuck_reports_tx_under_delivery() {
+    use mbarrier::{step, stuck, Cmd, Error, State};
+    let mut s = State::new(Policy::Numeric);
+    step(&mut s, Cmd::Init { count: 1, layout_v1: false }).unwrap();
+    assert_eq!(stuck(&s), None, "arrival missing: ordinary deadlock");
+    step(&mut s, Cmd::Arrive { count: 1, tx: Some(52), drop: false, no_complete: false }).unwrap();
+    step(&mut s, Cmd::Issue).unwrap();
+    assert_eq!(stuck(&s), None, "a transaction is still in flight");
+    step(&mut s, Cmd::CompleteTx { gen: 0, bytes: 48 }).unwrap();
+    assert_eq!(stuck(&s), Some(Error::TxUnderDelivered { gen: 0, expected: 52, completed: 48 }));
+}

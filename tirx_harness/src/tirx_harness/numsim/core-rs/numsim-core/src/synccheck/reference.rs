@@ -107,13 +107,17 @@ fn run_component(
     // One extra clock component per tcgen05.commit FIFO (issuing warp): a
     // commit's landing is an event of its own, ordered after the warp's
     // earlier commits, so HB through one landing implies the earlier ones.
-    let mut fifo_index = HashMap::<usize, usize>::new();
+    // Keyed by (issuing warp, restricted): restricted and unrestricted
+    // commits form two chains (sync-semantics §6.7).
+    let mut fifo_index = HashMap::<(usize, bool), usize>::new();
     for c in ts.cmds.iter().map(|lc| &program.commands[lc.global]).filter(|c| c.commit) {
         let next = warps + fifo_index.len();
-        fifo_index.entry(c.participants[0]).or_insert(next);
+        fifo_index.entry((c.participants[0], c.commit_restricted)).or_insert(next);
     }
     let dims = warps + fifo_index.len();
     let mut fifo_last = HashMap::<usize, Clock>::new();
+    // Landing clocks of restricted commits per issuing warp, by command.
+    let mut restricted_landed = HashMap::<usize, Vec<(usize, Clock)>>::new();
     let mut clocks = vec![Clock::zero(dims); warps];
     let mut payload = HashMap::<(usize, u64), Clock>::new();
     run.schedule.clear();
@@ -149,7 +153,9 @@ fn run_component(
             return Ok(true);
         }
         let landing_fifo = match t {
-            Transition::Complete(c, o) => state.pending.iter().find(|p| (p.cmd, p.ord) == (c, o)).and_then(|p| p.fifo),
+            Transition::Complete(c, o) => {
+                state.pending.iter().find(|p| (p.cmd, p.ord) == (c, o)).and_then(|p| p.fifo.map(|w| (w as usize, p.restricted)))
+            }
             _ => None,
         };
         let head_of_resume = match t {
@@ -233,13 +239,28 @@ fn run_component(
                 let g = ts.cmds[c as usize].global;
                 if let Some(issuer) = run.initial[g].clone() {
                     let mut released = issuer;
-                    if let Some(f) = landing_fifo.and_then(|w| fifo_index.get(&(w as usize)).copied()) {
-                        if let Some(prev) = fifo_last.get(&f) {
+                    if let Some((w, restricted)) = landing_fifo {
+                        // A landing follows its own chain. An unrestricted one
+                        // also follows the restricted commits issued before it
+                        // (full MMA completion implies their operand-A reads
+                        // are done); a restricted one does not follow earlier
+                        // unrestricted commits (sync-semantics §6.7).
+                        if let Some(prev) = fifo_index.get(&(w, restricted)).and_then(|i| fifo_last.get(i)) {
                             released.join(prev);
                         }
+                        if !restricted {
+                            if let Some((_, prev)) = restricted_landed.get(&w).and_then(|v| v.iter().filter(|(rg, _)| *rg < g).max_by_key(|(rg, _)| *rg)) {
+                                released.join(prev);
+                            }
+                        }
+                    }
+                    if let Some(f) = landing_fifo.and_then(|k| fifo_index.get(&k).copied()) {
                         released.tick(f);
                         fifo_last.insert(f, released.clone());
                         run.landings.insert((g, o), released.clone());
+                        if let Some((w, true)) = landing_fifo {
+                            restricted_landed.entry(w).or_default().push((g, released.clone()));
+                        }
                     }
                     for &(r, gen) in &fx.release {
                         payload.entry((r, gen)).or_insert_with(|| Clock::zero(dims)).join(&released);

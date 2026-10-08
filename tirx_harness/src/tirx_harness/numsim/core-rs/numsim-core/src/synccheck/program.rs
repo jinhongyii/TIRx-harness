@@ -29,6 +29,12 @@ pub struct Command {
     /// A `tcgen05.commit`: its deferred arrivals land in issue order with the
     /// issuing warp's other commits (tcgen05 pipeline order).
     pub commit: bool,
+    /// The commit is `.sync_restrict::shared::read::mma::a`: it lands when
+    /// the operand-A shared reads of the prior MMAs are done. Restricted
+    /// commits land in order among themselves and before any later
+    /// unrestricted commit, but not after an earlier unrestricted one
+    /// (sync-semantics §6.7).
+    pub commit_restricted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +100,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
         collective: Option<Collective>,
         tcgen_groups: Vec<u8>,
         commit: bool,
+        commit_restricted: bool,
     }
     let mut kernel = None::<u32>;
     let mut raws = Vec::<Raw>::new();
@@ -165,7 +172,8 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                 .iter()
                 .map(|t| (intern(t.res), t.bytes, t.arrivals))
                 .collect::<Vec<_>>();
-            let commit = cmds.iter().any(|pc| matches!(pc.cmd, SyncCmd::TcgenWork(tcgen::WorkCmd::Commit)));
+            let commit_restricted = cmds.iter().any(|pc| matches!(pc.cmd, SyncCmd::TcgenWork(tcgen::WorkCmd::CommitSharedA)));
+            let commit = commit_restricted || cmds.iter().any(|pc| matches!(pc.cmd, SyncCmd::TcgenWork(tcgen::WorkCmd::Commit)));
             if kept.is_empty() && issued.is_empty() && tcgen_groups.is_empty() {
                 continue;
             }
@@ -181,6 +189,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                 collective: collective.clone(),
                 tcgen_groups,
                 commit,
+                commit_restricted,
             });
         }
     }
@@ -240,6 +249,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
                 conditional: raw.conditional,
                 tcgen_groups: raw.tcgen_groups,
                 commit: raw.commit,
+                commit_restricted: raw.commit_restricted,
             });
             continue;
         }
@@ -256,6 +266,7 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
             conditional: raw.conditional,
             tcgen_groups: raw.tcgen_groups,
             commit: raw.commit,
+            commit_restricted: raw.commit_restricted,
         });
     }
     for (id, (command, seen)) in &collectives {

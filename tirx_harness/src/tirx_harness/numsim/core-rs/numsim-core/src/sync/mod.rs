@@ -428,6 +428,27 @@ impl SyncTable {
         out.sort_by_cached_key(|(id, _)| format!("{id:?}"));
         out
     }
+
+    /// Deadlock diagnosis for the scheduler's no-progress check
+    /// (sync-semantics §2.9). Call it only when the whole launch is
+    /// quiescent: no warp, completion, landing or inbox delivery can make
+    /// progress and the async queues are drained. Returns, for each of the
+    /// `blocked` resources, the protocol error that proves its wait can
+    /// never be satisfied (today: mbarrier `TxUnderDelivered`). Resources
+    /// without such a proof are an ordinary deadlock.
+    pub fn stuck(&self, blocked: &[ResourceId]) -> Vec<(ResourceId, SyncError)> {
+        let mut out = Vec::new();
+        for id in blocked {
+            if let Some(Resource::Mbarrier(s)) = self.resources.get(id) {
+                if let Some(e) = mbarrier::stuck(s) {
+                    out.push((*id, SyncError::Mbarrier(e)));
+                }
+            }
+        }
+        out.sort_by_cached_key(|(id, _)| format!("{id:?}"));
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
+    }
 }
 
 /// `.cta_group` a tcgen05 lifecycle command uses.

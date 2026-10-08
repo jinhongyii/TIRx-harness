@@ -209,6 +209,90 @@ pub fn quiescent(_s: &State) -> Result<(), Error> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- partial warps
+
+/// Lanes of one warp reaching `barrier.cluster.{arrive,wait}` in pieces.
+/// Same ruling as named barriers (sync-semantics §4.6, sync-isa-answers
+/// Q4/Q5): "barrier.cluster instructions cause the executing thread to wait
+/// for all non-exited threads from its warp", and only `.aligned` requires
+/// every thread of the warp to execute the *same* instruction. A
+/// **non-aligned** arrive or wait executed by a strict subset of the warp's
+/// non-exited lanes waits for the rest of the warp to execute the same kind
+/// (arrive or wait, any site); the warp then makes its single arrive or wait
+/// with the full live mask. `PartialWarp` fires when the missing lanes exit
+/// or execute the other kind, and for `.aligned` partial forms. A lane that
+/// executes the same kind twice before its warp completes is `EarlyArrival`
+/// ("each thread must arrive at the barrier only once").
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Gather {
+    pub warp: Warp,
+    pub pending: Option<Pending>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Pending {
+    /// `barrier.cluster.wait` (else `arrive`).
+    pub wait: bool,
+    pub lanes: LaneMask,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GatherCmd {
+    Execute { wait: bool, mask: LaneMask, live: LaneMask, aligned: bool },
+    /// Lanes of the warp exited while others may be waiting.
+    Exit { live: LaneMask },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GatherOutcome {
+    /// The lanes wait for the rest of their warp.
+    Wait,
+    /// Every non-exited lane is here: issue the warp's one command with `mask`.
+    Complete { mask: LaneMask },
+    /// Nothing pending.
+    Idle,
+}
+
+pub fn gather(g: &mut Gather, cmd: GatherCmd) -> Result<GatherOutcome, Error> {
+    match cmd {
+        GatherCmd::Exit { live } => match g.pending {
+            Some(p) => Err(Error::PartialWarp { mask: p.lanes, live }),
+            None => Ok(GatherOutcome::Idle),
+        },
+        GatherCmd::Execute { wait, mask, live, aligned } => {
+            let so_far = g.pending.map_or(0, |p| p.lanes);
+            if mask == 0 || mask & !live != 0 {
+                return Err(Error::PartialWarp { mask: mask | so_far, live });
+            }
+            if aligned {
+                if g.pending.is_some() || mask != live {
+                    return Err(Error::PartialWarp { mask: mask | so_far, live });
+                }
+                return Ok(GatherOutcome::Complete { mask: live });
+            }
+            if let Some(p) = g.pending {
+                if p.wait != wait {
+                    return Err(Error::PartialWarp { mask: p.lanes, live });
+                }
+                if p.lanes & mask != 0 {
+                    return Err(Error::EarlyArrival { warp: g.warp });
+                }
+            }
+            let lanes = so_far | mask;
+            if lanes & !live != 0 {
+                return Err(Error::PartialWarp { mask: lanes, live });
+            }
+            if lanes == live {
+                g.pending = None;
+                Ok(GatherOutcome::Complete { mask: live })
+            } else {
+                g.pending = Some(Pending { wait, lanes });
+                Ok(GatherOutcome::Wait)
+            }
+        }
+    }
+}
+
 pub fn check_invariants(s: &State) -> Result<(), String> {
     if s.all_arrived() {
         return Err("a complete generation was not rolled".into());

@@ -622,6 +622,40 @@ warp in a CTA using the Tensor Memory Allocation and Management Instructions."
 
 ---
 
+## Q10. Restricted `tcgen05.commit` (`.sync_restrict::shared::read::mma::a`)
+
+**ANSWER (ruling 2026-10-08).** The arrive-on fires when the shared-memory reads of operand A of all prior `tcgen05.mma` operations of the thread are done.
+- **What it certifies:** only those reads. It does not certify MMA completion, TMEM/accumulator writes, or reads of B or of TMEM operands.
+- **Sync model:** the MMAs stay uncommitted for a later full commit (`WorkCmd::CommitSharedA`).
+- **Ordering:** restricted commits are ordered among themselves and before later unrestricted commits, but not after earlier unrestricted ones.
+- **Racecheck:** the arrive publishes only the A reads (sync-semantics §6.7).
+
+**QUOTE** (PTX §9.7.18.12.1):
+
+> "The tcgen05.commit operation with .sync_restrict::shared::read::mma::a
+> performs an arrive-on operation on the barrier upon completion of read of A
+> matrix from shared memory for all prior tcgen05.mma operations. This does not
+> signal the overall completion of any prior tcgen05.mma operations."
+
+---
+
+## Q11. `barrier.cluster` reached by part of a warp (non-aligned)
+
+**ANSWER (ruling 2026-10-08).** This is the same rule as named barriers (Q3/Q5, sync-semantics §3.6 and §4.6).
+- **Non-aligned:** a non-aligned arrive or wait by a strict subset of the warp's non-exited lanes waits for the rest of the warp to execute the same kind, at any site. The warp then arrives (or waits) once.
+- **Aligned:** a partial mask is `PartialWarp` immediately, as is a missing lane that exits or executes the other kind.
+- **Delta C3** (always `PartialWarp`) now applies to `.aligned` forms only.
+
+**QUOTE** (PTX §9.7.15.3):
+
+> "In addition, barrier.cluster instructions cause the executing thread to wait
+> for all non-exited threads from its warp."
+
+> "The optional .aligned qualifier indicates that all threads in the warp must
+> execute the same barrier.cluster instruction."
+
+---
+
 ## Additional limits and forms
 
 ### Expected-arrival, pending and tx-count ranges

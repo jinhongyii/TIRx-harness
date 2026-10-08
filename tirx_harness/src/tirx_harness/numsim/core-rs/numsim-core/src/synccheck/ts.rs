@@ -47,6 +47,10 @@ pub struct Pending {
     pub kind: PendingKind,
     /// Commit FIFO (dense issuing warp): lands after that warp's earlier commits.
     pub fifo: Option<u32>,
+    /// A restricted (`.sync_restrict::shared::read::mma::a`) commit: ordered
+    /// after earlier restricted commits only, not after earlier unrestricted
+    /// ones (sync-semantics §6.7).
+    pub restricted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -527,19 +531,20 @@ impl<'p> Ts<'p> {
         let mut ord = 0u16;
         let issuer = &self.program.commands[lc.global];
         let fifo = issuer.commit.then(|| issuer.participants[0] as u32);
+        let restricted = issuer.commit_restricted;
         for (i, &(r, bytes, arrivals)) in lc.issued.iter().enumerate() {
             let gens = issued_gens.entry(r).or_default();
             let mut take = || if gens.is_empty() { None } else { Some(gens.remove(0)) };
             if bytes > 0 {
                 let Some(gen) = take() else { return Tried::Error(self.internal(c, "issued target without token")) };
                 fx.issued_gens[i] = Some(gen);
-                pending.push(Pending { cmd: c as u32, ord, res: r as u32, kind: PendingKind::Tx { gen, bytes }, fifo: None });
+                pending.push(Pending { cmd: c as u32, ord, res: r as u32, kind: PendingKind::Tx { gen, bytes }, fifo: None, restricted: false });
                 ord += 1;
             }
             if arrivals > 0 {
                 let Some(gen) = take() else { return Tried::Error(self.internal(c, "issued target without token")) };
                 fx.issued_gens[i] = Some(gen);
-                pending.push(Pending { cmd: c as u32, ord, res: r as u32, kind: PendingKind::Arrive { gen, count: arrivals, after: arrive_on }, fifo });
+                pending.push(Pending { cmd: c as u32, ord, res: r as u32, kind: PendingKind::Arrive { gen, count: arrivals, after: arrive_on }, fifo, restricted });
                 ord += 1;
             }
         }
@@ -772,6 +777,7 @@ impl<'p> Ts<'p> {
                 && !self.landing_gated[q.cmd as usize]
                 && q.res == p.res
                 && q.fifo == p.fifo
+                && q.restricted == p.restricted
                 && same_kind(q.kind, p.kind)
                 && self.pending_enabled(s, q)
         })
@@ -779,7 +785,11 @@ impl<'p> Ts<'p> {
 
     fn pending_enabled(&self, s: &State, p: &Pending) -> bool {
         // tcgen05.commit arrivals of one warp land in issue order.
-        if p.fifo.is_some() && s.pending.iter().any(|q| q.fifo == p.fifo && (q.cmd, q.ord) < (p.cmd, p.ord)) {
+        // An earlier unrestricted commit does not order a later restricted
+        // one (its operand-A reads may finish before the earlier MMAs).
+        if p.fifo.is_some()
+            && s.pending.iter().any(|q| q.fifo == p.fifo && (q.cmd, q.ord) < (p.cmd, p.ord) && (q.restricted || !p.restricted))
+        {
             return false;
         }
         match p.kind {

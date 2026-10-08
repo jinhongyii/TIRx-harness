@@ -259,6 +259,16 @@ pub enum Error {
         buffered: u64,
         tx_count: i64,
     },
+    /// Deadlock diagnosis (`stuck`): every arrival of the open phase is in,
+    /// no transaction is in flight or buffered, and the delivered bytes fall
+    /// short of `expect_tx`. Reported only when the launch is quiescent (no
+    /// warp, completion, landing or delivery can make progress), so nothing
+    /// can ever deliver the rest (sync-semantics §2.9).
+    TxUnderDelivered {
+        gen: u64,
+        expected: u64,
+        completed: u64,
+    },
 }
 
 pub struct Mbarrier;
@@ -460,6 +470,23 @@ pub fn quiescent(s: &State) -> Result<(), Error> {
 }
 
 /// Invariants every reachable state satisfies (checked by the property tests).
+/// Why the open phase can never complete, given that the launch is
+/// quiescent: the caller (the scheduler's no-progress check) has already
+/// proven that no warp, completion, landing or delivery can make progress.
+/// `Some(TxUnderDelivered)` when all arrivals are in, nothing is in flight
+/// or buffered, and the transaction bytes fall short; `None` otherwise (the
+/// wait is then an ordinary deadlock).
+pub fn stuck(s: &State) -> Option<Error> {
+    let in_flight = s.outstanding.values().any(|&n| n != 0) || s.buffered_next != 0;
+    if !s.live || s.complete || in_flight {
+        return None;
+    }
+    if s.arrived >= s.required() && s.tx_completed < s.tx_expected {
+        return Some(Error::TxUnderDelivered { gen: s.gen, expected: s.tx_expected, completed: s.tx_completed });
+    }
+    None
+}
+
 pub fn check_invariants(s: &State) -> Result<(), String> {
     if !s.live {
         return if *s == State::new(s.policy) { Ok(()) } else { Err("dead slot carries state".into()) };
@@ -615,6 +642,7 @@ pub fn finding_kind(e: &Error) -> FindingKind {
         // A landing the scheduler should never produce: infrastructure.
         Error::UnknownToken { .. } | Error::FutureNotBufferable { .. } => FindingKind::RuntimeError,
         Error::IncompleteAtExit { .. } => FindingKind::UnwaitedAsync,
+        Error::TxUnderDelivered { .. } => FindingKind::Deadlock,
         _ => FindingKind::MbarrierMisuse,
     }
 }
