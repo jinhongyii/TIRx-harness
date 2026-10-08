@@ -438,3 +438,4 @@ tests/numsim/runtime/test_wait_until.py::test_bit_typed_word_matches_raw_spellin
 tests/numsim/runtime/test_wait_until.py::test_a_backoff_is_the_cuda_loops_business_and_not_the_engines	pin-internals	pin-internals=1
 tests/numsim/runtime/test_wait_until.py::test_a_candidate_index_outside_its_local_table_is_an_execution_error	pin-message	pin-message=1
 tests/numsim/runtime/test_wait_until.py::test_reading_the_word_once_is_not_made_correct_by_declaring_it	racecheck-verdict	racecheck-verdict=1
+tests/numsim/microtests/test_cvt_f32_half.py::test_scalar_half_modifiers_match_independent_grid	pass	pass=1

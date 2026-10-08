@@ -95,6 +95,38 @@ def gpu_marked(func_id: str) -> bool:
     return False
 
 
+def replacement_env() -> dict[str, str]:
+    """Environment for the replacement pytest runs: import ``tirx_harness``
+    from this checkout (a worktree's own tree, not the venv's editable install
+    of another tree) and fail fast when its ``numsim_core_py`` is not built.
+
+    W1's rehearsal: run from a worktree without this, every replacement looked
+    failed (460 holds) and ``--force`` kept 58 files importing deleted modules."""
+    env = dict(os.environ)
+    ours = [str(TESTS_BASE / "src"), str(TESTS_BASE)]
+    env["PYTHONPATH"] = os.pathsep.join(ours + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and p not in ours])
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import tirx_harness; from tirx_harness.numsim.v2 import compile as c; "
+         "print(tirx_harness.__file__); print(c.native().__file__)"],
+        cwd=TESTS_BASE, env=env, capture_output=True, text=True, check=False,
+    )
+    lines = probe.stdout.split()
+    if probe.returncode != 0 or len(lines) < 2:
+        raise SystemExit(
+            "replacement runs cannot load the v2 engine from this checkout "
+            f"({REPO}); build it first (core-rs/numsim-py/build_dev.sh):\n{probe.stderr.strip()[-600:]}"
+        )
+    package = Path(lines[0]).resolve()
+    if REPO.resolve() not in package.parents and os.environ.get("RETIRE_ALLOW_EXTERNAL_PKG") != "1":
+        raise SystemExit(
+            f"replacement runs would import tirx_harness from {package}, outside {REPO}; "
+            "run from the checkout being retired (set RETIRE_ALLOW_EXTERNAL_PKG=1 to accept a private build)"
+        )
+    print(f"# replacements import {package.parent} with engine {lines[1]}", file=sys.stderr)
+    return env
+
+
 def passing(node_ids: set[str], results: Path | None) -> set[str]:
     """Function-level node ids whose every item passed."""
     if not node_ids:
@@ -107,7 +139,7 @@ def passing(node_ids: set[str], results: Path | None) -> set[str]:
         # Run whole files: one stale node id would abort a node-id run and
         # make every replacement look failed.
         files = sorted({n.split("::", 1)[0] for n in node_ids if (TESTS_BASE / n.split("::", 1)[0]).exists()})
-        subprocess.run(cmd + files, cwd=TESTS_BASE, stdout=subprocess.DEVNULL, check=False)
+        subprocess.run(cmd + files, cwd=TESTS_BASE, env=replacement_env(), stdout=subprocess.DEVNULL, check=False)
     outcome: dict[str, bool] = {}
     cases = list(ET.parse(results).iter("testcase"))
     if not cases:

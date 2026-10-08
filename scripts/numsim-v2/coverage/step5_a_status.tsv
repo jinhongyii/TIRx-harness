@@ -13,7 +13,7 @@ tests/analysis_tools/shared/test_native_dynamic_launch.py::test_checker_binds_ru
 tests/analysis_tools/shared/test_native_predicated_reduction.py::test_checker_models_predicated_global_reduction	public	pass	retired-wave4	checkers
 tests/analysis_tools/shared/test_native_shared_descriptor_table.py::test_checker_follows_matrix_descriptor_through_raw_shared_table	public	pass	retired-wave4	checkers
 tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime	public	other-assertion:delta+pin-internals	retired-wave4	
-tests/analysis_tools/synccheck/runtime/test_device_payload_ops.py::test_payload_runtime	internal	lowering-rejects	retired-wave4	analyze,call_op_names
+tests/analysis_tools/synccheck/runtime/test_device_payload_ops.py::test_payload_runtime	internal	lowering-rejects	retired-wave4	analyze,call_op_names,call_op_names <- tests/numsim/support/manifest.py::call_op_names
 tests/analysis_tools/synccheck/runtime/test_device_protocol_ops.py::test_protocol_runtime	internal	other-assertion	retired-wave4	analyze
 tests/analysis_tools/synccheck/test_native_gate_intrinsics.py::test_native_synccheck_accepts_scalar_gate_intrinsics	internal	pass	retired-wave4	synccheck
 tests/analysis_tools/synccheck/test_reported_tool_regressions.py::test_reported_instruction_support	public	pass	flip	
@@ -196,12 +196,10 @@ tests/numsim/integration/test_memory_artifact.py::test_partitioned_integer_addre
 tests/numsim/integration/test_memory_artifact.py::test_plain_global_buffer_poll_uses_general_time_slice	internal	pin-internals	retired-wave4	
 tests/numsim/integration/test_memory_artifact.py::test_st_bulk_executes_independently_for_every_active_lane	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_memory_artifact.py::test_unused_out_of_bounds_shared_view_has_no_memory_effect	internal	pass	flip-after-import-fix	
-tests/numsim/integration/test_memory_plan.py::test_all_declared_tmem_views_share_one_physical_backing	public	pass	flip	
-tests/numsim/integration/test_memory_plan.py::test_conflicting_pool_capacity_attrs_fail_closed	public	pass	flip	
+tests/numsim/integration/test_memory_plan.py::test_conflicting_pool_capacity_attrs_fail_closed	public	pass	retired-wave4	emitted_module <- tests/numsim/support/manifest.py::emitted_module
 tests/numsim/integration/test_memory_plan.py::test_dynamic_view_scope_annotation_does_not_reclassify_address_bits	public	pass	flip	
 tests/numsim/integration/test_memory_plan.py::test_evaluated_buffer_data_projection_is_a_structural_noop	public	pass	flip	
-tests/numsim/integration/test_memory_plan.py::test_malformed_pool_capacity_attr_fails_closed	public	pass	flip	
-tests/numsim/integration/test_memory_plan.py::test_mapa_source_in_a_nominal_global_declbuffer_keeps_runtime_address_resolution	public	pass	flip	
+tests/numsim/integration/test_memory_plan.py::test_malformed_pool_capacity_attr_fails_closed	public	pass	retired-wave4	emitted_module <- tests/numsim/support/manifest.py::emitted_module
 tests/numsim/integration/test_mismatch_diagnostics.py::test_injected_mismatch_reports_buffer_index_and_values	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_multi_kernel_artifact.py::test_cross_phase_sharing_requires_the_same_explicit_backing	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_multi_kernel_artifact.py::test_multi_kernel_pointer_parameters_are_phase_qualified	internal	pin-internals	retired-wave4	
@@ -336,9 +334,10 @@ tests/numsim/integration/test_written_buffer_inference.py::test_raw_store_pointe
 tests/numsim/integration/test_written_buffer_inference.py::test_selected_outputs_preserve_all_host_writes	internal	other-assertion	retired-wave4	
 tests/numsim/integration/test_written_buffer_inference.py::test_structured_alias_store_maps_back_to_parameter_owner	internal	pass	flip-after-import-fix	
 tests/numsim/integration/test_written_buffer_inference.py::test_tvm_access_ptr_destination_maps_to_parameter_owner	internal	pass	flip-after-import-fix	
+tests/numsim/microtests/test_cvt_f32_half.py::test_scalar_half_modifiers_match_independent_grid	public	pass	flip	
 tests/numsim/registry/test_bitwise_nodes.py::test_vector_bitwise_nodes_are_rejected	internal	pass	retired-wave4	analyze
-tests/numsim/registry/test_call_resolution.py::test_fetch_register_alias_normalization_is_explicit	internal	pass	retired-wave4	emitted_module
-tests/numsim/registry/test_call_resolution.py::test_frontend_discovers_typed_tensor_map_parameters_from_exact_owners	internal	pass	retired-wave4	TensorMapSpec,analyze,call_op_names
+tests/numsim/registry/test_call_resolution.py::test_fetch_register_alias_normalization_is_explicit	internal	pass	retired-wave4	emitted_module,emitted_module <- tests/numsim/support/manifest.py::emitted_module
+tests/numsim/registry/test_call_resolution.py::test_frontend_discovers_typed_tensor_map_parameters_from_exact_owners	internal	pass	retired-wave4	TensorMapSpec,analyze,call_op_names,call_op_names <- tests/numsim/support/manifest.py::call_op_names
 tests/numsim/registry/test_call_resolution.py::test_frontend_records_typed_implicit_tmem_requirement	internal	pass	retired-wave4	analyze
 tests/numsim/registry/test_call_resolution.py::test_host_abi_rejects_distinct_tensor_map_parameters_with_one_public_name	internal	pass	retired-wave4	HostAbiError,TensorMapSpec,analyze,build_host_abi
 tests/numsim/registry/test_copy_dispatch_contract.py::test_auto_local_to_local_copy_runs_for_every_active_lane	internal	pass	retired-wave4	
@@ -350,7 +349,7 @@ tests/numsim/registry/test_copy_dispatch_contract.py::test_ordinary_copy_dispatc
 tests/numsim/registry/test_copy_dispatch_contract.py::test_same_warp_copy_remaps_lane_owned_values	internal	pass	retired-wave4	
 tests/numsim/registry/test_copy_dispatch_contract.py::test_single_element_local_copy_runs_for_every_active_lane	internal	pass	retired-wave4	
 tests/numsim/registry/test_copy_dispatch_contract.py::test_warpgroup_shared_copy_snapshots_overlap_independent_of_dispatch	internal	pass	retired-wave4	
-tests/numsim/registry/test_ptx_spdecompress_registry.py::test_spdecompress_accepts_each_b32_carrier_without_changing_static_shape	internal	pass	retired-wave4	emitted_calls
+tests/numsim/registry/test_ptx_spdecompress_registry.py::test_spdecompress_accepts_each_b32_carrier_without_changing_static_shape	internal	pass	retired-wave4	emitted_calls,emitted_calls <- tests/numsim/support/manifest.py::emitted_calls
 tests/numsim/registry/test_ptx_spdecompress_registry.py::test_spdecompress_rejects_same_physical_register_through_alias_views	internal	pass	retired-wave4	analyze,emit_rust_module
 tests/numsim/registry/test_ptx_spdecompress_registry.py::test_spdecompress_rejects_unknown_dynamic_register_overlap	internal	pass	retired-wave4	analyze,emit_rust_module
 tests/numsim/runtime/test_approximate_f32_contract.py::test_bf16x2_exp2_executes_both_lanes_and_flushes_bf16_subnormals	public	pass	flip	
@@ -374,7 +373,7 @@ tests/numsim/runtime/test_bitwise_nodes.py::test_bitwise_node_in_static_launch_e
 tests/numsim/runtime/test_bitwise_nodes.py::test_bitwise_nodes_match_integer_oracle	internal	pass	retired-wave4	analyze
 tests/numsim/runtime/test_bitwise_nodes.py::test_boolean_bitwise_nodes_preserve_masks	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_bulk_reduce_s2g_f32.py::test_bulk_reduce_is_atomic_across_ctas_without_lost_updates	internal	pass	flip-after-import-fix	
-tests/numsim/runtime/test_bulk_reduce_s2g_f32.py::test_bulk_reduce_is_atomic_captures_source_and_publishes_only_at_full_wait	internal	other-assertion	retired-wave4	call_op_names
+tests/numsim/runtime/test_bulk_reduce_s2g_f32.py::test_bulk_reduce_is_atomic_captures_source_and_publishes_only_at_full_wait	internal	other-assertion	retired-wave4	call_op_names,call_op_names <- tests/numsim/support/manifest.py::call_op_names
 tests/numsim/runtime/test_bulk_reduce_s2g_f32.py::test_bulk_reduce_preserves_f32_subnormals	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_bulk_reduce_s2g_f32.py::test_bulk_reduce_reads_destination_at_full_completion	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_bulk_reduce_s2g_f32.py::test_bulk_reduce_rejects_invalid_runtime_layout	internal	pass	flip-after-import-fix	
@@ -383,7 +382,7 @@ tests/numsim/runtime/test_byte_copy_vector_store.py::test_vector_store_checks_to
 tests/numsim/runtime/test_byte_copy_vector_store.py::test_vector_store_registry_is_exact	internal	pass	retired-wave4	analyze
 tests/numsim/runtime/test_byte_pointer_view_alias.py::test_byte_pointer_can_form_a_wider_physical_alias	public	pin-internals	retired-wave4	
 tests/numsim/runtime/test_cache_hint_ops.py::test_async_applypriority_bulk_groups_are_visible_to_checkers	internal	pass	retired-wave4	_run_racecheck,_run_synccheck
-tests/numsim/runtime/test_cache_hint_ops.py::test_cache_hint_family_validates_operands_without_changing_memory	internal	other-assertion	retired-wave4	call_op_names
+tests/numsim/runtime/test_cache_hint_ops.py::test_cache_hint_family_validates_operands_without_changing_memory	internal	other-assertion	retired-wave4	call_op_names,call_op_names <- tests/numsim/support/manifest.py::call_op_names
 tests/numsim/runtime/test_cache_hint_ops.py::test_scalar_cache_hint_runtime_contracts_reach_the_engine	internal	pass	retired-wave4	
 tests/numsim/runtime/test_cache_hint_ops.py::test_tensor_map_selector_accepts_independent_lane_hint_descriptors	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_cache_hint_ops.py::test_valid_address_prefetch_checks_only_predicate_selected_lanes	internal	pass	retired-wave4	
@@ -528,7 +527,7 @@ tests/numsim/runtime/test_memory_ops.py::test_ptx_vector_f32_atomic_add_uses_sca
 tests/numsim/runtime/test_memory_ops.py::test_raw_tma_gather4_bar_address_and_prefetch	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_memory_ops.py::test_raw_tma_reduce_bfloat16_uses_plain_logical_dtype_array	internal	other-assertion	retired-wave4	prepare_bindings
 tests/numsim/runtime/test_memory_ops.py::test_raw_tma_reduce_uses_retained_logical_dtype	internal	pass	retired-wave4	prepare_bindings
-tests/numsim/runtime/test_memory_ops.py::test_scalar_atomic_add_has_no_s64_form_while_min_and_max_do	internal	pass	retired-wave4	emitted_calls
+tests/numsim/runtime/test_memory_ops.py::test_scalar_atomic_add_has_no_s64_form_while_min_and_max_do	internal	pass	retired-wave4	emitted_calls,emitted_calls <- tests/numsim/support/manifest.py::emitted_calls
 tests/numsim/runtime/test_memory_sync_coverage.py::test_half_atomic_old_value_preserves_signed_zero_subnormal_and_nan_bits	public	pass	flip	
 tests/numsim/runtime/test_memory_sync_coverage.py::test_half_vector_predicate_alias_is_captured_before_either_result_store	public	pass	flip	
 tests/numsim/runtime/test_memory_sync_coverage.py::test_memory_sync_extensions	public	racecheck-verdict	retired-wave4	
@@ -536,7 +535,7 @@ tests/numsim/runtime/test_mov_forms.py::test_mov_aliased_sources_destinations_an
 tests/numsim/runtime/test_mov_forms.py::test_mov_pointer_identity_masks_and_nulls	public	pass	flip	
 tests/numsim/runtime/test_mxf8_cta2.py::test_raw_mxf8_cta2_m128_checks_ownership_and_values	public	pass	flip	
 tests/numsim/runtime/test_mxf8_cta2.py::test_raw_mxf8_cta2_rejects_invalid_scale_copies	public	pass	flip	
-tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_g2s_cluster_accepts_static_true_predicate_as_unconditional	public	pin-internals	retired-wave4	
+tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_g2s_cluster_accepts_static_true_predicate_as_unconditional	public	pin-internals	retired-wave4	call_op_names <- tests/numsim/support/manifest.py::call_op_names
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_g2s_cluster_false_predicate_does_not_access_uninitialized_barrier	public	pass	flip	
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_g2s_cta_two_issuing_lanes_credit_both_transfers	public	pass	flip	
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_multicast_cta_mask_is_evaluated_per_issuing_lane	public	pass	flip	
@@ -546,7 +545,7 @@ tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_copies_only_
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_dead_bytes_are_zero_filled_and_require_review_if_read	public	pass	flip	
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_rejects_counts_outside_ptx_range	public	pass	flip	
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_mapped_shared_address_rejects_invalid_consumed_bits	public	pass	flip	
-tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_prefetch_preserves_global_memory	public	pin-internals	retired-wave4	
+tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_prefetch_preserves_global_memory	public	pin-internals	retired-wave4	call_op_names <- tests/numsim/support/manifest.py::call_op_names
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_s2c_preserves_mapped_remote_cta_ownership	public	racecheck-verdict	retired-wave4	
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_st_async_preserves_mapped_expression_byte_offset	public	pass	flip	
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_st_bulk_size_is_evaluated_per_issuing_lane	public	pass	flip	
@@ -555,7 +554,7 @@ tests/numsim/runtime/test_ordering_calls.py::test_deleting_setmaxnreg_keeps_the_
 tests/numsim/runtime/test_ordering_calls.py::test_griddep_token_crosses_sequential_kernel_phases	public	pin-internals	retired-wave4	
 tests/numsim/runtime/test_ordering_calls.py::test_ordering_only_calls_preserve_native_source_order	public	pin-internals	retired-wave4	
 tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_accepts_equivalent_requests_from_distinct_branch_sites	public	pass	flip	
-tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_is_an_ordering_call_not_a_tcgen_lifecycle_call	public	engine-stops	retired-wave4	
+tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_is_an_ordering_call_not_a_tcgen_lifecycle_call	public	engine-stops	retired-wave4	emitted_calls <- tests/numsim/support/manifest.py::emitted_calls
 tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_rejects_warp_disagreement_within_one_occurrence	public	pin-message	retired-wave4	
 tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_requires_explicit_warpgroup_sync_before_a_later_call	public	pin-message	retired-wave4	
 tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_static_expressions_follow_public_parser_and_runtime	public	engine-stops	retired-wave4	
@@ -652,7 +651,7 @@ tests/numsim/runtime/test_ptx_spdecompress.py::test_ptx_spdecompress_rejects_met
 tests/numsim/runtime/test_ptx_warp_collectives.py::test_raw_ptx_f32_reductions_match_nan_and_signed_zero_semantics	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_ptx_warp_collectives.py::test_raw_ptx_match_and_activemask_preserve_float_carrier_bits	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_ptx_warp_collectives.py::test_raw_ptx_match_collectives_execute_in_checkers	internal	pass	retired-wave4	_run_racecheck,_run_synccheck
-tests/numsim/runtime/test_ptx_warp_collectives.py::test_raw_ptx_match_redux_and_activemask_match_warp_oracles	internal	other-assertion	retired-wave4	call_op_names
+tests/numsim/runtime/test_ptx_warp_collectives.py::test_raw_ptx_match_redux_and_activemask_match_warp_oracles	internal	other-assertion	retired-wave4	call_op_names,call_op_names <- tests/numsim/support/manifest.py::call_op_names
 tests/numsim/runtime/test_ptx_warp_collectives.py::test_raw_ptx_movmatrix_b16_matches_register_fragment_transpose	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_ptx_warp_collectives.py::test_raw_ptx_shuffle_reads_only_selected_source_lanes	internal	other-assertion	retired-wave4	
 tests/numsim/runtime/test_ptx_warp_collectives.py::test_raw_ptx_vote_accepts_tagged_uint32_predicate_carrier	internal	pass	flip-after-import-fix	
@@ -851,7 +850,7 @@ tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_control_registry_covers_e
 tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_dealloc_non_power_of_two_columns_fail_at_engine	internal	pin-message	retired-wave4	
 tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_dealloc_runtime_proves_lane_local_address_uniform	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_dealloc_runtime_rejects_lane_disagreement	internal	pin-message	retired-wave4	
-tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_fence_forms_are_numerical_noops	internal	pin-internals	retired-wave4	call_op_names
+tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_fence_forms_are_numerical_noops	internal	pin-internals	retired-wave4	call_op_names,call_op_names <- tests/numsim/support/manifest.py::call_op_names
 tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_single_cta_lifecycle_writes_canonical_base	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_tcgen_codegen.py::test_tcgen_two_cta_lifecycle_rendezvous	internal	pin-internals	retired-wave4	
 tests/numsim/runtime/test_tcgen_codegen.py::test_tmem_pool_non_power_of_two_columns_fail_at_engine	internal	pin-message	retired-wave4	
@@ -933,7 +932,7 @@ tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_wide_im2col_per_thread
 tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_prefetch_preserves_memory	public	pass	flip	
 tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_transfer_rejects_only_when_issued	public	pass	flip	
 tests/numsim/runtime/test_tma_multiissuer.py::test_tma_multiissuer_coordinates_and_target_completion	public	pass	flip	
-tests/numsim/runtime/test_tma_overrides.py::test_tma_override_data_and_descriptor_isolation	internal	other-assertion	retired-wave4	call_op_names
+tests/numsim/runtime/test_tma_overrides.py::test_tma_override_data_and_descriptor_isolation	internal	other-assertion	retired-wave4	call_op_names,call_op_names <- tests/numsim/support/manifest.py::call_op_names
 tests/numsim/runtime/test_tma_overrides.py::test_tma_override_predicate_skips_invalid_replacement	internal	pass	flip-after-import-fix	
 tests/numsim/runtime/test_tma_overrides.py::test_tma_override_rejects_invalid_operands	internal	other-assertion	retired-wave4	analyze
 tests/numsim/runtime/test_tma_swizzle96.py::test_swizzle96_documented_layout	public	pass	flip	

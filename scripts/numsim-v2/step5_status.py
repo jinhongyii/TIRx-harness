@@ -142,6 +142,9 @@ def main() -> int:
     internal = junit_status(args.internal)
     cache: dict = {}
     per_file: dict = {}
+    # Cross-module reach (helpers in support modules that import deleted code
+    # inside their bodies); nothing removed or cut: today's tree.
+    tree = retire_legacy.TestTree(set(), {})
     out = []
     for r in a_rows:
         test = r["test_id"]
@@ -152,7 +155,7 @@ def main() -> int:
         if file not in per_file:
             per_file[file] = retire_legacy.legacy_uses_per_test(BASE / file)
         module_level, per_test = per_file[file]
-        used |= per_test.get(func, set()) | module_level
+        used |= per_test.get(func, set()) | module_level | tree.test_uses(file, func)
         fails = [k for k in status.split("+") if k and k not in ("pass", "skip")]
         if category.get(test) == "C":
             step = "delete-C"

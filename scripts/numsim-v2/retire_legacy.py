@@ -57,6 +57,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import retire_tests  # noqa: E402
+import delta_rows  # noqa: E402
 
 PKG = "tirx_harness/src/tirx_harness"
 NUMSIM = f"{PKG}/numsim"
@@ -342,7 +343,53 @@ def _post_deletion_ci(path: Path) -> None:
     subprocess.run(["git", "rm", "-q", str(source.relative_to(REPO))], cwd=REPO, check=True)
 
 
-TRANSFORMS = {"conftest_shim": _conftest_shim, "post_deletion_ci": _post_deletion_ci}
+POST_DELETION_PACKAGING_TEST = '''def test_editable_core_extension_is_copied_to_source(tmp_path, monkeypatch):
+    """Post-deletion setup.py builds only ``numsim_core_py`` (no legacy frontend
+    extension, identity file or tvm-rust-ext licenses); an editable build copies
+    it next to the v2 package."""
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    definitions = runpy.run_path(str(Path(__file__).resolve().parents[2] / "setup.py"))
+    assert "RustBuildExt" not in definitions
+    source = tmp_path / "src"
+    package = source / "tirx_harness" / "numsim" / "v2"
+    package.mkdir(parents=True)
+    extension = Extension("tirx_harness.numsim.v2.numsim_core_py", sources=[], py_limited_api=True)
+    distribution = Distribution({
+        "packages": ["tirx_harness.numsim.v2"],
+        "package_dir": {"": str(source)},
+        "ext_modules": [extension],
+    })
+    command = definitions["CoreBuildExt"](distribution)
+    command.build_lib = str(tmp_path / "build")
+    command.ensure_finalized()
+    library = Path(command.get_ext_fullpath(extension.name))
+    library.parent.mkdir(parents=True)
+    library.write_bytes(b"numsim core")
+
+    # Setuptools' editable build copies extensions from build_lib to src.
+    command.copy_extensions_to_source()
+
+    assert (package / library.name).read_bytes() == library.read_bytes()
+    assert not list(package.parent.glob("_tvm_rust_ext*"))
+'''
+
+
+def _packaging_test(path: Path) -> None:
+    """tests/test_packaging.py: the legacy-frontend copy test becomes the
+    post-deletion check of ``CoreBuildExt`` (W1 rehearsal round 3)."""
+    text = path.read_text()
+    tree = ast.parse(text)
+    node = next(n for n in tree.body if getattr(n, "name", None) == "test_editable_frontend_copies_identity_and_licenses")
+    lines = text.splitlines(keepends=True)
+    lines[node.lineno - 1 : node.end_lineno] = [POST_DELETION_PACKAGING_TEST]
+    text = "".join(lines).replace(
+        "Build commands must carry the native frontend's companion files and the skills.",
+        "Build commands must build the NumSim engine extension and carry the skills.",
+    )
+    path.write_text(text)
+
+
+TRANSFORMS = {"conftest_shim": _conftest_shim, "post_deletion_ci": _post_deletion_ci, "packaging_test": _packaging_test}
 
 
 def rewrites() -> list[Edit]:
@@ -381,17 +428,20 @@ def rewrites() -> list[Edit]:
         Edit(".github/workflows/tests.yml", "replaced by tests.post-deletion.yml with the push/pull_request "
              "triggers restored and its NOT-ACTIVE header dropped (the post-deletion file is removed)",
              transform="post_deletion_ci"),
+        Edit("tirx_harness/tests/test_packaging.py", "the legacy-frontend copy test (RustBuildExt, _tvm_rust_ext "
+             "identity/licenses) becomes the post-deletion CoreBuildExt check", transform="packaging_test"),
         Edit("docs/installation.md", "rewrite the build section: no tvm-rust-ext submodule; `pip install .` builds "
              "numsim_core_py (setup.py) and needs a Rust toolchain", manual=True),
         Edit(".github/workflows/build_wheels.yml", "drop the tvm-rust-ext archive download; wheels build numsim_core_py",
              manual=True),
         Edit("scripts/smoke_wheel.py", "check numsim_core_py instead of the tvm-rust-ext licenses", manual=True),
         Edit("tirx_harness/tests/numsim/support/paths.py", "drop ENGINE_ROOT (engine-rs)", manual=True),
-        Edit("tirx_harness/tests/numsim/support/manifest.py",
-             "delete the legacy-only views (kernel_manifest, resolved_kernel, call_op_names, emitted_calls, "
-             "emitted_module); after the cuts no surviving test calls them (check with --list, section 7)", manual=True),
         Edit(f"{NUMSIM}/CLAUDE.md", "remove the legacy-engine paragraph and the legacy snapshot policy", manual=True),
         Edit(f"{NUMSIM}/AGENTS.md", "mirror CLAUDE.md", manual=True),
+        Edit("STEP5_COMMIT_MSG", "commit the step-5 change with `git commit -F $(git rev-parse --git-path STEP5_COMMIT_MSG)` "
+             "(written by --apply; printed in section 5b): it carries fold_snapshot_deltas.py's `Snapshot-Regen: schema "
+             "fold N delta snapshots ... (rows ...)` trailer and `" + REGEN_TRAILER + "`, so "
+             "`check_snapshot_deltas.py --base HEAD~1` passes; regenerate snapshots before committing", manual=True),
         Edit(".github/workflows/tests.yml", "add `python scripts/numsim-v2/check_snapshot_deltas.py --base origin/main` "
              "(fails when a snapshot changes without a delta row cited in the commit message)", manual=True),
         Edit(f"{NUMSIM}/v2/api.py", "decision: missing bindings report `incomplete` instead of raising InputError [W8]", manual=True),
@@ -708,9 +758,305 @@ def prune_legacy_imports(path: Path) -> None:
     path.write_text("\n".join(lines))
 
 
-def blockers(info: dict[str, str], removed: set[str] | None = None, cut: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
+class TestTree:
+    """Cross-module view of ``tests/`` after the planned removals and cuts.
+
+    W1's rehearsal (round 2) found three things the per-file check missed:
+    helpers imported from a removed test module, support helpers that reach a
+    deleted module lazily (``support.manifest.emitted_module``), and orphaned
+    helpers whose legacy import survived the cut. This index follows names
+    across modules: a name is *bound* when it comes from a deleted legacy
+    module, a removed test module, or a *tainted* name of a surviving module
+    (a top-level def that reaches a bound name); code is *live* when a
+    surviving test, fixture, module-level statement or another module's live
+    import reaches it."""
+
+    def __init__(self, removed: set[str], cut: dict[str, list[str]]):
+        base = retire_tests.TESTS_BASE
+        self.removed = set(removed)
+        self.cut = {rel: set(funcs) for rel, funcs in cut.items()}
+        self.paths = {p.relative_to(base).as_posix(): p for p in (base / "tests").rglob("*.py")}
+        self.trees: dict[str, ast.Module] = {}
+        for rel, path in self.paths.items():
+            try:
+                self.trees[rel] = ast.parse(path.read_text())
+            except SyntaxError:
+                pass
+        self.survivors = sorted(rel for rel in self.trees if rel not in self.removed)
+        self.links = {rel: list(self._imports(rel)) for rel in self.trees}
+        self.tainted: dict[str, set[str]] = {}
+        self.external: dict[str, set[str] | None] = {}
+        for _ in range(20):
+            before = (repr(sorted((k, sorted(v)) for k, v in self.tainted.items())),
+                      repr(sorted((k, sorted(v) if v is not None else None) for k, v in self.external.items())))
+            self.bound = {rel: self._bound(rel) for rel in self.trees}
+            self.live = {rel: self._live(rel) for rel in self.survivors}
+            self.tainted = {rel: self._tainted(rel) for rel in self.survivors}
+            self.external = self._external()
+            after = (repr(sorted((k, sorted(v)) for k, v in self.tainted.items())),
+                     repr(sorted((k, sorted(v) if v is not None else None) for k, v in self.external.items())))
+            if before == after:
+                break
+
+    # -- import resolution -------------------------------------------------
+    def _file(self, stem: str) -> str | None:
+        for candidate in (f"{stem}.py", f"{stem}/__init__.py"):
+            if candidate in self.paths:
+                return candidate
+        return None
+
+    def _imports(self, rel: str):
+        """(node, bound name, target module file, attribute or None for a module import)."""
+        package = Path(rel).parent.as_posix().split("/")
+        for node in ast.walk(self.trees[rel]):
+            if isinstance(node, ast.ImportFrom):
+                if node.level:
+                    parent = package[: len(package) - (node.level - 1)]
+                    stem = "/".join(parent + (node.module.split(".") if node.module else []))
+                elif node.module and (node.module == "tests" or node.module.startswith("tests.")):
+                    stem = node.module.replace(".", "/")
+                else:
+                    continue
+                for alias in node.names:
+                    sub = self._file(f"{stem}/{alias.name}")
+                    if sub:
+                        yield node, alias.asname or alias.name, sub, None
+                    elif (target := self._file(stem)):
+                        yield node, alias.asname or alias.name, target, alias.name
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("tests.") and (target := self._file(alias.name.replace(".", "/"))):
+                        yield node, (alias.asname or alias.name).split(".")[0], target, None
+
+    # -- per-module facts ----------------------------------------------------
+    def _bound(self, rel: str) -> dict[str, str]:
+        """Bound name -> why (deleted module / removed or tainted test name)."""
+        bound, _ = legacy_import_uses(self.paths[rel], set())
+        out = {name: module for name, module in bound.items()}
+        for _, name, target, attr in self.links.get(rel, ()):
+            if target in self.removed:
+                out[name] = f"{target} (removed)"
+            elif attr is not None and attr in self.tainted.get(target, ()):
+                out[name] = f"{target}::{attr}"
+        return out
+
+    def _defs(self, rel: str) -> dict[str, ast.AST]:
+        """Top-level functions, non-Test classes, and simple module-level
+        assignments (``NAME = ...``): reached by name, so an import-time
+        constant that only cut tests use is dead (and deletable) too."""
+        out: dict[str, ast.AST] = {}
+        for n in self.trees[rel].body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) or (
+                isinstance(n, ast.ClassDef) and not n.name.startswith("Test")
+            ):
+                out[n.name] = n
+            elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                if targets and all(isinstance(t, ast.Name) for t in targets):
+                    for t in targets:
+                        out[t.id] = n
+        return out
+
+    def _reach(self, rel: str, roots: list[ast.AST]) -> tuple[set[str], set[str]]:
+        """(defs reached, bound names used) from ``roots``."""
+        defs, bound = self._defs(rel), self.bound[rel]
+        seen: set[str] = set()
+        used: set[str] = set()
+        todo = list(roots)
+        while todo:
+            node = todo.pop()
+            for sub in ast.walk(node):
+                name = sub.id if isinstance(sub, ast.Name) else sub.arg if isinstance(sub, ast.arg) else None
+                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
+                    name = sub.value.id
+                if name is None:
+                    continue
+                if name in bound:
+                    used.add(name)
+                if name in defs and name not in seen:
+                    seen.add(name)
+                    todo.append(defs[name])
+        return seen, used
+
+    def _roots(self, rel: str) -> list[ast.AST]:
+        tree, cut = self.trees[rel], self.cut.get(rel, set())
+        external = self.external.get(rel, set())
+        conftest = Path(rel).name == "conftest.py"
+        roots: list[ast.AST] = []
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Outside conftest.py a fixture is live only through a live test's
+                # argument (reached by name) unless it is autouse.
+                decorated = any(("fixture" in ast.unparse(d) and "autouse=True" in ast.unparse(d))
+                                or "hookimpl" in ast.unparse(d) for d in node.decorator_list)
+                if ((node.name.startswith("test_") and node.name not in cut) or decorated or conftest
+                        or node.name.startswith("pytest_") or external is None or node.name in external):
+                    roots.append(node)
+            elif isinstance(node, ast.ClassDef):
+                if node.name.startswith("Test"):
+                    roots += [s for s in node.body if not (isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                                           and f"{node.name}::{s.name}" in cut)]
+                elif conftest or external is None or node.name in external:
+                    roots.append(node)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and all(
+                isinstance(t, ast.Name) for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            ):
+                names = [t.id for t in (node.targets if isinstance(node, ast.Assign) else [node.target])]
+                if conftest or external is None or any(n in external or n.startswith("__") or n == "pytestmark" for n in names):
+                    roots.append(node)
+            else:
+                roots.append(node)  # other module-level statements run at import
+        return roots
+
+    def _live(self, rel: str) -> tuple[set[str], set[str]]:
+        return self._reach(rel, self._roots(rel))
+
+    def _tainted(self, rel: str) -> set[str]:
+        bound = self.bound[rel]
+        if not bound:
+            return set()
+        out = {name for name in bound if any(  # module-level re-exports
+            isinstance(n, (ast.Import, ast.ImportFrom)) and name in {(a.asname or a.name).split(".")[0] for a in n.names}
+            for n in self.trees[rel].body)}
+        for name, node in self._defs(rel).items():
+            if self._reach(rel, [node])[1]:
+                out.add(name)
+        return out
+
+    def _external(self) -> dict[str, set[str] | None]:
+        out: dict[str, set[str] | None] = {}
+        for rel in self.survivors:
+            _, used_bound = self.live[rel]
+            live_names = self._live_names(rel)
+            for _, name, target, attr in self.links[rel]:
+                if name not in live_names:
+                    continue  # pruned with the dead code that used it
+                if attr is None:
+                    out[target] = None
+                elif out.get(target, set()) is not None:
+                    out.setdefault(target, set()).add(attr)
+        return out
+
+    def _live_names(self, rel: str) -> set[str]:
+        names: set[str] = set()
+        for node in self._roots(rel) + [self._defs(rel)[d] for d in self.live[rel][0]]:
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+        return names
+
+    def test_uses(self, rel: str, test: str) -> set[str]:
+        """Bound names one test reaches, including helpers imported from other
+        modules that reach deleted code lazily (W1: test_memory_plan's
+        ``emitted_module``)."""
+        tree = self.trees.get(rel)
+        if tree is None or not self.bound.get(rel):
+            return set()
+        cls, _, name = test.rpartition("::")
+        for node in tree.body:
+            if cls and isinstance(node, ast.ClassDef) and node.name == cls:
+                node = next((s for s in node.body if getattr(s, "name", None) == name), None)
+                break
+            if not cls and getattr(node, "name", None) == name:
+                break
+        else:
+            return set()
+        if node is None:
+            return set()
+        used = self._reach(rel, [node])[1]
+        return {n if "/" not in self.bound[rel][n] else f"{n} <- {self.bound[rel][n]}" for n in used}
+
+    # -- results ------------------------------------------------------------
+    def broken(self) -> list[str]:
+        """Surviving modules whose live code uses a bound name."""
+        out = []
+        for rel in self.survivors:
+            used = self.live[rel][1]
+            if used:
+                why = sorted(f"{n} <- {self.bound[rel][n]}" if "/" in self.bound[rel][n] else n for n in used)
+                out.append(f"{rel}  ({', '.join(why)})")
+        return out
+
+    def imported_removed(self) -> set[str]:
+        """Removed test modules that live code of a survivor still imports."""
+        return {t for t in self.external if t in self.removed}
+
+    def dead_tainted(self, rel: str) -> set[str]:
+        """Top-level defs no live code reaches that reach a bound name (deleted by --apply)."""
+        roots = self._roots(rel)
+        defs = self._defs(rel)
+        live_defs = self.live[rel][0] | {name for name, node in defs.items() if any(node is r for r in roots)}
+        return {
+            name for name in self.tainted.get(rel, set())
+            if name in defs and name not in live_defs and not name.startswith("test_")  # cut tests go with the cut
+        }
+
+
+def delete_defs(path: Path, names: set[str]) -> None:
+    """Delete top-level defs (with decorators and the blank lines after them)."""
+    if not names:
+        return
+    tree = ast.parse(path.read_text())
+    lines = path.read_text().splitlines(keepends=True)
+    def named(n: ast.AST) -> set[str]:
+        if isinstance(n, ast.Assign):
+            return {t.id for t in n.targets if isinstance(t, ast.Name)}
+        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            return {n.target.id}
+        return {getattr(n, "name", None)}
+
+    spans = [
+        (min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])]), n.end_lineno)
+        for n in tree.body if named(n) & names
+    ]
+    for first, last in sorted(spans, reverse=True):
+        while last < len(lines) and not lines[last].strip():
+            last += 1
+        del lines[first - 1 : last]
+    path.write_text("".join(lines))
+
+
+def prune_imports(path: Path, names: set[str]) -> None:
+    """Drop imports binding ``names`` that the file no longer references (any
+    scope); a block left empty gets ``pass``."""
+    if not names:
+        return
+    source = path.read_text()
+    tree = ast.parse(source)
+    referenced = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    unused = {name for name in names if name not in referenced}
+    if not unused:
+        return
+    lines = source.split("\n")
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    for node in sorted(ast.walk(tree), key=lambda n: -getattr(n, "lineno", 0)):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        drop = [a for a in node.names if (a.asname or a.name).split(".")[0] in unused or (a.asname or a.name) in unused]
+        if not drop:
+            continue
+        line = lines[node.lineno - 1]
+        indent = line[: len(line) - len(line.lstrip())]
+        if len(drop) == len(node.names):
+            parent = parents.get(node)
+            body = getattr(parent, "body", None) if parent is not None else None
+            only = isinstance(body, list) and len(body) == 1 and body[0] is node and not isinstance(parent, ast.Module)
+            lines[node.lineno - 1 : node.end_lineno] = [indent + "pass"] if only else []
+        else:
+            keep = [a for a in node.names if a not in drop]
+            text = ", ".join(a.name + (f" as {a.asname}" if a.asname else "") for a in keep)
+            head = f"from {'.' * node.level}{node.module or ''} import " if isinstance(node, ast.ImportFrom) else "import "
+            lines[node.lineno - 1 : node.end_lineno] = [indent + head + text]
+    path.write_text("\n".join(lines))
+
+
+def blockers(info: dict[str, str], removed: set[str] | None = None, cut: dict[str, list[str]] | None = None,
+             tree: "TestTree | None" = None) -> dict[str, list[str]]:
     out: dict[str, list[str]] = collections.defaultdict(list)
-    for entry in broken_imports(removed or set(), cut):
+    tree = tree or TestTree(removed or set(), cut or {})
+    for entry in tree.broken():
         # tests/conftest.py's legacy ExecutionSubset import sits inside the
         # NUMSIM_IMPL block that the automated _conftest_shim rewrite deletes.
         if entry.startswith("tests/conftest.py ") and "_LegacyExecutionSubset" in entry:
@@ -728,6 +1074,49 @@ def blockers(info: dict[str, str], removed: set[str] | None = None, cut: dict[st
 
 
 # ----------------------------------------------------------------------------
+
+
+REGEN_TRAILER = "Snapshot-Regen: schema relax_unanchored projection"
+
+
+def folded_deltas(paths: list[str]) -> tuple[list[tuple[str, str, list[str]]], list[str]]:
+    """(case, mode, qualified rows) per delta snapshot, and the ones citing no
+    known row. Same rule as ``fold_snapshot_deltas.py``."""
+    ids = delta_rows.row_ids()
+    folded, unjustified = [], []
+    for rel in paths:
+        path = REPO / rel
+        case, mode = path.parent.name, path.name[: -len(".delta.json")]
+        citations = delta_rows.parse(str(json.loads(path.read_text()).get("delta", "")), ids)
+        if citations.ok and path.with_name(f"{mode}.json").exists():
+            folded.append((case, mode, sorted(citations.qualified)))
+        else:
+            unjustified.append(rel)
+    return folded, unjustified
+
+
+def commit_message(plan: "Plan") -> str:
+    """The step-5 commit message. ``check_snapshot_deltas.py`` (CI) accepts a
+    snapshot change only with a cited row or a ``Snapshot-Regen: schema``
+    trailer: the fold trailer is ``fold_snapshot_deltas.py``'s, and the
+    regeneration trailer covers the bases that matched only through
+    relax_unanchored (section 4)."""
+    folded, _ = folded_deltas(plan.delta_snapshots)
+    rows = sorted({r for _, _, cited in folded for r in cited})
+    lines = [
+        "Step 5: delete the legacy NumSim engine; v2 is the implementation and the conformance oracle",
+        "",
+        f"retire_legacy.py --apply: {count_files(plan.remove)} legacy files, "
+        f"{len(plan.whole_tests)} test files removed and {sum(map(len, plan.cut_tests.values()))} "
+        f"test functions cut, {len(plan.tooling)} migration tools.",
+        "",
+        "Folded delta snapshots:",
+        *[f"- {case}/{mode}: {', '.join(cited)}" for case, mode, cited in folded],
+        "",
+        f"Snapshot-Regen: schema fold {len(folded)} delta snapshots into the v2 oracle (rows {', '.join(rows)})",
+        REGEN_TRAILER,
+    ]
+    return "\n".join(lines) + "\n"
 
 
 ENV_HELPER = '''def _env(name: str, default: str = "") -> str:
@@ -748,6 +1137,9 @@ class Plan:
     markers: list[tuple[str, int, str, str]] = field(default_factory=list)
     tooling: list[str] = field(default_factory=list)
     tooling_decide: list[str] = field(default_factory=list)
+    kept_imported: list[str] = field(default_factory=list)  # all tests retired, helpers still imported
+    dead_helpers: dict[str, list[str]] = field(default_factory=dict)
+    prune_names: dict[str, list[str]] = field(default_factory=dict)
     delta_snapshots: list[str] = field(default_factory=list)
     env_files: list[str] = field(default_factory=list)
     blockers: dict[str, list[str]] = field(default_factory=dict)
@@ -786,7 +1178,26 @@ def build(waves: list[str], results: Path | None) -> Plan:
     plan.relocate = {s: d for s, d in RELOCATE.items() if (REPO / s).exists() and not (REPO / d).exists()}
     ids, info = retired_tests(waves, results)
     plan.whole_tests, plan.cut_tests = plan_tests(ids)
-    plan.support = orphaned_support(set(plan.whole_tests))
+    while True:
+        plan.support = orphaned_support(set(plan.whole_tests))
+        tree = TestTree(set(plan.whole_tests) | set(plan.support), plan.cut_tests)
+        # A test module whose tests all retire but whose helpers a surviving
+        # module still imports is kept with every test cut (W1 rehearsal).
+        keep = sorted(tree.imported_removed() & set(plan.whole_tests))
+        if not keep:
+            break
+        for rel in keep:
+            plan.whole_tests.remove(rel)
+            plan.kept_imported.append(rel)
+            spans = retire_tests.test_functions(retire_tests.TESTS_BASE / rel)
+            plan.cut_tests[rel] = sorted(spans, key=lambda f: spans[f][0])
+    plan.kept_imported.sort()
+    for rel in tree.survivors:
+        dead = tree.dead_tainted(rel)
+        if dead:
+            plan.dead_helpers[rel] = sorted(dead)
+        if tree.bound.get(rel):
+            plan.prune_names[rel] = sorted(tree.bound[rel])
     plan.edits = rewrites()
     for edit in plan.edits:
         if edit.path.endswith("v2/_compare.py"):
@@ -815,10 +1226,13 @@ def build(waves: list[str], results: Path | None) -> Plan:
     # v2.transpile), inventory.py, walk.py, lower_sweep.py,
     # check_snapshot_deltas.py; record_race_fixtures.py already lives in numsim-core/examples (W5).
     plan.tooling_decide = []
-    plan.blockers = blockers(info, set(plan.whole_tests) | set(plan.support), plan.cut_tests)
+    plan.blockers = blockers(info, set(plan.whole_tests) | set(plan.support), plan.cut_tests, tree)
     plan.delta_snapshots = sorted(
         p.relative_to(REPO).as_posix() for p in (REPO / "tirx_harness/tests/conformance/snapshots").glob("*/*.delta.json")
     )
+    unjustified = folded_deltas(plan.delta_snapshots)[1]
+    if unjustified:
+        plan.blockers["delta snapshot cites no known delta row (check_snapshot_deltas.py would fail)"] = unjustified
     plan.env_files = sorted(
         rel for rel in tracked(".")
         if rel.endswith((".py", ".md", ".yml", ".sh", ".toml"))
@@ -866,6 +1280,12 @@ def show(plan: Plan, listing: bool) -> None:
                 print(f"cut    tirx_harness/{f}::{func}")
     for f in plan.support:
         print(f"git rm tirx_harness/{f}    # orphaned support")
+    print(f"# {len(plan.kept_imported)} test modules kept with every test cut (a surviving module imports their helpers)")
+    for f in plan.kept_imported:
+        print(f"keep   tirx_harness/{f}")
+    print(f"# {sum(map(len, plan.dead_helpers.values()))} unreachable helpers that reach deleted code, deleted with their imports")
+    for f, names in plan.dead_helpers.items():
+        print(f"prune  tirx_harness/{f}: {', '.join(names)}")
 
     section("4. rewrites")
     for edit in plan.edits:
@@ -886,6 +1306,9 @@ def show(plan: Plan, listing: bool) -> None:
     print(f"# fold {len(plan.delta_snapshots)} delta snapshots into their base snapshots:")
     for path in plan.delta_snapshots:
         print(f"fold   {path}")
+    print("# commit message (--apply writes it to $(git rev-parse --git-path STEP5_COMMIT_MSG)):")
+    for line in commit_message(plan).splitlines():
+        print(f"msg    {line}")
     print(f"# NUMSIM_V2_* -> NUMSIM_* in {len(plan.env_files)} files (options.py keeps the aliases)")
     for path in plan.env_files:
         print(f"rename {path}")
@@ -907,6 +1330,10 @@ def show(plan: Plan, listing: bool) -> None:
 
 
 def apply(plan: Plan) -> None:
+    message_path = Path(subprocess.run(["git", "rev-parse", "--git-path", "STEP5_COMMIT_MSG"], cwd=REPO,
+                                       check=True, capture_output=True, text=True).stdout.strip())
+    message_path = message_path if message_path.is_absolute() else REPO / message_path
+    message_path.write_text(commit_message(plan))  # before the fold removes the delta files
     for src, dst in plan.relocate.items():
         if (REPO / dst).exists():
             continue  # already moved (e.g. generated in oplib); the source goes with its tree
@@ -921,6 +1348,11 @@ def apply(plan: Plan) -> None:
     subprocess.run(["git", "rm", "-q", *[f"tirx_harness/{f}" for f in plan.whole_tests + plan.support]], cwd=REPO, check=True)
     for file, funcs in plan.cut_tests.items():
         retire_tests.cut(retire_tests.TESTS_BASE / file, funcs)
+    for rel, names in plan.dead_helpers.items():
+        delete_defs(retire_tests.TESTS_BASE / rel, set(names))
+    for rel, names in plan.prune_names.items():
+        if (retire_tests.TESTS_BASE / rel).exists():
+            prune_imports(retire_tests.TESTS_BASE / rel, set(names))
     for path in (retire_tests.TESTS_BASE / "tests").rglob("*.py"):
         prune_legacy_imports(path)
     for path, line in plan.doc_lines:
@@ -950,7 +1382,8 @@ def apply(plan: Plan) -> None:
             text = text.replace("NUMSIM_V2_", "NUMSIM_")
         target.write_text(text)
     subprocess.run(["git", "rm", "-r", "-q", *plan.tooling], cwd=REPO, check=True)
-    print("applied; now do the `manual` items, rebuild numsim_core_py, run the suite and conformance", file=sys.stderr)
+    print("applied; now do the `manual` items, rebuild numsim_core_py, run the suite and conformance, then "
+          f"`git commit -F {message_path}` (its trailers satisfy check_snapshot_deltas.py)", file=sys.stderr)
 
 
 def main() -> int:
