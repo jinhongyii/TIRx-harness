@@ -33,3 +33,4 @@ fn descriptor_war_is_ordered_by_hb() {
     k.st(1, 0, GMEM2, 0..128);
     assert!(has_race(&k.run()));
 }
+

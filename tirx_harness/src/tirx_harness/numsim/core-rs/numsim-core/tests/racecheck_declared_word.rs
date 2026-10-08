@@ -189,3 +189,24 @@ fn predicate_reading_memory() {
     let r = pred_reads(false);
     assert!(r.incomplete.iter().any(|i| matches!(i, Incomplete::WaitPredicateReadsUnstable { .. })));
 }
+
+/// W7 (mega_moe workspace grid sync): a reused grid-sync counter accepts
+/// stale values of an earlier round (the predicate compares one bit). The
+/// waiter cannot read a value coherence-before its own add (CoWR), so the
+/// accepted entry is the earliest at or after its own write.
+#[test]
+fn accepted_entry_not_before_own_write() {
+    let run = |accepted: u64| {
+        let mut k = K::new(1, 1, 3);
+        k.declare(GMEM2, FLAG);
+        k.a(2, 0, atom(MemOrder::Relaxed, Scope::Gpu), GMEM2, FLAG); // entry 1 (earlier round, accepted)
+        k.st(0, 0, GMEM, 0..4);
+        k.a(0, 0, atom(MemOrder::Release, Scope::Gpu), GMEM2, FLAG); // entry 2
+        k.a(1, 0, atom(MemOrder::Release, Scope::Gpu), GMEM2, FLAG); // entry 3: own add
+        k.a(2, 0, atom(MemOrder::Release, Scope::Gpu), GMEM2, FLAG); // entry 4: completes the round
+        k.wait_until(1, 0, GMEM2, FLAG, Scope::Gpu, accepted, 4).ld(1, 0, GMEM, 0..4);
+        k.run()
+    };
+    assert!(clean(&run(0b1_0010)), "{:?}", run(0b1_0010));
+}
+

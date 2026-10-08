@@ -482,9 +482,12 @@ struct Word {
     history: Vec<HistEntry>,
     /// Last `(access seq, lane)` appended (one entry per lane per Access).
     last: Option<(u64, u8)>,
+    /// Per (warp, lane): history index (1-based) of its own latest write.
+    /// Coherence (CoWR): a later read of that thread cannot read from an
+    /// earlier entry, so a wait's accepted entry is at least this one.
+    own: HashMap<(WarpId, u8), u32>,
 }
 
-/// Who performs the access being checked.
 /// One segment of the alias tracker: `[start, end)` last written through
 /// logical name `buf` by `w` (warp `warp`, site `site`).
 #[derive(Clone)]
@@ -497,6 +500,7 @@ struct AliasSeg {
 }
 
 #[derive(Clone, Copy)]
+/// Who performs the access being checked.
 enum Cur {
     Lane { w: usize, lane: u8, epoch: Epoch },
     Async { a: usize },
@@ -1392,6 +1396,9 @@ impl Checker {
                 if word.last != Some((a.seq, lane)) {
                     word.last = Some((a.seq, lane));
                     word.history.push(HistEntry { rel, is_async, consumed: false, mixed_size });
+                    if let Cur::Lane { w: wi, lane, .. } = cur {
+                        word.own.insert((wi as WarpId, lane), word.history.len() as u32);
+                    }
                 }
             }
         }
@@ -1576,7 +1583,7 @@ impl Checker {
             SyncEvent::DeclareWord { alloc, range } => {
                 let ws = self.words.entry(alloc).or_default();
                 if !ws.iter().any(|w| w.range == range) {
-                    ws.push(Word { range, history: Vec::new(), last: None });
+                    ws.push(Word { range, history: Vec::new(), last: None, own: HashMap::new() });
                 }
             }
             SyncEvent::WarpSync { warp, mask, epoch } => {
@@ -2192,12 +2199,30 @@ impl Checker {
 
     #[allow(clippy::too_many_arguments)]
     fn wait_verdicts(&mut self, warp: WarpId, lanes: LaneMask, alloc: AllocId, range: Range<u64>, scope: Scope, accepted: &[u64], observed: u32, site: SiteId) {
-        let Some(wi) = self.words.get(&alloc).and_then(|ws| ws.iter().position(|w| w.range == range)) else {
+        let exact = self.words.get(&alloc).and_then(|ws| ws.iter().position(|w| w.range == range));
+        // A declared region polled element by element (a `sync_words`
+        // buffer declared whole): the launch value needs no history.
+        let within = self.words.get(&alloc).and_then(|ws| ws.iter().position(|w| w.range.start <= range.start && range.end <= w.range.end));
+        let Some(wi) = exact.or(within) else {
             self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
         };
-        // Earliest predicate-accepted history entry: schedule independent.
-        let first = accepted.iter().enumerate().find(|(_, b)| **b != 0).map(|(i, b)| i as u32 * 64 + b.trailing_zeros());
+        if exact.is_none() {
+            if accepted.first().is_some_and(|b| b & 1 != 0) {
+                return; // the launch value satisfied the predicate: no edge owed
+            }
+            self.note_incomplete(Incomplete::WaitExitUnproven { warp });
+            return;
+        }
+        // Earliest predicate-accepted history entry: schedule independent,
+        // but never coherence-before the waiting lanes' own latest write of
+        // the word (CoWR; deltas W7): a grid-sync counter accepts stale
+        // values of earlier rounds that the waiter can no longer read.
+        let floor = self.words[&alloc][wi].own.iter().filter(|((w, l), _)| *w == warp && lanes.has(*l)).map(|(_, i)| *i).max().unwrap_or(0);
+        // If no accepted entry is at or after it (the predicate's history
+        // view is coarser than the waiter's own writes), keep the earliest.
+        let all = || accepted.iter().enumerate().flat_map(|(i, b)| (0..64u32).filter(move |k| b >> k & 1 != 0).map(move |k| i as u32 * 64 + k));
+        let first = all().find(|idx| *idx >= floor).or_else(|| all().next());
         let Some(mut idx) = first else {
             self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;

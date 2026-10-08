@@ -2339,3 +2339,41 @@ V2C-39 resolved (2026-10-08, at 72c7908): with the non-aligned partial-warp
 `barrier.sync` gather (e75fbb0, 5241a22), `sparse_flashmla_decode_head64`
 matches legacy in numsim, racecheck and synccheck. There was no delta
 snapshot for it to remove; sync-behaviour-deltas B1/B2 are updated.
+
+## W9-public-API (2026-10-08): other-assertion triage
+
+Bugs found while triaging the 17 public-API legacy functions that fail under
+`NUMSIM_IMPL=v2` with an "other assertion" (full table:
+`scripts/numsim-v2/coverage/other_assertion_triage.tsv`). Not ported; each legacy
+test stays until the owner fixes v2 (or rules it a delta).
+
+- **[W2] interp, `discard` alignment.** `tests/numsim/runtime/test_discard.py::test_discard_indeterminate_read_and_alignment`. `T.ptx.discard.global_.L2(data.ptr_to([1]))` (address = buffer base + 4, base is 4096-aligned since V2C-35) is accepted: synccheck and racecheck give verdict `review` (only `uninitialized_read` of `data` bytes [128, 132), i.e. v2 discarded [4, 132)), and NumSim runs. Expected: verdict `error` with "discard requires a 128-byte aligned address" (legacy `engine-rs/src/runtime/instructions/mem.rs:2654`; `discard.L2 [a], 128` operates on a 128-byte line). `interp/handlers/mem.rs::discard` resolves the span but never checks `addr % 128`. The `restore=False` half of the test (review on reading discarded bytes, W8-5) already passes.
+- **[W2] interp, `st.bulk` size validation.** `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_st_bulk_size_is_evaluated_per_issuing_lane`. With `size=1` (lane 0 stores 1 byte, lane 1 stores 2 bytes) synccheck and racecheck are `clean` and NumSim runs, for all four size dtypes. Expected: `error` / `ExecutionError` "st.bulk byte count 1 must be a multiple of 8 with maximum 16777216 on lane 0" (legacy `engine-rs/src/runtime/memory_ops.rs:505-509`; PTX `st.bulk` size is a multiple of 8). The other invalid sizes (-8, 16777224, 4294967304) are rejected, but only as `out_of_bounds` against the 32-byte buffer, not by a size check: `interp/handlers/mem.rs::st_bulk` has no size (multiple of 8, <= 16 MiB, non-negative) or 8-byte address-alignment check.
+- **[W2] interp, `isspacep.shared::cta` ignores the CTA rank.** `tests/numsim/runtime/test_memory_sync_coverage.py::test_memory_sync_extensions[address_queries-inputs5-expected5]`. Column 5 of `address_queries`: `isspacep.shared::cta` of `mapa.u64(generic_shared_ptr, 1 - cta)` (a peer CTA's window in a 2-CTA cluster) returns 1 on both CTAs; expected 0 (legacy; the address is in the cluster window, not the executing CTA's `shared::cta` window). Column 6 (`mapa` to the own rank) correctly returns 1. `interp/handlers/mem.rs::isspacep` maps `AddrSpace::Shared` and `AddrSpace::SharedCluster` to the same `Generic::Shared(_)` test; `.shared::cta` must also require `decode_shared(..).rank == own rank`.
+- **[W2] arena::addr (coordinator ruling still open), generic shared aperture bits.** `tests/numsim/runtime/test_scalar_control.py::test_mapa_and_cvta_expose_the_device_validated_integer_bits`. `addresses64[..., 2]` (generic `mapa.u64` of the peer's shared address): v2 0x00007F00_01000000 | off (139637993504768 + off for CTA 0), expected the device-validated 0x0000FFFE_01000000 | off (281466403553280 + off). The 32-bit columns and the other 64-bit columns match. Cause: `GENERIC_SHARED_BASE` (W2-2) is a synthetic 0x7F00_0000_0000, not the hardware window base 0xFFFE_0000_0000. The "Public-API triage (W8)" entry above asked the coordinator for an `arena::addr` ruling on synthetic address bits; there is still none, so this stays a bug until the base is changed or a delta row is written.
+
+## W5-13 (for W2, 2026-10-08): two event-shape bugs from the public-API racecheck-verdict triage
+
+1. **Multicast `.sync_restrict` commit is not restricted.** In `tcgen_commit`,
+   `restricted = sync_restrict && multicast.is_none()`. A multicast restricted commit
+   (`...sync_restrict::shared::read::mma::a.shared::cluster.multicast::cluster`) therefore
+   tracks the whole MMA and is sent with `restricted: false`. This causes the false
+   negative in `test_restricted_commit_preserves_full_mma_completion[1-True-True]` and
+   `[2-False-True]`. Request: track only the shared-A reads and set
+   `AsyncIssue.restricted = true` for both the multicast and non-multicast forms.
+2. **`tensormap.cp_fenceproxy...sync.aligned` is emitted as 32 sibling-lane writes of
+   the whole 128-byte descriptor.** Each lane's write is followed by one all-lane
+   `TensormapRelease`. Lane 0's later `fence.proxy.tensormap::generic.acquire` cannot
+   cover lanes 1..31's writes (no warp sync between them), so the TMA by lane 0 is a
+   false `missing_proxy_bridge` (`test_tensor_map_predicate_effects`, shared::cta
+   carriers). The instruction is one warp-collective copy plus release. Request: emit the
+   copy as a single write by the first active lane (each lane writing a slice would hit
+   the same problem), followed by the release.
+
+## W5-14 (for W1, 2026-10-08): declare `sync_words` per element
+
+`T.cuda.wait_until` on `state.ptr_to([lane])` declares the whole 128-byte buffer as one
+word (`DeclareWord { span: 0..128 }`), but the verdicts name 4-byte elements. Racecheck now
+accepts a launch-value exit inside a declared region (delta W8). Any other exit on such a
+span is still `WaitExitUnproven`, because the history numbering is per declared word.
+Request: one `DeclareWord` per element, matching the verdict spans.
