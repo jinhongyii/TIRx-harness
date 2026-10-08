@@ -118,6 +118,15 @@ fn clock64(io: &mut PtxIo<'_>) -> OpResult {
     Ok(())
 }
 
+/// SM100 2-SM pair leader address: clear the shared::cluster CTA-rank bit 0
+/// (hardware bit 24; the engine's encoding is the hardware's `rank << 24 |
+/// offset`, `arena::addr::shared_addr`), i.e. the same offset in the even
+/// CTA of the pair (legacy `sm100_tma_2sm_mbarrier_address`).
+fn sm100_2sm_leader_smem_addr(io: &mut PtxIo<'_>) -> OpResult {
+    each_lane!(io, |lane| io.dsts[0][lane] = (io.srcs[0][lane] as u32 & 0xfeff_ffff) as u64);
+    Ok(())
+}
+
 // --- other fixed-signature forms -----------------------------------------------
 
 fn ffs_u32(io: &mut PtxIo<'_>) -> OpResult {
@@ -528,11 +537,7 @@ pub(in crate::oplib) fn resolve(
         "tirx.cuda.tcgen05_encode_instr_descriptor_block_scaled" => {
             encode_instr_descriptor(name, mods, ops, true).map(Some)
         }
-        "tirx.cuda.sm100_2sm_leader_smem_addr" => Err(OpError::unsupported(
-            "tirx.cuda.sm100_2sm_leader_smem_addr: clears the hardware shared::cluster CTA-rank bit 24; \
-             numsim's arena::addr shared::cluster encoding ((rank+1)<<24 | offset) differs, so the \
-             bit trick has no faithful pure-value model",
-        )),
+        "tirx.cuda.sm100_2sm_leader_smem_addr" => direct(sm100_2sm_leader_smem_addr, &[32], &[64]),
         "tirx.cuda.float22half2" | "tirx.cuda.float8tohalf8" | "tirx.cuda.half8tofloat8" => {
             Err(OpError::unsupported(format!(
                 "{name}: pointer-based helper reads/writes memory; not a pure value op (needs a memory lowering)"

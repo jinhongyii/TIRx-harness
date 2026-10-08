@@ -24,6 +24,7 @@
 
 mod clc;
 mod cvt;
+mod func_call;
 mod helpers;
 mod hints;
 mod io;
@@ -75,6 +76,8 @@ pub(super) fn resolve(key: &OpKey, dst_tys: &[Ty], src_tys: &[Ty]) -> OpResult<P
         found
     } else if let Some(found) = clc::resolve(name, &mods, &ops)? {
         found
+    } else if let Some(found) = func_call::resolve(name, &mods, &ops)? {
+        found
     } else if let Some(found) = helpers::resolve(name, &mods, &ops)? {
         found
     } else if let Some(found) = cvt::resolve(name, &mods, &ops)? {
@@ -102,6 +105,7 @@ pub(in crate::oplib) fn known_ops() -> Vec<&'static str> {
     names.extend_from_slice(vector::NAMES);
     names.extend_from_slice(hints::NAMES);
     names.extend_from_slice(clc::NAMES);
+    names.extend_from_slice(func_call::NAMES);
     names.extend_from_slice(helpers::NAMES);
     names.extend_from_slice(cvt::NAMES);
     names.extend_from_slice(warp::NAMES);

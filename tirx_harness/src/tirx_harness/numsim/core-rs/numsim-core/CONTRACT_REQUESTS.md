@@ -1719,6 +1719,30 @@ in `docs/development/numsim-behaviour-deltas.md`.
   `test_partial_tile_forms::test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs`
   is no longer marked xfail.
 
+## W4-14 (2026-10-08): reviewed `cuda.func_call` helpers (W1 round 2)
+
+`oplib/ptx/func_call.rs` resolves `tirx.cuda.func_call.<name>` for the
+reviewed helpers, using the legacy `emit/cuda_helper.rs` bodies:
+`combine_int_frac_ex2`, `flashkda_fmaf_rn`, `flashkda_rsqrtf`,
+`flashkda_tanh_approx`, `gdn_lg2_approx_ftz`, `shl_u32_clamp`,
+`tvm_builtin_fma_scale_sub_f32x2` and `tvm_builtin_smem_desc_add_16B_offset`.
+
+- A helper resolves only when its `source_sha256` modifier equals the digest
+  in `REVIEWED_HELPERS`, and the carrier widths are exact. Anything else is
+  `Unsupported`, so oplib fails closed as lowering does.
+- `numsim-core/src/oplib/ptx/func_call_tests.rs` has bit-exact tests built
+  from the legacy test vectors.
+
+Open, for W1:
+- `tvm_builtin_cast_{float32x2_float16x2, float16x2_float32x2, ...}` are in
+  `PURE_FUNC_CALLS`, but TVM's `cast_vec2` emits them as
+  `void f(void* dst, void* src)`: they load a packed pair, convert it, and
+  store it. A value op cannot model this; oplib answers `Unsupported`
+  ("pointer-based helper"). Lower them like `float22half2`, with a load, a
+  `Cast` (rn) and a store.
+- `smem_desc_make_lo_uniform` is effectful: a `__shfl_sync` of `lo` from
+  lane 0 through a pointer. Lowering rejects it today.
+
 ## W5-10 (for W2, 2026-10-08): restricted commit and tcgen smem operand proxy
 
 Found with `test_tcgen05_restricted_commit` (a racecheck false negative) and
@@ -1845,3 +1869,4 @@ V2C-5.
   the instruction guard. A guarded atom/red now runs inside `If(pred)`, and
   so do its destination write-backs. The `test_atomic_f32_noftz` numerics
   pass; the remaining failures assert the legacy `rust_source`.
+3. **Implicit bulk commit at exit is not logged (W2).** `interp/handlers/control.rs` (exit) steps `AsyncGroup(Exit)` on every open Bulk group but emits no `Protocol` event for it. The explorer then sees open bulk groups at exit and raised `UncommittedAtExit` on `flash_mla_sparse_fwd`, `bsa_backward_blk128` and `sparse_flashmla_prefill_head{64,128}_phase1`. Local workaround: `synccheck::backend::exit_lint` applies `Cmd::Exit` to bulk groups itself. Request: log the exit command like the cluster `Exit`, so the recording is complete.
