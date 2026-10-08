@@ -29,10 +29,13 @@ target="${CARGO_TARGET_DIR:-$core/target}"
 if [[ -n "$out" ]]; then
   # Private install: a copy of the v2 package next to a private .so, importable
   # ahead of the source tree via pytest -o "pythonpath=$out/pkg .".
-  pkg="$out/pkg/tirx_harness/numsim/v2"
-  mkdir -p "$pkg"
-  cp -r "$v2dir"/*.py "$v2dir"/lowering "$pkg"/
-  dest="$pkg/numsim_core_py.abi3.so"
+  # The whole Python package is copied (Rust trees excluded) so the copy is a
+  # regular package that shadows the source tree when placed first on the path.
+  src_pkg="$(dirname "$(dirname "$v2dir")")"
+  mkdir -p "$out/pkg/tirx_harness"
+  rsync -a --delete --exclude 'core-rs' --exclude 'engine-rs' --exclude '__pycache__' \
+    --exclude '*.so' "$src_pkg/" "$out/pkg/tirx_harness/"
+  dest="$out/pkg/tirx_harness/numsim/v2/numsim_core_py.abi3.so"
 else
   dest="$v2dir/numsim_core_py.abi3.so"
 fi
