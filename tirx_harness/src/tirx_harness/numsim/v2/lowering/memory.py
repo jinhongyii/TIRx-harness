@@ -217,7 +217,7 @@ class MemoryMixin:
         if handle(var) in self.uninit_locals:
             # May be read before written (V2C-19/20): keep it in tracked memory.
             space = TRACKED_SPACE
-        if space not in ("Local", "Shared") or static is None:
+        if space not in ("Local", "Shared", "Reg") or static is None:
             raise _Unsupported(node, f"allocation in scope {scope!r} with shape {[str(s) for s in info.shape]}")
         numel = _numel(static)
         buf = self.builder.buffer(

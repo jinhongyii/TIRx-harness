@@ -185,7 +185,7 @@ def k(out: T.Buffer((32,), "float32"), idx: T.Buffer((32,), "int32")):
 
 
 def _local_buffers(program: pb.Program) -> list[str]:
-    return [b.name for b in program.buffers if b.space == "Local"]
+    return [b.name for b in program.buffers if b.space in ("Local", "Reg")]
 
 
 def test_possibly_uninitialized_locals_stay_in_tracked_memory(lower_source):
@@ -271,3 +271,19 @@ def test_predicated_vector_atomic_is_guarded():
         open_ifs -= variant == "EndIf"
     assert open_ifs == 2
     assert program.code[atom].ty == pb.Ty("F32", 2)
+
+
+def test_vector_red_packs_pieces_that_tile_the_access_type():
+    """`red.v2.bf16x2` packs two bf16x2 pieces into bf16x4 (pack tiling rule)."""
+    from tests.analysis_tools.synccheck.test_reported_tool_regressions import packed_bf16_vector_reduction
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(packed_bf16_vector_reduction.func)
+    atom = only(program, "Atom")
+    assert atom.ty == pb.Ty("BF16", 4)
+    pack = definition(program, atom.value)
+    assert op_key(program, pack).name == "numsim.pack"
+    def ty(operand):
+        return program.consts[operand.index][0] if isinstance(operand, pb.Const) else program.regs[operand.index].ty
+
+    assert [ty(s) for s in pack.srcs] == [pb.Ty("BF16", 2), pb.Ty("BF16", 2)]

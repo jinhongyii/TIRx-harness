@@ -325,9 +325,12 @@ def lower_atom(c: PtxCtx) -> None:
     lw = c.lw
     lanes = _vec_lanes(c)
     ty = c.ptx_ty("type", lanes)
-    elem = ty.with_lanes(1)
-    values = [lw.convert(v, elem) for v in c.srcs("value")]
-    value = values[0] if lanes == 1 else lw.pack(values, ty)
+    sources = c.srcs("value")
+    # Pieces tile the access type exactly: `.v2.bf16x2` packs two bf16x2 pieces
+    # into bf16x4 (W4's pack tiling rule), `.v4.f32` four f32 pieces.
+    piece = ty.with_lanes(ty.lanes // max(len(sources), 1))
+    values = [lw.convert(v, piece) for v in sources]
+    value = values[0] if len(values) == 1 else lw.pack(values, ty)
     cmp = lw.convert(c.src("compare"), ty) if c.has("compare") else None
     addr, space = c.addr("addr")
     dsts = c.dsts("d") if c.has("d") else []
@@ -343,7 +346,7 @@ def lower_atom(c: PtxCtx) -> None:
     b.emit("Atom", site=c.site(), op=op, ty=ty, dst=result, addr=addr, space=space, value=value,
            cmp=cmp, sem=sem, scope=c.scope(), ftz=not c.flag("noftz") and ty.elem == "F32")
     if result is not None:
-        outs = [result] if lanes == 1 else lw.unpack(result, lanes)
+        outs = [result] if len(dsts) == 1 else lw.unpack(result, len(dsts))
         for reg, lane in zip(dsts, outs):
             if reg is not None:
                 lw.assign(reg, lane)

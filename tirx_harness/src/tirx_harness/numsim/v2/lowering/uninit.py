@@ -30,10 +30,10 @@ from typing import Any
 from . import builtins, ptx_decode
 from .dtypes import type_key
 
-# Engine space for tracked locals. `Space::Reg` buffers are not bound by the
-# scheduler yet (W2-16), so tracked locals use per-lane `Local` memory, which
-# starts `Init::Uninit`.
-TRACKED_SPACE = "Local"
+# Engine space for tracked locals: `Space::Reg` buffers, bound per lane with
+# `Init::Uninit` like `Local` (W2-16, sched `BufBinding::Reg`), so findings read
+# `space: register` as legacy reports them.
+TRACKED_SPACE = "Reg"
 
 _UNROLL_LIMIT = 64
 _ALL = None  # sentinel: every element written

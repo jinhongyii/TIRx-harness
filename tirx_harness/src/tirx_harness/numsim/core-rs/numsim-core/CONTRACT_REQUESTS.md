@@ -1956,3 +1956,27 @@ No racecheck change is needed.
   (`['handle'] -> void`). It lowers to: load the u64, then
   `Shfl{Idx, lane 0, clamp 0x1f, full mask}` of the low word, then store
   `(hi & 0xffffffff00000000) | lo`. Verified end to end on a 32-lane run.
+
+## W1 (2026-10-08, W5/W6 round-2 items)
+
+- **`red_vec_packed_bf16`: fixed.** `lower_atom` packed vector sources as
+  scalars of the element type. The pieces now tile the access type exactly:
+  `red.v2.bf16x2` is two `bf16x2` pieces packed into `bf16x4`, and `.v4.f32`
+  is four `f32` pieces. A vector result unpacks into one piece per
+  destination. All `test_reported_tool_regressions` cases pass.
+- **Tracked locals are `Space::Reg`.** `uninit.TRACKED_SPACE` is now `"Reg"`.
+  W2's `BufBinding::Reg` is in HEAD: per-lane, `Init::Uninit`.
+  - `flashinfer_rmsnorm_quant`, `gdn_decode_fp32_mtp_warp` and
+    `selective_state_update_mtp_vertical` now report `uninitialized_read`
+    with `space: "reg"` on `regs[w*]`.
+  - For W8: the conformance projection must map `reg` to legacy `register`.
+  - `flashinfer_qk_rmsnorm` (V2C-20) still reports only its shared finding.
+    The bf16 register bytes legacy flags (`buffer[0]`, bytes 4-6, 8-10, ...)
+    are not read uninitialized by the lowered program; that row is open.
+- **Runtime tensor-map box (item 30), status of the two tests:**
+  - `tests/numsim/integration/test_host_prelude.py::test_dynamic_tensor_map_expressions_run_in_the_loaded_artifact_prologue`
+    needs a v2 port (W9): it calls the legacy `CompiledModule.load()`.
+  - `tests/numsim/integration/test_host_prelude.py::test_dynamic_tensor_map_prologue_is_shared_by_native_checkers`
+    lowers, but synccheck reports `invalid_operand: NumSim TensorMap image
+    has invalid magic`. That is W2's bind-time encode of a map whose
+    `box_dim` is a runtime `DimExpr`.
