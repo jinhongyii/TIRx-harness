@@ -23,6 +23,18 @@ Source: `backend-comparison.json` (`head.cases`, engine wall, min of the samples
 - `kda_backward_packed` racecheck
 - `sparse_flashmla_prefill_head128_phase1` racecheck
 
+## Mega-MoE perf workloads (verdict-identical rows only)
+
+Separate configuration set (148 SMs, `native_loop_iteration_budget=10_000_000`, one run each, 900 s cap; `backend-comparison.md` "Mega-MoE perf workloads"). Only numsim verdicts agree (both `clean`); every racecheck row differs (legacy `review`, v2 `error` per B7/T19, or v2 timed out at 6ba4190) and is excluded.
+
+| config | mode | workers | legacy | v2 | v2 vs legacy |
+| --- | --- | --- | --- | --- | --- |
+| small | numsim | 1 / 16 / 32 | 3.1 / 1.5 / 1.5 s | 0.6 / 0.4 / 0.4 s | **5.2x / 3.8x / 3.8x faster** |
+| twenty_four_experts | numsim | 1 / 16 / 32 | 4.8 / 1.8 / 1.7 s | 1.7 / 0.7 / 0.7 s | **2.8x / 2.6x / 2.4x faster** |
+| medium | numsim | 1 | 35.7 s | 36.0 s | 1.01x (even) |
+| medium | numsim | 16 / 32 | 5.0 / 3.7 s | 8.2 / 7.7 s | 1.6x / 2.1x slower |
+| large | numsim | 1 / 16 / 32 | not measured | 75.1 / 14.0 / 13.6 s | — |
+
 ## numsim
 
 | case | workers | legacy | v2 | v2 vs legacy |
