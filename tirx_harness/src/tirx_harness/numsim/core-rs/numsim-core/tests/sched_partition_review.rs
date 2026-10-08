@@ -257,15 +257,16 @@ const SENTINEL: u32 = 0xFFFF_FFFF;
 
 /// Three single-CTA clusters. Lane 0 of CTA c < 2 does `stores[c]` relaxed
 /// stores to the declared word `flag`, then `atoms[c]` relaxed `atom.add`s
-/// (serial points), then `st.release flag = SENTINEL`. CTA 2 waits
+/// (serial points), then a release store of `fin[c]`. CTA 2 waits
 /// `wait_until(flag == SENTINEL)`. A huge quantum lets each writer's store
 /// loop finish in one slice, so both writers' stores land in one round.
-fn overflow_writers(stores: [u32; 2], atoms: [u32; 2]) -> Scenario {
+fn overflow_writers(stores: [u32; 2], atoms: [u32; 2], finals: [u32; 2]) -> Scenario {
     let mut b = ProgramBuilder::new("overflow_writers", 32);
     b.grid(3, 1, 1);
     let flag = b.global("flag", Dtype::U32);
     let ns = b.global("ns", Dtype::U32);
     let na = b.global("na", Dtype::U32);
+    let fin = b.global("fin", Dtype::U32);
     b.declare_sync_words(flag);
     let lane = b.reg(Ty::U32);
     let cta = b.reg(Ty::U32);
@@ -308,7 +309,9 @@ fn overflow_writers(stores: [u32; 2], atoms: [u32; 2]) -> Scenario {
     b.push(Instr::Atom { op: AtomOp::Add, ty: Ty::U32, dst: Some(old), addr: fa.into(), space: AddrSpace::Global, value: k1, cmp: None, sem: Sem::Relaxed, scope: Scope::Gpu, ftz: false });
     b.add_u32(k, k, k1);
     b.loop_end();
-    b.push(Instr::StoreAddr { ty: Ty::U32, addr: fa.into(), space: AddrSpace::Generic, value: ks, sem: Sem::Release, scope: Scope::Gpu, mods: MemMods::default() });
+    // Final release store of `fin[cta]`.
+    b.ld_u32(v, fin, cta);
+    b.push(Instr::StoreAddr { ty: Ty::U32, addr: fa.into(), space: AddrSpace::Generic, value: v.into(), sem: Sem::Release, scope: Scope::Gpu, mods: MemMods::default() });
     b.else_();
     b.site("wait_until", 1);
     let placeholder = b.push(Instr::Nop);
@@ -333,7 +336,7 @@ fn overflow_writers(stores: [u32; 2], atoms: [u32; 2]) -> Scenario {
         captures: vec![],
     };
     prog.validate().expect("valid");
-    let inputs: Inputs = scenarios::inputs(vec![("flag", u32_buf([0])), ("ns", u32_buf(stores)), ("na", u32_buf(atoms))]);
+    let inputs: Inputs = scenarios::inputs(vec![("flag", u32_buf([0])), ("ns", u32_buf(stores)), ("na", u32_buf(atoms)), ("fin", u32_buf(finals))]);
     let mut config = RunConfig::default();
     config.loop_budget = 1 << 40;
     config.quantum = 1 << 30;
@@ -367,7 +370,7 @@ fn overflow_is_incomplete_everywhere(s: &Scenario) -> usize {
 #[test]
 fn history_overflow_crossed_only_in_the_partition_merge() {
     let each = MAX / 2 + 4;
-    let s = overflow_writers([each - 1, each - 1], [0, 0]); // + the sentinel store
+    let s = overflow_writers([each - 1, each - 1], [0, 0], [SENTINEL, SENTINEL]); // + the sentinel store
     let writes = overflow_is_incomplete_everywhere(&s);
     assert_eq!(writes, 2 * each as usize, "every write is still delivered to the observer");
 }
@@ -376,6 +379,8 @@ fn history_overflow_crossed_only_in_the_partition_merge() {
 /// atomics (one instruction per round per writer) cross MAX.
 #[test]
 fn history_overflow_crossed_in_the_serial_phase() {
-    let s = overflow_writers([MAX - 2, 0], [3, 1]);
+    // Only CTA 0's last store releases the waiter, after all atomics.
+    let s = overflow_writers([MAX - 2, 0], [3, 1], [SENTINEL, 0]);
     overflow_is_incomplete_everywhere(&s);
 }
+
