@@ -11,11 +11,12 @@ The legacy write-seed optimisation (``global_write_seed_replays``) has no
 analogue in the new core and is not asserted, nor is the legacy
 ``inspect_accesses`` parametrisation (payload shape, C).
 
-Host-input aliasing has no spec sentence (test-migration.md, "Semantics in
-legacy tests that no new spec mentions" item 2), and v2 fails closed on it
-today (``run.py::_reject_aliased_buffers`` raises ``NotImplementedError``,
-CONTRACT_REQUESTS W8-6). The aliased parametrisations are therefore
-``xfail(strict=False)``; the non-aliased controls must be clean.
+Host-input aliasing is implemented (W8-6: overlapping host arrays are views
+of one engine allocation). Kernels that receive a pointer as DATA (an integer
+word or offset) get the binding's engine address from ``Engine.address_of``
+(W8-7): device addresses are not host addresses (numsim-behaviour-deltas H1),
+so the legacy ``ndarray.ctypes.data`` words are not meaningful in v2. The
+non-aliased controls must be clean.
 """
 
 from __future__ import annotations
@@ -34,18 +35,12 @@ from ._runnable import (
     assert_clean,
     assert_error_kind,
     assert_no_incomplete,
-    no_spec,
     race_access_pairs,
     requires_v2_engine,
 )
 
 pytestmark = requires_v2_engine
 
-_HOST_POINTER = no_spec(
-    2,
-    "host-input aliasing; the legacy kernel is fed HOST addresses (ndarray.ctypes.data) as pointer "
-    "data, and the v2 API has no way to obtain an engine address of a binding",
-)
 
 
 def _assert_alias_race(report) -> None:
@@ -298,7 +293,6 @@ def test_loop_carried_selected_pointer_preserves_compact_alias_races(select_b, a
         assert_clean(report)
 
 
-@_HOST_POINTER
 @pytest.mark.parametrize("func", [clobbered_pointer_write, copied_pointer_write], ids=["xor", "tile-copy"])
 def test_unknown_register_overwrite_keeps_read_before_write_race(func):
     """Replaces ``tests/analysis_tools/racecheck/test_native_global_write_seed.py::test_unknown_register_overwrite_keeps_read_before_write_race`` (all params).
@@ -308,11 +302,15 @@ def test_unknown_register_overwrite_keeps_read_before_write_race(func):
     """
 
     source = np.zeros(1, dtype=np.int32)
-    report = v2.racecheck(func, {
+    inputs = {
         "source": source, "target": np.zeros(1, dtype=np.int32),
-        "pointer_bits": np.array([source.ctypes.data], dtype=np.uint64),
+        "pointer_bits": np.zeros(1, dtype=np.uint64),
         "output": np.zeros(1, dtype=np.int32),
-    })
+    }
+    # The pointer word is the ENGINE address of `source` (delta H1: device
+    # addresses are not host addresses; Engine.address_of, W8-7).
+    inputs["pointer_bits"][0] = v2.Engine().address_of(v2.transpile(func), inputs, "source")
+    report = v2.racecheck(func, inputs)
     _assert_alias_race(report)
 
 
@@ -366,7 +364,6 @@ def test_discard_is_a_write_for_compact_alias_races(alias_inputs):
         assert_clean(report)
 
 
-@_HOST_POINTER
 @pytest.mark.parametrize("alias_inputs", [False, True], ids=["distinct", "aliased"])
 def test_raw_offset_escaping_seed_restarts_from_original_inputs(alias_inputs):
     """Replaces ``tests/analysis_tools/racecheck/test_native_global_write_seed.py::test_raw_offset_escaping_seed_restarts_from_original_inputs`` (all params; ``inspect_accesses`` dropped).
@@ -376,11 +373,15 @@ def test_raw_offset_escaping_seed_restarts_from_original_inputs(alias_inputs):
     arrays are never modified. The seed replay count is C and not asserted.
     """
 
-    target, redirected = sorted((np.zeros(1, np.int32), np.zeros(1, np.int32)), key=lambda value: value.ctypes.data)
+    target, redirected = np.zeros(1, np.int32), np.zeros(1, np.int32)
     source = redirected if alias_inputs else np.zeros(1, np.int32)
     inputs = dict(source=source, target=target, redirected=redirected,
-                  offset=np.array([redirected.ctypes.data - target.ctypes.data], np.uint64),
-                  output=np.zeros(1, np.int32))
+                  offset=np.zeros(1, np.uint64), output=np.zeros(1, np.int32))
+    # The byte offset between the ENGINE addresses of the two bindings (delta
+    # H1; Engine.address_of, W8-7), wrapped to u64 like the kernel's add.
+    module, engine = v2.transpile(offset_pointer_write), v2.Engine()
+    delta = engine.address_of(module, inputs, "redirected") - engine.address_of(module, inputs, "target")
+    inputs["offset"][0] = delta % (1 << 64)
     report = v2.racecheck(offset_pointer_write, inputs)
     if alias_inputs:
         _assert_alias_race(report)

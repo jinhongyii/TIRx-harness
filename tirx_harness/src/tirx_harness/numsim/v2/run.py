@@ -11,31 +11,29 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import time
+import re
 import struct
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Union
-
-import re
+from typing import Any
 
 import numpy as np
+
+from tirx_harness.numsim.errors import NumSimExecutionError
 
 from .compile import CompiledModule, native
 from .options import BACKENDS, options
 from .report import (
     AnalysisResult,
-    attach_operations,
-    stop_facts,
-    checker_phase_payload,
     NumSimResult,
+    attach_operations,
+    checker_phase_payload,
     diagnostic_from_core,
     phase_payload,
     record_from_core,
+    stop_facts,
 )
-
-
-from tirx_harness.numsim.errors import NumSimExecutionError
 
 
 class InputError(NumSimExecutionError, ValueError):
@@ -65,8 +63,11 @@ def _raise_unless_completed(status: Mapping[str, Any], diagnostics: list[dict[st
 
     if status.get("kind") in (None, "completed"):
         return
-    stops = [d for d in diagnostics if d.get("status") in ("error", "incomplete")
-             and d.get("reason") != "subset_execution"]
+    stops = [
+        d
+        for d in diagnostics
+        if d.get("status") in ("error", "incomplete") and d.get("reason") != "subset_execution"
+    ]
     if not stops:
         return
     first = stops[0]
@@ -82,7 +83,6 @@ def _raise_unless_completed(status: Mapping[str, Any], diagnostics: list[dict[st
     raise ExecutionError(
         f"NumSim execution {status.get('kind')}: {first.get('kind')}: {detail}{where}", diagnostics
     )
-
 
 
 @dataclass(frozen=True)
@@ -106,9 +106,17 @@ class BoundInput:
 
 
 _SCALAR_FORMATS = {
-    "F32": "<f", "F64": "<d", "TF32": "<f",
-    "U8": "<B", "U16": "<H", "U32": "<I", "U64": "<Q",
-    "S8": "<b", "S16": "<h", "S32": "<i", "S64": "<q",
+    "F32": "<f",
+    "F64": "<d",
+    "TF32": "<f",
+    "U8": "<B",
+    "U16": "<H",
+    "U32": "<I",
+    "U64": "<Q",
+    "S8": "<b",
+    "S16": "<h",
+    "S32": "<i",
+    "S64": "<q",
 }
 
 
@@ -142,7 +150,7 @@ class ExecutionSubset:
 #: An ``ExecutionSubset`` or a mapping from phase (launch) index to one. One
 #: engine run serves every launch of a module, so the mapped subsets must be
 #: equal.
-ExecutionSubsetSelection = Union[ExecutionSubset, Mapping[int, ExecutionSubset]]
+ExecutionSubsetSelection = ExecutionSubset | Mapping[int, ExecutionSubset]
 
 
 def _clusters_of_ctas(module: CompiledModule, cta_ids: list[int]) -> set[int]:
@@ -155,7 +163,9 @@ def _clusters_of_ctas(module: CompiledModule, cta_ids: list[int]) -> set[int]:
         for d in value or (1, 1, 1):
             if isinstance(d, Mapping):
                 if "Const" not in d:
-                    raise InputError(f"cta_ids subsets need a static {what}; select cluster_ids instead")
+                    raise InputError(
+                        f"cta_ids subsets need a static {what}; select cluster_ids instead"
+                    )
                 d = d["Const"]
             out.append(max(int(d), 1))
         return tuple(out)  # type: ignore[return-value]
@@ -165,8 +175,10 @@ def _clusters_of_ctas(module: CompiledModule, cta_ids: list[int]) -> set[int]:
         topo = kernel.topology
         shapes.add((dims(topo.get("grid"), "grid"), dims(topo.get("cluster"), "cluster shape")))
     if len(shapes) != 1:
-        raise InputError("cta_ids subsets need one launch shape across the module's kernels; select cluster_ids instead")
-    (grid, cluster), = shapes
+        raise InputError(
+            "cta_ids subsets need one launch shape across the module's kernels; select cluster_ids instead"
+        )
+    ((grid, cluster),) = shapes
     total = grid[0] * grid[1] * grid[2]
     ncl = (grid[0] // cluster[0], grid[1] // cluster[1])
     per_cluster: dict[int, set[int]] = {}
@@ -174,12 +186,18 @@ def _clusters_of_ctas(module: CompiledModule, cta_ids: list[int]) -> set[int]:
         if not 0 <= cta < total:
             raise InputError(f"cta id {cta} is outside the grid of {total} CTAs")
         c = (cta % grid[0], (cta // grid[0]) % grid[1], cta // (grid[0] * grid[1]))
-        cid = c[0] // cluster[0] + (c[1] // cluster[1]) * ncl[0] + (c[2] // cluster[2]) * ncl[0] * ncl[1]
+        cid = (
+            c[0] // cluster[0]
+            + (c[1] // cluster[1]) * ncl[0]
+            + (c[2] // cluster[2]) * ncl[0] * ncl[1]
+        )
         per_cluster.setdefault(cid, set()).add(cta)
     size = cluster[0] * cluster[1] * cluster[2]
     partial = sorted(cid for cid, ctas in per_cluster.items() if len(ctas) != size)
     if partial:
-        raise InputError(f"cta_ids must select whole clusters of {size} CTAs; clusters {partial} are partial")
+        raise InputError(
+            f"cta_ids must select whole clusters of {size} CTAs; clusters {partial} are partial"
+        )
     return set(per_cluster)
 
 
@@ -211,7 +229,10 @@ def _attach_subset_scope(payload: dict[str, Any], topology: Mapping[str, Any]) -
         scope["selected_warp_count"] = len(clusters) * cluster_size * warps_per_cta
         scope["total_warp_count"] = grid[0] * grid[1] * grid[2] * warps_per_cta
         for record in records:
-            record.update(selected_warp_count=scope["selected_warp_count"], total_warp_count=scope["total_warp_count"])
+            record.update(
+                selected_warp_count=scope["selected_warp_count"],
+                total_warp_count=scope["total_warp_count"],
+            )
     payload["analysis_scope"] = scope
 
 
@@ -221,11 +242,19 @@ def _scalar_bits(name: str, value: Any, ty: Mapping[str, Any] | None) -> int:
         value = value[()]
     if isinstance(value, np.generic):
         value = value.item()
-    if isinstance(value, (np.ndarray, list, tuple, bytes, bytearray, memoryview)) or hasattr(value, "__dlpack__"):
+    if isinstance(value, (np.ndarray, list, tuple, bytes, bytearray, memoryview)) or hasattr(
+        value, "__dlpack__"
+    ):
         # W5-17: a buffer (e.g. descriptor storage) bound to a scalar parameter.
         shape = getattr(value, "shape", None)
-        what = f"{type(value).__name__} of shape {tuple(shape)}" if shape is not None else type(value).__name__
-        raise InputError(f"scalar argument {name!r} has a buffer value ({what}); pass a Python or NumPy scalar")
+        what = (
+            f"{type(value).__name__} of shape {tuple(shape)}"
+            if shape is not None
+            else type(value).__name__
+        )
+        raise InputError(
+            f"scalar argument {name!r} has a buffer value ({what}); pass a Python or NumPy scalar"
+        )
     if isinstance(value, (bool, np.bool_)) or elem == "PRED":
         return int(bool(value))
     if elem == "F16":
@@ -238,13 +267,16 @@ def _scalar_bits(name: str, value: Any, ty: Mapping[str, Any] | None) -> int:
     try:
         packed = struct.pack(fmt, value)
     except struct.error as error:
-        raise InputError(f"scalar argument {name!r}={value!r} does not fit {elem}: {error}") from error
+        raise InputError(
+            f"scalar argument {name!r}={value!r} does not fit {elem}: {error}"
+        ) from error
     return int.from_bytes(packed, "little")
 
 
 # ml_dtypes types that store one sub-byte value per byte.
-_UNPACKED_SUB_BYTE = frozenset({"float4_e2m1fn", "int4", "uint4", "int2", "uint2",
-                                "float6_e2m3fn", "float6_e3m2fn"})
+_UNPACKED_SUB_BYTE = frozenset(
+    {"float4_e2m1fn", "int4", "uint4", "int2", "uint2", "float6_e2m3fn", "float6_e3m2fn"}
+)
 _SUB_BYTE_ELEMS = frozenset({"E2M1", "U4", "S4", "E2M3", "E3M2", "S2F6"})
 
 
@@ -254,7 +286,9 @@ def _reject_unpacked_sub_byte(name: str, array: np.ndarray, slot: Mapping[str, A
     packed bytes."""
 
     elem = str((slot.get("dtype") or {}).get("elem", "")).upper()
-    if array.dtype.name in _UNPACKED_SUB_BYTE or (elem in _SUB_BYTE_ELEMS and array.dtype.itemsize != 1):
+    if array.dtype.name in _UNPACKED_SUB_BYTE or (
+        elem in _SUB_BYTE_ELEMS and array.dtype.itemsize != 1
+    ):
         raise InputError(
             f"buffer argument {name!r} holds sub-byte {elem or array.dtype.name} values one per byte "
             f"({array.dtype}); bind the packed bytes as a contiguous uint8 array"
@@ -274,6 +308,15 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
     slots: dict[str, Mapping[str, Any]] = {}
     lookup: dict[str, str] = {}
     for kernel in module.spec.kernels:
+        names = [str(slot["name"]) for slot in kernel.host_abi]
+        repeated = sorted({n for n in names if names.count(n) > 1})
+        if repeated:
+            # Two distinct parameters of one kernel share a public name: no
+            # binding by name can tell them apart (legacy HostAbiError).
+            raise InputError(
+                f"ambiguous host binding: kernel {kernel.index} has several parameters named "
+                f"{repeated}"
+            )
         for slot in kernel.host_abi:
             canonical = str(slot["name"])
             slots.setdefault(canonical, slot)
@@ -303,8 +346,11 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
                 given_objects.setdefault(base_name, base)
                 contiguous = np.ascontiguousarray(base)
                 bound[base_name] = BoundInput(
-                    base_name, "buffer", ("buffer", contiguous.view(np.uint8).reshape(-1).tobytes(), None),
-                    dtype=contiguous.dtype, shape=tuple(contiguous.shape),
+                    base_name,
+                    "buffer",
+                    ("buffer", contiguous.view(np.uint8).reshape(-1).tobytes(), None),
+                    dtype=contiguous.dtype,
+                    shape=tuple(contiguous.shape),
                     host_addr=int(base.__array_interface__["data"][0]),
                 )
         return base_name
@@ -312,7 +358,9 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
     for given, value in inputs.items():
         canonical = lookup.get(given)
         if canonical is None:
-            raise InputError(f"NumSim input binding {given!r} is unknown; expected one of {sorted(slots)}")
+            raise InputError(
+                f"NumSim input binding {given!r} is unknown; expected one of {sorted(slots)}"
+            )
         if canonical == "":
             raise InputError(f"NumSim input binding {given!r} is ambiguous across kernels")
         if canonical in given_objects:
@@ -321,24 +369,37 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
             if given_objects[canonical] is value:
                 continue
             previous = bound[canonical]
-            if not (isinstance(value, np.ndarray) and previous.kind == "buffer"
-                    and np.ascontiguousarray(value).view(np.uint8).tobytes() == previous.native[1]):
-                raise InputError(f"NumSim input {canonical!r} is bound more than once with different values")
+            if not (
+                isinstance(value, np.ndarray)
+                and previous.kind == "buffer"
+                and np.ascontiguousarray(value).view(np.uint8).tobytes() == previous.native[1]
+            ):
+                raise InputError(
+                    f"NumSim input {canonical!r} is bound more than once with different values"
+                )
             continue
         given_objects[canonical] = value
         slot = slots[canonical]
         kind = _slot_kind(slot)
         if isinstance(value, tuple) and value and value[0] == "pointer":
-            bound[canonical] = BoundInput(canonical, "pointer", ("pointer", str(value[1]), int(value[2])))
+            bound[canonical] = BoundInput(
+                canonical, "pointer", ("pointer", str(value[1]), int(value[2]))
+            )
         elif kind in ("scalar", "implicit_shape"):
-            bound[canonical] = BoundInput(canonical, "scalar", ("scalar", _scalar_bits(canonical, value, slot.get("dtype"))))
+            bound[canonical] = BoundInput(
+                canonical, "scalar", ("scalar", _scalar_bits(canonical, value, slot.get("dtype")))
+            )
         elif kind == "tensor_map":
             image = np.ascontiguousarray(np.asarray(value)).view(np.uint8).reshape(-1)
             if image.size != 128:
-                raise InputError(f"tensor map {canonical!r} must be a 128-byte image, got {image.size} bytes")
+                raise InputError(
+                    f"tensor map {canonical!r} must be a 128-byte image, got {image.size} bytes"
+                )
             base = getattr(value, "_tensor_map_base", None)
             if base is None:
-                bound[canonical] = BoundInput(canonical, "tensor_map", ("tensor_map", image.tobytes()))
+                bound[canonical] = BoundInput(
+                    canonical, "tensor_map", ("tensor_map", image.tobytes())
+                )
                 continue
             # A host descriptor (numsim.cases.TensorMap) addresses a host
             # array: bind that array as a buffer and let the engine encode the
@@ -350,7 +411,10 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
             if not 0 <= offset <= base.nbytes:
                 raise InputError(f"tensor map {canonical!r} does not address its base array")
             bound[canonical] = BoundInput(
-                canonical, "tensor_map", ("tensor_map_of", base_name, offset, image.tobytes()), base=base_name,
+                canonical,
+                "tensor_map",
+                ("tensor_map_of", base_name, offset, image.tobytes()),
+                base=base_name,
             )
         else:
             if hasattr(value, "detach") and hasattr(value, "cpu"):  # torch tensor
@@ -373,10 +437,14 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
                 if not 0 <= patch <= descriptor_base.nbytes:
                     raise InputError(f"descriptor {canonical!r} does not address its base array")
             bound[canonical] = BoundInput(
-                canonical, "buffer", ("buffer", array.view(np.uint8).reshape(-1).tobytes(), None),
-                dtype=array.dtype, shape=tuple(array.shape),
+                canonical,
+                "buffer",
+                ("buffer", array.view(np.uint8).reshape(-1).tobytes(), None),
+                dtype=array.dtype,
+                shape=tuple(array.shape),
                 host_addr=int(host.__array_interface__["data"][0]) if host.size else None,
-                base=base_name, patch_offset=patch,
+                base=base_name,
+                patch_offset=patch,
             )
     # Buffer slot shapes: check static dims, bind `Param` dims (W1 binder
     # convention: implicit shape variables are Scalar slots referenced from
@@ -402,10 +470,14 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
             if source is None or source.shape is None:
                 continue  # reported as missing below
             if axis >= len(source.shape):
-                raise InputError(f"{name!r}: buffer {buffer!r} has rank {len(source.shape)}, needs axis {axis}")
+                raise InputError(
+                    f"{name!r}: buffer {buffer!r} has rank {len(source.shape)}, needs axis {axis}"
+                )
             value = _scalar_bits(name, int(source.shape[axis]), slot.get("dtype"))
             if name in bound and bound[name].native[1] != value:
-                raise InputError(f"{name!r} disagrees with {buffer!r}.shape[{axis}]={source.shape[axis]}")
+                raise InputError(
+                    f"{name!r} disagrees with {buffer!r}.shape[{axis}]={source.shape[axis]}"
+                )
             bound[name] = BoundInput(name, "scalar", ("scalar", value))
     _resolve_aliased_buffers(bound, given_objects)
     _patch_descriptor_pointers(module, bound)
@@ -413,11 +485,16 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
     # (legacy accepted kernels that never use it): bind an all-zero image,
     # which the descriptor decoder rejects, so any use fails closed.
     for name, slot in slots.items():
-        if name not in bound and _slot_kind(slot) == "tensor_map" and not slot.get("tensor_map") \
-                and slot.get("implicit_base") is None:
+        if (
+            name not in bound
+            and _slot_kind(slot) == "tensor_map"
+            and not slot.get("tensor_map")
+            and slot.get("implicit_base") is None
+        ):
             bound[name] = BoundInput(name, "tensor_map", ("tensor_map", bytes(128)))
     missing = sorted(
-        name for name, slot in slots.items()
+        name
+        for name, slot in slots.items()
         if name not in bound and not slot.get("tensor_map") and slot.get("implicit_base") is None
     )
     if missing:
@@ -426,21 +503,46 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
 
 
 _ELEM_BITS = {
-    "PRED": 8, "U8": 8, "S8": 8, "E4M3": 8, "E5M2": 8, "UE8M0": 8, "UE4M3": 8, "UE5M3": 8,
-    "U16": 16, "S16": 16, "F16": 16, "BF16": 16, "U32": 32, "S32": 32, "F32": 32, "TF32": 32,
-    "U64": 64, "S64": 64, "F64": 64, "B128": 128, "E2M3": 6, "E3M2": 6, "S2F6": 6,
-    "E2M1": 4, "U4": 4, "S4": 4,
+    "PRED": 8,
+    "U8": 8,
+    "S8": 8,
+    "E4M3": 8,
+    "E5M2": 8,
+    "UE8M0": 8,
+    "UE4M3": 8,
+    "UE5M3": 8,
+    "U16": 16,
+    "S16": 16,
+    "F16": 16,
+    "BF16": 16,
+    "U32": 32,
+    "S32": 32,
+    "F32": 32,
+    "TF32": 32,
+    "U64": 64,
+    "S64": 64,
+    "F64": 64,
+    "B128": 128,
+    "E2M3": 6,
+    "E3M2": 6,
+    "S2F6": 6,
+    "E2M1": 4,
+    "U4": 4,
+    "S4": 4,
 }
 
 
-def _bind_shape(slot: Mapping[str, Any], abi: tuple, source: BoundInput, bound: dict[str, BoundInput]) -> None:
+def _bind_shape(
+    slot: Mapping[str, Any], abi: tuple, source: BoundInput, bound: dict[str, BoundInput]
+) -> None:
     name = str(slot["name"])
     dims = list(slot["shape"])
     shape = source.shape or ()
     consts = [d.get("Const") if isinstance(d, Mapping) else None for d in dims]
     if len(dims) == len(shape):
         mismatch = [
-            (axis, want, got) for axis, (want, got) in enumerate(zip(consts, shape))
+            (axis, want, got)
+            for axis, (want, got) in enumerate(zip(consts, shape))
             if want is not None and int(want) != int(got)
         ]
         if not mismatch:
@@ -451,11 +553,17 @@ def _bind_shape(slot: Mapping[str, Any], abi: tuple, source: BoundInput, bound: 
                     value = int(shape[axis])
                     if target_name in bound:
                         given = bound[target_name]
-                        if given.kind == "scalar" and given.native[1] != _scalar_bits(target_name, value, target.get("dtype")):
-                            raise InputError(f"{target_name!r} disagrees with {name!r}.shape[{axis}]={value}")
+                        if given.kind == "scalar" and given.native[1] != _scalar_bits(
+                            target_name, value, target.get("dtype")
+                        ):
+                            raise InputError(
+                                f"{target_name!r} disagrees with {name!r}.shape[{axis}]={value}"
+                            )
                     else:
                         bound[target_name] = BoundInput(
-                            target_name, "scalar", ("scalar", _scalar_bits(target_name, value, target.get("dtype")))
+                            target_name,
+                            "scalar",
+                            ("scalar", _scalar_bits(target_name, value, target.get("dtype"))),
                         )
             return
     # Different rank or dims: accept a reinterpretation of the same bytes
@@ -463,7 +571,9 @@ def _bind_shape(slot: Mapping[str, Any], abi: tuple, source: BoundInput, bound: 
     if all(c is not None for c in consts):
         elem = str((slot.get("dtype") or {}).get("elem", "U8")).upper()
         lanes = int((slot.get("dtype") or {}).get("lanes", 1))
-        bits = int(np.prod([int(c) for c in consts], dtype=np.int64)) * _ELEM_BITS.get(elem, 8) * lanes
+        bits = (
+            int(np.prod([int(c) for c in consts], dtype=np.int64)) * _ELEM_BITS.get(elem, 8) * lanes
+        )
         nbytes = len(source.native[1])
         if (bits + 7) // 8 == nbytes:
             return
@@ -483,7 +593,11 @@ def _memory_span(value: Any) -> tuple[int, int] | None:
 
 
 def host_addresses(bound: Mapping[str, BoundInput]) -> dict[str, int]:
-    return {name: b.host_addr for name, b in bound.items() if b.kind == "buffer" and b.host_addr is not None}
+    return {
+        name: b.host_addr
+        for name, b in bound.items()
+        if b.kind == "buffer" and b.host_addr is not None
+    }
 
 
 def _patch_descriptor_pointers(module: CompiledModule, bound: dict[str, BoundInput]) -> None:
@@ -494,10 +608,14 @@ def _patch_descriptor_pointers(module: CompiledModule, bound: dict[str, BoundInp
     if not pending:
         return
     natives = {name: b.native for name, b in bound.items()}
-    addresses = native().plan_global_addresses(module.handle, natives, host_addrs=host_addresses(bound))
+    addresses = native().plan_global_addresses(
+        module.handle, natives, host_addrs=host_addresses(bound)
+    )
     for name, b in pending.items():
         if b.base not in addresses:
-            raise InputError(f"descriptor {name!r}: the engine placed no allocation for its base {b.base!r}")
+            raise InputError(
+                f"descriptor {name!r}: the engine placed no allocation for its base {b.base!r}"
+            )
         image = bytearray(b.native[1])
         image[0:8] = int(addresses[b.base] + b.patch_offset).to_bytes(8, "little")
         bound[name] = replace(b, native=("buffer", bytes(image), None))
@@ -538,25 +656,45 @@ def _resolve_aliased_buffers(bound: dict[str, BoundInput], values: Mapping[str, 
         lo = min(l for l, _, _ in group)
         hi = max(h for _, h, _ in group)
         region = f"__host_region_{index}"
-        bound[region] = BoundInput(region, "buffer", ("buffer", ctypes.string_at(lo, hi - lo), None),
-                                   dtype=np.dtype(np.uint8), shape=(hi - lo,), host_addr=lo)
+        bound[region] = BoundInput(
+            region,
+            "buffer",
+            ("buffer", ctypes.string_at(lo, hi - lo), None),
+            dtype=np.dtype(np.uint8),
+            shape=(hi - lo,),
+            host_addr=lo,
+        )
         for start, end, name in group:
             b = bound[name]
-            bound[name] = BoundInput(name, "view", ("view", region, start - lo, end - start),
-                                     dtype=b.dtype, shape=b.shape, base=region)
+            bound[name] = BoundInput(
+                name,
+                "view",
+                ("view", region, start - lo, end - start),
+                dtype=b.dtype,
+                shape=b.shape,
+                base=region,
+            )
 
 
-def _select_outputs(bound: Mapping[str, BoundInput], outputs: Iterable[str] | Mapping[str, str] | None,
-                    module: CompiledModule) -> list[tuple[str, str, str]]:
+def _select_outputs(
+    bound: Mapping[str, BoundInput],
+    outputs: Iterable[str] | Mapping[str, str] | None,
+    module: CompiledModule,
+) -> list[tuple[str, str, str]]:
     """Return ``(canonical buffer, external output name, selector)`` triples."""
 
-    buffers = {name for name, b in bound.items() if b.kind in ("buffer", "view") and not name.startswith("__")}
+    buffers = {
+        name
+        for name, b in bound.items()
+        if b.kind in ("buffer", "view") and not name.startswith("__")
+    }
     if outputs is None:
         selected = [(name, name, name) for name in sorted(buffers)]
         # Legacy also exposed a buffer bound through a host tensor map under
         # the tensor-map parameter's name (as the map's logical tensor).
         selected += [
-            (b.base, name, name) for name, b in sorted(bound.items())
+            (b.base, name, name)
+            for name, b in sorted(bound.items())
             if b.kind == "tensor_map" and b.base is not None and b.base in bound
         ]
         return selected
@@ -574,10 +712,18 @@ def _select_outputs(bound: Mapping[str, BoundInput], outputs: Iterable[str] | Ma
     seen: set[str] = set()
     for external, selector in pairs:
         canonical = aliases.get(selector, selector)
-        if canonical in bound and bound[canonical].kind == "tensor_map" and bound[canonical].base is not None:
+        if (
+            canonical in bound
+            and bound[canonical].kind == "tensor_map"
+            and bound[canonical].base is not None
+        ):
             canonical = bound[canonical].base  # a tensor map selects its base array
-        if canonical not in buffers and not (canonical in bound and bound[canonical].kind in ("buffer", "view")):
-            raise InputError(f"NumSim output selector {selector!r} does not identify a bound kernel buffer")
+        if canonical not in buffers and not (
+            canonical in bound and bound[canonical].kind in ("buffer", "view")
+        ):
+            raise InputError(
+                f"NumSim output selector {selector!r} does not identify a bound kernel buffer"
+            )
         if canonical in seen:
             raise InputError(f"NumSim buffer {canonical!r} is exposed as more than one output")
         seen.add(canonical)
@@ -599,10 +745,13 @@ def _tensor_map_view(image: np.ndarray, base: np.ndarray, data: bytes) -> np.nda
     rank = int(raw[59]) & 7
     if not 1 <= rank <= 5:
         return None
-    dims = [int.from_bytes(raw[16 + 4 * a: 20 + 4 * a].tobytes(), "little") or 2**32 for a in range(rank)]
+    dims = [
+        int.from_bytes(raw[16 + 4 * a : 20 + 4 * a].tobytes(), "little") or 2**32
+        for a in range(rank)
+    ]
     strides_bytes = []
     for pair in range(2):
-        packed = int.from_bytes(raw[36 + 9 * pair: 45 + 9 * pair].tobytes(), "little")
+        packed = int.from_bytes(raw[36 + 9 * pair : 45 + 9 * pair].tobytes(), "little")
         strides_bytes += [(packed & ((1 << 36) - 1)) << 4, (packed >> 36) << 4]
     item = base.dtype.itemsize
     pointer = int.from_bytes(raw[0:8].tobytes(), "little")
@@ -614,8 +763,12 @@ def _tensor_map_view(image: np.ndarray, base: np.ndarray, data: bytes) -> np.nda
     if offset < 0 or extent > flat.size or offset % item:
         return None
     return np.lib.stride_tricks.as_strided(
-        flat[offset:].view(base.dtype) if (flat.size - offset) % item == 0 else flat[offset: flat.size - (flat.size - offset) % item].view(base.dtype),
-        shape=shape, strides=strides, writeable=False,
+        flat[offset:].view(base.dtype)
+        if (flat.size - offset) % item == 0
+        else flat[offset : flat.size - (flat.size - offset) % item].view(base.dtype),
+        shape=shape,
+        strides=strides,
+        writeable=False,
     )
 
 
@@ -627,6 +780,36 @@ def _input_digest(bound: Mapping[str, BoundInput]) -> str:
         for part in bound[name].native[1:]:
             digest.update(part if isinstance(part, bytes) else repr(part).encode())
     return digest.hexdigest()
+
+
+def _positive_int(knob: str, value: Any, expected: str) -> None:
+    """Engine knob check: ``TypeError`` for a non-integer (``bool`` included),
+    ``ValueError`` for an integer below 1."""
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{knob} must be {expected}, got {type(value).__name__} {value!r}")
+    if int(value) < 1:
+        raise ValueError(f"{knob} must be {expected}, got {value!r}")
+
+
+def _subset_key(subset: Any) -> tuple:
+    """Order-free identity of a subset's selection (None = the full launch)."""
+    if subset is None:
+        return (None, None)
+    clusters, ctas = getattr(subset, "cluster_ids", None), getattr(subset, "cta_ids", None)
+    return (
+        None if clusters is None else tuple(sorted(int(c) for c in clusters)),
+        None if ctas is None else tuple(sorted(int(c) for c in ctas)),
+    )
+
+
+def _check_subset_ids(subset: Any) -> None:
+    for field in ("cluster_ids", "cta_ids"):
+        ids = getattr(subset, field, None)
+        if ids is None:
+            continue
+        values = [int(v) for v in ids]
+        if len(set(values)) != len(values):
+            raise InputError(f"ExecutionSubset.{field} has duplicate ids {sorted(values)}")
 
 
 class Engine:
@@ -649,9 +832,18 @@ class Engine:
         opt_level: int = 1,
     ):
         opts = options()
+        if not (isinstance(max_workers, str) and max_workers == "auto"):
+            _positive_int("max_workers", max_workers, "a positive integer or 'auto'")
         self.max_workers = (os.cpu_count() or 1) if max_workers == "auto" else int(max_workers)
-        if self.max_workers < 1:
-            raise ValueError("max_workers must be a positive integer or 'auto'")
+        # Loop policy knobs: None = engine default; otherwise a positive int.
+        # Invalid values raise at construction, never at run time (a zero
+        # quantum would never reschedule).
+        for knob, value in (
+            ("native_loop_iteration_budget", native_loop_iteration_budget),
+            ("native_loop_reschedule_quantum", native_loop_reschedule_quantum),
+        ):
+            if value is not None:
+                _positive_int(knob, value, "a positive integer or None")
         self.loop_budget = native_loop_iteration_budget
         self.quantum = native_loop_reschedule_quantum
         self.seed = opts.seed if seed is None else int(seed)
@@ -662,8 +854,9 @@ class Engine:
         self._phase_memo: dict[tuple, list[dict[str, Any]]] = {}
 
     # -- core call ---------------------------------------------------------
-    def _native_run(self, module: CompiledModule, bound: Mapping[str, BoundInput], mode: str,
-                    **extra: Any) -> dict[str, Any]:
+    def _native_run(
+        self, module: CompiledModule, bound: Mapping[str, BoundInput], mode: str, **extra: Any
+    ) -> dict[str, Any]:
         if "synccheck_limits" in extra:
             extra = {**extra, "synccheck_limits": dict(extra["synccheck_limits"])}
         try:
@@ -675,7 +868,9 @@ class Engine:
                 raise NumSimBuildError(str(error)) from error
             raise
 
-    def _native_call(self, module: CompiledModule, bound, mode: str, extra: Mapping[str, Any]) -> dict[str, Any]:
+    def _native_call(
+        self, module: CompiledModule, bound, mode: str, extra: Mapping[str, Any]
+    ) -> dict[str, Any]:
         return native().run(
             module.handle,
             {name: b.native for name, b in bound.items()},
@@ -698,7 +893,9 @@ class Engine:
 
         bound = canonicalize_inputs(module, inputs)
         natives = {key: b.native for key, b in bound.items()}
-        addresses = native().plan_global_addresses(module.handle, natives, host_addrs=host_addresses(bound))
+        addresses = native().plan_global_addresses(
+            module.handle, natives, host_addrs=host_addresses(bound)
+        )
         lookup = {}
         for kernel in module.spec.kernels:
             for slot in kernel.host_abi:
@@ -712,7 +909,13 @@ class Engine:
         return int(addresses[canonical])
 
     @staticmethod
-    def _subset_extra(subset: Any, assumptions: Any = None, module: CompiledModule | None = None) -> dict[str, Any]:
+    def _subset_extra(
+        subset: Any,
+        assumptions: Any = None,
+        module: CompiledModule | None = None,
+        *,
+        whole_module: bool = False,
+    ) -> dict[str, Any]:
         """``ExecutionSubset`` -> resident cluster ids for ``RunConfig::subset``.
 
         ``cluster_ids`` are linear cluster ids. ``cta_ids`` (flattened global
@@ -723,13 +926,42 @@ class Engine:
         # field, external_grid_dependencies_satisfied, is satisfied
         # automatically at a launch boundary, and no corpus case sets it.
         del assumptions
+        launches = len(module.spec.kernels) if module is not None else None
         if isinstance(subset, Mapping):
-            chosen = {(tuple(getattr(v, "cluster_ids", None) or ()) if getattr(v, "cluster_ids", None) is not None else None,
-                       tuple(getattr(v, "cta_ids", None) or ()) if getattr(v, "cta_ids", None) is not None else None)
-                      for v in subset.values()}
+            # {phase index: ExecutionSubset} (legacy). Indices are launch
+            # positions; an absent phase runs in full. One engine run serves
+            # every launch (RunConfig::subset is per run), so every launch
+            # must select the same clusters (numsim-behaviour-deltas H6).
+            for index in subset:
+                if isinstance(index, bool) or not isinstance(index, (int, np.integer)):
+                    raise TypeError(
+                        f"ExecutionSubset phase indices must be integers, got {index!r}"
+                    )
+                if launches is not None and not 0 <= int(index) < launches:
+                    raise InputError(
+                        f"ExecutionSubset phase index {index} is outside the module's "
+                        f"{launches} launch(es)"
+                    )
+            for value in subset.values():
+                _check_subset_ids(value)
+            chosen = {_subset_key(v) for v in subset.values()}
+            if launches is not None and len(subset) < launches:
+                chosen.add(_subset_key(None))
             if len(chosen) > 1:
-                raise InputError("per-phase subsets must be equal: one engine run serves every launch")
+                raise InputError(
+                    "per-phase subsets must be equal: one engine run serves every launch"
+                )
             subset = next(iter(subset.values()), None)
+        elif subset is not None:
+            _check_subset_ids(subset)
+            if whole_module and launches is not None and launches > 1:
+                # Engine.run covers every launch: a bare subset would silently
+                # apply to all of them (legacy: never broadcast). The checker
+                # phase calls select one phase and keep the bare form.
+                raise InputError(
+                    "an ExecutionSubset is not broadcast to a multi-kernel module: pass "
+                    "{phase index: subset} for every launch"
+                )
         if subset is None:
             return {}
         clusters = getattr(subset, "cluster_ids", None)
@@ -754,7 +986,7 @@ class Engine:
         assumptions: Any = None,
         outputs: Iterable[str] | Mapping[str, str] | None = None,
     ) -> NumSimResult:
-        extra = self._subset_extra(subset, assumptions, module)
+        extra = self._subset_extra(subset, assumptions, module, whole_module=True)
         started = time.perf_counter()
         bound = canonicalize_inputs(module, inputs)
         selected = _select_outputs(bound, outputs, module)
@@ -769,7 +1001,7 @@ class Engine:
                 region = raw["outputs"].get(b.base)
                 if region is not None:
                     _, _, start, length = b.native
-                    data = region[start:start + length]
+                    data = region[start : start + length]
             if data is None:
                 continue
             given = inputs.get(selector)
@@ -788,18 +1020,30 @@ class Engine:
             result_outputs[external] = array.reshape(shape) if shape is not None else array
         diagnostics = [
             diagnostic_from_core(
-                d, _span_resolver(module, d["kernel_index"] if isinstance(d.get("kernel_index"), int) else None)
+                d,
+                _span_resolver(
+                    module, d["kernel_index"] if isinstance(d.get("kernel_index"), int) else None
+                ),
             )
             for d in raw["diagnostics"]
         ]
-        attach_operations(diagnostics, 0, _site_info_resolver(module), _kernel_span_resolver(module))
+        attach_operations(
+            diagnostics, 0, _site_info_resolver(module), _kernel_span_resolver(module)
+        )
         timing = _timing(module, bind_ms, raw, report_started)
         _raise_unless_completed(raw["status"], diagnostics)
-        return NumSimResult(outputs=result_outputs, diagnostics=diagnostics, stats=dict(raw["stats"]),
-                            status=dict(raw["status"]), timing=timing)
+        return NumSimResult(
+            outputs=result_outputs,
+            diagnostics=diagnostics,
+            stats=dict(raw["stats"]),
+            status=dict(raw["status"]),
+            timing=timing,
+        )
 
     # -- checkers ----------------------------------------------------------
-    def _checker_run(self, module: CompiledModule, bound, mode: str, extra: Mapping[str, Any]) -> dict[str, Any]:
+    def _checker_run(
+        self, module: CompiledModule, bound, mode: str, extra: Mapping[str, Any]
+    ) -> dict[str, Any]:
         """One checker run over every launch, memoized for the phase loop."""
 
         key = (mode, module.cache_key, _input_digest(bound), tuple(sorted(extra.items())))
@@ -808,8 +1052,14 @@ class Engine:
             self._phase_memo[key] = self._native_run(module, bound, mode, **extra)
         return self._phase_memo[key]
 
-    def _checker_phase(self, mode: str, module: CompiledModule, inputs: dict[str, Any], phase_index: int,
-                       extra: Mapping[str, Any]) -> AnalysisResult:
+    def _checker_phase(
+        self,
+        mode: str,
+        module: CompiledModule,
+        inputs: dict[str, Any],
+        phase_index: int,
+        extra: Mapping[str, Any],
+    ) -> AnalysisResult:
         kernels = module.spec.kernels
         if not 0 <= phase_index < len(kernels):
             raise ValueError(f"native {mode} phase {phase_index} is outside [0, {len(kernels)})")
@@ -824,7 +1074,9 @@ class Engine:
         # Payloads and reports come one per launch, in launch order. A
         # payload's own `launch` field is used only when it is consistent
         # (a launch without sync events cannot name its kernel).
-        numbers = [int(r.get("launch", i)) for i, r in enumerate(reports)] or list(range(len(payloads)))
+        numbers = [int(r.get("launch", i)) for i, r in enumerate(reports)] or list(
+            range(len(payloads))
+        )
         if len(set(numbers)) != len(numbers):
             numbers = list(range(len(payloads)))
         launches = dict(zip(numbers, payloads))
@@ -833,28 +1085,54 @@ class Engine:
             report = next((r for r in reports if int(r.get("launch", -1)) == phase_index), None)
             if report is not None:
                 base = phase_payload(
-                    checker=mode, phase_index=phase_index, phase_name=kernels[phase_index].name,
-                    records=[record_from_core(f, lambda site: span_of_kernel(phase_index, site))
-                             for f in report.get("findings", ())],
-                    status={}, diagnostics=[], coverage=report.get("coverage", ()),
+                    checker=mode,
+                    phase_index=phase_index,
+                    phase_name=kernels[phase_index].name,
+                    records=[
+                        record_from_core(f, lambda site: span_of_kernel(phase_index, site))
+                        for f in report.get("findings", ())
+                    ],
+                    status={},
+                    diagnostics=[],
+                    coverage=report.get("coverage", ()),
                 )
             elif raw["status"].get("kind") not in (None, "completed"):
                 # Only the engine's own stop (RunStatus) prevents later
                 # launches; a checker verdict on an earlier launch never does.
                 stop = next((d for d in raw["diagnostics"] if d.get("source") == "run_status"), {})
                 failed = stop.get("kernel_index")
-                cause = f"{stop.get('kind')}: {stop.get('message') or stop.get('reason') or ''}".strip(": ")
-                base = {"verdict": "incomplete", "incomplete": [{
-                    "kind": "analysis_incomplete", "status": "incomplete", "reason": "launch_not_executed",
-                    "stopped_kernel_index": failed,
-                    "message": (f"launch {phase_index} did not run: the engine stopped the module at "
-                                f"launch {failed} ({cause})"),
-                }]}
+                cause = (
+                    f"{stop.get('kind')}: {stop.get('message') or stop.get('reason') or ''}".strip(
+                        ": "
+                    )
+                )
+                base = {
+                    "verdict": "incomplete",
+                    "incomplete": [
+                        {
+                            "kind": "analysis_incomplete",
+                            "status": "incomplete",
+                            "reason": "launch_not_executed",
+                            "stopped_kernel_index": failed,
+                            "message": (
+                                f"launch {phase_index} did not run: the engine stopped the module at "
+                                f"launch {failed} ({cause})"
+                            ),
+                        }
+                    ],
+                }
             else:
-                base = {"verdict": "incomplete", "incomplete": [{
-                    "kind": "analysis_incomplete", "status": "incomplete", "reason": "no_checker_report",
-                    "message": f"the {mode} checker produced no report for launch {phase_index}",
-                }]}
+                base = {
+                    "verdict": "incomplete",
+                    "incomplete": [
+                        {
+                            "kind": "analysis_incomplete",
+                            "status": "incomplete",
+                            "reason": "no_checker_report",
+                            "message": f"the {mode} checker produced no report for launch {phase_index}",
+                        }
+                    ],
+                }
         last_launch = max(launches) if launches else len(reports) - 1
         diagnostics = []
         for diagnostic in raw["diagnostics"]:
@@ -863,7 +1141,9 @@ class Engine:
             if owner == phase_index:
                 site = diagnostic.get("site")
                 record = diagnostic_from_core(diagnostic, lambda s, k=owner: span_of_kernel(k, s))
-                record.setdefault("source_span", span_of_kernel(owner, site) if isinstance(site, int) else None)
+                record.setdefault(
+                    "source_span", span_of_kernel(owner, site) if isinstance(site, int) else None
+                )
                 diagnostics.append(record)
         payload = checker_phase_payload(
             base,
@@ -922,11 +1202,18 @@ class Engine:
         if resource_limits is not None:
             extra["state_budget"] = int(resource_limits.max_backtrack_nodes)
             extra["transition_budget"] = int(resource_limits.max_loop_steps)
-            extra["synccheck_limits"] = tuple(sorted(
-                (name, int(getattr(resource_limits, name)))
-                for name in ("max_schedules", "max_events_per_run", "max_total_events",
-                             "max_wall_time_ms", "max_diagnostic_bytes")
-            ))
+            extra["synccheck_limits"] = tuple(
+                sorted(
+                    (name, int(getattr(resource_limits, name)))
+                    for name in (
+                        "max_schedules",
+                        "max_events_per_run",
+                        "max_total_events",
+                        "max_wall_time_ms",
+                        "max_diagnostic_bytes",
+                    )
+                )
+            )
         if max_transitions is not None:
             extra["max_rounds"] = int(max_transitions)
         result = self._checker_phase("synccheck", module, inputs, phase_index, extra)
@@ -940,13 +1227,17 @@ class Engine:
         if coverage_bounds is not None:
             coverage["requested_bounds"] = {
                 "max_warp_preemptions": int(coverage_bounds.max_warp_preemptions),
-                "max_completion_schedule_deviations": int(coverage_bounds.max_completion_schedule_deviations),
+                "max_completion_schedule_deviations": int(
+                    coverage_bounds.max_completion_schedule_deviations
+                ),
             }
         coverage["bounded_exploration"] = False
         return result
 
 
-def _timing(module: CompiledModule, bind_ms: float, raw: Mapping[str, Any], report_started: float) -> dict[str, float]:
+def _timing(
+    module: CompiledModule, bind_ms: float, raw: Mapping[str, Any], report_started: float
+) -> dict[str, float]:
     engine = raw.get("timing") or {}
     # Lowering and module-cache loading are separate phases: exactly one of
     # the two is non-zero (`CompiledModule.cache_hit`).
@@ -1003,4 +1294,11 @@ def _span_resolver(module: CompiledModule, kernel_index: int | None):
     return span_of
 
 
-__all__ = ["BoundInput", "Engine", "ExecutionError", "InputError", "MissingBindingsError", "canonicalize_inputs"]
+__all__ = [
+    "BoundInput",
+    "Engine",
+    "ExecutionError",
+    "InputError",
+    "MissingBindingsError",
+    "canonicalize_inputs",
+]

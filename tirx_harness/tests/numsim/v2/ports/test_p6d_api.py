@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -54,11 +54,6 @@ def test_engine_native_loop_knobs_accept_positive_values():
         np.testing.assert_array_equal(result.outputs["values"], np.ones(32, dtype=np.float32))
 
 
-@v2_gap(
-    "[W8] Engine does not validate native_loop_iteration_budget / native_loop_reschedule_quantum: "
-    "0 and True are accepted (budget=0 completes, quantum=0 hangs Engine.run), 1.5 fails only at run "
-    "time with TypeError"
-)
 def test_engine_native_loop_policy_is_explicit_and_validated():
     """Replaces the legacy validation half: invalid knobs are rejected at
     construction."""

@@ -133,7 +133,7 @@ def test_scalar_parameter_rejects_buffer_values():
 
 
 def test_engine_subset_selects_clusters(module):
-    from tirx_harness.numsim.api import ExecutionSubset
+    from tirx_harness.numsim.v2 import ExecutionSubset
 
     result = _skip_if_unimplemented(
         lambda: v2.Engine().run(module, _inputs(), subset=ExecutionSubset(cluster_ids=[0]))
@@ -150,10 +150,14 @@ def test_engine_subset_maps_cta_ids_to_whole_clusters(module):
     from tirx_harness.numsim.v2.run import Engine
 
     assert Engine._subset_extra(ExecutionSubset(cta_ids=[3, 1]), None, module) == {"subset": (1, 3)}
+    # Phase mappings (module=None: no launch count to check indices against).
     per_phase = {0: ExecutionSubset(cluster_ids=[2]), 1: ExecutionSubset(cluster_ids=[2])}
-    assert Engine._subset_extra(per_phase, None, module) == {"subset": (2,)}
+    assert Engine._subset_extra(per_phase, None, None) == {"subset": (2,)}
+    assert Engine._subset_extra({0: ExecutionSubset(cluster_ids=[2])}, None, module) == {"subset": (2,)}
     with pytest.raises(v2.InputError, match="must be equal"):
-        Engine._subset_extra({0: ExecutionSubset(cluster_ids=[1]), 1: ExecutionSubset(cluster_ids=[2])}, None, module)
+        Engine._subset_extra({0: ExecutionSubset(cluster_ids=[1]), 1: ExecutionSubset(cluster_ids=[2])}, None, None)
+    with pytest.raises(v2.InputError, match="outside the module"):
+        Engine._subset_extra(per_phase, None, module)  # vector_add has one launch
     both = ExecutionSubset(cta_ids=[1, 3], cluster_ids=[3, 5])
     assert Engine._subset_extra(both, None, module) == {"subset": (3,)}
     with pytest.raises(v2.InputError, match="outside the grid"):
@@ -466,3 +470,20 @@ def test_incomplete_reason_is_the_message_when_message_is_empty():
     )
     text = rep.SyncCheckReport([rep.AnalysisResult("synccheck", payload)]).format()
     assert "[INCOMPLETE] analysis_incomplete: tma_swizzled_16b_interleave_unmodeled" in text
+
+
+def test_engine_knobs_are_validated_at_construction():
+    """Invalid Engine knobs raise a typed error when the Engine is built, never
+    at run time: TypeError for a non-integer (bool included), ValueError below 1."""
+
+    for knob in ("native_loop_iteration_budget", "native_loop_reschedule_quantum"):
+        assert getattr(v2.Engine(**{knob: 17}), {"native_loop_iteration_budget": "loop_budget",
+                                                 "native_loop_reschedule_quantum": "quantum"}[knob]) == 17
+        for bad, error in ((0, ValueError), (-3, ValueError), (True, TypeError), (1.5, TypeError), ("8", TypeError)):
+            with pytest.raises(error, match=knob):
+                v2.Engine(**{knob: bad})
+    assert v2.Engine(max_workers=np.int64(4)).max_workers == 4
+    with pytest.raises(ValueError, match="positive"):
+        v2.Engine(max_workers=0)
+    with pytest.raises(TypeError, match="positive integer"):
+        v2.Engine(max_workers=True)

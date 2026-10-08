@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 from tirx_harness.numsim.cases import NumSimCase
 from tirx_harness.numsim.errors import NumSimExecutionError
@@ -47,11 +47,6 @@ class _RecordingEngine(v2.Engine):
         return super().run(*args, **kwargs)
 
 
-@v2_gap(
-    "v2.run_case does not check reference keys: it runs the kernel (engine.run called) "
-    "and returns a compare report without raising; legacy raised "
-    "NumSimExecutionError('... must name selected kernel outputs ...') before execution"
-)
 def test_run_case_requires_reference_keys_to_name_selected_outputs():
     """Port of tests/numsim/integration/test_api.py::test_run_case_requires_reference_keys_to_name_selected_outputs.
 
@@ -76,10 +71,6 @@ def test_run_case_requires_reference_keys_to_name_selected_outputs():
     assert not engine.executed
 
 
-@v2_gap(
-    "v2.run_case raises a plain ValueError('NumSim expected outputs must not be empty') "
-    "for an empty reference; legacy raised NumSimExecutionError (not executed in both)"
-)
 def test_run_case_rejects_empty_reference_before_execution():
     """Port of tests/numsim/integration/test_api.py::test_run_case_rejects_empty_reference_before_execution.
 
@@ -104,11 +95,6 @@ def test_run_case_rejects_empty_reference_before_execution():
     assert not engine.executed
 
 
-@v2_gap(
-    "v2.run_case calls the reference before binding inputs and never restores host "
-    "buffers: the kernel sees the reference's source=99 (mismatch actual=99, "
-    "expected the frozen 3) and the caller's source/output stay mutated (99/7) instead of restored (3/0)"
-)
 def test_run_case_freezes_bindings_before_mutating_reference():
     """Port of tests/numsim/integration/test_api.py::test_run_case_freezes_bindings_before_mutating_reference.
 

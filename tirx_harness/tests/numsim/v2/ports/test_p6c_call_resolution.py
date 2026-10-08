@@ -24,7 +24,7 @@ from tests.numsim.support.kernels import (
     tcgen_lifecycle_single_cta,
     tcgen_tmem_to_local_roundtrip,
 )
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 from tirx_harness.numsim.errors import UnsupportedTIRxError
 
@@ -72,11 +72,6 @@ def test_frontend_discovers_typed_tensor_map_parameters_from_exact_owners():
     assert _tensor_maps(module) == [("input_map", 0), ("output_map", 1)]
 
 
-@v2_gap(
-    "v2 accepts two distinct TensorMap parameters that share the public name "
-    "'descriptor' (host ABI lists both, run completes); legacy build_host_abi "
-    "raised HostAbiError 'host binding \"descriptor\"' for the ambiguous binding"
-)
 def test_host_abi_rejects_distinct_tensor_map_parameters_with_one_public_name():
     """Port of ``tests/numsim/registry/test_call_resolution.py::test_host_abi_rejects_distinct_tensor_map_parameters_with_one_public_name``.
 
