@@ -265,3 +265,36 @@ def test_per_16bytes_report_carries_its_pattern_and_width():
         copy = only(program, "BulkCopy")
         assert copy.report == {"Per16BytesPattern": {"pattern": pattern, "bits": bits}}
     assert only(lower(report_kernel("per_element::ff", cluster=False, layout=1)), "BulkCopy").report == "PerElementFf"
+
+
+def test_sites_name_one_logical_buffer_per_pointer_operand():
+    """W5-15 (format 3): `SiteInfo.buffers` lists each pointer operand's logical
+    buffer in PTX operand order (copy: dst, src, then the mbarrier); `buffer` is
+    buffers[0]."""
+    from tests.numsim.runtime.test_mbarrier_report import report_kernel
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(report_kernel("per_element::ff", cluster=False, layout=1))
+    sites = {i.variant: program.sites[program.code_sites[n]] for n, i in enumerate(program.code)
+             if i.variant in ("BulkCopy", "MbarArrive")}
+    assert sites["BulkCopy"].all_buffers() == ["shared", "source", "barrier"]
+    assert sites["MbarArrive"].all_buffers() == ["barrier"]
+    payload = sites["BulkCopy"].to_json()
+    assert payload["buffers"] == ["shared", "source", "barrier"] and payload["buffer"] == "shared"
+    assert pb.FORMAT_VERSION == 3
+
+
+def test_bare_fence_defaults_to_acq_rel(lower_source):
+    """W5-16: PTX `fence{.sem}.scope` with no `.sem` is `.acq_rel` (ISA: "If the optional
+    .sem qualifier is absent, .acq_rel is assumed by default."); `.sc` stays explicit."""
+    program = lower_source('''
+@T.prim_func
+def k():
+    T.attr({"tirx.device_entry": T.bool(True)})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    T.ptx.fence.cta()
+    T.ptx.fence.sc.gpu()
+''')
+    fences = [(f.kind, f.sem, f.scope) for f in all_of(program, "Fence")]
+    assert fences == [("Thread", "AcqRel", "Cta"), ("Thread", "Sc", "Gpu")]

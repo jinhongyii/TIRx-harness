@@ -779,3 +779,19 @@ definition.
 | R7 | `bar.warp.sync` | Ordering only among mask participants; warp is not a scope | WC whole-warp merge wrong (§9.10) | Correct (per lane) |
 | R8 | `fence.sc` | Runtime order over morally strong pairs; synchronizes-with; treat as acq_rel too (ISA silent) | n/a | Linearise by sim order, pairwise moral strength |
 | R9 | Data race definition; load carve-out | Overlap ∧ conflict ∧ ¬morally strong ∧ ¬causality; weak loads never exempt; strong loads exempt | G strong-load carve-out stricter than PTX | Correct; keep the advisory separate |
+
+## R10 (W5-16): the default `.sem` of `fence`
+
+**Question.** A bare `fence.cta` (no `.sem`): is it `.sc` or `.acq_rel`?
+
+**Answer: `.acq_rel`.** PTX ISA, *Parallel Synchronization and Communication
+Instructions: membar/fence*. The syntax is `fence{.sem}.scope;` with
+`.sem = { .sc, .acq_rel, .acquire, .release }`, and the description says:
+
+> "``fence.acq_rel`` is a light-weight fence that is sufficient for memory
+> synchronization in most programs. ... If the optional ``.sem`` qualifier is
+> absent, ``.acq_rel`` is assumed by default."
+
+v2 lowering emits `Fence { kind: Thread, sem: AcqRel }` for a bare `fence.<scope>`;
+`fence.sc.<scope>` stays `Sc`. The legacy `membar` forms are `.sc` by
+definition and are unchanged.

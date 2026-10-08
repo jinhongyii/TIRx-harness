@@ -365,3 +365,19 @@ def test_legacy_mma_fill_and_store_follow_the_lane_register_layout():
     for row, col in ((0, 0), (9, 3), (15, 15)):
         lane, local_id = 4 * (row % 8) + (col % 8) // 2, 4 * (col // 8) + 2 * (row // 8) + col % 2
         assert stored[0, row, col] == lane * 100 + local_id
+
+
+def test_shared_scope_view_over_a_mapa_result_reads_the_cluster_window():
+    """A `decl_buffer(scope="shared", data=<mapa.shared::cluster result>)` is addressed in
+    shared::cluster space (32-bit window address), not as a generic pointer (W2)."""
+    import inspect
+    import re
+
+    from tests.numsim.runtime import test_scalar_control as module
+    from tirx_harness.numsim.v2.lowering import lower
+
+    test = inspect.getsource(module.test_canonical_mapa_integer_address_resolves_shared_memory)
+    kernel = getattr(module, re.search(r"transpile\((\w+)", test).group(1))
+    program = lower(kernel)
+    reads = [i for i in all_of(program, "LoadAddr") if i.space != "Generic"]
+    assert reads and all(i.space == "SharedCluster" for i in reads)

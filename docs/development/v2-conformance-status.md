@@ -29,6 +29,7 @@ fail-closed reason); **crash** (engine runtime error or binder exception); **no 
 
 | issue | owner | cause | cases (modes) |
 | --- | --- | --- | --- |
+| V2C-TF1 (closed) | W1, W12 | Coverage regression: TVM's `TilePrimitiveDispatch` rejected tile ops in 58 public-API kernels that legacy compiled. All 58 are now resolved: lowered through TVM after a legacy-spelling repair or by a v2 tile form (`v2/lowering/tile_forms/`, lowering-inventory Part F), or ruled hardware-invalid (deltas L4–L7, with the tests moved to valid shapes), or blocked only by L1 (replicated TMEM view). | `tests/numsim/v2/tile_forms/legacy_compiled.tsv`; `test_legacy_compiled_tile_forms.py`: 62 pass, 1 strict-xfail (L1) |
 | V2C-31 | synccheck | synccheck exhausts its state/transition budget where legacy completed within the same ResourceLimits | 1: `kda_forward_portfolio_multishape` (s) |
 
 ## Cases without a legacy result

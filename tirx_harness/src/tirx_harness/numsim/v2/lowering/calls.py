@@ -270,6 +270,7 @@ class CallsMixin:
         name = _string(node.args[1])
         if name is None:
             raise _Unsupported(node, "mov_sreg register name must be a literal")
+        name = name.removeprefix("%")  # legacy accepted the PTX spelling `%laneid` too (W11-6)
         bits = int(node.args[0].value)
         ty = pb.Ty("U64") if bits == 64 else pb.Ty("U32")
         if name in _SREGS:

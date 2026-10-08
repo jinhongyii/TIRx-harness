@@ -279,3 +279,20 @@ def k(source: T.Buffer((128, 2), "float32"), output: T.Buffer((128, 2), "float32
     assert len(barriers) == 3
     pcs = [pc_of(program, b) for b in barriers]
     assert pcs[0] < pc_of(program, stores[0]) < pcs[1] < pc_of(program, loads[0]) < pcs[2]
+
+
+def test_fallback_watch_is_hooked_into_tvm_dispatch():
+    """Guard for F4: ``fallback_watch`` patches TVM's private dispatch table. If
+    TVM renames the table or the ``copy/fallback`` variant, the watch would
+    silently record nothing and register copies would regress to TVM's
+    single-thread fallback; this test fails instead."""
+    import tvm
+    from tvm import tirx
+    from tvm.script import tirx as T
+
+    func = tvm.script.from_source(LOCAL_WARP_COPY, {"T": T})
+    with tile_copy.fallback_watch() as picked:
+        assert picked.hooked == 1, "TVM's copy/fallback variant was not found in its dispatch table"
+        with tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}):
+            tirx.transform.TilePrimitiveDispatch()(tvm.IRModule({"main": func}))
+    assert len(picked) == 1 and tile_copy.reroute(picked[0])

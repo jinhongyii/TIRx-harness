@@ -202,7 +202,11 @@ class PtxCtx:
     # -- emission ---------------------------------------------------------
     def site(self) -> int:
         if self._site is None:
-            self._site = self.lw.site(self.node, op_name=self.d.op_name)
+            # W5-15: one logical buffer per pointer operand, in PTX operand order
+            # (copies: dst then src; then the completion mbarrier).
+            pointers = [value for info, values in zip(self.d.operands, self.d.values)
+                        if info.kind in ("addr", "ptr") for value in values if value is not ptx_decode.SINK]
+            self._site = self.lw.site(self.node, op_name=self.d.op_name, operands=pointers or None)
         return self._site
 
     def emit(self, variant: str, /, **fields: Any) -> None:
@@ -782,7 +786,9 @@ def lower_cluster_barrier(c: PtxCtx) -> None:
 def lower_fence(c: PtxCtx) -> None:
     name = c.name
     if name == "fence":
-        c.emit("Fence", kind="Thread", sem=c.sem("Sc"), scope=c.scope())
+        # PTX ISA (fence): "If the optional .sem qualifier is absent, .acq_rel is
+        # assumed by default." (W5-16; racecheck-isa-answers.md R10)
+        c.emit("Fence", kind="Thread", sem=c.sem("AcqRel"), scope=c.scope())
     elif name == "fence_mbarrier_init":
         c.emit("Fence", kind="MbarrierInit", sem="Release", scope="Cluster")
     elif name == "fence_proxy":
