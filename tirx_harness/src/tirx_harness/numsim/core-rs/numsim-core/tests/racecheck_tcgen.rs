@@ -375,3 +375,20 @@ fn restricted_commit_does_not_imply_completed_ops() {
     assert!(clean(&run(false)));
     assert!(has_race(&run(true)));
 }
+
+/// T17: an un-waited tcgen05.ld is reviewed once, against the first write
+/// that overwrites its bytes (legacy); a second overwrite is not a new review.
+#[test]
+fn unwaited_ld_reviewed_once_per_overwrite_chain() {
+    let mut k = K::one_warp();
+    let ld = k.issue(0, 0, AsyncKind::TcgenLd, Proxy::Tcgen, &[], &[]);
+    k.aacc(ld, Milestone::Read, AccessKind::Read, Proxy::Tcgen, TMEM, 0..64);
+    for _ in 0..2 {
+        let st = k.issue(0, 0, AsyncKind::TcgenSt, Proxy::Tcgen, &[], &[]);
+        k.aacc(st, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, 0..64);
+        k.done_warp(st, Milestone::Write, 0, 1);
+    }
+    let r = k.run();
+    let n = r.findings.iter().filter(|f| matches!(f.kind, FindingKind::TmemLifetimeReview { .. })).count();
+    assert_eq!(n, 1, "{r:?}");
+}

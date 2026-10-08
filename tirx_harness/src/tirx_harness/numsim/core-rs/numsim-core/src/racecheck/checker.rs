@@ -1363,6 +1363,10 @@ impl Checker {
                         // judged by a different bridge is not covered.
                         cell.reads.retain(|r| !(w.same_view_class(&r.w) && this.ordered(cur, &r.w, a.proxy)));
                     }
+                    // An un-waited tcgen05.ld read is reported once, against
+                    // the first write that overwrites it (the review names
+                    // the hazard; legacy shadow semantics, deltas T17).
+                    cell.reads.retain(|r| !this.slot_of(r.w.stamp.actor()).is_some_and(|x| x.kind == AsyncKind::TcgenLd));
                 } else {
                     cell.reads.record(Entry { w, rel: None, base: None }, wide, |p| this.ordered(cur, p, a.proxy));
                 }
