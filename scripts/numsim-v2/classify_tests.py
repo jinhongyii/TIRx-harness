@@ -75,6 +75,10 @@ OVERRIDES: dict[str, tuple[str, str, str]] = {
     "tests/numsim/integration/test_numpy_backend.py": ("C", "delete", "legacy numpy backend switch"),
     "tests/numsim/integration/test_dependency_isolation.py": ("C", "delete", "legacy import layering"),
     "tests/numsim/integration/test_tirx_kernels.py": ("F", "keep", "tirx-kernels package loader used by the corpus"),
+    # Phase-3 review of the v2 public-API run: the only internals-pin failure
+    # with no semantic assert left once the pin is stripped.
+    "tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_g2s_cluster_dynamic_predicate_transpiles": (
+        "C", "delete", "only asserts the legacy resolved PTX op-name set"),
     "tests/test_dump_kernel.py": ("F", "keep", "dump_kernel tool"),
     "tests/test_packaging.py": ("F", "keep", "packaging"),
     "tests/test_skills.py": ("F", "keep", "skills CLI"),
@@ -195,6 +199,7 @@ class Row:
     rust_tests: str = ""
     signals: str = ""
     surface: str = ""
+    v2_status: str = ""
 
 
 def directory_of(rel: str) -> str:
@@ -213,6 +218,14 @@ def load_tsv(path: Path) -> dict[str, tuple[str, str, str]]:
         for row in csv.DictReader(handle, delimiter="\t"):
             out[row["legacy_test"].strip()] = (row["status"].strip(), row.get("rust_tests", "").strip(), row.get("note", "").strip())
     return out
+
+
+def load_v2_status(path: Path) -> dict[str, str]:
+    """``NUMSIM_IMPL=v2`` outcome of the public-API A tests (per function)."""
+    if not path.exists():
+        return {}
+    with path.open() as handle:
+        return {row["legacy_test"]: row["v2_status"] for row in csv.DictReader(handle, delimiter="\t")}
 
 
 def load_tile_rejections(path: Path) -> dict[str, str]:
@@ -280,8 +293,14 @@ def classify(row: Row, f: Features, module_src: str, rel: str, maps, tile) -> No
             return
     # 3. TVM-dispatch-rejected tile forms.
     if row.test_id in tile:
-        row.category, row.target, row.rule, row.reason = "E", "delete", "tile_dispatch_rejections", tile[row.test_id]
-        return
+        ratio = tile[row.test_id].split()[0]
+        done, _, total = ratio.partition("/")
+        if done == total:
+            row.category, row.target, row.rule, row.reason = "E", "delete", "tile_dispatch_rejections", tile[row.test_id]
+            return
+        # Only some parametrizations hit a rejected tile form: classify the
+        # function normally; retiring just those params is a manual edit.
+        row.signals = f"partial-E:{ratio}"
     # 4. Path rules.
     if rel.startswith(("tests/conformance/", "tests/numsim/v2/")):
         row.category, row.target, row.rule, row.reason = "N", "keep", "path", "new-layer test"
@@ -403,6 +422,9 @@ def walk(tests_root: Path, maps, tile) -> list[Row]:
                     feats.merge(features(helpers[name]))
             row = Row(test_id=f"{rel}::{prefix}{fn.name}", directory=directory_of(rel), params=param_count(fn))
             classify(row, feats, src, rel, maps, tile)
+            ratio = tile.get(row.test_id, "").split(" ", 1)[0]
+            if ratio and ratio.split("/")[0] != ratio.split("/")[-1]:
+                row.reason += f" [partial E: {ratio} kernels hit a TVM-rejected tile form; drop those params by hand]"
             row.surface = surface
             rows.append(row)
 
@@ -470,6 +492,9 @@ def main() -> int:
     tile = load_tile_rejections(COVERAGE / "tile_dispatch_rejections.txt")
     RUNNERS.update(discover_runners(args.tests))
     rows = walk(args.tests, maps, tile)
+    v2 = load_v2_status(COVERAGE / "v2_public_status.tsv")
+    for r in rows:
+        r.v2_status = v2.get(r.test_id, "")
     seen = {r.test_id for r in rows}
     for kind, table in maps.items():
         for stale in sorted(set(table) - seen):
@@ -477,9 +502,9 @@ def main() -> int:
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     with args.csv.open("w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["test_id", "directory", "params", "category", "target", "rule", "reason", "rust_tests", "surface", "signals"])
+        writer.writerow(["test_id", "directory", "params", "category", "target", "rule", "reason", "rust_tests", "surface", "v2_status", "signals"])
         for r in rows:
-            writer.writerow([r.test_id, r.directory, r.params, r.category, r.target, r.rule, r.reason, r.rust_tests, r.surface, r.signals])
+            writer.writerow([r.test_id, r.directory, r.params, r.category, r.target, r.rule, r.reason, r.rust_tests, r.surface, r.v2_status, r.signals])
     text = summary(rows)
     if args.check_goldens:
         text += "\n\n" + check_goldens(args.tests)
