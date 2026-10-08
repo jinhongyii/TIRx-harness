@@ -362,3 +362,25 @@ pub fn tma_many_waiters(warps: u32) -> RecordingObserver {
     }
     log.build()
 }
+
+/// `wgs` warpgroups (4 warps each) on one setmaxnreg pool: warpgroup 0
+/// increases (pending until warpgroup 1's decrease releases registers), the
+/// others decrease; then every warp credits `credits` warpgroup syncs of
+/// its own warpgroup (the engine logs one per completed aligned `bar.sync`).
+/// Shape of `kda_forward_portfolio_multishape` (5 warpgroups, ~30 credits).
+pub fn regpool_credits(wgs: u32, credits: u32) -> RecordingObserver {
+    let mut log = LogBuilder::new();
+    for wg in 0..wgs {
+        let warps = (4 * wg..4 * wg + 4).collect::<Vec<_>>();
+        let (inc, count) = if wg == 0 { (true, 232) } else { (false, 104) };
+        log.collective(&warps, 10 + wg, vec![(reg_pool(0), setmax(wg, inc, count))]);
+    }
+    for wg in 0..wgs {
+        for w in 4 * wg..4 * wg + 4 {
+            for k in 0..credits {
+                log.cmd(w, 100 + k, reg_pool(0), wg_sync(wg));
+            }
+        }
+    }
+    log.build()
+}

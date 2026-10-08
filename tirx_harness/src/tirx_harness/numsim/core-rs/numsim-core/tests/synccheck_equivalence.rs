@@ -278,11 +278,16 @@ fn compare(seed: u64, cases: u32, gen: fn(&mut Rng, u32) -> RecordingObserver) {
 /// `max_closed_percent`: tolerated fail-closed (`generation_assignment_differs`)
 /// variant results, in percent of the cases.
 fn compare_with(seed: u64, cases: u32, gen: fn(&mut Rng, u32) -> RecordingObserver, max_closed_percent: usize) {
+    compare_full(seed, cases, gen, max_closed_percent, None)
+}
+
+/// `fixed_warps`: warps per CTA for every case (default: 2-4 at random).
+fn compare_full(seed: u64, cases: u32, gen: fn(&mut Rng, u32) -> RecordingObserver, max_closed_percent: usize, fixed_warps: Option<u32>) {
     let mut rng = Rng(seed);
     let mut counts = [0usize; 4];
     let mut closed = 0usize;
     for case in 0..cases {
-        let warps = 2 + rng.below(3);
+        let warps = fixed_warps.unwrap_or_else(|| 2 + rng.below(3));
         let init = ResourceInit { cluster_warps: warps, ..cta(warps) };
         let log = gen(&mut rng, warps);
         let oracle = SynccheckConfig {
@@ -353,4 +358,39 @@ fn reductions_preserve_results_on_lap_logs() {
     // Lap-prone programs often leave the reference generation assignment in
     // gated projections, which fails closed by design.
     compare_with(0x0bad_cafe_f00d_d00d, 600, |rng, w| lap_log(rng, w + 1), 40);
+}
+
+/// setmaxnreg on two warpgroups (8 warps): one or two `Set`s per warpgroup
+/// (increases that wait for the other warpgroup's decrease, invalid
+/// directions and counts), with 0-2 warpgroup-sync credits per warp before,
+/// between and after them (missing credits are `MissingWarpgroupSync`).
+/// Guards the setmaxnreg-credit and `Poll`-resume singletons.
+fn regpool_log(rng: &mut Rng, _warps: u32) -> RecordingObserver {
+    let mut log = LogBuilder::new();
+    let counts = [104u32, 168, 232, 256, 24, 100];
+    for wg in 0..2u32 {
+        let warps = (4 * wg..4 * wg + 4).collect::<Vec<_>>();
+        let sets = 1 + rng.below(2);
+        for j in 0..sets {
+            for &w in &warps {
+                for k in 0..rng.below(3) {
+                    log.cmd(w, 100 + 10 * j + k, reg_pool(0), wg_sync(wg));
+                }
+            }
+            let inc = rng.chance(1, 2);
+            let count = counts[rng.below(counts.len() as u32) as usize];
+            log.collective(&warps, 10 + 2 * wg + j, vec![(reg_pool(0), setmax(wg, inc, count))]);
+        }
+        for &w in &warps {
+            for k in 0..rng.below(2) {
+                log.cmd(w, 200 + k, reg_pool(0), wg_sync(wg));
+            }
+        }
+    }
+    log.build()
+}
+
+#[test]
+fn reductions_preserve_results_on_regpool_logs() {
+    compare_full(0x7f4a_7c15_9e37_79b9, 400, regpool_log, 20, Some(8));
 }

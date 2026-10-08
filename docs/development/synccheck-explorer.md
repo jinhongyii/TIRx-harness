@@ -891,6 +891,7 @@ Release build, one run (after the tx-terminal removal below):
 | singleton: ready observer | per_lane_arrivals(1,8,2,1) | 118 / 7,171 | 117 / 7,170 | 9.0 ms / 518 ms | 58x | Clean / Clean |
 | sleep sets (in combination with the singletons) | per_lane_arrivals(4,2,2,1) | 2,805 / 14,275 | 2,804 / 14,626 | 740 ms / 2.1 s | 2.8x | Clean / Clean |
 | singleton: deferred completion | per_lane_arrivals(4,2,2,1) | 2,805 / 200,000 (budget) | 2,804 / 200,511 | 726 ms / 58.0 s | 80x | Clean / Incomplete |
+| singleton: setmaxnreg credit / `Poll` resume (`Rules::regpool_sync`) | regpool_credits(3,2) | 104 / 200,000 (budget) | 114 / 200,000 | 0.9 ms / 3.5 s | 3740x | Clean / Incomplete |
 
 **Removed: tx-terminal persistent rule.** This was the terminal transaction-completion rule (`persistent_transition`). Measured with everything else on, it never mattered across eight scenarios, and it is subsumed by the observer and deferred-completion singletons:
 
@@ -919,3 +920,15 @@ On the other shapes they cost 0.8-0.9x. Their guard row is "sleep sets (in combi
 - **HB gates** are not a performance technique. They make per-resource projection sound against false alarms, so their guard is the Clean assertion.
 - **`sync/` memoization:** there is none (no caches in `numsim-core/src/sync/`), so there is nothing to guard.
 - **Budget paths** have scenario tests: `budget_exhaustion_is_incomplete` (`fixed_sync_states`), `transition_budget_is_incomplete` (`fixed_sync_transitions`) and `wall_time_limit_is_incomplete` (`wall_time`).
+
+**`kda_forward_portfolio_multishape` (no-oracle corpus case, V2C-31).**
+- **Before:** the per-CTA setmaxnreg pool projection hit the 100k-state limit.
+- **Shape:** 5 warpgroups (20 warps). One `Set` per warpgroup; increases wait for another warpgroup's decrease. About 30 `WarpgroupSync` credits come from 20 warps; the engine logs one per completed aligned `bar.sync`, from a warp of the credited warpgroup.
+- **New rule, a fifth `singleton_persistent` rule (`Rules::regpool_sync`):**
+  - A credit `WarpgroupSync { wg }` that no `Set` of `wg` can precede is explored first, on its own. A credit only clears `needs_sync[wg]`, never blocks and never fails, so it commutes with everything except a `Set` of `wg`.
+  - An enabled `Poll` resume (a granted increase) is explored first, on its own. It mutates nothing, and only a `Set` of its own warpgroup could make it pending again; that `Set` is a collective it takes part in.
+- **Result:** Clean in 1.3 s (the projection is under 1,000 states).
+- **Checks:**
+  - New equivalence generator `regpool_log`: 2 warpgroups, 1-2 `Set`s each with valid and invalid directions and counts, 0-2 credits per warp around them. Over 400 cases the oracle agrees (47 Clean, 353 Error).
+  - Under the engine contract (a credit comes from a warp of its own warpgroup), every conflicting `Set` is a collective that includes the crediting warp. The conflict check is therefore defensive, and a mutation that removes it is not observable.
+  - Scenario `regpool_credits_stay_small`: 104 states; it fails with the rule off.

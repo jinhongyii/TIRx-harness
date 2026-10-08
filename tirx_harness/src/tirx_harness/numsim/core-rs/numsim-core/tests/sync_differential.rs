@@ -34,10 +34,46 @@ fn dbg<T: std::fmt::Debug>(v: &T) -> String {
     format!("{v:?}")
 }
 
+// ---------------------------------------------------------------- coverage
+
+/// Hits per `module/kind/Variant` (kind: cmd, ok, err, lint, ...), shared by
+/// every property in this binary. `coverage_reaches_every_variant` runs the
+/// properties and checks the table against the reference crate's enums.
+static COVERAGE: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Leading identifier of a `Debug` rendering ("PartialWarp { .. }" -> "PartialWarp").
+fn variant(rendered: &str) -> &str {
+    let end = rendered.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(rendered.len());
+    &rendered[..end]
+}
+
+fn hit(module: &str, kind: &str, rendered: &str) {
+    let key = format!("{module}/{kind}/{}", variant(rendered));
+    *COVERAGE.lock().unwrap().entry(key).or_default() += 1;
+}
+
+/// Record a `Result` rendering: `Ok(X)` -> ok/X, `Err(E)` -> err/E.
+fn hit_result(module: &str, ok_kind: &str, rendered: &str) {
+    if let Some(rest) = rendered.strip_prefix("Ok(") {
+        hit(module, ok_kind, rest);
+    } else if let Some(rest) = rendered.strip_prefix("Err(") {
+        hit(module, "err", rest);
+    }
+}
+
+/// Record an `Option` rendering: `Some(L)` -> kind/L.
+fn hit_option(module: &str, kind: &str, rendered: &str) {
+    if let Some(rest) = rendered.strip_prefix("Some(") {
+        hit(module, kind, rest);
+    }
+}
+
 /// Compare one step.
 macro_rules! diff_step {
     ($module:ident, $rs:expr, $cs:expr, $rc:expr, $cc:expr, $ctx:expr) => {{
         let before = dbg(&$cs);
+        hit(stringify!($module), "cmd", &dbg(&$rc));
         let r = spec::$module::step(&mut $rs, $rc);
         let c = prod::$module::step(&mut $cs, $cc);
         if matches!(&c, Ok(o) if dbg(o) == "Blocked") {
@@ -45,8 +81,10 @@ macro_rules! diff_step {
             let unarm = |s: String| s.replace("armed: true", "armed: false");
             prop_assert_eq!(unarm(before), unarm(dbg(&$cs)), "blocked step changed state at {}", $ctx);
         }
+        hit_result(stringify!($module), "ok", &dbg(&r));
         prop_assert_eq!(dbg(&r), dbg(&c), "result differs at {}", $ctx);
         prop_assert_eq!(dbg(&$rs), dbg(&$cs), "state differs at {}", $ctx);
+        hit_result(stringify!($module), "quiescent", &dbg(&spec::$module::quiescent(&$rs)));
         prop_assert_eq!(
             dbg(&spec::$module::quiescent(&$rs)),
             dbg(&prod::$module::quiescent(&$cs)),
@@ -175,8 +213,10 @@ proptest! {
                     prod::named::GatherCmd::Execute { id, flavor: [prod::named::Flavor::Arrive, prod::named::Flavor::Sync, prod::named::Flavor::Red][f as usize], count, mask, live, aligned },
                 )
             };
+            hit("named", "gather_cmd", &dbg(&rc));
             let r = spec::named::gather(&mut rg, rc);
             let c = prod::named::gather(&mut cg, cc);
+            hit_result("named", "gather_ok", &dbg(&r));
             prop_assert_eq!(dbg(&r), dbg(&c), "#{} outcome", i);
             prop_assert_eq!(dbg(&rg), dbg(&cg), "#{} state", i);
         }
@@ -211,6 +251,7 @@ proptest! {
                 _ => both!(named, Cmd::Resume { gen }),
             };
             diff_step!(named, rs, cs, rc, cc, format!("#{i}"));
+            hit_option("named", "lint", &dbg(&spec::named::exit_lint(&rs)));
             prop_assert_eq!(dbg(&spec::named::exit_lint(&rs)), dbg(&prod::named::exit_lint(&cs)));
         }
     }
@@ -273,6 +314,7 @@ proptest! {
                 }
             };
             diff_step!(async_group, rs, cs, rc, cc, format!("#{i}"));
+            hit_option("async_group", "lint", &dbg(&spec::async_group::exit_lint(&rs)));
             prop_assert_eq!(dbg(&spec::async_group::exit_lint(&rs)), dbg(&prod::async_group::exit_lint(&cs)));
             for k in 0..4 {
                 prop_assert_eq!(spec::async_group::wait_prefix_len(&rs, k), prod::async_group::wait_prefix_len(&cs, k));
@@ -324,7 +366,9 @@ proptest! {
         let mut cw = prod::tcgen::WorkState::default();
         for &(kind, g) in &ops {
             if kind == 6 {
-                prop_assert_eq!(dbg(&spec::tcgen::use_cta_group(&mut rk, g)), dbg(&prod::tcgen::use_cta_group(&mut ck, g)));
+                let r = spec::tcgen::use_cta_group(&mut rk, g);
+                hit_result("tcgen", "group_ok", &dbg(&r).replace("Ok(())", "Ok(Unit)"));
+                prop_assert_eq!(dbg(&r), dbg(&prod::tcgen::use_cta_group(&mut ck, g)));
                 prop_assert_eq!(dbg(&rk), dbg(&ck));
                 continue;
             }
@@ -336,7 +380,10 @@ proptest! {
                 4 => both!(tcgen, WorkCmd::WaitLd),
                 _ => both!(tcgen, WorkCmd::WaitSt),
             };
-            prop_assert_eq!(dbg(&spec::tcgen::work_step(&mut rw, rc)), dbg(&prod::tcgen::work_step(&mut cw, cc)));
+            hit("tcgen", "work_cmd", &dbg(&rc));
+            let r = spec::tcgen::work_step(&mut rw, rc);
+            hit("tcgen", "work_out", &dbg(&r));
+            prop_assert_eq!(dbg(&r), dbg(&prod::tcgen::work_step(&mut cw, cc)));
             prop_assert_eq!(dbg(&rw), dbg(&cw));
         }
     }
@@ -560,5 +607,129 @@ mod table {
         let alloc = |columns| SyncCmd::Tcgen(prod::tcgen::Cmd::Alloc { who: prod::tcgen::Who::One(0), columns, exclusive: false });
         assert!(matches!(t.step(pair, alloc(512)).unwrap(), Step::Done(_)));
         assert_eq!(t.step(pair, alloc(256)).unwrap(), Step::Blocked(pair));
+    }
+}
+
+// ---------------------------------------------------------------- coverage check
+
+/// Top-level variant names of `pub enum <name>` in a reference source file.
+fn enum_variants(src: &str, name: &str) -> Vec<String> {
+    let start = src.find(&format!("pub enum {name} {{")).unwrap_or_else(|| panic!("enum {name} not found"));
+    let body = &src[start + format!("pub enum {name} {{").len()..];
+    let (mut depth, mut out) = (0i32, Vec::new());
+    for line in body.lines() {
+        let t = line.trim();
+        if depth == 0 && t.starts_with('}') {
+            break;
+        }
+        if depth == 0 && !t.starts_with("//") {
+            let v = variant(t);
+            if v.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                out.push(v.to_string());
+            }
+        }
+        depth += t.matches(['{', '(']).count() as i32 - t.matches(['}', ')']).count() as i32;
+    }
+    out
+}
+
+/// Minimum hits per variant across one run of every property.
+const MIN_HITS: u64 = 3;
+
+/// Every command, outcome, error and lint variant of every reference
+/// protocol is reached by the generators above (tagged enumeration parsed
+/// from `numsim-sync-ref/src`, so a new variant fails this test until a
+/// generator reaches it). Variants that cannot be produced through the
+/// protocol's step function are listed in `UNREACHABLE` with the reason.
+#[test]
+fn coverage_reaches_every_variant() {
+    mbarrier_matches_reference();
+    named_gather_matches_reference();
+    named_matches_reference();
+    cluster_matches_reference();
+    async_group_matches_reference();
+    tcgen_matches_reference();
+    tcgen_kernel_and_work_match_reference();
+    setmaxnreg_matches_reference();
+    query_matches_reference();
+    let sources: [(&str, &str, &[(&str, &str)]); 7] = [
+        ("query", include_str!("../../numsim-sync-ref/src/query.rs"), &[("err", "TokenError")]),
+        ("mbarrier", include_str!("../../numsim-sync-ref/src/mbarrier.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error")]),
+        ("named", include_str!("../../numsim-sync-ref/src/named.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error"), ("lint", "Lint"), ("gather_cmd", "GatherCmd"), ("gather_ok", "GatherOutcome")]),
+        ("cluster", include_str!("../../numsim-sync-ref/src/cluster.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error")]),
+        ("async_group", include_str!("../../numsim-sync-ref/src/async_group.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error"), ("lint", "Lint")]),
+        ("tcgen", include_str!("../../numsim-sync-ref/src/tcgen.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error"), ("work_cmd", "WorkCmd"), ("work_out", "WorkOutcome")]),
+        ("setmaxnreg", include_str!("../../numsim-sync-ref/src/setmaxnreg.rs"), &[("cmd", "Cmd"), ("ok", "Outcome"), ("err", "Error")]),
+    ];
+    let cov = COVERAGE.lock().unwrap().clone();
+    let mut missing = Vec::new();
+    let mut table = String::new();
+    for (module, src, kinds) in sources {
+        for &(kind, enum_name) in kinds {
+            for v in enum_variants(src, enum_name) {
+                let key = format!("{module}/{kind}/{v}");
+                let n = cov.get(&key).copied().unwrap_or(0);
+                table.push_str(&format!("| {module} | {enum_name} | {v} | {n} |\n"));
+                if n < MIN_HITS && !UNREACHABLE.iter().any(|(k, _)| *k == key) {
+                    missing.push(format!("{key} ({n})"));
+                }
+            }
+        }
+    }
+    if std::env::var("SYNC_COVERAGE_TABLE").is_ok() {
+        eprintln!("| protocol | enum | variant | hits |\n| --- | --- | --- | ---: |\n{table}");
+    }
+    assert!(missing.is_empty(), "variants reached fewer than {MIN_HITS} times: {missing:#?}");
+}
+
+/// Variants no generator can reach through the protocol's step function.
+const UNREACHABLE: &[(&str, &str)] = &[
+    (
+        "mbarrier/err/FutureNotBufferable",
+        "defensive: `CompleteTx`/`DeferredArrive` take their token first (UnknownToken), and issue binds \
+         tokens only to the current or next generation (production invariant `token bound to an \
+         unreachable generation`); the premature-landing case is exercised by \
+         `table_mbarrier_steps_and_enabled`'s probe against `SyncTable::enabled`",
+    ),
+    (
+    "named/err/ArrivalOverflow",
+    "defensive: `b` is a multiple of 32 (InvalidCount), every contribution carries the generation's `b` \
+     (ContractMismatch) and a warp adds exactly 32, so `arrived < b` implies `arrived + 32 <= b`",
+    ),
+];
+
+// ---------------------------------------------------------------- mbarrier queries
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(CASES))]
+
+    /// State tokens, `pending_count` and `check_layout` against the reference.
+    #[test]
+    fn query_matches_reference(
+        gen in prop::sample::select(vec![0u64, 1, 5, (1 << 43) - 1, 1 << 43, u64::MAX]),
+        pending in prop::sample::select(vec![0u64, 3, (1 << 20) - 1, 1 << 20]),
+        no_complete in any::<bool>(),
+        raw in any::<u64>(),
+        init in prop::option::of(any::<bool>()),
+        ask in any::<bool>(),
+    ) {
+        let r = spec::query::encode(gen, pending, no_complete);
+        let c = prod::query::encode(gen, pending, no_complete);
+        prop_assert_eq!(dbg(&r), dbg(&c));
+        if let Ok(t) = r {
+            prop_assert_eq!(spec::query::generation(t), prod::query::generation(t));
+            hit_result("query", "ok", &dbg(&spec::query::pending_count(t)));
+            prop_assert_eq!(dbg(&spec::query::pending_count(t)), dbg(&prod::query::pending_count(t)));
+        }
+        hit_result("query", "ok", &dbg(&r));
+        prop_assert_eq!(spec::query::generation(raw), prod::query::generation(raw));
+        prop_assert_eq!(dbg(&spec::query::pending_count(raw)), dbg(&prod::query::pending_count(raw)));
+        let mut rs = spec::mbarrier::State::new(spec::Policy::Numeric);
+        let mut cs = prod::mbarrier::State::new(prod::Policy::Numeric);
+        if let Some(layout_v1) = init {
+            spec::mbarrier::step(&mut rs, spec::mbarrier::Cmd::Init { count: 1, layout_v1 }).unwrap();
+            prod::mbarrier::step(&mut cs, prod::mbarrier::Cmd::Init { count: 1, layout_v1 }).unwrap();
+        }
+        prop_assert_eq!(dbg(&spec::query::check_layout(&rs, ask)), dbg(&prod::query::check_layout(&cs, ask)));
     }
 }

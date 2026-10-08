@@ -83,11 +83,14 @@ pub struct Rules {
     pub deferred_completion: bool,
     /// Symmetry: only the lowest of interchangeable enabled pendings.
     pub twin_landings: bool,
+    /// Singleton: setmaxnreg warpgroup-sync credit with no `Set` of that
+    /// warpgroup able to run first.
+    pub regpool_sync: bool,
 }
 
 impl Rules {
-    pub const ALL: Self = Self { private_issue: true, ready_observer: true, deferred_completion: true, twin_landings: true };
-    pub const NONE: Self = Self { private_issue: false, ready_observer: false, deferred_completion: false, twin_landings: false };
+    pub const ALL: Self = Self { private_issue: true, ready_observer: true, deferred_completion: true, twin_landings: true, regpool_sync: true };
+    pub const NONE: Self = Self { private_issue: false, ready_observer: false, deferred_completion: false, twin_landings: false, regpool_sync: false };
 }
 
 impl Options {

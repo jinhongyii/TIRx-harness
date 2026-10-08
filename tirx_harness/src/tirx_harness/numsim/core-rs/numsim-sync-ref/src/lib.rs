@@ -28,6 +28,7 @@ pub mod async_group;
 pub mod cluster;
 pub mod mbarrier;
 pub mod named;
+pub mod query;
 pub mod setmaxnreg;
 pub mod tcgen;
 

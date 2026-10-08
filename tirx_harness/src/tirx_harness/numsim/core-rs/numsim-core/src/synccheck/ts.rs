@@ -659,6 +659,46 @@ impl<'p> Ts<'p> {
         true
     }
 
+    /// `t` issues a lone `RegPool(WarpgroupSync { wg })` and no `Set` of
+    /// warpgroup `wg` on that pool can run before it: other warps' un-issued
+    /// commands not HB-gated behind `t`, excluding collectives `t`'s own
+    /// warp takes part in (they follow `t` in its program), and retries.
+    fn regpool_sync_first(&self, s: &State, t: &Transition) -> bool {
+        // A warp whose increase was granted resuming its `Poll`: reads
+        // `pending[wg]`, mutates nothing, and only a `Set` of its own
+        // warpgroup (a collective it takes part in) could re-arm it.
+        if let Transition::Resume(w) = *t {
+            return matches!(s.retry[w as usize], Some((_, SyncCmd::RegPool(setmaxnreg::Cmd::Poll { .. }))));
+        }
+        let Transition::Issue(c) = *t else { return false };
+        let lc = &self.cmds[c as usize];
+        let [(r, SyncCmd::RegPool(setmaxnreg::Cmd::WarpgroupSync { wg }))] = lc.cmds[..] else { return false };
+        let [tw] = lc.participants[..] else { return false };
+        let pos = lc.positions[0];
+        let conflicts = |cmd: &SyncCmd| matches!(cmd, SyncCmd::RegPool(setmaxnreg::Cmd::Set { wg: w, .. }) if *w == wg);
+        for w in 0..self.warps.len() {
+            if w == tw {
+                continue;
+            }
+            if let Some((rr, ref cmd)) = s.retry[w] {
+                if rr as usize == r && conflicts(cmd) {
+                    return false;
+                }
+            }
+            let start = s.cursors[w] as usize + usize::from(s.retry[w].is_some());
+            for &o in self.programs[w].iter().skip(start) {
+                let other = &self.cmds[o];
+                if other.gate.iter().any(|&(gw, n)| gw as usize == tw && n as usize > pos) || other.participants.contains(&tw) {
+                    break;
+                }
+                if other.cmds.iter().any(|&(cr, ref cmd)| cr == r && conflicts(cmd)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Symmetry reduction (V2C-31): enabled pendings that differ only in
     /// their issuing command and ordinal (per-lane
     /// `cp.async.mbarrier.arrive`, multicast transactions, the same arrival
@@ -1097,6 +1137,18 @@ impl TransitionSystem for Ts<'_> {
         if let Some(t) = enabled.iter().copied().find(|t| {
             self.rules.ready_observer && matches!(*t, Transition::Issue(_) | Transition::Resume(_)) && self.only_observers_before(s, t)
         }) {
+            if self.step(s, &t).is_ok() {
+                return Some(t);
+            }
+        }
+        // A setmaxnreg warpgroup-sync credit (`WarpgroupSync { wg }`) only
+        // clears `needs_sync[wg]`, never blocks and never fails, so it
+        // commutes with every transition except a `Set` of the same
+        // warpgroup. If no such `Set` can run before it, it is a persistent
+        // singleton; so is an enabled `Poll` resume (granted increase),
+        // which mutates nothing (no-oracle `kda_forward_portfolio_multishape`:
+        // 5 warpgroups, ~30 credits from 20 warps on one register pool).
+        if let Some(t) = enabled.iter().copied().find(|t| self.rules.regpool_sync && self.regpool_sync_first(s, t)) {
             if self.step(s, &t).is_ok() {
                 return Some(t);
             }

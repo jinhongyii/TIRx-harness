@@ -1076,3 +1076,18 @@ fn four_producers_per_lane_arrivals_on_two_barriers_stay_small() {
     assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
     assert!(stat(&r, "visited_state_count") < 5_000, "{:?}", r.coverage);
 }
+
+/// No-oracle `kda_forward_portfolio_multishape`: several warpgroups share one
+/// setmaxnreg pool, one increase waits for another warpgroup's decrease, and
+/// every warp credits warpgroup syncs. A credit with no `Set` of its
+/// warpgroup able to run first, and an enabled `Poll` resume, are persistent
+/// singletons, so the credits of different warps do not interleave.
+#[test]
+fn regpool_credits_stay_small() {
+    let log = numsim_core::synccheck::build::regpool_credits(3, 2);
+    let cfg = SynccheckConfig { certificates: false, state_budget: 20_000, ..config(cta(12)) };
+    let r = check(&log, &cfg);
+    assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+    eprintln!("regpool visited={}", stat(&r, "visited_state_count"));
+    assert!(stat(&r, "visited_state_count") < 2_000, "{:?}", r.coverage);
+}
