@@ -354,7 +354,7 @@ fn corpus() -> Vec<Scenario> {
         .filter(|c| fixtures::exists(&dir, c))
         .map(|c| {
             let (module, inputs, config) = fixtures::load(&dir, c);
-            Scenario { name: "corpus", module, inputs, config }
+            Scenario { name: c, module, inputs, config }
         })
         .collect()
 }
@@ -416,5 +416,84 @@ fn all_scenarios_fork_join_matches_serial() {
 fn corpus_fork_join_matches_serial() {
     for s in corpus() {
         fork_join_matches_serial(&s, &RacecheckConfig::default());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §11.1 D7 and I8 under racecheck (W6 re-review of milestone 1)
+// ---------------------------------------------------------------------------
+
+/// Serial payload with an explicit GC mode.
+fn serial_payload_gc(s: &Scenario, workers: usize, rc: &RacecheckConfig, phase_gc: bool) -> (String, String) {
+    let cfg = RunConfig { workers, ..s.config.clone() };
+    let mut obs = RaceObserver::new(rc.clone());
+    obs.fork_join = false;
+    obs.phase_gc = phase_gc;
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &cfg).expect("run starts");
+    let mut report: Report = obs.finish();
+    // The collector's counters (and the slot peak, which reclaim after GC
+    // lowers) depend on when it runs, by construction.
+    report.coverage.retain(|(k, _)| !matches!(k.as_str(), "gc_runs" | "witnesses_retired" | "async_slots" | "async_slots_reclaimed"));
+    (format!("{:?}", o.status), format!("{report:?}"))
+}
+
+fn review_scenarios() -> Vec<(Scenario, RacecheckConfig)> {
+    let d = RacecheckConfig::default;
+    let mut v = vec![
+        (h1(), d()),
+        (h2(), d()),
+        (h3(), d()),
+        (same_round_writers(), d()),
+        (turnover(), d()),
+        (many_races(), capped()),
+        (scenarios::cross_cluster_sb(), d()),
+    ];
+    v.extend(scenarios::all().into_iter().map(|s| (s, d())));
+    v.extend(corpus().into_iter().map(|s| (s, d())));
+    v
+}
+
+/// D7: when the collector runs (phase ends vs the periodic default) changes
+/// no finding, no reported witness and no other payload field. Only the
+/// collector's counters (`gc_runs`, `witnesses_retired`) and the async-slot
+/// peak/reclaim counts may differ. Both arms of the review tests pin
+/// `phase_gc = true`, so this is the only check that phase-end GC equals the
+/// former serial behaviour.
+#[test]
+fn d7_phase_end_gc_does_not_change_the_payload() {
+    for (s, rc) in review_scenarios() {
+        let (periodic, phase) = (serial_payload_gc(&s, 1, &rc, false), serial_payload_gc(&s, 1, &rc, true));
+        if periodic != phase {
+            let (a, b) = (periodic.1.as_bytes(), phase.1.as_bytes());
+            let i = a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+            let at = |t: &str| t[i.saturating_sub(300)..(i + 300).min(t.len())].to_string();
+            panic!("{}: phase-end GC changes the payload at byte {i}:\nperiodic: ...{}...\nphase:    ...{}...", s.name, at(&periodic.1), at(&phase.1));
+        }
+    }
+}
+
+/// I8 under racecheck: status and outputs are identical with no observer
+/// and with a `RaceObserver` (serial or fork/join, phase-end GC on), at 1
+/// and 8 workers.
+#[test]
+fn race_observer_does_not_change_the_run() {
+    use numsim_core::observe::NoopObserver;
+    for (s, rc) in review_scenarios() {
+        for workers in [1usize, 8] {
+            let cfg = RunConfig { workers, ..s.config.clone() };
+            let plain = sched::run_with_config(&s.module, &s.inputs, &mut NoopObserver, &cfg).expect("run starts");
+            for fork_join in [false, true] {
+                let mut obs = RaceObserver::new(rc.clone());
+                obs.fork_join = fork_join;
+                obs.phase_gc = true;
+                let watched = sched::run_with_config(&s.module, &s.inputs, &mut obs, &cfg).expect("run starts");
+                assert_eq!(
+                    (format!("{:?}", plain.status), &plain.outputs),
+                    (format!("{:?}", watched.status), &watched.outputs),
+                    "{}: racecheck (fork_join {fork_join}) changes the run at {workers} workers",
+                    s.name
+                );
+            }
+        }
     }
 }

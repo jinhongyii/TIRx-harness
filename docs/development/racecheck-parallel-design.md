@@ -245,11 +245,11 @@ The review checks the design against the scheduler's tested invariants (numsim-r
 | --- | --- | --- |
 | D1 | `seq` is assigned at replay in `shard_replay_order`; that order does not depend on the worker count (I7). The representative "earliest first `seq`" rule is therefore worker-independent. | pass |
 | D2 | `AsyncId`s are partition-scoped by cluster, `(cluster + 1) << 40`, so they are deterministic. | pass |
-| D3 | **Partition index is not stable.** `Scheduler::partitions` is a `Vec` that loses entries at turnover (`partitions.remove(k)`), so index p names different clusters in different rounds. Tie-breaks, per-partition slot ranges and `JoinMemo` identity must key on the partition's **first cluster id** (`Partition::clusters[0]`, the same value the RNG seed and `AsyncId` range use), never on the `Vec` index or a pool-thread id. | open |
-| D4 | **Join order.** `Observer::join(p, child)` must run after `par_for` returns, in partition order, as `merge_shard` does today. The merged finding list must be sorted by (key, representative `seq`), never in completion order. | open |
-| D5 | **`max_findings` cap.** The serial checker stops recording after the cap, in `seq` order ("later findings were not recorded"). A per-partition cap would keep a different set. Rule: each partition keeps its earliest `max_findings` by `seq`, the merge keeps the global earliest `max_findings`, and the `incomplete` note fires iff the global count exceeds the cap. The global earliest N is a subset of the union of each partition's earliest N, so the result equals serial. | open |
+| D3 | **Partition index is not stable.** `Scheduler::partitions` is a `Vec` that loses entries at turnover (`partitions.remove(k)`), so index p names different clusters in different rounds. Tie-breaks, per-partition slot ranges and `JoinMemo` identity must key on the partition's **first cluster id** (`Partition::clusters[0]`, the same value the RNG seed and `AsyncId` range use), never on the `Vec` index or a pool-thread id. | pass (milestone 1, §11.5) |
+| D4 | **Join order.** `Observer::join(p, child)` must run after `par_for` returns, in partition order, as `merge_shard` does today. The merged finding list must be sorted by (key, representative `seq`), never in completion order. | pass (milestone 1, §11.5) |
+| D5 | **`max_findings` cap.** The serial checker stops recording after the cap, in `seq` order ("later findings were not recorded"). A per-partition cap would keep a different set. Rule: each partition keeps its earliest `max_findings` by `seq`, the merge keeps the global earliest `max_findings`, and the `incomplete` note fires iff the global count exceeds the cap. The global earliest N is a subset of the union of each partition's earliest N, so the result equals serial. | pass (milestone 1, §11.5) |
 | D6 | Per-cell processing order. A private cell sees its partition's events in `seq` order. A global cell (one stripe) receives pieces in replay order `(round, partition, seq)`, which is `seq` order. `EVICT_WINDOW` decisions are therefore identical to serial. | pass, if fan-out preserves `seq` order |
-| D7 | GC at round merges (§8) uses a meet that is at most the serial checker's at the same `seq`. Retiring dominated witnesses changes no finding, but it can change which witness is reported if serial GC ran at a different point. Pin GC to round merges in the serial checker too, or prove reported witnesses never depend on GC timing. | open |
+| D7 | GC at round merges (§8) uses a meet that is at most the serial checker's at the same `seq`. Retiring dominated witnesses changes no finding, but it can change which witness is reported if serial GC ran at a different point. Pin GC to round merges in the serial checker too, or prove reported witnesses never depend on GC timing. | pass (milestone 1, §11.5) |
 
 ### 11.2 HB snapshots versus the engine's merge/replay rules (§4, §5)
 
@@ -257,10 +257,10 @@ The engine guarantees that within a phase, a partition reads global memory as of
 
 | # | State | Why the design exposes it | Rule | Status |
 | --- | --- | --- | --- | --- |
-| H1 | Release heads of global words written by a later-replayed partition in the same round | §5.4 runs the serial global-sync step **after** the parallel stripe apply. An acquire read by B (replayed before A because B read A's bytes at the round start) would then see A's same-round write as the latest morally strong write and acquire its head. That is a spurious edge and a missed race. | Each strong read is resolved against the cell state at its own `seq`. Either interleave the stripe apply and the sync step in `seq` order per stripe, or keep per-cell writes versioned by `seq` and pick the latest write with a lower `seq`. | open |
-| H2 | `wait_until` `pred_reads` stability check | "Every retained write to those bytes is ordered before the wait" would also see same-round writes with a higher `seq` (applied in the parallel pass) and report `WaitPredicateReadsUnstable` where serial does not. | Consider only writes with a lower `seq`. | open |
-| H3 | The serial phase and `drain_all` | The engine has up to three replay batches per round: the parallel phase, the serial phase (global RMWs, partition order, main arena), and `drain_all`. A serial-phase RMW of A reads B's same-round parallel-phase write. | The checker's "round" is the engine **phase**. Serial-phase events of A are processed after the global apply of that round's parallel phase, in partition order, each partition's word history merged before the next one runs (as S-b). | open |
-| H4 | Events handed to children before the engine's merge | Under fork/join, events must reach `fork(p)` children only after `shard_replay_order` assigned `seq` and `merge_words` renumbered the buffered `WaitVerdicts` (W6-P1). Live delivery during the parallel phase would see pre-merge `observed`/`accepted` indices and no `seq`. | Children receive each partition's buffer at the same point `EventBuffer::replay` runs today. | open |
+| H1 | Release heads of global words written by a later-replayed partition in the same round | §5.4 runs the serial global-sync step **after** the parallel stripe apply. An acquire read by B (replayed before A because B read A's bytes at the round start) would then see A's same-round write as the latest morally strong write and acquire its head. That is a spurious edge and a missed race. | Each strong read is resolved against the cell state at its own `seq`. Either interleave the stripe apply and the sync step in `seq` order per stripe, or keep per-cell writes versioned by `seq` and pick the latest write with a lower `seq`. | pass (milestone 1, §11.5) |
+| H2 | `wait_until` `pred_reads` stability check | "Every retained write to those bytes is ordered before the wait" would also see same-round writes with a higher `seq` (applied in the parallel pass) and report `WaitPredicateReadsUnstable` where serial does not. | Consider only writes with a lower `seq`. | pass (milestone 1, §11.5) |
+| H3 | The serial phase and `drain_all` | The engine has up to three replay batches per round: the parallel phase, the serial phase (global RMWs, partition order, main arena), and `drain_all`. A serial-phase RMW of A reads B's same-round parallel-phase write. | The checker's "round" is the engine **phase**. Serial-phase events of A are processed after the global apply of that round's parallel phase, in partition order, each partition's word history merged before the next one runs (as S-b). | pass (milestone 1, §11.5) |
+| H4 | Events handed to children before the engine's merge | Under fork/join, events must reach `fork(p)` children only after `shard_replay_order` assigned `seq` and `merge_words` renumbered the buffered `WaitVerdicts` (W6-P1). Live delivery during the parallel phase would see pre-merge `observed`/`accepted` indices and no `seq`. | Children receive each partition's buffer at the same point `EventBuffer::replay` runs today. | pass (milestone 1, §11.5) |
 | H5 | Snapshot contents | Release heads and async-op knowledge produced in earlier rounds/phases are exactly what the engine let other partitions read (one round later). A snapshot taken at the end of each phase cannot show more. | — | pass |
 | H6 | `cross_cluster_same_round_cycle` | When no faithful order exists the engine reports `incomplete` and falls back to partition order. The parallel checker must take the same fallback order and add nothing. | — | pass, given H4 |
 
@@ -285,6 +285,22 @@ Each runs the serial checker and the fork/join checker at 1, 8 and 32 workers, a
 6. **D5:** more than `max_findings` races spread over several clusters. The kept set and the `incomplete` note must equal serial.
 7. **H6:** `scenarios::cross_cluster_sb` (store-buffering). The same incomplete and payload as serial.
 8. **All:** extend `every_scenario_is_observer_and_worker_independent` (`sched_partition_review`) with a `RaceObserver` arm, fork/join on and off, over every scenario and the recorded corpus fixtures (e24, medium_moe, fp16_bf16_gemm, gdn).
+
+### 11.5 Re-review of milestone 1 (d82cf38, W6)
+
+Checked against `sched/mod.rs::replay_partitions`, `racecheck/observer.rs` (`RaceChild`, `fork`/`join`/`phase_end`) and `racecheck/checker/partition.rs`. Tests: `racecheck_parallel_review` 20/20 (release, both arms, every scenario and the 8 corpus fixtures at 1/8/32 workers); `sched_partition_review` 11/11 and `racecheck_sync_consistency` 9/9 (debug).
+
+| Item | Evidence | Status |
+| --- | --- | --- |
+| D3 | `PartitionInfo.key` = `clusters.first()`; child slot pool = `key + 1` (`Checker::split`). | pass |
+| D4 | Children are joined after `par_for`, in replay order (`order`), each with a pre-assigned `seq` range (`starts`); the merge sorts by tag. | pass |
+| D5 | `d5_findings_cap_*`: 7 races, cap 3, truncation reported; fork/join equals serial. | pass |
+| D7 | New `d7_phase_end_gc_does_not_change_the_payload`: periodic vs phase-end GC give identical findings, witnesses, verdicts and coverage over every review scenario and fixture. Only the collector counters (`gc_runs`, `witnesses_retired`) and the async-slot peak (`async_slots`, e.g. 423 vs 424 on fp16_bf16_gemm) differ, by construction. Those counters are in the payload's `coverage`, so the default switch changes them relative to older baselines. | pass |
+| H1, H2 | A child suspends at its first strong/atomic global access or `WaitVerdicts`; the main checker continues in `seq` order. Exact by construction (milestone 2 must keep the round-start rule of §13). | pass |
+| H3 | The serial phase and `drain_all` replay through the main observer (`absorb`), never forked; `phase_end` follows each phase. | pass |
+| H4 | Parallel phase: `merge_words` (verdict renumbering) runs before `replay_partitions`. Single-partition path replays first, which is exact there (local history = merged history). | pass |
+| I8 | New `race_observer_does_not_change_the_run`: status and outputs equal with `NoopObserver` and with `RaceObserver` (serial and fork/join, phase-end GC on), at 1 and 8 workers, over every review scenario and fixture. The three W13 observer-dependence items are fixed and un-ignored in `sched_partition_review`. | pass |
+| W1 | §6 still describes declared words as forcing one partition. | open (doc fix) |
 
 ## 12. Effort estimate
 
@@ -367,3 +383,55 @@ the child:
 - Measure first, on e24 and medium: the fraction of `WaitVerdicts` and strong
   global reads whose witnesses lie entirely in round-start state plus the
   partition's own history. Report it before building child-side resolution.
+
+**Milestone-2 measurement (2026-10-08).** A probe observer (no checker)
+runs the real scheduler at 16 workers. It does the following:
+
+- It maps clusters to partitions per replay batch from the `fork` offers and
+  delimits batches with `phase_end`.
+- It records global touches per batch at 4-byte granularity.
+- It rebuilds each declared word's history in delivery order, with batch,
+  partition and async flag per entry plus each lane's own latest write.
+
+For every `WaitVerdicts` it takes the entry the checker would acquire: the
+earliest accepted entry at or after the waiter's own-write floor, or the
+observed index for an async entry. It then classifies that entry:
+
+- *round-start*: written in an earlier batch;
+- *own*: same partition, with no other partition's entry before it in the
+  batch;
+- *foreign*: anything else.
+
+A `WaitVerdicts` is also foreign when another partition wrote a `pred_reads`
+granule in the same batch. A strong or atomic global access is foreign when
+another partition wrote an overlapping granule in the same batch (for writes,
+when it read one).
+
+| e24 (t8_h1024_i512_e24_k2_g1) | total | round-start | own | foreign |
+| --- | --- | --- | --- | --- |
+| `WaitVerdicts` in partitions | 18068 | 18068 (1088 owe no edge) | 0 | 0 |
+| strong global reads in partitions | 2750 | 2750 | 0 | 0 |
+| strong global writes / RMW in partitions | 0 | – | – | – |
+| strong global accesses in serial-phase batches | 1579 | | | |
+
+| medium (t64_h2048_i1536_e96_k4_g1) | total | round-start | own | foreign |
+| --- | --- | --- | --- | --- |
+| `WaitVerdicts` in partitions | 87716 | 87716 (64688 owe no edge) | 0 | 0 |
+| strong global reads in partitions | 25778 | 25778 | 0 | 0 |
+| strong global writes / RMW in partitions | 0 | – | – | – |
+| strong global accesses in serial-phase batches | 9751 | | | |
+
+The share of partition events before the first suspension changes as
+follows:
+
+| Case | Milestone 1 | Milestone 2 | Partition events | Partition-batches |
+| --- | --- | --- | --- | --- |
+| e24 | 73.9% | 98.1% | 332045 | 6879 |
+| medium | 88.2% | 99.2% | 5.32M | 144184 |
+
+On e24 at 1 worker the counts are the same. Under milestone 2 the only first
+suspension left is alloc/declare: 141 on e24, 411 on medium. Strong writes
+and atomics run in serial-phase batches. A partition reads only round-start
+values plus its own writes (I11/I12), so child-side resolution against the
+round-start state is exact by construction. The join-time overlap check is a
+safety net, not a policy.
