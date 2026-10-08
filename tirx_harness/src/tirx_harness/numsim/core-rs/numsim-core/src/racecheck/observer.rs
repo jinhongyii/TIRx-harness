@@ -228,12 +228,6 @@ impl Observer for RaceObserver {
     }
 
     fn access(&mut self, a: &CAccess<'_>) {
-        if let Ok(path) = std::env::var("W5_RC_TRACE") { // TEMPTRACE
-            use std::io::Write; // TEMPTRACE
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) { // TEMPTRACE
-                let _ = writeln!(f, "A {:?} site{} alloc{} {:?} {:?} {:?} spans{:?}", a.actor, a.site.0, a.alloc.0, a.kind, a.proxy, a.sem, &a.spans[..a.spans.len().min(3)]); // TEMPTRACE
-            } // TEMPTRACE
-        } // TEMPTRACE
         let Some(c) = self.checker.as_mut() else {
             self.outside_launch += 1;
             return;
@@ -301,12 +295,6 @@ impl Observer for RaceObserver {
     }
 
     fn sync(&mut self, e: &CSync) {
-        if let Ok(path) = std::env::var("W5_RC_TRACE") { // TEMPTRACE
-            use std::io::Write; // TEMPTRACE
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) { // TEMPTRACE
-                let _ = writeln!(f, "S k{} {:?} site{} lanes{:x} {:?}", e.kernel, e.actor, e.site.0, e.lanes.0, e.kind); // TEMPTRACE
-            } // TEMPTRACE
-        } // TEMPTRACE
         if let SyncKind::AllocBegin { alloc, space, .. } = &e.kind {
             self.buffers.entry(*alloc).or_insert_with(|| (format!("{alloc}"), *space));
         }
