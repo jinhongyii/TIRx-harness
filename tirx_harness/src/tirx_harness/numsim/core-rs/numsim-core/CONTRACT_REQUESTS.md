@@ -2946,3 +2946,26 @@ input binding, where the test expects a typed rejection.
 The legacy class lives in `numsim/api.py`, which is deleted with the legacy layer. That deletion breaks `tests/analysis_tools/{racecheck,synccheck}/corpus/*` (the flashmla task-steal subset runs) and the documented import path.
 
 Request: export a v2 `ExecutionSubset` (`cluster_ids`, `cta_ids`), and the `ExecutionSubsetSelection` alias if it is kept, from `tirx_harness.numsim.v2.api`. Then update `docs/api/inputs.md` to point at it. W11 then switches the two corpus modules' import.
+
+## W2 (2026-10-08): W11-pin-message items 1 and 5 (engine facts), clippy, W9 phase 6, canonical mapa
+
+- **Structured stop facts.** `ExecError.attrs` and `RunStatus::Incomplete.attrs`, both `BTreeMap<String, serde_json::Value>`, the same convention as `Finding.attrs`. numsim-py `merge_attrs` adds them to the run-status diagnostics.
+  - **ALU faults.** TIR binary/ternary and generic PTX ops narrow `lanes` to the faulting lanes and set attrs `faulting_lanes` (list), `operation`, and `operands` (the first faulting lane's source bits).
+  - **Incomplete stops.**
+    - Every Budget/Unsupported stop: `warp`, `lanes`, `kernel`.
+    - Loop budget: `budget`, `iteration`.
+    - `divergent_block` and G8: `warp`, `lanes`.
+    - Round budget: `max_rounds`.
+  - Scenarios: `alu_div_by_zero_lane7`, `divergent_stuck_wait` (and `loop_budget`).
+  - Passing: `test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane`, `test_ptx_signed_division_overflow_fails_closed`. W8 has the keys.
+- **Clippy.** `cargo clippy -p numsim-core --all-targets -- -D warnings` is clean for `interp/`, `sched/`, `arena.rs`, `testutil` and my tests.
+  - Fixes: type aliases `LatchedWait` / `MmaFootprintKey` / `DeferredPublish` / `RoundItem`, `is_multiple_of`, `as_chunks`, `sort_by_key`, iterator loops, a doc list.
+  - In `support::resolve_buf`, `byte` was always `Some`; it is now a plain `i64`.
+  - Remaining errors are in other workers' code: racecheck (`checker.rs`, `payload.rs`, `tests/racecheck_common`; W5) and synccheck (`explore.rs`, `reference.rs`; W6).
+- **W9 phase 6.**
+  - A vector CAS / exchange (`u64x2`, `f32x4`) is one whole-operand operation (bitwise compare, all-or-nothing). Scenario: `cas128`.
+  - MMA TMEM reads that are invalid when read (D accumulated before written) are reported from a read-time check in `run_mma`.
+  - The three W9 copies XPASS.
+  - Engine knob validation is W8's (`v2.Engine` constructor), as W9 filed it.
+- **`test_canonical_mapa_integer_address_resolves_shared_memory`.** Lowering (W1, fixed): a shared-scope view over a mapa result was loaded as Generic, and 0 is now a null dereference. The engine was unchanged.
+- **Results.** `cargo test --workspace` passes 1039 / 1039; codegen equivalence passes 4 / 4.

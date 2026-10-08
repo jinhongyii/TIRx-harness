@@ -21,7 +21,7 @@ use crate::value::WarpMask;
 pub fn check_align(ctx: &ExecCtx<'_>, loc: Loc, n: u64, lane: usize) -> Result<(), ExecError> {
     let align = n.next_power_of_two().clamp(1, 32);
     let base = ctx.arena.get(loc.alloc).base;
-    if (base.wrapping_add(loc.offset)) % align != 0 {
+    if !base.wrapping_add(loc.offset).is_multiple_of(align) {
         return Err(support::err(
             ctx,
             ExecErrorKind::Misaligned,
@@ -72,7 +72,7 @@ fn load_proxy(mods: &MemMods) -> Proxy {
 #[inline]
 fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<(crate::arena::AllocId, u64, u64, Option<crate::observe::Window>)> {
     use crate::interp::BufBinding;
-    if ctx.program.buffers[buf.0 as usize].dtype.bits() % 8 != 0 {
+    if !ctx.program.buffers[buf.0 as usize].dtype.bits().is_multiple_of(8) {
         return None;
     }
     let (alloc, base, len) = match ctx.buffers[buf.0 as usize] {
@@ -108,7 +108,7 @@ fn fast_offset(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, n: u64, len: u64, abs_base
     }
     let off = abs_base + byte as u64;
     let align = n.next_power_of_two().clamp(1, 32);
-    (off % align == 0).then_some(off)
+    off.is_multiple_of(align).then_some(off)
 }
 
 #[inline]
@@ -444,6 +444,25 @@ pub fn rmw_elem(op: AtomOp, elem: Dtype, old: u64, val: u64, cmp: u64, ftz: bool
 /// Apply `op` element-wise over little-endian byte buffers (`dst = op(dst, src)`).
 pub fn rmw_bytes(op: AtomOp, elem: Dtype, dst: &mut [u8], src: &[u8], cmp: &[u8], ftz: bool) -> oplib::OpResult {
     let eb = elem.mem_bytes() as usize;
+    // CAS / exchange act on the whole operand (a vector-typed CAS such as
+    // `atomic_cas` on `uint64x2` / `float32x4` is ONE 128-bit
+    // compare-and-swap: compared by bits and replaced all-or-nothing,
+    // never per component, W9-public-API phase 6).
+    match op {
+        AtomOp::Cas => {
+            if cmp.len() >= dst.len() && dst[..] == cmp[..dst.len()] {
+                let n = dst.len();
+                dst.copy_from_slice(&src[..n]);
+            }
+            return Ok(());
+        }
+        AtomOp::Exch => {
+            let n = dst.len();
+            dst.copy_from_slice(&src[..n]);
+            return Ok(());
+        }
+        _ => {}
+    }
     if eb > 8 {
         // `.b128` atomics (PTX §9.7.13.5): only exch and cas exist; both
         // are bytewise on whole 16-byte elements.
@@ -566,7 +585,7 @@ pub fn st_bulk(ctx: &mut ExecCtx<'_>, a: Operand, space: AddrSpace, size: Operan
             ));
         }
         let n = n_signed as u64;
-        if v % 8 != 0 {
+        if !v.is_multiple_of(8) {
             return Err(support::err(ctx, ExecErrorKind::Misaligned, WarpMask::lane(l), format!("st.bulk address {v:#x} is not 8-byte aligned on lane {l}")));
         }
         let loc = support::resolve_data(ctx, space, v, l, n)?;
@@ -594,7 +613,7 @@ pub fn discard(ctx: &mut ExecCtx<'_>, a: Operand, space: AddrSpace, size: u32) -
     for l in ctx.warp.active.lanes() {
         let v = lane_val(ctx, a, l);
         // `discard.L2 [a], 128` works on one 128-byte line (legacy check).
-        if v % 128 != 0 {
+        if !v.is_multiple_of(128) {
             return Err(support::err(
                 ctx,
                 ExecErrorKind::Misaligned,

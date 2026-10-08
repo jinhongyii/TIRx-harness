@@ -216,6 +216,8 @@ pub fn loop_end(ctx: &mut ExecCtx<'_>, head_pc: Pc) -> HResult {
             format!("loop exceeded its iteration budget of {budget} (raise loop_budget)"),
         );
         e.site = ctx.program.site_of(begin);
+        e.attrs.insert("budget".into(), serde_json::json!(budget));
+        e.attrs.insert("iteration".into(), serde_json::json!(it));
         return Err(e);
     }
     ctx.warp.active = next;

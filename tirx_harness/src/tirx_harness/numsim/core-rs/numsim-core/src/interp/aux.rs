@@ -333,6 +333,15 @@ pub struct GridBarrier {
     pub arrived: HashSet<WarpId>,
 }
 
+/// A latched `mbarrier` wait: (target, command, lanes, observed generation).
+pub type LatchedWait = (ResourceId, crate::sync::SyncCmd, WarpMask, Option<u64>);
+/// Shared-A footprint cache key: (A descriptor without start, start mod
+/// 1024, instruction descriptor, cta_group).
+pub type MmaFootprintKey = (u64, u64, u32, u8);
+/// A deferred `cp.async.mbarrier.arrive` publication: (mbarrier, phase,
+/// prior cp.async ops).
+pub type DeferredPublish = (ResourceId, u64, Vec<AsyncId>);
+
 /// All launch-wide engine bookkeeping.
 #[derive(Clone, Debug, Default)]
 pub struct LaunchAux {
@@ -393,7 +402,7 @@ pub struct LaunchAux {
     /// another target of the same instruction blocks, per (warp, pc):
     /// (target, command, lanes, observed generation). Those lanes left the
     /// wait (per-lane latching, as for `wait_until`).
-    pub mbar_latch: HashMap<(WarpId, crate::program::Pc), Vec<(ResourceId, crate::sync::SyncCmd, WarpMask, Option<u64>)>>,
+    pub mbar_latch: HashMap<(WarpId, crate::program::Pc), Vec<LatchedWait>>,
     /// Exited warps per CTA (bit = warp in CTA): they leave the membership
     /// of count-less named barriers (sync-isa-answers Q3/Q4, PTX §9.7.14.7).
     pub cta_exited: HashMap<CtaId, u64>,
@@ -416,13 +425,13 @@ pub struct LaunchAux {
     pub tcgen_inflight_shared: HashMap<(WarpId, u8), Vec<AsyncId>>,
     /// Cache of shared-A footprints per (A descriptor, B descriptor, idesc,
     /// cta_group): window (cta, address, len) reads.
-    pub mma_a_footprints: HashMap<(u64, u64, u32, u8), Vec<(u32, u32, u32)>>,
+    pub mma_a_footprints: HashMap<MmaFootprintKey, Vec<(u32, u32, u32)>>,
     /// cp.async ops per issuing thread not yet covered by a
     /// `cp.async.mbarrier.arrive` (W5-11).
     pub cp_async_unpublished: HashMap<(WarpId, u8), Vec<AsyncId>>,
     /// Deferred `cp.async.mbarrier.arrive`s per (group, ordinal): the
     /// (mbarrier, phase, prior cp.async ops) published when it fires.
-    pub cp_arrive_publish: HashMap<(ResourceId, u64), Vec<(ResourceId, u64, Vec<AsyncId>)>>,
+    pub cp_arrive_publish: HashMap<(ResourceId, u64), Vec<DeferredPublish>>,
     /// Next async op id (partition-scoped: high bits name the partition).
     pub next_async: u64,
     /// Set by a handler that must run as a serial point (a global

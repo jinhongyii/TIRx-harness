@@ -308,6 +308,11 @@ pub struct ExecError {
     pub site: SiteId,
     pub lanes: WarpMask,
     pub message: String,
+    /// Structured facts for the report (merged into the run-status
+    /// diagnostic / `Finding::attrs`): e.g. `faulting_lanes`, `operation`,
+    /// `operands` for ALU faults, `budget` for loop budgets (W11-pin-message
+    /// items 1 and 5).
+    pub attrs: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl fmt::Display for ExecError {
@@ -651,6 +656,7 @@ impl<'a> ExecCtx<'a> {
             site: self.site(),
             lanes: self.warp.active,
             message: message.into(),
+            attrs: Default::default(),
         }
     }
     /// Record a failed poll for spin parking.
@@ -731,6 +737,7 @@ pub fn end_instr(ctx: &mut ExecCtx<'_>, pc: Pc, progress: bool, res: handlers::H
 ///   suspended arm resumes at its blocked instruction;
 /// * if the complementary arm is itself suspended, the two swap: the warp
 ///   returns `Blocked` and its next retry starts with the other arm.
+///
 /// Otherwise the warp blocks as a whole. Arms without an `Else` cannot be
 /// interleaved (the other lanes' continuation lies after the `EndIf`); a
 /// deadlock involving a divergent warp is reported as incomplete, never as

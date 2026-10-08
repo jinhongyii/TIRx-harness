@@ -376,9 +376,9 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
     if bit.rem_euclid(8) != 0 {
         return Err(err(ctx, ExecErrorKind::Misaligned, lanes, format!("{}[{idx}]: sub-byte element is not byte-aligned", decl.name)));
     }
-    let byte = Some(bit.div_euclid(8));
+    let byte = bit.div_euclid(8);
     let oob = |ctx: &ExecCtx<'_>, alloc: AllocId, size: u64| {
-        let start = byte.unwrap_or(i64::MIN);
+        let start = byte;
         let msg = format!("{}[{idx}]: element out of bounds of {size} bytes", decl.name);
         let mut e = err(ctx, ExecErrorKind::OutOfBounds, lanes, msg);
         if start >= 0 {
@@ -386,7 +386,7 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
         }
         e
     };
-    let in_range = |size: u64| byte.is_some_and(|b| b >= 0 && (b as u64).checked_add(len).is_some_and(|e| e <= size));
+    let in_range = |size: u64| byte >= 0 && (byte as u64).checked_add(len).is_some_and(|e| e <= size);
     match ctx.buffers[buf.0 as usize] {
         BufBinding::View(v) => {
             if !in_range(v.len) {
@@ -398,13 +398,13 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
                 Space::Shared => Some(Window::SharedCta),
                 _ => None,
             };
-            Ok(Loc { alloc: v.alloc, offset: v.offset + byte.unwrap() as u64, window, remote: None })
+            Ok(Loc { alloc: v.alloc, offset: v.offset + byte as u64, window, remote: None })
         }
         BufBinding::SharedWindow { offset, len: blen } => {
             if !in_range(blen) {
                 return Err(oob(ctx, ctx.cta.smem, blen));
             }
-            let off = offset as u64 + byte.unwrap() as u64;
+            let off = offset as u64 + byte as u64;
             bounds(ctx, ctx.cta.smem, off, len, lane)?;
             Ok(Loc { alloc: ctx.cta.smem, offset: off, window: Some(Window::SharedCta), remote: None })
         }
@@ -415,7 +415,7 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
             if !in_range(per_lane) {
                 return Err(oob(ctx, alloc, per_lane));
             }
-            let off = lane as u64 * ctx.loaded.local_per_lane + offset + byte.unwrap() as u64;
+            let off = lane as u64 * ctx.loaded.local_per_lane + offset + byte as u64;
             Ok(Loc { alloc, offset: off, window: None, remote: None })
         }
         BufBinding::Reg { offset, per_lane } => {
@@ -425,7 +425,7 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
             if !in_range(per_lane) {
                 return Err(oob(ctx, alloc, per_lane));
             }
-            let off = lane as u64 * ctx.loaded.reg_per_lane + offset + byte.unwrap() as u64;
+            let off = lane as u64 * ctx.loaded.reg_per_lane + offset + byte as u64;
             Ok(Loc { alloc, offset: off, window: None, remote: None })
         }
         BufBinding::Tmem { base_col, cols, base_reg } => {
@@ -437,7 +437,7 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
                 }
                 None => (0, base_col),
             };
-            let b = byte.ok_or_else(|| err(ctx, ExecErrorKind::OutOfBounds, lanes, "tmem offset overflows"))?;
+            let b = byte;
             // 8/16-bit elements pack `32 / bits` per 32-bit cell: element
             // `idx` is in cell `idx / per_cell` at byte `(idx % per_cell) *
             // bits / 8` (contract batch 4); the access must stay in its cell
@@ -451,7 +451,7 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
             }
             let packed = matches!(bits, 8 | 16) && len < 4;
             let sub = if packed { b.rem_euclid(4) as u64 } else { 0 };
-            let bad = if packed { b < 0 || sub + len > 4 } else { b < 0 || b % 4 != 0 || len % 4 != 0 };
+            let bad = if packed { b < 0 || sub + len > 4 } else { b < 0 || b % 4 != 0 || !len.is_multiple_of(4) };
             if bad {
                 return Err(err(ctx, ExecErrorKind::Misaligned, lanes, format!("{}[{idx}]: tmem access is not 32-bit aligned", decl.name)));
             }
@@ -736,7 +736,7 @@ pub fn emit_accesses(
         return;
     }
     // Stable grouping by (alloc, window), preserving lane order inside.
-    acc.items.sort_by(|a, b| (a.0, window_key(a.1), a.2).cmp(&(b.0, window_key(b.1), b.2)));
+    acc.items.sort_by_key(|a| (a.0, window_key(a.1), a.2));
     let mut spans: Vec<LaneSpan> = Vec::with_capacity(acc.items.len());
     let mut i = 0;
     while i < acc.items.len() {

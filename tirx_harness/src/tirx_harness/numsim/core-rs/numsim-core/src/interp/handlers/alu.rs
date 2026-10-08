@@ -160,9 +160,18 @@ pub fn unary(ctx: &mut ExecCtx<'_>, op: UnOp, ty: Ty, dst: Reg, a: Operand) -> H
 }
 
 /// An ALU error names the lanes that fault (e.g. the divide-by-zero lane),
-/// not the whole active mask: re-run lane by lane (error path only).
+/// not the whole active mask: re-run lane by lane (error path only). The
+/// structured attrs carry the faulting lanes, the operation and the first
+/// faulting lane's operand bits (W11-pin-message item 1).
 #[cold]
-fn narrow(ctx: &ExecCtx<'_>, e: oplib::OpError, mask: WarpMask, mut f: impl FnMut(WarpMask) -> oplib::OpResult) -> crate::interp::ExecError {
+fn narrow(
+    ctx: &ExecCtx<'_>,
+    e: oplib::OpError,
+    mask: WarpMask,
+    operation: String,
+    operands: impl Fn(usize) -> Vec<u64>,
+    mut f: impl FnMut(WarpMask) -> oplib::OpResult,
+) -> crate::interp::ExecError {
     let mut bad = 0u32;
     for l in mask.lanes() {
         if f(WarpMask::lane(l)).is_err() {
@@ -172,7 +181,11 @@ fn narrow(ctx: &ExecCtx<'_>, e: oplib::OpError, mask: WarpMask, mut f: impl FnMu
     let mut err = support::op_err(ctx, e);
     if bad != 0 {
         err.lanes = WarpMask(bad);
+        let lanes: Vec<u32> = (0..32).filter(|l| bad >> l & 1 == 1).collect();
+        err.attrs.insert("operands".into(), serde_json::json!(operands(lanes[0] as usize)));
+        err.attrs.insert("faulting_lanes".into(), serde_json::json!(lanes));
     }
+    err.attrs.insert("operation".into(), serde_json::json!(operation));
     err
 }
 
@@ -187,7 +200,7 @@ pub fn binary(ctx: &mut ExecCtx<'_>, op: BinOp, ty: Ty, dst: Reg, a: Operand, b:
         let mut out = [[0u64; 32]];
         if let Err(e) = oplib::binary(op, ty, &sa, &sb, &mut out, mask) {
             let mut tmp = [[0u64; 32]];
-            return Err(narrow(ctx, e, mask, |m| oplib::binary(op, ty, &sa, &sb, &mut tmp, m)));
+            return Err(narrow(ctx, e, mask, format!("{op:?}.{ty}"), |l| vec![sa[0][l], sb[0][l]], |m| oplib::binary(op, ty, &sa, &sb, &mut tmp, m)));
         }
         let s = ctx.slot(dst);
         support::write_masked(ctx.warp.regs.get_mut(s), &out[0], mask);
@@ -200,7 +213,7 @@ pub fn binary(ctx: &mut ExecCtx<'_>, op: BinOp, ty: Ty, dst: Reg, a: Operand, b:
     let mut out = zero_slots();
     if let Err(e) = oplib::binary(op, ty, &sa[..n as usize], &sb[..n as usize], &mut out[..n as usize], mask) {
         let mut tmp = zero_slots();
-        return Err(narrow(ctx, e, mask, |m| oplib::binary(op, ty, &sa[..n as usize], &sb[..n as usize], &mut tmp[..n as usize], m)));
+        return Err(narrow(ctx, e, mask, format!("{op:?}.{ty}"), |l| sa[..n as usize].iter().chain(&sb[..n as usize]).map(|s| s[l]).collect(), |m| oplib::binary(op, ty, &sa[..n as usize], &sb[..n as usize], &mut tmp[..n as usize], m)));
     }
     support::scatter(ctx, dst, reg_ty(ctx, dst).slots().min(n), &out, mask);
     Ok(Flow::Next)
@@ -218,7 +231,7 @@ pub fn ternary(ctx: &mut ExecCtx<'_>, op: TerOp, ty: Ty, dst: Reg, a: Operand, b
         let mut out = [[0u64; 32]];
         if let Err(e) = oplib::ternary(op, ty, &sa, &sb, &sc, &mut out, mask) {
             let mut tmp = [[0u64; 32]];
-            return Err(narrow(ctx, e, mask, |m| oplib::ternary(op, ty, &sa, &sb, &sc, &mut tmp, m)));
+            return Err(narrow(ctx, e, mask, format!("{op:?}.{ty}"), |l| vec![sa[0][l], sb[0][l], sc[0][l]], |m| oplib::ternary(op, ty, &sa, &sb, &sc, &mut tmp, m)));
         }
         let s = ctx.slot(dst);
         support::write_masked(ctx.warp.regs.get_mut(s), &out[0], mask);
@@ -234,7 +247,7 @@ pub fn ternary(ctx: &mut ExecCtx<'_>, op: TerOp, ty: Ty, dst: Reg, a: Operand, b
     let k = n as usize;
     if let Err(e) = oplib::ternary(op, ty, &sa[..k], &sb[..k], &sc[..k], &mut out[..k], mask) {
         let mut tmp = zero_slots();
-        return Err(narrow(ctx, e, mask, |m| oplib::ternary(op, ty, &sa[..k], &sb[..k], &sc[..k], &mut tmp[..k], m)));
+        return Err(narrow(ctx, e, mask, format!("{op:?}.{ty}"), |l| sa[..k].iter().chain(&sb[..k]).chain(&sc[..k]).map(|s| s[l]).collect(), |m| oplib::ternary(op, ty, &sa[..k], &sb[..k], &sc[..k], &mut tmp[..k], m)));
     }
     support::scatter(ctx, dst, reg_ty(ctx, dst).slots().min(n), &out, mask);
     Ok(Flow::Next)
@@ -369,7 +382,15 @@ pub fn ptx(ctx: &mut ExecCtx<'_>, op: OpId, dsts: &[Reg], srcs: &[Operand], pred
         }
         if !exec.is_empty() {
             let mut io = PtxIo { dsts: &mut sc.dsts, dst_tys: &sc.dst_tys, srcs: &sc.srcs, src_tys: &sc.src_tys, mask: exec };
-            f.call(&mut io).map_err(|e| support::op_err(ctx, e))?;
+            if let Err(e) = f.call(&mut io) {
+                let key = &ctx.program.ops[op.0 as usize];
+                let operation = std::iter::once(key.name.as_str()).chain(key.mods.iter().map(String::as_str)).collect::<Vec<_>>().join(".");
+                let srcs = &sc.srcs;
+                let mut tmp = sc.dsts.clone();
+                return Err(narrow(ctx, e, exec, operation, |l| srcs.iter().map(|s| s[l]).collect(), |m| {
+                    f.call(&mut PtxIo { dsts: &mut tmp, dst_tys: &sc.dst_tys, srcs: &sc.srcs, src_tys: &sc.src_tys, mask: m })
+                }));
+            }
         }
         let zero_lanes = if keep_dst { WarpMask::NONE } else { active.and_not(exec) };
         let mut k = 0usize;

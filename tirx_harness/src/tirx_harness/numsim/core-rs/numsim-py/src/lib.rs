@@ -238,12 +238,133 @@ fn exec_error_kind(e: &ExecError) -> (String, &'static str) {
     (kind, status)
 }
 
+fn snake(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Structured `{protocol, error, fields}` of a sync protocol error, from its
+/// serde form (`{"RegPool": {"MissingWarpgroupSync": {"wg": 0}}}`).
+fn protocol_details(error: &numsim_core::sync::SyncError) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let value = serde_json::to_value(error).unwrap_or(Value::Null);
+    let (protocol, inner) = match &value {
+        Value::Object(m) if m.len() == 1 => {
+            let (k, v) = m.iter().next().unwrap();
+            (snake(k), v.clone())
+        }
+        Value::String(s) => (snake(s), Value::Null),
+        _ => ("unknown".to_string(), value.clone()),
+    };
+    let (name, fields) = match &inner {
+        Value::Object(m) if m.len() == 1 => {
+            let (k, v) = m.iter().next().unwrap();
+            (snake(k), v.clone())
+        }
+        Value::String(s) => (snake(s), Value::Null),
+        other => (String::new(), other.clone()),
+    };
+    out.insert("protocol".into(), json!(protocol));
+    out.insert("error".into(), json!(name));
+    if let Value::Object(f) = fields {
+        for (k, v) in f {
+            out.entry(k).or_insert(v);
+        }
+    } else if !fields.is_null() {
+        out.insert("fields".into(), fields);
+    }
+    out
+}
+
+/// The address an arena error message names (`... address 0x... ...`).
+fn message_address(message: &str) -> Option<u64> {
+    let at = message.find("address 0x")? + "address 0x".len();
+    let hex: String = message[at..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    u64::from_str_radix(&hex, 16).ok()
+}
+
 fn exec_error_json(kernel_index: Option<usize>, e: &ExecError) -> Value {
+    use numsim_core::arena::addr::{classify_generic, decode_shared, Generic};
+    use numsim_core::interp::ExecErrorKind as K;
     let (kind, status) = exec_error_kind(e);
-    json!({
+    let mut m = serde_json::Map::new();
+    let mut message = e.message.clone();
+    match &e.kind {
+        K::Protocol(sync_error) => {
+            let details = protocol_details(sync_error);
+            let fields: Vec<String> = details
+                .iter()
+                .filter(|(k, _)| k.as_str() != "protocol" && k.as_str() != "error")
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            let protocol = details.get("protocol").and_then(Value::as_str).unwrap_or("sync").replace('_', " ");
+            let error = details.get("error").and_then(Value::as_str).unwrap_or("").replace('_', " ");
+            // Readable message (W11-pin-message 2); the Debug form stays in `detail`.
+            let plain = match (
+                details.get("protocol").and_then(Value::as_str),
+                details.get("error").and_then(Value::as_str),
+            ) {
+                // Plain words where the variant name alone does not say what
+                // happened (coordinator, sweep 6).
+                (Some("tcgen"), Some("live_allocations_at_exit")) => Some(match details.get("cta") {
+                    Some(cta) => format!("kernel exited with live TMEM allocations (CTA {cta})"),
+                    None => "kernel exited with live TMEM allocations".to_string(),
+                }),
+                _ => None,
+            };
+            message = if let Some(plain) = plain {
+                plain
+            } else if fields.is_empty() {
+                format!("{protocol} protocol error: {error}")
+            } else {
+                format!("{protocol} protocol error: {error} ({})", fields.join(", "))
+            };
+            // Handlers that add context (`pending_count: NotNoComplete`,
+            // named-barrier lane masks) keep it, in the text and as `context`.
+            if !e.message.is_empty() && e.message != format!("{sync_error:?}") {
+                message = format!("{message}; {}", e.message);
+                m.insert("context".into(), json!(e.message));
+            }
+            m.extend(details);
+        }
+        K::BadAddress => {
+            if let Some(addr) = message_address(&e.message) {
+                m.insert("address".into(), json!(addr));
+                // Name the aperture an address that missed its space decodes
+                // into (W11-pin-message 3).
+                let aperture = match classify_generic(addr) {
+                    Generic::Shared(sa) => {
+                        let (rank, offset) = decode_shared(sa);
+                        m.insert("shared_cta_rank".into(), json!(rank));
+                        m.insert("shared_offset".into(), json!(offset));
+                        Some(format!("generic shared window (CTA rank {rank}, offset {offset})"))
+                    }
+                    Generic::Local(offset) => Some(format!("generic local window (offset {offset})")),
+                    Generic::Param(offset) => Some(format!("kernel parameter window (offset {offset})")),
+                    Generic::Global(_) | Generic::Unmapped(_) => None,
+                };
+                if let Some(aperture) = aperture {
+                    m.insert("aperture".into(), json!(aperture));
+                    message = format!("{message}; the address decodes into the {aperture}");
+                }
+            }
+        }
+        _ => {}
+    }
+    let base = json!({
         "kind": kind,
         "status": status,
-        "message": e.message,
+        "message": message,
         "detail": format!("{:?}", e.kind),
         "kernel_index": kernel_index.map(|k| k as u32).unwrap_or(e.kernel),
         "source": "run_status",
@@ -251,7 +372,25 @@ fn exec_error_json(kernel_index: Option<usize>, e: &ExecError) -> Value {
         "warp": e.warp.0,
         "pc": e.pc.0,
         "lanes": format!("{:?}", e.lanes),
-    })
+    });
+    let Value::Object(mut out) = base else { unreachable!() };
+    for (k, v) in m {
+        out.entry(k).or_insert(v);
+    }
+    let mut out = Value::Object(out);
+    merge_attrs(&mut out, &e.attrs);
+    out
+}
+
+/// Merge engine-structured facts (`ExecError::attrs`, `RunStatus::Incomplete
+/// attrs`: `faulting_lanes`, `operation`, `operands`, `warp`, `lanes`,
+/// `budget`, ...) into a diagnostic without overwriting its own keys.
+fn merge_attrs(v: &mut Value, attrs: &std::collections::BTreeMap<String, Value>) {
+    if let Value::Object(m) = v {
+        for (k, a) in attrs {
+            m.entry(k.clone()).or_insert_with(|| a.clone());
+        }
+    }
 }
 
 fn status_json(status: &RunStatus) -> Value {
@@ -264,11 +403,15 @@ fn status_json(status: &RunStatus) -> Value {
                 .map(|(w, r)| json!({"warp": w.0, "resource": serde_json::to_value(r).unwrap_or(Value::Null)}))
                 .collect::<Vec<_>>(),
         }),
-        RunStatus::Incomplete { reason, site } => json!({
-            "kind": "incomplete",
-            "reason": reason,
-            "site": site.filter(|s| !s.is_none()).map(|s| s.0),
-        }),
+        RunStatus::Incomplete { reason, site, attrs } => {
+            let mut v = json!({
+                "kind": "incomplete",
+                "reason": reason,
+                "site": site.filter(|s| !s.is_none()).map(|s| s.0),
+            });
+            merge_attrs(&mut v, attrs);
+            v
+        }
         RunStatus::Error(e) => json!({"kind": "error", "error": exec_error_json(None, e)}),
     }
 }
@@ -320,14 +463,18 @@ fn diagnostics_of(outcome: &RunOutcome) -> Vec<Value> {
             "kernel_index": kernel,
             "blocked": blocked.len(),
         })),
-        RunStatus::Incomplete { reason, site } => out.push(json!({
-            "kind": "analysis_incomplete",
-            "status": "incomplete",
-            "reason": reason,
-            "source": "run_status",
-            "kernel_index": kernel,
-            "site": site.filter(|s| !s.is_none()).map(|s| s.0),
-        })),
+        RunStatus::Incomplete { reason, site, attrs } => {
+            let mut v = json!({
+                "kind": "analysis_incomplete",
+                "status": "incomplete",
+                "reason": reason,
+                "source": "run_status",
+                "kernel_index": kernel,
+                "site": site.filter(|s| !s.is_none()).map(|s| s.0),
+            });
+            merge_attrs(&mut v, attrs);
+            out.push(v);
+        }
         RunStatus::Completed => {}
     }
     for (resource, error) in &outcome.sync_leftovers {
@@ -888,6 +1035,18 @@ mod tests {
                 Err(other) => panic!("{mode:?}: {other}"),
             }
         }
+    }
+
+    #[test]
+    fn protocol_errors_get_structured_details() {
+        assert_eq!(snake("MissingWarpgroupSync"), "missing_warpgroup_sync");
+        assert_eq!(message_address("Global address 0xfffe00000004 is not mapped"), Some(0xfffe00000004));
+        assert_eq!(message_address("no address here"), None);
+        let live = numsim_core::sync::SyncError::Tcgen(numsim_core::sync::tcgen::Error::LiveAllocationsAtExit { cta: 0 });
+        let details = protocol_details(&live);
+        assert_eq!(details.get("protocol"), Some(&json!("tcgen")));
+        assert_eq!(details.get("error"), Some(&json!("live_allocations_at_exit")));
+        assert_eq!(details.get("cta"), Some(&json!(0)));
     }
 
     #[test]

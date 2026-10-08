@@ -1183,7 +1183,7 @@ pub mod addr {
             Generic::Local((va - GENERIC_LOCAL_BASE) as u32)
         } else if (GENERIC_PARAM_BASE..GENERIC_PARAM_BASE + APERTURE).contains(&va) {
             Generic::Param((va - GENERIC_PARAM_BASE) as u32)
-        } else if va >= GLOBAL_VA_BASE && va < GENERIC_LOCAL_BASE {
+        } else if (GLOBAL_VA_BASE..GENERIC_LOCAL_BASE).contains(&va) {
             Generic::Global(va)
         } else {
             Generic::Unmapped(va)

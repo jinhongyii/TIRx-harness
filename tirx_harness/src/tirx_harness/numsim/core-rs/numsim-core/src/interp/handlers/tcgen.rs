@@ -400,8 +400,7 @@ fn emit_async_spans(ctx: &mut ExecCtx<'_>, op: AsyncId, side: Side, kind: Access
     if !ctx.observing || spans.is_empty() {
         return;
     }
-    let mut acc = Accesses::default();
-    acc.items = spans.into_iter().map(|s| (alloc, None, s)).collect();
+    let mut acc = Accesses { items: spans.into_iter().map(|s| (alloc, None, s)).collect() };
     let spec = AccessSpec {
         actor: Actor::Async { op, side },
         site: ctx.site(),
@@ -586,7 +585,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
         let compressed: Vec<u8>;
         let out: &[u8] = match compress {
             Some((max, abs)) => {
-                let words: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+                let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
                 // Unreadable (invalid) words already failed or reported at the read.
                 let valid = vec![true; words.len()];
                 let (kept, _) = oplib::tcgen_ld_spcompress(&words, &valid, max, abs).map_err(|e| support::op_err(ctx, e))?;
@@ -605,7 +604,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
             pos += n;
         }
         if let Some((red, regs)) = &red {
-            let words: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+            let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
             let v = oplib::tcgen_ld_reduce(*red, &words).map_err(|e| support::op_err(ctx, e))?;
             if let Some(&rr) = regs.first() {
                 write_lane_bytes(ctx, rr, t, &v.to_le_bytes());

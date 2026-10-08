@@ -148,7 +148,7 @@ pub fn divergent_if_else() -> Scenario {
 }
 
 pub fn divergent_expected(tid: u32) -> u32 {
-    let r = if tid % 2 == 0 { tid * 2 + if tid < 16 { 1000 } else { 0 } } else { tid + 100 };
+    let r = if tid.is_multiple_of(2) { tid * 2 + if tid < 16 { 1000 } else { 0 } } else { tid + 100 };
     r + 1
 }
 
@@ -1191,6 +1191,83 @@ pub fn tmap_replace_generic_shared() -> Scenario {
     let bytes = rank1_u32_desc().try_encode().expect("valid descriptor");
     let words: Vec<u32> = bytes.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     scenario("tmap_replace_generic_shared", b.build_module(), inputs(vec![("desc", u32_buf(words)), ("out", u32_buf([0; 32]))]))
+}
+
+/// W11-pin-message 1: `out[lane] = 29 / rhs[lane]` (TIR u32 division) with
+/// `rhs[7] = 0`: an error naming only lane 7, with the operands.
+pub fn alu_div_by_zero_lane7() -> Scenario {
+    let mut b = ProgramBuilder::new("alu_div_by_zero_lane7", 32);
+    let rhs = b.global("rhs", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let d = b.reg(Ty::U32);
+    let q = b.reg(Ty::U32);
+    b.lane_id(lane);
+    b.ld_u32(d, rhs, lane);
+    let k29 = b.k_u32(29);
+    b.binary(BinOp::Div, Ty::U32, q, k29, d);
+    b.st_u32(out, lane, q);
+    b.exit();
+    let mut v = vec![1u32; 32];
+    v[7] = 0;
+    scenario("alu_div_by_zero_lane7", b.build_module(), inputs(vec![("rhs", u32_buf(v)), ("out", u32_buf([0; 32]))]))
+}
+
+/// W11-pin-message 5: lanes 1..31 wait on an mbarrier nobody arrives at,
+/// inside an `If` without `Else` (lane 0's continuation is after `EndIf`):
+/// `divergent_block` incomplete naming warp 0 and lanes 1..31.
+pub fn divergent_stuck_wait() -> Scenario {
+    let mut b = ProgramBuilder::new("divergent_stuck_wait", 32);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let ba = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    b.smem_addr(ba, bar, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.mbar_init(ba, 1);
+    b.end_if();
+    b.bar_sync(0);
+    b.compare(CmpOp::Ne, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.mbar_wait_parity(ba, k0);
+    b.end_if();
+    b.exit();
+    scenario("divergent_stuck_wait", b.build_module(), inputs(vec![]))
+}
+
+/// W9 phase 6: a `u64x2` CAS is one 128-bit compare-and-swap. `mem` =
+/// [7, 9]; lane 0 CASes with compare [7, 10] (component 1 differs: no
+/// change), then compare [7, 9] -> [23, 29]. `out` = the two old values
+/// [7, 9, 7, 9]; `mem` ends [23, 29] (never torn).
+pub fn cas128() -> Scenario {
+    let mut b = ProgramBuilder::new("cas128", 32);
+    let mem = b.global("mem", Dtype::U64);
+    let out = b.global("out", Dtype::U64);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let g = b.reg(Ty::U64);
+    let v2 = Ty::vector(Dtype::U64, 2);
+    let old = b.reg(v2);
+    let wide = |lo: u64, hi: u64| (hi as u128) << 64 | lo as u128;
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.addr_of(g, mem, k0);
+    for (i, (cmp, val)) in [((7u64, 10u64), (11u64, 13u64)), ((7, 9), (23, 29))].into_iter().enumerate() {
+        let c = b.konst(v2, wide(cmp.0, cmp.1));
+        let v = b.konst(v2, wide(val.0, val.1));
+        b.push(Instr::Atom { op: AtomOp::Cas, ty: v2, dst: Some(old), addr: g.into(), space: AddrSpace::Global, value: v, cmp: Some(c), sem: Sem::Relaxed, scope: Scope::Gpu, ftz: false });
+        let at = b.k_u32(2 * i as u32);
+        b.st(v2, out, at, old);
+    }
+    b.end_if();
+    b.exit();
+    let u64s = |v: &[u64]| ArgValue::Buffer { bytes: v.iter().flat_map(|x| x.to_le_bytes()).collect(), valid: None };
+    scenario("cas128", b.build_module(), inputs(vec![("mem", u64s(&[7, 9])), ("out", u64s(&[0; 4]))]))
 }
 
 /// Rows x cols of the TMA scenario's f32 tensor, and its box.
@@ -3560,7 +3637,7 @@ pub fn tma_load_param_box() -> Scenario {
 /// Scenarios that are deliberately racy or only meaningful with a specific
 /// configuration (each test states its expectation): not in [`all`].
 pub fn special() -> Vec<Scenario> {
-    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), tmem_subword(), tmem_f16_rows(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE), readonly_proxy("after"), readonly_proxy("cross_cta"), tcgen_ld_wide(false), divergent_named_barrier("other_id"), divergent_named_barrier("exit")]
+    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), tmem_subword(), tmem_f16_rows(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE), readonly_proxy("after"), readonly_proxy("cross_cta"), tcgen_ld_wide(false), divergent_named_barrier("other_id"), divergent_named_barrier("exit"), alu_div_by_zero_lane7(), divergent_stuck_wait()]
 }
 
 /// Writes in [`word_history_overflow`] past `MAX_WORD_HISTORY`.
@@ -3570,6 +3647,7 @@ pub const MAX_HISTORY_PROBE: u32 = (crate::interp::aux::MAX_WORD_HISTORY as u32)
 pub fn all() -> Vec<Scenario> {
     vec![
         vector_add(),
+        cas128(),
         tmap_replace_generic_shared(),
         ptx_op_per_signature(),
         generic_load(false),

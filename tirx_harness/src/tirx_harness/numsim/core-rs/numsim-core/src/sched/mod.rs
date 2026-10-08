@@ -229,7 +229,9 @@ pub enum RunStatus {
     Completed,
     Deadlock { blocked: Vec<(WarpId, ResourceId)> },
     /// Coverage could not be established (budget, unsupported op).
-    Incomplete { reason: String, site: Option<SiteId> },
+    /// `attrs`: structured facts for the report (`warp`, `lanes`, `budget`,
+    /// `max_rounds`, ... — W11-pin-message item 5).
+    Incomplete { reason: String, site: Option<SiteId>, attrs: BTreeMap<String, serde_json::Value> },
     Error(ExecError),
 }
 
@@ -404,6 +406,10 @@ fn cta_coords(shape: &LaunchShape, id: u32, rank: u32) -> [u32; 3] {
     [cc[0] * cl[0] + r[0], cc[1] * cl[1] + r[1], cc[2] * cl[2] + r[2]]
 }
 
+/// One partition's work item in a parallel round: the partition, its arena
+/// shard and its result slot.
+type RoundItem<'a> = (&'a mut Partition, &'a mut Arena, &'a mut Option<Result<bool, ExecError>>);
+
 fn linear(shape: &LaunchShape, c: [u32; 3]) -> u32 {
     c[0] + c[1] * shape.grid[0] + c[2] * shape.grid[0] * shape.grid[1]
 }
@@ -416,7 +422,15 @@ fn is_incomplete(k: &ExecErrorKind) -> bool {
 /// Status of a failed launch.
 pub fn classify(e: ExecError) -> RunStatus {
     if is_incomplete(&e.kind) {
-        RunStatus::Incomplete { reason: format!("{:?}: {}", e.kind, e.message), site: Some(e.site) }
+        let mut attrs = e.attrs.clone();
+        if e.warp != WarpId(u32::MAX) {
+            attrs.insert("warp".into(), serde_json::json!(e.warp.0));
+        }
+        if !e.lanes.is_empty() {
+            attrs.insert("lanes".into(), serde_json::json!(e.lanes.0));
+        }
+        attrs.insert("kernel".into(), serde_json::json!(e.kernel));
+        RunStatus::Incomplete { reason: format!("{:?}: {}", e.kind, e.message), site: Some(e.site), attrs }
     } else {
         RunStatus::Error(e)
     }
@@ -459,8 +473,8 @@ impl<'p> Scheduler<'p> {
     ) -> Result<Scheduler<'p>, RunError> {
         let invalid = |m: String| RunError::InvalidProgram(m);
         let cl = shape.cluster.map(|x| x.max(1));
-        for d in 0..3 {
-            if shape.grid[d] % cl[d] != 0 {
+        for (g, c) in shape.grid.iter().zip(cl) {
+            if !g.is_multiple_of(c) {
                 return Err(invalid(format!("grid {:?} is not a multiple of cluster {:?}", shape.grid, shape.cluster)));
             }
         }
@@ -1117,19 +1131,19 @@ impl<'p> Scheduler<'p> {
                 observing: self.observing,
             };
             let kernel = self.kernel_index;
-            let items: Vec<std::cell::UnsafeCell<(&mut Partition, &mut Arena, &mut Option<Result<bool, ExecError>>)>> = self
+            let items: Vec<std::cell::UnsafeCell<RoundItem<'_>>> = self
                 .partitions
                 .iter_mut()
                 .zip(shards.iter_mut())
                 .zip(results.iter_mut())
                 .map(|((p, a), r)| std::cell::UnsafeCell::new((p, a, r)))
                 .collect();
-            struct Items<'a, 'b>(&'b [std::cell::UnsafeCell<(&'a mut Partition, &'a mut Arena, &'a mut Option<Result<bool, ExecError>>)>]);
+            struct Items<'a, 'b>(&'b [std::cell::UnsafeCell<RoundItem<'a>>]);
             // SAFETY: `par_for` hands every index to exactly one thread.
             unsafe impl Sync for Items<'_, '_> {}
             impl<'a> Items<'a, '_> {
                 #[allow(clippy::mut_from_ref)]
-                unsafe fn item(&self, i: usize) -> &mut (&'a mut Partition, &'a mut Arena, &'a mut Option<Result<bool, ExecError>>) {
+                unsafe fn item(&self, i: usize) -> &mut RoundItem<'a> {
                     &mut *self.0[i].get()
                 }
             }
@@ -1199,9 +1213,9 @@ impl<'p> Scheduler<'p> {
         }
         let mut progress = false;
         let mut first_err = None;
-        for k in 0..kept {
+        for (k, result) in results.iter_mut().enumerate().take(kept) {
             self.absorb_state(k);
-            match results[k].take().expect("ran") {
+            match result.take().expect("ran") {
                 Ok(p) => progress |= p,
                 Err(e) => first_err = Some(e),
             }
@@ -1292,7 +1306,9 @@ impl<'p> Scheduler<'p> {
         self.turnover(arena, observer)?;
         loop {
             if self.round >= self.config.max_rounds {
-                return Ok(RunStatus::Incomplete { reason: format!("round budget of {} exhausted", self.config.max_rounds), site: None });
+                let mut attrs = BTreeMap::new();
+                attrs.insert("max_rounds".into(), serde_json::json!(self.config.max_rounds));
+                return Ok(RunStatus::Incomplete { reason: format!("round budget of {} exhausted", self.config.max_rounds), site: None, attrs });
             }
             let mut progress = self.parallel_phase(arena, observer, step_fn, pool)?;
             progress |= self.serial_phase(arena, observer, step_fn)?;
@@ -1319,21 +1335,28 @@ impl<'p> Scheduler<'p> {
                             if let WarpStatus::Blocked(r) = w.status {
                                 blocked.push((w.id, r));
                                 if divergent.is_none() && crate::interp::is_divergent(w) {
-                                    divergent = Some((w.id, self.program.site_of(w.pc)));
+                                    divergent = Some((w.id, self.program.site_of(w.pc), w.active));
                                 }
                                 // G8: a named barrier with an explicit count may
                                 // be waiting only on warps that exited.
                                 if let ResourceId::Named { cta, .. } = r {
                                     if after_exit.is_none() && p.aux.cta_exited.get(&cta).is_some_and(|m| *m != 0) {
-                                        after_exit = Some((w.id, self.program.site_of(w.pc)));
+                                        after_exit = Some((w.id, self.program.site_of(w.pc), w.active));
                                     }
                                 }
                             }
                         }
                     }
                 }
-                if let Some((w, site)) = after_exit {
+                let at = |w: WarpId, lanes: WarpMask| {
+                    let mut a = BTreeMap::new();
+                    a.insert("warp".to_string(), serde_json::json!(w.0));
+                    a.insert("lanes".to_string(), serde_json::json!(lanes.0));
+                    a
+                };
+                if let Some((w, site, lanes)) = after_exit {
                     return Ok(RunStatus::Incomplete {
+                        attrs: at(w, lanes),
                         reason: format!(
                             "named_barrier_after_exit (G8): no progress while warp {} waits on a named barrier of a CTA with exited warps; release of explicit-count barriers by exit is not modeled",
                             w.0
@@ -1343,8 +1366,9 @@ impl<'p> Scheduler<'p> {
                 }
                 // A divergent warp's lanes may be waiting on each other in a
                 // way structured SIMT cannot interleave: not a proof.
-                if let Some((w, site)) = divergent {
+                if let Some((w, site, lanes)) = divergent {
                     return Ok(RunStatus::Incomplete {
+                        attrs: at(w, lanes),
                         reason: format!("divergent_block: no progress while warp {} is blocked with a divergent mask", w.0),
                         site: Some(site),
                     });

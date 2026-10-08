@@ -115,7 +115,7 @@ fn loop_budget_is_incomplete() {
     let s = scenarios::loop_budget();
     let o = run(&s);
     match &o.status {
-        RunStatus::Incomplete { reason, site } => {
+        RunStatus::Incomplete { reason, site, .. } => {
             assert!(reason.contains("Budget"), "{reason}");
             let site = site.expect("site");
             assert_eq!(s.module.kernels[0].sites[site.0 as usize].op_name, "spin");
@@ -653,7 +653,7 @@ fn lane_split_mbarrier_events() {
         })
         .count();
     assert_eq!(waits, 1, "one Protocol event for the lane-varying wait");
-    let wait_events = all_events(&log).iter().filter(|e| matches!(e.kind, SyncKind::Wait { .. })).map(|e| e.lanes.bits()).count();
+    let wait_events = all_events(&log).iter().filter(|e| matches!(e.kind, SyncKind::Wait { .. })).count();
     assert_eq!(wait_events, 2);
 }
 
@@ -1385,4 +1385,42 @@ fn access_operand_names_the_pointer_operand() {
     assert!(!async_writes.is_empty() && async_writes.iter().all(|&o| o == 0), "{async_writes:?}");
     assert!(!async_reads.is_empty() && async_reads.iter().all(|&o| o == 1), "{async_reads:?}");
     assert!(obs.0.iter().any(|x| matches!(x.0, Actor::Warp { .. }) && x.1 == Space::Param && x.3 == 1), "{:?}", obs.0);
+}
+
+/// W11-pin-message 1: an ALU fault names the faulting lanes and carries the
+/// operation and the operands as structured attrs.
+#[test]
+fn alu_fault_names_the_faulting_lane_and_operands() {
+    let o = run(&scenarios::alu_div_by_zero_lane7());
+    let RunStatus::Error(e) = &o.status else { panic!("{:?}", o.status) };
+    assert_eq!(e.lanes.0, 1 << 7, "{e:?}");
+    assert_eq!(e.attrs["faulting_lanes"], serde_json::json!([7]));
+    assert_eq!(e.attrs["operands"], serde_json::json!([29, 0]));
+    assert!(e.attrs["operation"].as_str().unwrap().starts_with("Div"), "{e:?}");
+}
+
+/// W11-pin-message 5: incomplete stops carry warp / lanes / budget attrs.
+#[test]
+fn incomplete_stops_carry_structured_location() {
+    let s = scenarios::loop_budget();
+    let o = run(&s);
+    let RunStatus::Incomplete { attrs, .. } = &o.status else { panic!("{:?}", o.status) };
+    assert_eq!(attrs["budget"], serde_json::json!(s.config.loop_budget));
+    assert!(attrs.contains_key("warp") && attrs.contains_key("lanes") && attrs.contains_key("iteration"), "{attrs:?}");
+    let o = run(&scenarios::divergent_stuck_wait());
+    let RunStatus::Incomplete { reason, attrs, .. } = &o.status else { panic!("{:?}", o.status) };
+    assert!(reason.starts_with("divergent_block"), "{reason}");
+    assert_eq!(attrs["warp"], serde_json::json!(0));
+    assert_eq!(attrs["lanes"], serde_json::json!(0xffff_fffeu32));
+}
+
+/// W9 phase 6: a vector (`u64x2`) CAS compares and replaces all 16 bytes at
+/// once: a compare differing in one component changes nothing.
+#[test]
+fn vector_cas_is_one_128_bit_compare_and_swap() {
+    let o = run(&scenarios::cas128());
+    completed(&o);
+    let u64s = |n: &str| o.outputs.buffers[n].0.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect::<Vec<u64>>();
+    assert_eq!(u64s("out"), vec![7, 9, 7, 9]);
+    assert_eq!(u64s("mem"), vec![23, 29]);
 }

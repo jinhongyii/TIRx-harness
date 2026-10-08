@@ -36,7 +36,7 @@ pub(crate) struct Env<'a> {
 }
 
 pub(crate) fn sched_error(kind: ExecErrorKind, kernel: u32, warp: WarpId, site: SiteId, message: String) -> ExecError {
-    ExecError { kind, kernel, warp, pc: Pc(0), site, lanes: WarpMask::NONE, message }
+    ExecError { kind, kernel, warp, pc: Pc(0), site, lanes: WarpMask::NONE, message, attrs: Default::default() }
 }
 
 /// An owned copy of an [`Access`] (its `seq` is assigned at replay).
@@ -554,6 +554,9 @@ impl Partition {
         let mut reads: Vec<(AllocId, ByteSpan)> = Vec::new();
         let mut writes: Vec<(AllocId, ByteSpan)> = Vec::new();
         let mut rmw = false;
+        // Reads whose bytes were invalid when read but are written by the same
+        // op (MMA accumulator D): reported from the read-time check.
+        let mut read_time_uninit: Vec<(AllocId, ByteSpan)> = Vec::new();
         match &op.payload {
             Payload::None => {}
             Payload::Copy { src, dst, zero_fill } => {
@@ -626,9 +629,10 @@ impl Partition {
                 rmw = true;
             }
             Payload::TcgenMma(p) => {
-                let (r, w) = run_mma(arena, p, tc_arch(env.program.arch.as_deref()), meta.as_ref().and_then(|m| m.lut_b))
+                let (r, w, u) = run_mma(arena, p, tc_arch(env.program.arch.as_deref()), meta.as_ref().and_then(|m| m.lut_b))
                     .map_err(|e| sched_error(ExecErrorKind::Op(e.kind), kernel, op.source.warp, op.source.site, e.message))?;
                 reads.extend(r);
+                read_time_uninit = u;
                 writes.extend(w);
                 rmw = true;
             }
@@ -679,6 +683,9 @@ impl Partition {
         if arena.policy() == crate::arena::ValidityPolicy::ZeroAndReport {
             for &(a, s) in &reads {
                 self.report_async_uninit(env, arena, op.id, op.source.site, lane, a, s);
+            }
+            for &(a, s) in &read_time_uninit {
+                self.report_read_time_uninit(env, arena, op.id, op.source.site, lane, a, s);
             }
         }
         if env.observing {
@@ -816,6 +823,17 @@ impl Partition {
 }
 
 impl Partition {
+    /// One `UninitRead` finding for `span` of `alloc`, whose bytes were
+    /// invalid when the op read them (since overwritten by the op itself).
+    fn report_read_time_uninit(&mut self, env: &Env<'_>, arena: &Arena, op: crate::sync::AsyncId, site: SiteId, lane: u8, alloc: AllocId, span: ByteSpan) {
+        if self.aux.uninit_seen.insert((site, alloc, span)) {
+            let a = arena.get(alloc);
+            let actor = Actor::Async { op, side: Side::Read };
+            let l = if lane == ALL_LANES { 0 } else { lane as usize };
+            self.aux.diagnostics.push(support::uninit_finding(env.kernel, site, Some(actor), a.space, alloc, &a.name, span, l));
+        }
+    }
+
     /// One `UninitRead` finding per maximal invalid range of `span` of
     /// `alloc` read by async op `op` (deduplicated like synchronous reads).
     fn report_async_uninit(&mut self, env: &Env<'_>, arena: &Arena, op: crate::sync::AsyncId, site: SiteId, lane: u8, alloc: AllocId, span: ByteSpan) {
@@ -1003,11 +1021,14 @@ fn tc_arch(arch: Option<&str>) -> crate::oplib::TcArch {
 /// tcgen05.mma numerics through oplib (`tc_mma_ctas`), recording the spans
 /// it touched. `p.smem` / `p.tmem` are indexed by CTA within the issuing
 /// group (0 = even CTA of the pair for `cta_group::2`).
-fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch: crate::oplib::TcArch, lut_b: Option<u32>) -> crate::oplib::OpResult<(Spans, Spans)> {
+/// Returns (reads, writes, TMEM reads that saw invalid bytes when they were
+/// made: the accumulator D read before the MMA writes D, W9 phase 6).
+fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch: crate::oplib::TcArch, lut_b: Option<u32>) -> crate::oplib::OpResult<(Spans, Spans, Spans)> {
     use crate::oplib::OpError;
     use std::cell::RefCell;
     let cell = RefCell::new(arena);
     let reads: RefCell<Spans> = RefCell::new(Vec::new());
+    let uninit: RefCell<Spans> = RefCell::new(Vec::new());
     let mut writes: Spans = Vec::new();
     let options = crate::oplib::TcMmaOptions { arch, ti16: p.args.kind == crate::program::TcMmaKind::Ti16, lut_b, ..Default::default() };
     // oplib reads/writes one small piece at a time: record them merged with
@@ -1058,6 +1079,9 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
         let ar = cell.borrow();
         let span = ByteSpan::new(off, out.len() as u64);
         if !fast_read(&ar, al, span, out) {
+            if ar.first_invalid(support::whole(&ar, al), span).is_some() {
+                note(&mut uninit.borrow_mut(), al, span);
+            }
             ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
         }
         note(&mut reads.borrow_mut(), al, span);
@@ -1082,7 +1106,9 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
     let mut r = reads.into_inner();
     coalesce(&mut r);
     coalesce(&mut writes);
-    Ok((r, writes))
+    let mut u = uninit.into_inner();
+    coalesce(&mut u);
+    Ok((r, writes, u))
 }
 
 fn coalesce(v: &mut Spans) {
