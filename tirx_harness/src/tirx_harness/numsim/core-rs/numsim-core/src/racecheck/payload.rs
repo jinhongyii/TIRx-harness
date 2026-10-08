@@ -106,6 +106,7 @@ fn incomplete_reason(i: &Incomplete) -> (String, Value) {
         Incomplete::WaitPredicateReadsUnstable { warp } => ("wait_predicate_reads_unstable", json!({"warp_id": warp})),
         Incomplete::EventOutsideLaunch { events } => ("event_outside_launch", json!({"events": events})),
         Incomplete::FindingsTruncated { dropped } => ("findings_truncated", json!({"dropped": dropped})),
+        Incomplete::SignalWriteNotRecorded { warp } => ("signal_write_not_recorded", json!({"warp_id": warp})),
         Incomplete::AsyncLaneUnknown { op } => ("async_lane_unknown", json!({"async_op": op.0})),
         Incomplete::CompletionWarpOutOfRange { warp } => ("shadow_rejected", json!({"cause": "completion_warp_out_of_range", "warp_id": warp})),
         Incomplete::KernelMismatch { expected, got } => ("kernel_mismatch", json!({"expected": expected, "got": got})),
@@ -238,11 +239,27 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
             let (name, ck) = match kind {
                 AdvisoryKind::CrossCtaAsyncOrder => ("cross_cta_async_order", FindingKind::CrossCtaAsyncOrder),
                 AdvisoryKind::UndeclaredProtocolWord => ("undeclared_protocol_word", FindingKind::UndeclaredProtocolWord),
+                AdvisoryKind::AliasStaleRead => ("alias_stale_read", FindingKind::Other("alias_stale_read".into())),
             };
+            if *kind == AdvisoryKind::AliasStaleRead {
+                // Legacy advisory keys.
+                let reader = f.current.as_ref().map(|c| c.site);
+                let writer = f.prior.as_ref().map(|c| c.site);
+                let name = |s: Option<crate::site::SiteId>| s.and_then(|s| lr.buffer_of_site.get(&s).cloned());
+                race.insert("reader_buffer".into(), json!(name(reader)));
+                race.insert("writer_buffer".into(), json!(name(writer)));
+                race.insert("allocation_id".into(), json!(f.alloc.0));
+                race.insert("space".into(), json!(lr.buffers.get(&f.alloc).map(|(_, s)| space_name(*s))));
+                race.insert(
+                    "overlaps".into(),
+                    json!([{"allocation_id": f.alloc.0, "byte_offset": f.bytes.start, "byte_len": f.bytes.end - f.bytes.start, "byte_end": f.bytes.end}]),
+                );
+            }
             race.insert("legacy_kind".into(), json!(name));
             let msg = match kind {
                 AdvisoryKind::CrossCtaAsyncOrder => "async-proxy accesses issued from different CTAs are ordered only by base causality; PTX preserves same-proxy order only within one thread block".to_string(),
                 AdvisoryKind::UndeclaredProtocolWord => "a strong load observed an unordered strong write on a word not declared for wait_until; the resulting ordering depends on the schedule".to_string(),
+                AdvisoryKind::AliasStaleRead => "stale-name read through pool alias: the read observes bytes last written through another logical buffer".to_string(),
             };
             (ck, Status::Review, msg)
         }
@@ -422,7 +439,7 @@ pub fn serialize(r: &Report) -> Value {
         }
         m.insert("message".into(), json!(f.message));
         m.insert("sites".into(), json!(f.sites.iter().map(|s| s.0).collect::<Vec<_>>()));
-        if matches!(legacy.as_str(), "undeclared_protocol_word" | "cross_cta_async_order") {
+        if matches!(legacy.as_str(), "undeclared_protocol_word" | "cross_cta_async_order" | "alias_stale_read") {
             advisories.push(Value::Object(m));
         } else {
             findings.push(Value::Object(m));

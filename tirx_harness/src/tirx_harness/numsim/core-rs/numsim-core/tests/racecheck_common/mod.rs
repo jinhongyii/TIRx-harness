@@ -116,6 +116,9 @@ pub struct K {
     issuer_lane: HashMap<u64, u8>,
     pub kernel: u32,
     pub gc_every: u64,
+    /// Logical buffer name per site (`SiteInfo::buffer`), for the
+    /// `alias_stale_read` advisory. Warp access sites are `w * 1000 + epoch`.
+    pub site_buffers: Vec<(SiteId, String)>,
 }
 
 impl K {
@@ -130,6 +133,7 @@ impl K {
             issuer_lane: HashMap::new(),
             kernel: 0,
             gc_every: 1 << 14,
+            site_buffers: Vec::new(),
         };
         k.alloc(SMEM, Space::Shared, 4096);
         k.alloc(SMEM1, Space::Shared, 4096);
@@ -469,6 +473,9 @@ impl K {
         let mut obs = RaceObserver::new(RacecheckConfig::default());
         obs.gc_every = self.gc_every;
         obs.start_launch(self.topo, 0);
+        if !self.site_buffers.is_empty() {
+            obs.set_site_buffers(self.site_buffers.clone());
+        }
         for (i, e) in self.ev.iter().enumerate() {
             match e {
                 Ev::Access { actor, site, alloc, space, kind, sem, scope, atomic, returns_value, proxy, window, spans } => {

@@ -56,6 +56,8 @@ pub struct LaunchResult {
     pub stats: Stats,
     /// Buffer name and space per allocation, for evidence.
     pub buffers: HashMap<AllocId, (String, Space)>,
+    /// Logical buffer name per site (`SiteInfo::buffer`).
+    pub buffer_of_site: HashMap<crate::site::SiteId, String>,
 }
 
 /// The checker as an [`Observer`]. Feed it to `sched::run`.
@@ -75,11 +77,12 @@ pub struct RaceObserver {
     subops: HashMap<AsyncId, Vec<(u8, AsyncId)>>,
     next_sub: u64,
     pub launches: Vec<LaunchResult>,
+    buffer_of_site: HashMap<crate::site::SiteId, String>,
 }
 
 impl RaceObserver {
     pub fn new(config: RacecheckConfig) -> RaceObserver {
-        RaceObserver { config, gc_every: DEFAULT_GC_EVERY, checker: None, kernel: 0, buffers: HashMap::new(), outside_launch: 0, subops: HashMap::new(), next_sub: SUBOP_BASE, launches: Vec::new() }
+        RaceObserver { config, gc_every: DEFAULT_GC_EVERY, checker: None, kernel: 0, buffers: HashMap::new(), outside_launch: 0, subops: HashMap::new(), next_sub: SUBOP_BASE, launches: Vec::new(), buffer_of_site: HashMap::new() }
     }
 
     /// Start a launch from an explicit topology (tests and replay; the
@@ -93,6 +96,15 @@ impl RaceObserver {
         c.max_findings = self.config.max_findings;
         self.kernel = kernel;
         self.checker = Some(c);
+    }
+
+    /// Logical buffer names per site (normally from `Program::sites`); enables
+    /// the `alias_stale_read` advisory.
+    pub fn set_site_buffers(&mut self, names: Vec<(crate::site::SiteId, String)>) {
+        if let Some(c) = &mut self.checker {
+            c.site_buffer = names.iter().map(|(s, b)| (*s, std::sync::Arc::<str>::from(b.as_str()))).collect();
+        }
+        self.buffer_of_site = names.into_iter().collect();
     }
 
     /// Register an allocation (normally via `begin_launch` or `AllocBegin`).
@@ -120,6 +132,7 @@ impl RaceObserver {
             report,
             stats,
             buffers: self.buffers.clone(),
+            buffer_of_site: std::mem::take(&mut self.buffer_of_site),
         });
     }
 
@@ -192,6 +205,14 @@ impl Observer for RaceObserver {
         let s = info.shape;
         let topo = ri::Topology { warps_per_cta: s.warps_per_cta(), ctas_per_cluster: s.ctas_per_cluster().max(1), num_ctas: s.num_ctas() };
         self.start_launch(topo, info.kernel_index);
+        let names: Vec<(crate::site::SiteId, String)> = info
+            .program
+            .sites
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.buffer.clone().map(|b| (crate::site::SiteId(i as u32), b)))
+            .collect();
+        self.set_site_buffers(names);
         for (id, a) in info.arena.iter() {
             if matches!(a.space, Space::Global | Space::Shared | Space::Tmem) {
                 self.register_alloc(id, a.space, a.size, &a.name);

@@ -48,6 +48,10 @@ pub enum FindingKind {
     UndeclaredProtocolWord,
     /// Async-proxy writers from several CTAs ordered only by base causality (W5-3).
     CrossCtaAsyncOrder,
+    /// A read through one logical buffer name observed pooled bytes last written through another name (advisory, W5-7).
+    AliasStaleRead,
+    /// A declared-word wait accepted a write that does not exactly cover the word (W5 delta row W5).
+    SignalWriteNotRecorded,
     BarrierMismatch,
     MbarrierMisuse,
     AsyncGroupMisuse,

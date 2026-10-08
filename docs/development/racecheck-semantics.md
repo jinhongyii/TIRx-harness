@@ -1105,6 +1105,22 @@ reserves the top values). The adapter converts the epoch with
 the event; it never truncates or panics. Async-slot epochs share the same
 32-bit field, at 2 per slot generation.
 
+### Test-migration rulings (`test-migration.md`)
+
+- **Wide or narrow writes to a declared word.** These are numbered (V3), but a
+  wait that accepts one is `SignalWriteNotRecorded`, the legacy
+  `signal_write_not_recorded` (delta W5). Mixed-size accesses are outside the
+  morally strong relation (PTX §8.7.2).
+- **`alias_stale_read` is ported** (delta P7). It is driven by
+  `SiteInfo::buffer`.
+- **Same-rank `mapa` is the CTA's own `shared::cta` window**, because
+  `mapa(p, own rank) == p`. The checker normalises the window by comparing the
+  accessor's CTA with the allocation's CTA (delta X10).
+- **Declared words may live in shared memory** (delta W6).
+- **A qualifier-less remote `mbarrier.arrive.shared::cluster` defaults to
+  `.cta`**, which gives `ScopeMismatch` (delta B7). Lowering keeps the PTX
+  default.
+
 ### Fixes from the adversarial review (`checker-review.md`)
 
 **Soundness**

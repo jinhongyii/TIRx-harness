@@ -96,6 +96,10 @@ pub enum AdvisoryKind {
     /// that is not a declared `wait_until` word: not a race (§8.7.1), but
     /// the edge it yields is schedule dependent.
     UndeclaredProtocolWord,
+    /// A read through one logical buffer name observes bytes last written
+    /// through another name of the same pooled allocation (legacy
+    /// `alias_stale_read`; ordered, so not a race, but likely a stale name).
+    AliasStaleRead,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +137,9 @@ pub enum Incomplete {
     EventOutsideLaunch { events: u64 },
     /// A multi-lane per-thread async op's access did not name its lane.
     AsyncLaneUnknown { op: AsyncId },
+    /// A `wait_until` exit is explained only by a write that does not exactly
+    /// cover the declared word (wider, narrower or misaligned).
+    SignalWriteNotRecorded { warp: WarpId },
     /// An `AsyncComplete` named a warp outside the launch.
     CompletionWarpOutOfRange { warp: WarpId },
     /// A sync event's `kernel` differs from the launch being checked.
@@ -429,6 +436,10 @@ struct Phase {
 struct HistEntry {
     rel: Option<Heads>,
     is_async: bool,
+    /// The write's span is not exactly the word: a mixed-size access is
+    /// not single-copy atomic with the word's polls (PTX §8.7.2), so a wait
+    /// accepting it is `incomplete` (legacy `signal_write_not_recorded`).
+    mixed_size: bool,
     /// GC found the payload dominated by every live actor and dropped it.
     consumed: bool,
 }
@@ -468,6 +479,9 @@ pub struct Checker {
     sc: HashMap<(WarpId, u8, Scope), Arc<Knowledge>>,
     words: HashMap<AllocId, Vec<Word>>,
     advisory_dedup: HashMap<(AdvisoryKind, AllocId, SiteId), usize>,
+    /// Logical buffer name per site (`SiteInfo::buffer`), for
+    /// `AliasStaleRead`. Empty = advisory off.
+    pub site_buffer: HashMap<SiteId, Arc<str>>,
     wide: WideSpans,
     report: Report,
     dedup: HashMap<(AllocId, RaceClass, SiteId, SiteId, bool), usize>,
@@ -521,6 +535,7 @@ impl Checker {
             sc: HashMap::new(),
             words: HashMap::new(),
             advisory_dedup: HashMap::new(),
+            site_buffer: HashMap::new(),
             wide: WideSpans::default(),
             report: Report::default(),
             dedup: HashMap::new(),
@@ -891,9 +906,20 @@ impl Checker {
         if a.range.start == a.range.end {
             return; // e.g. cp.async zfill with src-size 0: no bytes (review R7)
         }
+        // A `mapa` to the accessor's own rank is the CTA's own window: the
+        // hardware encoding gives `mapa(p, own rank) == p` (PTX §9.7.9.20),
+        // so it is the shared::cta window, not shared::cluster.
+        let accessor_cta = match cur {
+            Cur::Lane { w, .. } => self.topo.cta_of(w as u32),
+            Cur::Async { a: i } => self.topo.cta_of(self.asyncs[i].warp),
+        };
+        let domain = match (a.domain, self.allocs.get(&a.alloc)) {
+            (Some(Domain::SharedCluster), Some(al)) if al.space == Space::Shared && al.cta == accessor_cta => Some(Domain::SharedCta),
+            (d, _) => d,
+        };
         if a.range.end > size || a.range.start > a.range.end {
             let current = matches!(cur, Cur::Lane { .. }).then(|| {
-                let w = Witness::pack(stamp, lane, a.proxy, a.domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.wide);
+                let w = Witness::pack(stamp, lane, a.proxy, domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.wide);
                 self.info(&w)
             });
             let f = Finding {
@@ -939,7 +965,7 @@ impl Checker {
             }
             self.asyncs[i].k.g2t = v;
         }
-        let w = Witness::pack(stamp, lane, a.proxy, a.domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.wide);
+        let w = Witness::pack(stamp, lane, a.proxy, domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.wide);
         let writes = w.writes();
         let strong = a.scope.is_some();
 
@@ -971,19 +997,21 @@ impl Checker {
         let mut acquired: Vec<Heads> = Vec::new();
         // Every declared word this access overlaps, with the byte whose
         // segment decides the word's entry.
-        let word_points: Vec<(usize, u64)> = self
+        let word_points: Vec<(usize, u64, bool)> = self
             .words
             .get(&a.alloc)
             .map(|ws| {
                 ws.iter()
                     .enumerate()
                     .filter(|(_, x)| x.range.start < a.range.end && a.range.start < x.range.end)
-                    .map(|(i, x)| (i, x.range.start.max(a.range.start)))
+                    .map(|(i, x)| (i, x.range.start.max(a.range.start), x.range == a.range))
                     .collect()
             })
             .unwrap_or_default();
         let in_word = !word_points.is_empty();
-        let mut word_rels: Vec<(usize, Option<Heads>)> = Vec::new();
+        let alias_space = !self.site_buffer.is_empty()
+            && self.allocs.get(&a.alloc).is_some_and(|al| matches!(al.space, Space::Shared | Space::Tmem));
+        let mut word_rels: Vec<(usize, Option<Heads>, bool)> = Vec::new();
 
         let mut shadow = std::mem::take(&mut self.allocs.get_mut(&a.alloc).unwrap().shadow);
         {
@@ -1008,6 +1036,20 @@ impl Checker {
                 if writes {
                     for p in cell.reads.as_slice() {
                         check(&p.w);
+                    }
+                }
+                // alias_stale_read: a read through one logical name of bytes
+                // last written (and ordered before it) through another name
+                // of the same pooled allocation.
+                if !writes && alias_space {
+                    if let Some(last) = cell.writes.last() {
+                        if this.ordered(cur, &last.w, a.proxy) {
+                            if let (Some(rb), Some(wb)) = (this.site_buffer.get(&a.site), this.site_buffer.get(&this.site_of(&last.w))) {
+                                if rb != wb {
+                                    advisories.push((overlap(last.w.span(wide), &seg), last.w, AdvisoryKind::AliasStaleRead));
+                                }
+                            }
+                        }
                     }
                 }
                 // The write this access reads from: the latest one that is
@@ -1042,9 +1084,9 @@ impl Checker {
                             Some(Arc::new(v))
                         }
                     };
-                    for (i, pt) in &word_points {
+                    for (i, pt, exact) in &word_points {
                         if seg.start <= *pt && *pt < seg.end {
-                            word_rels.push((*i, rel.clone()));
+                            word_rels.push((*i, rel.clone(), !*exact));
                         }
                     }
                     cell.writes.record(Entry { w, rel, base }, wide, |p| this.ordered(cur, p, a.proxy));
@@ -1071,11 +1113,11 @@ impl Checker {
         if !word_rels.is_empty() {
             let is_async = matches!(cur, Cur::Async { .. });
             let ws = self.words.get_mut(&a.alloc).unwrap();
-            for (i, rel) in word_rels {
+            for (i, rel, mixed_size) in word_rels {
                 let word = &mut ws[i];
                 if word.last != Some((a.seq, lane)) {
                     word.last = Some((a.seq, lane));
-                    word.history.push(HistEntry { rel, is_async, consumed: false });
+                    word.history.push(HistEntry { rel, is_async, consumed: false, mixed_size });
                 }
             }
         }
@@ -1781,6 +1823,10 @@ impl Checker {
             self.note_incomplete(Incomplete::WaitExitUnproven { warp });
             return;
         };
+        if e.mixed_size {
+            self.note_incomplete(Incomplete::SignalWriteNotRecorded { warp });
+            return;
+        }
         if e.is_async {
             // Async publications land their bytes at completion; the run's
             // observed version is the only edge available (degraded,

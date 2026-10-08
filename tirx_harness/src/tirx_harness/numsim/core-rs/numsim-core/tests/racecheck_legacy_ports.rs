@@ -325,10 +325,9 @@ fn g2_wide_publication(width: u64) -> Report {
 /// overlapping word) and, given an accepting verdict bit, reports clean.
 /// No delta row states that wide publications are no longer incomplete.
 #[test]
-#[ignore = "undocumented divergence: wide (v4.b32) release store on a declared word is accepted via the verdict bitset (clean); legacy and racecheck-semantics.md list wide writes as incomplete"]
 fn g2_publication_too_wide_to_poll_fails_closed() {
     let r = g2_wide_publication(16);
-    assert!(!r.incomplete.is_empty(), "{r:?}");
+    assert!(r.incomplete.iter().any(|i| matches!(i, Incomplete::SignalWriteNotRecorded { .. })), "{r:?}");
 }
 
 /// test_declared_word_regressions.py::test_a_publication_a_wait_can_poll_is_clean

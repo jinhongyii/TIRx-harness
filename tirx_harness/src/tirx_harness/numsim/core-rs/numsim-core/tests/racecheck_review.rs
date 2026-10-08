@@ -13,11 +13,15 @@ const FLAG: std::ops::Range<u64> = 0..4;
 
 /// S2: a shared::cta store must not evict a shared::cluster (mapa) store:
 /// the bridge for the async access is chosen by the prior's window.
+/// (A same-rank mapa is the CTA's own window, so the two windows only
+/// differ for a remote rank: CTA1 writes CTA0's smem through shared::cluster,
+/// then CTA0 rewrites it through shared::cta.)
 #[test]
 fn s2_eviction_respects_window_domain() {
     let run = |second_store: bool| {
-        let mut k = K::one_warp();
-        k.inst_in(0, &[0], PLAIN_ST, Some(Domain::SharedCluster), |_| (SMEM, 0..16));
+        let mut k = K::new(1, 2, 2);
+        k.inst_in(1, &[0], PLAIN_ST, Some(Domain::SharedCluster), |_| (SMEM, 0..16));
+        k.cluster_bar(&[0, 1]);
         if second_store {
             k.st(0, 0, SMEM, 0..16);
         }
@@ -26,7 +30,7 @@ fn s2_eviction_respects_window_domain() {
         k.ar(op, Proxy::Async, SMEM, 0..16).aw(op, Proxy::Async, GMEM, 0..16).done_warp(op, Milestone::Write, 0, 1);
         k.run()
     };
-    assert!(has_failure(&run(false), |f| matches!(f, OrderingFailure::MissingProxyBridge { .. })));
+    assert!(has_failure(&run(false), |f| matches!(f, OrderingFailure::MissingProxyBridge { domain: Some(Domain::SharedCluster), .. })));
     assert!(has_failure(&run(true), |f| matches!(f, OrderingFailure::MissingProxyBridge { domain: Some(Domain::SharedCluster), .. })));
 }
 
@@ -62,12 +66,19 @@ fn s4_declared_word_numbering() {
     };
     assert!(clean(&run(0b1000)), "entry 3 is the release");
     assert!(has_race(&run(0b0100)), "entry 2 is lane 1's relaxed atom");
-    // An 8-byte release covering two declared words appends to both.
-    let mut k = K::new(1, 1, 2);
-    k.declare(GMEM2, 0..4).declare(GMEM2, 4..8);
-    k.st(0, 0, GMEM, 0..4).a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, 0..8);
-    k.wait_until(1, 0, GMEM2, 4..8, Scope::Gpu, 0b10, 1).ld(1, 0, GMEM, 0..4);
-    assert!(clean(&k.run()));
+    // An 8-byte release covering two declared words is entry 1 of both;
+    // a later exact 4-byte release to the second word is its entry 2.
+    let run = |accepted: u64| {
+        let mut k = K::new(1, 1, 2);
+        k.declare(GMEM2, 0..4).declare(GMEM2, 4..8);
+        k.st(0, 0, GMEM, 0..4).a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, 0..8);
+        k.a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, 4..8);
+        k.wait_until(1, 0, GMEM2, 4..8, Scope::Gpu, accepted, 2).ld(1, 0, GMEM, 0..4);
+        k.run()
+    };
+    assert!(clean(&run(0b100)));
+    // Accepting the mixed-size (8-byte) write is incomplete (spec §5).
+    assert!(run(0b10).incomplete.iter().any(|i| matches!(i, Incomplete::SignalWriteNotRecorded { .. })));
 }
 
 /// S6: the tensormap acquire filters by the RELEASING thread.
@@ -287,4 +298,62 @@ fn all_lanes_warp_access_is_collective() {
 #[allow(dead_code)]
 fn _cta(c: u32) -> CtaId {
     CtaId(c)
+}
+
+/// test_native_alias_advisory.py (ported): a read through logical name A of
+/// pooled smem last written (ordered) through name B is a review advisory;
+/// reading through the writer's name, or a read before the B write, is clean.
+fn alias(mode: u8) -> Report {
+    use numsim_core::site::SiteId;
+    let mut k = K::one_warp();
+    // warp 0 sites: epoch 1 = write A, 2 = write B / read, 3 = read / write.
+    match mode {
+        0 => {
+            k.st(0, 0, SMEM, 0..4).st(0, 0, SMEM, 0..4).ld(0, 0, SMEM, 0..4);
+            k.site_buffers = vec![(SiteId(1), "A_shared".into()), (SiteId(2), "B_shared".into()), (SiteId(3), "A_shared".into())];
+        }
+        1 => {
+            k.st(0, 0, SMEM, 0..4).st(0, 0, SMEM, 0..4).ld(0, 0, SMEM, 0..4);
+            k.site_buffers = vec![(SiteId(1), "A_shared".into()), (SiteId(2), "B_shared".into()), (SiteId(3), "B_shared".into())];
+        }
+        _ => {
+            k.st(0, 0, SMEM, 0..4).ld(0, 0, SMEM, 0..4).st(0, 0, SMEM, 0..4);
+            k.site_buffers = vec![(SiteId(1), "A_shared".into()), (SiteId(2), "A_shared".into()), (SiteId(3), "B_shared".into())];
+        }
+    }
+    k.run()
+}
+
+#[test]
+fn alias_stale_read_advisory() {
+    let r = alias(0);
+    assert!(has_advisory(&r, AdvisoryKind::AliasStaleRead), "{r:?}");
+    assert!(review_only(&r));
+    assert!(clean(&alias(1)) && !has_advisory(&alias(1), AdvisoryKind::AliasStaleRead));
+    assert!(clean(&alias(2)) && !has_advisory(&alias(2), AdvisoryKind::AliasStaleRead));
+    // Payload keeps the legacy keys.
+    let mut k = K::one_warp();
+    use numsim_core::site::SiteId;
+    k.st(0, 0, SMEM, 0..4).st(0, 0, SMEM, 0..4).ld(0, 0, SMEM, 0..4);
+    k.site_buffers = vec![(SiteId(1), "A_shared".into()), (SiteId(2), "B_shared".into()), (SiteId(3), "A_shared".into())];
+    let p = serialize(&report(&k.observe()));
+    let a = &p["advisories"][0];
+    assert_eq!(a["kind"], "alias_stale_read");
+    assert_eq!(a["reader_buffer"], "A_shared");
+    assert_eq!(a["writer_buffer"], "B_shared");
+    assert_eq!(a["space"], "shared");
+    assert_eq!(a["overlaps"][0]["byte_len"], 4);
+}
+
+/// Declared words are not global-only: a word in shared memory polled
+/// through shared::cluster by a peer CTA is declared like any other.
+#[test]
+fn declared_word_in_shared_cluster_window() {
+    let mut k = K::new(1, 2, 2);
+    k.declare(SMEM, 0..4);
+    k.st(0, 0, GMEM, 0..4);
+    k.inst_in(0, &[0], st(MemOrder::Release, Scope::Cluster), Some(Domain::SharedCta), |_| (SMEM, 0..4));
+    k.wait_until(1, 0, SMEM, 0..4, Scope::Cluster, 0b10, 1).ld(1, 0, GMEM, 0..4);
+    let r = k.run();
+    assert!(clean(&r) && r.findings.is_empty(), "{r:?}");
 }

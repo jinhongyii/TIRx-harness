@@ -39,6 +39,7 @@ that a future change is caught.
 | P3 | Same-actor frontier replacement | G: overwrites regardless of semantics, so a plain store hidden behind the same lane's atom can lose a race. | Eviction requires happens-before **and** a subsuming conflict contract. | §8.7 |
 | P4 | Async witness evidence | Issuer warp/lane only | Issuer warp/lane plus the async op id | — |
 | P5 | Out-of-bounds access | `execution_error{oob}`. The report shows it only if no other error finding exists. | `OutOfBounds` finding; the access is skipped. | — |
+| P7 | `alias_stale_read` advisory | `review`: a read through one logical name of pooled smem/TMEM observes bytes last written through another name | Ported. The checker compares `SiteInfo::buffer` of the reading site with that of the last ordered write in the same cell (shared memory and TMEM only). It produces the same `review` advisory with the legacy keys (`reader_buffer`, `writer_buffer`, `space`, `allocation_id`, `overlaps`). This needs lowering to fill `SiteInfo::buffer` with the logical name; until `FindingKind` gains a variant it is `Other("alias_stale_read")` (CONTRACT_REQUESTS W5-7). | — |
 | P6 | Allocation end with an in-flight async footprint | An ordinary conflict, or `effect_commit_unobserved` at exit | `AsyncLifetime` finding at `AllocEnd`; `AsyncNeverCompleted` incomplete at launch end | §9.7.10.28.1.1 |
 
 ## Release/acquire, observation order, fences
@@ -61,6 +62,7 @@ that a future change is caught.
 | B3 | complete-tx scope | Unscoped | Release at `.cluster`. An acquire wait of any scope receives the copy's own bytes, without issuer history. | §9.7.10.28.4.1, §8.9.1.1 (R4) |
 | B4 | Named barrier `bar.arrive`-only thread | No resume, so no acquire | Same (confirmed): `arrive` is a source only, and `sync`/`red` are targets among participants, with no scope | §8.9.4, §9.7.15.1 (R5) |
 | B5 | Cluster barrier with a missing memory payload | RS: treated as "relaxed only" (race_check.rs:6933-6936). G: `ShadowRejected`. | Omitted qualifiers default to arrive `.release` / wait `.acquire` at `.cluster`. A qualifier lost in lowering → `SyncQualifierUnknown` incomplete, never relaxed. | §9.7.15.3 (R5) |
+| B7 | Qualifier-less `mbarrier.arrive.shared::cluster` on a **peer** CTA's barrier | Clean (no scope model) | `ScopeMismatch` error: the ISA default is `.release.cta` for the `shared::cluster` form too, and a `.cta` arrive does not include the peer waiter. Lowering must not invent `.cluster`; kernels must write `.release.cluster` (and wait at `.cluster`). | §9.7.15.16.16 ("If the .scope qualifier is not specified then it defaults to .cta"); R4 |
 | B6 | `bar.warp.sync` / `__syncwarp` | RS: the WC clock merges lane-masked acquisitions into the whole warp | Ordering only among masked lanes; no ordering for in-flight async ops | §9.7.15.2, §8.5; CUDA PG (R7) |
 
 ## Proxies and async operations
@@ -68,7 +70,8 @@ that a future change is caught.
 | ID | Change | Legacy | New | ISA basis |
 | --- | --- | --- | --- | --- |
 | X1 | `fence.proxy.async.shared::cluster` on a `shared::cta` prior | Legacy test `shared_cta_proxy_fence[.shared::cluster]` expects a race | Covered (clean). The `shared::cta` window lies inside the `shared::cluster` window. | §5.1.7, §9.7.15.4 (R3) |
-| X2 | `fence.proxy.async.shared::cta` on a `shared::cluster` (mapa) window prior | Race | Race (confirmed; ISA-silent, see S2) | §9.7.15.4 (R3) |
+| X2 | `fence.proxy.async.shared::cta` on a prior made through a **remote-rank** `shared::cluster` (mapa) window | Race | Race (confirmed; ISA-silent, see S2). A *same-rank* `mapa` is the CTA's own `shared::cta` window (X10). Legacy also resolved it that way, so the old "Legacy: Race" entry did not apply to same-rank `mapa`. | §9.7.15.4 (R3) |
+| X10 | Same-rank `mapa` (`mapa(p, own rank) == p`) | Resolved to `shared::cta`: a `.shared::cta` fence is clean, a `.shared::cluster` fence races | Normalised to the `shared::cta` window. A `.shared::cta` fence is clean (as legacy). A `.shared::cluster` fence is also clean, because it covers `shared::cta` (X1); this differs from legacy. | §9.7.9.20 (`mapa`), §5.1.7, §9.7.15.4 |
 | X3 | Implicit async→generic bridge at copy completion | RS: only for domains already bridged for every lane. G: always. | Always, but only for the op's own milestone (its results), never issuer history | §9.7.10.28.2 (R3) |
 | X4 | Async-proxy writes issued from different CTAs, ordered by base causality | Ordered, no finding | `review` advisory `CrossCtaAsyncOrder` | §8.9.5 (R3; ISA-silent, see S3) |
 | X5 | Async-group completion visibility | RS: the WC clock merges a lane's group wait into the whole warp | Per thread: the waiting lane only | §9.7.10.28.1.1 (sync Q7, R6) |
@@ -85,13 +88,15 @@ that a future change is caught.
 | W2 | Observed-version fallback | Any exit the history cannot name: truncated history, wide writes, plain writes, launch-value exits | Only async publications. A launch-value exit owes no edge. Other unexplained exits → `WaitExitUnproven` incomplete. | — (fail closed) |
 | W3 | Predicate that reads memory (`PredProgram.reads_memory`) | Not modelled | Uses the bitset iff every write to the predicate's inputs happens before the wait; otherwise `WaitPredicateReadsUnstable` incomplete | — (fail closed) |
 | W4 | History scope | Every 4- or 8-byte global atomic write, never retired | Declared words only | — |
+| W5 | A wait whose accepted write does not exactly cover the declared word (wider, e.g. a `.v4.b32` release over a 4-byte word; narrower; misaligned) | `incomplete` (`signal_write_not_recorded`) | Same, implemented: the history entry is marked mixed-size, and a wait that accepts it is `SignalWriteNotRecorded`. Such a write is still numbered (V3). | §8.7.2: mixed-size accesses are not morally strong, so single-copy atomicity with the word's polls does not hold |
+| W6 | Declared words outside global memory | G: global only (a `shared::cluster` poll could never be declared) | A declared word may live in any allocation, including shared memory reached through `shared::cta` or `shared::cluster`. Lowering's `sync_words` hint carries them and the engine emits `DeclareWord`/`WaitVerdicts` for them. A declared shared word gets no `UndeclaredProtocolWord` advisory. | — |
 
 ## ISA-silent points and their fail-closed choices
 
 | ID | Silent point | Choice | Where |
 | --- | --- | --- | --- |
 | S1 | Order among same-address RMWs of one warp instruction (§9.7.15.5) | Unconstrained. Sibling lanes never inherit each other's release heads. | A1 (R1) |
-| S2 | Whether `fence.proxy.async.shared::cta` covers a same-CTA object reached through a `mapa` `shared::cluster` address | It does not | X2 (R3) |
+| S2 | Whether `fence.proxy.async.shared::cta` covers an object reached through a remote-rank `mapa` `shared::cluster` address | It does not. A same-rank `mapa` is not ambiguous: it is the CTA's own window (X10). | X2 (R3) |
 | S3 | Which thread block an async op belongs to, for same-proxy preservation (§8.9.5) | Cross-CTA async-proxy pairs ordered by base causality → `review` advisory, not error | X4 (R3) |
 | S4 | Which thread an async op's complete-tx counts as executing, for the mutual-scope test | An acquire wait of any scope receives the copy's own bytes. Thread arrives keep the mutual-scope test. | B3 (R4) |
 | S5 | `bar.warp.sync` and in-flight async ops | No ordering for in-flight async ops | B6 (R7) |

@@ -957,3 +957,90 @@ validity, memory resolution, footprints) stay with W2.
   `handlers/async_copy.rs` (~547) with one `apply_overrides` call.
 - **`tcgen05.ld.red` modifiers**: pass `TcgenLdArgs::{red_abs, red_nan}` to
   `TcgenLdRed::new(op, ty, abs, nan)` (W4-7).
+
+## W2 phase 2 (2026-10-08): parallel scheduler, access rules, open items
+
+### W2-8: `ReportMode::Per16Bytes` needs its pattern (request)
+`mbarrier::report::validity::per_16bytes::{8,80,8000,80000000}` inspect the
+lowest-addressed element of each 16-byte source chunk against that pattern
+(legacy `copy_report_matches_runs`), but `ReportMode::Per16Bytes` drops the
+pattern and lowering (`ptx_lower.py::_report`) does too. Request
+`Per16Bytes(u32 /*pattern*/)`. Until then the engine fails closed on
+`Per16Bytes`; `PerElementFf` is implemented (report bit per (mbarrier,
+generation) in `LaunchAux::mbar_reports`, read by report `test/try_wait`;
+`report_value` is always 0, as legacy). W3 may move the bit into
+`mbarrier::State` (synccheck does not need it).
+
+### W2-9: access-emission rules (documented, implemented)
+- **Reductions** (`cp.reduce.async.bulk`, tensor reduce, `red.async`): one
+  `Access{kind: Rmw, atomic: true, returns_value: false, sem: Relaxed,
+  scope: Gpu}` per landing, actor `Async{op, Write}`, with element-granular
+  spans (one `LaneSpan` per element of the reduction dtype).
+- **Predicated-off** instructions (empty active mask, guard false, every
+  lane skipped) emit no `Access` and no `SyncEvent`.
+- **Footprints are the transferred bytes**: `.cp_mask` byte selection,
+  `.ignore_oob` left/right clipping, TMA plans (incl. gather4/scatter4 rows
+  and OOB fill, which is a separate write of the filled spans) narrow both
+  the `AsyncIssue.footprint` and the landing `Access` spans; nothing is
+  emitted for skipped bytes.
+- Async accesses name the issuing lane; warp-collective ones (ldmatrix,
+  stmatrix, tcgen05.ld/st) name each thread's own lane.
+
+### W2-10: synccheck needs the launch's `ResourceInit` (for W6)
+`tests/synccheck_engine.rs` checks every `testutil::scenarios::all()` log
+with `SynccheckConfig::default()`, whose `init.warps_per_cta` is 0, so any
+`setmaxnreg` `Set{wg}` replays as `IncompleteWarpgroup`
+(`setmaxnreg_launch_bounds` scenario). The engine run completes and W3's
+`step` accepts the same commands with the launch's init. Either the test
+passes `ResourceInit{warps_per_cta: shape.warps_per_cta(), cluster_warps,
+..}` or synccheck takes it from the log (a `LaunchInfo` record in
+`RecordingObserver`). The launch-bounds `Configure` is now logged as a
+`Protocol` event with `actor: Host` before the CTA's warps run.
+Also fixed engine-side (was W2's bug): `tcgen05.commit` and
+`clusterlaunchcontrol.try_cancel` now list their deferred mbarrier
+arrivals / complete_tx in `Protocol.issued` (synccheck reported a false
+deadlock on `tcgen_cp_ld`).
+
+### W2-11: parallel scheduler semantics (implemented)
+- **Partition** = unit of ownership: one cluster, or one partition for the
+  whole launch when it has launch-wide state (cooperative / `grid.sync`,
+  `sync_words` / `wait_until`, mixed `cta_group`). Each partition owns its
+  CTAs, a `SyncTable` and a `LaunchAux` (every resource is cluster-local),
+  and an event buffer. Decided from the program only (never from the
+  observer or the worker count).
+- **Round**: every partition runs its CTAs against an `Arena` shard
+  (private allocations in place; global/param through a copy-on-write
+  4 KiB-stripe overlay over the round-start snapshot) on up to
+  `RunConfig::workers` threads (launch-lifetime pool). Shards merge in
+  partition order (later partition wins per byte); buffered events replay
+  in partition order (`Access::seq` assigned at replay). With one resident
+  partition the arena is used directly.
+- **Cross-partition visibility**: another partition's global writes become
+  visible at the round boundary (plan 2.4); within a partition, effects are
+  synchronous (ruling 2). Global RMWs (`atom`, `red`, bulk/tensor
+  reductions into global) inside a shard are **serial points**: the warp
+  stops before the instruction, which executes after the merge in partition
+  order (no lost updates, no rollback).
+- Async op ids are partition-scoped (`(cluster + 1) << 40 | n`).
+- Invariant (tested for workers 1/2/8/33, with and without word history):
+  bit-identical outputs, statuses, stats and observer streams.
+
+### W2-12: `tcgen05.ld .spcompress` (for W4 / coordinator)
+Lowering emits `dsts` = mdata lanes then cdata lanes (dea8c9d), and W4's
+`tcgen_ld_spcompress(values, valid, max, abs)` returns `(mdata ++ cdata)` in
+the same order, but `TcgenLdArgs` carries neither `max` nor `abs`; the
+engine fails closed on `.spcompress` until they are in the contract.
+
+## W5-7: `FindingKind::AliasStaleRead`
+
+Racecheck now ports the legacy `alias_stale_read` review advisory (deltas
+P7). It reports through `FindingKind::Other("alias_stale_read")`. Please add
+an `AliasStaleRead` variant.
+
+Lowering (W1) must fill `SiteInfo::buffer` with the **logical** buffer name
+of each access site, for example `A_shared` versus `B_shared` over one pooled
+allocation. An explicit view of one buffer must keep that buffer's name.
+
+Also for W1: a qualifier-less `mbarrier.arrive` keeps the PTX default
+`.release.cta`, including on a peer CTA's barrier (deltas B7). Do not
+default it to `.cluster`.

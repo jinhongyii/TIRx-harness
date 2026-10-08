@@ -63,8 +63,10 @@ fn shared_cta_proxy_fence_modes() {
     assert!(has_race(&shared_cta_proxy_fence(Some(FenceKind::ProxyAsync(Some(Domain::SharedCta))), true)));
 }
 
-/// same_rank_mapa_shared_cluster: the generic store goes through a
-/// shared::cluster window; the fence must name that window.
+/// same_rank_mapa_shared_cluster: the generic store goes through a `mapa`
+/// to the CTA's own rank. `mapa(p, own rank) == p`, so it is the CTA's own
+/// shared::cta window: a `.shared::cta` fence bridges it (as in legacy), and
+/// a `.shared::cluster` fence does too (it covers shared::cta, delta X1/X10).
 fn mapa(fence: Option<Domain>, unqualified: bool) -> Report {
     let mut k = K::one_warp();
     k.inst_in(0, &[0], PLAIN_ST, Some(Domain::SharedCluster), |_| (SMEM, 0..4));
@@ -84,7 +86,7 @@ fn same_rank_mapa_shared_cluster() {
     let none = mapa(None, false);
     assert!(has_class(&none, RaceClass::WriteWrite));
     assert!(clean(&mapa(Some(Domain::SharedCluster), false)));
-    assert!(has_race(&mapa(Some(Domain::SharedCta), false)));
+    assert!(clean(&mapa(Some(Domain::SharedCta), false)));
     assert!(clean(&mapa(None, true)));
 }
 
