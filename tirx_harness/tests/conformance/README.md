@@ -72,6 +72,8 @@ legacy engine is deleted.
 | `msa_prefill_multishape` / synccheck | sync-behaviour-deltas S1 (synccheck-explorer.md §5.8) | `incomplete` (`fixed_sync_program_model_incomplete`, `generation_assignment_differs`): a genuine parity-aliasing race in the kernel; legacy reported clean |
 | `deepgemm_sm100_tf32_hc_prenorm_gemm` / numsim, racecheck, synccheck | CONTRACT_REQUESTS W2-20 (V2C-19/20 reporting point) | an `uninitialized_read` review on TMEM columns 128-160 at the memory read (legacy reported at the later register use); outputs and reference check unchanged |
 | `flash_attention_backward_sm100` / racecheck | racecheck-behaviour-deltas B7 (+ X4) | `scope_mismatch` on default-`.cta` remote arrives, the data races that follow from the dropped edge, and a `cross_cta_async_order` advisory |
+| `sparse_flashmla_prefill_head128_phase1`, `sparse_flashmla_prefill_head128_small_topk_phase1` / racecheck | racecheck-behaviour-deltas B7 (+ X4 for the first) | `scope_mismatch` on default-`.cta` remote arrives and the `missing_proxy_bridge` race that follows; `cross_cta_async_order` advisory (X4) |
+| `sm100_fp8_fp4_mega_moe` / racecheck | racecheck-behaviour-deltas T19, R4/B1, B7, X4 | true-positive race of non-elected-lane `lds128` TaskInfo reads vs remote `st.async` (T19), scope mismatches (R4/B1, B7), `cross_cta_async_order` (X4); the `alias_stale_read` grouping also follows the per-instruction-pair advisory rule |
 | (removed) `msa_sparse_atten_fwd_nvfp4_kv_sm100` / racecheck | racecheck-behaviour-deltas T12 | subsumed by the schema-4 projection rule below (`tmem_lifetime_review` compared by kind + anchors) |
 
 ## What a snapshot contains (`snapshot.py`)

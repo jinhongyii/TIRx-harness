@@ -13,21 +13,11 @@ import pytest
 from tvm.script import tirx as T
 
 from tirx_harness.numsim import v2
-from tests.numsim.v2.checkers._runnable import WARP_COLLECTIVE_DIVERGENCE, requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import WARP_COLLECTIVE_DIVERGENCE, requires_v2_engine
 
 pytestmark = requires_v2_engine
 
 LANES = 32
-
-# core-rs ``interp/handlers/tcgen.rs::tcgen_wait`` has no ``full_warp`` check
-# (``tcgen05.ld/st/alloc/dealloc/relinquish`` do), so an elected single lane
-# executing ``tcgen05.wait::ld/st.sync.aligned`` runs clean.
-_TCGEN_WAIT_GAP = v2_gap(
-    "tcgen05.wait::ld/st.sync.aligned executed by one elect.sync lane is not rejected: "
-    "interp tcgen_wait lacks the full_warp (Divergence) check the other tcgen05 "
-    ".sync.aligned handlers apply; racecheck and synccheck both report clean"
-)
-
 
 @T.prim_func
 def nested_elect_only(output: T.Buffer((1,), "int32")):
@@ -76,13 +66,11 @@ def elected_tcgen_wait_st():
             elected_tcgen_wait_ld,
             {},
             id="tcgen-wait-ld-sync",
-            marks=_TCGEN_WAIT_GAP,
         ),
         pytest.param(
             elected_tcgen_wait_st,
             {},
             id="tcgen-wait-st-sync",
-            marks=_TCGEN_WAIT_GAP,
         ),
     ],
 )

@@ -4,7 +4,7 @@ orphan: true
 
 # v2 conformance status
 
-Generated 2026-10-08 at f6e9fa7 sweep; rows re-run at 9b1869e: sparse_flashmla_decode_head64, msa_prefill_multishape/synccheck, deepgemm_sm100_tf32_hc_prenorm_gemm, flash_attention_backward_sm100/racecheck by the W8 sweep: every canonical case
+Generated 2026-10-08 at 8fba7e1 + a3c4df9 (fifth sweep; mega_moe racecheck re-run with its T19 delta) by the W8 sweep: every canonical case
 (`tests/numsim/corpus/canonical_cases.py`) x {numsim, racecheck, synccheck} run under
 `NUMSIM_IMPL=v2` and compared with the legacy snapshots in `tirx_harness/tests/conformance/`
 (v2 may add source anchors to diagnostics legacy recorded without one; see
@@ -22,15 +22,13 @@ fail-closed reason); **crash** (engine runtime error or binder exception); **no 
 | mode | match | differs | incomplete | crash | no oracle |
 | --- | --- | --- | --- | --- | --- |
 | numsim | 98 | 0 | 0 | 0 | 3 |
-| racecheck | 90 | 8 | 0 | 0 | 3 |
+| racecheck | 96 | 2 | 0 | 0 | 3 |
 | synccheck | 98 | 0 | 0 | 0 | 3 |
 
 ## Issues by root cause
 
 | issue | owner | cause | cases (modes) |
 | --- | --- | --- | --- |
-| V2C-36 | racecheck | new `scope_mismatch` + `data_race` (+ `cross_cta_async_order`) findings on cluster kernels legacy found clean or review-only; likely racecheck-behaviour-deltas R4/B1/B7 scope rules -- W5 to confirm and add delta snapshots | 3: `sm100_fp8_fp4_mega_moe` (r), `sparse_flashmla_prefill_head128_phase1` (r), `sparse_flashmla_prefill_head128_small_topk_phase1` (r) |
-| V2C-38 | racecheck | same finding kinds, different source anchors (witness site pair) and/or footprint | 2: `gdn_cp_prefill_sm100` (r), `gdn_prefill_sm100` (r) |
 
 ## Public-API legacy tests under v2
 
@@ -42,87 +40,65 @@ unchanged with `NUMSIM_IMPL=v2`: `tests/conftest.py` rebinds the public names of
 collection.
 
 - legacy: 762 passed, 0 failed (2026-10-08)
-- v2: **489 passed, 273 failed** of 762
+- v2: **551 passed, 211 failed** of 762
 
 | failure class | owner | count | example |
 | --- | --- | --- | --- |
-| pins legacy internals (generated Rust text, scheduler poll stats); needs porting (test-migration A-internal) | test port | 89 | `tests/numsim/runtime/test_loop_bounds.py::test_lane_varying_min_extent_and_step_use_masked_native_loop` |
-| synccheck verdict differs from legacy | synccheck / sync | 54 | `tests/numsim/runtime/test_mbarrier_report.py::test_report_queries_and_phase_reset[per_16bytes::80000000]` |
-| other assertion (numeric or report shape) | triage | 36 | `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_prefetch_preserves_global_memory` |
-| racecheck verdict differs from legacy | racecheck | 35 | `tests/numsim/runtime/test_red_async.py::test_red_async[add-u32-10]` |
-| engine runtime error legacy did not raise | interp / sync | 27 | `tests/numsim/integration/test_gemm_async_artifact.py::test_m64_tcgen_mma_infers_weight_stationary_from_packed_layout_e` |
-| expects legacy error text or a legacy raise site | test port / delta review | 25 | `tests/numsim/integration/test_scheduler_polling_artifact.py::test_finite_for_uses_native_loop_iteration_budget` |
-| lowering rejects the kernel | lowering | 6 | `tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem` |
+| pins legacy internals (generated Rust text, scheduler poll stats); needs porting (test-migration A-internal) | test port | 85 | `tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_combine_int_frac_ex2_is_bit_exact` |
+| other assertion (numeric or report shape) | triage | 41 | `tests/numsim/runtime/test_memory_sync_coverage.py::test_memory_sync_extensions[address_queries-inputs5-expected5]` |
+| expects legacy error text or a legacy raise site | test port / delta review | 26 | `tests/numsim/integration/test_scheduler_polling_artifact.py::test_finite_for_uses_native_loop_iteration_budget` |
+| racecheck verdict differs from legacy | racecheck | 24 | `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_s2c_preserves_mapped_remote_cta_ownership` |
+| engine runtime error legacy did not raise | interp / sync | 21 | `tests/numsim/runtime/test_layout_lowering_contract.py::test_tmem_tlane_tcol_coordinates_are_observable_through_a_physical_alias` |
+| synccheck verdict differs from legacy | synccheck / sync | 7 | `tests/numsim/runtime/test_pointer_slot_arrays.py::test_pointer_array_initialization_and_bounds[uninitialized]` |
+| lowering rejects the kernel | lowering | 6 | `tests/numsim/runtime/test_dense_mma_forms.py::test_legacy_m16n8k32_int8_reuses_dense_form_and_engine` |
 | engine stops fail-closed (unsupported / budget) | interp / oplib | 1 | `tests/numsim/runtime/test_gate_intrinsics.py::test_gate_intrinsics_match_float32_semantics` |
 
-Files passing completely under v2: 52 of 120.
+Files passing completely under v2: 64 of 120.
 
-### Public-API failure triage (current run, f6e9fa7)
+### Public-API failure triage (fifth sweep, 8fba7e1)
 
-Per function in `scripts/numsim-v2/coverage/v2_public_status.tsv` (refreshed from this run; W9 wave 4 input).
+Per function in `scripts/numsim-v2/coverage/v2_public_status.tsv` (refreshed from this run; W9 input).
 An item counts once, under the first class its failure message matches. "delta-explained" items need their
 expectation ported; "legacy-internals" items pin legacy implementation details and are delete-or-port; the
 rest are v2 bugs for the named owner unless a delta row is added.
 
 | class | triage | owner | failing items | functions | example function |
 | --- | --- | --- | --- | --- | --- |
-| pin-internals | legacy-internals (delete or port) | test port (W9) | 94 | 41 | `tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_combine_int_frac_ex2_is_bit_exact` |
-| synccheck-verdict | bug or delta: synccheck verdict differs | synccheck / sync (W6 / W3) | 60 | 25 | `tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime` |
-| racecheck-verdict | bug or delta: racecheck verdict differs | racecheck (W5) | 37 | 12 | `tests/numsim/runtime/test_cp_async_mbarrier_visibility.py::test_copy_arrival_retains_earlier_copy_history` |
-| engine-stops | bug: engine stops (unsupported / runtime error) | interp / oplib (W2 / W4) | 29 | 26 | `tests/numsim/integration/test_fp8_cta1_descriptor_layout.py::test_fp8_cta1_extended_shared_addresses` |
-| pin-message | delta-explained or message change (port expectation) | test port (W9) | 23 | 18 | `tests/numsim/integration/test_scheduler_polling_artifact.py::test_finite_for_uses_native_loop_iteration_budget` |
-| other-assertion | bug: numeric or report-shape assertion | triage per test | 22 | 21 | `tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime` |
+| pin-internals | legacy-internals (delete or port) | test port (W9) | 90 | 39 | `tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_combine_int_frac_ex2_is_bit_exact` |
+| other-assertion | bug: numeric or report-shape assertion | triage per test | 29 | 25 | `tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime` |
+| pin-message | delta-explained or message change (port expectation) | test port (W9) | 25 | 19 | `tests/numsim/integration/test_scheduler_polling_artifact.py::test_finite_for_uses_native_loop_iteration_budget` |
+| racecheck-verdict | bug or delta: racecheck verdict differs | racecheck (W5) | 24 | 7 | `tests/numsim/runtime/test_cp_async_mbarrier_visibility.py::test_copy_arrival_retains_earlier_copy_history` |
+| engine-stops | bug: engine stops (unsupported / runtime error) | interp / oplib (W2 / W4) | 22 | 19 | `tests/numsim/integration/test_fp8_cta1_descriptor_layout.py::test_fp8_cta1_extended_shared_addresses` |
+| synccheck-verdict | bug or delta: synccheck verdict differs | synccheck / sync (W6 / W3) | 14 | 8 | `tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime` |
 | lowering-rejects | bug: lowering rejects the kernel | lowering (W1) | 6 | 6 | `tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem` |
-| v2-accepts-legacy-rejection | bug: v2 accepts what legacy rejected | lowering / interp (per test) | 2 | 2 | `tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges` |
+| v2-accepts-legacy-rejection | bug: v2 accepts what legacy rejected | lowering / interp (per test) | 1 | 1 | `tests/numsim/integration/test_reported_layout_regressions.py::test_explicit_shared_strides_still_reject_an_executed_oob_address` |
 
-<details><summary>synccheck-verdict: 25 functions, owner synccheck / sync (W6/W3)</summary>
+<details><summary>synccheck-verdict: 8 functions, owner synccheck / sync (W6/W3)</summary>
 
 - `tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime` (other-assertion=1 pin-internals=38 synccheck-verdict=2)
-- `tests/numsim/runtime/test_compare_predicates.py::test_compare_instruction_predicates` (synccheck-verdict=2)
 - `tests/numsim/runtime/test_copy_multicast32.py::test_multicast_high_bit_targets_and_bounds` (synccheck-verdict=4)
 - `tests/numsim/runtime/test_cp_async_mbarrier_visibility.py::test_copy_arrival_is_not_an_explicit_commit` (synccheck-verdict=1)
-- `tests/numsim/runtime/test_cvt_carriers.py::test_cvt_carriers_truncate_extend_and_gate_reads` (synccheck-verdict=3)
-- `tests/numsim/runtime/test_cvt_integer_sat.py::test_integer_cvt_sat_clamps_before_narrowing_and_preserves_predicates` (synccheck-verdict=2)
-- `tests/numsim/runtime/test_im2col_cache_hints.py::test_im2col_cache_hints` (synccheck-verdict=4)
-- `tests/numsim/runtime/test_layout_lowering_contract.py::test_physical_buffers_preserve_coordinates_aliases_and_lane_private_storage` (synccheck-verdict=1)
-- `tests/numsim/runtime/test_logic_carriers.py::test_logic_carriers_preserve_bits_and_masks` (synccheck-verdict=3)
-- `tests/numsim/runtime/test_mbarrier_maintenance.py::test_maintenance_predicates_and_carriers` (synccheck-verdict=1)
-- `tests/numsim/runtime/test_mbarrier_report.py::test_gather4_report_samples_only_selected_source_rows` (pass=2 synccheck-verdict=2)
-- `tests/numsim/runtime/test_mbarrier_report.py::test_report_queries_and_phase_reset` (pass=2 synccheck-verdict=4)
-- `tests/numsim/runtime/test_memory_coverage_next.py::test_tensor_map_ftz_types_preserve_copy_values` (synccheck-verdict=2)
 - `tests/numsim/runtime/test_mov_forms.py::test_mov_pointer_identity_masks_and_nulls` (synccheck-verdict=1)
-- `tests/numsim/runtime/test_pointer_slot_arrays.py::test_pointer_array_initialization_and_bounds` (pin-message=1 synccheck-verdict=2)
-- `tests/numsim/runtime/test_register_extensions.py::test_register_extensions` (synccheck-verdict=4)
-- `tests/numsim/runtime/test_scalar_f64_rounding.py::test_scalar_f64_rounding` (synccheck-verdict=6)
-- `tests/numsim/runtime/test_sm107_register_predicates.py::test_sm107_register_predicates` (synccheck-verdict=2)
+- `tests/numsim/runtime/test_pointer_slot_arrays.py::test_pointer_array_initialization_and_bounds` (pass=1 pin-message=1 synccheck-verdict=1)
 - `tests/numsim/runtime/test_sync_instruction_predicates.py::test_pending_count_instruction_predicates` (synccheck-verdict=1)
 - `tests/numsim/runtime/test_tcgen05_ld_spcompress.py::test_tcgen_load_compression` (synccheck-verdict=3)
-- `tests/numsim/runtime/test_tcgen_commit_predicates.py::test_tcgen_commit_predicates_gate_all_operands` (synccheck-verdict=2)
-- `tests/numsim/runtime/test_tensormap_predicates.py::test_tensor_map_predicates_retain_errors` (synccheck-verdict=1)
-- `tests/numsim/runtime/test_tma_im2col.py::test_im2col_store_and_reduce` (pass=1 pin-internals=1 synccheck-verdict=2)
-- `tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_prefetch_preserves_memory` (synccheck-verdict=2)
-- `tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_transfer_rejects_only_when_issued` (synccheck-verdict=3)
+- `tests/numsim/runtime/test_tensormap_predicates.py::test_tensor_map_predicate_effects` (synccheck-verdict=1)
 
 </details>
 
-<details><summary>racecheck-verdict: 12 functions, owner racecheck (W5)</summary>
+<details><summary>racecheck-verdict: 7 functions, owner racecheck (W5)</summary>
 
 - `tests/numsim/runtime/test_cp_async_mbarrier_visibility.py::test_copy_arrival_retains_earlier_copy_history` (racecheck-verdict=2)
-- `tests/numsim/runtime/test_ldmatrix_b8.py::test_ldmatrix_b8_invalid_controls` (pass=2 racecheck-verdict=1)
+- `tests/numsim/runtime/test_layout_lowering_contract.py::test_physical_buffers_preserve_coordinates_aliases_and_lane_private_storage` (racecheck-verdict=1)
 - `tests/numsim/runtime/test_mbarrier_multicast.py::test_mbarrier_multicast32` (pass=2 racecheck-verdict=6)
 - `tests/numsim/runtime/test_mbarrier_multicast.py::test_mbarrier_multicast_lane_masks` (racecheck-verdict=1)
 - `tests/numsim/runtime/test_memory_sync_coverage.py::test_memory_sync_extensions` (other-assertion=1 pass=5 racecheck-verdict=1)
 - `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_s2c_preserves_mapped_remote_cta_ownership` (racecheck-verdict=1)
 - `tests/numsim/runtime/test_red_async.py::test_red_async` (racecheck-verdict=12)
-- `tests/numsim/runtime/test_tcgen05_restricted_commit.py::test_restricted_commit_preserves_full_mma_completion` (pass=1 racecheck-verdict=2)
-- `tests/numsim/runtime/test_tensormap_predicates.py::test_tensor_map_predicate_effects` (racecheck-verdict=1)
-- `tests/numsim/runtime/test_wait_until.py::test_a_plain_access_on_a_declared_word_is_reported` (racecheck-verdict=1)
-- `tests/numsim/runtime/test_wait_until.py::test_initial_wait_rechecks_conditional_predicate` (racecheck-verdict=8)
-- `tests/numsim/runtime/test_wait_until.py::test_reading_the_word_once_is_not_made_correct_by_declaring_it` (racecheck-verdict=1)
 
 </details>
 
-<details><summary>engine-stops: 26 functions, owner interp / oplib (W2/W4)</summary>
+<details><summary>engine-stops: 19 functions, owner interp / oplib (W2/W4)</summary>
 
 - `tests/numsim/integration/test_fp8_cta1_descriptor_layout.py::test_fp8_cta1_extended_shared_addresses` (engine-stops=2)
 - `tests/numsim/integration/test_gemm_async_artifact.py::test_bf16_m64_tcgen_mma_uses_layout_f` (engine-stops=1)
@@ -134,26 +110,19 @@ rest are v2 bugs for the named owner unless a delta row is added.
 - `tests/numsim/integration/test_gemm_async_artifact.py::test_m64_tcgen_mma_uses_layout_f_independently_of_declared_tmem_layout` (engine-stops=1)
 - `tests/numsim/integration/test_raw_versus_typed_cta2_mma.py::test_raw_cta2_mma_matches_the_typed_gemm_async_exactly` (engine-stops=3)
 - `tests/numsim/integration/test_raw_versus_typed_cta2_mma.py::test_raw_cta2_ts_m128_selects_the_matching_a_lane_bank` (engine-stops=1)
-- `tests/numsim/integration/test_reported_layout_regressions.py::test_dynamic_shared_tile_view_uses_its_static_parent_bounds` (engine-stops=1)
 - `tests/numsim/integration/test_tmem_artifact.py::test_tmem_layout_f_maps_rows_to_half_slabs` (engine-stops=1)
 - `tests/numsim/runtime/test_gate_intrinsics.py::test_gate_intrinsics_match_float32_semantics` (engine-stops=1)
 - `tests/numsim/runtime/test_launch_resource_facts.py::test_exclusive_tmem_uses_cta_local_lifecycle_without_placement` (engine-stops=1)
-- `tests/numsim/runtime/test_layout_lowering_contract.py::test_compose_layout_combines_tile_and_swizzle_into_physical_alias_bytes` (engine-stops=1)
-- `tests/numsim/runtime/test_layout_lowering_contract.py::test_local_view_exposes_raw_span_including_layout_gaps_and_offset` (engine-stops=1)
 - `tests/numsim/runtime/test_layout_lowering_contract.py::test_tmem_tlane_tcol_coordinates_are_observable_through_a_physical_alias` (engine-stops=1)
 - `tests/numsim/runtime/test_ordering_calls.py::test_deleting_setmaxnreg_keeps_the_numerical_result` (engine-stops=1)
 - `tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_is_an_ordering_call_not_a_tcgen_lifecycle_call` (engine-stops=1)
 - `tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_static_expressions_follow_public_parser_and_runtime` (engine-stops=1)
-- `tests/numsim/runtime/test_packed_float4_global_views.py::test_explicit_uint8_backing_supplies_two_float4_values_per_byte` (engine-stops=1)
-- `tests/numsim/runtime/test_packed_float4_global_views.py::test_global_alias_view_uses_layout_physical_span` (engine-stops=1)
-- `tests/numsim/runtime/test_packed_float4_global_views.py::test_odd_float4_logical_count_uses_a_ceiling_byte_span` (engine-stops=1)
-- `tests/numsim/runtime/test_scalar_control.py::test_pointer_conversions_and_runtime_descriptor_patch` (engine-stops=1)
 - `tests/numsim/runtime/test_tf32_layout_f_poison.py::test_tf32_layout_f_unwritten_holes_are_zero_filled_and_require_review` (engine-stops=1)
 - `tests/numsim/runtime/test_tile_owner_transport.py::test_copy_transports_unique_owners_across_warps` (engine-stops=1)
 
 </details>
 
-<details><summary>other-assertion: 21 functions, owner triage per test</summary>
+<details><summary>other-assertion: 25 functions, owner triage per test</summary>
 
 - `tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime` (other-assertion=1 pin-internals=38 synccheck-verdict=2)
 - `tests/numsim/integration/test_global_alias_artifact.py::test_global_decl_buffer_alias_reuses_parameter_allocation_bytes` (other-assertion=1)
@@ -163,13 +132,17 @@ rest are v2 bugs for the named owner unless a delta row is added.
 - `tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_supports_float16_payloads` (other-assertion=1)
 - `tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_expands_tlane_replicas` (other-assertion=1)
 - `tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_supports_rank3_multi_instruction_layout` (other-assertion=1)
+- `tests/numsim/runtime/test_compare_predicates.py::test_compare_instruction_predicates` (other-assertion=2)
+- `tests/numsim/runtime/test_cvt_carriers.py::test_cvt_carriers_truncate_extend_and_gate_reads` (other-assertion=3)
 - `tests/numsim/runtime/test_discard.py::test_discard_indeterminate_read_and_alignment` (other-assertion=1)
 - `tests/numsim/runtime/test_launch_resource_facts.py::test_pointer_bits_preserve_binding_address_and_subview_offset` (other-assertion=1)
 - `tests/numsim/runtime/test_mbarrier_maintenance.py::test_maintenance_active_addresses_still_checked` (other-assertion=1)
+- `tests/numsim/runtime/test_mbarrier_maintenance.py::test_maintenance_predicates_and_carriers` (other-assertion=1)
 - `tests/numsim/runtime/test_memory_coverage_next.py::test_no_complete_rejects_exhausted_arrivals` (other-assertion=2)
 - `tests/numsim/runtime/test_memory_sync_coverage.py::test_memory_sync_extensions` (other-assertion=1 pass=5 racecheck-verdict=1)
 - `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_st_bulk_size_is_evaluated_per_issuing_lane` (other-assertion=1)
 - `tests/numsim/runtime/test_scalar_control.py::test_mapa_and_cvta_expose_the_device_validated_integer_bits` (other-assertion=1)
+- `tests/numsim/runtime/test_sm107_register_predicates.py::test_sm107_register_predicates` (other-assertion=1 pass=1)
 - `tests/numsim/runtime/test_tile_general_semantics.py::test_right_aligned_buffer_broadcast_maps_destination_coordinates` (other-assertion=1)
 - `tests/numsim/runtime/test_tile_reduction_variants.py::test_local_collective_uses_lexicographic_order` (other-assertion=1)
 - `tests/numsim/runtime/test_tile_reduction_variants.py::test_maxmin_uses_canonical_lexicographic_nan_and_signed_zero_order` (other-assertion=1)
@@ -190,18 +163,18 @@ rest are v2 bugs for the named owner unless a delta row is added.
 
 </details>
 
-<details><summary>v2-accepts-legacy-rejection: 2 functions, owner lowering / interp</summary>
+<details><summary>v2-accepts-legacy-rejection: 1 functions, owner lowering / interp</summary>
 
-- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges` (pin-message=2 v2-accepts-legacy-rejection=1)
-- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_runtime_address_without_a_dynamic_lease_is_rejected` (v2-accepts-legacy-rejection=1)
+- `tests/numsim/integration/test_reported_layout_regressions.py::test_explicit_shared_strides_still_reject_an_executed_oob_address` (v2-accepts-legacy-rejection=1)
 
 </details>
 
-<details><summary>pin-message: 18 functions, owner test port (W9)</summary>
+<details><summary>pin-message: 19 functions, owner test port (W9)</summary>
 
 - `tests/numsim/integration/test_scheduler_polling_artifact.py::test_finite_for_uses_native_loop_iteration_budget` (pin-message=1)
 - `tests/numsim/integration/test_scheduler_polling_artifact.py::test_finite_loop_can_exceed_default_budget_when_configured` (pin-message=1)
-- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges` (pin-message=2 v2-accepts-legacy-rejection=1)
+- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges` (pin-message=3)
+- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_runtime_address_without_a_dynamic_lease_is_rejected` (pin-message=1)
 - `tests/numsim/integration/test_warp_ops_artifact.py::test_warp_collectives_reject_invalid_participant_contracts` (pin-message=1)
 - `tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_if_then_else_mixed_pointer_spaces_fail_closed` (pin-message=1)
 - `tests/numsim/runtime/test_mbarrier_lane_semantics.py::test_blocking_wait_fails_closed_for_mixed_lane_readiness` (pin-message=1)
@@ -209,7 +182,7 @@ rest are v2 bugs for the named owner unless a delta row is added.
 - `tests/numsim/runtime/test_ordering_calls.py::test_default_full_mask_warp_sync_rejects_divergent_execution` (pin-message=1)
 - `tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_rejects_warp_disagreement_within_one_occurrence` (pin-message=1)
 - `tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_requires_explicit_warpgroup_sync_before_a_later_call` (pin-message=1)
-- `tests/numsim/runtime/test_pointer_slot_arrays.py::test_pointer_array_initialization_and_bounds` (pin-message=1 synccheck-verdict=2)
+- `tests/numsim/runtime/test_pointer_slot_arrays.py::test_pointer_array_initialization_and_bounds` (pass=1 pin-message=1 synccheck-verdict=1)
 - `tests/numsim/runtime/test_ptx_integer_arithmetic.py::test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane` (pin-message=2)
 - `tests/numsim/runtime/test_ptx_integer_arithmetic.py::test_ptx_signed_division_overflow_fails_closed` (pin-message=2)
 - `tests/numsim/runtime/test_scalar_control.py::test_cuda_pointer_helpers_check_typed_dereference_alignment` (pin-message=1)
@@ -220,7 +193,7 @@ rest are v2 bugs for the named owner unless a delta row is added.
 
 </details>
 
-<details><summary>pin-internals: 41 functions, owner test port (W9): delete or port</summary>
+<details><summary>pin-internals: 39 functions, owner test port (W9): delete or port</summary>
 
 - `tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_combine_int_frac_ex2_is_bit_exact` (pin-internals=1)
 - `tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_shl_u32_clamp_is_bit_exact` (pin-internals=1)
@@ -257,8 +230,6 @@ rest are v2 bugs for the named owner unless a delta row is added.
 - `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_prefetch_preserves_global_memory` (pin-internals=1)
 - `tests/numsim/runtime/test_ordering_calls.py::test_griddep_token_crosses_sequential_kernel_phases` (pin-internals=1)
 - `tests/numsim/runtime/test_ordering_calls.py::test_ordering_only_calls_preserve_native_source_order` (pin-internals=1)
-- `tests/numsim/runtime/test_tma_im2col.py::test_im2col_interleaved` (pin-internals=3)
-- `tests/numsim/runtime/test_tma_im2col.py::test_im2col_store_and_reduce` (pass=1 pin-internals=1 synccheck-verdict=2)
 - `tests/numsim/runtime/test_wait_until.py::test_a_backoff_is_the_cuda_loops_business_and_not_the_engines` (pin-internals=1)
 - `tests/numsim/runtime/test_wait_until.py::test_bit_typed_word_matches_raw_spelling` (pin-internals=1)
 - `tests/numsim/runtime/test_wait_until.py::test_packed_wait_matches_raw_spelling` (pin-internals=4)
@@ -328,12 +299,12 @@ rest are v2 bugs for the named owner unless a delta row is added.
 | `flashinfer_rmsnorm_fp4quant` | match | match | match |
 | `flashinfer_rmsnorm_quant` | match | match | match |
 | `fp16_bf16_gemm` | no oracle | no oracle | no oracle |
-| `gdn_cp_prefill_sm100` | match | differs [V2C-38] | match |
+| `gdn_cp_prefill_sm100` | match | match | match |
 | `gdn_decode_bf16_ilp4` | match | match | match |
 | `gdn_decode_bf16_wide_vec_mtp` | match | match | match |
 | `gdn_decode_bf16_wide_vec_t1` | match | match | match |
 | `gdn_decode_fp32_mtp_warp` | match | match | match |
-| `gdn_prefill_sm100` | match | differs [V2C-38] | match |
+| `gdn_prefill_sm100` | match | match | match |
 | `grouped_gemm_masked_rubin` | match | match | match |
 | `kda_backward_packed` | match | differs | match |
 | `kda_decode_multishape` | match | match | match |
@@ -352,7 +323,7 @@ rest are v2 bugs for the named owner unless a delta row is added.
 | `nvfp4_gemm` | match | match | match |
 | `nvfp4_quantize` | match | match | match |
 | `nvfp4_quantize_per_token` | match | match | match |
-| `radix_topk_multi_cta` | match | differs | match |
+| `radix_topk_multi_cta` | match | match | match |
 | `radix_topk_single_cta` | match | match | match |
 | `recurrent_kda_decode_grouped` | match | match | match |
 | `recurrent_kda_decode_one_warp` | match | match | match |
@@ -364,10 +335,10 @@ rest are v2 bugs for the named owner unless a delta row is added.
 | `selective_state_update_stp_simple` | match | match | match |
 | `selective_state_update_stp_vertical` | match | match | match |
 | `silu_and_mul_nvfp4_experts_quantize` | match | match | match |
-| `sm100_fp8_fp4_mega_moe` | match | differs [V2C-36] | match |
+| `sm100_fp8_fp4_mega_moe` | match | match | match |
 | `sparse_flashmla_decode_head64` | match | match | match |
-| `sparse_flashmla_prefill_head128_phase1` | match | differs [V2C-36] | match |
-| `sparse_flashmla_prefill_head128_small_topk_phase1` | match | differs [V2C-36] | match |
+| `sparse_flashmla_prefill_head128_phase1` | match | match | match |
+| `sparse_flashmla_prefill_head128_small_topk_phase1` | match | match | match |
 | `sparse_flashmla_prefill_head64_phase1` | match | match | match |
 | `stable_sort_topk_by_value` | match | match | match |
 | `vsa_multishape` | match | match | match |

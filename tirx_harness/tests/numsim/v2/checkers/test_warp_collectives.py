@@ -13,7 +13,7 @@ delta row records that rename, so both names are accepted
 asserted.
 
 No spec covers partial ``shfl.sync`` participation (test-migration.md no-spec
-item 17), so the module is ``xfail(strict=False)`` until the ruling.
+item 17); the module passes since W5-13 (8fba7e1), so it is no longer xfail.
 """
 
 from __future__ import annotations
@@ -30,15 +30,11 @@ from ._runnable import (
     assert_error_kind,
     assert_no_incomplete,
     coverage_bounds,
-    no_spec,
     requires_v2_engine,
     resource_limits,
 )
 
-pytestmark = [
-    requires_v2_engine,
-    no_spec(17, "warp_collective_divergence for partial shfl.sync participation (numsim delta P5 covers only a non-participant source lane)"),
-]
+pytestmark = [requires_v2_engine]
 
 
 @T.prim_func

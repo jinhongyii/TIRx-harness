@@ -2548,3 +2548,12 @@ Request: one `DeclareWord` per element, matching the verdict spans.
   - Passing: `test_tcgen05_restricted_commit.py` (all), `test_ldmatrix_b8.py`, `v2/checkers/test_warp_collectives.py`, `test_divergence_liveness.py`, `v2/ports/test_single_lane_participation.py`. 18 tests marked xfail now pass, so W8 can drop those marks.
   - `test_tensor_map_predicate_effects`: the data race is gone. It still fails on a racecheck REVIEW `alias_stale_read`: the `tensormap.replace` read through `image.ptr_to(...)` is treated as a different logical buffer (W5 naming).
 - **W5-14.** A `sync_words` buffer declares one word per element of its dtype (`bits / 8` bytes, at least 1), both for shared windows and global views (`sched/mod.rs::sync_word_spans`). Scenario `polled_flag_words`: 128 bytes of u32 polled per element gives 32 four-byte words. W5: landed.
+
+## v2 conformance, sweep 5 (W8, 2026-10-08, at 8fba7e1 + a3c4df9)
+
+Matches out of 101 (3 per mode have no legacy oracle): numsim 98, racecheck 96, synccheck 98.
+No open V2C row. The two racecheck rows that still differ from the legacy snapshot are explained
+by delta rows and have no delta snapshot yet: `alphamoe_fp8_blockscale_qwen3next` (R3,
+`undeclared_protocol_word` instead of `data_race`) and `kda_backward_packed` (X4,
+`cross_cta_async_order` advisory). Public-API set: 551 of 762 pass; per-function status in
+`scripts/numsim-v2/coverage/v2_public_status.tsv`, triage by owner in the status doc.

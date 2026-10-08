@@ -96,7 +96,6 @@ def _sync(kernel, inputs, **limits):
 _PARTIAL_WARP = WARP_COLLECTIVE_DIVERGENCE | {"named_barrier_invalid_arrival_count", "barrier_mismatch"}
 
 
-@no_spec(15, "liveness at a later named barrier of lanes that broke out of a loop but have not exited")
 def test_lane_divergent_break_is_exact_collective_error():
     """Replaces ``tests/analysis_tools/synccheck/test_native_break_continue.py::test_public_native_lane_divergent_break_is_exact_collective_error``.
 
