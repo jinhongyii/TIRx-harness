@@ -62,6 +62,7 @@ pub fn error_kind(e: &SyncError) -> &'static str {
             tcgen::Error::AllocationSizeIncrease { .. } => "tcgen_allocation_size_increase", // NEW
             tcgen::Error::DeallocationMismatch { .. } => "tcgen_deallocation_mismatch", // NEW
             tcgen::Error::LiveAllocationsAtExit { .. } => "tcgen_live_allocations_at_exit", // NEW
+            tcgen::Error::AllocWhileExclusive { .. } => "tcgen_alloc_while_exclusive", // NEW
         },
         SyncError::RegPool(e) => match e {
             setmaxnreg::Error::InvalidCount { .. } => "setmaxnreg_invalid_count", // NEW

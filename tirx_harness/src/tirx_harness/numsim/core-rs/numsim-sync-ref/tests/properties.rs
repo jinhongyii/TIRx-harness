@@ -995,3 +995,19 @@ proptest! {
         }
     }
 }
+
+/// tcgen05 exclusive ruling (sync-isa-answers, "Exclusive allocation"): a
+/// CTA holding a live `.exclusive` allocation may not allocate again ("This
+/// must be the only live allocation, until it is deallocated"); the peer
+/// CTA's allocation waits for the exclusive one.
+#[test]
+fn tcgen_alloc_while_exclusive_is_an_error() {
+    use tcgen::{Cmd, Error, Outcome, Who};
+    let mut s = tcgen::State::new(576);
+    let alloc = |cta, columns, exclusive| Cmd::Alloc { who: Who::One(cta), columns, exclusive };
+    assert_eq!(tcgen::step(&mut s, alloc(0, 96, true)), Ok(Outcome::Allocated { base: 0 }));
+    assert_eq!(tcgen::step(&mut s, alloc(0, 32, false)), Err(Error::AllocWhileExclusive { cta: 0 }));
+    assert_eq!(tcgen::step(&mut s, alloc(0, 32, true)), Err(Error::AllocWhileExclusive { cta: 0 }));
+    tcgen::step(&mut s, Cmd::Dealloc { who: Who::One(0), taddr: 0, columns: 96, exclusive: true }).unwrap();
+    assert_eq!(tcgen::step(&mut s, alloc(0, 32, false)), Ok(Outcome::Allocated { base: 0 }));
+}

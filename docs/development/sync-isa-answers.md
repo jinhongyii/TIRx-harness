@@ -450,6 +450,24 @@ illegal.
   live (Q1).
 - **Re-alloc while holding an allocation.** Legal for non-exclusive allocations,
   subject only to capacity (block, see Q1) and the non-increase rule.
+- **Alloc while the same CTA holds a live `.exclusive` allocation (ruling
+  2026-10-08).** Illegal, option (b): legacy was wrong to allow it. An `.exclusive`
+  allocation "must be the only live allocation, until it is deallocated with a
+  corresponding tcgen05.dealloc.exclusive operation", and "No other allocation
+  may exist at the same time as an exclusive allocation". Relinquish does not
+  help. `relinquish_alloc_permit` only ends the CTA's right to allocate, so after
+  it the alloc is illegal for that reason instead. Option (c), "legal after
+  relinquish", has no basis. Another CTA's alloc blocks until the exclusive one
+  is deallocated ("no other CTA may allocate"). A self-deadlock is not the
+  ISA reading for the owning CTA: a "must" is violated, so the model reports
+  `tcgen::Error::AllocWhileExclusive` (synccheck kind
+  `tcgen_alloc_while_exclusive`) instead of blocking. The legacy test
+  `test_exclusive_tmem_uses_cta_local_lifecycle_without_placement` (96-column
+  case) also deallocates the ordinary 32-column allocation with
+  `tcgen05.dealloc.exclusive`. That alone violates "Memory must be deallocated
+  with .exclusive if and only if it is allocated with .exclusive". The CUTLASS
+  allocators (`TmemAllocator1Sm` / `TmemAllocator2Sm`) issue one allocation per
+  CTA and relinquish the permit right after it, so they never hit this.
 
 ---
 

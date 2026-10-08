@@ -1032,3 +1032,16 @@ fn gathered_partial_warp_named_barrier_is_clean() {
     log.cmd(1, 1, named_bar(0, 1), bar_sync(1, 64));
     run_all(&log.build(), cta(2), Verdict::Clean);
 }
+
+/// tcgen05 exclusive ruling: an ordinary `tcgen05.alloc` by the CTA that
+/// holds a live `.exclusive` allocation is an error
+/// (`tcgen_alloc_while_exclusive`), not a hang and not clean (legacy).
+#[test]
+fn alloc_while_exclusive_is_an_error() {
+    let exclusive = SyncCmd::Tcgen(tcgen::Cmd::Alloc { who: tcgen::Who::One(0), columns: 96, exclusive: true });
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, tmem(0), exclusive).cmd(0, 2, tmem(0), tmem_alloc(32));
+    for (name, r) in run_all(&log.build(), one(), Verdict::Error) {
+        assert_eq!(kind(&r), "tcgen_alloc_while_exclusive", "{name}");
+    }
+}

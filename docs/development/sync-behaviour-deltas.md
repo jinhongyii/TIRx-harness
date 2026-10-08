@@ -61,7 +61,8 @@ ISA cites use PTX 9.4 section numbers. Quotes are in `sync-isa-answers.md`.
 | ID | Change | Legacy | New | ISA basis |
 | --- | --- | --- | --- | --- |
 | T1 | `alloc` with no free columns | E, N and verifier: `AllocationUnavailable` | `Blocked` and retried. A deadlock is reported only when nothing can progress. | §9.7.18.7.1 |
-| T2 | `.exclusive` alloc while other allocations are live, or any alloc while an exclusive allocation is live | Placed first-fit | `Blocked` | §9.7.18.7.1 |
+| T2 | `.exclusive` alloc while other allocations are live, or another CTA's alloc while an exclusive allocation is live | Placed first-fit | `Blocked` | §9.7.18.7.1 "An exclusive allocation operation blocks until there is no other live allocation … no other CTA may allocate" |
+| T8 | Any alloc by the CTA that holds a live `.exclusive` allocation (`test_exclusive_tmem_uses_cta_local_lifecycle_without_placement`, 96 columns) | Allowed ("the model deliberately permits ordinary allocation while exclusive is live") | Error `AllocWhileExclusive` (synccheck kind `tcgen_alloc_while_exclusive`), in every mode | §9.7.18.7.1 "This must be the only live allocation, until it is deallocated with a corresponding tcgen05.dealloc.exclusive operation"; "No other allocation may exist at the same time as an exclusive allocation" (sync-isa-answers Q6) |
 | T3 | Dealloc exclusivity mismatch | Not checked | `DeallocationMismatch` | §9.7.18.7.1 "deallocated with .exclusive if and only if" |
 | T4 | Exclusive width limit | `min(cap, 512)` | `exclusive_max` parameter: 512 on sm_100f/103/110, 576 on sm_107f | Table 58 |
 | T5 | `cta_group` uniformity | E: across lifecycle ops only; commit silently ignored work of the other group | Kernel-wide across all tcgen05 ops; any mismatch is `CtaGroupMismatch` | §9.7.18.7.1 |

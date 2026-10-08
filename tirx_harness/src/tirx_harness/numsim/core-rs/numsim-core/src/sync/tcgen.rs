@@ -150,6 +150,13 @@ pub enum Error {
     LiveAllocationsAtExit {
         cta: u8,
     },
+    /// An allocation by a CTA that holds a live `.exclusive` allocation:
+    /// "This must be the only live allocation, until it is deallocated with
+    /// a corresponding tcgen05.dealloc.exclusive operation" (PTX §9.7.18.7.1;
+    /// sync-isa-answers, tcgen05 exclusive rule). Other CTAs block instead.
+    AllocWhileExclusive {
+        cta: u8,
+    },
 }
 
 pub struct Tcgen;
@@ -186,6 +193,9 @@ pub fn step(state: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
                 let cta = &state.ctas[i];
                 if cta.relinquished {
                     return Err(Error::AllocAfterRelinquish);
+                }
+                if cta.allocations.iter().any(|a| a.exclusive) {
+                    return Err(Error::AllocWhileExclusive { cta: i as u8 });
                 }
                 if let Some(previous) = cta.last_alloc_columns.filter(|&p| columns > p) {
                     return Err(Error::AllocationSizeIncrease { previous, requested: columns });
