@@ -253,7 +253,11 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
                 AdvisoryKind::CrossCtaAsyncOrder => ("cross_cta_async_order", FindingKind::CrossCtaAsyncOrder),
                 AdvisoryKind::UndeclaredProtocolWord => ("undeclared_protocol_word", FindingKind::UndeclaredProtocolWord),
                 AdvisoryKind::AliasStaleRead => ("alias_stale_read", FindingKind::AliasStaleRead),
+                AdvisoryKind::DeclaredWordRawRead => ("declared_word_raw_read", FindingKind::UndeclaredProtocolWord),
             };
+            if *kind == AdvisoryKind::DeclaredWordRawRead {
+                race.insert("reason".into(), json!("declared_word_raw_read"));
+            }
             if *kind == AdvisoryKind::AliasStaleRead {
                 // Legacy advisory keys.
                 let reader = f.current.as_ref().map(|c| c.site);
@@ -274,6 +278,7 @@ fn convert(f: &RaceFinding, lr: &LaunchResult) -> Finding {
                 AdvisoryKind::CrossCtaAsyncOrder => "async-proxy accesses issued from different CTAs are ordered only by base causality; PTX preserves same-proxy order only within one thread block".to_string(),
                 AdvisoryKind::UndeclaredProtocolWord => "a strong load observed an unordered strong write on a word not declared for wait_until; the resulting ordering depends on the schedule".to_string(),
                 AdvisoryKind::AliasStaleRead => "stale-name read through pool alias: the read observes bytes last written through another logical buffer".to_string(),
+                AdvisoryKind::DeclaredWordRawRead => "a declared wait_until word was read directly, not through wait_until, while its publication was unordered with the read: the value is taken without the protocol's retry or edge".to_string(),
             };
             (ck, Status::Review, msg)
         }
@@ -516,7 +521,7 @@ pub fn serialize(r: &Report) -> Value {
         }
         m.insert("message".into(), json!(f.message));
         m.insert("sites".into(), json!(f.sites.iter().map(|s| s.0).collect::<Vec<_>>()));
-        if matches!(legacy.as_str(), "undeclared_protocol_word" | "cross_cta_async_order" | "alias_stale_read") {
+        if matches!(legacy.as_str(), "undeclared_protocol_word" | "cross_cta_async_order" | "alias_stale_read" | "declared_word_raw_read") {
             advisories.push(Value::Object(m));
         } else {
             findings.push(Value::Object(m));

@@ -210,3 +210,28 @@ fn accepted_entry_not_before_own_write() {
     assert!(clean(&run(0b1_0010)), "{:?}", run(0b1_0010));
 }
 
+
+/// T18 (#677 example 2): a raw strong read of a declared word, outside
+/// `wait_until`, racing its publication is a review (not a race: both are
+/// strong); read through wait_until it is the protocol working.
+#[test]
+fn raw_strong_read_of_declared_word_is_review() {
+    let mut k = K::new(1, 1, 2);
+    k.declare(GMEM2, FLAG);
+    k.a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, FLAG);
+    k.a(1, 0, ld(MemOrder::Relaxed, Scope::Gpu), GMEM2, FLAG).st(1, 0, GMEM, 0..4);
+    let r = k.run();
+    assert!(review_only(&r) && has_advisory(&r, AdvisoryKind::DeclaredWordRawRead), "{r:?}");
+    // Raw read delivered before the publication: reported too.
+    let mut k = K::new(1, 1, 2);
+    k.declare(GMEM2, FLAG);
+    k.a(1, 0, ld(MemOrder::Relaxed, Scope::Gpu), GMEM2, FLAG);
+    k.a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, FLAG);
+    assert!(has_advisory(&k.run(), AdvisoryKind::DeclaredWordRawRead));
+    // A poll (the read the wait_until is made of) is the protocol working.
+    let mut k = K::new(1, 1, 2);
+    k.declare(GMEM2, FLAG);
+    k.a(0, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, FLAG);
+    k.a(1, 0, ld(MemOrder::Acquire, Scope::Gpu), GMEM2, FLAG).wait_until(1, 0, GMEM2, FLAG, Scope::Gpu, 0b10, 1);
+    assert!(clean(&k.run()));
+}

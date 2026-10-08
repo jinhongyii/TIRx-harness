@@ -108,6 +108,13 @@ impl RaceObserver {
         self.buffer_of_site = names.into_iter().collect();
     }
 
+    /// Sites of `wait_until` polls (normally from the program's site table).
+    pub fn set_poll_sites(&mut self, sites: impl IntoIterator<Item = crate::site::SiteId>) {
+        if let Some(c) = &mut self.checker {
+            c.poll_sites = sites.into_iter().collect();
+        }
+    }
+
     /// Register an allocation (normally via `begin_launch` or `AllocBegin`).
     pub fn register_alloc(&mut self, alloc: AllocId, space: Space, size: u64, name: &str) {
         self.buffers.insert(alloc, (name.to_string(), space));
@@ -214,6 +221,16 @@ impl Observer for RaceObserver {
             .filter_map(|(i, s)| s.buffer.clone().filter(|b| !b.is_empty()).map(|b| (crate::site::SiteId(i as u32), b)))
             .collect();
         self.set_site_buffers(names);
+        if let Some(c) = &mut self.checker {
+            c.poll_sites = info
+                .program
+                .sites
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.op_name == "tirx.cuda.wait_until")
+                .map(|(i, _)| crate::site::SiteId(i as u32))
+                .collect();
+        }
         for (id, a) in info.arena.iter() {
             if matches!(a.space, Space::Global | Space::Shared | Space::Tmem) {
                 self.register_alloc(id, a.space, a.size, &a.name);

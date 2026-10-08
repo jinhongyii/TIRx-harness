@@ -103,6 +103,10 @@ pub enum AdvisoryKind {
     /// through another name of the same pooled allocation (legacy
     /// `alias_stale_read`; ordered, so not a race, but likely a stale name).
     AliasStaleRead,
+    /// A raw (non-`wait_until`) strong read of a DECLARED protocol word
+    /// raced its publication (morally strong, so not a race, §8.7.1): the
+    /// protocol says to read the word through `wait_until` (deltas T18).
+    DeclaredWordRawRead,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -538,6 +542,8 @@ pub struct Checker {
     /// Logical buffer name per site (`SiteInfo::buffer`), for
     /// `AliasStaleRead`. Empty = advisory off.
     pub site_buffer: HashMap<SiteId, Arc<str>>,
+    /// Sites of `wait_until` polls (lowering's `tirx.cuda.wait_until`).
+    pub poll_sites: HashSet<SiteId>,
     wide: WideSpans,
     report: Report,
     dedup: HashMap<(AllocId, RaceClass, SiteId, SiteId, bool), usize>,
@@ -639,6 +645,7 @@ impl Checker {
             lane_g2t: None,
             alias_dedup: HashMap::new(),
             site_buffer: HashMap::new(),
+            poll_sites: HashSet::new(),
             wide: WideSpans::default(),
             report: Report::default(),
             dedup: HashMap::new(),
@@ -1306,7 +1313,17 @@ impl Checker {
                         races.push((overlap(p.span(wide), &seg), *p));
                     } else if ordered && this.cross_cta_async(p, cur, a.proxy) {
                         advisories.push((overlap(p.span(wide), &seg), *p, AdvisoryKind::CrossCtaAsyncOrder));
-                    } else if !ordered && ms && !writes && !in_word && p.writes() {
+                    } else if !ordered && ms && in_word && p.writes() != writes {
+                        // T18: a strong read of a declared word that is not
+                        // a `wait_until` poll, unordered with a write of it.
+                        let read_site = if writes { this.site_of(p) } else { a.site };
+                        if !this.poll_sites.contains(&read_site) {
+                            advisories.push((overlap(p.span(wide), &seg), *p, AdvisoryKind::DeclaredWordRawRead));
+                        }
+                    } else if !ordered && ms && !in_word && p.writes() != writes && (p.writes() || !p.atomic()) {
+                        // Either order: a strong load that ran before an
+                        // unordered strong write could have read it on
+                        // another schedule (T18 note, #677).
                         advisories.push((overlap(p.span(wide), &seg), *p, AdvisoryKind::UndeclaredProtocolWord));
                     }
                 };

@@ -137,12 +137,15 @@ fn r9_strong_load_exempt_with_undeclared_word_advisory() {
     let r = k.run();
     assert!(races(&r).is_empty());
     assert!(has_advisory(&r, AdvisoryKind::UndeclaredProtocolWord));
-    // Declared: no advisory.
+    // Declared: no race and no undeclared-word advisory; a raw read of the
+    // declared word is the T18 protocol-usage review instead.
     let mut k = K::new(1, 1, 2);
     k.declare(GMEM, FLAG);
     k.a(0, 0, st(MemOrder::Relaxed, Scope::Gpu), GMEM, FLAG);
     k.a(1, 0, ld(MemOrder::Relaxed, Scope::Gpu), GMEM, FLAG);
-    assert!(k.run().findings.is_empty());
+    let r = k.run();
+    assert!(races(&r).is_empty() && !has_advisory(&r, AdvisoryKind::UndeclaredProtocolWord));
+    assert!(review_only(&r) && has_advisory(&r, AdvisoryKind::DeclaredWordRawRead));
     // A weak load is never exempt.
     let mut k = K::new(1, 1, 2);
     k.a(0, 0, st(MemOrder::Relaxed, Scope::Gpu), GMEM, FLAG).ld(1, 0, GMEM, FLAG);

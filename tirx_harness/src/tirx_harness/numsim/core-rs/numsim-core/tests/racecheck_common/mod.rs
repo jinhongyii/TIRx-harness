@@ -119,6 +119,8 @@ pub struct K {
     /// Logical buffer name per site (`SiteInfo::buffer`), for the
     /// `alias_stale_read` advisory. Warp access sites are `w * 1000 + epoch`.
     pub site_buffers: Vec<(SiteId, String)>,
+    /// Sites of accesses that are `wait_until` polls.
+    pub poll_sites: Vec<SiteId>,
 }
 
 impl K {
@@ -134,6 +136,7 @@ impl K {
             kernel: 0,
             gc_every: 1 << 14,
             site_buffers: Vec::new(),
+            poll_sites: Vec::new(),
         };
         k.alloc(SMEM, Space::Shared, 4096);
         k.alloc(SMEM1, Space::Shared, 4096);
@@ -477,6 +480,12 @@ impl K {
         observed: u32,
         pred_reads: &[(AllocId, Range<u64>)],
     ) -> &mut Self {
+        // The warp's preceding read of this word, if any, is the poll.
+        if let Some(Ev::Access { site, .. }) = self.ev.iter().rev().find(|e| {
+            matches!(e, Ev::Access { actor: Actor::Warp { warp, .. }, alloc: al, kind: AccessKind::Read, .. } if warp.0 == w && *al == alloc)
+        }) {
+            self.poll_sites.push(*site);
+        }
         let a = self.wactor(w);
         self.sync_ev(
             a,
@@ -500,6 +509,7 @@ impl K {
         if !self.site_buffers.is_empty() {
             obs.set_site_buffers(self.site_buffers.clone());
         }
+        obs.set_poll_sites(self.poll_sites.iter().copied());
         for (i, e) in self.ev.iter().enumerate() {
             match e {
                 Ev::Access { actor, site, alloc, space, kind, sem, scope, atomic, returns_value, proxy, window, spans } => {
