@@ -3213,3 +3213,63 @@ The changes below are bit-identical. On the recorded mega_moe e24 stream, the ha
 - **TcgenCp landing.** Private (non-overlaid) source and destination with valid source bytes copy and decode through the byte arrays: a stack buffer and a direct write plus a validity range, instead of a `Vec`, `arena.read` and `arena.write` per cell. Max config: 324 → 131 CPU-s.
 - **Copy landing.** The source gather fills one buffer through the new `Arena::read_raw_into`, with no `Vec` per span. Max config: 163 → 114 CPU-s.
 - **Landing scan.** Readiness uses a lazily built set of live op ids, built only when an op has `after` dependencies, instead of a queue rescan per dependency. The order and RNG draws are unchanged. Max config: 86 → 75 CPU-s.
+
+## W5-17a (2026-10-08, for the coordinator): decision-17 fork gating and a partition size hint
+
+**Problem.** With `FORK_JOIN` on (6cfabec), racecheck pays the fork cost even
+when nothing runs in parallel. These rows are in `perf_regressions.tsv`:
+
+| Case | Slowdown |
+| --- | --- |
+| kda w1 | +19% |
+| kda w32 | +19% |
+| stp w1 | +18% |
+| radix_topk w1 | +14% |
+| e24 w1 | +12% |
+| gdn w1 | +10% |
+
+- `Scheduler::replay_partitions` calls `observer.fork` for every partition,
+  even when `pool` is `None` or `order.len() == 1`, where the children then
+  run one after another on the calling thread.
+- kda at 32 workers forks many small partitions whose split/absorb cost
+  exceeds their replay.
+
+**Request 1: fork only when there is a parallel replay.** In
+`replay_partitions`, offer `fork` only when `pool.is_some() && order.len() > 1`
+(the condition under which `par_for` is used today). Otherwise replay every
+partition into `observer` in order, as the non-forked branch already does.
+
+**Request 2: a size hint.** Add `pub accesses: u64` to `PartitionInfo`: the
+partition's `events.access_count()`, the value `replay_partitions` already
+adds to `seq`. Fill it in both the `fork` and the `join` calls.
+
+**What racecheck does with the hint (no further contract change).** Below a
+threshold, `RaceObserver::fork` will still return a child. That child only
+buffers the converted events: no checker split, no lent globals. `join`
+queues it with the real children, and the main checker replays it in join
+order at the next settle. This is the serial work for that partition, in
+the same position as serial replay.
+
+`fork` must not return `None` for some partitions of a phase and `Some` for
+others. A non-forked partition's events reach the main checker between
+joins, while later children still hold the lent round-start globals (§14),
+so the main checker could not take them back. Request 1 removes the
+all-`None` case entirely; the buffer child covers the mixed case.
+
+**Why results and streams stay worker-count independent.** `fork`, `join` and
+`phase_end` are structural callbacks on the observer only:
+
+- The scheduler's `Access`/`SyncEvent` streams, their seq numbers, the
+  verdict indices and the replay order are fixed before `fork` is offered
+  (after `merge_words`). They are the same whether a partition is forked,
+  buffered or replayed into the parent.
+- Gating on `pool`/`order.len()` or on `accesses` only chooses which of these
+  equivalent deliveries happens. An observer that ignores the hooks (every
+  other observer; `fork` defaults to `None`) sees exactly today's stream.
+- Racecheck's merged payload is already required, and tested, to equal
+  serial replay at any partitioning: `racecheck_parallel_review`, the
+  prof-harness hashes at 1/8/32 workers, conformance 101/101. So a
+  worker-count-dependent choice of which partitions fork cannot change it.
+- `accesses` is a property of the partition's buffered events, which are
+  themselves worker-count independent. Only whether a pool exists depends on
+  the worker count, and that changes delivery, never content.
