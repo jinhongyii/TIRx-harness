@@ -551,3 +551,205 @@ fn successor_scenario_reclaims_slots() {
         assert!(coverage(&r, "async_slots_reclaimed") > 0, "hb={hb}: no async slot was reclaimed: {:?}", r.coverage);
     }
 }
+
+// ---------------------------------------------------------------------------
+// TMA stage reuse (W5's eviction diagnosis): two TMA writes to one stage with
+// the full/empty mbarrier chain between them.
+// ---------------------------------------------------------------------------
+
+/// One CTA, two warps, one shared stage of 32 words, `full` and `empty`
+/// mbarriers (count 1). For `iters` iterations, the producer (warp 0, elected
+/// lane) waits `empty` (from the second iteration on, when `chain`), arms
+/// `full` with `expect_tx(128)` and bulk-copies 128 bytes of `w` into the
+/// stage. The consumer (warp 1) waits `full`, reads the stage, and (elected
+/// lane, after a warp sync) arrives on `empty`.
+/// - With `chain`, each TMA write is ordered after the previous iteration's
+///   consumer reads (full complete → reads → empty arrive (release) →
+///   producer wait → next issue): race-free.
+/// - Without `chain`, the producer waits only for its own TMA to land
+///   (`full`), so the next TMA write is unordered with the consumer's reads
+///   of the previous one: a real race.
+/// The consumer fences `proxy.async` before arriving on `empty` (its stage
+/// reads are generic; the next write is async-proxy).
+fn tma_stage_pipeline(iters: u32, chain: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("tma_stage_pipeline", 64);
+    let w = b.global("w", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let full = b.shared("full", Dtype::U64, 1);
+    let empty = b.shared("empty", Dtype::U64, 1);
+    let stage = b.shared("stage", Dtype::U32, W_WORDS as u64);
+    let tid = b.reg(Ty::U32);
+    let warp = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let e = b.reg(Ty::PRED);
+    let e2 = b.reg(Ty::PRED);
+    let fr = b.reg(Ty::U32);
+    let er = b.reg(Ty::U32);
+    let sa = b.reg(Ty::U32);
+    let ga = b.reg(Ty::U64);
+    let i = b.reg(Ty::U32);
+    let par = b.reg(Ty::U32);
+    let prev = b.reg(Ty::U32);
+    let off = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    b.thread_rank(tid);
+    b.warp_id(warp);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let kn = b.k_u32(iters);
+    let kw = b.k_u32(W_WORDS);
+    let kbytes = b.k_u32(4 * W_WORDS);
+    b.smem_addr(fr, full, k0);
+    b.smem_addr(er, empty, k0);
+    b.smem_addr(sa, stage, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, tid, k0);
+    b.if_(p);
+    b.mbar_init(fr, 1);
+    b.mbar_init(er, 1);
+    b.end_if();
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    b.bar_sync(0);
+    b.mov(i, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, warp, k0);
+    b.if_(p);
+    // ---- producer ----
+    elect_if(&mut b, e);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, i, kn);
+    b.loop_if(p);
+    if chain {
+        b.compare(CmpOp::Ne, Ty::U32, p, i, k0);
+        b.if_(p);
+        b.binary(BinOp::Sub, Ty::U32, prev, i, k1);
+        b.binary(BinOp::And, Ty::U32, par, prev, k1);
+        b.site("empty_wait", 10);
+        b.mbar_wait_parity(er, par);
+        b.no_site();
+        b.end_if();
+    }
+    b.push(Instr::MbarArrive(MbarArriveArgs {
+        mbar: fr.into(),
+        space: AddrSpace::Shared,
+        count: None,
+        expect_tx: Some(kbytes),
+        drop: false,
+        no_complete: false,
+        sem: Sem::Release,
+        scope: Scope::Cta,
+        multicast: None,
+        state: None,
+    }));
+    b.mul(Ty::U32, off, i, kw);
+    b.addr_of(ga, w, off);
+    b.site("tma_stage_write", 11);
+    b.push(Instr::BulkCopy(BulkCopyArgs {
+        dst: sa.into(),
+        dst_space: AddrSpace::SharedCluster,
+        src: ga.into(),
+        src_space: AddrSpace::Global,
+        size: kbytes,
+        completion: BulkCompletion::Mbarrier { mbar: fr.into(), space: AddrSpace::Shared },
+        multicast: None,
+        reduce: None,
+        byte_mask: None,
+        ignore_oob: None,
+        report: None,
+        mods: MemMods::default(),
+    }));
+    b.no_site();
+    if !chain {
+        // Wait for this TMA to land (keeps the `full` protocol valid) but
+        // never for the consumer: the next write is unordered with its reads.
+        b.binary(BinOp::And, Ty::U32, par, i, k1);
+        b.mbar_wait_parity(fr, par);
+    }
+    b.add_u32(i, i, k1);
+    b.loop_end();
+    b.end_if();
+    b.else_();
+    // ---- consumer ----
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, i, kn);
+    b.loop_if(p);
+    b.binary(BinOp::And, Ty::U32, par, i, k1);
+    b.site("full_wait", 12);
+    b.mbar_wait_parity(fr, par);
+    b.site("stage_read", 13);
+    b.ld_u32(v, stage, lane);
+    b.no_site();
+    b.mul(Ty::U32, off, i, kw);
+    b.add_u32(off, off, lane);
+    b.st_u32(out, off, v);
+    if chain {
+        // Generic reads of the stage, then a later async-proxy (TMA) write
+        // of it: the consumer bridges the proxies before releasing the stage.
+        b.fence(FenceKind::ProxyAsync(Some(AddrSpace::Shared)), Sem::Weak, Scope::Cta);
+        let fullm = b.k_u32(u32::MAX);
+        b.push(Instr::WarpSync { membermask: fullm });
+        elect_if(&mut b, e2);
+        b.site("empty_arrive", 14);
+        b.mbar_arrive(er, None);
+        b.no_site();
+        b.end_if();
+    }
+    b.add_u32(i, i, k1);
+    b.loop_end();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    mark_elect(&mut prog, e);
+    if chain {
+        mark_elect(&mut prog, e2);
+    }
+    let words = (iters * W_WORDS) as usize;
+    let s = Scenario {
+        name: "tma_stage_pipeline",
+        module: Module::new(vec![prog]),
+        inputs: inputs(vec![("w", u32_buf(0..words as u32)), ("out", u32_buf(vec![0; words]))]),
+        config: RunConfig { loop_budget: 1 << 40, ..RunConfig::default() },
+    };
+    s
+}
+
+fn site_named(s: &Scenario, op: &str) -> SiteId {
+    let i = s.module.kernels[0].sites.iter().position(|x| x.op_name == op).unwrap_or_else(|| panic!("no site {op}"));
+    SiteId(i as u32)
+}
+
+#[test]
+fn tma_stage_reuse_with_chain_is_clean() {
+    for iters in [2u32, 8] {
+        let s = tma_stage_pipeline(iters, true);
+        assert_clean(&worker_independent(&s));
+        aggressive_gc_agrees(&s);
+    }
+}
+
+#[test]
+fn tma_stage_reuse_without_chain_races() {
+    let s = tma_stage_pipeline(4, false);
+    let r = worker_independent(&s);
+    let (read, write) = (site_named(&s, "stage_read"), site_named(&s, "tma_stage_write"));
+    assert!(
+        r.findings.iter().any(|f| f.sites.contains(&read) && f.sites.contains(&write)),
+        "the unchained TMA write must race the previous stage read: {r:#?}"
+    );
+}
+
+/// With the chain, each stage's TMA write witness is superseded by the next
+/// one: under `gc_every = 1`, the live async-slot peak (`async_slots`) must
+/// not grow with the iteration count. Today it does (4 at 4 iterations, 32
+/// at 32): the stage's previous TMA write witness is never evicted. That is
+/// the mega_moe medium blow-up W5 is diagnosing.
+#[test]
+#[ignore = "xfail: W5 TMA stage-reuse eviction (mega_moe medium); remove when the eviction rule lands"]
+fn tma_stage_reuse_with_chain_keeps_witnesses_bounded() {
+    let peak = |iters| {
+        let s = tma_stage_pipeline(iters, true);
+        coverage(&run_gc(&s, 1, Some(1)).1, "async_slots")
+    };
+    let (short, long) = (peak(4), peak(32));
+    assert!(long <= short + 1, "async-slot peak grows with stage reuse: {short} at 4 iterations, {long} at 32");
+}
