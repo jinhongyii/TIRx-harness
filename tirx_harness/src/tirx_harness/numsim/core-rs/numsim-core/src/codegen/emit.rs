@@ -127,9 +127,10 @@ pub(crate) fn handler_call(pc: usize, ins: &Instr) -> String {
         MbarTx { op, mbar, space, bytes, multicast, scope } => {
             c("mbar_tx", &[l(op), l(mbar), l(space), l(bytes), l(multicast), l(scope)])
         }
-        MbarTestWait { kind, mbar, space, phase, sem, scope, dst } => {
-            c("mbar_test_wait", &[l(kind), l(mbar), l(space), l(phase), l(sem), l(scope), l(dst)])
-        }
+        MbarTestWait { kind, mbar, space, phase, sem, scope, dst, report, report_value } => c(
+            "mbar_test_wait",
+            &[l(kind), l(mbar), l(space), l(phase), l(sem), l(scope), l(dst), l(report), l(report_value)],
+        ),
         MbarWait { mbar, space, phase, sem, scope } => c("mbar_wait", &[l(mbar), l(space), l(phase), l(sem), l(scope)]),
         MbarQuery { dst, op } => c("mbar_query", &[l(dst), l(op)]),
         Fence { kind, sem, scope } => c("fence", &[l(kind), l(sem), l(scope)]),
@@ -147,9 +148,10 @@ pub(crate) fn handler_call(pc: usize, ins: &Instr) -> String {
             c("tcgen_dealloc", &[l(taddr), l(ncols), l(cta_group), l(exclusive)])
         }
         TcgenRelinquish { cta_group } => c("tcgen_relinquish", &[l(cta_group)]),
-        TcgenCommit { mbar, space, cta_group, multicast } => {
-            c("tcgen_commit", &[l(mbar), l(space), l(cta_group), l(multicast)])
-        }
+        TcgenCommit { mbar, space, cta_group, multicast, sync_restrict, multicast_width } => c(
+            "tcgen_commit",
+            &[l(mbar), l(space), l(cta_group), l(multicast), l(sync_restrict), l(multicast_width)],
+        ),
         TcgenLd(_) => borrowed("TcgenLd", "tcgen_ld"),
         TcgenSt(_) => borrowed("TcgenSt", "tcgen_st"),
         TcgenWait { st } => c("tcgen_wait", &[l(st)]),
