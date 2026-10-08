@@ -2676,3 +2676,38 @@ Behaviour changes seen in this triage with no delta row yet (asserted as v2 beha
   - `test_gate_intrinsics_match_float32_semantics` fails only on the `rust_source` pin (W9).
 - **Unchanged and not mine:** `test_memory_sync_extensions[scalar_async_store]` remains a racecheck `scope_mismatch` (W5).
 - **Conformance.** `NUMSIM_IMPL=v2` gives 295 passed, 9 skipped (numsim / racecheck / synccheck 98 / 98 / 98 run, 0 failed). `cargo test --workspace` passes 1024 / 1024, and codegen equivalence 4 / 4.
+
+## W1 (2026-10-08): lowering-rejects, sweep residual table, mma_fill/mma_store
+
+- **`lowering-rejects` (6): confirmed fail-closed.** Delta rows L1
+  (replicated TMEM view, 4 tests) and L2 (`tirx.ptx_legacy`, 2 tests) are in
+  `numsim-behaviour-deltas.md`. W9 ported all six as expected
+  `UnsupportedTIRxError` (`tests/numsim/v2/ports/test_failclosed_lowering.py`).
+- **Sweep residuals:** 2217 of 2343 kernels lower clean (up from 2215).
+  Every unclean module falls in one documented class:
+
+  | kernels | reason | row |
+  | --- | --- | --- |
+  | 69 | TVM `TilePrimitiveDispatch` rejects the tile op (gemm_async, copy_async, permute_layout, unregistered copy variants) | L3 (new) |
+  | 37 | Legacy fail-closed rules kept: mutated or unreviewed helpers, invalid reinterprets, invalid TMA-reduce op or dtype, bad wait_group counts, unknown tile config keys, directed f64 rounding, off-ABI warp-gemm fragments, fuzz/negative kernels (`op None`, non-literal `mov_sreg`, `boolx128`, parallel or thread-bound loops, unknown attributes, shuffle out of range) | legacy rejections |
+  | 9 | `tirx.ptx_legacy` | L2 |
+  | 9 | Direct access to a replicated TMEM view | L1 |
+
+- **New lowering: `tirx.mma_fill` / `mma_store` (+ `_legacy`).** This is
+  the one real gap the sweep showed.
+  - `mma_fill` zeroes `local_size` accumulator elements.
+  - `mma_store` writes the 16x16 fragment by the lane/register ABI of legacy
+    `emit/matrix.rs`: element `id` of lane `l` goes to
+    `row = 8*((id%4)/2) + l/4`, `col = 8*(id/4) + 2*(l%4) + id%2`.
+  - Both use generic `LoadAddr`/`StoreAddr` and need no contract change.
+  - `test_mma_fragment_fill_and_store_observe_lane_register_layout` and
+    `test_reused_mma_store_pointers_write_lane_register_layout` pass.
+- **`test_mov_pointer_identity_masks_and_nulls`: engine-side, not
+  allocation sizing.**
+  - The positive global and shared cases pass numsim, synccheck and
+    racecheck, and the shared storage is sized correctly (256 static bytes).
+  - The failure is the `dereference_null=True` variant. Its `ld.b32` through
+    a generic null pointer (0) is resolved into the CTA's shared window of
+    0 bytes (`smem[cta0]`) and reported as out_of_bounds.
+  - Legacy reports a null dereference. For W2: a generic address 0 should
+    fail as `null`, not fall into the shared aperture.

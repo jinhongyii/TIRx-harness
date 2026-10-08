@@ -630,6 +630,66 @@ class CallsMixin:
         self.builder.emit("StoreAddr", site=site, ty=dst_ty, addr=dst_ptr, space="Generic", value=converted,
                           sem="Weak", scope="Gpu", mods=pb.mem_mods())
 
+    # -- legacy warp-MMA fragment helpers (tirx.mma_fill / tirx.mma_store) ---
+    _MMA_ACCUMULATORS = ("float16", "float32", "float64", "int32")
+
+    def call_tirx_mma_fill(self: "Lowerer", node: Any) -> None:
+        """``mma_fill(local_size, ptr, offset)``: zero ``local_size`` accumulator
+        elements at element ``offset`` of ``ptr`` (legacy emit/matrix.rs)."""
+        dtype = dtypes.dtype_of(node) or ""
+        if dtype not in self._MMA_ACCUMULATORS or len(node.args) != 3:
+            raise _Unsupported(node, f"tirx.mma_fill accumulator dtype must be one of {self._MMA_ACCUMULATORS}")
+        local_size = node.args[0]
+        if type_key(local_size) != "ir.IntImm" or int(local_size.value) <= 0:
+            raise _Unsupported(node, "tirx.mma_fill.local_size must be a positive integer constant")
+        ty = self.ty(dtype, node)
+        site = self.site(node, op_name=_op_name(node))
+        base = self.binary("Add", pb.Ty("U64"), self.as_address(self.expr(node.args[1])),
+                           self.element_bytes(dtype, self.expr(node.args[2])))
+        zero = self.const(dtype, 0)
+        for slot in range(int(local_size.value)):
+            addr = self.binary("Add", pb.Ty("U64"), base, self.const("uint64", slot * dtypes.bits(dtype) // 8))
+            self.builder.emit("StoreAddr", site=site, ty=ty, addr=addr, space="Generic", value=zero,
+                              sem="Weak", scope="Gpu", mods=pb.mem_mods())
+
+    call_tirx_mma_fill_legacy = call_tirx_mma_fill
+
+    def call_tirx_mma_store(self: "Lowerer", node: Any) -> None:
+        """``mma_store(m, n, dst, src, src_offset, dst_stride)`` for the 16x16
+        accumulator fragment: lane-owned element ``local_id`` (0..8) goes to
+        ``row = 8*((id%4)/2) + lane/4``, ``col = 8*(id/4) + 2*(lane%4) + id%2``
+        of ``dst`` (row stride ``dst_stride``), as legacy emit/matrix.rs."""
+        dtype = dtypes.dtype_of(node) or ""
+        if dtype not in self._MMA_ACCUMULATORS or len(node.args) != 6:
+            raise _Unsupported(node, f"tirx.mma_store accumulator dtype must be one of {self._MMA_ACCUMULATORS}")
+        m, n = node.args[0], node.args[1]
+        if any(type_key(x) != "ir.IntImm" or int(x.value) != 16 for x in (m, n)):
+            raise _Unsupported(node, "tirx.mma_store supports the 16x16 accumulator fragment only")
+        ty = self.ty(dtype, node)
+        i64, u64 = pb.Ty("S64"), pb.Ty("U64")
+        site = self.site(node, op_name=_op_name(node))
+        dst = self.as_address(self.expr(node.args[2]))
+        src = self.as_address(self.expr(node.args[3]))
+        src_offset = self.cast_to(self.expr(node.args[4]), i64)
+        stride = self.cast_to(self.expr(node.args[5]), i64)
+        lane = self.cast_to(self.thread_coordinate("laneid"), i64)
+        quad_row = self.binary("FloorDiv", i64, lane, self.const(i64, 4))
+        pair_col = self.binary("Mul", i64, self.binary("FloorMod", i64, lane, self.const(i64, 4)), self.const(i64, 2))
+        for local_id in range(8):
+            source_elem = self.binary("Add", i64, src_offset, self.const(i64, local_id))
+            row = self.binary("Add", i64, quad_row, self.const(i64, 8 * ((local_id % 4) // 2)))
+            col = self.binary("Add", i64, pair_col, self.const(i64, 8 * (local_id // 4) + local_id % 2))
+            dest_elem = self.binary("Add", i64, self.binary("Mul", i64, row, stride), col)
+            value = self.builder.reg(ty)
+            self.builder.emit("LoadAddr", site=site, ty=ty, dst=value, space="Generic",
+                              addr=self.binary("Add", u64, src, self.element_bytes(dtype, source_elem)),
+                              sem="Weak", scope="Gpu", mods=pb.mem_mods())
+            self.builder.emit("StoreAddr", site=site, ty=ty, space="Generic", value=value,
+                              addr=self.binary("Add", u64, dst, self.element_bytes(dtype, dest_elem)),
+                              sem="Weak", scope="Gpu", mods=pb.mem_mods())
+
+    call_tirx_mma_store_legacy = call_tirx_mma_store
+
     def call_tirx_cuda_float22half2(self: "Lowerer", node: Any) -> None:
         self.convert_through_memory(node, pb.Ty("F32", 2), pb.Ty("F16", 2))
 

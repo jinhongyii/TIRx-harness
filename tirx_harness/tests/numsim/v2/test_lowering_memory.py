@@ -348,3 +348,20 @@ def test_cross_owner_fragment_copy_is_transported_through_shared_scratch():
     barriers = all_of(program, "Barrier")
     assert len(barriers) == 2 and all(const(program, b.id) == 8 for b in barriers)
     assert not any(i.variant == "Unsupported" for i in program.code)
+
+
+def test_legacy_mma_fill_and_store_follow_the_lane_register_layout():
+    """`tirx.mma_fill` zeroes the fragment; `tirx.mma_store` writes element `id` of lane `l`
+    to row 8*((id%4)//2) + l//4, col 8*(id//4) + 2*(l%4) + id%2 (legacy emit/matrix.rs)."""
+    import numpy as np
+
+    from tests.numsim.runtime.test_matrix_instruction_codegen import mma_fragment_fill_and_store
+    from tirx_harness.numsim import v2
+
+    result = v2.Engine().run(v2.transpile(mma_fragment_fill_and_store), {
+        "filled": np.ones((2, 32, 8), dtype=np.float32), "stored": np.zeros((2, 16, 16), dtype=np.float32)})
+    assert not result.outputs["filled"].any()
+    stored = result.outputs["stored"]
+    for row, col in ((0, 0), (9, 3), (15, 15)):
+        lane, local_id = 4 * (row % 8) + (col % 8) // 2, 4 * (col // 8) + 2 * (row // 8) + col % 2
+        assert stored[0, row, col] == lane * 100 + local_id
