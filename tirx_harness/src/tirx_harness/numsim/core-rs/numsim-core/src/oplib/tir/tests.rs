@@ -153,6 +153,9 @@ fn integer_semantics() {
     // Unary.
     assert_eq!(un(UnOp::Neg, Ty::S32, s32(5)).unwrap(), s32(-5));
     assert_eq!(un(UnOp::Not, Ty::U8, 0x0f).unwrap(), 0xf0);
+    assert_eq!(un(UnOp::BitNot, Ty::U32, 0x0f).unwrap(), 0xffff_fff0);
+    assert_eq!(un(UnOp::BitNot, Ty::U64, 0).unwrap(), u64::MAX);
+    assert_eq!(un(UnOp::BitNot, Ty::PRED, 1).unwrap(), 0);
     assert_eq!(un(UnOp::Popcount, Ty::U32, 0xf0f0).unwrap(), 8);
     assert_eq!(un(UnOp::Clz, Ty::U32, 1).unwrap(), 31);
     assert_eq!(un(UnOp::Clz, Ty::U64, 1).unwrap(), 63);
@@ -424,7 +427,7 @@ fn fast_paths_match_the_generic_path() {
                 let g = binary_generic(op, ty, &a, &b, &mut go, mask);
                 same(format!("binary {op:?} {d}"), f, g, &fo, &go);
             }
-            for op in [UnOp::Neg, UnOp::Abs, UnOp::Not, UnOp::Sqrt, UnOp::Exp, UnOp::Exp2, UnOp::Log, UnOp::Log2, UnOp::Rsqrt] {
+            for op in [UnOp::Neg, UnOp::Abs, UnOp::Not, UnOp::BitNot, UnOp::Sqrt, UnOp::Exp, UnOp::Exp2, UnOp::Log, UnOp::Log2, UnOp::Rsqrt] {
                 let (a, init) = (operand(ty), operand(ty));
                 let (mut fo, mut go) = (init.clone(), init.clone());
                 let Some(f) = fast::unary(op, ty, &a, &mut fo, mask) else { continue };

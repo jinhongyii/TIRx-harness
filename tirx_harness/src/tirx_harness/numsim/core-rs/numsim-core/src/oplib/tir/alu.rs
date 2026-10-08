@@ -136,11 +136,11 @@ pub(super) fn unary(op: UnOp, d: Dtype, x: u128) -> OpResult<u128> {
     }
     match d {
         Dtype::Pred => match op {
-            UnOp::Not => Ok((x & 1) ^ 1),
+            UnOp::Not | UnOp::BitNot => Ok((x & 1) ^ 1),
             _ => Err(unsupported_un(op, d)),
         },
         Dtype::B128 => match op {
-            UnOp::Not => Ok(!x),
+            UnOp::BitNot | UnOp::Not => Ok(!x),
             _ => Err(unsupported_un(op, d)),
         },
         _ if d.is_int() => {
@@ -148,7 +148,9 @@ pub(super) fn unary(op: UnOp, d: Dtype, x: u128) -> OpResult<u128> {
             Ok(match op {
                 UnOp::Neg => (v.wrapping_neg() as u128) & m,
                 UnOp::Abs => (v.wrapping_abs() as u128) & m,
-                UnOp::Not => !x & m,
+                // `BitNot` is `~x`; `Not` on an integer (pre-contract-batch
+                // lowering spelled `~x` as `Not`) keeps the same meaning.
+                UnOp::BitNot | UnOp::Not => !x & m,
                 UnOp::Popcount => u128::from((x & m).count_ones()),
                 UnOp::Clz => u128::from((x & m).leading_zeros() - (128 - w)),
                 UnOp::Floor | UnOp::Ceil | UnOp::Round | UnOp::Trunc => x & m,

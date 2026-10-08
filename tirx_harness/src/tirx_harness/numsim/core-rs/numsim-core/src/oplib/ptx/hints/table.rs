@@ -1,5 +1,7 @@
-// @generated from tvm.backend.cuda.ptx.table (prefetch*/applypriority* ops): (op, [(slot, choices, optional)]).
+// @generated from tvm.backend.cuda.ptx.table (prefetch*/applypriority*/cp_async_bulk_prefetch* ops): (op, [(slot, choices, optional)]).
 pub(super) const HINT_OPS: &[(&str, &[(&str, &[&str], bool)])] = &[
+    ("tirx.ptx.cp_async_bulk_prefetch", &[("api", &["async"], false), ("kind", &["bulk"], false), ("op", &["prefetch"], false), ("level", &["L2"], false), ("src", &["global"], false), ("cache", &["L2::cache_hint"], true)]),
+    ("tirx.ptx.cp_async_bulk_prefetch_evict_last", &[("api", &["async"], false), ("kind", &["bulk"], false), ("op", &["prefetch"], false), ("level", &["L2"], false), ("src", &["global"], false), ("priority", &["L2::evict_last"], false)]),
     ("tirx.ptx.applypriority", &[("space", &["global"], true), ("level", &["L2::evict_normal"], false)]),
     ("tirx.ptx.applypriority_async_bulk", &[("api", &["async"], false), ("kind", &["bulk"], false), ("src", &["global"], true), ("completion", &["bulk_group"], false), ("priority", &["L2::evict_normal"], false)]),
     ("tirx.ptx.applypriority_async_bulk_tensor", &[("api", &["async"], false), ("kind", &["bulk"], false), ("unit", &["tensor"], false), ("dim", &["1d", "2d", "3d", "4d", "5d"], false), ("src", &["global"], true), ("completion", &["bulk_group"], false), ("load_mode", &["tile", "tile::gather4"], true), ("priority", &["L2::evict_normal"], false)]),

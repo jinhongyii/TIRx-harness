@@ -322,8 +322,8 @@ pub(super) fn unary(op: UnOp, ty: Ty, a: &[W], out: &mut [W], mask: WarpMask) ->
         (Dtype::F64, UnOp::Abs) => map1::<u64, u64>(a, out, mask, |x| x & !(1 << 63)),
         (Dtype::F16 | Dtype::BF16, UnOp::Neg) => map1::<u16, u16>(a, out, mask, |x| x ^ 0x8000),
         (Dtype::F16 | Dtype::BF16, UnOp::Abs) => map1::<u16, u16>(a, out, mask, |x| x & 0x7fff),
-        (Dtype::Pred, UnOp::Not) => map1::<u64, u64>(a, out, mask, |x| (x & 1) ^ 1),
-        (d, UnOp::Neg | UnOp::Abs | UnOp::Not) => {
+        (Dtype::Pred, UnOp::Not | UnOp::BitNot) => map1::<u64, u64>(a, out, mask, |x| (x & 1) ^ 1),
+        (d, UnOp::Neg | UnOp::Abs | UnOp::Not | UnOp::BitNot) => {
             macro_rules! go {
                 ($t:ty, $signed:expr, $($rest:tt)*) => {
                     match op {
