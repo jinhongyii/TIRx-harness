@@ -55,11 +55,13 @@ workspace) driven from `tirx_harness.numsim.v2` through the pyo3 extension
 (cd src/tirx_harness/numsim/core-rs && cargo test --workspace)
 (cd src/tirx_harness/numsim/core-rs && cargo test -p numsim-py)
 
-# Dev install of the extension into the source tree (release; --debug for a
-# debug build). Rerun after any core-rs change you want Python to see.
+# Build the extension (release; --debug for a debug build). Rerun after any
+# core-rs change you want Python to see. Concurrent work: private target and
+# package, never the shared .so (rebuilding it crashes runs that loaded it).
+CARGO_TARGET_DIR=<dir>/target bash src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh --out <dir>/ext
+$PY -m pytest -q -n 8 -o "pythonpath=<dir>/ext/pkg ." tests/numsim/v2
+# Single developer: install into the source tree, then run pytest as usual.
 bash src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh
-
-# Python layer + lowering tests
 $PY -m pytest -q -n 8 tests/numsim/v2
 ```
 
