@@ -276,3 +276,57 @@ Case `t8192_m8192_h7168_i3072_e384_k6_g1`, `Engine(max_workers=16)`, NumSim mode
   - fixed-size small copies.
 - **Conclusion.** The MMA cost is oplib's arithmetic per MMA. Engine-side callback work is not the lever. Don't retry views or callback micro-optimizations without a new profile that attributes time below `tc_mma_ctas` correctly (py-spy's native unwinding truncates there).
 
+
+## Interpreter hot paths (W13, 2026-10-08)
+
+**Results.** Every change keeps outputs, `RunStatus`, stats and observer streams bit-identical. That was checked by a digest of outputs plus every observer callback, with and without word history, over all `testutil` scenarios and the corpus fixtures, at 1, 8 and 32 workers. Each change has a criterion row in `numsim-core/benches/interp_hot.rs`; corpus rows read `examples/record_race_fixtures.py` fixtures. Exactness tests are in `tests/interp_hot_equivalence.rs`, plus unit tests beside `coalesce` and `subtract_spans`.
+
+Single worker, before → after the whole series:
+
+| Kernel | Before | After | Speedup |
+| --- | --- | --- | --- |
+| rmsnorm | 0.97 ms | 0.64 ms | 1.4x |
+| deepgemm_sm100_fp8_gemm_1d1d | 9.5 ms | 5.4 ms | 1.7x |
+| fp16_bf16_gemm | 75 ms | 57 ms | 1.3x |
+
+Mega MoE e24 (`mega_moe_t8_h1024_i512_e24_k2_g1`) at 16 workers:
+
+| Mode | Before | After |
+| --- | --- | --- |
+| Engine only, no observer | 652 ms | 379 ms |
+| Observed (counting observer) | 1.85 s | 0.61 s |
+
+The cost of being observed on e24 fell from ~1.2 s to ~230 ms.
+
+| Change | Where | Bench row | Before → after |
+| --- | --- | --- | --- |
+| Exact memo of `WarpState::spin_hash` (memcmp against the last hashed state) and an 8-chain multiply-rotate hash | interp/mod.rs | `spin_wait_regs/pad768_iters4096` | 7.35 → 2.19 ms |
+| Register file from one zeroed allocation (`vec![[0u64;32]; n]` cloned slot by slot) | interp/mod.rs | `admit_regs/ctas64_pad256` | 1.56 → 1.48 ms; 765 slots per warp 100 → 65 µs |
+| Lane-parallel `read_special` / `read_param` (`%tid` stepped, not divided; one masked write) | alu.rs, support.rs | `read_special/iters256` | 66.2 → 17.5 ms |
+| `tcgen_ld` register-major writes from the run images, with run offsets cached per map; chosen by data shape only | tcgen.rs | `tcgen_ld/x64_iters64` | 16.8 → 4.15 ms |
+| Warp-uniform index fast path for register arrays | alu.rs | `reg_indexed/iters2048` | 12.0 → 4.74 ms |
+| Vector stores up to 32 bytes on the store fast path | mem.rs | `store_v4/iters2048` | 14.6 → 5.1 ms |
+| Resident-CTA count kept, not re-summed per admission | sched/mod.rs `turnover` | `corpus_numsim/rmsnorm` | 6.5% of rmsnorm removed |
+| `run_mma` span `coalesce`: unstable sort, plus a bitmap union when spans are dense | partition.rs | `corpus_numsim/deepgemm_sm100_fp8_gemm_1d1d` | `coalesce` 14.7% → 7.6% of 1d1d |
+| `subtract_spans` without quadratic splitting (union walk, empty-span cuts kept) | partition.rs | `observed_overhead/*/counting` | e24 observed, 1 worker: 9.0 → 2.3 s |
+| Process-wide MMA shared-A footprint cache (each miss ran two MMAs) | tcgen.rs | `observed_overhead/fp16_bf16_gemm/counting` | 91 → 73 ms |
+| In-place tcgen access items; event-buffer lane-span pool; sorted-input sort skip | tcgen.rs, partition.rs, support.rs | `observed_overhead/*/counting` | fp16_bf16_gemm 73 → 62.5 ms; e24 at 16 workers 845 → 606 ms |
+| Register files ≥ 128 KiB zeroed at the warp's first step, on the worker | interp/mod.rs, sched/mod.rs `admit` | `observed_overhead/mega_moe…/noop` | 652 → 379 ms at 16 workers; small files unchanged |
+| Unstable key sort in `emit_accesses`; event-buffer access counter | support.rs, partition.rs | `observed_overhead/fp16_bf16_gemm/counting` | ~1.5% |
+
+Observer-gated fast paths were made observer-independent, so each path is selected by data shape alone and emits the same events: `tcgen_ld` direct copy, `RunImages` under predicate capture, load/store fast paths under word history, `tcgen_st`. The audit table is in the W13 reports.
+
+**Rejected or deferred, measured.**
+- **Register-file pool across runs** (zero on reuse): 3–5% on rmsnorm for 64 MB held per process. Not landed.
+- **Deferring every register file to the first step:** e24 at 16 workers improved 1.4x, but `corpus_numsim/rmsnorm` went 0.66 → 3.37 ms and `admit_regs` 1.40 → 7.8 ms. Zeroing at admission gets fresh heap, so untouched pages are never faulted. Zeroing at first step interleaves with other allocations and becomes a full memset plus brk churn. Landed only for files of at least 128 KiB.
+- **Malloc churn:**
+  - sharing one `Arc<[BufBinding]>` across CTAs (3% of rmsnorm allocations): no measurable gain;
+  - `partitions.reserve` in `turnover`: no measurable gain.
+  Neither landed. Malloc is now 2–7% of a run.
+
+**What remains on the observed path** (e24, 16 workers):
+- `SyncEvent` clones into `EventBuffer` and their drop at replay: ~4.4%. Contract-bound: the observer receives an owned `SyncEvent`.
+- `merge_shard` and `shard_replay_order`: ~3%, on W5's replay/fork-join path.
+- `emit_accesses` copying lane spans into each `Access`: ~5%.
+
+Engine-side, mega_moe is bounded by MMA arithmetic (previous section) and by the full-register-file memcmp of `spin_hash` on poll-only loop ends. Removing that memcmp needs register-write tracking, which is a `value.rs` contract change.
