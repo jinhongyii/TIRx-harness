@@ -1371,43 +1371,57 @@ These are only out-of-scope or fail-closed-by-design rows:
 
 ---
 
-## Part F: Residuals (2026-10-08, after the tile forms)
+## Part F: Residuals (2026-10-08, after the tile forms and the data-path rules)
 
-Live tree (W12 sweep, `scripts/numsim-v2/lower_sweep.py` over the full
-capture set, `strict=False`; `program_builder.FORMAT_VERSION` 3):
+Live tree, measured by W12's sweep: `scripts/numsim-v2/lower_sweep.py` over the full
+capture set, `strict=False`, `program_builder.FORMAT_VERSION` 3.
 
 | scope | result |
 | --- | --- |
 | captured kernels | 2343 (2341 loadable; 2 need test-only node types, as in C.1) |
-| lower with no `Unsupported` | **2250** (E.2: 2196; before the tile forms: 2217) |
+| lower with no `Unsupported` | **2230** |
 | lowering exceptions | 0 |
 | Rust decode + `validate()` (`validate.sh`) | 2341/2341 loadable kernels |
 
-The 91 loadable kernels that still carry an `Unsupported` are listed below.
-Each has an owner ruling, and none is a finding (a kernel legacy compiled
-without a ruling). The "legacy" column comes from running legacy
-`numsim.transpile` on the same capture.
+The clean count fell from 2250 to 2230. All 20 kernels that became non-clean
+are marked **(new)** in the table, and each is a deliberate fail-closed rule:
+
+- **W12 data-path rules (8 kernels).** Every one is a negative test that legacy rejected too:
+  - 4 f8f6f4 `cta_group::2` MMAs without an exact `tirx.cuda_arch`;
+  - 3 packed-bool `cuda.ldg`;
+  - 1 vector `bitwise_not` (delta D11).
+- **W1 fail-closed rules (12 kernels):** launch-topology conflicts (5), loop
+  kinds and annotations (2), `spdecompress` register overlap (5).
+  - 3 of the `spdecompress` kernels are negative tests that legacy also rejects.
+  - 2 are **findings**: `test_ptx_spdecompress_matches_low_bit_first_sparse_scatter`
+    and `test_ptx_spdecompress_executes_the_128_register_output_boundary`.
+    Legacy compiled both, and v2 now stops with "cannot prove disjoint
+    physical registers (data has a dynamic index)". No delta row covers this
+    yet; owner W1.
+
+All 111 non-clean kernels:
 
 - **Legacy compiled, v2 fails closed by ruling (43):**
-  - L1 replicated TMEM view (13; 3 of them also hit L5 in their `gemm_async`);
+  - L1 replicated TMEM view (13; 3 of them also hit L5);
   - L2 `ptx_legacy.*` (9);
-  - L4 tcgen05.mma shape that is invalid on hardware (14; L4's text says 13, and the 14th is `dense_fp8_gemm_async_cta1`, `kind::f8f6f4`, same rule);
+  - L4 tcgen05.mma shape invalid on hardware (14, all kinds);
   - L6 TMA innermost box under 16 B (6);
   - L7 TMA into a padded shared slice (1).
-- **Both reject (48):**
-  - L3 negative tile-form tests (11: 8 `UnsupportedTIRxError` and 3 `UnmodeledTIRxFormError` in legacy);
-  - other negative fail-closed tests that legacy rejects too (37: 34 `UnsupportedTIRxError` and 3 `UnmodeledTIRxFormError`). Three of these are tile ops TVM *would* dispatch: `float64_directed_rounding_is_unsupported`, `tile_unary_unknown_config` and `_warp_gemm_wrong_a_fragment_layout`. v2 keeps legacy's fail-closed rule for them (`tile_checks.py`).
-- **Open V2C-TF1 (legacy compiled, tile form not yet ported): none.** Of
-  W1's 28 `gemm_async`/`copy_async` kernels, the hint repairs lower 8. Every
-  other one is an L4/L5/L6/L7 ruling or a negative test. W12's 30 kernels
-  lower except `fp8_scale_permute_tmem_roundtrip` (L1).
+- **Both reject (66):**
+  - L3 negative tile-form tests (11);
+  - other negative fail-closed tests (55: 49 `UnsupportedTIRxError` and 6 `UnmodeledTIRxFormError` in legacy). This includes the three tile ops whose legacy fail-closed rules v2 keeps in `tile_checks.py`.
+- **Findings (2):** the two `spdecompress` kernels above.
+- **Open V2C-TF1 (legacy compiled, tile form not yet ported):** none.
 
 "Ruling" values: `Lx` = row of `numsim-behaviour-deltas.md` "Lowering
 fail-closed forms"; "legacy also rejects (E)" = a negative test whose legacy
-`transpile` raises E.
+`transpile` raises E (from running legacy `numsim.transpile` on the same
+capture).
 
 | capture | kernel | test (first capturing node) | v2 reason (first) | class | ruling |
 | --- | --- | --- | --- | --- | --- |
+| `94b33d54` **(new)** | `kernel` | `test_ptx_spdecompress_executes_the_128_register_output_boundary` | tirx.ptx.spdecompress: cannot prove disjoint physical registers (data has a dynamic index) | spdecompress register-overlap proof (W1 rule); legacy compiled: NO RULING | FINDING (W1) |
+| `8a016e69` **(new)** | `ptx_spdecompress_b8_b4_2_4_x2` | `test_ptx_spdecompress_matches_low_bit_first_sparse_scatter` | tirx.ptx.spdecompress: cannot prove disjoint physical registers (data has a dynamic index) | spdecompress register-overlap proof (W1 rule); legacy compiled: NO RULING | FINDING (W1) |
 | `6c673522` | `_block_scaled_fp8_dynamic_shared_stage` | `test_fp8_snapshot_gather_honors_a_dynamic_shared_stage` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view | L1 |
 | `ce2d8cb9` | `_block_scaled_nvfp4_gemm_cta_group2_pair23` | `test_cta_group2_uses_the_issuing_ctas_pair_2_and_3` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view | L1 |
 | `3f0bffe8` | `_block_scaled_runtime_instruction_descriptor` | `test_block_scaled_desc_i_rejects_static_abi_mismatch_at_runtime` | tmem_replicated_view: scale_a_tmem | direct access to a replicated TMEM view | L1 |
@@ -1462,9 +1476,12 @@ fail-closed forms"; "legacy also rejects (E)" = a negative test whose legacy
 | `810f07d0` | `kernel` | `test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair[min-bfloat16]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA innermost box under 16 B | L6 |
 | `e43b7b8c` | `kernel` | `test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair[add-float16]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA innermost box under 16 B | L6 |
 | `8960cb4a` | `tma_padded_narrow_rows` | `test_checkers_reject_a_misaligned_tma_shared_component[racecheck]` | tile op tirx.tile.copy_async: v2 tile form 'copy_async' not ported yet (TVM rejects) | TMA into a padded shared slice | L7 |
+| `5edfa1ff` **(new)** | `call_location_probe` | `test_unmodeled_form_is_also_located` | cuda.ldg has no __ldg overload for 'boolx2' | negative test of a fail-closed form | legacy also rejects (UnmodeledTIRxFormError) |
 | `c41fc9ba` | `float64_directed_rounding_is_unsupported` | `test_float64_directed_rounding_fails_closed` | tile op tirx.tile.add: TilePrimitiveCall(add): directed float64 rounding is not implemented | negative test; legacy fail-closed rule kept in v2 `tile_checks` (TVM would dispatch) | legacy also rejects (UnmodeledTIRxFormError) |
 | `c24dc32f` | `fp8_identity_reinterpret_roundtrip` | `test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip[float8_e8m0fn` | tirx.reinterpret: raw payload reinterpret is not modeled for scalar low-precision/storage-only dtype | negative test of a fail-closed form | legacy also rejects (UnmodeledTIRxFormError) |
 | `ec7bbd85` | `fp8_identity_reinterpret_roundtrip` | `test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip[float8_e4m3fn` | tirx.reinterpret: raw payload reinterpret is not modeled for scalar low-precision/storage-only dtype | negative test of a fail-closed form | legacy also rejects (UnmodeledTIRxFormError) |
+| `f8792977` **(new)** | `raw_tcgen_mma_f8f6f4_cta_group2_invalid_n` | `test_raw_tcgen_dense_mma_gate_names_the_exact_legal_set[f8f6f4_cta2_invalid_n]` | tirx.ptx.tcgen05_mma_ss: kind::f8f6f4 cta_group::2 requires tirx.cuda_arch in ['sm_100a', 'sm_100f', | negative test of a fail-closed form | legacy also rejects (UnmodeledTIRxFormError) |
+| `5f045443` **(new)** | `raw_tcgen_mma_f8f6f4_cta_group2_reserved_destination` | `test_raw_tcgen_dense_mma_gate_names_the_exact_legal_set[f8f6f4_cta2_f16]` | tirx.ptx.tcgen05_mma_ss: kind::f8f6f4 cta_group::2 requires tirx.cuda_arch in ['sm_100a', 'sm_100f', | negative test of a fail-closed form | legacy also rejects (UnmodeledTIRxFormError) |
 | `1fa183ad` | `?` | `test_cuda_atomic_cas_classifier_rejects_non128_or_non_byte_addressable_vectors[b` | dtype 'boolx128' has no numsim_core::Ty | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `38b6aa34` | `?` | `test_ordinary_handle_address_is_not_classified_as_a_tensor_map` | address of variable descriptor_like_name | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `43d04f19` | `?` | `test_async_group_wait_count_rejects_negative_values[cp.async.wait_group]` | tirx.ptx.cp_async_wait_group: wait_group count -1 out of range | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
@@ -1476,11 +1493,20 @@ fail-closed forms"; "legacy also rejects (E)" = a negative test whose legacy
 | `e7a93836` | `?` | `test_async_group_wait_count_rejects_runtime_values` | tirx.ptx.cp_async_wait_group: group must be a constant | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `f7ee9326` | `?` | `test_pure_call_form_strings_must_be_compile_time_static[form0]` | cta_reduce op None | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `cd42c619` | `_warp_gemm_wrong_a_fragment_layout` | `test_warp_gemm_rejects_layout_that_disagrees_with_instruction_abi` | tile op tirx.tile.gemm: TilePrimitiveCall(gemm): no mma.sync.m16n8k{16,8} instruction matches M=16,  | negative test; legacy fail-closed rule kept in v2 `tile_checks` (TVM would dispatch) | legacy also rejects (UnsupportedTIRxError) |
+| `385379c9` **(new)** | `conflicting_cluster_extents` | `test_conflicting_or_invalid_topology_constraints_fail_closed[conflicting_cluster` | topology: kernel>cta extent 6 disagrees with 2 clusters of 2 CTAs | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `034b9849` **(new)** | `conflicting_direct_and_warpgroup_extents` | `test_conflicting_or_invalid_topology_constraints_fail_closed[conflicting_direct_` | topology: cta>warp extent 4 disagrees with 2 warpgroups | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `8778d53a` **(new)** | `conflicting_repeated_warp_extents` | `test_conflicting_or_invalid_topology_constraints_fail_closed[conflicting_repeate` | topology: conflicting cta>warp extents 2 and 3 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `0c602e5a` **(new)** | `cuda_ldg_bool_x2_to_bool_x2` | `test_cuda_ldg_packed_bool_buffer_is_rejected_before_instruction_emission[boolx2]` | cuda.ldg has no __ldg overload for 'boolx2' | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `e68490ff` **(new)** | `cuda_ldg_bool_x4_to_bool_x4` | `test_cuda_ldg_packed_bool_buffer_is_rejected_before_instruction_emission[boolx4]` | cuda.ldg has no __ldg overload for 'boolx4' | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `47e2290c` | `flashkda_rsqrtf_wrong_dtype` | `test_flashkda_math_helper_dtype_mismatch_fails_closed` | tirx.cuda.func_call helper 'flashkda_rsqrtf' requires ['float32'] -> float32 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `e07d5f51` | `host_encoded_unregistered_integer_tensor_map` | `test_host_tensor_map_integer_expressions_fail_closed_on_unregistered_nodes` | unsupported integer operation BitwiseAnd in a host extent expression (no DimExpr) | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `a94a1ef2` | `invalid` | `test_bulk_wait_group_rejects_runtime_count_during_numsim_transpilation` | tirx.ptx.cp_async_bulk_wait_group: group must be a constant | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `6adc14ce` | `invalid_vector_shuffle_extract` | `test_vector_shuffle_classifier_and_frontend_reject_out_of_range_extract` | Shuffle index outside the concatenated lanes | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `447efa07` **(new)** | `invalid_warpgroup_thread_extent` | `test_conflicting_or_invalid_topology_constraints_fail_closed[invalid_warpgroup_t` | topology: warpgroup>thread extent 96 != 128 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `2dcb2b0b` **(new)** | `invalid_warpgroup_warp_extent` | `test_conflicting_or_invalid_topology_constraints_fail_closed[invalid_warpgroup_w` | topology: warpgroup>warp extent 3 != 4 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `0f67083b` | `kernel` | `test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs[min-float32-invalid ` | cp.reduce.async.bulk.tensor operation .min is invalid for TensorMap dtype F32 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `6605934c` **(new)** | `kernel` | `test_spdecompress_rejects_statically_visible_register_overlap` | tirx.ptx.spdecompress: undefined register overlap: mdata and data name the same physical register (a | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `7fbfc324` **(new)** | `kernel` | `test_vector_bitwise_nodes_are_rejected[bitwise_not]` | bitwise_not on vector operand int32x2 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `8f859059` | `kernel` | `test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs[inc-int32-invalid fo` | cp.reduce.async.bulk.tensor operation .inc is invalid for TensorMap dtype S32 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `90d84e56` | `kernel` | `test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs[add-float64-invalid ` | cp.reduce.async.bulk.tensor operation .add is invalid for TensorMap dtype F64 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `aa0c2443` | `kernel` | `test_registry_rejects_wrong_arity_or_dtype[handle-tirx.reinterpret-arguments3]` | tirx.reinterpret: source and result must have identical bit widths | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
@@ -1495,7 +1521,105 @@ fail-closed forms"; "legacy also rejects (E)" = a negative test whose legacy
 | `41bb86ad` | `opaque_statement_helper` | `test_opaque_or_spoofed_cuda_helpers_are_rejected[opaque_statement_helper]` | cuda.func_call of unreviewed or effectful helper 'tvm_builtin_tcgen05_mma_mxf4_block32_ss' | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `ffd3c5a0` | `opaque_value_helper` | `test_opaque_or_spoofed_cuda_helpers_are_rejected[opaque_value_helper]` | cuda.func_call of unreviewed or effectful helper 'opaque_fdividef' | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `369bfe5c` | `parallel_loop` | `test_non_serial_loop_semantics_are_not_silently_sequentialized[parallel_loop-PAR` | for-loop kind 1 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `225c3f85` **(new)** | `raw_tcgen_mma_f8f6f4_cta2_k32_without_arch` | `test_raw_tcgen_f8f6f4_cta2_requires_exact_kernel_architecture[missing]` | tirx.ptx.tcgen05_mma_ss: kind::f8f6f4 cta_group::2 requires tirx.cuda_arch in ['sm_100a', 'sm_100f', | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `fbeeca05` **(new)** | `raw_tcgen_mma_f8f6f4_cta2_k32_without_arch` | `test_raw_tcgen_f8f6f4_cta2_requires_exact_kernel_architecture[unknown]` | tirx.ptx.tcgen05_mma_ss: kind::f8f6f4 cta_group::2 requires tirx.cuda_arch in ['sm_100a', 'sm_100f', | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `893f646a` **(new)** | `spdecompress_aliased_register_views` | `test_spdecompress_rejects_same_physical_register_through_alias_views` | tirx.ptx.spdecompress: undefined register overlap: mdata and data name the same physical register (a | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `7a6627bf` **(new)** | `spdecompress_dynamic_register_index` | `test_spdecompress_rejects_unknown_dynamic_register_overlap` | tirx.ptx.spdecompress: cannot prove disjoint physical registers (data has a dynamic index) | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `208ad05e` | `thread_bound_loop` | `test_non_serial_loop_semantics_are_not_silently_sequentialized[thread_bound_loop` | for-loop kind 4 | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `3bb8d714` | `tile_unary_unknown_config` | `test_unary_tile_ops_fail_closed_on_unknown_config` | tile op tirx.tile.exp: TilePrimitiveCall(exp): unsupported config keys ['undocumented_mode'] | negative test; legacy fail-closed rule kept in v2 `tile_checks` (TVM would dispatch) | legacy also rejects (UnsupportedTIRxError) |
 | `e55f4a71` | `unknown_attr` | `test_unknown_attr_semantics_fail_closed` | attribute 'numsim.unknown_control' | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `ec720e80` **(new)** | `unknown_loop_annotation` | `test_unknown_loop_annotations_fail_closed` | for-loop annotations ['numsim.unknown_loop'] have no modeled semantics | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
 | `fdb571e7` | `unsupported_local_layout` | `test_frontend_finding_points_at_the_offending_node[racecheck-rebuilt-root]` | host statements after tirx.device_entry | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+| `12b906ce` **(new)** | `vectorized_loop` | `test_non_serial_loop_semantics_are_not_silently_sequentialized[vectorized_loop-V` | for-loop kind VECTORIZED written in the kernel source | negative test of a fail-closed form | legacy also rejects (UnsupportedTIRxError) |
+
+---
+
+## Part G: Tile forms (W12, 2026-10-08)
+
+Amended Decision 6: TVM's `TilePrimitiveDispatch` defines a tile op's
+semantics. Where TVM registers no form for a call, v2 runs legacy's form,
+ported onto ordinary Program ops in `v2/lowering/tile_forms/`. That package has one module
+per family: `copy` (copy / cast / add), `fill`, `permute`, `reduce`, plus W1's
+`gemm` and `copy_async`.
+
+### G.1 Dispatch order (`ir_walk.dispatch_tile_primitives`)
+
+1. **Marking.** Every tile call is wrapped in `AttrStmt("numsim.tile_op")`,
+   which keeps the call's span. TVM keeps the marker around the code it
+   generates. The walker uses it to anchor checks raised inside the op, such
+   as the register-ownership `Assert`, at the tile call (W11-5).
+2. **TVM dispatch.** The whole function goes through `TilePrimitiveDispatch`.
+3. **Repair.** When TVM rejects an op, the family's `repair` tries the same
+   call as TVM accepts it:
+   - drop a `dispatch=` hint, which never selected semantics in legacy (`copy`, `cast`, `add`, `sum`/`max`/`min`);
+   - for `fill`, type an untyped Python literal to the destination dtype;
+   - for `copy_async`, map legacy variant names (W1).
+4. **Probe and swap.** Calls TVM still rejects are probed one at a time. Each
+   rejected call becomes a placeholder `Evaluate(call_extern(numsim_v2_tile_form, key))`,
+   so TVM still lowers the rest of the function.
+5. **Family port.** The walker lowers each placeholder with `tile_forms.lower`.
+   A form the port does not model raises `Unsupported` with TVM's reason
+   appended.
+6. **Fallback reroute** (delta F4). `copy.fallback_watch` records the calls
+   TVM lowered with `copy/fallback`, which runs the whole copy in one thread.
+   Calls with a register (`local`) operand (`copy.reroute`) are swapped out to
+   the copy port, and dispatch is retried. A single-thread copy of registers
+   is not a copy: the thread would read other threads' registers, or copy
+   only its own. The guard test
+   `tile_forms/test_tile_form_ports.py::test_fallback_watch_is_hooked_into_tvm_dispatch`
+   fails if TVM renames the variant table.
+
+### G.2 Element ownership (legacy `scope_lanes` / `execute_typed_copy`)
+
+- **Region operand.** A region is a buffer, its minima and static extents.
+  Minima that are not literals are evaluated once, before the op.
+- **Executing thread for a logical element:**
+  - a register *fragment* operand (a local whose layout maps to thread axes)
+    is executed by the element's owner thread in that layout;
+  - otherwise, a thread-private local destination is executed by every
+    active thread;
+  - otherwise (memory operands) by thread `linear % threads(scope)` of the
+    scope (warp 32, warpgroup 128, CTA `warps_per_cta * 32`). At `thread`
+    scope every active thread executes.
+- **Fragments with different owners** move values between threads (owner
+  transport): sync, the source owners stage the values in a shared scratch,
+  sync, the destination owners read them, sync.
+- **Participation.** `warp` and `warpgroup` ops start with a full-mask
+  `vote.sync.all`. A partial warp raises `warp_collective_divergence` (legacy
+  #594, delta F3). A `warpgroup` op adds no four-warp rendezvous.
+
+### G.3 Synchronisation patterns
+
+- **Snapshot copy and `permute_layout`** (both operands memory, or both local):
+  participate, owners read into per-thread registers, scope sync, owners
+  write, scope sync. Scope sync is `bar.warp.sync` (warp), `bar.sync 8, 128`
+  (warpgroup), or `bar.sync 0` (CTA).
+- **Register fragment <-> memory copy:** each owner moves its own elements,
+  with no snapshot and no sync (legacy `NoSnapshotSync`).
+- **Element-wise ops** (`fill`, `cast`, `add`): storage is all local or all
+  shared. A shared op ends with a scope sync.
+- **Reductions over shared regions:** each output is computed by its owner as
+  a sequential reduction in index order. The seed is the identity, or the
+  destination when `accum`. Each step is rounded to the dtype. The op ends
+  with a scope sync.
+- **Uninitialized source bytes** read as 0 and are reported as
+  `uninitialized_read` (delta F1; legacy's `permute_layout` zero-fill
+  reported nothing).
+
+### G.4 Tests and deltas
+
+- Program contents: `tests/numsim/v2/tile_forms/test_tile_form_ports.py`.
+  It covers the snapshot order and syncs, the shared reduction with its
+  identity and completion barrier, partial-lane participation, the repairs,
+  the once-evaluated minima, the register-check anchoring, the fallback
+  reroute and its guard, and owner transport.
+- Every legacy-compiled kernel lowers:
+  `tests/numsim/v2/tile_forms/test_legacy_compiled_tile_forms.py` over
+  `legacy_compiled.tsv` and the captures. `fp8_scale_permute_tmem_roundtrip`
+  is a strict xfail under L1.
+- Public tests under `NUMSIM_IMPL=v2`: `test_copy_dispatch_contract.py`,
+  `test_tile_codegen.py`, `test_tile_unary_codegen.py`,
+  `test_permute_layout_artifact.py`, `test_tile_reduction_variants.py`,
+  `test_tile_dispatch_invariance.py`, `test_reported_layout_regressions.py`,
+  and the v2 ports `test_w11_registry.py` and `test_p6d_copy_dispatch_contract.py`.
+- Deltas: numsim-behaviour-deltas F1–F5 and racecheck-behaviour-deltas T21.
