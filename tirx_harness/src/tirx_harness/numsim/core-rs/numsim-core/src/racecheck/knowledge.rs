@@ -105,7 +105,12 @@ pub fn select_view(prior: Proxy, cur: Proxy, d: Option<Domain>) -> View {
     match (prior, cur) {
         (Proxy::Tcgen, Proxy::Tcgen) => View::Tcgen,
         (Proxy::Generic, Proxy::TensorMap) => View::G2t,
-        (Proxy::TensorMap, Proxy::Generic) => d.map_or(View::Hb, |d| View::A2g(d as usize)),
+        // A descriptor read (TMA issue) before a later generic write of the
+        // descriptor: the ISA defines only the generic->tensormap direction
+        // (fence.proxy.tensormap::generic release/acquire); the read is
+        // ordered by hb (program order, or the TMA's observed completion)
+        // like legacy (deltas I9).
+        (Proxy::TensorMap, Proxy::Generic) => View::Hb,
         (Proxy::Generic, Proxy::Async) => d.map_or(View::Hb, |d| View::G2a(d as usize)),
         (Proxy::Async, Proxy::Generic) => d.map_or(View::Hb, |d| View::A2g(d as usize)),
         _ => View::Hb,

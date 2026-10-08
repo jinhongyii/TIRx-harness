@@ -374,9 +374,10 @@ struct AsyncActor {
     footprint: Vec<(AllocId, Range<u64>)>,
     /// Highest milestone reached (0 none, 1 read, 2 write/full).
     done: u8,
-    /// A bulk copy still in flight when its CTA's shared memory ended
-    /// (implicit CTA exit): drained by the hardware (deltas S7). Its
-    /// accesses stay unordered with everything after them.
+    /// No further completion is expected: a bulk copy still in flight when
+    /// its CTA's shared memory ended (implicit CTA exit, deltas S7), or an
+    /// mbarrier-less st.async / red.async `.release` that landed at issue
+    /// (T13). Its accesses stay unordered with everything after them.
     drained: bool,
 }
 
@@ -524,6 +525,9 @@ pub struct Checker {
     /// `alias_stale_read` (legacy alias tracker): per allocation, the last
     /// named warp-lane writer of every byte, keyed by segment start.
     alias_writers: HashMap<AllocId, std::collections::BTreeMap<u64, AliasSeg>>,
+    /// The tensormap view of the current warp-lane `Proxy::TensorMap`
+    /// access (set per access).
+    lane_g2t: Option<Clock>,
     /// One advisory per (alloc, reader name, writer name, reader warp/site,
     /// writer warp/site), as legacy keyed them.
     alias_dedup: HashMap<(AllocId, Arc<str>, Arc<str>, WarpId, SiteId, WarpId, SiteId), usize>,
@@ -544,6 +548,10 @@ pub struct Checker {
     pub mbarrier_scope_assumed: bool,
     dropped_findings: u64,
     since_gc: u64,
+    /// Accesses between collections: `gc_every`, raised to twice the live
+    /// shadow cells after each collection so a pass (linear in the cells)
+    /// stays amortised O(1) per access while memory stays within 2x live.
+    gc_period: u64,
     pub stats: Stats,
 }
 
@@ -624,6 +632,7 @@ impl Checker {
             poll_stash: HashMap::new(),
             advisory_dedup: HashMap::new(),
             alias_writers: HashMap::new(),
+            lane_g2t: None,
             alias_dedup: HashMap::new(),
             site_buffer: HashMap::new(),
             wide: WideSpans::default(),
@@ -634,6 +643,7 @@ impl Checker {
             mbarrier_scope_assumed: false,
             dropped_findings: 0,
             since_gc: 0,
+            gc_period: 0,
             stats: Stats::default(),
         }
     }
@@ -781,14 +791,14 @@ impl Checker {
 
     /// A natural pause (inbox drain): collect if a quarter period elapsed.
     pub fn safe_point(&mut self) {
-        if self.gc_every != 0 && self.since_gc >= self.gc_every / 4 {
+        if self.gc_every != 0 && self.since_gc >= self.gc_every.max(self.gc_period) / 4 {
             self.gc();
         }
     }
 
     fn maybe_gc(&mut self) {
         self.since_gc += 1;
-        if self.gc_every != 0 && self.since_gc >= self.gc_every {
+        if self.gc_every != 0 && self.since_gc >= self.gc_every.max(self.gc_period) {
             self.gc();
         }
     }
@@ -831,7 +841,14 @@ impl Checker {
     /// Is `prior` ordered before an access by `cur` in proxy `cur_proxy`?
     #[inline]
     fn ordered(&self, cur: Cur, prior: &Witness, cur_proxy: Proxy) -> bool {
-        let view = select_view(prior.proxy(), cur_proxy, prior.domain());
+        let mut view = select_view(prior.proxy(), cur_proxy, prior.domain());
+        // W2-19 (deltas T14): a warp-lane `Proxy::Tcgen` witness is a
+        // buffer-form TMEM access, synchronous in its thread (completed at
+        // the instruction, like a waited tcgen05.ld/st): hb orders it, not
+        // the tcgen pipeline view.
+        if view == View::Tcgen && prior.stamp.actor() < self.topo.num_warps() {
+            view = View::Hb;
+        }
         match cur {
             Cur::Lane { w, lane, epoch } => {
                 let warp = &self.warps[w];
@@ -852,6 +869,10 @@ impl Checker {
                 }
                 if view == View::Tcgen {
                     return warp.tcgen[lane as usize].observes(prior.stamp, prior.lane());
+                }
+                if view == View::G2t {
+                    // A lane's descriptor read: only its acquired ranges.
+                    return self.lane_g2t.as_ref().is_some_and(|v| v.observes(prior.stamp, prior.lane()));
                 }
                 warp.knows(lane, view, prior.stamp, prior.lane())
             }
@@ -1157,10 +1178,17 @@ impl Checker {
             self.push_finding(f);
             return;
         }
-        if let (Cur::Async { a: i }, Proxy::TensorMap) = (cur, a.proxy) {
+        self.lane_g2t = None;
+        if a.proxy == Proxy::TensorMap {
+            // The acquired tensormap ranges of the reader: an async op's
+            // (inherited at issue) or, for a descriptor read the engine
+            // emits at TMA issue as a warp-lane access, the lane's own.
+            let ranges = match cur {
+                Cur::Async { a: i } => self.asyncs[i].g2t_ranges.clone(),
+                Cur::Lane { w, lane, .. } => self.warps[w].g2t_ranges[lane as usize].clone(),
+            };
             // Split at acquired-range boundaries so each piece has one view.
-            let mut cuts: Vec<u64> = self.asyncs[i]
-                .g2t_ranges
+            let mut cuts: Vec<u64> = ranges
                 .iter()
                 .filter(|(al, _, _)| *al == a.alloc)
                 .flat_map(|(_, r, _)| [r.start, r.end])
@@ -1181,12 +1209,15 @@ impl Checker {
             }
             // The tensormap view for exactly these descriptor bytes.
             let mut v = Clock::default();
-            for (al, r, k) in self.asyncs[i].g2t_ranges.iter() {
+            for (al, r, k) in ranges.iter() {
                 if *al == a.alloc && r.start < a.range.end && a.range.start < r.end {
                     v.join(k, &self.memo);
                 }
             }
-            self.asyncs[i].k.g2t = v;
+            match cur {
+                Cur::Async { a: i } => self.asyncs[i].k.g2t = v,
+                Cur::Lane { .. } => self.lane_g2t = Some(v),
+            }
         }
         let w = Witness::pack(stamp, lane, a.proxy, domain, a.kind, a.scope, a.atomic, (a.range.start, a.range.end), &mut self.wide);
         let writes = w.writes();
@@ -1210,6 +1241,13 @@ impl Checker {
             // strong release at `.scope`, performed in the generic proxy):
             // releases what the issuing thread knew at issue.
             (Cur::Async { a: i }, true) if strong && matches!(a.order, MemOrder::Release | MemOrder::AcqRel) => {
+                // W2-20 (1): the mbarrier-less form has no completion event;
+                // the write lands at issue (generic proxy), so the op is
+                // complete there: neither never-completed nor a lifetime
+                // finding (deltas T13).
+                if a.proxy == Proxy::Generic {
+                    self.asyncs[i].drained = true;
+                }
                 let act = &self.asyncs[i];
                 Some(Arc::new(Rel { k: act.k.propagating(), scope: a.scope, warp: act.warp, site: act.site }))
             }
@@ -1837,6 +1875,25 @@ impl Checker {
             }
             pred_idx.push((pi, pa.gen_base));
         }
+        if kind == AsyncKind::TcgenCommit {
+            // PTX: the commit tracks ALL prior async tcgen05 ops of the
+            // thread. The engine names only those still in flight; an op
+            // whose completion was already delivered (through another
+            // commit's mbarrier the issuer never waited on) is complete
+            // before this commit is issued, so this commit's arrival
+            // implies it too (deltas T15).
+            for (si, sa) in self.asyncs.iter().enumerate() {
+                if sa.in_use
+                    && sa.done >= 2
+                    && sa.kind == AsyncKind::TcgenPipelined
+                    && sa.warp == warp
+                    && lanes.has(sa.lane)
+                    && !pred_idx.iter().any(|(p, _)| *p == si)
+                {
+                    pred_idx.push((si, sa.gen_base));
+                }
+            }
+        }
         let lane = lanes.lanes8().next().unwrap_or(0);
         let nw = self.topo.num_warps();
         let idx = match self.free_slots.pop() {
@@ -2326,6 +2383,8 @@ impl Checker {
                 e.info.span = e.lo..e.hi;
             }
         }
+        let cells: u64 = allocs.values().map(|a| a.shadow.len() as u64).sum();
+        self.gc_period = 2 * cells;
         self.allocs = allocs;
         self.stats.witnesses_retired += retired;
         // Declared-word history: a release whose payload every live actor

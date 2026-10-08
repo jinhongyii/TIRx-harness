@@ -328,3 +328,26 @@ fn unwaited_tcgen_ld_is_not_incomplete() {
     let r = k.run();
     assert!(!r.findings.is_empty(), "{r:?}");
 }
+
+/// T15 (vsa_multishape): a later commit implies every prior tcgen05 op of
+/// the thread, including one already completed through an earlier commit
+/// the issuer never waited on (the engine omits it from `preds`).
+#[test]
+fn later_commit_implies_already_completed_mma() {
+    let run = |second_commit: bool| {
+        let mut k = K::new(2, 1, 1);
+        let mma = k.issue(0, 0, AsyncKind::TcgenPipelined, Proxy::Async, &[], &[(SMEM, 0..64)]);
+        k.aacc(mma, Milestone::Read, AccessKind::Read, Proxy::Async, SMEM, 0..64);
+        let c1 = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[mma], &[]);
+        k.done_phase(c1, Milestone::Write, 1, 0);
+        if second_commit {
+            let c2 = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[], &[]);
+            k.done_phase(c2, Milestone::Write, 2, 0);
+        }
+        k.wait(1, 1, 2, 0, true);
+        k.fence(1, 1, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+        k.st(1, 0, SMEM, 0..4);
+        k.run()
+    };
+    assert!(clean(&run(true)), "{:?}", run(true));
+}

@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 numsim-core = { path = "../numsim-core" }
+serde_json.workspace = true
 
 [dev-dependencies]
 criterion = { version = "=0.5.1", default-features = false }

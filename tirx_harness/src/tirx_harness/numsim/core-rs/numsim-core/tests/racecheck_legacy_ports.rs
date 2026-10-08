@@ -2501,3 +2501,23 @@ fn g6_wait_on_a_word_that_carries_its_own_payload_is_clean() {
     let r = k.run();
     assert!(clean(&r) && r.findings.is_empty(), "{:?} {:?}", r.findings, r.incomplete);
 }
+
+/// W2-20 (1), deltas T13: the engine emits the mbarrier-less form with no
+/// completion event; it is complete at issue (not `AsyncNeverCompleted`),
+/// and still publishes only pre-issue work.
+#[test]
+fn g6_async_release_without_completion_event_is_complete() {
+    for reduction in [false, true] {
+        let mut k = K::new(2, 1, 1);
+        k.declare(GMEM2, 0..4);
+        k.st(0, 0, GMEM, 0..4);
+        let op = k.issue(0, 0, AsyncKind::Copy, Proxy::Generic, &[], &[(GMEM2, 0..4)]);
+        let kind = if reduction { AccessKind::Rmw } else { AccessKind::Write };
+        g6_acc(&mut k, op, Milestone::Write, kind, Sem::Release, Scope::Gpu, Proxy::Generic, GMEM2, Space::Global, Some(Window::Global), &[(0, 0..4)]);
+        k.a(1, 0, ld(MemOrder::Acquire, Scope::Gpu), GMEM2, 0..4).wait_until(1, 0, GMEM2, 0..4, Scope::Gpu, 0b10, 1);
+        k.ld(1, 0, GMEM, 0..4);
+        k.alloc_end(GMEM2);
+        let r = k.run();
+        assert!(r.findings.is_empty() && r.incomplete.is_empty(), "red={reduction}: {r:?}");
+    }
+}

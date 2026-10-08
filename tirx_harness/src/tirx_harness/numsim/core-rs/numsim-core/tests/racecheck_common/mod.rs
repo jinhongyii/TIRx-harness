@@ -233,6 +233,16 @@ impl K {
         self
     }
 
+    /// A TMA's descriptor read as the engine emits it: a warp-lane read
+    /// through `Proxy::TensorMap` at issue.
+    pub fn tmap_read(&mut self, w: WarpId, lane: u8, alloc: AllocId, r: Range<u64>) -> &mut Self {
+        self.inst_in(w, &[lane], PLAIN_LD, Some(Domain::Global), |_| (alloc, r.clone()));
+        if let Some(Ev::Access { proxy, .. }) = self.ev.last_mut() {
+            *proxy = Proxy::TensorMap;
+        }
+        self
+    }
+
     pub fn a(&mut self, w: WarpId, lane: u8, op: Op, alloc: AllocId, r: Range<u64>) -> &mut Self {
         self.inst(w, &[lane], op, |_| (alloc, r.clone()))
     }

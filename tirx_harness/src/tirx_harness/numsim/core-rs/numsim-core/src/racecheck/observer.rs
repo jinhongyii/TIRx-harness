@@ -18,6 +18,7 @@
 //! pass.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::arena::{AllocId, ByteSpan, Space};
 use crate::observe::{
@@ -270,10 +271,28 @@ impl Observer for RaceObserver {
             }
             Actor::Async { op, side } => {
                 let subs = self.subops.get(&op);
-                for s in a.spans {
+                // One async op touches its footprint as many small spans
+                // (TMA swizzle fragments, MMA operand rows). Coalesce
+                // touching/overlapping byte ranges of one lane: the shadow
+                // is byte-exact, so the union is the same set of accesses.
+                // Only weak, non-atomic accesses: a strong or atomic span is
+                // one element whose exact extent decides moral strength.
+                let mut spans: Vec<(u8, Range<u64>)> = a.spans.iter().map(|s| (s.lane, span_range(s.span))).collect();
+                if spans.len() > 1 && scope.is_none() && !a.atomic {
+                    spans.sort_unstable_by_key(|(l, r)| (*l, r.start));
+                    let mut out: Vec<(u8, Range<u64>)> = Vec::with_capacity(spans.len());
+                    for (l, r) in spans {
+                        match out.last_mut() {
+                            Some((pl, pr)) if *pl == l && r.start <= pr.end => pr.end = pr.end.max(r.end),
+                            _ => out.push((l, r)),
+                        }
+                    }
+                    spans = out;
+                }
+                for (lane, range) in spans {
                     let id = match subs {
                         None => op,
-                        Some(subs) => match subs.iter().find(|(l, _)| *l == s.lane) {
+                        Some(subs) => match subs.iter().find(|(l, _)| *l == lane) {
                             Some((_, id)) => *id,
                             None => {
                                 // A multi-lane per-thread op whose span does
@@ -286,7 +305,7 @@ impl Observer for RaceObserver {
                         },
                     };
                     let mut x = base(ri::Who::Async { op: id, side });
-                    x.range = span_range(s.span);
+                    x.range = range;
                     c.access(&x);
                 }
             }
