@@ -306,6 +306,37 @@ Partly explained:
 
 Open: the remaining ~1.3–1.5x is an intra-run effect: it is absent across processes and independent of footprint. Hardware counters are unavailable on this host (`perf_event_paranoid=4`), so it is not attributed yet. Compact register storage stays a noted, unstarted lever (see "Interpreter hot paths"), not a fix for this inflation.
 
+**Spin-before-park in the worker pool: measured, not landed (below the 1.5x bar).**
+
+Prototype (private build of a6c5202, `sched/pool.rs` only; the tree is untouched):
+- Before parking on the condvar, a worker busy-polls a lock-free copy of the round generation for up to a fixed budget. The caller does the same for the round's end.
+- Variants: pure `spin_loop` for 500/1000/2000/5000 µs, or `yield_now` polling for 1000 µs.
+- Results do not depend on it: it only changes when a thread notices the next round.
+- A 1-worker run has no pool and never spins (e24 at 1 worker: 1.64 → 1.60 s).
+
+Measurements:
+- Wall and process CPU, min of 1–5 runs per variant, interleaved with the baseline.
+- Host load 6–20 (not near-idle), NoopObserver.
+- Medium = `mega_moe_t64_h2048_i1536_e96_k4_g1`.
+
+| Case | Workers | Baseline wall / CPU | Best spin variant wall / CPU | Wall gain |
+| --- | --- | --- | --- | --- |
+| mega_moe medium | 32 | 8.15 s / 103 s | yield 1 ms: 5.83 s / 140 s; spin 500 µs: 5.92 s / 113 s | 1.40x |
+| mega_moe medium | 16 | 7.12 s / 67 s | spin 2 ms: 7.24 s / 98 s | 1.0x |
+| mega_moe e24 | 32 | 0.364 s / 4.05 s | yield 1 ms: 0.288 s / 7.05 s | 1.26x |
+| mega_moe e24 | 16 | 0.364 s / 2.98 s | spin 500 µs: 0.359 s / 4.12 s | 1.0x |
+| recurrent_kda_decode_one_warp | 16 / 32 | 0.128 / 0.084 s | spin: 0.129 / 0.091 s; yield: 0.124 / 0.088 s | 1.0x (pure spin up to 8% slower) |
+| gdn_decode_bf16_wide_vec_mtp | 16 / 32 | 0.027 / 0.025 s | spin: 0.030 / 0.029 s; yield: 0.029 / 0.029 s | 0.9x |
+
+Conclusions:
+- Only 32-worker Mega MoE gains: up to 1.40x wall on medium.
+- With spinning, medium at 32 workers (5.8 s) beats the 16-worker baseline (7.1 s). Without it, 32 workers is slower than 16.
+- Every spin variant raises process CPU by 10–90%.
+- Pure spinning makes the small kernels 5–15% slower at 16 and 32 workers, likely by stealing SMT-sibling cycles; polling with `yield_now` keeps them neutral.
+- No criterion reaches 1.5x, so `pool.rs` stays as is.
+- The loaded-host check (another 16-worker job running alongside) was not run, because the change does not land.
+- **Lever, if 32-worker Mega MoE matters:** a per-round handoff that avoids the condvar park/wake. For example, workers that stay on a partition across rounds until the serial phase. That is a scheduler design question, not a spin budget.
+
 ## tcgen05.mma cost: arithmetic, not the callback boundary (2026-10-08)
 
 **Decision (coordinator): borrowed-view MMA I/O is not landed.** Rule: no optimization without a measured gain.
