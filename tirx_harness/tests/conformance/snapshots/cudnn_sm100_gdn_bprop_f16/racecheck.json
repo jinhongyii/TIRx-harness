@@ -14,9 +14,6 @@
       "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:541:1-541:55",
       "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:932:1-932:27"
      ],
-     "bytes": {
-      "tmem-columns": "512-768,1024-1536"
-     },
      "category": "findings",
      "kind": "tmem_lifetime_review",
      "ordering_domain": "completion",
@@ -30,9 +27,6 @@
       "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:541:1-541:55",
       "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:956:1-956:27"
      ],
-     "bytes": {
-      "tmem-columns": "1024-1536"
-     },
      "category": "findings",
      "kind": "tmem_lifetime_review",
      "ordering_domain": "completion",
@@ -46,9 +40,6 @@
       "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:574:1-574:55",
       "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:581:1-581:55"
      ],
-     "bytes": {
-      "tmem-columns": "1792-1920"
-     },
      "category": "findings",
      "kind": "tmem_lifetime_review",
      "ordering_domain": "completion",
@@ -70,5 +61,5 @@
    "verdict": "review"
   }
  ],
- "schema": 3
+ "schema": 4
 }

@@ -38,7 +38,7 @@ from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = 3  # 2: no allocation id for window spaces; 3: register reads projected to presence
+SCHEMA_VERSION = 4  # 2: no window alloc ids; 3: register reads -> presence; 4: tmem_lifetime_review -> kind + anchors
 MODES = ("numsim", "racecheck", "synccheck")
 SNAPSHOT_ROOT = Path(__file__).resolve().parent / "snapshots"
 IMPL_ENV = "NUMSIM_IMPL"
@@ -319,6 +319,11 @@ def normalize_records(
             if isinstance(value, (str, int, bool)) and not isinstance(value, float):
                 key_fields[field] = value
         key_fields["anchors"] = sorted(collect_anchors(record, resolver))
+        # Projection rule (README): which dynamic instance of a static
+        # (load site, store site) pair witnesses a TMEM lifetime conflict is
+        # schedule-dependent, so `tmem_lifetime_review` compares kind and
+        # anchors only (W5, CONTRACT_REQUESTS).
+        tmem_review = key_fields["kind"] == "tmem_lifetime_review"
         register_read = key_fields["kind"] == "uninitialized_read" and key_fields.get("space") == "register"
         if register_read:
             # Projection rule (README, coordinator ruling on V2C-20): register
@@ -327,7 +332,7 @@ def normalize_records(
             key_fields["anchors"] = []
         key = json.dumps(key_fields, sort_keys=True)
         group = groups.setdefault(key, {**key_fields, "_bytes": {}})
-        if register_read:
+        if register_read or tmem_review:
             continue
         columns = record.get("tmem_columns")
         # numsim-core states TMEM footprints as exact column ranges

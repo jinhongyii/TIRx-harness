@@ -389,13 +389,7 @@ def _patch_descriptor_pointers(module: CompiledModule, bound: dict[str, BoundInp
     addresses = native().plan_global_addresses(module.handle, natives, host_addrs=host_addresses(bound))
     for name, b in pending.items():
         if b.base not in addresses:
-            # The base array is not a kernel argument, and numsim-core only
-            # allocates arguments some parameter references
-            # (CONTRACT_REQUESTS W8-8).
-            raise NotImplementedError(
-                f"descriptor {name!r} is bound to a plain buffer parameter and addresses host array "
-                f"{b.base!r}, which is not a kernel argument; numsim-core cannot place it yet (W8-8)"
-            )
+            raise InputError(f"descriptor {name!r}: the engine placed no allocation for its base {b.base!r}")
         image = bytearray(b.native[1])
         image[0:8] = int(addresses[b.base] + b.patch_offset).to_bytes(8, "little")
         bound[name] = replace(b, native=("buffer", bytes(image), None))

@@ -2334,3 +2334,8 @@ reversal; W8-8 is resolved by d5b0f09.
   - It next stops at line 2191 with `bad_address`: global 0x1000000a9800, which is 2048 bytes past the end of `out` (planned at 0x100000099000, 65536 bytes).
   - The op is `st.global.u64` through `o_ptr.view("uint64")` of a bf16 global `decl_buffer(data=out.data, elem_offset=out_offset)`.
   - Likely view / element-offset scaling in lowering (W1, aed5b1b "C-style global view offsets"). Please triage.
+
+V2C-39 resolved (2026-10-08, at 72c7908): with the non-aligned partial-warp
+`barrier.sync` gather (e75fbb0, 5241a22), `sparse_flashmla_decode_head64`
+matches legacy in numsim, racecheck and synccheck. There was no delta
+snapshot for it to remove; sync-behaviour-deltas B1/B2 are updated.

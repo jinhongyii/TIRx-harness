@@ -4,7 +4,7 @@ orphan: true
 
 # v2 conformance status
 
-Generated 2026-10-08 at 27b485c + W8 binder/report fixes (sweep), same (public-API run) by the W8 sweep: every canonical case
+Generated 2026-10-08 at 5895aa2 + W8 fixes (fourth sweep); sparse_flashmla_decode_head64 re-run at 72c7908 by the W8 sweep: every canonical case
 (`tests/numsim/corpus/canonical_cases.py`) x {numsim, racecheck, synccheck} run under
 `NUMSIM_IMPL=v2` and compared with the legacy snapshots in `tirx_harness/tests/conformance/`
 (v2 may add source anchors to diagnostics legacy recorded without one; see
@@ -21,19 +21,16 @@ fail-closed reason); **crash** (engine runtime error or binder exception); **no 
 
 | mode | match | differs | incomplete | crash | no oracle |
 | --- | --- | --- | --- | --- | --- |
-| numsim | 88 | 1 | 0 | 9 | 3 |
-| racecheck | 59 | 27 | 0 | 12 | 3 |
-| synccheck | 83 | 2 | 3 | 10 | 3 |
+| numsim | 97 | 1 | 0 | 0 | 3 |
+| racecheck | 88 | 10 | 0 | 0 | 3 |
+| synccheck | 96 | 1 | 1 | 0 | 3 |
 
 ## Issues by root cause
 
 | issue | owner | cause | cases (modes) |
 | --- | --- | --- | --- |
-| V2C-35 | coordinator ruling + sched | vector access at buffer offset 0 is misaligned: the engine now keeps the host pointer's low 8 bits (`arena::addr` ruling, `Inputs.host_addrs`) and numpy arrays are only 16-byte aligned; legacy ran these | 12: `cudnn_sm100_gdn2_bprop_f16` (n/r/s), `cudnn_sm100_gdn2_prefill_f16` (n/r/s), `cudnn_sm100_gdn_bprop_f16` (n/r/s), `cudnn_sm100_gdn_prefill_f16` (r/s), `cudnn_sm100_gdn_recompute_f16` (n/r/s), `cudnn_sm100_kda_bprop_f16` (n/r/s), `flash_mla_sparse_fwd` (s), `flashinfer_fused_dit_layernorm` (n/r/s), `kda_backward_packed` (n/r/s), `sparse_flashmla_decode_head64` (n), `sparse_flashmla_prefill_head128_phase1` (r/s), `sparse_flashmla_prefill_head128_small_topk_phase1` (n/r) |
-| V2C-38 | racecheck | same finding kinds, different source anchors (witness site pair) and/or footprint | 9: `cudnn_sm100_bsa_forward_blk128` (r), `cudnn_sm100_bsa_forward_blk64` (r), `cudnn_sm100_gdn2_recompute_f16` (r), `cudnn_sm103_flex_attention_forward` (r), `flash_mla_sparse_fwd` (r), `gdn_cp_prefill_sm100` (r), `msa_sparse_atten_fwd_nvfp4_kv_sm100` (r), `sparse_flashmla_prefill_head64_phase1` (r), `stable_sort_topk_by_value` (r) |
-| V2C-36 | racecheck | new `scope_mismatch` (+ `data_race`) findings where legacy was clean (cf. racecheck-behaviour-deltas R4/B1 scope rules) -- verify | 8: `bmm_fp8_rubin` (r), `cudnn_sm100_dense_blockscaled_gemm_persistent_dsrelu_quant` (r), `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` (r), `deepgemm_sm100_fp8_gemm_1d1d` (r), `fastcu_nvfp4_gemm_gb300` (r), `flash_attention_backward_sm100` (r), `nvfp4_gemm` (r), `sm100_fp8_fp4_mega_moe` (r) |
-| V2C-37 | racecheck | new `data_race` where legacy was clean or review | 6: `cudnn_sm100_dsa_sparse_attention_backward` (r), `deepgemm_sm100_fp4_mqa_logits` (r), `flash_attention4` (r), `gdn_prefill_sm100` (r), `msa_prefill_multishape` (r), `vsa_multishape` (r) |
-| V2C-31 | synccheck | no result within the sweep timeout (explorer ignores the wall-time limit inside one projection) | 4: `blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin` (s), `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in` (r), `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` (r), `sm100_fp8_fp4_mega_moe` (s) |
+| V2C-36 | racecheck | new `scope_mismatch` + `data_race` (+ `cross_cta_async_order`) findings on cluster kernels legacy found clean or review-only; likely racecheck-behaviour-deltas R4/B1/B7 scope rules -- W5 to confirm and add delta snapshots | 4: `flash_attention_backward_sm100` (r), `sm100_fp8_fp4_mega_moe` (r), `sparse_flashmla_prefill_head128_phase1` (r), `sparse_flashmla_prefill_head128_small_topk_phase1` (r) |
+| V2C-38 | racecheck | same finding kinds, different source anchors (witness site pair) and/or footprint | 2: `gdn_cp_prefill_sm100` (r), `gdn_prefill_sm100` (r) |
 | V2C-22 | interp / oplib | new `uninitialized_read` advisories: reads of bytes the engine never wrote (same cases fail the numeric reference, V2C-22) | 1: `deepgemm_sm100_tf32_hc_prenorm_gemm` (n/r/s) |
 | V2C-28 | synccheck | synccheck: fixed sync program model incomplete | 1: `msa_prefill_multishape` (s) |
 
@@ -47,20 +44,20 @@ unchanged with `NUMSIM_IMPL=v2`: `tests/conftest.py` rebinds the public names of
 collection.
 
 - legacy: 762 passed, 0 failed (2026-10-08)
-- v2: **484 passed, 278 failed** of 762
+- v2: **489 passed, 273 failed** of 762
 
 | failure class | owner | count | example |
 | --- | --- | --- | --- |
-| pins legacy internals (generated Rust text, scheduler poll stats); needs porting (test-migration A-internal) | test port | 89 | `tests/numsim/runtime/test_tma_im2col.py::test_im2col_store_and_reduce[False-False-False]` |
+| pins legacy internals (generated Rust text, scheduler poll stats); needs porting (test-migration A-internal) | test port | 89 | `tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_known_combine_int_frac_ex2_is_bit_exact` |
 | synccheck verdict differs from legacy | synccheck / sync | 54 | `tests/numsim/runtime/test_mbarrier_report.py::test_report_queries_and_phase_reset[per_16bytes::80000000]` |
-| other assertion (numeric or report shape) | triage | 41 | `tests/numsim/runtime/test_memory_sync_coverage.py::test_memory_sync_extensions[address_queries-inputs5-expected5]` |
-| racecheck verdict differs from legacy | racecheck | 34 | `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_s2c_preserves_mapped_remote_cta_ownership` |
-| engine runtime error legacy did not raise | interp / sync | 28 | `tests/numsim/runtime/test_layout_lowering_contract.py::test_tmem_tlane_tcol_coordinates_are_observable_through_a_physical_alias` |
+| other assertion (numeric or report shape) | triage | 36 | `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_prefetch_preserves_global_memory` |
+| racecheck verdict differs from legacy | racecheck | 35 | `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_s2c_preserves_mapped_remote_cta_ownership` |
+| engine runtime error legacy did not raise | interp / sync | 27 | `tests/numsim/integration/test_gemm_async_artifact.py::test_m64_tcgen_mma_infers_weight_stationary_from_packed_layout_e` |
 | expects legacy error text or a legacy raise site | test port / delta review | 25 | `tests/numsim/integration/test_scheduler_polling_artifact.py::test_finite_for_uses_native_loop_iteration_budget` |
-| lowering rejects the kernel | lowering | 6 | `tests/numsim/runtime/test_dense_mma_forms.py::test_legacy_m16n8k32_int8_reuses_dense_form_and_engine` |
+| lowering rejects the kernel | lowering | 6 | `tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem` |
 | engine stops fail-closed (unsupported / budget) | interp / oplib | 1 | `tests/numsim/runtime/test_gate_intrinsics.py::test_gate_intrinsics_match_float32_semantics` |
 
-Files passing completely under v2: 50 of 120.
+Files passing completely under v2: 52 of 120.
 
 ### Triage of the "other assertion" public-API failures (from the second run at 9484204; several rows have since been fixed, recount pending)
 
@@ -150,38 +147,38 @@ row) by the test-migration owner:
 | --- | --- | --- | --- |
 | `act_and_mul` | match | match | match |
 | `alphamoe_fp8_blockscale_qwen3next` | match | differs | match |
-| `blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin` | match | match | incomplete [V2C-31] |
-| `bmm_fp8_rubin` | match | differs [V2C-36] | match |
+| `blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin` | match | match | match |
+| `bmm_fp8_rubin` | match | match | match |
 | `cudnn_sm100_bsa_backward_blk128` | match | match | match |
 | `cudnn_sm100_bsa_backward_blk64` | match | match | match |
-| `cudnn_sm100_bsa_forward_blk128` | match | differs [V2C-38] | match |
-| `cudnn_sm100_bsa_forward_blk64` | match | differs [V2C-38] | match |
+| `cudnn_sm100_bsa_forward_blk128` | match | match | match |
+| `cudnn_sm100_bsa_forward_blk64` | match | match | match |
 | `cudnn_sm100_bsa_forward_combine_blk64` | match | match | match |
 | `cudnn_sm100_csa_compressor_fwd` | match | match | match |
 | `cudnn_sm100_dense_blockscaled_gemm_persistent_amax` | match | match | match |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_dsrelu_quant` | match | differs [V2C-36] | match |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` | match | differs [V2C-36] | match |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_dsrelu_quant` | match | match | match |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` | match | match | match |
 | `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | match | match | match |
 | `cudnn_sm100_dense_gemm_persistent_swiglu` | match | match | match |
-| `cudnn_sm100_dsa_sparse_attention_backward` | match | differs [V2C-37] | match |
+| `cudnn_sm100_dsa_sparse_attention_backward` | match | match | match |
 | `cudnn_sm100_flex_attention_backward` | match | match | match |
 | `cudnn_sm100_flex_attention_forward_hd256` | match | match | match |
-| `cudnn_sm100_gdn2_bprop_f16` | crash [V2C-35] | crash [V2C-35] | crash [V2C-35] |
-| `cudnn_sm100_gdn2_prefill_f16` | crash [V2C-35] | crash [V2C-35] | crash [V2C-35] |
-| `cudnn_sm100_gdn2_recompute_f16` | match | differs [V2C-38] | match |
-| `cudnn_sm100_gdn_bprop_f16` | crash [V2C-35] | crash [V2C-35] | crash [V2C-35] |
-| `cudnn_sm100_gdn_prefill_f16` | match | crash [V2C-35] | crash [V2C-35] |
-| `cudnn_sm100_gdn_recompute_f16` | crash [V2C-35] | crash [V2C-35] | crash [V2C-35] |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in` | match | crash [V2C-31] | match |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | match | crash [V2C-31] | match |
-| `cudnn_sm100_kda_bprop_f16` | crash [V2C-35] | crash [V2C-35] | crash [V2C-35] |
+| `cudnn_sm100_gdn2_bprop_f16` | match | match | match |
+| `cudnn_sm100_gdn2_prefill_f16` | match | match | match |
+| `cudnn_sm100_gdn2_recompute_f16` | match | match | match |
+| `cudnn_sm100_gdn_bprop_f16` | match | match | match |
+| `cudnn_sm100_gdn_prefill_f16` | match | match | match |
+| `cudnn_sm100_gdn_recompute_f16` | match | match | match |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in` | match | match | match |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | match | match | match |
+| `cudnn_sm100_kda_bprop_f16` | match | match | match |
 | `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | match | match | match |
 | `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | match | match | match |
-| `cudnn_sm103_flex_attention_forward` | match | differs [V2C-38] | match |
-| `deepgemm_sm100_fp4_mqa_logits` | match | differs [V2C-37] | match |
+| `cudnn_sm103_flex_attention_forward` | match | match | match |
+| `deepgemm_sm100_fp4_mqa_logits` | match | match | match |
 | `deepgemm_sm100_fp4_paged_mqa_logits` | match | match | match |
 | `deepgemm_sm100_fp8_bmm` | match | match | match |
-| `deepgemm_sm100_fp8_gemm_1d1d` | match | differs [V2C-36] | match |
+| `deepgemm_sm100_fp8_gemm_1d1d` | match | match | match |
 | `deepgemm_sm100_fp8_mqa_logits` | match | match | match |
 | `deepgemm_sm100_fp8_paged_mqa_logits` | match | match | match |
 | `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | match | match | match |
@@ -190,16 +187,16 @@ row) by the test-migration owner:
 | `deepgemm_sm100_tf32_hc_prenorm_gemm` | differs [V2C-22] | differs [V2C-22] | differs [V2C-22] |
 | `dense_blockscaled_gemm_sm107` | match | match | match |
 | `fast_topk_clusters` | match | match | match |
-| `fastcu_nvfp4_gemm_gb300` | match | differs [V2C-36] | match |
+| `fastcu_nvfp4_gemm_gb300` | match | match | match |
 | `filtered_topk` | match | match | match |
-| `flash_attention4` | match | differs [V2C-37] | match |
+| `flash_attention4` | match | match | match |
 | `flash_attention4_fp4` | match | match | match |
 | `flash_attention_backward_sm100` | match | differs [V2C-36] | match |
-| `flash_mla_sparse_fwd` | match | differs [V2C-38] | crash [V2C-35] |
+| `flash_mla_sparse_fwd` | match | match | match |
 | `flashinfer_add_rmsnorm_fp4quant` | match | match | match |
 | `flashinfer_fused_add_rmsnorm` | match | match | match |
 | `flashinfer_fused_add_rmsnorm_quant` | match | match | match |
-| `flashinfer_fused_dit_layernorm` | crash [V2C-35] | crash [V2C-35] | crash [V2C-35] |
+| `flashinfer_fused_dit_layernorm` | match | match | match |
 | `flashinfer_layernorm` | match | match | match |
 | `flashinfer_qk_rmsnorm` | match | match | match |
 | `flashinfer_rmsnorm` | match | match | match |
@@ -211,23 +208,23 @@ row) by the test-migration owner:
 | `gdn_decode_bf16_wide_vec_mtp` | match | match | match |
 | `gdn_decode_bf16_wide_vec_t1` | match | match | match |
 | `gdn_decode_fp32_mtp_warp` | match | match | match |
-| `gdn_prefill_sm100` | match | differs [V2C-37] | match |
+| `gdn_prefill_sm100` | match | differs [V2C-38] | match |
 | `grouped_gemm_masked_rubin` | match | match | match |
-| `kda_backward_packed` | crash [V2C-35] | crash [V2C-35] | crash [V2C-35] |
+| `kda_backward_packed` | match | differs | match |
 | `kda_decode_multishape` | match | match | match |
 | `kda_forward_portfolio_multishape` | no oracle | no oracle | no oracle |
 | `merge_state` | match | match | match |
 | `mla_dsv4_multishape` | no oracle | no oracle | no oracle |
 | `msa_decode_multishape` | match | match | match |
-| `msa_prefill_multishape` | match | differs [V2C-37] | incomplete [V2C-28] |
+| `msa_prefill_multishape` | match | match | incomplete [V2C-28] |
 | `msa_sparse_atten_fwd_combine_sm100` | match | match | match |
-| `msa_sparse_atten_fwd_nvfp4_kv_sm100` | match | differs [V2C-38] | match |
+| `msa_sparse_atten_fwd_nvfp4_kv_sm100` | match | match | match |
 | `msa_sparse_atten_fwd_sm100` | match | match | match |
 | `msa_sparse_prepare_flat_schedule_sm100` | match | match | match |
 | `msa_sparse_prepare_fwd_split_atomic_sm100` | match | match | match |
 | `mxfp4_quantize` | match | match | match |
 | `mxfp8_quantize` | match | match | match |
-| `nvfp4_gemm` | match | differs [V2C-36] | match |
+| `nvfp4_gemm` | match | match | match |
 | `nvfp4_quantize` | match | match | match |
 | `nvfp4_quantize_per_token` | match | match | match |
 | `radix_topk_multi_cta` | match | differs | match |
@@ -242,10 +239,10 @@ row) by the test-migration owner:
 | `selective_state_update_stp_simple` | match | match | match |
 | `selective_state_update_stp_vertical` | match | match | match |
 | `silu_and_mul_nvfp4_experts_quantize` | match | match | match |
-| `sm100_fp8_fp4_mega_moe` | match | differs [V2C-36] | incomplete [V2C-31] |
-| `sparse_flashmla_decode_head64` | crash [V2C-35] | differs | differs |
-| `sparse_flashmla_prefill_head128_phase1` | match | crash [V2C-35] | crash [V2C-35] |
-| `sparse_flashmla_prefill_head128_small_topk_phase1` | crash [V2C-35] | crash [V2C-35] | match |
-| `sparse_flashmla_prefill_head64_phase1` | match | differs [V2C-38] | match |
-| `stable_sort_topk_by_value` | match | differs [V2C-38] | match |
-| `vsa_multishape` | match | differs [V2C-37] | match |
+| `sm100_fp8_fp4_mega_moe` | match | differs [V2C-36] | match |
+| `sparse_flashmla_decode_head64` | match | match | match |
+| `sparse_flashmla_prefill_head128_phase1` | match | differs [V2C-36] | match |
+| `sparse_flashmla_prefill_head128_small_topk_phase1` | match | differs [V2C-36] | match |
+| `sparse_flashmla_prefill_head64_phase1` | match | match | match |
+| `stable_sort_topk_by_value` | match | match | match |
+| `vsa_multishape` | match | match | match |

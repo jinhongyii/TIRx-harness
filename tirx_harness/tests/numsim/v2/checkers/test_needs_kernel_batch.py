@@ -187,15 +187,13 @@ def _cp_mask_readonly_kernel(before):
     return kernel
 
 
-_READONLY_OVERLAP = no_spec(20, "write overlapping readonly-read bytes")
-
-
 @pytest.mark.parametrize(
     "mask",
     [
         pytest.param(0, id="mask0"),
         pytest.param(0xF0, id="mask0xf0"),
-        pytest.param(1, id="mask1", marks=_READONLY_OVERLAP),
+        # Readonly-proxy write rule implemented in the engine (d5b0f09).
+        pytest.param(1, id="mask1"),
     ],
 )
 @pytest.mark.parametrize("before", [False, True], ids=["read_after", "read_before"])

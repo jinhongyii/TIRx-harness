@@ -10,9 +10,6 @@
       "tirx_kernels/ported/cudnn/bsa/block_sparse_attention_forward_sm100_blk128.py:473:1-473:83",
       "tirx_kernels/ported/cudnn/bsa/block_sparse_attention_forward_sm100_blk128.py:481:1-481:83"
      ],
-     "bytes": {
-      "tmem-columns": "256-320,384-448"
-     },
      "category": "findings",
      "kind": "tmem_lifetime_review",
      "ordering_domain": "completion",
@@ -24,5 +21,5 @@
    "verdict": "review"
   }
  ],
- "schema": 3
+ "schema": 4
 }

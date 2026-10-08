@@ -46,6 +46,14 @@ difference in whether such reads exist still fails. Legacy payloads carry no
 buffer name, so a per-buffer count cannot be compared. This is a projection
 rule, not a behaviour delta.
 
+## Projection rule: `tmem_lifetime_review` (schema 4)
+
+Which dynamic instance of a static (load site, store site) pair witnesses a
+TMEM lifetime conflict is schedule-dependent, so these findings are compared
+by kind, status and source anchors only; their byte/column footprint is
+dropped (W5 note in CONTRACT_REQUESTS). Schema 4 regeneration: 173 s, 304
+passed.
+
 ## Delta snapshots
 
 When a behaviour-delta row rules that legacy was wrong, the corrected oracle
@@ -59,7 +67,9 @@ legacy engine is deleted.
 
 | case / mode | delta row | change |
 | --- | --- | --- |
-| `msa_sparse_atten_fwd_nvfp4_kv_sm100` / racecheck | racecheck-behaviour-deltas T12 | `tmem_lifetime_review` covers columns 64-128 (4 load/store pairs, true positives); legacy reported 64-80 and 96-112 only |
+| `bmm_fp8_rubin`, `cudnn_sm100_dense_blockscaled_gemm_persistent_{dsrelu,srelu}_quant`, `fastcu_nvfp4_gemm_gb300`, `nvfp4_gemm` / racecheck | racecheck-behaviour-deltas B7 | `scope_mismatch` errors: a qualifier-less remote `mbarrier.arrive` is `.release.cta` (ISA R4), so the cross-CTA arrive/wait edge is dropped |
+| `deepgemm_sm100_fp8_gemm_1d1d` / racecheck | racecheck-behaviour-deltas B7 | as above, plus the `data_race`s that follow from the dropped edge |
+| (removed) `msa_sparse_atten_fwd_nvfp4_kv_sm100` / racecheck | racecheck-behaviour-deltas T12 | subsumed by the schema-4 projection rule below (`tmem_lifetime_review` compared by kind + anchors) |
 
 ## What a snapshot contains (`snapshot.py`)
 
