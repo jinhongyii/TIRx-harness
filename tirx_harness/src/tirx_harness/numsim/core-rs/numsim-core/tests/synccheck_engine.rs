@@ -43,9 +43,14 @@ fn launch_bounds_configure_reaches_the_explorer() {
     let (status, log) = run(&s);
     assert_eq!(status, RunStatus::Completed);
     assert!(log.other.iter().any(|e| format!("{:?}", e.kind).contains("Configure")), "no host Configure event logged");
-    let shape = sched::resolve_launch(&s.module.kernels[0], &s.inputs).unwrap();
-    let r = check(&log, &SynccheckConfig { init: resource_init(&shape), ..SynccheckConfig::default() });
+    // The shape comes from the recording (`RecordingObserver::launches`).
+    assert!(!log.launches.is_empty());
+    let r = check(&log, &SynccheckConfig::default());
     assert_eq!(r.verdict, Verdict::Clean, "{:#}", serialize(&r));
+    // The explicit form gives the same result.
+    let shape = sched::resolve_launch(&s.module.kernels[0], &s.inputs).unwrap();
+    let explicit = check(&log, &SynccheckConfig { init: resource_init(&shape), ..SynccheckConfig::default() });
+    assert_eq!(explicit.verdict, Verdict::Clean);
 }
 
 /// Every interpreter scenario's stream is checked within a small budget and
@@ -56,13 +61,7 @@ fn every_engine_scenario_is_checked_within_budget() {
     for s in scenarios::all() {
         let (status, log) = run(&s);
         let started = Instant::now();
-        let shape = sched::resolve_launch(&s.module.kernels[0], &s.inputs).unwrap();
-        let cfg = SynccheckConfig {
-            state_budget: 20_000,
-            transition_budget: 200_000,
-            init: resource_init(&shape),
-            ..SynccheckConfig::default()
-        };
+        let cfg = SynccheckConfig { state_budget: 20_000, transition_budget: 200_000, ..SynccheckConfig::default() };
         let r = check(&log, &cfg);
         let p = serialize(&r);
         assert_ne!(p["coverage"]["termination"]["kind"], "resource_limit", "{}: {p:#}", s.name);

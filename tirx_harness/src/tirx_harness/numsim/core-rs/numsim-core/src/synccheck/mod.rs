@@ -117,6 +117,12 @@ pub fn split_launches(log: &RecordingObserver) -> Vec<(u32, RecordingObserver)> 
         let event = if warp == u32::MAX { &log.other[index as usize] } else { &log.per_warp[warp as usize][index as usize] };
         crate::observe::Observer::sync(out.entry(event.kernel).or_default(), event);
     }
+    for (kernel, shape) in &log.launches {
+        let rec = out.entry(*kernel).or_default();
+        if !rec.launches.iter().any(|(k, _)| k == kernel) {
+            rec.launches.push((*kernel, *shape));
+        }
+    }
     out.into_iter().collect()
 }
 
@@ -162,7 +168,17 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
         out.static_error(&program, cmd, error);
         return out.finish(started);
     }
-    let reference = match reference::run(&program, &config.init) {
+    // Launch facts: an explicit `config.init` wins; otherwise the shape the
+    // recording captured in `begin_launch` for this kernel.
+    let init = if config.init != ResourceInit::default() {
+        config.init
+    } else {
+        log.launches
+            .iter()
+            .find(|(k, _)| *k == program.kernel)
+            .map_or(config.init, |(_, shape)| ResourceInit { policy: config.init.policy, ..resource_init(shape) })
+    };
+    let reference = match reference::run(&program, &init) {
         Ok(r) => r,
         Err(detail) => {
             out.program_build(detail);
@@ -170,7 +186,7 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
         }
     };
     if !reference.is_complete() {
-        out.reference_failure(&program, &config.init, &reference);
+        out.reference_failure(&program, &init, &reference);
         // Without gates (whole / components) the search does not need the
         // reference clocks; in all-failures mode keep exploring.
         if config.explore.stop_on_first_failure || config.mode == ProjectionMode::PerResource || config.certificates {
@@ -187,7 +203,7 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
             out.wall_time_limit(started);
             break;
         }
-        let ts = match ts::Ts::new(&program, &spec, &config.init, Some(&reference)) {
+        let ts = match ts::Ts::new(&program, &spec, &init, Some(&reference)) {
             Ok(ts) => ts,
             Err(detail) => {
                 out.program_build(detail);
@@ -196,7 +212,7 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
         };
         out.stats.programs += 1;
         if config.certificates {
-            if let Some(result) = certificate::certify(&ts, &reference, config.init.cluster_warps) {
+            if let Some(result) = certificate::certify(&ts, &reference, init.cluster_warps) {
                 out.stats.certified += 1;
                 out.stats.visited += 1;
                 out.stats.transitions += ts.cmds.len() as u64;
