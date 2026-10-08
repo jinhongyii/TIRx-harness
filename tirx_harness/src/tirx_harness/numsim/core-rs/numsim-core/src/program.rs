@@ -446,6 +446,8 @@ pub enum SpecialReg {
     GlobalTimer,
     DynamicSmemSize,
     TotalSmemSize,
+    /// `%nwarpid`: maximum warps per SM (deterministic representative).
+    NWarpId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -559,10 +561,9 @@ pub struct BulkCopyArgs {
     /// written only if bit `i` is set.
     #[serde(deserialize_with = "required")]
     pub byte_mask: Option<Operand>,
-    /// `.ignore_oob` (g2s): source bytes beyond the source allocation are
-    /// not read; the destination keeps its bytes there (tx still counts the
-    /// full size).
-    pub ignore_oob: bool,
+    /// `.ignore_oob` (g2s) with its byte counts; `None` = no `.ignore_oob`.
+    #[serde(deserialize_with = "required")]
+    pub ignore_oob: Option<IgnoreOob>,
     /// `_report` forms (layout::v1 barriers): validity inspection mode whose
     /// result is OR-ed into the completion mbarrier's primary-phase report
     /// predicate. There is no register destination: the report is read back
@@ -570,6 +571,19 @@ pub struct BulkCopyArgs {
     #[serde(deserialize_with = "required")]
     pub report: Option<ReportMode>,
     pub mods: MemMods,
+}
+
+/// `.ignore_oob` byte counts of a bulk copy: the first `ignore_bytes_left`
+/// and last `ignore_bytes_right` bytes of the source range are not read and
+/// the corresponding destination bytes are left unchanged (tx still counts
+/// the full size). A `None` count is 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoreOob {
+    #[serde(deserialize_with = "required")]
+    pub ignore_bytes_left: Option<Operand>,
+    #[serde(deserialize_with = "required")]
+    pub ignore_bytes_right: Option<Operand>,
 }
 
 /// Validity-inspection mode of `_report` copy forms.
@@ -616,7 +630,17 @@ pub enum TmapField {
     Rank,
     BoxDim,
     GlobalDim,
+    /// Global stride of dimension `ord`. In the
+    /// `override_global_dim_stride_*` TMA forms this carries the *lower*
+    /// stride operand of dimension `ord`; the shared upper operand is a
+    /// separate `GlobalStrideUpper` override.
     GlobalStride,
+    /// Upper stride operand of the `override_global_dim_stride_*` TMA forms
+    /// (`ord: null`; one per instruction, applies to every overridden
+    /// stride). Combined with the per-dimension `GlobalStride` lower parts
+    /// by oplib exactly as legacy `override_tensor_map(lower_stride[],
+    /// upper_stride)`.
+    GlobalStrideUpper,
     ElementStride,
     ElemType,
     InterleaveLayout,
@@ -810,6 +834,11 @@ pub struct TcgenLdArgs {
     /// `.red.{min,max}`: op and reduced destinations.
     #[serde(deserialize_with = "required")]
     pub red: Option<(ReduxOp, Vec<Reg>)>,
+    /// `.red` modifiers: `.abs` (reduce absolute values) and `.NaN`
+    /// (propagate NaN); only meaningful with `red`.
+    pub red_abs: bool,
+    pub red_nan: bool,
+    /// `.spcompress` (sparse-compressed destination).
     pub spcompress: bool,
 }
 
@@ -857,6 +886,8 @@ pub enum TcMmaKind {
     MxF8f6f4,
     MxF4,
     MxF4Nvf4,
+    /// `.kind::i16` table-indexed forms (`tcgen05_mma*_ti16_*`).
+    Ti16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -894,13 +925,13 @@ pub struct TcgenMmaArgs {
     pub collector_a: CollectorOp,
     pub collector_b: CollectorOp,
     pub ashift: bool,
-    /// `_ti16` forms (`tcgen05_mma*_ti16_*`): 16-bit table-indexed A operand.
-    pub ti16: bool,
     /// `_lut_b` forms (`tcgen05_mma*_lut_b_*`): B through a lookup table.
     /// Orthogonal to `kind` (block-scaled `lut_b` forms exist).
     pub lut_b: bool,
-    /// LUT table address for `lut_b` forms (shared-memory address value);
-    /// must be `Some` iff `lut_b` (checked by `validate`).
+    /// LUT table address for `lut_b` forms: a *tensor-memory* address value
+    /// (`taddr = lane<<16 | column`; TVM types the operand `addr@tmem`).
+    /// Must be `Some` iff `lut_b` (checked by `validate`); the engine fails
+    /// closed if it does not name a column inside a live TMEM allocation.
     #[serde(deserialize_with = "required")]
     pub lut_b_addr: Option<Operand>,
 }
@@ -1733,6 +1764,12 @@ pub struct BufferDecl {
     /// Byte offset of the buffer in its backing: shared-window offset for
     /// shared buffers; offset within `view_of` for views; 0 otherwise.
     pub base: u64,
+    /// Runtime base (TMEM views over a dynamic `allocated_addr`): when set,
+    /// the buffer starts at the value of this register (in the space's
+    /// address encoding, e.g. a TMEM `taddr`), read when each access
+    /// executes and required to be warp-uniform; `base` must then be 0.
+    #[serde(deserialize_with = "required")]
+    pub base_reg: Option<Reg>,
     /// Total bytes; None = taken from the bound host argument.
     #[serde(deserialize_with = "required")]
     pub byte_len: Option<DimExpr>,
@@ -2150,6 +2187,13 @@ impl Program {
         for (i, b) in self.buffers.iter().enumerate() {
             if !ty_ok(b.dtype) {
                 return Err(glob(format!("b{i}: invalid dtype {}", b.dtype)));
+            }
+            if b.base_reg.is_some_and(|r| r.0 as usize >= nregs)
+                || (b.base_reg.is_some() && b.base != 0)
+            {
+                return Err(glob(format!(
+                    "b{i}: base_reg out of range or combined with a nonzero base"
+                )));
             }
             if b.param_slot.is_some_and(|p| p.0 as usize >= np)
                 || b.view_of
@@ -2756,6 +2800,10 @@ impl Instr {
                 completion(&a.completion, f);
                 opt(&a.multicast, f);
                 opt(&a.byte_mask, f);
+                if let Some(io) = &a.ignore_oob {
+                    opt(&io.ignore_bytes_left, f);
+                    opt(&io.ignore_bytes_right, f);
+                }
                 mods(&a.mods, f);
             }
             Tma(a) => {
@@ -3332,6 +3380,7 @@ mod tests {
             strides: vec![],
             param_slot: None,
             base: 0,
+            base_reg: None,
             byte_len: None,
             align: 16,
             view_of: None,

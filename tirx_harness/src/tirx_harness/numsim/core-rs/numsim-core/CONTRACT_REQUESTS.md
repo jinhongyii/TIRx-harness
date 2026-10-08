@@ -526,6 +526,39 @@ All of these are JSON-visible. `FORMAT_VERSION` is now **2**.
     `Payload::None`, `after` = the tracked ops, and `signals` = the deferred
     arrive(s). It matches `observe::AsyncClass::TcgenCommit`.
 
+### Batch 3 (2026-10-08, lowering §D.3)
+
+20. **`TcMmaKind::Ti16`** (`"Ti16"`) is now a real kind for
+    `.kind::i16`. `TcgenMmaArgs.ti16: bool` is **removed**. `lut_b: bool`
+    stays and remains orthogonal to the kind.
+21. **Split-stride TMA overrides** (`override_global_dim_stride_*`). Emit:
+    - one `GlobalStride` override per dimension `ord`, holding that
+      dimension's *lower* stride operand;
+    - one `{"field": "GlobalStrideUpper", "ord": null, ...}` override,
+      holding the shared upper operand.
+
+    Oplib combines them exactly as legacy `override_tensor_map` did.
+22. **`BufferDecl.base_reg: Option<Reg>`** (required field; `null` when
+    unused). It covers TMEM views whose `allocated_addr` is only known at
+    run time. When set:
+    - the buffer starts at that register's value (a TMEM `taddr`), read at
+      each access;
+    - the register must be warp-uniform;
+    - `base` must be 0 (`validate`).
+23. **`TcgenLdArgs` gains `red_abs: bool` and `red_nan: bool`** for
+    `.red.abs` / `.red.NaN`. `.spcompress` was already the `spcompress`
+    bool.
+24. **`BulkCopyArgs.ignore_oob` is now `Option<IgnoreOob>`**, replacing
+    the bool. The struct is
+    `IgnoreOob { ignore_bytes_left: Option<Operand>, ignore_bytes_right: Option<Operand> }`.
+    `null` means no `.ignore_oob`; a `null` count means 0.
+25. **`SpecialReg::NWarpId`** (`"NWarpId"`) for `%nwarpid`. The engine
+    returns a deterministic representative value.
+26. **`TcgenMmaArgs.lut_b_addr`** is documented as a *TMEM* address
+    (`addr@tmem`, `lane<<16 | column`). `validate` still requires it to be
+    set iff `lut_b`. The engine fails closed if the address is outside a
+    live allocation.
+
 **C.3 acks.**
 - **Accepted:** 1 (`numsim.pack`/`unpack`, W4), 2 (`<name>.value`, W4),
   5, 6, 7, 8, 9 and 10.
