@@ -144,7 +144,7 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
             }
             if ok {
                 let s = ctx.slot(dst);
-                support::write_masked(ctx.warp.regs.get_mut(s), &vals, active);
+                support::write_masked(ctx.warp.reg_mut(s), &vals, active);
                 if ctx.aux.capture_reads.is_some() {
                     for l in active.lanes() {
                         let off = fast_offset(ctx, buf, lane_int(ctx, offset, l), n, len, base).expect("checked");

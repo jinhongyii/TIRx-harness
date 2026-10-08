@@ -41,7 +41,7 @@ pub fn mov(ctx: &mut ExecCtx<'_>, dst: Reg, src: Operand) -> HResult {
         // Single slot, no truncation needed.
         let v = ctx.read_slot(src, 0);
         let s = ctx.slot(dst);
-        support::write_masked(ctx.warp.regs.get_mut(s), &v, mask);
+        support::write_masked(ctx.warp.reg_mut(s), &v, mask);
         return Ok(Flow::Next);
     }
     let mut out = zero_slots();
@@ -245,7 +245,7 @@ pub fn binary(ctx: &mut ExecCtx<'_>, op: BinOp, ty: Ty, dst: Reg, a: Operand, b:
             return Err(narrow(ctx, e, mask, format!("{op:?}.{ty}"), |l| vec![sa[0][l], sb[0][l]], |m| oplib::binary(op, ty, &sa, &sb, &mut tmp, m)));
         }
         let s = ctx.slot(dst);
-        support::write_masked(ctx.warp.regs.get_mut(s), &out[0], mask);
+        support::write_masked(ctx.warp.reg_mut(s), &out[0], mask);
         return Ok(Flow::Next);
     }
     let mut sa = zero_slots();
@@ -276,7 +276,7 @@ pub fn ternary(ctx: &mut ExecCtx<'_>, op: TerOp, ty: Ty, dst: Reg, a: Operand, b
             return Err(narrow(ctx, e, mask, format!("{op:?}.{ty}"), |l| vec![sa[0][l], sb[0][l], sc[0][l]], |m| oplib::ternary(op, ty, &sa, &sb, &sc, &mut tmp, m)));
         }
         let s = ctx.slot(dst);
-        support::write_masked(ctx.warp.regs.get_mut(s), &out[0], mask);
+        support::write_masked(ctx.warp.reg_mut(s), &out[0], mask);
         return Ok(Flow::Next);
     }
     let mut sa = zero_slots();
@@ -299,7 +299,7 @@ pub fn ternary(ctx: &mut ExecCtx<'_>, op: TerOp, ty: Ty, dst: Reg, a: Operand, b
 #[inline]
 pub fn write_pred(ctx: &mut ExecCtx<'_>, dst: Reg, yes: WarpMask, mask: WarpMask) {
     let s = ctx.slot(dst);
-    let v = ctx.warp.regs.get_mut(s);
+    let v = ctx.warp.reg_mut(s);
     let (y, m) = (yes.bits(), mask.bits());
     for (l, d) in v.iter_mut().enumerate() {
         if (m >> l) & 1 == 1 {
@@ -339,7 +339,7 @@ pub fn select(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, cond: Operand, a: Operand
     for i in 0..n {
         let va = ctx.read_slot(a, i);
         let vb = ctx.read_slot(b, i);
-        let d = ctx.warp.regs.get_mut(base + i);
+        let d = ctx.warp.reg_mut(base + i);
         for l in mask.lanes() {
             d[l] = if yes.contains(l) { va[l] } else { vb[l] };
         }
@@ -442,7 +442,7 @@ pub fn ptx(ctx: &mut ExecCtx<'_>, op: OpId, dsts: &[Reg], srcs: &[Operand], pred
             for i in 0..ty.slots() {
                 let v = sc.dsts[k];
                 k += 1;
-                let r = ctx.warp.regs.get_mut(base + i);
+                let r = ctx.warp.reg_mut(base + i);
                 for l in exec.lanes() {
                     r[l] = v[l];
                 }
@@ -496,7 +496,7 @@ pub fn load_reg_indexed(ctx: &mut ExecCtx<'_>, dst: Reg, base: Reg, len: u32, id
         for i in 0..n.min(reg_ty(ctx, r).slots()) {
             let v = *ctx.reg_slot(r, i);
             let s = ctx.slot(dst) + i;
-            support::write_masked(ctx.warp.regs.get_mut(s), &v, mask);
+            support::write_masked(ctx.warp.reg_mut(s), &v, mask);
         }
         return Ok(Flow::Next);
     }
@@ -505,7 +505,7 @@ pub fn load_reg_indexed(ctx: &mut ExecCtx<'_>, dst: Reg, base: Reg, len: u32, id
         for i in 0..n.min(reg_ty(ctx, r).slots()) {
             let v = ctx.reg_slot(r, i)[l];
             let s = ctx.slot(dst) + i;
-            ctx.warp.regs.get_mut(s)[l] = v;
+            ctx.warp.reg_mut(s)[l] = v;
         }
     }
     Ok(Flow::Next)
@@ -528,7 +528,7 @@ pub fn store_reg_indexed(ctx: &mut ExecCtx<'_>, base: Reg, len: u32, idx: Operan
                     *x &= (1u64 << rem) - 1;
                 }
             }
-            support::write_masked(ctx.warp.regs.get_mut(s + i), &v, mask);
+            support::write_masked(ctx.warp.reg_mut(s + i), &v, mask);
         }
         return Ok(Flow::Next);
     }
@@ -542,7 +542,7 @@ pub fn store_reg_indexed(ctx: &mut ExecCtx<'_>, base: Reg, len: u32, idx: Operan
             if rem < 64 {
                 v &= (1u64 << rem) - 1;
             }
-            ctx.warp.regs.get_mut(s + i)[l] = v;
+            ctx.warp.reg_mut(s + i)[l] = v;
         }
     }
     let _ = (extend, lane_val);

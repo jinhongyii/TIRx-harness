@@ -159,7 +159,7 @@ pub fn write_lane_bytes(ctx: &mut ExecCtx<'_>, r: Reg, lane: usize, src: &[u8]) 
         if rem < 64 {
             v &= (1u64 << rem) - 1;
         }
-        ctx.warp.regs.get_mut(base + s)[lane] = v;
+        ctx.warp.reg_mut(base + s)[lane] = v;
     }
 }
 
@@ -177,7 +177,7 @@ pub fn write_lanes_bytes(ctx: &mut ExecCtx<'_>, r: Reg, mask: WarpMask, rows: &[
         let off = (s * 8) as usize;
         let rem = bits.saturating_sub(s * 64);
         let m = if rem < 64 { (1u64 << rem) - 1 } else { u64::MAX };
-        let dst = ctx.warp.regs.get_mut(base + s);
+        let dst = ctx.warp.reg_mut(base + s);
         let k = len.saturating_sub(off).min(8);
         let word = |at: usize| -> u64 {
             match k {
@@ -204,9 +204,9 @@ pub fn write_lane(ctx: &mut ExecCtx<'_>, r: Reg, lane: usize, v: u64) {
     let base = ctx.slot(r);
     let bits = ty.bits();
     let v = if bits < 64 { v & ((1u64 << bits) - 1) } else { v };
-    ctx.warp.regs.get_mut(base)[lane] = v;
+    ctx.warp.reg_mut(base)[lane] = v;
     for s in 1..ty.slots() {
-        ctx.warp.regs.get_mut(base + s)[lane] = 0;
+        ctx.warp.reg_mut(base + s)[lane] = 0;
     }
 }
 
@@ -222,9 +222,9 @@ pub fn write_lanes(ctx: &mut ExecCtx<'_>, r: Reg, v: &WarpValue<u64>, mask: Warp
     for x in w.iter_mut() {
         *x &= m;
     }
-    write_masked(ctx.warp.regs.get_mut(base), &w, mask);
+    write_masked(ctx.warp.reg_mut(base), &w, mask);
     for s in 1..ty.slots() {
-        write_masked(ctx.warp.regs.get_mut(base + s), &[0u64; 32], mask);
+        write_masked(ctx.warp.reg_mut(base + s), &[0u64; 32], mask);
     }
 }
 
@@ -241,7 +241,7 @@ pub fn gather(ctx: &ExecCtx<'_>, o: Operand, n: u32, out: &mut [WarpValue<u64>; 
 pub fn scatter(ctx: &mut ExecCtx<'_>, r: Reg, n: u32, v: &[WarpValue<u64>], mask: WarpMask) {
     let base = ctx.slot(r);
     for i in 0..n {
-        write_masked(ctx.warp.regs.get_mut(base + i), &v[i as usize], mask);
+        write_masked(ctx.warp.reg_mut(base + i), &v[i as usize], mask);
     }
 }
 

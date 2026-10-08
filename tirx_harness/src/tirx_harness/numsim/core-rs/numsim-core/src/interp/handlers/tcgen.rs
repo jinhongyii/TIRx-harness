@@ -607,13 +607,13 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
                     let m = if ty.bits() < 64 { (1u64 << ty.bits()) - 1 } else { u64::MAX };
                     let base = ctx.slot(d);
                     let row = &offs[r * 32..r * 32 + 32];
-                    let dst = ctx.warp.regs.get_mut(base);
+                    let dst = ctx.warp.reg_mut(base);
                     for t in active.lanes() {
                         let k = row[t] as usize;
                         dst[t] = u32::from_le_bytes(runs.image[k..k + 4].try_into().unwrap()) as u64 & m;
                     }
                     for s in 1..ty.slots() {
-                        support::write_masked(ctx.warp.regs.get_mut(base + s), &[0u64; 32], active);
+                        support::write_masked(ctx.warp.reg_mut(base + s), &[0u64; 32], active);
                     }
                 }
                 return finish_ld(ctx, args, op, tspans, &red, active);

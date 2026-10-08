@@ -154,22 +154,22 @@ fn spin_hash_memo_is_exact() {
             2 => {
                 let s = (next() % 40) as u32;
                 let l = (next() % 32) as usize;
-                w.regs.get_mut(s)[l] = next();
+                w.reg_mut(s)[l] = next();
             }
             // Write the same value back: still a hit.
             3 => {
                 let s = (next() % 40) as u32;
                 let l = (next() % 32) as usize;
                 let v = w.regs.get(s)[l];
-                w.regs.get_mut(s)[l] = v;
+                w.reg_mut(s)[l] = v;
             }
             4 => w.active = WarpMask(next() as u32),
             _ => {
                 // Flip one bit and flip it back over two calls.
                 let s = (next() % 40) as u32;
-                w.regs.get_mut(s)[3] ^= 1;
+                w.reg_mut(s)[3] ^= 1;
                 assert_eq!(w.spin_hash(), w.spin_hash_uncached(), "step {step} flipped");
-                w.regs.get_mut(s)[3] ^= 1;
+                w.reg_mut(s)[3] ^= 1;
             }
         }
         assert_eq!(w.spin_hash(), w.spin_hash_uncached(), "step {step}");

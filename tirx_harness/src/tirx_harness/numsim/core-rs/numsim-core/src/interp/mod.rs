@@ -157,14 +157,57 @@ pub struct WarpState {
     pub pending_slots: usize,
 }
 
-/// The last state [`WarpState::spin_hash`] hashed, with its hash. A spin
-/// loop's poll-only iterations usually leave the state unchanged, so the
-/// next call compares (memcmp) instead of re-hashing every register.
+/// Incremental state of [`WarpState::spin_hash`] (W13): the hash of every
+/// register slot, their wrapping sum, and the slots written since the last
+/// call (marked by [`WarpState::reg_mut`] / [`WarpState::reg_write_raw`]).
+/// A call re-hashes only the written slots, so a poll-only loop iteration
+/// costs O(registers it wrote), not O(register file): a kernel's file can
+/// be megabytes per warp.
 #[derive(Clone, Debug, Default)]
 pub struct SpinMemo {
-    masks: u64,
-    hash: u64,
-    regs: Vec<WarpValue<u64>>,
+    slot: Vec<u64>,
+    total: u64,
+    dirty: Vec<u32>,
+    marked: Vec<u64>,
+}
+
+impl SpinMemo {
+    #[inline]
+    fn mark(&mut self, s: u32) {
+        let (w, b) = ((s / 64) as usize, s % 64);
+        if let Some(x) = self.marked.get_mut(w) {
+            if *x >> b & 1 == 0 {
+                *x |= 1 << b;
+                self.dirty.push(s);
+            }
+        }
+    }
+}
+
+/// Hash of register slot `i` holding `v` (four multiply-rotate chains,
+/// folded, then a splitmix finalizer).
+#[inline]
+fn slot_hash(i: u32, v: &WarpValue<u64>) -> u64 {
+    const K: u64 = 0x5851_f42d_4c95_7f2d;
+    let seed = 0xcbf2_9ce4_8422_2325 ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut acc: [u64; 4] = std::array::from_fn(|k| seed.wrapping_add(k as u64));
+    for chunk in v.as_chunks::<4>().0 {
+        for (a, &x) in acc.iter_mut().zip(chunk) {
+            *a = (a.rotate_left(5) ^ x).wrapping_mul(K);
+        }
+    }
+    let mut h = seed;
+    for a in acc {
+        h = (h.rotate_left(5) ^ a).wrapping_mul(K);
+    }
+    splitmix(h)
+}
+
+#[inline]
+fn splitmix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// Register files at least this large are allocated at the warp's first
@@ -237,21 +280,30 @@ impl WarpState {
     /// masks); equal hashes at consecutive poll-only `LoopEnd`s mean the
     /// next iteration repeats unless memory or sync state changes.
     ///
-    /// Memoized exactly: when the registers and masks are bit-identical to
-    /// the last hashed state the cached hash is returned, so the value is
-    /// always [`WarpState::spin_hash_uncached`] of the current state.
+    /// Computed incrementally ([`SpinMemo`]): equal to
+    /// [`WarpState::spin_hash_uncached`] of the current state (checked on
+    /// every call in debug builds). Only equality of two hashes is ever
+    /// used (a fixed point of the same loop frame), never the value.
     pub fn spin_hash(&mut self) -> u64 {
-        let masks = self.spin_masks();
-        if let Some(m) = &self.spin_memo {
-            if m.masks == masks && m.regs.as_flattened() == self.regs.regs.as_flattened() {
-                return m.hash;
-            }
-        }
-        let h = self.spin_hash_uncached();
+        let n = self.regs.regs.len();
         let m = self.spin_memo.get_or_insert_with(Default::default);
-        m.masks = masks;
-        m.hash = h;
-        m.regs.clone_from(&self.regs.regs);
+        if m.slot.len() != n {
+            m.slot = self.regs.regs.iter().enumerate().map(|(i, v)| slot_hash(i as u32, v)).collect();
+            m.total = m.slot.iter().fold(0u64, |a, &h| a.wrapping_add(h));
+            m.marked = vec![0; n.div_ceil(64)];
+            m.dirty.clear();
+        } else {
+            for &s in &m.dirty {
+                let i = s as usize;
+                let h = slot_hash(s, &self.regs.regs[i]);
+                m.total = m.total.wrapping_sub(m.slot[i]).wrapping_add(h);
+                m.slot[i] = h;
+                m.marked[i / 64] = 0;
+            }
+            m.dirty.clear();
+        }
+        let h = Self::spin_finish(m.total, self.spin_masks());
+        debug_assert_eq!(h, self.spin_hash_uncached(), "spin_hash: a register write bypassed WarpState::reg_mut");
         h
     }
 
@@ -259,27 +311,33 @@ impl WarpState {
         (self.active.bits() as u64) << 32 | self.live.bits() as u64
     }
 
-    /// The spin-parking state hash, computed from scratch: eight
-    /// independent multiply-rotate chains over interleaved register words
-    /// (instruction-level parallelism; one serial chain cost ~5 cycles per
-    /// word), folded together at the end. Only equality of two hashes is
-    /// ever used (a fixed point of the same loop frame), never the value.
+    fn spin_finish(total: u64, masks: u64) -> u64 {
+        splitmix(total ^ splitmix(masks ^ 0x2545_f491_4f6c_dd1d)) | 1
+    }
+
+    /// The spin-parking state hash, computed from scratch.
     pub fn spin_hash_uncached(&self) -> u64 {
-        const K: u64 = 0x5851_f42d_4c95_7f2d;
-        let mix = |h: u64, v: u64| (h.rotate_left(5) ^ v).wrapping_mul(K);
-        let seed = 0xcbf2_9ce4_8422_2325 ^ self.spin_masks();
-        let mut acc: [u64; 8] = std::array::from_fn(|i| seed.wrapping_add(i as u64));
-        // A slot is 32 words, a multiple of the eight chains.
-        for chunk in self.regs.regs.as_flattened().as_chunks::<8>().0 {
-            for (a, &v) in acc.iter_mut().zip(chunk) {
-                *a = mix(*a, v);
-            }
+        let total = self.regs.regs.iter().enumerate().fold(0u64, |a, (i, v)| a.wrapping_add(slot_hash(i as u32, v)));
+        Self::spin_finish(total, self.spin_masks())
+    }
+
+    /// Register slot `s` for writing; marks it for [`WarpState::spin_hash`].
+    /// Every register write goes through this or [`WarpState::reg_write_raw`].
+    #[inline]
+    pub fn reg_mut(&mut self, s: u32) -> &mut WarpValue<u64> {
+        if let Some(m) = &mut self.spin_memo {
+            m.mark(s);
         }
-        let mut h = mix(seed, self.regs.regs.len() as u64);
-        for a in acc {
-            h = mix(h, a);
+        self.regs.get_mut(s)
+    }
+
+    /// [`RegFile::write_raw`] through [`WarpState::reg_mut`]'s marking.
+    #[inline]
+    pub fn reg_write_raw(&mut self, s: u32, v: &WarpValue<u64>, mask: WarpMask) {
+        if let Some(m) = &mut self.spin_memo {
+            m.mark(s);
         }
-        h | 1
+        self.regs.write_raw(s, v, mask);
     }
 
     pub fn new(id: WarpId, cta: CtaId, warp_in_cta: u32, nslots: usize, live: WarpMask) -> WarpState {
@@ -736,7 +794,7 @@ impl<'a> ExecCtx<'a> {
     pub fn write_slot(&mut self, r: Reg, i: u32, v: &WarpValue<u64>) {
         let m = self.warp.active;
         let s = self.slot(r) + i;
-        self.warp.regs.write_raw(s, v, m);
+        self.warp.reg_write_raw(s, v, m);
     }
     /// Write a <= 64-bit value under the active mask.
     #[inline]

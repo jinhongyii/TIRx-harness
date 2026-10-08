@@ -27,7 +27,7 @@
 //!   recorded 16 workers); skipped when missing.
 //! * `corpus_numsim` — whole corpus kernels (NumSim mode, 1 worker) from the
 //!   recorded fixtures: `examples/record_race_fixtures.py OUT rmsnorm
-//!   deepgemm_sm100_fp8_gemm_1d1d fp16_bf16_gemm` into `$RACE_FIXTURES` or
+//!   deepgemm_sm100_fp8_gemm_1d1d fp16_bf16_gemm kda_backward_packed` into `$RACE_FIXTURES` or
 //!   `core-rs/target/race-fixtures`; skipped when missing.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
@@ -362,6 +362,8 @@ pub fn store_v4(iters: u32) -> Scenario {
 
 fn bench(c: &mut Criterion) {
     group(c, "spin_wait_regs", "pad768_iters4096", &spin_wait(768, 4096));
+    // A kda_backward_packed-sized register file (~8 MiB per warp).
+    group(c, "spin_wait_regs", "pad32768_iters1024", &spin_wait(32768, 1024));
     group(c, "admit_regs", "ctas64_pad256", &admit(64, 256));
     group(c, "read_special", "iters256", &read_special(256));
     group(c, "tcgen_ld", "x64_iters64", &tcgen_ld(64));
@@ -411,7 +413,7 @@ fn observed_overhead(c: &mut Criterion) {
 
 fn corpus(c: &mut Criterion) {
     let dir = fixtures::dir();
-    for case in ["rmsnorm", "deepgemm_sm100_fp8_gemm_1d1d", "fp16_bf16_gemm"] {
+    for case in ["rmsnorm", "deepgemm_sm100_fp8_gemm_1d1d", "fp16_bf16_gemm", "kda_backward_packed"] {
         if !fixtures::exists(&dir, case) {
             eprintln!("corpus_numsim: fixture {dir}/{case}.* missing, skipped");
             continue;
