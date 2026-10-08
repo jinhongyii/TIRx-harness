@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -109,12 +109,6 @@ def test_lane_varying_min_extent_and_step_use_masked_native_loop():
     np.testing.assert_array_equal(result.outputs["selected"], selected)
 
 
-@v2_gap(
-    "a lane-varying For step of 0 is not rejected as an error: the run stops "
-    "with v2.ExecutionError 'NumSim execution incomplete: analysis_incomplete: "
-    "Budget: loop exceeded its iteration budget of 16777216' (legacy: "
-    "NumSimExecutionError 'For step must be positive'); error->incomplete delta"
-)
 def test_lane_varying_for_rejects_zero_step():
     """Second half of ``tests/numsim/runtime/test_loop_bounds.py::test_lane_varying_min_extent_and_step_use_masked_native_loop``
     (split out so the passing output half is not hidden by this gap).

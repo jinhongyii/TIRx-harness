@@ -29,7 +29,6 @@ from ._runnable import (
     assert_error_kind,
     assert_no_incomplete,
     coverage_bounds,
-    no_spec,
     requires_v2_engine,
     resource_limits,
 )
@@ -409,7 +408,6 @@ def test_racecheck_executes_lane_varying_dynamic_while_exactly():
 # -- test_native_racecheck_artifact.py -----------------------------------------
 
 
-@no_spec(8, "fully predicated-off accesses emit no access")
 def test_racecheck_ignores_fully_predicated_shared_pointer_load():
     """Replaces ``tests/analysis_tools/racecheck/test_native_racecheck_artifact.py::test_native_racecheck_ignores_fully_predicated_shared_pointer_load``.
 

@@ -19,7 +19,7 @@ from tests.numsim.support.kernels import mapped_remote_mbarrier_pointer
 from tests.numsim.support.remote_mbarrier import mapped_remote_mbarrier_pointer_expect_tx
 from tirx_harness.numsim import v2
 
-from ._runnable import assert_error_kind, coverage_bounds, requires_v2_engine, resource_limits, v2_gap
+from ._runnable import assert_error_kind, coverage_bounds, requires_v2_engine, resource_limits
 
 pytestmark = requires_v2_engine
 
@@ -35,7 +35,6 @@ def _sync(kernel):
     )
 
 
-@v2_gap("local-form mbarrier op on a mapa (remote) address is no longer rejected since 62c4226 (unqualified mbarrier operands lowered as generic/shared::cluster); sync-semantics.md section 2.1 keeps the decode rule")
 def test_synccheck_rejects_local_arrive_on_mapped_remote_address():
     """Replaces ``tests/analysis_tools/synccheck/test_native_synccheck_artifact.py::test_public_native_synccheck_rejects_local_arrive_on_mapped_remote_address``.
 
@@ -46,7 +45,6 @@ def test_synccheck_rejects_local_arrive_on_mapped_remote_address():
     assert_error_kind(_sync(mapped_remote_mbarrier_pointer), _KIND)
 
 
-@v2_gap("local-form mbarrier op on a mapa (remote) address is no longer rejected since 62c4226 (unqualified mbarrier operands lowered as generic/shared::cluster); sync-semantics.md section 2.1 keeps the decode rule")
 def test_synccheck_rejects_local_expect_tx_on_mapped_remote_address():
     """Replaces ``tests/analysis_tools/synccheck/test_native_synccheck_artifact.py::test_public_native_synccheck_rejects_local_expect_tx_on_mapped_remote_address``.
 

@@ -74,6 +74,8 @@ legacy engine is deleted.
 | `flash_attention_backward_sm100` / racecheck | racecheck-behaviour-deltas B7 (+ X4) | `scope_mismatch` on default-`.cta` remote arrives, the data races that follow from the dropped edge, and a `cross_cta_async_order` advisory |
 | `sparse_flashmla_prefill_head128_phase1`, `sparse_flashmla_prefill_head128_small_topk_phase1` / racecheck | racecheck-behaviour-deltas B7 (+ X4 for the first) | `scope_mismatch` on default-`.cta` remote arrives and the `missing_proxy_bridge` race that follows; `cross_cta_async_order` advisory (X4) |
 | `sm100_fp8_fp4_mega_moe` / racecheck | racecheck-behaviour-deltas T19, R4/B1, B7, X4 | true-positive race of non-elected-lane `lds128` TaskInfo reads vs remote `st.async` (T19), scope mismatches (R4/B1, B7), `cross_cta_async_order` (X4); the `alias_stale_read` grouping also follows the per-instruction-pair advisory rule |
+| `alphamoe_fp8_blockscale_qwen3next` / racecheck | racecheck-behaviour-deltas R3 | `undeclared_protocol_word` review instead of legacy's `data_race` |
+| `kda_backward_packed` / racecheck | racecheck-behaviour-deltas X4 | new `cross_cta_async_order` review advisory |
 | (removed) `msa_sparse_atten_fwd_nvfp4_kv_sm100` / racecheck | racecheck-behaviour-deltas T12 | subsumed by the schema-4 projection rule below (`tmem_lifetime_review` compared by kind + anchors) |
 
 ## What a snapshot contains (`snapshot.py`)

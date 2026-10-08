@@ -1,0 +1,26 @@
+{
+ "case": "alphamoe_fp8_blockscale_qwen3next",
+ "delta": "racecheck-behaviour-deltas R3: a strong generic load vs a morally strong store on an undeclared protocol word is an undeclared_protocol_word review, not a data_race",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/moe/alphamoe_fp8_blockscale_qwen3next.py:1579:1-1579:149",
+      "tirx_kernels/moe/alphamoe_fp8_blockscale_qwen3next.py:474:1-474:148"
+     ],
+     "bytes": {
+      "global#5": "6912-6920,7168-7176,20480-20488,21504-21512,45056-45064,46080-46088,53248-53256,54272-54280,77824-77832,78848-78856,86016-86024,87040-87048,110592-110600,111616-111624,118784-118792,119808-119816"
+     },
+     "category": "advisories",
+     "kind": "undeclared_protocol_word",
+     "space": "global",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

@@ -449,17 +449,20 @@ _A_ONLY_RESTRICTED_COMMIT = _no_spec_unlisted(
     "(not in the TcgenCommit contract per lowering-inventory.md; the v2 interpreter treats it as a "
     "full commit, so the B/metadata/LUT reuse is ordered and racecheck is clean)"
 )
-_DISABLED = pytest.mark.parametrize(
-    "disabled",
+# Shared-B reuse is reported since W5-13 (8fba7e1); only the TMEM
+# lookup/metadata reuse after the A-only restricted commit is still no_spec.
+_RESOURCE_DISABLED = pytest.mark.parametrize(
+    ("resource", "disabled"),
     [
-        pytest.param(True, id="mma_disabled"),
-        pytest.param(False, id="mma_enabled", marks=_A_ONLY_RESTRICTED_COMMIT),
+        pytest.param("b", True, id="b-mma_disabled"),
+        pytest.param("b", False, id="b-mma_enabled"),
+        pytest.param("lookup", True, id="lookup-mma_disabled"),
+        pytest.param("lookup", False, id="lookup-mma_enabled", marks=_A_ONLY_RESTRICTED_COMMIT),
     ],
 )
 
 
-@_DISABLED
-@pytest.mark.parametrize("resource", ["b", "lookup"])
+@_RESOURCE_DISABLED
 def test_sparse_b16_metadata_and_b_lifetimes(resource, disabled):
     """Replaces ``tests/numsim/runtime/test_tcgen05_sparse_b16.py::test_sparse_b16_metadata_and_b_lifetimes`` (its ``resource``/``disabled`` loops as params).
 
@@ -477,9 +480,8 @@ def test_sparse_b16_metadata_and_b_lifetimes(resource, disabled):
     assert report.verdict == ("clean" if disabled else "error"), report.format()
 
 
-@_DISABLED
+@_RESOURCE_DISABLED
 @pytest.mark.parametrize("block", [False, True], ids=["dense", "block_scale"])
-@pytest.mark.parametrize("resource", ["b", "lookup"])
 def test_lut_b_async_read_lifetimes(resource, block, disabled):
     """Replaces ``tests/numsim/runtime/test_tcgen_lut_b.py::test_lut_b_async_read_lifetimes[resource]`` (its ``block``/``disabled`` loops as params).
 

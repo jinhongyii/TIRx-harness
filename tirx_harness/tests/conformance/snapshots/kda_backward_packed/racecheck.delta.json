@@ -1,0 +1,39 @@
+{
+ "case": "kda_backward_packed",
+ "delta": "racecheck-behaviour-deltas X4: async-proxy writes from different CTAs ordered only by base causality get a cross_cta_async_order review advisory (legacy silent)",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/kda/kda_backward_packed.py:6565:1-6565:57",
+      "tirx_kernels/kda/kda_backward_packed.py:7030:1-7030:49"
+     ],
+     "bytes": {
+      "global#11": "0-256"
+     },
+     "category": "advisories",
+     "kind": "cross_cta_async_order",
+     "space": "global",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/kda/kda_backward_packed.py:6596:1-6596:57",
+      "tirx_kernels/kda/kda_backward_packed.py:7074:1-7074:49"
+     ],
+     "bytes": {
+      "global#12": "0-256"
+     },
+     "category": "advisories",
+     "kind": "cross_cta_async_order",
+     "space": "global",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

@@ -19,7 +19,7 @@ from tvm.script import tirx as T
 
 from tirx_harness.numsim import v2
 
-from ._runnable import DEADLOCK, assert_clean, assert_error_kind, no_spec, requires_v2_engine, v2_gap
+from ._runnable import DEADLOCK, assert_clean, assert_error_kind, requires_v2_engine, v2_gap
 
 pytestmark = requires_v2_engine
 
@@ -173,7 +173,6 @@ def test_racecheck_subset_is_typed_incomplete():
     ), report.format()
 
 
-@no_spec(9, "footprint narrowing: .ignore_oob read clipping")
 def test_bulk_g2s_cta_ignore_oob_does_not_bounds_check_the_ignored_bytes():
     """Replaces ``tests/analysis_tools/racecheck/test_native_raw_async_copy_footprints.py::test_bulk_g2s_cta_ignore_oob_does_not_bounds_check_the_ignored_bytes``.
 
@@ -195,11 +194,6 @@ def test_bulk_g2s_cta_ignore_oob_does_not_bounds_check_the_ignored_bytes():
         pytest.param(
             native_conditional_tcgen_alloc,
             id="warp-conditional-alloc",
-            marks=v2_gap(
-                "tcgen05.alloc emits no WarpSync (racecheck-semantics §3 row 3), so the dealloc's "
-                "read of the lane-0 address write is a missing_same_warp_lane_order race "
-                "(test-migration.md 'Missing WarpSync on tcgen05.alloc')"
-            ),
         ),
         pytest.param(native_rank_conditional_tmem_pool, id="rank-conditional-pool"),
         pytest.param(native_thread_topology_conditional_tmem_pool, id="thread-topology-conditional-pool"),

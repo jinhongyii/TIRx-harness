@@ -46,6 +46,28 @@ jobs:
             echo "core-rs is not present; skipping"
           fi
 
+  snapshot-deltas:
+    name: Snapshot changes cite a delta row
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Check conformance snapshot commits
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # A new branch push has no `before`; then only HEAD is checked.
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE=HEAD~1
+          fi
+          python scripts/numsim-v2/check_snapshot_deltas.py --base "$BASE" --head HEAD
+
   python:
     name: Python suite
     runs-on: ubuntu-24.04

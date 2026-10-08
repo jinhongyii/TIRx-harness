@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -66,11 +66,6 @@ def host_encoded_dynamic_integer_tensor_map(
         output[lane] = shared[lane]
 
 
-@v2_gap(
-    "host-encoded cuTensorMapEncodeTiled prologue with runtime integer expressions: the TMA "
-    "reads a descriptor image with invalid magic (invalid_operand); the sibling legacy checker "
-    "test fails the same way under NUMSIM_IMPL=v2 (observed at 0f55b57)"
-)
 def test_dynamic_tensor_map_expressions_run_in_the_loaded_artifact_prologue():
     """``-7/2`` truncates to -3 while floor division gives -4; reading at
     coordinate 16 makes the distinction observable (an incorrect

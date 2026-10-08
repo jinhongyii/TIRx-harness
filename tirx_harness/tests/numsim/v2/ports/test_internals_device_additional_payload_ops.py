@@ -29,7 +29,7 @@ from tvm.script import tirx as T
 from tvm.tirx.layout import S, TCol, TileLayout, TLane, tmem_datapath_layout
 
 from tests.numsim.support.kernels import tcgen_commit_runtime_multicast
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import TensorMap, v2
 
 pytestmark = requires_v2_engine
@@ -1523,13 +1523,7 @@ def _arguments(kernel_name: str) -> dict[str, Any]:
     return arguments
 
 
-_GAPS = {
-    "scalar_warp_intrinsics": v2_gap(
-        "synccheck verdict incomplete: analysis_incomplete 'Unsupported: "
-        "tirx.cuda.sm100_2sm_leader_smem_addr ... has no faithful pure-value model' "
-        "(numsim's shared::cluster address encoding differs from the hardware bit 24)"
-    ),
-}
+_GAPS: dict = {}
 
 
 # Covered by test_triage_device_additional_payload_ops.py, which asserts the

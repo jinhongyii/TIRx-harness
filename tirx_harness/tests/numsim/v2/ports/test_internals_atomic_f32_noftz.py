@@ -6,7 +6,7 @@ import pytest
 import tvm
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -90,17 +90,9 @@ def addition_expected(*, flush=False):
     return np.resize(bits, 128).view(np.float32)
 
 
-_PRED_IGNORED = v2_gap(
-    "predicated vector f32 atom/red (.v2/.v4 with pred=lane % 2 == 0) updates the "
-    "destination for predicated-off lanes too (e.g. v2 sink: element 2, lane 1, "
-    "0x00800001 -> 0x00000001 after +0x80800000); scalar forms are exact"
-)
-
-
 def _cases():
     for kind, width, space in ATOMIC_CASES:
-        marks = (_PRED_IGNORED,) if width > 1 else ()
-        yield pytest.param(kind, width, space, marks=marks, id=f"{kind}-{width}-{space}")
+        yield pytest.param(kind, width, space, id=f"{kind}-{width}-{space}")
 
 
 @pytest.mark.parametrize("kind,width,space", list(_cases()))

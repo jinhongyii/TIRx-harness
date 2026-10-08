@@ -37,7 +37,6 @@ from ._runnable import (
     no_spec,
     race_access_pairs,
     requires_v2_engine,
-    v2_gap,
 )
 
 pytestmark = requires_v2_engine
@@ -320,12 +319,8 @@ def test_unknown_register_overwrite_keeps_read_before_write_race(func):
 @pytest.mark.parametrize(
     "replace",
     [
-        pytest.param(False, id="initial-base", marks=v2_gap(
-            "distinct inputs: racecheck reports an alias_stale_read review on the TMA store "
-            "(W5; the V2C-25 bad_address is fixed)")),
-        pytest.param(True, id="replaced-base", marks=v2_gap(
-            "tensormap.replace + fence.proxy.tensormap::generic release/acquire still reports a "
-            "missing_proxy_bridge data_race on the descriptor bytes")),
+        pytest.param(False, id="initial-base"),
+        pytest.param(True, id="replaced-base"),
     ],
 )
 @pytest.mark.parametrize("alias_inputs", [_alias(False), _alias(True)])

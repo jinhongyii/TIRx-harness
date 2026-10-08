@@ -181,10 +181,6 @@ def test_raw_ptx_shared_address_retains_logical_alias_owner():
     _assert_alias_review(report)
 
 
-@v2_gap(
-    "alias_stale_read fires on a view/rearrange of ONE shared buffer (storage vs transposed): "
-    "the site->buffer table names views, not their logical root"
-)
 def test_explicit_view_keeps_one_logical_identity():
     """Replaces ``tests/analysis_tools/racecheck/test_native_alias_advisory.py::test_public_native_explicit_view_keeps_one_logical_identity``.
 
@@ -218,7 +214,6 @@ def test_full_extent_tmem_subview_keeps_one_logical_identity():
     _assert_numeric_then_clean(native_tmem_full_extent_subview_provenance)
 
 
-@_NO_SPEC
 def test_reused_tmem_lifetime_remains_distinct():
     """Replaces ``tests/analysis_tools/racecheck/test_native_alias_advisory.py::test_public_native_reused_tmem_lifetime_remains_distinct``.
 
