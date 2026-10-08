@@ -3206,3 +3206,10 @@ Review of 934f2b3 (partitioned declared words), invariant I10: verdict indices m
   - `declare` and `log_lane` mark regions dirty. `merge_words` merges only the dirty regions (sorted), and its verdict remap treats untouched regions as identity, since their log is the launch log's prefix. Dirty lists are cleared after each merge and on the `new_partition` copy.
   - When declared regions overlap, a lookup returns the first in span order (before: declaration order).
 - **Numbers.** `interp/recorded_word_history` radix rows: engine 55 ms, observing 85 ms, word history 244 ms (it hung before). mega_moe e24 findings and WaitVerdicts streams are hash-identical to the pre-change engine at workers 1 and 16.
+
+## W2 (2026-10-08): landing fast paths (Mega MoE max config); no contract change
+
+The changes below are bit-identical. On the recorded mega_moe e24 stream, the hash of every access and sync event (341,477 events) and the outputs are unchanged with and without them, at workers 1 and 16.
+- **TcgenCp landing.** Private (non-overlaid) source and destination with valid source bytes copy and decode through the byte arrays: a stack buffer and a direct write plus a validity range, instead of a `Vec`, `arena.read` and `arena.write` per cell. Max config: 324 → 131 CPU-s.
+- **Copy landing.** The source gather fills one buffer through the new `Arena::read_raw_into`, with no `Vec` per span. Max config: 163 → 114 CPU-s.
+- **Landing scan.** Readiness uses a lazily built set of live op ids, built only when an op has `after` dependencies, instead of a queue rescan per dependency. The order and RNG draws are unchanged. Max config: 86 → 75 CPU-s.

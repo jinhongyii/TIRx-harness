@@ -401,18 +401,31 @@ impl Partition {
     /// shard are deferred to the serial phase.
     pub(crate) fn land(&mut self, cta: Option<CtaId>, env: &Env<'_>, arena: &mut Arena, all: bool) -> Result<bool, ExecError> {
         let mut any = false;
+        // Live op ids, built only when an op with `after` dependencies is
+        // tested (most ops have none): readiness is then a set lookup, not
+        // a rescan of the queue per dependency. Same order and RNG draws.
+        let mut live: Option<std::collections::HashSet<crate::sync::AsyncId>> = None;
         loop {
             let mut landed_one = false;
             let mut i = 0;
             while i < self.sync.async_ops.len() {
                 let op = &self.sync.async_ops[i];
                 let mine = cta.is_none_or(|c| op.source.cta == c);
-                let ready = op.after.iter().all(|d| !self.sync.async_ops.iter().any(|o| o.id == *d));
+                let ready = mine
+                    && (op.after.is_empty() || {
+                        let ops = &self.sync.async_ops;
+                        let l = live.get_or_insert_with(|| ops.iter().map(|o| o.id).collect());
+                        op.after.iter().all(|d| !l.contains(d))
+                    });
                 if mine && ready && !self.deferred.contains(&op.id) && (all || self.rng.below(2) == 0) {
                     if Self::is_global_reduce(op, arena) {
                         self.deferred.push(op.id);
                     } else {
+                        let id = op.id;
                         self.fire_op(i, env, arena)?;
+                        if let Some(l) = live.as_mut() {
+                            l.remove(&id);
+                        }
                         landed_one = true;
                         any = true;
                         continue;
@@ -559,12 +572,39 @@ impl Partition {
                 if src.len() != dst.len() {
                     return Err(sched_error(ExecErrorKind::Internal, kernel, op.source.warp, op.source.site, "tcgen05.cp payload pairs".into()));
                 }
+                // Fast path (as `run_mma`'s): private (non-overlaid) source
+                // and destination whose source bytes are all valid move
+                // through the allocations' byte arrays directly; anything
+                // else takes the generic arena read/write (same result).
+                let direct = |ar: &Arena, al: AllocId| !ar.is_overlaid(al) && !ar.get(al).metadata_only;
                 for (&(sa, ss), &(da, ds)) in src.iter().zip(dst) {
-                    let mut b = vec![0u8; ss.len as usize];
-                    arena.read(support::whole(arena, sa), &[ss], &mut b).map_err(|e| src_err(e.to_string()))?;
-                    let cell = crate::oplib::tcgen_cp_decode(&b, *decompress_bits)
+                    let mut buf = [0u8; 8];
+                    let n = ss.len as usize;
+                    let fast = n <= buf.len()
+                        && direct(arena, sa)
+                        && direct(arena, da)
+                        && ss.end() <= arena.get(sa).size
+                        && ds.end() <= arena.get(da).size
+                        && arena.get(sa).valid.first_clear(ss.start, ss.len).is_none();
+                    let b: &mut [u8] = &mut buf[..n.min(8)];
+                    let mut heap;
+                    let b: &mut [u8] = if fast {
+                        b.copy_from_slice(&arena.get(sa).bytes[ss.start as usize..ss.end() as usize]);
+                        b
+                    } else {
+                        heap = vec![0u8; n];
+                        arena.read(support::whole(arena, sa), &[ss], &mut heap).map_err(|e| src_err(e.to_string()))?;
+                        &mut heap
+                    };
+                    let cell = crate::oplib::tcgen_cp_decode(b, *decompress_bits)
                         .map_err(|e| sched_error(ExecErrorKind::Op(e.kind), kernel, op.source.warp, op.source.site, e.message))?;
-                    arena.write(support::whole(arena, da), &[ds], &cell).map_err(|e| src_err(e.to_string()))?;
+                    if fast && cell.len() as u64 == ds.len {
+                        let a = arena.get_mut(da);
+                        a.bytes[ds.start as usize..ds.end() as usize].copy_from_slice(&cell);
+                        a.valid.set_range(ds.start, ds.len, true);
+                    } else {
+                        arena.write(support::whole(arena, da), &[ds], &cell).map_err(|e| src_err(e.to_string()))?;
+                    }
                 }
                 reads.extend(src.iter().copied());
                 writes.extend(dst.iter().copied());
@@ -896,13 +936,16 @@ fn copy_spans(arena: &mut Arena, src: &[(AllocId, ByteSpan)], dst: &[(AllocId, B
     // shard overlay).
     let src_runs = merge_runs(src);
     if src_runs.iter().all(|&(a, s)| !arena.get(a).metadata_only && arena.first_invalid(support::whole(arena, a), s).is_none()) {
-        let mut bytes = Vec::with_capacity(total(src) as usize);
+        let mut bytes = vec![0u8; total(src) as usize];
+        let mut at = 0usize;
         for &(a, s) in &src_runs {
+            let out = &mut bytes[at..at + s.len as usize];
             if arena.is_overlaid(a) {
-                bytes.extend(arena.read_raw(a, s));
+                arena.read_raw_into(a, s, out);
             } else {
-                bytes.extend_from_slice(&arena.get(a).bytes[s.start as usize..s.end() as usize]);
+                out.copy_from_slice(&arena.get(a).bytes[s.start as usize..s.end() as usize]);
             }
+            at += s.len as usize;
         }
         let mut pos = 0usize;
         for (a, s) in merge_runs(dst) {
@@ -1160,8 +1203,19 @@ fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch
     Ok((r, writes, u))
 }
 
+/// Sort and merge overlapping/adjacent spans per allocation.
 fn coalesce(v: &mut Spans) {
-    v.sort();
+    if v.len() >= 64 && coalesce_dense(v) {
+        return;
+    }
+    coalesce_sorted(v);
+}
+
+fn coalesce_sorted(v: &mut Spans) {
+    // Unstable is exact here: equal `(AllocId, ByteSpan)` keys are
+    // indistinguishable (W13: the stable sort's buffer moves were ~10% of
+    // an fp8 GEMM run).
+    v.sort_unstable();
     let mut out: Spans = Vec::with_capacity(v.len());
     for (a, s) in v.drain(..) {
         match out.last_mut() {
@@ -1173,4 +1227,120 @@ fn coalesce(v: &mut Spans) {
         }
     }
     *v = out;
+}
+
+/// [`coalesce_sorted`] through one bitmap per allocation (W13): an MMA
+/// notes thousands of small spans over a few compact shared/TMEM ranges,
+/// where marking bytes and reading back the maximal runs is linear. The
+/// result is the same: the union of the spans as maximal runs (touching
+/// spans merged), in (allocation, start) order. Returns false, leaving `v`
+/// untouched, when the spans are not dense (or a span is empty, which the
+/// sorted merge keeps as its own entry).
+fn coalesce_dense(v: &mut Spans) -> bool {
+    let mut ranges: Vec<(AllocId, u64, u64)> = Vec::new();
+    for &(a, s) in v.iter() {
+        if s.len == 0 {
+            return false;
+        }
+        match ranges.iter_mut().find(|r| r.0 == a) {
+            Some(r) => {
+                r.1 = r.1.min(s.start);
+                r.2 = r.2.max(s.end());
+            }
+            None => {
+                if ranges.len() == 8 {
+                    return false;
+                }
+                ranges.push((a, s.start, s.end()));
+            }
+        }
+    }
+    let words: u64 = ranges.iter().map(|r| (r.2 - r.1).div_ceil(64)).sum();
+    if words > 8 * v.len() as u64 + 1024 {
+        return false;
+    }
+    ranges.sort_unstable_by_key(|r| r.0);
+    let mut bits: Vec<Vec<u64>> = ranges.iter().map(|r| vec![0u64; (r.2 - r.1).div_ceil(64) as usize]).collect();
+    for &(a, s) in v.iter() {
+        let k = ranges.iter().position(|r| r.0 == a).expect("range");
+        let (b, lo) = (&mut bits[k], ranges[k].1);
+        let (mut i, end) = (s.start - lo, s.end() - lo);
+        while i < end {
+            let w = (i / 64) as usize;
+            let bit = i % 64;
+            let n = (64 - bit).min(end - i);
+            b[w] |= if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << bit };
+            i += n;
+        }
+    }
+    v.clear();
+    for (r, b) in ranges.iter().zip(&bits) {
+        // Maximal runs of set bits, word by word (bits past the range's
+        // end are never set).
+        let mut start: Option<u64> = None;
+        for (wi, &w) in b.iter().enumerate() {
+            let base = wi as u64 * 64;
+            match start {
+                None if w == 0 => continue,
+                Some(_) if w == u64::MAX => continue,
+                _ => {}
+            }
+            let mut pos = 0u32;
+            while pos < 64 {
+                let y = if start.is_some() { !w } else { w } >> pos;
+                if y == 0 {
+                    break;
+                }
+                let t = pos + y.trailing_zeros();
+                match start.take() {
+                    Some(st) => v.push((r.0, ByteSpan::new(r.1 + st, base + t as u64 - st))),
+                    None => start = Some(base + t as u64),
+                }
+                pos = t;
+            }
+        }
+        if let Some(st) = start {
+            let end = b.len() as u64 * 64;
+            v.push((r.0, ByteSpan::new(r.1 + st, end - st)));
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::*;
+
+    #[test]
+    fn dense_matches_sorted_merge() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut dense = 0;
+        for case in 0..400 {
+            let n = 64 + rnd(600) as usize;
+            let allocs = 1 + rnd(4) as u32;
+            let width = 64 + rnd(8192);
+            let v: Spans = (0..n)
+                .map(|_| (AllocId(rnd(allocs as u64) as u32 * 3), ByteSpan::new(1000 + rnd(width), 1 + rnd(if case % 3 == 0 { 3 } else { 40 }))))
+                .collect();
+            let mut want = v.clone();
+            coalesce_sorted(&mut want);
+            let mut got = v.clone();
+            if coalesce_dense(&mut got) {
+                dense += 1;
+                assert_eq!(got, want, "case {case}");
+            } else {
+                assert_eq!(got, v, "case {case}: a declined dense pass leaves the spans");
+            }
+            let mut via = v;
+            coalesce(&mut via);
+            assert_eq!(via, want, "case {case}");
+        }
+        assert!(dense > 300, "{dense} dense cases");
+    }
 }

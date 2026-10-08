@@ -770,8 +770,15 @@ impl Arena {
     /// Bytes of `span` (allocation-relative) regardless of validity
     /// (out-of-range bytes read as zero).
     pub fn read_raw(&self, id: AllocId, span: ByteSpan) -> Vec<u8> {
-        let size = self.get(id).size;
         let mut out = vec![0u8; span.len as usize];
+        self.read_raw_into(id, span, &mut out);
+        out
+    }
+
+    /// [`Self::read_raw`] into `out` (`span.len` bytes; bytes past the
+    /// allocation are left untouched).
+    pub fn read_raw_into(&self, id: AllocId, span: ByteSpan, out: &mut [u8]) {
+        let size = self.get(id).size;
         let end = span.end().min(size);
         if span.start < end && !self.get(id).metadata_only {
             let abs = ByteSpan::new(span.start, end - span.start);
@@ -780,7 +787,6 @@ impl Arena {
                 out[d..d + n as usize].copy_from_slice(&bytes[at as usize..(at + n) as usize]);
             });
         }
-        out
     }
 
     /// First invalid byte (allocation-relative) of a view-relative span.
