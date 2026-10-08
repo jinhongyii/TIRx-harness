@@ -82,6 +82,11 @@ pub struct SynccheckConfig {
     pub fingerprints: bool,
     pub explore: explore::Options,
     pub limits: EchoLimits,
+    /// Largest `.exclusive` tcgen05.alloc in columns, from the launch's
+    /// arch (`sched::exclusive_tmem_columns`: 576 on sm_107f, 512
+    /// elsewhere). `None`: derived from the recording (see
+    /// `Program::tcgen_exclusive_max`).
+    pub tcgen_exclusive_max: Option<u32>,
 }
 
 impl Default for SynccheckConfig {
@@ -95,6 +100,7 @@ impl Default for SynccheckConfig {
             fingerprints: true,
             explore: explore::Options::ALL,
             limits: EchoLimits::default(),
+            tcgen_exclusive_max: None,
         }
     }
 }
@@ -199,7 +205,7 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
         out.program_build(format!("the log mixes launches {kernels:?}; check each launch separately (check_launches)"));
         return out.finish(started);
     }
-    let (program, failures) = match program::build(log) {
+    let (mut program, failures) = match program::build(log) {
         Ok(x) => x,
         Err(detail) => {
             // A protocol error the engine hit stops the launch, so the log
@@ -231,6 +237,9 @@ pub fn check(log: &RecordingObserver, config: &SynccheckConfig) -> Report {
         return out.finish(started);
     }
     out.kernel = program.kernel;
+    if let Some(max) = config.tcgen_exclusive_max {
+        program.tcgen_exclusive_max = max;
+    }
     if program.commands.is_empty() {
         return out.finish(started);
     }

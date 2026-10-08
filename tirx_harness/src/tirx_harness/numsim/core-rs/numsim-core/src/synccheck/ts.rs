@@ -255,7 +255,11 @@ impl<'p> Ts<'p> {
         let mut initial_res = Vec::new();
         for &r in &resources {
             let id: ResourceId = program.resources[r];
-            initial_res.push(backend::fresh(id, init).ok_or_else(|| format!("resource {id:?} has no protocol model"))?);
+            let mut fresh = backend::fresh(id, init).ok_or_else(|| format!("resource {id:?} has no protocol model"))?;
+            if let Res::Tcgen(t) = &mut fresh {
+                t.exclusive_max = program.tcgen_exclusive_max;
+            }
+            initial_res.push(fresh);
         }
         let mut resource_cmds = vec![Vec::new(); resources.len()];
         for (i, c) in cmds.iter().enumerate() {

@@ -938,3 +938,39 @@ fn uncommitted_bulk_issue_at_exit_is_not_a_lint() {
         assert_eq!(r.verdict, verdict, "{domain:?}: {:#}", serialize(&r));
     }
 }
+
+/// W2-18: the `.exclusive` limit is 576 columns on sm_107f (PTX Table 58).
+/// The recording has no arch; the width of a committed alloc is static and
+/// the engine validated it against the arch, so the explorer accepts what
+/// the run committed. An explicit `tcgen_exclusive_max` (sm_100: 512) still
+/// rejects it.
+#[test]
+fn tcgen_exclusive_576_follows_the_arch() {
+    let alloc = SyncCmd::Tcgen(tcgen::Cmd::Alloc { who: tcgen::Who::One(0), columns: 576, exclusive: true });
+    let dealloc = SyncCmd::Tcgen(tcgen::Cmd::Dealloc { who: tcgen::Who::One(0), taddr: 0, columns: 576, exclusive: true });
+    let mut log = LogBuilder::new();
+    log.cmd(0, 1, tmem(0), alloc).cmd(0, 2, tmem(0), dealloc).cmd(0, 3, tmem(0), tmem_relinquish());
+    let log = log.build();
+    run_all(&log, one(), Verdict::Clean);
+    let sm107 = check(&log, &SynccheckConfig { tcgen_exclusive_max: Some(576), ..config(one()) });
+    assert_eq!(sm107.verdict, Verdict::Clean);
+    let sm100 = check(&log, &SynccheckConfig { tcgen_exclusive_max: Some(512), ..config(one()) });
+    assert_eq!(sm100.verdict, Verdict::Error, "{:#}", serialize(&sm100));
+}
+
+/// V2C-14 (`cudnn_sm100_dense_blockscaled_gemm_persistent_{amax,dsrelu_quant}`):
+/// in a 6-warp CTA, warpgroup 0 runs setmaxnreg and the CTA-wide aligned
+/// `bar.sync` also credits the trailing warps 4-5 (no warpgroup): that credit
+/// is a no-op. A setmaxnreg by warps 4-5 is still `IncompleteWarpgroup`.
+#[test]
+fn trailing_partial_warpgroup_sync_is_not_an_error() {
+    let mut log = LogBuilder::new();
+    log.collective(&WG[0], 1, vec![(reg_pool(0), setmax(0, false, 64))]);
+    log.cmd(4, 2, reg_pool(0), wg_sync(1));
+    run_all(&log.build(), cta(6), Verdict::Clean);
+    let mut log = LogBuilder::new();
+    log.collective(&[4, 5], 1, vec![(reg_pool(0), setmax(1, false, 64))]);
+    for (name, r) in run_all(&log.build(), cta(6), Verdict::Error) {
+        assert_eq!(kind(&r), "setmaxnreg_incomplete_warpgroup", "{name}");
+    }
+}

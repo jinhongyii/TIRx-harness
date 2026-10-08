@@ -2044,3 +2044,8 @@ Fixed in this phase (W2):
 RaceObserver: 147 s for the same 200 rounds (engine ~5 s). More than 95% is in RaceObserver callbacks, which are W5 internals and were not profiled per the rule. Engine-side under observation:
 - `tcgen05.mma` handler 1.37 ms: the W5-10 shared-A footprint probe runs oplib twice and is cached per descriptor; misses dominate (W2: amortize).
 - MMA landing 2.0 ms.
+
+## W6-5 (2026-10-08): W2-18 / V2C-14
+
+1. **W2-18 (done in synccheck).** `SynccheckConfig::tcgen_exclusive_max: Option<u32>`. Request to the numsim-py owner: set it from `Program.arch` via `sched::exclusive_tmem_columns`. Without it, synccheck uses the largest `.exclusive` width the run committed (at least 512), which is sound because the engine already validated each width against the arch. The `tcgen_exclusive_576_sm107` special scenario can now assert synccheck Clean (`tests/interp_checkers_smoke.rs`, W2).
+2. **V2C-14 (rule clarified, reference and sync changed).** `setmaxnreg` by the trailing warps of a CTA (warp count not a multiple of 4) stays `IncompleteWarpgroup`. `WarpgroupSync` for such a tail is a no-op in `numsim-sync-ref::setmaxnreg` and `numsim-core::sync::setmaxnreg` (sync-semantics §7.4). Optional for W2: `interp/handlers/sync.rs` could skip crediting a group with fewer than 4 warps (`n < 4`). The model now tolerates it either way.

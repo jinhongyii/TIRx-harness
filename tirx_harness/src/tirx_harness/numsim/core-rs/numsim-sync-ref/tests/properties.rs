@@ -913,3 +913,16 @@ proptest! {
         }
     }
 }
+
+/// V2C-14: warps 4-5 of a 6-warp CTA form no warpgroup. Their `setmaxnreg`
+/// is `IncompleteWarpgroup` (PTX 9.7.21.5: UB unless every warp of the
+/// warpgroup executes it), but crediting their aligned `bar.sync` is a no-op.
+#[test]
+fn setmaxnreg_trailing_partial_warpgroup() {
+    use setmaxnreg::{step, Cmd, Error, Outcome, State};
+    let mut s = State::new(6);
+    assert_eq!(step(&mut s, Cmd::WarpgroupSync { wg: 1 }), Ok(Outcome::Done));
+    assert_eq!(step(&mut s, Cmd::Set { wg: 1, inc: false, count: 64 }), Err(Error::IncompleteWarpgroup { wg: 1 }));
+    assert_eq!(step(&mut s, Cmd::Set { wg: 0, inc: false, count: 64 }), Ok(Outcome::Applied { count: 64 }));
+    assert_eq!(step(&mut s, Cmd::WarpgroupSync { wg: 2 }), Ok(Outcome::Done));
+}

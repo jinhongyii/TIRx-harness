@@ -181,8 +181,20 @@ fn apply(s: &mut State, cmd: Cmd) -> Result<Outcome, Error> {
             }
         }
         Cmd::WarpgroupSync { wg } => {
-            let i = check_wg(s, wg)?;
-            s.needs_sync[i] = false;
+            // A warpgroup is four contiguous warps whose first warp rank is a
+            // multiple of 4 (PTX ISA "warpgroup"). The trailing warps of a CTA
+            // whose warp count is not a multiple of 4 (e.g. warps 4-5 of a
+            // 6-warp CTA) form no warpgroup, so `setmaxnreg` there is still
+            // `IncompleteWarpgroup` (UB: "If a setmaxnreg instruction is not
+            // executed by all warps in the warpgroup, then the behavior is
+            // undefined", PTX 9.7.21.5). But an aligned `bar.sync` among
+            // them is legal and owes no setmaxnreg sync: crediting it is a
+            // no-op, not an error (V2C-14).
+            match check_wg(s, wg) {
+                Ok(i) => s.needs_sync[i] = false,
+                Err(Error::IncompleteWarpgroup { .. }) => {}
+                Err(e) => return Err(e),
+            }
             Ok(Outcome::Done)
         }
         Cmd::Grant { wg } => {

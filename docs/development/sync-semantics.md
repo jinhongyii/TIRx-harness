@@ -871,6 +871,7 @@ The reference follows the hub. Its commands are `Configure`, `Set`, `WarpgroupSy
 ### 7.4 PTX basis
 
 - All warps of the warpgroup execute the same setmaxnreg. This underlies `Divergence`, the full-warp checks and `IncompleteWarpgroup`.
+- A warpgroup is four contiguous warps whose first warp rank is a multiple of 4. The trailing warps of a CTA whose warp count is not a multiple of 4 (warps 4-5 of a 6-warp CTA) form no warpgroup. A `setmaxnreg` by them is `IncompleteWarpgroup`: PTX 9.7.21.5 says "If a `setmaxnreg` instruction is not executed by all warps in the *warpgroup*, then the behavior is undefined", and the legacy hub also rejects it. An aligned `bar.sync` among them is legal and owes no setmaxnreg sync, so a `WarpgroupSync` credit for such a group is a no-op (V2C-14, 2026-10-08; reference and `sync::setmaxnreg` both changed).
 - The count is in [24, 256] and a multiple of 8.
 - `inc` requests more registers and blocks until they are available. `dec` releases them.
 - A warpgroup must synchronize explicitly before a subsequent setmaxnreg.

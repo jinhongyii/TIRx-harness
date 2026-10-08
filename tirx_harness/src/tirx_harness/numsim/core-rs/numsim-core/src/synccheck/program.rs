@@ -43,6 +43,13 @@ pub struct Program {
     /// host-side protocol events (e.g. the launch-bounds setmaxnreg
     /// `Configure`) and every `Configure` wherever it was logged.
     pub init_cmds: Vec<(usize, SyncCmd)>,
+    /// Largest `.exclusive` tcgen05.alloc (PTX Table 58: 512 columns, 576 on
+    /// sm_107f). The recording has no arch, but an alloc's width is a static
+    /// fact of its command that the engine already validated against the
+    /// launch's arch (a rejected one is a Phase A failure). So the default is
+    /// the largest width the run committed, and at least 512.
+    /// `SynccheckConfig::tcgen_exclusive_max` overrides it (W2-18).
+    pub tcgen_exclusive_max: u32,
 }
 
 /// A failure the engine already hit in the concrete run (Phase A).
@@ -269,7 +276,15 @@ pub fn build(log: &RecordingObserver) -> Result<(Program, Vec<PhaseAFailure>), S
         }
         warp_programs.push(list.into_iter().map(|(_, c)| c).collect());
     }
-    Ok((Program { kernel: kernel.unwrap_or(0), warp_ids, warp_programs, commands, resources, init_cmds }, failures))
+    let tcgen_exclusive_max = commands
+        .iter()
+        .flat_map(|c| &c.cmds)
+        .filter_map(|(_, cmd)| match cmd {
+            SyncCmd::Tcgen(tcgen::Cmd::Alloc { columns, exclusive: true, .. }) => Some(*columns),
+            _ => None,
+        })
+        .fold(tcgen::TMEM_COLUMNS, u32::max);
+    Ok((Program { kernel: kernel.unwrap_or(0), warp_ids, warp_programs, commands, resources, init_cmds, tcgen_exclusive_max }, failures))
 }
 
 impl Program {
