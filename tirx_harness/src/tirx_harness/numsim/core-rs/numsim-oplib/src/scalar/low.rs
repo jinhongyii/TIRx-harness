@@ -175,7 +175,7 @@ pub fn low_add_rn(
     };
     let lhs = decode_low(lhs, format);
     let rhs = decode_low(rhs, format);
-    let host = if subtract { lhs - rhs } else { lhs + rhs };
+    let host = pin_nan2_f32(lhs, rhs, if subtract { lhs - rhs } else { lhs + rhs });
     if !lhs.is_finite() || !rhs.is_finite() {
         return format.encode_host_result(host);
     }

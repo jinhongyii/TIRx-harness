@@ -108,7 +108,7 @@ pub(crate) fn round_f32_candidate(
 }
 
 pub fn add_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
-    let rounded = lhs + rhs;
+    let rounded = pin_nan2_f32(lhs, rhs, lhs + rhs);
     if mode == F32RoundingMode::Nearest || !lhs.is_finite() || !rhs.is_finite() {
         return rounded;
     }
@@ -117,7 +117,7 @@ pub fn add_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
 }
 
 pub fn sub_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
-    let rounded = lhs - rhs;
+    let rounded = pin_nan2_f32(lhs, rhs, lhs - rhs);
     if mode == F32RoundingMode::Nearest || !lhs.is_finite() || !rhs.is_finite() {
         return rounded;
     }
@@ -127,7 +127,7 @@ pub fn sub_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
 }
 
 pub fn mul_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
-    round_f32_from_exact(lhs * rhs, (lhs as f64) * (rhs as f64), mode)
+    round_f32_from_exact(pin_nan2_f32(lhs, rhs, lhs * rhs), (lhs as f64) * (rhs as f64), mode)
 }
 
 pub fn add_f32_ftz(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
@@ -546,7 +546,7 @@ pub fn add_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
 
 pub fn sub_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
     if mode == F32RoundingMode::Nearest || !lhs.is_finite() || !rhs.is_finite() {
-        lhs - rhs
+        pin_nan2_f64(lhs, rhs, lhs - rhs)
     } else {
         fma_f64(lhs, 1.0, -rhs, mode)
     }
@@ -554,7 +554,7 @@ pub fn sub_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
 
 pub fn mul_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
     if mode == F32RoundingMode::Nearest || !lhs.is_finite() || !rhs.is_finite() {
-        lhs * rhs
+        pin_nan2_f64(lhs, rhs, lhs * rhs)
     } else {
         // Same-signed zero addition preserves the product's sign, including -0.
         let zero = f64::from_bits((lhs.to_bits() ^ rhs.to_bits()) & (1_u64 << 63));

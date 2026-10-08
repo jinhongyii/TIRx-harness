@@ -508,3 +508,28 @@ fn f32_modifiers_compose_rounding_ftz_and_saturation() {
         0x3c00
     );
 }
+
+/// PTX `add/sub/mul.f32` NaN results are pinned (first NaN of (a, b),
+/// quieted; invalid -> 0xffc00000), so optimized and unoptimized builds give
+/// the same bits (the `--release` run of this test checks the former).
+#[test]
+fn ptx_add_sub_mul_nan_bits_are_build_independent() {
+    use crate::scalar::F32RoundingMode as M;
+    let f = f32::from_bits;
+    let (qa, sb) = (f(0x7fc0_1234), f(0xffa0_0001));
+    for mode in [M::Nearest, M::Zero, M::Down, M::Up] {
+        for ftz in [false, true] {
+            let add = |a, b| add_f32(std::hint::black_box(a), std::hint::black_box(b), mode, ftz, false).to_bits();
+            let sub = |a, b| sub_f32(std::hint::black_box(a), std::hint::black_box(b), mode, ftz, false).to_bits();
+            let mul = |a, b| mul_f32(std::hint::black_box(a), std::hint::black_box(b), mode, ftz, false).to_bits();
+            for op in [&add as &dyn Fn(f32, f32) -> u32, &sub, &mul] {
+                assert_eq!(op(qa, sb), 0x7fc0_1234, "{mode:?} ftz {ftz}");
+                assert_eq!(op(sb, qa), 0xffe0_0001, "{mode:?} ftz {ftz}");
+                assert_eq!(op(1.0, sb), 0xffe0_0001, "{mode:?} ftz {ftz}");
+            }
+            assert_eq!(add(f32::INFINITY, f32::NEG_INFINITY), 0xffc0_0000);
+            assert_eq!(sub(f32::INFINITY, f32::INFINITY), 0xffc0_0000);
+            assert_eq!(mul(f32::INFINITY, 0.0), 0xffc0_0000);
+        }
+    }
+}

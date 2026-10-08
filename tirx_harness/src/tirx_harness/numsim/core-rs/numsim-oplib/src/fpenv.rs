@@ -110,6 +110,57 @@ fn validate_abt_shapes<A, B, O>(
     Ok(())
 }
 
+/// `a * b + c` with the pinned host NaN (`scalar::host_fma_f32/f64`). The
+/// kernels keep plain `mul_add` (vectorizable); [`repin_nan_outputs`] then
+/// recomputes every NaN output with this, so the NaN payload never depends
+/// on the operand order LLVM picks for `vfmadd`.
+trait PinnedFma: Copy {
+    fn pinned(self, b: Self, c: Self) -> Self;
+    fn nan(self) -> bool;
+}
+impl PinnedFma for f32 {
+    #[inline(always)]
+    fn pinned(self, b: f32, c: f32) -> f32 {
+        crate::scalar::host_fma_f32(self, b, c)
+    }
+    #[inline(always)]
+    fn nan(self) -> bool {
+        self.is_nan()
+    }
+}
+impl PinnedFma for f64 {
+    #[inline(always)]
+    fn pinned(self, b: f64, c: f64) -> f64 {
+        crate::scalar::host_fma_f64(self, b, c)
+    }
+    #[inline(always)]
+    fn nan(self) -> bool {
+        self.is_nan()
+    }
+}
+#[inline(always)]
+fn fma_pinned<T: PinnedFma>(a: T, b: T, c: T) -> T {
+    a.pinned(b, c)
+}
+
+/// SIMD lanes leave a NaN's payload to the instruction's operand order:
+/// recompute every NaN output's chain with the pinned scalar FMA from its
+/// initial accumulator (a NaN, once produced, stays NaN along the chain).
+fn repin_nan_outputs<T: PinnedFma>(n: usize, k: usize, a_values: &[T], b_transposed: &[T], initial: &[T], output: &mut [T]) {
+    for (index, value) in output.iter_mut().enumerate() {
+        if !value.nan() {
+            continue;
+        }
+        let (row, column) = (index / n, index % n);
+        let mut accumulator = initial[index];
+        for inner in 0..k {
+            accumulator = fma_pinned(a_values[row * k + inner], b_transposed[inner * n + column], accumulator);
+        }
+        *value = accumulator;
+    }
+}
+
+
 fn fma_f32_abt_increasing_k_scalar(
     m: usize,
     n: usize,
@@ -199,8 +250,7 @@ fn fma_scalar_columns(
         for column in columns.clone() {
             let mut accumulator = output[row * n + column];
             for inner in 0..k {
-                accumulator = a_values[row * k + inner]
-                    .mul_add(b_transposed[inner * n + column], accumulator);
+                accumulator = a_values[row * k + inner].mul_add(b_transposed[inner * n + column], accumulator);
             }
             output[row * n + column] = accumulator;
         }
@@ -345,6 +395,20 @@ pub fn fma_f32_abt_increasing_k(
     output: &mut [f32],
 ) -> Result<(), FmaShapeError> {
     validate_abt_shapes(m, n, k, a_values, b_transposed, output)?;
+    let initial = output.to_vec();
+    fma_f32_abt_increasing_k_dispatch(m, n, k, a_values, b_transposed, output);
+    repin_nan_outputs(n, k, a_values, b_transposed, &initial, output);
+    Ok(())
+}
+
+fn fma_f32_abt_increasing_k_dispatch(
+    m: usize,
+    n: usize,
+    k: usize,
+    a_values: &[f32],
+    b_transposed: &[f32],
+    output: &mut [f32],
+) {
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -356,7 +420,7 @@ pub fn fma_f32_abt_increasing_k(
             unsafe {
                 fma_f32_abt_increasing_k_avx512(m, n, k, a_values, b_transposed, output);
             }
-            return Ok(());
+            return;
         }
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
@@ -365,12 +429,11 @@ pub fn fma_f32_abt_increasing_k(
             unsafe {
                 fma_f32_abt_increasing_k_avx2(m, n, k, a_values, b_transposed, output);
             }
-            return Ok(());
+            return;
         }
     }
 
     fma_f32_abt_increasing_k_scalar(m, n, k, a_values, b_transposed, output);
-    Ok(())
 }
 
 fn fma_f64_abt_increasing_k_scalar(
@@ -481,6 +544,20 @@ pub fn fma_f64_abt_increasing_k(
     output: &mut [f64],
 ) -> Result<(), FmaShapeError> {
     validate_abt_shapes(m, n, k, a_values, b_transposed, output)?;
+    let initial = output.to_vec();
+    fma_f64_abt_increasing_k_dispatch(m, n, k, a_values, b_transposed, output);
+    repin_nan_outputs(n, k, a_values, b_transposed, &initial, output);
+    Ok(())
+}
+
+fn fma_f64_abt_increasing_k_dispatch(
+    m: usize,
+    n: usize,
+    k: usize,
+    a_values: &[f64],
+    b_transposed: &[f64],
+    output: &mut [f64],
+) {
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -491,7 +568,7 @@ pub fn fma_f64_abt_increasing_k(
             unsafe {
                 fma_f64_abt_increasing_k_avx2(m, n, k, a_values, b_transposed, output);
             }
-            return Ok(());
+            return;
         }
         if std::arch::is_x86_feature_detected!("avx512f") {
             // SAFETY: runtime detection establishes AVX-512F support and the
@@ -499,12 +576,11 @@ pub fn fma_f64_abt_increasing_k(
             unsafe {
                 fma_f64_abt_increasing_k_avx512(m, n, k, a_values, b_transposed, output);
             }
-            return Ok(());
+            return;
         }
     }
 
     fma_f64_abt_increasing_k_scalar(m, n, k, a_values, b_transposed, output);
-    Ok(())
 }
 
 fn multiply_accumulate_i32_abt_scalar(
@@ -715,8 +791,7 @@ mod tests {
             for column in 0..n {
                 let mut accumulator = initial[row * n + column];
                 for inner in 0..k {
-                    accumulator = a_values[row * k + inner]
-                        .mul_add(b_transposed[inner * n + column], accumulator);
+                    accumulator = a_values[row * k + inner].mul_add(b_transposed[inner * n + column], accumulator);
                 }
                 expected.push(accumulator.to_bits());
             }
@@ -760,5 +835,63 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(test)]
+mod pinned_nan_tests {
+    use super::*;
+
+    /// The SIMD MMA chains give the pinned scalar chain's bits on NaN
+    /// outputs (several NaN payloads per chain, invalid products), whichever
+    /// vector path the CPU takes and in any build profile.
+    #[test]
+    fn abt_chains_pin_nan_payloads() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let nans32 = [0x7fc0_1234_u32, 0xffa0_0001, 0x7f80_0007, 0xffc0_0000];
+        for (m, n, k) in [(5, 37, 9), (16, 64, 16), (3, 8, 1)] {
+            let pick = |x: u64| -> f32 {
+                match x % 13 {
+                    0 => f32::from_bits(nans32[(x >> 8) as usize % 4]),
+                    1 => f32::INFINITY,
+                    2 => 0.0,
+                    _ => f32::from_bits(0x3f00_0000 | (x as u32 & 0x00ff_ffff)),
+                }
+            };
+            let a: Vec<f32> = (0..m * k).map(|_| pick(next())).collect();
+            let b: Vec<f32> = (0..k * n).map(|_| pick(next())).collect();
+            let init: Vec<f32> = (0..m * n).map(|_| pick(next())).collect();
+            let mut fast = init.clone();
+            fma_f32_abt_increasing_k(m, n, k, &a, &b, &mut fast).unwrap();
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = init[row * n + col];
+                    for inner in 0..k {
+                        acc = crate::scalar::host_fma_f32(a[row * k + inner], b[inner * n + col], acc);
+                    }
+                    assert_eq!(fast[row * n + col].to_bits(), acc.to_bits(), "f32 {m}x{n}x{k} ({row}, {col})");
+                }
+            }
+            let a: Vec<f64> = a.iter().map(|&v| f64::from(v)).collect();
+            let b: Vec<f64> = b.iter().map(|&v| f64::from(v)).collect();
+            let init: Vec<f64> = init.iter().map(|&v| f64::from(v)).collect();
+            let mut fast = init.clone();
+            fma_f64_abt_increasing_k(m, n, k, &a, &b, &mut fast).unwrap();
+            for row in 0..m {
+                for col in 0..n {
+                    let mut acc = init[row * n + col];
+                    for inner in 0..k {
+                        acc = crate::scalar::host_fma_f64(a[row * k + inner], b[inner * n + col], acc);
+                    }
+                    assert_eq!(fast[row * n + col].to_bits(), acc.to_bits(), "f64 {m}x{n}x{k} ({row}, {col})");
+                }
+            }
+        }
     }
 }

@@ -31,7 +31,7 @@ pub fn mma_f32_dot_increasing_k(
         )));
     }
     for (&a, &b) in a_values.iter().zip(b_values) {
-        accumulator = a.mul_add(b, accumulator);
+        accumulator = crate::scalar::host_fma_f32(a, b, accumulator);
     }
     Ok(accumulator)
 }

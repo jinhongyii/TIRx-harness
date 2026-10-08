@@ -434,7 +434,7 @@ mod tests {
             for col in 0..8 {
                 let mut acc = c(row, col);
                 for inner in 0..k {
-                    acc = a_val(row, inner).mul_add(b_val(inner, col), acc);
+                    acc = crate::scalar::host_fma_f32(a_val(row, inner), b_val(inner, col), acc);
                 }
                 out[row * 8 + col] = acc;
             }
@@ -623,7 +623,7 @@ mod tests {
                 for col in 0..8 {
                     let mut acc = 0.0_f32;
                     for inner in 0..4 {
-                        acc = a_val(row + computation, inner).mul_add(b_val(inner, col), acc);
+                        acc = crate::scalar::host_fma_f32(a_val(row + computation, inner), b_val(inner, col), acc);
                     }
                     let (lane, slot) = m8n8k4_f32_acc_owner(computation, row, col).unwrap();
                     assert_eq!(d[slot][lane], acc);
