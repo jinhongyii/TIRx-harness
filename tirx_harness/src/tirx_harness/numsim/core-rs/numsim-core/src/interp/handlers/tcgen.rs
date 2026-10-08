@@ -474,17 +474,55 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
     };
     let op = ldst_op(ctx, AsyncClass::TcgenLd);
     let tmem = ctx.cta.tmem;
-    let mut tspans = Vec::new();
+    let mut tspans = Vec::with_capacity(if ctx.observing { active.count() as usize * nregs } else { 0 });
+    // One register image buffer for every lane (no per-lane allocation).
+    let mut bytes = vec![0u8; nregs * 4];
+    // Pieces of one lane, in order, as (piece, register byte).
+    let mut lane_pieces: Vec<(oplib::TcgenLdstPiece, usize)> = Vec::with_capacity(nregs * 2);
     for t in active.lanes() {
-        let mut bytes = vec![0u8; nregs * 4];
+        bytes.fill(0);
+        lane_pieces.clear();
         for r in 0..nregs {
-            for p in map.pieces(r, t) {
-                check_piece_live(ctx, p, t, "tcgen05.ld")?;
-                let loc = support::Loc { alloc: tmem, offset: piece_offset(p), window: None, remote: None };
-                let at = 4 * r + p.reg_byte as usize;
-                support::mem_read(ctx, loc, t, &mut bytes[at..at + p.len as usize])?;
-                tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(loc.offset, p.len as u64) });
+            lane_pieces.extend(map.pieces(r, t).iter().map(|p| (*p, 4 * r + p.reg_byte as usize)));
+        }
+        // Contiguous runs (TMEM bytes and register bytes both consecutive)
+        // are read at once when every column is live and every byte valid;
+        // otherwise the run is read piece by piece (same errors / findings).
+        let mut i = 0;
+        while i < lane_pieces.len() {
+            let (p0, at0) = lane_pieces[i];
+            let off0 = piece_offset(&p0);
+            let (mut len, mut last_col, mut j) = (p0.len as u64, p0.column, i + 1);
+            while let Some(&(p, at)) = lane_pieces.get(j) {
+                if piece_offset(&p) != off0 + len || at as u64 != at0 as u64 + len || p.column < last_col || p.column > last_col + 1 {
+                    break;
+                }
+                len += p.len as u64;
+                last_col = p.column;
+                j += 1;
             }
+            let span = ByteSpan::new(off0, len);
+            let batched = j - i > 1
+                && ctx.aux.capture_reads.is_none()
+                && support::tmem_live(ctx, p0.column, last_col - p0.column + 1)
+                && ctx.arena.first_invalid(support::whole(ctx.arena, tmem), span).is_none();
+            if batched {
+                let loc = support::Loc { alloc: tmem, offset: off0, window: None, remote: None };
+                support::mem_read(ctx, loc, t, &mut bytes[at0..at0 + len as usize])?;
+                if ctx.observing {
+                    tspans.extend(lane_pieces[i..j].iter().map(|(p, _)| LaneSpan { lane: t as u8, span: ByteSpan::new(piece_offset(p), p.len as u64) }));
+                }
+            } else {
+                for &(p, at) in &lane_pieces[i..j] {
+                    check_piece_live(ctx, &p, t, "tcgen05.ld")?;
+                    let loc = support::Loc { alloc: tmem, offset: piece_offset(&p), window: None, remote: None };
+                    support::mem_read(ctx, loc, t, &mut bytes[at..at + p.len as usize])?;
+                    if ctx.observing {
+                        tspans.push(LaneSpan { lane: t as u8, span: ByteSpan::new(loc.offset, p.len as u64) });
+                    }
+                }
+            }
+            i = j;
         }
         let mut pos = 0usize;
         for &d in &args.dsts {
@@ -508,7 +546,7 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
     if let Some((_, regs)) = &red {
         written.extend(regs.iter().copied());
     }
-    let rs = reg_spans(ctx, &written, active);
+    let rs = if ctx.observing { reg_spans(ctx, &written, active) } else { Vec::new() };
     if let Some(&ra) = ctx.aux.reg_allocs.get(ctx.warp.id.0 as usize) {
         emit_async_spans(ctx, op, Side::Write, AccessKind::Write, ra, rs);
     }
@@ -551,7 +589,7 @@ pub fn tcgen_st(ctx: &mut ExecCtx<'_>, args: &TcgenStArgs) -> HResult {
         }
     }
     let regs: Vec<Reg> = args.srcs.iter().filter_map(|s| if let Operand::Reg(r) = s { Some(*r) } else { None }).collect();
-    let rs = reg_spans(ctx, &regs, active);
+    let rs = if ctx.observing { reg_spans(ctx, &regs, active) } else { Vec::new() };
     if let Some(&ra) = ctx.aux.reg_allocs.get(ctx.warp.id.0 as usize) {
         emit_async_spans(ctx, op, Side::Read, AccessKind::Read, ra, rs);
     }
@@ -767,9 +805,15 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
 /// 1024 bytes (a swizzle-atom multiple, so swizzling is unchanged); reads
 /// that moved are A's, the others B's. Cached per descriptor set.
 fn mma_a_footprint(ctx: &mut ExecCtx<'_>, p: &TcgenMmaPayload) -> Result<Vec<(u32, u32, u32)>, ExecError> {
-    let key = (p.a, p.b_desc, p.idesc, p.args.cta_group);
+    // The A footprint depends on A's descriptor (layout, LBO/SBO, swizzle),
+    // the instruction descriptor and the group, and moves with A's start
+    // address; swizzling sees the start only modulo 1024 bytes. Cache it
+    // relative to the start, keyed by everything else, so a pipeline
+    // walking its stages reuses one probe.
+    let start = ((p.a & 0x3fff) << 4) as u32;
+    let key = (p.a & !0x3fff, (start % 1024) as u64, p.idesc, p.args.cta_group);
     if let Some(v) = ctx.aux.mma_a_footprints.get(&key) {
-        return Ok(v.clone());
+        return Ok(v.iter().map(|&(c, rel, n)| (c, rel.wrapping_add(start), n)).collect());
     }
     let arch = match ctx.program.arch.as_deref() {
         Some(a) if a.starts_with("sm_103") => oplib::TcArch::Sm103,
@@ -778,7 +822,7 @@ fn mma_a_footprint(ctx: &mut ExecCtx<'_>, p: &TcgenMmaPayload) -> Result<Vec<(u3
     };
     let options = oplib::TcMmaOptions { arch, ti16: p.args.kind == TcMmaKind::Ti16, ..Default::default() };
     let out = mma_a_footprint_probe(p, &options);
-    ctx.aux.mma_a_footprints.insert(key, out.clone());
+    ctx.aux.mma_a_footprints.insert(key, out.iter().map(|&(c, a, n)| (c, a.wrapping_sub(start), n)).collect());
     Ok(out)
 }
 
@@ -787,14 +831,10 @@ fn mma_a_footprint(ctx: &mut ExecCtx<'_>, p: &TcgenMmaPayload) -> Result<Vec<(u3
 /// MMA has read A when it completes), and is what a `.sync_restrict`
 /// commit tracks.
 fn shared_a_read(ctx: &mut ExecCtx<'_>, l: usize, mma: AsyncId, p: &TcgenMmaPayload) -> Result<(), ExecError> {
-    if !ctx.observing {
-        // Numerics and sync never depend on the split: only the commit
-        // bookkeeping does, which tracks the MMA itself without it.
-        let rec = ctx.aux.tcgen_shared_reads.entry((ctx.warp.id, l as u8)).or_default();
-        rec.push(mma);
-        return Ok(());
-    }
-    let reads = mma_a_footprint(ctx, p)?;
+    // The op exists whether or not anyone observes (landing order and
+    // commit tracking must not depend on the observer); only its access
+    // footprint is computed for observers.
+    let reads = if ctx.observing { mma_a_footprint(ctx, p)? } else { Vec::new() };
     let mut spans: Vec<(crate::arena::AllocId, ByteSpan)> = reads
         .iter()
         .filter_map(|&(cta, a, n)| p.smem.get(cta as usize).map(|&al| (al, ByteSpan::new(addr::decode_shared(a).1 as u64, n as u64))))

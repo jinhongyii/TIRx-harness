@@ -2045,6 +2045,44 @@ RaceObserver: 147 s for the same 200 rounds (engine ~5 s). More than 95% is in R
 - `tcgen05.mma` handler 1.37 ms: the W5-10 shared-A footprint probe runs oplib twice and is cached per descriptor; misses dominate (W2: amortize).
 - MMA landing 2.0 ms.
 
+#### W2-21 phase 5 (engine perf, W2)
+
+Uninstrumented release build of `fp16_bf16_gemm` at 200 rounds. 27b485c and the current tree were run back to back on the same host, at load average about 10.
+
+| mode | 27b485c | now | instrs |
+| --- | --- | --- | --- |
+| NoopObserver | 5.07 s | 1.55 s (3.3x) | 1,390,361 -> 1,350,095 |
+| RaceObserver | 161.5 s | 154.9 s | 1,350,095 both; 207 findings both |
+
+The instruction count is now the same under every observer. Before, the W5-10 shared-A read op existed only when observing. It now always exists, and only its footprint is computed when observing.
+
+Changes:
+
+1. **Shared-A footprint cache.** Keyed by (descriptor bits without the start address, start mod 1024, idesc, cta_group). The cached footprint is stored relative to A's start, so a K-loop that advances the start reuses it. The footprint is computed only when observing.
+2. **TMA landing.**
+   - The root cause of hot spot #3, and most of hot spot #2, was copy-on-write stripe creation. It copied a 4096-bit validity mask one bit at a time, about 9 us per stripe. Every round's fresh shard overlay paid this for each global stripe a TMA store or reduce touched.
+   - `BitSet::slice` / `copy_bits` are now word-level, used in stripe creation and in `merge_shard`.
+   - `copy_spans` merges contiguous runs and stores each with one memcpy and one validity range.
+   - Per-span observer events are unchanged.
+   - Result: landing 706 -> 58 us per op, handler about 1 ms -> off the top list.
+3. **TMA handler.** The global window is resolved once per op, and later spans are offsets within it.
+4. **`tcgen05.ld`.**
+   - One register buffer for all lanes.
+   - Each lane's pieces are read as contiguous TMEM runs, with one liveness check and one read per run. A run that is not live, or has invalid bytes, falls back to per-piece reads, so errors and uninit findings are unchanged.
+   - Spans are recorded only when observing.
+   - Result: 188 -> 49 us per op.
+
+Remaining NoopObserver profile (instrumented, 1.68 s):
+
+| item | cost | share |
+| --- | --- | --- |
+| MMA landing (`oplib::tc_mma_ctas` numerics, W4) | 0.6 ms/op | 34% |
+| generic `Ptx` | 2.6 us/op | 22% |
+| `tcgen05.ld` | 49 us/op | 11% |
+| TMA landing | 58 us/op | 5% |
+
+RaceObserver time is still more than 95% inside W5 callbacks.
+
 ## W6-5 (2026-10-08): W2-18 / V2C-14
 
 1. **W2-18 (done in synccheck).** `SynccheckConfig::tcgen_exclusive_max: Option<u32>`. Request to the numsim-py owner: set it from `Program.arch` via `sched::exclusive_tmem_columns`. Without it, synccheck uses the largest `.exclusive` width the run committed (at least 512), which is sound because the engine already validated each width against the arch. The `tcgen_exclusive_576_sm107` special scenario can now assert synccheck Clean (`tests/interp_checkers_smoke.rs`, W2).
@@ -2090,3 +2128,37 @@ RaceObserver: 147 s for the same 200 rounds (engine ~5 s). More than 95% is in R
    (`elem_base` + index), like a C pointer: indices may reach before or past
    the view. Its logical identity was already the root.
    `sm100_fp8_fp4_mega_moe` runs to completion.
+
+### W8-8 [sched]: allocate unreferenced buffer arguments
+
+A host `numsim.TensorMap` image passed to a plain `T.Buffer((128,), "uint8")`
+parameter (`tests/numsim/runtime/test_tma_atomicity.py`, non-`T.TensorMap()`
+variants) addresses a host array that is not itself a kernel argument. The
+binder passes that array as an extra `ArgValue::Buffer` and rewrites the
+image's pointer from `plan_global_addresses`, but `allocate_host` only
+allocates arguments some slot (or `View`/`Pointer`/`TensorMapOf`) references,
+so the base gets no address. Request: allocate every `ArgValue::Buffer` in
+`Inputs` (in a deterministic order after the referenced ones) and report it
+in `plan_global_addresses` and `Outputs`. Until then numsim-py raises
+`NotImplementedError` (W8-8) for this binding. The `T.TensorMap()` variant
+binds through `TensorMapOf` and is unaffected.
+
+## W5 (2026-10-08): responses to W2-19 and W2-20
+
+- **W2-19 (buffer-form TMEM), done in racecheck.**
+  - A warp-lane `Proxy::Tcgen` witness is a synchronous TMEM access, so hb orders it: program order, plus thread synchronisation across threads. The tcgen pipeline view no longer judges it.
+  - Ordering against asynchronous tcgen05 ops is unchanged.
+  - Delta T14. Test: `racecheck_buffer_tmem` (`implicit_tmem`, `tmem_subword` are now race-free). W2 can drop the caveat in `interp_checkers_smoke`.
+- **W2-20 (1), st.async / red.async without an mbarrier: done.**
+  - The strong generic release write makes the op complete at issue: no `AsyncNeverCompleted`, no `AsyncLifetime`. No `AsyncComplete` is expected.
+  - Delta T13. Test: `g6_async_release_without_completion_event_is_complete`.
+- **W2-20 (2), `readonly_proxy`: declined for racecheck. It belongs to the engine.**
+  - Legacy rejects the kernel in NumSim itself. `tests/numsim/runtime/test_readonly_proxy.py` runs `assert_rejected`, which requires `NumSimExecutionError("write overlaps readonly bytes")` from `Engine.run` (no observer attached), plus the same reason in both checkers.
+  - A racecheck finding cannot satisfy the NumSim half. Once the engine raises the execution error, every tool reports it anyway.
+  - PTX (`ld.global.nc`): the bytes must be read-only for the whole kernel, so this is a property of program execution in either order, not an ordering question. Request: the engine keeps per-launch read-only-proxy byte ranges and rejects any overlapping write in either order with that message. No `ReadonlyProxyViolation` kind is needed.
+- **W2-20 (3), `missing_proxy_bridge` on tensormap bytes: these were false positives, now fixed in racecheck.**
+  - The engine emits the descriptor read as a warp-lane `Proxy::TensorMap` access at TMA issue. Racecheck only applied the acquired ranges to async readers.
+  - Write-then-read: the reading lane's own acquired ranges now judge it.
+  - Read-then-write: this is now ordered by hb, since the ISA defines the tensormap fence only for generic→tensormap.
+  - On gdn_prefill_sm100 the kernel's release/acquire pattern is correct, so both directions are now clean.
+  - Delta I9. Tests: `racecheck_tmap_lane`.

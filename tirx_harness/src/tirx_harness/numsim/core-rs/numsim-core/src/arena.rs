@@ -169,6 +169,41 @@ impl BitSet {
         None
     }
 
+    /// Up to 64 bits starting at `start` (bit `k` of the result is bit
+    /// `start + k`), `n <= 64`, `start + n <= len`.
+    #[inline]
+    fn bits_at(&self, start: u64, n: u64) -> u64 {
+        let w = (start / 64) as usize;
+        let sh = start % 64;
+        let mut v = self.words[w] >> sh;
+        if sh != 0 && sh + n > 64 {
+            v |= self.words[w + 1] << (64 - sh);
+        }
+        if n == 64 { v } else { v & ((1u64 << n) - 1) }
+    }
+
+    /// Bits `[start, start+len)` as a new bitset (word-level).
+    pub fn slice(&self, start: u64, len: u64) -> BitSet {
+        let mut out = BitSet::new(len, false);
+        out.copy_bits(0, self, start, len);
+        out
+    }
+
+    /// Set bits `[at, at+len)` of `self` to bits `[from, from+len)` of
+    /// `src` (word-level).
+    pub fn copy_bits(&mut self, at: u64, src: &BitSet, from: u64, len: u64) {
+        let mut k = 0;
+        while k < len {
+            let i = at + k;
+            let n = (64 - i % 64).min(len - k);
+            let v = src.bits_at(from + k, n);
+            let w = (i / 64) as usize;
+            let m = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << (i % 64) };
+            self.words[w] = (self.words[w] & !m) | ((v << (i % 64)) & m);
+            k += n;
+        }
+    }
+
     /// Do `self` and `other` (same length) share a set bit?
     pub fn intersects(&self, other: &BitSet) -> bool {
         self.words.iter().zip(&other.words).any(|(a, b)| a & b != 0)
@@ -653,12 +688,7 @@ impl Arena {
             let st = sh.overlay.entry((id, stripe)).or_insert_with(|| {
                 let s0 = stripe * STRIPE;
                 let len = STRIPE.min(base.size - s0);
-                let mut valid = BitSet::new(len, false);
-                for k in 0..len {
-                    if base.valid.get(s0 + k) {
-                        valid.set_range(k, 1, true);
-                    }
-                }
+                let valid = base.valid.slice(s0, len);
                 Stripe {
                     bytes: base.bytes[s0 as usize..(s0 + len) as usize].to_vec(),
                     valid,
@@ -986,9 +1016,7 @@ impl Arena {
                         let end = st.written.first_clear(x, len - x).unwrap_or(len);
                         let (lo, hi) = (x as usize, end as usize);
                         a.bytes[(s0 + x) as usize..(s0 + end) as usize].copy_from_slice(&st.bytes[lo..hi]);
-                        for b in x..end {
-                            a.valid.set_range(s0 + b, 1, st.valid.get(b));
-                        }
+                        a.valid.copy_bits(s0 + x, &st.valid, x, end - x);
                         k = end;
                     }
                 }
@@ -1140,6 +1168,27 @@ pub mod addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitset_copy_bits_matches_bitwise() {
+        let mut src = BitSet::new(300, false);
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        for i in 0..300 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            src.set_range(i, 1, x & 1 == 1);
+        }
+        for &(at, from, len) in &[(0, 0, 300), (5, 3, 200), (64, 0, 128), (70, 129, 150), (0, 63, 2), (127, 1, 64)] {
+            let mut dst = BitSet::new(300, true);
+            dst.copy_bits(at, &src, from, len);
+            for k in 0..300 {
+                let want = if k >= at && k < at + len { src.get(from + k - at) } else { true };
+                assert_eq!(dst.get(k), want, "at={at} from={from} len={len} k={k}");
+            }
+        }
+        let s = src.slice(37, 100);
+        assert_eq!(s.len(), 100);
+        assert!((0..100).all(|k| s.get(k) == src.get(37 + k)));
+    }
 
     #[test]
     fn read_write_validity() {

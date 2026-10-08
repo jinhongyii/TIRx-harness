@@ -848,13 +848,34 @@ fn copy_spans(arena: &mut Arena, src: &[(AllocId, ByteSpan)], dst: &[(AllocId, B
     if total(src) != total(dst) {
         return Err(format!("copy length mismatch: {} vs {}", total(src), total(dst)));
     }
-    // Common case (every source byte valid): gather once, scatter once.
-    if src.iter().all(|&(a, s)| arena.first_invalid(support::whole(arena, a), s).is_none() && !arena.get(a).metadata_only) {
+    // Common case (every source byte valid): gather the source as merged
+    // contiguous runs, then store each merged destination run with one
+    // memcpy + one validity range (direct when the allocation is not a
+    // shard overlay).
+    let src_runs = merge_runs(src);
+    if src_runs.iter().all(|&(a, s)| !arena.get(a).metadata_only && arena.first_invalid(support::whole(arena, a), s).is_none()) {
         let mut bytes = Vec::with_capacity(total(src) as usize);
-        for &(a, s) in src {
-            bytes.extend(arena.read_raw(a, s));
+        for &(a, s) in &src_runs {
+            if arena.is_overlaid(a) {
+                bytes.extend(arena.read_raw(a, s));
+            } else {
+                bytes.extend_from_slice(&arena.get(a).bytes[s.start as usize..s.end() as usize]);
+            }
         }
-        return scatter_bytes(arena, dst, &bytes);
+        let mut pos = 0usize;
+        for (a, s) in merge_runs(dst) {
+            let n = s.len as usize;
+            let direct = !arena.is_overlaid(a) && !arena.get(a).metadata_only && s.end() <= arena.get(a).size;
+            if direct {
+                let al = arena.get_mut(a);
+                al.bytes[s.start as usize..s.end() as usize].copy_from_slice(&bytes[pos..pos + n]);
+                al.valid.set_range(s.start, s.len, true);
+            } else {
+                arena.write(support::whole(arena, a), &[s], &bytes[pos..pos + n]).map_err(|e| e.to_string())?;
+            }
+            pos += n;
+        }
+        return Ok(());
     }
     let (mut si, mut so, mut di, mut doff) = (0usize, 0u64, 0usize, 0u64);
     while si < src.len() && di < dst.len() {
@@ -878,6 +899,18 @@ fn copy_spans(arena: &mut Arena, src: &[(AllocId, ByteSpan)], dst: &[(AllocId, B
         }
     }
     Ok(())
+}
+
+/// Consecutive same-allocation spans that touch, merged (order kept).
+fn merge_runs(v: &[(AllocId, ByteSpan)]) -> Vec<(AllocId, ByteSpan)> {
+    let mut out: Vec<(AllocId, ByteSpan)> = Vec::with_capacity(v.len());
+    for &(a, s) in v {
+        match out.last_mut() {
+            Some((la, ls)) if *la == a && ls.end() == s.start => ls.len += s.len,
+            _ => out.push((a, s)),
+        }
+    }
+    out
 }
 
 fn gather_bytes(arena: &Arena, spans: &[(AllocId, ByteSpan)]) -> Result<Vec<u8>, String> {

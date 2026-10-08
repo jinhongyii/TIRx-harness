@@ -658,12 +658,25 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
                 mask: f.mask,
             });
         }
+        // Resolve the tensor's allocation once and offset within it; a span
+        // outside it goes through the full resolution (and its errors).
         let mut global = Vec::with_capacity(plan.global.len());
+        let mut window: Option<(crate::arena::AllocId, u64, u64)> = None;
         for s in &plan.global {
+            if let Some((alloc, base, end)) = window {
+                if s.start >= base && s.start.checked_add(s.len).is_some_and(|e| e <= end) {
+                    global.push((alloc, ByteSpan::new(s.start - base, s.len)));
+                    continue;
+                }
+            }
             let (alloc, off) = ctx
                 .arena
                 .resolve_global(s.start, s.len)
                 .map_err(|e| support::arena_err(ctx, e, WarpMask::lane(l)))?;
+            let a = ctx.arena.get(alloc);
+            if a.space == crate::arena::Space::Global {
+                window = Some((alloc, a.base, a.base + a.size));
+            }
             global.push((alloc, ByteSpan::new(off, s.len)));
         }
         // Destination CTAs for loads (multicast).
