@@ -70,6 +70,10 @@ runs skip with "numsim_core_py is not built". The hand-built Module fixture
 `ProgramBuilder`; refresh it after a `program.rs` change with
 `UPDATE_FIXTURES=1 cargo test -p numsim-py`.
 
+`numsim-core/tests/synccheck_equivalence.rs` explores only every 10th
+generated case by default (5 s debug). Set `SYNCCHECK_EQUIV_FULL=1` to check
+every case (45 s debug, 13 s release) after changing a synccheck reduction rule.
+
 The `NUMSIM_V2_*` prefix is temporary: these variables become `NUMSIM_*`
 when the legacy engine is deleted (redesign step 5).
 

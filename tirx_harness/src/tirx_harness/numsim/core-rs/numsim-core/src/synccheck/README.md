@@ -48,7 +48,8 @@ incomplete:
 1. **Switch.** Add a field to `explore::Rules` (also in `ALL` and `NONE`), and implement it
    in `ts.rs`, guarded by `self.rules.<name>`. State the soundness argument in
    synccheck-explorer.md §5.10.
-2. **Oracle.** `tests/synccheck_equivalence.rs` compares each variant with the all-failures
+2. **Oracle.** `tests/synccheck_equivalence.rs` (checks every 10th case by default;
+   `SYNCCHECK_EQUIV_FULL=1` checks all, 45 s debug) compares each variant with the all-failures
    exhaustive oracle across its generators. Add a generator shape that makes the rule fire.
    Then check that a deliberately unsound version of the rule fails the comparison.
 3. **Scenario.** Add a `tests/synccheck_scenarios.rs` test with a state-count bound that
