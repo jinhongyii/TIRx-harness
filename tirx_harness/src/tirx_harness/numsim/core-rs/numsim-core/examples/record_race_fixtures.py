@@ -111,7 +111,7 @@ def record(name: str, out_dir: Path) -> str:
                 (out_dir / f"{stem}.module.json").write_text(module)
                 (out_dir / f"{stem}.inputs.json").write_text(enc)
                 plain = (int, str, float, bool, type(None), list, dict)
-                kws = {k: v for k, v in kw.items() if isinstance(v, plain) and k != "codegen_cache_dir"}
+                kws = {k: v for k, v in kw.items() if isinstance(v, plain)}
                 (out_dir / f"{stem}.kw.json").write_text(json.dumps(kws, sort_keys=True))
                 key_file.write_text(key)
                 status = "recorded"
