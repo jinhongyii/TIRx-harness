@@ -407,6 +407,20 @@ def elementwise_value(call: Any, op: str, values: list[Any], dtype: str) -> Any:
 
 
 # ----------------------------------------------------------------------- entry
+def repair(call: Any) -> Any | None:
+    """The call without its ``dispatch=`` hint, or None.
+
+    A hint never selects tile semantics (legacy contract,
+    ``test_copy_dispatch_contract.py``): a hint naming a variant this TVM does
+    not register (``reg``, ``gmem_smem``) or one that rejects the operands
+    (``smem`` on locals) is dropped so TVM's dispatch picks its own variant.
+    """
+    if call.dispatch is None:
+        return None
+    return tirx.TilePrimitiveCall(*call.args, op=call.op, workspace=dict(call.workspace),
+                                  config=dict(call.config), dispatch=None, scope=call.scope)
+
+
 def lower(call: Any, ctx: "Lowerer") -> None:
     op = op_name(call)
     if op == "copy":

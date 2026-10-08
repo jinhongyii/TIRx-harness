@@ -174,13 +174,32 @@ class _Analysis:
         if kind == "tirx.Break":
             return state, True
         if kind == "tirx.Evaluate":
+            pending = _tile_placeholder(node.value)
+            if pending is not None:
+                self.tile_regions(pending, state)
+                return state, False
             return self.evaluate(node.value, state, env), False
+        if kind == "tirx.TilePrimitiveCall":
+            self.tile_regions(node, state)
+            return state, False
         if kind == "tirx.Bind":
             self.reads(node.value, state, env)
             return state, False
         # DeclBuffer, ScopeIdDefStmt, AssertStmt, Continue, Return, ...: reads only.
         self.reads(node, state, env)
         return state, False
+
+    def tile_regions(self, call: Any, state: dict[int, Any]) -> None:
+        """A tile op touches whole regions: every candidate region operand
+        (destination included, e.g. accumulating reductions) counts as a read of
+        all its elements, and no write is recorded (errs toward tracking)."""
+        for arg in call.args:
+            source = getattr(arg, "source", None)
+            if source is None or not hasattr(arg, "region"):
+                continue
+            buf = _handle(source)
+            if buf in self.shapes and not self.written(state, buf, None):
+                self.maybe_uninit.add(buf)
 
     def loop(self, node: Any, state: dict[int, Any], env: dict[int, int]) -> dict[int, Any]:
         self.reads(node.min, state, env)
@@ -262,6 +281,17 @@ class _Analysis:
             if buf in self.shapes:
                 self.write(state, buf, self.flat(buf, load.indices, env))
         return state
+
+
+def _tile_placeholder(value: Any) -> Any | None:
+    """The original tile call behind a v2 tile-form placeholder, or None."""
+    if type_key(value) != "ir.Call" or str(getattr(value.op, "name", "")) != "tirx.call_extern" or not value.args:
+        return None
+    from . import tile_forms
+
+    if getattr(value.args[0], "value", None) != tile_forms.PLACEHOLDER:
+        return None
+    return tile_forms.PENDING[int(value.args[1].value)][0]
 
 
 def maybe_uninit_locals(statements: list[Any], candidates: dict[int, tuple[int, ...]]) -> set[int]:

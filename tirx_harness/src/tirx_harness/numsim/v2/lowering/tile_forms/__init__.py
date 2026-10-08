@@ -62,6 +62,18 @@ def repair(call: Any) -> Any | None:
         from . import copy_async
 
         return copy_async.repair(call)
+    if op in ("copy", "cast", "add"):
+        from . import copy
+
+        return copy.repair(call)
+    if op == "fill":
+        from . import fill
+
+        return fill.repair(call)
+    if op in ("sum", "max", "min"):
+        from . import reduce
+
+        return reduce.repair(call)
     return None
 
 
