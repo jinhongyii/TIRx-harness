@@ -23,6 +23,15 @@ mod legacy {
         add_f32, add_f32_ftz, ptx_max_f32, ptx_min_f32, F32RoundingMode, U64x2,
     };
     use numsim_oplib::types::{OpError, OpResult};
+    use numsim_oplib::scalar::{pin_nan2_f32, pin_nan2_f64};
+
+    /// The legacy kernels added on the host, whose NaN payload for two NaN
+    /// operands depends on the optimizer's operand order (debug and release
+    /// disagreed: W6, 2026-10-08). The oracle pins it by the D8 rule (first
+    /// NaN of `(old, operand)`, quieted), which is also the engine's D13 order.
+    fn add_pinned(old: f32, operand: f32) -> f32 {
+        pin_nan2_f32(old, operand, old + operand)
+    }
 
     /// PTX/CUDA atomic operation (legacy `RawAtomicOperation`).
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -131,7 +140,7 @@ mod legacy {
                 Ok(add_f32_ftz(old, operand, F32RoundingMode::Nearest))
             }
             AtomicOp::AddNoFtz => Ok(add_f32(old, operand, F32RoundingMode::Nearest)),
-            AtomicOp::Add => Ok(old + operand),
+            AtomicOp::Add => Ok(pin_nan2_f32(old, operand, old + operand)),
             _ => unsupported(operation),
         }
     }
@@ -139,19 +148,19 @@ mod legacy {
     /// `atom/red.add.f64` and CUDA `atomicAdd(double*)`.
     pub fn atomic_f64(operation: AtomicOp, old: f64, operand: f64) -> OpResult<f64> {
         match operation {
-            AtomicOp::Add => Ok(old + operand),
+            AtomicOp::Add => Ok(pin_nan2_f64(old, operand, old + operand)),
             _ => unsupported(operation),
         }
     }
 
     /// CUDA `atomicAdd(__half*)` / `atom.add.noftz.f16` on raw payloads.
     pub fn atomic_add_f16(old: u16, operand: u16) -> u16 {
-        f32_to_fp16_bits(fp16_bits_to_f32(old) + fp16_bits_to_f32(operand))
+        f32_to_fp16_bits(add_pinned(fp16_bits_to_f32(old), fp16_bits_to_f32(operand)))
     }
 
     /// CUDA `atomicAdd(__nv_bfloat16*)` / `atom.add.noftz.bf16` on raw payloads.
     pub fn atomic_add_bf16(old: u16, operand: u16) -> u16 {
-        f32_to_bf16_bits(bf16_bits_to_f32(old) + bf16_bits_to_f32(operand))
+        f32_to_bf16_bits(add_pinned(bf16_bits_to_f32(old), bf16_bits_to_f32(operand)))
     }
 
     /// CUDA `atomicAdd(__half2*)`: each 16-bit component is added independently
@@ -189,7 +198,7 @@ mod legacy {
         };
         let (old, operand) = (decode(old), decode(operand));
         let result = match operation {
-            AtomicOp::Add => old + operand,
+            AtomicOp::Add => add_pinned(old, operand),
             AtomicOp::Minimum => ptx_min_f32(old, operand, false, false),
             AtomicOp::Maximum => ptx_max_f32(old, operand, false, false),
             _ => return unsupported(operation),
@@ -418,13 +427,9 @@ fn disagreements() -> Vec<String> {
                 n.to_bits().into(),
             );
             // Delta D13: with both operands NaN the engine keeps `old`'s NaN
-            // (PTX operand order `*a = old + b`, D8 first-NaN rule, quieted);
-            // the legacy shared form returned the host's choice (`val`'s).
-            let s = if fa.is_nan() && fb.is_nan() {
-                f32::from_bits(a | 0x0040_0000)
-            } else {
-                lib::atomic_f32(AtomicOp::Add, fa, fb, AtomicSpace::Shared).unwrap()
-            };
+            // quieted (PTX order `*a = old + b`, D8). The oracle's host adds
+            // are pinned the same way (`legacy::add_pinned`).
+            let s = lib::atomic_f32(AtomicOp::Add, fa, fb, AtomicSpace::Shared).unwrap();
             record(
                 &mut out,
                 "f32 add shared",
@@ -439,11 +444,7 @@ fn disagreements() -> Vec<String> {
     for &a in F64_EDGES {
         for &b in F64_EDGES {
             // Delta D13, as for f32 above.
-            let l = if f64::from_bits(a).is_nan() && f64::from_bits(b).is_nan() {
-                f64::from_bits(a | 0x0008_0000_0000_0000)
-            } else {
-                lib::atomic_f64(AtomicOp::Add, f64::from_bits(a), f64::from_bits(b)).unwrap()
-            };
+            let l = lib::atomic_f64(AtomicOp::Add, f64::from_bits(a), f64::from_bits(b)).unwrap();
             let e = rmw_elem(Add, Dtype::F64, a, b, 0, false).unwrap();
             record(&mut out, "f64 add", a, b, e, l.to_bits());
         }
