@@ -408,7 +408,7 @@ fn stmatrix_inverts_ldmatrix_and_writes_m16n8_b8() {
     assert_eq!(writes.len(), 128);
     assert_eq!(
         writes[..3],
-        [(0, 0, vec![0x11]), (1, 0, vec![0x22]), (0, 8, vec![0x33])]
+        [0x11_u8, 0x22, 0x33].map(|b| numsim_oplib::layout::WriteBytes::new(&[b])).iter().zip([(0, 0), (1, 0), (0, 8)]).map(|(&w, (p, d))| (p, d, w)).collect::<Vec<_>>()[..]
     );
     let error = stmatrix_writes(&store, &[[0; 32]], |p| Ok(p as u64 * 8)).unwrap_err();
     assert!(error.message.contains("16-byte alignment"));

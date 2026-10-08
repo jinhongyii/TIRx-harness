@@ -230,7 +230,7 @@ pub fn stmatrix_writes(
     plan: &StMatrixPlan,
     sources: &[WarpValue<u32>],
     row_address: impl Fn(usize) -> OpResult<u64>,
-) -> OpResult<Vec<(usize, usize, Vec<u8>)>> {
+) -> OpResult<Vec<(usize, usize, lib::WriteBytes)>> {
     if sources.len() != plan.registers {
         return Err(OpError::invalid(format!(
             "stmatrix needs {} source registers, got {}",

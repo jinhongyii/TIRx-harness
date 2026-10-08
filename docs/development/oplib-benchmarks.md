@@ -158,10 +158,17 @@ Dispatched tile reductions run on `shfl.sync` and `redux`; `warp_reduce` covers 
 | Arithmetic E4M3 encoder (W4-19; the old nearest-code search is the test oracle) | `cvt_x1024/f32_to_e4m3_satfinite` | 693 µs | 4.8 µs |
 | Streamed CTA-pair Layout-D accumulator walk (`cta2_runs`; no `m*n` cell list) (W4-perf) | `tc_mma/bf16_ss_cta2_m256_n256_k16_accumulate` | 1.43 ms | 0.67 ms |
 | Table decode of tcgen05 narrow operands (fp8/fp6/fp4; bit-identical, tested exhaustively) (W4-perf) | `tcgen05_narrow_decode_x1024_atoms/E4M3_table` (old path: `..._direct`) | 136 µs | 20.4 µs |
+| AVX2 register-tiled FMA chain (4 rows x 16 columns kept in registers across K, as the AVX-512 path; bit-identical, tested over tile shapes and specials) and branch-free NaN pre-scan (W4-perf2) | `mma_chain/f32_m128_n256_k16` / `_k32` / `f32_m16_n8_k16_mma_sync` | 85.7 / 132.9 / 0.92 µs | 23.4 / 65.5 / 0.26 µs |
+| Cross-crate `#[inline]` on cell/operand decoders, one decode-table fetch per atom, contiguous-run fast path in `read_run`/`write_run` (W4-perf2) | `tc_mma/f16_ss_m128_n256_k16_accumulate`, `tc_mma/mxf8f6f4_e4m3_ss_m128_n256_k32`, `tc_mma/bf16_ss_cta2_m256_n256_k16_accumulate` | 457 / 391 / 661 µs | 332 / 249 / 359 µs |
 
-End to end (1 worker, interpreter, min of 3 interleaved runs on a loaded host), these
-two changes took `fp16_bf16_gemm` from 96 to 76 ms per run and
-`deepgemm_sm100_fp8_gemm_1d1d` from 11.5 to 10.0 ms per run.
+End to end (1 worker, interpreter, min of 3 interleaved runs on a loaded host), the two
+W4-perf changes took `fp16_bf16_gemm` from 96 to 76 ms per run and
+`deepgemm_sm100_fp8_gemm_1d1d` from 11.5 to 10.0 ms per run. The W4-perf2 round is
+within host noise end to end (gemm 69.7 -> 67.4 ms min, while concurrent engine work
+moved the same runs), so its criterion rows above are the guard. A thin-LTO,
+one-codegen-unit release build measured a further ~10% on `fp16_bf16_gemm`
+(67 -> 60 ms) and ~4% on `deepgemm_sm100_fp8_gemm_1d1d`; that is a workspace
+profile choice, not adopted here.
 
 The NaN re-pin of the MMA chain (delta D8) costs nothing on finite outputs.
 When many outputs are NaN, it recomputes each of their chains with the scalar

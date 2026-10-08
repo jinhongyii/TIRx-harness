@@ -213,38 +213,93 @@ pub enum StmatrixShape {
     M16n8B8Transposed,
 }
 
+/// The 1 or 2 value bytes of one `stmatrix` write, stored inline (no heap
+/// allocation per write; perf, W4 profile). Dereferences to `&[u8]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteBytes {
+    bytes: [u8; 2],
+    len: u8,
+}
+
+impl WriteBytes {
+    /// One or two bytes; panics on any other length (internal use only).
+    pub fn new(bytes: &[u8]) -> Self {
+        assert!(
+            matches!(bytes.len(), 1 | 2),
+            "stmatrix writes are 1 or 2 bytes"
+        );
+        let mut inline = [0; 2];
+        inline[..bytes.len()].copy_from_slice(bytes);
+        Self {
+            bytes: inline,
+            len: bytes.len() as u8,
+        }
+    }
+}
+
+impl std::ops::Deref for WriteBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
 /// `(provider lane, byte delta, value bytes)` written by source register
-/// `matrix` of `source_lane`, in legacy write order.
-pub fn stmatrix_lane_writes(
+/// `matrix` of `source_lane`, in legacy write order, appended to `writes`.
+fn push_stmatrix_lane_writes(
+    writes: &mut Vec<(usize, usize, WriteBytes)>,
     shape: StmatrixShape,
     matrix: usize,
     source_lane: usize,
     register: u32,
-) -> Vec<(usize, usize, Vec<u8>)> {
+) {
     match shape {
-        StmatrixShape::M8n8B16 { transpose } => (0..2_usize)
-            .map(|half_index| {
+        StmatrixShape::M8n8B16 { transpose } => {
+            for half_index in 0..2_usize {
                 let (row, column) = if transpose {
                     (2 * (source_lane % 4) + half_index, source_lane / 4)
                 } else {
                     (source_lane / 4, 2 * (source_lane % 4) + half_index)
                 };
                 let value = (register >> (half_index * 16)) as u16;
-                (matrix * 8 + row, column * 2, value.to_le_bytes().to_vec())
-            })
-            .collect(),
-        StmatrixShape::M16n8B8Transposed => (0..4_usize)
-            .map(|byte_index| {
+                writes.push((
+                    matrix * 8 + row,
+                    column * 2,
+                    WriteBytes {
+                        bytes: value.to_le_bytes(),
+                        len: 2,
+                    },
+                ));
+            }
+        }
+        StmatrixShape::M16n8B8Transposed => {
+            for byte_index in 0..4_usize {
                 let row = 2 * (source_lane % 4) + (byte_index % 2);
                 let column = source_lane / 4 + 8 * (byte_index / 2);
-                (
+                writes.push((
                     matrix * 8 + row,
                     column,
-                    vec![(register >> (byte_index * 8)) as u8],
-                )
-            })
-            .collect(),
+                    WriteBytes {
+                        bytes: [(register >> (byte_index * 8)) as u8, 0],
+                        len: 1,
+                    },
+                ));
+            }
+        }
     }
+}
+
+/// `(provider lane, byte delta, value bytes)` written by source register
+/// `matrix` of `source_lane`, in legacy write order. No numerics.
+pub fn stmatrix_lane_writes(
+    shape: StmatrixShape,
+    matrix: usize,
+    source_lane: usize,
+    register: u32,
+) -> Vec<(usize, usize, WriteBytes)> {
+    let mut writes = Vec::with_capacity(4);
+    push_stmatrix_lane_writes(&mut writes, shape, matrix, source_lane, register);
+    writes
 }
 
 /// All `stmatrix` writes of a warp (matrix-major, then source lane).
@@ -254,7 +309,7 @@ pub fn stmatrix_writes(
     shape: StmatrixShape,
     sources: &[&WarpValue<u32>],
     row_address: impl Fn(usize) -> OpResult<usize>,
-) -> OpResult<Vec<(usize, usize, Vec<u8>)>> {
+) -> OpResult<Vec<(usize, usize, WriteBytes)>> {
     if !matches!(sources.len(), 1 | 2 | 4) {
         return Err(OpError::message(format!(
             "stmatrix source count must be 1, 2, or 4, got {}",
@@ -268,10 +323,10 @@ pub fn stmatrix_writes(
             )));
         }
     }
-    let mut writes = Vec::new();
+    let mut writes = Vec::with_capacity(sources.len() * WARP_SIZE * 4);
     for (matrix, source) in sources.iter().enumerate() {
         for (source_lane, register) in source.iter().enumerate() {
-            writes.extend(stmatrix_lane_writes(shape, matrix, source_lane, *register));
+            push_stmatrix_lane_writes(&mut writes, shape, matrix, source_lane, *register);
         }
     }
     Ok(writes)
@@ -389,9 +444,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(writes.len(), 128);
-        assert_eq!(writes[0], (0, 0, vec![0x11]));
-        assert_eq!(writes[1], (1, 0, vec![0x22]));
-        assert_eq!(writes[2], (0, 8, vec![0x33]));
+        assert_eq!(writes[0], (0, 0, WriteBytes::new(&[0x11])));
+        assert_eq!(writes[1], (1, 0, WriteBytes::new(&[0x22])));
+        assert_eq!(writes[2], (0, 8, WriteBytes::new(&[0x33])));
         assert!(stmatrix_writes(
             StmatrixShape::M16n8B8Transposed,
             &[&register],
