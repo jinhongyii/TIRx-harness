@@ -74,3 +74,9 @@ ISA cites use PTX 9.4 section numbers. Quotes are in `sync-isa-answers.md`.
 | --- | --- | --- | --- | --- |
 | R1 | NumSim pool semantics (D6) | N: no pool, no direction check, `inc` never blocks | Checker-mode pool in every mode. NumSim can now report `InvalidDirection` or a pool deadlock. | setmaxnreg: `inc` blocks until registers are available |
 | R2 | Warpgroup-sync rule in the fixed verifier | Verifier: not modeled | `MissingWarpgroupSync` in every mode | setmaxnreg: "synchronize explicitly before a subsequent setmaxnreg" |
+
+## Synccheck explorer
+
+| ID | Change | Legacy | New | ISA basis |
+| --- | --- | --- | --- | --- |
+| S1 | Generations observed by waits are proved schedule-independent, not taken from the run (`msa_prefill_multishape`, V2C-28) | S: the fixed verifier took each wait's generation from the concrete run as a fact, so a wait that some schedule lets pass on an older generation of the same parity was clean | Gated per-resource searches compare every command's generations with the reference run. A schedule that assigns another generation is `incomplete` (`fixed_sync_program_model_incomplete`, source `generation_assignment_differs`), with the operation and a witness schedule (explorer rule S5, `synccheck-explorer.md` §5.5). In `msa_prefill_multishape` this is a genuine kernel race. Warpgroup 1's iteration-1 `o_smem_free.wait(0, (seq_x+1)&1)` (line 1280) is not ordered after the store warp's generation-1 arrival, so it can pass on stale generation 0. It then overwrites `o_smem` during the in-flight TMA store (`synccheck-explorer.md` §5.8, with the interleaving and fixes) | `mbarrier.try_wait.parity` waits for the completion of the phase with the given parity: the current or immediately preceding phase. A parity cannot tell generation g from g−2 |
