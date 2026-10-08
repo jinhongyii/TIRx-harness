@@ -892,10 +892,12 @@ fn hint_ops_engine_effects() {
     completed(&o);
     let issued = log.per_warp[0].iter().any(|e| matches!(&e.kind, SyncKind::Protocol { cmds, .. } if cmds.iter().any(|c| format!("{:?}", c.cmd).contains("Issue"))));
     assert!(issued, "applypriority.async.bulk did not join the bulk group");
+    // An address no binding covers cannot be proven invalid (W12-gaps 1
+    // ruling): `incomplete`, superseding W4-9's `BadAddress`.
     let o = run(&scenarios::hint_ops(false));
     match &o.status {
-        RunStatus::Error(e) => assert_eq!(e.kind, ExecErrorKind::BadAddress, "{e:?}"),
-        other => panic!("expected BadAddress, got {other:?}"),
+        RunStatus::Incomplete { reason, .. } => assert!(reason.contains("integer_address_without_binding"), "{reason}"),
+        other => panic!("expected incomplete, got {other:?}"),
     }
 }
 
@@ -1420,7 +1422,322 @@ fn incomplete_stops_carry_structured_location() {
 fn vector_cas_is_one_128_bit_compare_and_swap() {
     let o = run(&scenarios::cas128());
     completed(&o);
-    let u64s = |n: &str| o.outputs.buffers[n].0.chunks(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect::<Vec<u64>>();
+    let u64s = |n: &str| {
+        o.outputs.buffers[n]
+            .0
+            .chunks(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect::<Vec<u64>>()
+    };
     assert_eq!(u64s("out"), vec![7, 9, 7, 9]);
     assert_eq!(u64s("mem"), vec![23, 29]);
+}
+
+/// W5-12: the `tcgen05.alloc` address store is one warp-collective access
+/// (`ALL_LANES`), not one lane's.
+#[test]
+fn tcgen_alloc_address_store_is_one_warp_access() {
+    #[derive(Default)]
+    struct Stores(Vec<Vec<u8>>);
+    impl Observer for Stores {
+        fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+            if a.space == numsim_core::arena::Space::Shared
+                && a.kind == numsim_core::observe::AccessKind::Write
+            {
+                self.0.push(a.spans.iter().map(|s| s.lane).collect());
+            }
+        }
+    }
+    let s = scenarios::tcgen_alloc_lanes_read();
+    let mut obs = Stores::default();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config)
+        .expect("run starts");
+    completed(&o);
+    assert!(!obs.0.is_empty());
+    assert!(
+        obs.0
+            .iter()
+            .all(|lanes| lanes == &vec![numsim_core::observe::ALL_LANES]),
+        "{:?}",
+        obs.0
+    );
+}
+
+/// Host operands of the `tcgen_mma_f16` tests: small integers (exact in
+/// f16), and the reference `d0 + A x B^T`.
+fn mma_operands() -> (Vec<u16>, Vec<u16>, Vec<f32>) {
+    use numsim_core::testutil::scenarios::{MMA_K as K, MMA_M as M, MMA_N as N};
+    let f16 = numsim_oplib::arith::half::encode_f16;
+    let a: Vec<f32> = (0..M * K)
+        .map(|i| ((i / K + i % K) % 5) as f32 - 2.0)
+        .collect();
+    let b: Vec<f32> = (0..N * K)
+        .map(|i| ((3 * (i / K) + i % K) % 4) as f32 - 1.0)
+        .collect();
+    let mut d = vec![0f32; M * N];
+    for m in 0..M {
+        for n in 0..N {
+            d[m * N + n] = (0..K).map(|k| a[m * K + k] * b[n * K + k]).sum();
+        }
+    }
+    (
+        a.iter().map(|&x| f16(x)).collect(),
+        b.iter().map(|&x| f16(x)).collect(),
+        d,
+    )
+}
+
+/// The reusable MMA program computes D = A x B^T through real descriptors.
+#[test]
+fn tcgen_mma_f16_program_matches_the_reference() {
+    let (a, b, want) = mma_operands();
+    let o = run(&scenarios::tcgen_mma_f16(
+        scenarios::MmaSpec {
+            accumulate: false,
+            init_d: None,
+            two_issuers: false,
+        },
+        &a,
+        &b,
+    ));
+    completed(&o);
+    assert_eq!(f32s(&o, "out"), want);
+    let o = run(&scenarios::tcgen_mma_f16(
+        scenarios::MmaSpec {
+            accumulate: true,
+            init_d: Some(1.0),
+            two_issuers: false,
+        },
+        &a,
+        &b,
+    ));
+    completed(&o);
+    assert_eq!(
+        f32s(&o, "out"),
+        want.iter().map(|x| x + 1.0).collect::<Vec<_>>()
+    );
+    assert!(
+        !o.diagnostics
+            .iter()
+            .any(|f| f.kind == FindingKind::UninitRead),
+        "{:?}",
+        o.diagnostics
+    );
+}
+
+/// W9 phase 6: an MMA accumulating into never-written TMEM D reports the
+/// uninitialized D read (checked when read, before the MMA writes D); D
+/// reads as zero.
+#[test]
+fn tcgen_mma_into_never_written_tmem_reports_uninit_read() {
+    let (a, b, want) = mma_operands();
+    let s = scenarios::tcgen_mma_f16(
+        scenarios::MmaSpec {
+            accumulate: true,
+            init_d: None,
+            two_issuers: false,
+        },
+        &a,
+        &b,
+    );
+    let o = run_cfg(
+        &s,
+        &RunConfig {
+            validity: ValidityPolicy::ZeroAndReport,
+            ..s.config.clone()
+        },
+    );
+    completed(&o);
+    assert_eq!(f32s(&o, "out"), want);
+    let tmem = o.diagnostics.iter().filter(|f| {
+        f.kind == FindingKind::UninitRead
+            && f.evidence
+                .iter()
+                .any(|e| e.space == Some(numsim_core::arena::Space::Tmem))
+    });
+    assert!(tmem.count() > 0, "{:?}", o.diagnostics);
+}
+
+/// W12-tile-forms 1: `AddrOf` scales by the scalar element of a vector
+/// buffer dtype, the same rule as Load/Store.
+#[test]
+fn addr_of_uses_the_scalar_element_size() {
+    let o = run(&scenarios::addr_of_vector_buffer());
+    completed(&o);
+    assert_eq!(u32s(&o, "dist"), (0..32).map(|l| 4 * l).collect::<Vec<u32>>());
+    assert_eq!(u32s(&o, "val"), (100..132).collect::<Vec<u32>>());
+}
+
+/// An observer that hashes the whole stream (accesses, sync events, warp
+/// ends) and wants the declared-word history, so `WaitVerdicts` are
+/// produced and the partitioned word merge runs.
+#[derive(Default)]
+struct StreamHash {
+    h: u64,
+    verdicts: Vec<String>,
+}
+
+impl StreamHash {
+    fn mix(&mut self, s: &str) {
+        for b in s.bytes() {
+            self.h = (self.h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+}
+
+impl Observer for StreamHash {
+    fn wants_word_history(&self) -> bool {
+        true
+    }
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        let s = format!("{:?}/{:?}/{:?}/{:?}/{:?}/{:?}", a.actor, a.site, a.alloc, a.kind, a.spans, a.declared_word);
+        self.mix(&s);
+    }
+    fn sync(&mut self, e: &SyncEvent) {
+        let s = format!("{e:?}");
+        if matches!(e.kind, SyncKind::WaitVerdicts { .. }) {
+            self.verdicts.push(s.clone());
+        }
+        self.mix(&s);
+    }
+}
+
+/// Partitioned declared words: a wait_until chain across 8 single-CTA
+/// clusters gives the same outputs and the same observer stream (incl.
+/// WaitVerdicts numbering) at 1, 8 and 32 workers.
+#[test]
+fn partitioned_wait_until_is_deterministic_across_workers() {
+    let s = scenarios::wait_until_chain(8);
+    let mut seen: Option<(Vec<u32>, u64, Vec<String>)> = None;
+    for workers in [1usize, 8, 32] {
+        let mut obs = StreamHash::default();
+        let cfg = RunConfig { workers, ..s.config.clone() };
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &cfg).expect("run starts");
+        completed(&o);
+        assert_eq!(u32s(&o, "out"), (0..8).collect::<Vec<u32>>(), "workers {workers}");
+        assert_eq!(u32s(&o, "flag"), vec![8]);
+        assert_eq!(obs.verdicts.len(), 8, "one verdict per CTA: {:?}", obs.verdicts);
+        let now = (u32s(&o, "out"), obs.h, obs.verdicts.clone());
+        if let Some(prev) = &seen {
+            assert_eq!(prev, &now, "workers {workers} differ");
+        }
+        seen = Some(now);
+    }
+}
+
+/// The partitioned word merge runs only for history-consuming observers and
+/// changes nothing program-visible: same outputs with no observer and with
+/// a history observer.
+#[test]
+fn partitioned_words_do_not_depend_on_the_observer() {
+    let s = scenarios::wait_until_chain(8);
+    let plain = sched::run_with_config(&s.module, &s.inputs, &mut numsim_core::observe::NoopObserver, &Backend::Interp, &s.config).unwrap();
+    let mut obs = StreamHash::default();
+    let watched = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).unwrap();
+    assert_eq!(plain.status, watched.status);
+    assert_eq!(plain.outputs, watched.outputs);
+    assert_eq!(plain.stats.rounds, watched.stats.rounds);
+    assert_eq!(plain.stats.instrs, watched.stats.instrs);
+}
+
+/// W5-14 ruling: a `sync_words` buffer whose dtype is not a whole number of
+/// bytes has no well-defined word: `incomplete` (history observers only).
+#[test]
+fn sub_byte_sync_words_fail_closed() {
+    let mut s = scenarios::wait_until_flag();
+    let flag = s.module.kernels[0].buffers.iter().position(|b| b.name == "flag").unwrap();
+    s.module.kernels[0].buffers[flag].dtype = numsim_core::dtype::Ty::scalar(numsim_core::dtype::Dtype::E2M1);
+    let mut obs = StreamHash::default();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &s.config).unwrap();
+    match &o.status {
+        RunStatus::Incomplete { reason, .. } => assert!(reason.contains("sync_words"), "{reason}"),
+        other => panic!("expected incomplete, got {other:?}"),
+    }
+}
+
+/// W6 (sync §1.5 / §2.9): an mbarrier armed for more tx bytes than its TMA
+/// delivers, waited on by the whole (converged) warp, is a protocol error
+/// naming the byte counts, not a generic deadlock; the matching kernel
+/// completes.
+#[test]
+fn tma_under_delivery_is_a_protocol_error() {
+    completed(&run(&scenarios::tma_load()));
+    let o = run(&scenarios::tma_under_delivery_full_warp());
+    let RunStatus::Error(e) = &o.status else { panic!("{:?}", o.status) };
+    assert!(
+        matches!(
+            e.kind,
+            ExecErrorKind::Protocol(numsim_core::sync::SyncError::Mbarrier(numsim_core::sync::mbarrier::Error::TxUnderDelivered { gen: 0, expected: 516, completed: 512 }))
+        ),
+        "{e:?}"
+    );
+    assert!(e.message.contains("512 of 516 bytes"), "{}", e.message);
+}
+
+/// W12-gaps 1 ruling: an integer address naming no binding is
+/// `incomplete` (`integer_address_without_binding`); just past a real
+/// allocation (its guard gap) it is an out-of-bounds error.
+#[test]
+fn unbound_integer_address_is_incomplete() {
+    let o = run(&scenarios::unbound_integer_load(false));
+    match &o.status {
+        RunStatus::Incomplete { reason, .. } => assert!(reason.contains("integer_address_without_binding"), "{reason}"),
+        other => panic!("expected incomplete, got {other:?}"),
+    }
+    let o = run(&scenarios::unbound_integer_load(true));
+    let RunStatus::Error(e) = &o.status else { panic!("{:?}", o.status) };
+    assert_eq!(e.kind, ExecErrorKind::OutOfBounds, "{e:?}");
+}
+
+/// W12-gaps 3: two lanes executing one `tcgen05.mma` site is a kernel
+/// error (single issuing thread).
+#[test]
+fn tcgen_mma_from_two_lanes_is_an_error() {
+    let (a, b, _) = mma_operands();
+    let o = run(&scenarios::tcgen_mma_f16(scenarios::MmaSpec { accumulate: false, init_d: None, two_issuers: true }, &a, &b));
+    let RunStatus::Error(e) = &o.status else { panic!("{:?}", o.status) };
+    assert!(e.message.contains("single thread"), "{e:?}");
+    assert_eq!(e.lanes.0, 0b11);
+}
+
+/// W6 S-b: every `WaitVerdicts.observed` index equals the number of
+/// declared-word writes delivered before it (history numbering follows the
+/// delivery order even when several partitions write the word in the serial
+/// phase of one round).
+#[test]
+fn wait_verdict_indices_follow_the_delivery_order() {
+    #[derive(Default)]
+    struct Check {
+        writes: u32,
+        verdicts: Vec<(u32, u32)>,
+    }
+    impl Observer for Check {
+        fn wants_word_history(&self) -> bool {
+            true
+        }
+        fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+            if a.declared_word && a.writes() {
+                self.writes += a.spans.len() as u32;
+            }
+        }
+        fn sync(&mut self, e: &SyncEvent) {
+            if let SyncKind::WaitVerdicts { verdicts, .. } = &e.kind {
+                for v in verdicts {
+                    self.verdicts.push((v.observed, self.writes));
+                }
+            }
+        }
+    }
+    for workers in [1usize, 8] {
+        let s = scenarios::atomic_count_wait(4);
+        let mut obs = Check::default();
+        let cfg = RunConfig { workers, ..s.config.clone() };
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &Backend::Interp, &cfg).expect("run starts");
+        completed(&o);
+        assert_eq!(u32s(&o, "out"), vec![4; 4]);
+        assert_eq!(obs.verdicts.len(), 4, "{:?}", obs.verdicts);
+        for (observed, delivered) in &obs.verdicts {
+            assert_eq!(observed, delivered, "verdict index vs delivered writes: {:?}", obs.verdicts);
+        }
+    }
 }

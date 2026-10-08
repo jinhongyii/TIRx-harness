@@ -612,8 +612,27 @@ impl Arena {
                 let lo = i % STRIPE;
                 let n = (STRIPE - lo).min(abs.end() - i);
                 if let Some(r) = reads.as_mut() {
+                    // Only bytes this shard has not written itself are reads
+                    // of the round-start value (a shard reading its own write
+                    // does not order it before another writer: W6 S-a).
                     let len = STRIPE.min(base.size - stripe * STRIPE);
-                    r.entry((id, stripe)).or_insert_with(|| BitSet::new(len, false)).set_range(lo, n, true);
+                    let bits = r.entry((id, stripe)).or_insert_with(|| BitSet::new(len, false));
+                    match sh.overlay.get(&(id, stripe)) {
+                        Some(st) => {
+                            let mut k = lo;
+                            while k < lo + n {
+                                match st.written.first_clear(k, lo + n - k) {
+                                    None => break,
+                                    Some(x) => {
+                                        let end = st.written.first_set(x, lo + n - x).unwrap_or(lo + n);
+                                        bits.set_range(x, end - x, true);
+                                        k = end;
+                                    }
+                                }
+                            }
+                        }
+                        None => bits.set_range(lo, n, true),
+                    }
                 }
                 match sh.overlay.get(&(id, stripe)) {
                     Some(st) => f(&st.bytes, &st.valid, lo, i, n),
@@ -899,6 +918,20 @@ impl Arena {
             return Err(ArenaError::BadAddress { space: Space::Global, addr: va });
         }
         Ok((id, va - base))
+    }
+
+    /// The global allocation whose range or trailing guard gap contains
+    /// `va`: `(id, base, end)` (an address there is an out-of-bounds use of
+    /// that allocation, not an unknown one).
+    pub fn global_neighbor(&self, va: u64) -> Option<(AllocId, u64, u64)> {
+        let index = match &self.shard {
+            None => &self.global_index,
+            // SAFETY: see `Shard`.
+            Some(sh) => unsafe { &*sh.global_index },
+        };
+        let i = index.partition_point(|(base, _, _)| *base <= va);
+        let (base, end, id) = *index.get(i.checked_sub(1)?)?;
+        (va < end.saturating_add(addr::GLOBAL_GUARD)).then_some((id, base, end))
     }
 
     /// Split off a shard (see [`Shard`]): it addresses this arena's
@@ -1233,6 +1266,32 @@ pub mod addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W6 S-a: a shard that reads back bytes it wrote itself this round did
+    /// not read the round-start value; it must not be ordered before
+    /// another writer of those bytes (no spurious replay cycle).
+    #[test]
+    fn reading_own_writes_is_not_a_round_start_read() {
+        let mut a = Arena::new(ValidityPolicy::Error);
+        let id = a.alloc(Space::Global, Owner::Launch, "x", 64, Init::Zeroed);
+        let mut s0 = a.make_shard(&[]);
+        let mut s1 = a.make_shard(&[]);
+        for s in [&mut s0, &mut s1] {
+            s.track_shard_reads();
+        }
+        let v = s0.view(id);
+        s0.write(v, &[ByteSpan::new(0, 4)], &[1, 1, 1, 1]).unwrap();
+        s1.write(v, &[ByteSpan::new(0, 4)], &[2, 2, 2, 2]).unwrap();
+        let mut b = [0u8; 4];
+        s1.read(v, &[ByteSpan::new(0, 4)], &mut b).unwrap();
+        assert_eq!(b, [2; 4]);
+        assert_eq!(Arena::shard_replay_order(&[s0.clone(), s1.clone()]), Ok(vec![0, 1]));
+        // A genuine round-start read still orders the reader first.
+        let mut s2 = a.make_shard(&[]);
+        s2.track_shard_reads();
+        s2.read(v, &[ByteSpan::new(0, 4)], &mut b).unwrap();
+        assert_eq!(Arena::shard_replay_order(&[s0, s2]), Ok(vec![1, 0]));
+    }
 
     #[test]
     fn bitset_copy_bits_matches_bitwise() {

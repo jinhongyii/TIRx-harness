@@ -643,6 +643,116 @@ pub fn wait_until_flag() -> Scenario {
     )
 }
 
+/// Partitioned declared words (W2 design, coordinator priority): `ctas`
+/// single-CTA clusters (one partition each). CTA `c`'s lane 0 waits
+/// (`wait_until`, a captured-register predicate `flag == c`) on a global
+/// `sync_words` flag, records what it saw in `out[c]`, then release-stores
+/// `flag = c + 1`: a chain that crosses partitions every round. Expected
+/// `out[c] = c`, `flag = ctas`.
+pub fn wait_until_chain(ctas: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("wait_until_chain", 32);
+    b.grid(ctas, 1, 1);
+    let flag = b.global("flag", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    b.declare_sync_words(flag);
+    let lane = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let fa = b.reg(Ty::U64);
+    let got = b.reg(Ty::U32);
+    let next = b.reg(Ty::U32);
+    let arg = b.reg(Ty::U32);
+    let res = b.reg(Ty::PRED);
+    b.lane_id(lane);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    b.addr_of(fa, flag, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.site("wait_until", 1);
+    let placeholder = b.push(Instr::Nop);
+    b.no_site();
+    b.st_u32(out, cta, got);
+    b.add_u32(next, cta, k1);
+    b.site("publish", 2);
+    b.push(Instr::StoreAddr { ty: Ty::U32, addr: fa.into(), space: AddrSpace::Generic, value: next.into(), sem: Sem::Release, scope: Scope::Gpu, mods: MemMods::default() });
+    b.no_site();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    let start = Pc(prog.code.len() as u32);
+    prog.code.push(Instr::Compare { op: CmpOp::Eq, ty: Ty::U32, dst: res, a: arg.into(), b: cta.into() });
+    prog.code_sites.push(crate::site::SiteId::NONE);
+    prog.preds.push(PredProgram { arg, start, end: Pc(start.0 + 1), result: res, reads_memory: false });
+    prog.code[placeholder.0 as usize] = Instr::WaitUntil {
+        dst: got,
+        addr: fa.into(),
+        ty: Ty::U32,
+        space: AddrSpace::Generic,
+        sem: Sem::Acquire,
+        scope: Scope::Gpu,
+        pred: PredId(0),
+        captures: vec![cta],
+    };
+    prog.validate().expect("valid");
+    let mut sc = scenario(
+        "wait_until_chain",
+        Module::new(vec![prog]),
+        inputs(vec![("flag", u32_buf([0])), ("out", u32_buf(vec![u32::MAX; ctas as usize]))]),
+    );
+    sc.config.loop_budget = 1 << 40;
+    sc
+}
+
+/// W6 S-b: `ctas` single-CTA clusters; lane 0 of each atomically adds 1 to
+/// a global `sync_words` counter (a serial-phase global RMW) and then waits
+/// (`wait_until`) until it equals `ctas`. Expected `out[c] = ctas`.
+pub fn atomic_count_wait(ctas: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("atomic_count_wait", 32);
+    b.grid(ctas, 1, 1);
+    let cnt = b.global("cnt", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    b.declare_sync_words(cnt);
+    let lane = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let ca = b.reg(Ty::U64);
+    let old = b.reg(Ty::U32);
+    let got = b.reg(Ty::U32);
+    let arg = b.reg(Ty::U32);
+    let res = b.reg(Ty::PRED);
+    b.lane_id(lane);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let kn = b.k_u32(ctas);
+    b.addr_of(ca, cnt, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.push(Instr::Atom { op: AtomOp::Add, ty: Ty::U32, dst: Some(old), addr: ca.into(), space: AddrSpace::Global, value: k1, cmp: None, sem: Sem::Relaxed, scope: Scope::Gpu, ftz: false });
+    b.site("wait_until", 1);
+    let placeholder = b.push(Instr::Nop);
+    b.no_site();
+    b.st_u32(out, cta, got);
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    let start = Pc(prog.code.len() as u32);
+    let knc = match kn {
+        Operand::Const(c) => c,
+        _ => unreachable!(),
+    };
+    prog.code.push(Instr::Compare { op: CmpOp::Eq, ty: Ty::U32, dst: res, a: arg.into(), b: Operand::Const(knc) });
+    prog.code_sites.push(crate::site::SiteId::NONE);
+    prog.preds.push(PredProgram { arg, start, end: Pc(start.0 + 1), result: res, reads_memory: false });
+    prog.code[placeholder.0 as usize] = Instr::WaitUntil { dst: got, addr: ca.into(), ty: Ty::U32, space: AddrSpace::Generic, sem: Sem::Acquire, scope: Scope::Gpu, pred: PredId(0), captures: vec![] };
+    prog.validate().expect("valid");
+    let mut sc = scenario("atomic_count_wait", Module::new(vec![prog]), inputs(vec![("cnt", u32_buf([0])), ("out", u32_buf(vec![0; ctas as usize]))]));
+    sc.config.loop_budget = 1 << 40;
+    sc
+}
+
 /// A register-only scalar loop (`iters` iterations of fma) per thread:
 /// dispatch cost per instruction.
 pub fn scalar_loop(iters: u32) -> Scenario {
@@ -1257,17 +1367,397 @@ pub fn cas128() -> Scenario {
     b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
     b.if_(p);
     b.addr_of(g, mem, k0);
-    for (i, (cmp, val)) in [((7u64, 10u64), (11u64, 13u64)), ((7, 9), (23, 29))].into_iter().enumerate() {
+    for (i, (cmp, val)) in [((7u64, 10u64), (11u64, 13u64)), ((7, 9), (23, 29))]
+        .into_iter()
+        .enumerate()
+    {
         let c = b.konst(v2, wide(cmp.0, cmp.1));
         let v = b.konst(v2, wide(val.0, val.1));
-        b.push(Instr::Atom { op: AtomOp::Cas, ty: v2, dst: Some(old), addr: g.into(), space: AddrSpace::Global, value: v, cmp: Some(c), sem: Sem::Relaxed, scope: Scope::Gpu, ftz: false });
+        b.push(Instr::Atom {
+            op: AtomOp::Cas,
+            ty: v2,
+            dst: Some(old),
+            addr: g.into(),
+            space: AddrSpace::Global,
+            value: v,
+            cmp: Some(c),
+            sem: Sem::Relaxed,
+            scope: Scope::Gpu,
+            ftz: false,
+        });
         let at = b.k_u32(2 * i as u32);
         b.st(v2, out, at, old);
     }
     b.end_if();
     b.exit();
-    let u64s = |v: &[u64]| ArgValue::Buffer { bytes: v.iter().flat_map(|x| x.to_le_bytes()).collect(), valid: None };
-    scenario("cas128", b.build_module(), inputs(vec![("mem", u64s(&[7, 9])), ("out", u64s(&[0; 4]))]))
+    let u64s = |v: &[u64]| ArgValue::Buffer {
+        bytes: v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        valid: None,
+    };
+    scenario(
+        "cas128",
+        b.build_module(),
+        inputs(vec![("mem", u64s(&[7, 9])), ("out", u64s(&[0; 4]))]),
+    )
+}
+
+/// Shape and options of [`tcgen_mma_f16`].
+#[derive(Clone, Copy, Debug)]
+pub struct MmaSpec {
+    /// `enable_input_d` (accumulate into D).
+    pub accumulate: bool,
+    /// Preset D (f32, every cell) with `tcgen05.st` before the MMA; `None`
+    /// leaves D never written.
+    pub init_d: Option<f32>,
+    /// Lanes 0 and 1 both execute the MMA site (a kernel error: the MMA has
+    /// a single issuing thread, W12-gaps 3).
+    pub two_issuers: bool,
+}
+
+/// M x N x K of [`tcgen_mma_f16`] (`kind::f16`, cta_group::1, f32 D).
+pub const MMA_M: usize = 128;
+pub const MMA_N: usize = 16;
+pub const MMA_K: usize = 16;
+
+/// Host layout of a `rows x k` f16 operand (row-major `vals`, f16 bits) in
+/// shared memory, K-major without swizzle: 8-row x 16-byte core matrices,
+/// LBO = 128 bytes between core matrices along K, SBO = `k / 8 * 128` bytes
+/// along rows. Element `(r, c)` is at `(r/8)*SBO + (c/8)*128 + (r%8)*16 +
+/// (c%8)*2`.
+pub fn kmajor_core_bytes(rows: usize, k: usize, vals: &[u16]) -> Vec<u8> {
+    let sbo = k / 8 * 128;
+    let mut out = vec![0u8; rows * k * 2];
+    for r in 0..rows {
+        for c in 0..k {
+            let at = (r / 8) * sbo + (c / 8) * 128 + (r % 8) * 16 + (c % 8) * 2;
+            out[at..at + 2].copy_from_slice(&vals[r * k + c].to_le_bytes());
+        }
+    }
+    out
+}
+
+/// A minimal real `tcgen05.mma` program (W2, reusable by W4/W5): 4 warps;
+/// warp 0 allocates 32 TMEM columns; all threads copy A (`a`, M x K) and
+/// B (`b`, N x K), host-laid-out by [`kmajor_core_bytes`], into shared
+/// memory; `fence.proxy.async`; optionally every warp presets its D lanes
+/// with `tcgen05.st` (`init_d`); thread 0 builds both descriptors at run
+/// time ([`ProgramBuilder::smem_desc`]), issues `tcgen05.mma.cta_group::1
+/// .kind::f16` (idesc f32 <- f16 x f16, M=128, N=16, K=16) and
+/// `tcgen05.commit` to an mbarrier; every warp waits on it, reads its 32
+/// TMEM lanes with `tcgen05.ld.32x32b.x16` and stores D to `out` (f32, row
+/// `m` = TMEM lane `m`, column `n`). Expected (accumulate with D preset to
+/// `d0`): `out[m][n] = d0 + sum_k a[m][k] * b[n][k]`.
+pub fn tcgen_mma_f16(spec: MmaSpec, a: &[u16], b: &[u16]) -> Scenario {
+    let (m, n, k) = (MMA_M, MMA_N, MMA_K);
+    let mut bld = ProgramBuilder::new("tcgen_mma_f16", 128);
+    let b_ = &mut bld;
+    let out = b_.global("out", Dtype::F32);
+    let ag = b_.global("a", Dtype::U32);
+    let bg = b_.global("b", Dtype::U32);
+    let slot = b_.shared("taddr", Dtype::U32, 1);
+    let bar = b_.shared("bar", Dtype::U64, 1);
+    let a_s = b_.shared("a_s", Dtype::U32, (m * k * 2 / 4) as u64);
+    let b_s = b_.shared("b_s", Dtype::U32, (n * k * 2 / 4) as u64);
+    let tid = b_.reg(Ty::U32);
+    let w = b_.reg(Ty::U32);
+    let p = b_.reg(Ty::PRED);
+    let sa = b_.reg(Ty::U32);
+    let ba = b_.reg(Ty::U32);
+    let t = b_.reg(Ty::U32);
+    let tw = b_.reg(Ty::U32);
+    let idx = b_.reg(Ty::U32);
+    let v = b_.reg(Ty::U32);
+    let da = b_.reg(Ty::U64);
+    let db = b_.reg(Ty::U64);
+    let aa = b_.reg(Ty::U32);
+    let bb = b_.reg(Ty::U32);
+    let d: Vec<Reg> = (0..n).map(|_| b_.reg(Ty::F32)).collect();
+    b_.thread_rank(tid);
+    b_.warp_id(w);
+    let k0 = b_.k_u32(0);
+    let k32 = b_.k_u32(32);
+    let k16 = b_.k_u32(16);
+    let k128 = b_.k_u32(128);
+    b_.smem_addr(sa, slot, k0);
+    b_.smem_addr(ba, bar, k0);
+    b_.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b_.if_(p);
+    b_.push(Instr::TcgenAlloc {
+        dst: sa.into(),
+        ncols: k32,
+        cta_group: 1,
+        exclusive: false,
+    });
+    b_.end_if();
+    // Operands into shared memory (word copies of the host layout).
+    for (src, dst, words) in [(ag, a_s, m * k / 2), (bg, b_s, n * k / 2)] {
+        for j in 0..words.div_ceil(128) {
+            let kj = b_.k_u32((j * 128) as u32);
+            b_.add_u32(idx, tid, kj);
+            let kw = b_.k_u32(words as u32);
+            b_.compare(CmpOp::Lt, Ty::U32, p, idx, kw);
+            b_.if_(p);
+            b_.ld_u32(v, src, idx);
+            b_.st_u32(dst, idx, v);
+            b_.end_if();
+        }
+    }
+    b_.compare(CmpOp::Eq, Ty::U32, p, tid, k0);
+    b_.if_(p);
+    b_.mbar_init(ba, 1);
+    b_.end_if();
+    b_.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    b_.fence(
+        FenceKind::ProxyAsync(Some(AddrSpace::Shared)),
+        Sem::Weak,
+        Scope::Cta,
+    );
+    b_.push(Instr::Fence {
+        kind: FenceKind::Tcgen05Before,
+        sem: Sem::Weak,
+        scope: Scope::Cta,
+    });
+    b_.bar_sync(0);
+    b_.push(Instr::Fence {
+        kind: FenceKind::Tcgen05After,
+        sem: Sem::Weak,
+        scope: Scope::Cta,
+    });
+    b_.ld_u32(t, slot, k0);
+    // This warp's TMEM lanes: taddr + ((warp * 32) << 16).
+    b_.binary(BinOp::Mul, Ty::U32, tw, w, k32);
+    b_.binary(BinOp::Shl, Ty::U32, tw, tw, k16);
+    b_.add_u32(tw, t, tw);
+    if let Some(d0) = spec.init_d {
+        let kd = b_.k_f32(d0);
+        let srcs: Vec<Operand> = (0..n).map(|_| kd).collect();
+        b_.site("tcgen_st_d", 1);
+        b_.push(Instr::TcgenSt(Box::new(TcgenStArgs {
+            srcs,
+            taddr: tw.into(),
+            row: k0,
+            col: k0,
+            shape: TcShape::S32x32b,
+            num: n as u16,
+            unpack: false,
+        })));
+        b_.push(Instr::TcgenWait { st: true });
+        b_.no_site();
+        b_.push(Instr::Fence {
+            kind: FenceKind::Tcgen05Before,
+            sem: Sem::Weak,
+            scope: Scope::Cta,
+        });
+        b_.bar_sync(0);
+        b_.push(Instr::Fence {
+            kind: FenceKind::Tcgen05After,
+            sem: Sem::Weak,
+            scope: Scope::Cta,
+        });
+    }
+    if spec.two_issuers {
+        let k2 = b_.k_u32(2);
+        b_.compare(CmpOp::Lt, Ty::U32, p, tid, k2);
+    } else {
+        b_.compare(CmpOp::Eq, Ty::U32, p, tid, k0);
+    }
+    b_.if_(p);
+    let a_addr = b_.reg(Ty::U32);
+    let b_addr = b_.reg(Ty::U32);
+    b_.smem_addr(a_addr, a_s, k0);
+    b_.smem_addr(b_addr, b_s, k0);
+    let _ = (aa, bb);
+    b_.smem_desc(da, a_addr, 128, (k / 8 * 128) as u32, 0);
+    b_.smem_desc(db, b_addr, 128, (k / 8 * 128) as u32, 0);
+    let idesc = numsim_oplib::tcgen05::encode::encode_dense_instr_descriptor_fields(
+        "float32", "float16", "float16", m as i64, n as i64, k as i64, false, false, 1, false,
+        false, false, false,
+    )
+    .expect("valid f16 idesc") as u32;
+    let ki = b_.k_u32(idesc);
+    let ke = b_.k_u32(spec.accumulate as u32);
+    b_.site("tcgen_mma", 2);
+    b_.push(Instr::TcgenMma(Box::new(TcgenMmaArgs {
+        kind: TcMmaKind::F16,
+        cta_group: 1,
+        d: t.into(),
+        a: TcA::Smem(da.into()),
+        b_desc: db.into(),
+        idesc: ki,
+        enable_input_d: ke,
+        ws: false,
+        ws_b_buffer: 0,
+        block_scale: None,
+        scale_input_d: None,
+        sparse_meta: None,
+        disable_output_lane: Vec::new(),
+        collector_a: CollectorOp::None,
+        collector_b: CollectorOp::None,
+        ashift: false,
+        lut_b: false,
+        lut_b_addr: None,
+        declared: None,
+    })));
+    b_.push(Instr::TcgenCommit {
+        mbar: ba.into(),
+        space: AddrSpace::Shared,
+        cta_group: 1,
+        multicast: None,
+        sync_restrict: false,
+        multicast_width: None,
+    });
+    b_.no_site();
+    b_.end_if();
+    b_.mbar_wait_parity(ba, k0);
+    b_.push(Instr::Fence {
+        kind: FenceKind::Tcgen05After,
+        sem: Sem::Weak,
+        scope: Scope::Cta,
+    });
+    b_.site("tcgen_ld_d", 3);
+    b_.push(Instr::TcgenLd(Box::new(TcgenLdArgs {
+        dsts: d.clone(),
+        taddr: tw.into(),
+        row: k0,
+        col: k0,
+        shape: TcShape::S32x32b,
+        num: n as u16,
+        pack: false,
+        red: None,
+        red_abs: false,
+        red_nan: false,
+        spcompress: false,
+    })));
+    b_.push(Instr::TcgenWait { st: false });
+    b_.no_site();
+    let kn = b_.k_u32(n as u32);
+    let base = b_.reg(Ty::U32);
+    b_.binary(BinOp::Mul, Ty::U32, base, tid, kn);
+    for (j, &r) in d.iter().enumerate() {
+        let kj = b_.k_u32(j as u32);
+        b_.add_u32(idx, base, kj);
+        b_.st(Ty::F32, out, idx, r);
+    }
+    b_.push(Instr::Fence {
+        kind: FenceKind::Tcgen05Before,
+        sem: Sem::Weak,
+        scope: Scope::Cta,
+    });
+    b_.bar_sync(0);
+    b_.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b_.if_(p);
+    b_.push(Instr::TcgenDealloc {
+        taddr: t.into(),
+        ncols: k32,
+        cta_group: 1,
+        exclusive: false,
+    });
+    b_.push(Instr::TcgenRelinquish { cta_group: 1 });
+    b_.end_if();
+    let _ = k128;
+    b_.exit();
+    let words = |bytes: Vec<u8>| {
+        u32_buf(
+            bytes
+                .chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    scenario(
+        "tcgen_mma_f16",
+        bld.build_module(),
+        inputs(vec![
+            ("a", words(kmajor_core_bytes(m, k, a))),
+            ("b", words(kmajor_core_bytes(n, k, b))),
+            ("out", f32_buf(vec![0.0; m * n])),
+        ]),
+    )
+}
+
+/// [`tcgen_mma_f16`] with small-integer operands and D preset to 1.0
+/// (accumulating): the checker smoke instance.
+pub fn tcgen_mma_f16_default() -> Scenario {
+    let f16 = numsim_oplib::arith::half::encode_f16;
+    let a: Vec<u16> = (0..MMA_M * MMA_K)
+        .map(|i| f16(((i / MMA_K + i % MMA_K) % 5) as f32 - 2.0))
+        .collect();
+    let b: Vec<u16> = (0..MMA_N * MMA_K)
+        .map(|i| f16(((3 * (i / MMA_K) + i % MMA_K) % 4) as f32 - 1.0))
+        .collect();
+    tcgen_mma_f16(
+        MmaSpec {
+            accumulate: true,
+            init_d: Some(1.0),
+            two_issuers: false,
+        },
+        &a,
+        &b,
+    )
+}
+
+/// W12-tile-forms 1: `AddrOf` on a vector-typed (`u32x4`) buffer uses the
+/// scalar element size, like Load/Store. Lane `l`: `dist[l]` =
+/// `&v[l] - &v[0]` (expected `4 * l`), `val[l]` = `ld.u32 [&v[l]]`
+/// (expected `v[l]` = 100 + l).
+pub fn addr_of_vector_buffer() -> Scenario {
+    let mut b = ProgramBuilder::new("addr_of_vector_buffer", 32);
+    let v = b.global("v", Dtype::U32);
+    let dist = b.global("dist", Dtype::U32);
+    let val = b.global("val", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let g = b.reg(Ty::U64);
+    let g0 = b.reg(Ty::U64);
+    let d64 = b.reg(Ty::U64);
+    let d = b.reg(Ty::U32);
+    let x = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    b.addr_of(g, v, lane);
+    b.addr_of(g0, v, k0);
+    b.binary(BinOp::Sub, Ty::U64, d64, g, g0);
+    b.cast(Ty::U64, Ty::U32, d, d64);
+    b.st_u32(dist, lane, d);
+    b.push(Instr::LoadAddr { ty: Ty::U32, dst: x, addr: g.into(), space: AddrSpace::Generic, sem: Sem::Weak, scope: Scope::Cta, mods: MemMods::default() });
+    b.st_u32(val, lane, x);
+    b.exit();
+    let mut prog = b.build();
+    prog.buffers[v.0 as usize].dtype = Ty::vector(Dtype::U32, 4);
+    scenario(
+        "addr_of_vector_buffer",
+        Module::new(vec![prog]),
+        inputs(vec![("v", u32_buf(100..132)), ("dist", u32_buf([0; 32])), ("val", u32_buf([0; 32]))]),
+    )
+}
+
+/// W12-gaps 1: lane 0 loads `ld.global.u32` from an integer address:
+/// `past_end` = 64 bytes past the end of the 128-byte `data` buffer (its
+/// guard gap: out of bounds, an error); otherwise a global address no
+/// binding covers (`incomplete`, `integer_address_without_binding`).
+pub fn unbound_integer_load(past_end: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("unbound_integer_load", 32);
+    let data = b.global("data", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let g = b.reg(Ty::U64);
+    let v = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    if past_end {
+        let k48 = b.k_u32(48);
+        b.addr_of(g, data, k48);
+    } else {
+        let far = b.konst(Ty::U64, 0x0000_5000_0000_0000);
+        b.mov(g, far);
+    }
+    b.push(Instr::LoadAddr { ty: Ty::U32, dst: v, addr: g.into(), space: AddrSpace::Global, sem: Sem::Weak, scope: Scope::Cta, mods: MemMods::default() });
+    b.st_u32(out, k0, v);
+    b.end_if();
+    b.exit();
+    scenario("unbound_integer_load", b.build_module(), inputs(vec![("data", u32_buf([0; 32])), ("out", u32_buf([0]))]))
 }
 
 /// Rows x cols of the TMA scenario's f32 tensor, and its box.
@@ -1281,6 +1771,19 @@ pub const TMA_BOX_ROWS: u32 = 4;
 /// completing on one mbarrier armed with `arrive.expect_tx(512)`; the warp
 /// waits and copies both boxes to `out`.
 pub fn tma_load() -> Scenario {
+    tma_load_tx(0)
+}
+
+/// W6 (sync §1.5 / §2.9): [`tma_load`] with the barrier armed for 4 more
+/// bytes than the two boxes deliver (516 expected, 512 completed): every
+/// lane then blocks converged in the parity wait; numsim reports
+/// `Protocol(Mbarrier(TxUnderDelivered { gen: 0, expected: 516, completed:
+/// 512 }))` instead of a generic deadlock.
+pub fn tma_under_delivery_full_warp() -> Scenario {
+    tma_load_tx(4)
+}
+
+fn tma_load_tx(extra: u32) -> Scenario {
     let mut b = ProgramBuilder::new("tma_load", 32);
     let _src = b.global("src", Dtype::F32);
     let out = b.global("out", Dtype::F32);
@@ -1312,7 +1815,7 @@ pub fn tma_load() -> Scenario {
     let e = b.reg(Ty::PRED);
     b.push(Instr::Elect { dst_pred: e, dst_lane: None, membermask: full });
     b.if_(e);
-    let ktx = b.k_u32(2 * box_elems * 4);
+    let ktx = b.k_u32(2 * box_elems * 4 + extra);
     b.push(Instr::MbarArrive(MbarArriveArgs {
         mbar: barr.into(),
         space: AddrSpace::Shared,
@@ -3637,7 +4140,7 @@ pub fn tma_load_param_box() -> Scenario {
 /// Scenarios that are deliberately racy or only meaningful with a specific
 /// configuration (each test states its expectation): not in [`all`].
 pub fn special() -> Vec<Scenario> {
-    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), tmem_subword(), tmem_f16_rows(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE), readonly_proxy("after"), readonly_proxy("cross_cta"), tcgen_ld_wide(false), divergent_named_barrier("other_id"), divergent_named_barrier("exit"), alu_div_by_zero_lane7(), divergent_stuck_wait()]
+    vec![mbar_latch(), tcgen_exclusive_576("sm_107f"), implicit_tmem(), tmem_subword(), tmem_f16_rows(), cross_cluster_flag(false), cross_cluster_sb(), cp_async_no_wait(), word_history_overflow(MAX_HISTORY_PROBE), readonly_proxy("after"), readonly_proxy("cross_cta"), tcgen_ld_wide(false), tma_under_delivery_full_warp(), divergent_named_barrier("other_id"), divergent_named_barrier("exit"), alu_div_by_zero_lane7(), divergent_stuck_wait()]
 }
 
 /// Writes in [`word_history_overflow`] past `MAX_WORD_HISTORY`.
@@ -3647,6 +4150,10 @@ pub const MAX_HISTORY_PROBE: u32 = (crate::interp::aux::MAX_WORD_HISTORY as u32)
 pub fn all() -> Vec<Scenario> {
     vec![
         vector_add(),
+        atomic_count_wait(4),
+        wait_until_chain(6),
+        addr_of_vector_buffer(),
+        tcgen_mma_f16_default(),
         cas128(),
         tmap_replace_generic_shared(),
         ptx_op_per_signature(),

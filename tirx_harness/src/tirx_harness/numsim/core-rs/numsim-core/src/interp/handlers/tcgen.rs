@@ -56,9 +56,12 @@ fn write_taddr(ctx: &mut ExecCtx<'_>, dst: Operand, base: u32) -> Result<(), Exe
     let loc = support::resolve(ctx, space, a, l, 4)?;
     let taddr = addr::tmem_addr(0, base);
     support::mem_write(ctx, loc, l, &taddr.to_le_bytes())?;
+    // The result store is ONE 32-bit write by the issuing warp (the alloc
+    // is warp-collective): a warp-collective access (`ALL_LANES`), not lane
+    // `l`'s (W5-12).
     let mut acc = Accesses::default();
     if ctx.observing {
-        acc.push(loc, l as u8, 4);
+        acc.push(loc, crate::observe::ALL_LANES, 4);
     }
     let sp = support::spec(ctx, AccessKind::Write, Sem::Weak, Scope::Cta, Proxy::Generic);
     support::emit(ctx, sp, &mut acc);
@@ -400,7 +403,9 @@ fn emit_async_spans(ctx: &mut ExecCtx<'_>, op: AsyncId, side: Side, kind: Access
     if !ctx.observing || spans.is_empty() {
         return;
     }
-    let mut acc = Accesses { items: spans.into_iter().map(|s| (alloc, None, s)).collect() };
+    let mut acc = Accesses {
+        items: spans.into_iter().map(|s| (alloc, None, s)).collect(),
+    };
     let spec = AccessSpec {
         actor: Actor::Async { op, side },
         site: ctx.site(),
@@ -794,6 +799,18 @@ pub fn tcgen_cp(ctx: &mut ExecCtx<'_>, args: TcgenCpArgs) -> HResult {
 #[inline]
 pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
     active_or_next!(ctx);
+    // `tcgen05.mma` is issued by a single thread (sync-semantics §6.3): two
+    // lanes executing one MMA site issue two MMAs into the same TMEM
+    // accumulator, a kernel bug (W12-gaps 3).
+    if ctx.warp.active.count() > 1 {
+        let m = ctx.warp.active;
+        return Err(support::err(
+            ctx,
+            ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+            m,
+            format!("tcgen05.mma must be issued by a single thread; lanes {:#010x} issued it", m.bits()),
+        ));
+    }
     // `.lut_b`: the lookup table's TMEM address must name a column inside
     // a live allocation (fail closed otherwise).
     let lut_b = match args.lut_b_addr {
@@ -826,6 +843,12 @@ pub fn tcgen_mma(ctx: &mut ExecCtx<'_>, args: &TcgenMmaArgs) -> HResult {
         } else {
             (vec![ctx.cta.smem], vec![ctx.cta.tmem])
         };
+        // Decision 16 (W11-7): a runtime instruction descriptor must encode the
+        // shape the typed op declared.
+        if let Some(declared) = args.declared {
+            crate::oplib::tcgen_mma_check_declared(args.kind, v(args.idesc) as u32, declared)
+                .map_err(|e| support::op_err(ctx, e))?;
+        }
         let payload = TcgenMmaPayload {
             args: args.clone(),
             d_taddr: v(args.d) as u32,
@@ -1059,6 +1082,7 @@ mod tests {
                 ashift: false,
                 lut_b: false,
                 lut_b_addr: None,
+                declared: None,
             },
             d_taddr: 0,
             a: desc(0x1000),

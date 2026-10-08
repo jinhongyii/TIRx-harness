@@ -77,6 +77,28 @@ impl ProgramBuilder {
         }
     }
 
+    /// `dst` (u64) = a tcgen05 shared-memory matrix descriptor for the 32-bit
+    /// shared address in `smem_addr` (computed at run time, like TVM's
+    /// `SmemDescriptor`): `((addr >> 4) & 0x3fff) | ldo << 16 | sdo << 32 |
+    /// version | layout`. `ldo` / `sdo` are in bytes; `swizzle` 0 = none,
+    /// 1..=4 = 128B/64B/32B/128B-base32 as in `encode_matrix_descriptor`.
+    pub fn smem_desc(&mut self, dst: Reg, smem_addr: Reg, ldo: u32, sdo: u32, swizzle: i64) {
+        let rest = numsim_oplib::tcgen05::encode::encode_matrix_descriptor(
+            0,
+            (ldo >> 4) as i64,
+            (sdo >> 4) as i64,
+            swizzle,
+        );
+        let t = self.reg(Ty::U32);
+        let k4 = self.k_u32(4);
+        let mask = self.k_u32(0x3fff);
+        self.binary(BinOp::Shr, Ty::U32, t, smem_addr, k4);
+        self.binary(BinOp::And, Ty::U32, t, t, mask);
+        self.cast(Ty::U32, Ty::U64, dst, t);
+        let r = self.konst(Ty::U64, rest as u128);
+        self.binary(BinOp::Or, Ty::U64, dst, dst, r);
+    }
+
     /// Clear the current site (pure ALU code).
     pub fn no_site(&mut self) {
         self.site = SiteId::NONE;

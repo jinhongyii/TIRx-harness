@@ -72,7 +72,9 @@ fn load_proxy(mods: &MemMods) -> Proxy {
 #[inline]
 fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<(crate::arena::AllocId, u64, u64, Option<crate::observe::Window>)> {
     use crate::interp::BufBinding;
-    if !ctx.program.buffers[buf.0 as usize].dtype.bits().is_multiple_of(8) {
+    // Sub-byte elements take the general path (element size rule:
+    // `BufferDecl::bit_offset`, the scalar element of the dtype).
+    if !ctx.program.buffers[buf.0 as usize].dtype.elem.bits().is_multiple_of(8) {
         return None;
     }
     let (alloc, base, len) = match ctx.buffers[buf.0 as usize] {
@@ -101,8 +103,9 @@ fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<(crate::arena::AllocId, u6
 /// `None` (out of bounds / misaligned: the general path reports it).
 #[inline(always)]
 fn fast_offset(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, n: u64, len: u64, abs_base: u64) -> Option<u64> {
-    let eb = (ctx.program.buffers[buf.0 as usize].dtype.bits() / 8) as i64;
-    let byte = idx.checked_mul(eb)?;
+    // One element-size rule for every buffer access (`BufferDecl::
+    // byte_offset`: the scalar element of a vector dtype, W12-tile-forms 1).
+    let byte = ctx.program.buffers[buf.0 as usize].byte_offset(idx)?;
     if byte < 0 || (byte as u64).checked_add(n)? > len {
         return None;
     }
@@ -371,10 +374,15 @@ pub fn store_addr(ctx: &mut ExecCtx<'_>, ty: Ty, a: Operand, space: AddrSpace, v
 #[inline]
 pub fn addr_of(ctx: &mut ExecCtx<'_>, dst: Reg, buf: Buf, offset: Operand) -> HResult {
     active_or_next!(ctx);
-    let bits = ctx.program.buffers[buf.0 as usize].dtype.bits() as i64;
     for l in ctx.warp.active.lanes() {
         let idx = lane_int(ctx, offset, l);
-        let byte = idx.wrapping_mul(bits).div_euclid(8);
+        // Same element-size rule as Load/Store (`BufferDecl::bit_offset`,
+        // the scalar element of a vector dtype; W12-tile-forms 1).
+        let Some(bit) = ctx.program.buffers[buf.0 as usize].bit_offset(idx) else {
+            let name = ctx.program.buffers[buf.0 as usize].name.clone();
+            return Err(support::err(ctx, ExecErrorKind::OutOfBounds, WarpMask::lane(l), format!("{name}[{idx}]: offset overflows")));
+        };
+        let byte = bit.div_euclid(8);
         let a = support::buf_generic_addr(ctx, buf, byte)?;
         write_lane(ctx, dst, l, a);
     }

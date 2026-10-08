@@ -280,6 +280,32 @@ pub fn resolve_data(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, le
     resolve(ctx, space, a, lane, len)
 }
 
+/// A global/generic integer address that names no bound allocation
+/// (W12-gaps 1 ruling): `incomplete` (`integer_address_without_binding`),
+/// since the memory may exist outside the launch's bindings. An address in
+/// an allocation's trailing guard gap is an out-of-bounds use of that
+/// allocation (a kernel error).
+fn unbound_global(ctx: &ExecCtx<'_>, va: u64, len: u64, lanes: WarpMask) -> ExecError {
+    // A null pointer, or an address that decodes into another state space's
+    // generic window (shared, local, param), is a provable state-space
+    // mismatch, not unknown memory: a `bad_address` error (W11).
+    if va == 0 || !matches!(addr::classify_generic(va), addr::Generic::Global(_) | addr::Generic::Unmapped(_)) {
+        return arena_err(ctx, ArenaError::BadAddress { space: Space::Global, addr: va }, lanes);
+    }
+    if let Some((alloc, base, end)) = ctx.arena.global_neighbor(va) {
+        let e = ArenaError::OutOfBounds { alloc, span: ByteSpan::new(va - base, len), size: end - base };
+        return arena_err(ctx, e, lanes);
+    }
+    let mut e = err(
+        ctx,
+        ExecErrorKind::Unsupported,
+        lanes,
+        format!("integer_address_without_binding: global address {va:#x} names no bound allocation"),
+    );
+    e.attrs.insert("address".into(), serde_json::json!(va));
+    e
+}
+
 pub fn resolve(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, len: u64) -> Result<Loc, ExecError> {
     let lanes = WarpMask::lane(lane);
     match space {
@@ -290,7 +316,11 @@ pub fn resolve(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, len: u6
             if let addr::Generic::Param(off) = addr::classify_generic(a) {
                 return resolve(ctx, AddrSpace::Param, off as u64, lane, len);
             }
-            let (alloc, offset) = ctx.arena.resolve_global(a, len).map_err(|e| arena_err(ctx, e, lanes))?;
+            let (alloc, offset) = match ctx.arena.resolve_global(a, len) {
+                Ok(x) => x,
+                Err(ArenaError::BadAddress { .. }) => return Err(unbound_global(ctx, a, len, lanes)),
+                Err(e) => return Err(arena_err(ctx, e, lanes)),
+            };
             Ok(Loc { alloc, offset, window: Some(Window::Global), remote: None })
         }
         AddrSpace::Shared => {
@@ -328,7 +358,7 @@ pub fn resolve(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, len: u6
                     let w = if rank == ctx.cta.rank_in_cluster { Window::SharedCta } else { Window::SharedCluster };
                     shared_loc(ctx, rank, off, len, lane, w)
                 }
-                addr::Generic::Unmapped(va) => Err(arena_err(ctx, ArenaError::BadAddress { space: Space::Global, addr: va }, lanes)),
+                addr::Generic::Unmapped(va) => Err(unbound_global(ctx, va, len, lanes)),
             }
         }
         AddrSpace::Local => {

@@ -3087,3 +3087,56 @@ These are legacy run-time rejections that v2 accepts. Each reproducer is the leg
 - With `corrupt_descriptor=1`, the runtime instruction descriptor of the block-scaled MMA has bit 17 (the N field) flipped. v2 runs to completion and produces different values.
 - Expected, as legacy: an error, because the runtime `descI` does not match the typed TCGEN ABI (the shape declared by the `gemm_async`). This fails open, since an undeclared shape change goes through without an error.
 - The MMA handler (oplib) or the issue path (interp) should check that a runtime `descI` agrees with the statically declared shape and kind.
+
+## W4-W11-7 (for coordinator + W1 + W2, 2026-10-08): declared MMA shape on `TcgenMmaArgs`
+
+- **Need.** The declared shape of a typed `gemm_async` is known only to lowering: `TcgenMmaArgs` has `kind` but no M/N/K. A runtime `descI` with a flipped N bit (reproducer `ports/test_w11_l1_block_scaled.py::test_block_scaled_desc_i_rejects_static_abi_mismatch_at_runtime_corrected_kernel`) therefore cannot be checked.
+- **Contract (coordinator).** Add `TcgenMmaArgs.declared: Option<[u16; 3]>`, holding `[M, N, K]` of the typed op. M is the full M, i.e. 256 for cta_group::2 M256. K is per instruction: 32 for mxf8f6f4, doubled for sparse. It is `None` for raw `tcgen05.mma` with no typed ABI. Serde must require it, as for the other `Option` fields.
+- **Lowering (W1).** Fill `declared` for every `tcgen05.mma` that the `gemm_async`/`gemm` tile dispatch emits, from the tile op's `mma_m/mma_n` and instruction K.
+- **Interp (W2).** In `handlers/tcgen.rs::tcgen_mma`, at issue, per lane, after `idesc` is read:
+  - add `if let Some(d) = args.declared { oplib::tcgen_mma_check_declared(args.kind, idesc, d).map_err(|e| support::op_err(ctx, e))?; }`;
+  - the result is `Invalid`, and the message names both shapes ("encodes M=128 N=24 K=32, which does not match the declared MMA shape M=128 N=16 K=32").
+- **Oplib (done, W4).**
+  - `numsim_oplib::tcgen05::instr_desc::{idesc_shape, check_declared_shape, IdescFamily, MmaShape}` cover the dense, mxf8f6f4 and mxf4 layouts and K bits.
+  - The wrapper is `numsim_core::oplib::tcgen_mma_check_declared`.
+  - Tests: `runtime_descriptor_shape_must_match_the_declared_mma` and `tcgen_mma_runtime_descriptor_must_match_declared_shape`.
+
+## W2 (2026-10-08): partition independence (launch-wide words), W6 hooks/suspects, W12-gaps 1/3, AddrOf, W5-12, MMA program builder
+
+- **Partitioning.**
+  - `single_partition()` no longer forces one partition for `wait_until` / `sync_words`.
+  - `Scheduler::merge_words` merges the launch-wide declared-word history:
+    - after the parallel phase, in replay order;
+    - in the serial phase and `drain_all`, after each partition (W6 S-b).
+  - Entries are rebased onto the launch table, and partitions are refreshed.
+  - The fallback (cooperative/grid.sync, `max_resident_ctas == 0`, mixed cta_group, `RunConfig::single_partition`) is documented in engine-review.md.
+  - Tests:
+    - `partitioned_wait_until_is_deterministic_across_workers` (1/8/32: outputs, stream hash, verdicts);
+    - `partitioned_words_do_not_depend_on_the_observer`;
+    - `wait_verdict_indices_follow_the_delivery_order` (S-b);
+    - `sub_byte_sync_words_fail_closed`.
+  - Measured, `sm100_fp8_fp4_mega_moe` medium_moe (148 SMs, 16 workers, load ~43):
+    - Engine.run: >1500 s (killed) before, 10.8 s after. W10: 10.4 s, against legacy 4.2 s.
+    - Racecheck still does not finish within 900 s (W10). The checker path is now the bottleneck.
+- **W6 S-a: confirmed and fixed.** `Arena::pieces` no longer records a shard's read of bytes it wrote itself this round. This removed a spurious `stream_cycle`. Test: `arena::tests::reading_own_writes_is_not_a_round_start_read`.
+- **W6 S-c: refuted.** `InboxMsg::Sync` has no producer: remote mbarrier ops apply at issue, and the handler emits a qualified `Arrive` (`release` and `scope` set). The unqualified emit in `drain_inbox` is dead code.
+- **W6 stuck hook.** At no progress, `SyncTable::stuck` turns a provably stuck resource into `Protocol(Mbarrier(TxUnderDelivered))` at the blocked warp. Scenario `tma_under_delivery_full_warp`.
+- **W12-gaps 1 ruling.**
+  - An unbound integer global address is `incomplete` (`integer_address_without_binding`).
+  - It stays an error in these cases: in an allocation's guard gap (`out_of_bounds`), null, or a non-global aperture such as a generic shared window (`bad_address`, W11).
+  - W4-9's `prefetch.valid_addr` expectation is updated accordingly.
+- **W12-gaps 3.** A multi-lane `tcgen05.mma` issue is an error.
+- **W12-tile-forms 1.** AddrOf and the fast load/store path use `BufferDecl::bit_offset` / `byte_offset`. Scenario `addr_of_vector_buffer`.
+- **W5-12.** The `tcgen05.alloc` address store is one `ALL_LANES` access.
+- **W9 phase 6 MMA uninit.** Scenario `tcgen_mma_f16` (reusable builder: `ProgramBuilder::smem_desc`, `kmajor_core_bytes`, `MmaSpec`). Tests:
+  - `tcgen_mma_f16_program_matches_the_reference`;
+  - `tcgen_mma_into_never_written_tmem_reports_uninit_read`;
+  - `tcgen_mma_from_two_lanes_is_an_error`.
+- **Delta D13.** The atomic float-add NaN operand order (W4 differential test).
+- **Not started:**
+  - W12-gaps 6 (CLC claims under a subset: needs a serialized launch-wide claim queue);
+  - W12-gaps 7–9;
+  - W6 cluster-barrier gather;
+  - `WorkCmd::CommitSharedA`;
+  - W5 tcgen `preds` (per-thread);
+  - intra-cluster partitioning (design sent to the coordinator).

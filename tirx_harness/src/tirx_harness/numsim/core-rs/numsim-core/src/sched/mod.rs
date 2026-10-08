@@ -724,11 +724,11 @@ impl<'p> Scheduler<'p> {
         // Never depends on the observer: observers must not change
         // program-visible behaviour (and partitioning changes when other
         // partitions' global writes become visible).
-        self.config.single_partition
-            || self.all_resident()
-            || groups.len() > 1
-            || p.buffers.iter().any(|b| b.sync_words)
-            || p.code.iter().any(|i| matches!(i, Instr::WaitUntil { .. }))
+        // Declared words / `wait_until` do NOT force one partition: the
+        // launch-wide word history is merged in replay order after every
+        // phase (`merge_words`), which keeps verdict numbering identical to
+        // the delivery order (README / engine-review "partitioned words").
+        self.config.single_partition || self.all_resident() || groups.len() > 1
     }
 
     fn new_partition(&self, cluster: u32) -> Partition {
@@ -863,7 +863,9 @@ impl<'p> Scheduler<'p> {
             if self.wants_history {
                 for (i, b) in self.program.buffers.iter().enumerate() {
                     if let (true, BufBinding::SharedWindow { offset, len }) = (b.sync_words, self.bindings[i]) {
-                        for span in sync_word_spans(b, offset as u64, len) {
+                        let spans = sync_word_spans(b, offset as u64, len)
+                            .map_err(|m| sched_error(ExecErrorKind::Unsupported, self.kernel_index, WarpId(u32::MAX), SiteId::NONE, m))?;
+                        for span in spans {
                             self.partitions[pi].aux.words.declare(arena, ctx.smem, span);
                             self.host_event(observer, SyncKind::DeclareWord { alloc: ctx.smem, span });
                         }
@@ -1027,7 +1029,11 @@ impl<'p> Scheduler<'p> {
         if self.wants_history {
             for (i, b) in self.program.buffers.iter().enumerate() {
                 if let (true, BufBinding::View(v)) = (b.sync_words, self.bindings[i]) {
-                    for span in sync_word_spans(b, v.offset, v.len) {
+                    let spans = match sync_word_spans(b, v.offset, v.len) {
+                        Ok(s) => s,
+                        Err(m) => return classify(sched_error(ExecErrorKind::Unsupported, self.kernel_index, WarpId(u32::MAX), SiteId::NONE, m)),
+                    };
+                    for span in spans {
                         self.launch_words.declare(arena, v.alloc, span);
                         self.host_event(observer, SyncKind::DeclareWord { alloc: v.alloc, span });
                     }
@@ -1105,6 +1111,7 @@ impl<'p> Scheduler<'p> {
             };
             let r = self.partitions[0].run_round(&env, arena);
             self.absorb(0, observer);
+            self.merge_words(&[0]);
             return r;
         }
         let mut shards: Vec<Arena> = Vec::with_capacity(n);
@@ -1211,6 +1218,9 @@ impl<'p> Scheduler<'p> {
         for &k in &order {
             self.partitions[k].events.replay(observer, &mut self.next_seq);
         }
+        // Declared-word history: each partition's new entries, in the same
+        // order its events were delivered.
+        self.merge_words(&order);
         let mut progress = false;
         let mut first_err = None;
         for (k, result) in results.iter_mut().enumerate().take(kept) {
@@ -1269,9 +1279,81 @@ impl<'p> Scheduler<'p> {
             };
             let r = self.partitions[pi].run_serial(&env, arena);
             self.absorb(pi, observer);
+            // Serial work runs partition by partition on the main arena:
+            // merge each partition's history before the next one runs, so a
+            // later partition's verdicts see earlier entries (W6 S-b).
+            self.merge_words(&[pi]);
             progress |= r?;
         }
         Ok(progress)
+    }
+
+    /// Merge the partitions' declared-word histories into the launch table
+    /// (`order` = the order their events were just delivered) and give every
+    /// partition the merged table back.
+    ///
+    /// Each partition ran the phase with a copy of the launch table, so its
+    /// entries past the copy's length are new. They are appended rebased
+    /// onto the launch table's last image (each entry keeps only the bytes
+    /// it wrote). Indices stay equal to the delivery order: the replay
+    /// order puts a partition that read bytes another one wrote this round
+    /// before the writer, so no partition delivered earlier wrote a word a
+    /// later one waited on (a read/write cycle is reported `incomplete`).
+    /// History exists only for history-consuming observers; nothing
+    /// program-visible depends on it.
+    fn merge_words(&mut self, order: &[usize]) {
+        use crate::interp::aux::{WordRegion, MAX_WORD_HISTORY};
+        if !self.wants_history {
+            return;
+        }
+        let base = self.launch_words.clone();
+        let base_len = |alloc: &AllocId, span: ByteSpan| {
+            base.regions.get(alloc).and_then(|rs| rs.iter().find(|r| r.span == span)).map(|r| r.log.len())
+        };
+        let mut changed = false;
+        for &k in order {
+            let local = &self.partitions[k].aux.words;
+            for (alloc, regions) in &local.regions {
+                for r in regions {
+                    let start = base_len(alloc, r.span);
+                    if start == Some(r.log.len()) && !r.overflow {
+                        continue;
+                    }
+                    changed = true;
+                    let target = self.launch_words.regions.entry(*alloc).or_default();
+                    let ti = match target.iter().position(|t| t.span == r.span) {
+                        Some(i) => i,
+                        None => {
+                            target.push(WordRegion { span: r.span, init: r.init.clone(), log: Vec::new(), overflow: false });
+                            target.len() - 1
+                        }
+                    };
+                    let t = &mut target[ti];
+                    for (spans, img) in r.log.iter().skip(start.unwrap_or(0)) {
+                        if t.log.len() >= MAX_WORD_HISTORY {
+                            t.overflow = true;
+                            break;
+                        }
+                        let mut merged = t.log.last().map(|e| e.1.clone()).unwrap_or_else(|| t.init.clone());
+                        for sp in spans {
+                            let lo = sp.start.max(r.span.start);
+                            let hi = sp.end().min(r.span.end());
+                            for x in lo..hi {
+                                let i = (x - r.span.start) as usize;
+                                merged[i] = img[i];
+                            }
+                        }
+                        t.log.push((spans.clone(), merged));
+                    }
+                    t.overflow |= r.overflow;
+                }
+            }
+        }
+        if changed {
+            for p in &mut self.partitions {
+                p.aux.words = self.launch_words.clone();
+            }
+        }
     }
 
     /// Land / apply everything ready in every partition (main arena).
@@ -1291,6 +1373,7 @@ impl<'p> Scheduler<'p> {
             let p = &mut self.partitions[pi];
             let r = p.land(None, &env, arena, true).and_then(|a| Ok(a | p.apply_completions(&env)?));
             self.absorb(pi, observer);
+            self.merge_words(&[pi]);
             any |= r?;
         }
         Ok(any)
@@ -1329,11 +1412,15 @@ impl<'p> Scheduler<'p> {
                 let mut blocked = Vec::new();
                 let mut divergent = None;
                 let mut after_exit = None;
-                for p in &self.partitions {
+                // Per partition: (warp, resource, site, lanes) of each
+                // blocked warp, for the stuck-resource diagnosis below.
+                let mut per_partition: Vec<Vec<(WarpId, ResourceId, SiteId, WarpMask)>> = vec![Vec::new(); self.partitions.len()];
+                for (pi, p) in self.partitions.iter().enumerate() {
                     for c in &p.ctas {
                         for w in &c.warps {
                             if let WarpStatus::Blocked(r) = w.status {
                                 blocked.push((w.id, r));
+                                per_partition[pi].push((w.id, r, self.program.site_of(w.pc), w.active));
                                 if divergent.is_none() && crate::interp::is_divergent(w) {
                                     divergent = Some((w.id, self.program.site_of(w.pc), w.active));
                                 }
@@ -1372,6 +1459,26 @@ impl<'p> Scheduler<'p> {
                         reason: format!("divergent_block: no progress while warp {} is blocked with a divergent mask", w.0),
                         site: Some(site),
                     });
+                }
+                // A blocked resource that can provably never complete (sync
+                // §1.5 / §2.9, e.g. an mbarrier whose arrivals are all in
+                // with nothing in flight but fewer tx bytes than expected) is
+                // a kernel error at the warp blocked on it, not a generic
+                // deadlock (W6).
+                for (pi, warps) in per_partition.iter().enumerate() {
+                    let ids: Vec<ResourceId> = warps.iter().map(|w| w.1).collect();
+                    if let Some((res, err)) = self.partitions[pi].sync.stuck(&ids).into_iter().next() {
+                        let &(warp, _, site, lanes) = warps.iter().find(|w| w.1 == res).expect("stuck resource is blocked on");
+                        let message = match &err {
+                            crate::sync::SyncError::Mbarrier(crate::sync::mbarrier::Error::TxUnderDelivered { gen, expected, completed }) => {
+                                format!("mbarrier transaction under-delivery: {completed} of {expected} bytes for phase {gen}")
+                            }
+                            other => format!("{other:?}"),
+                        };
+                        let mut e = sched_error(ExecErrorKind::Protocol(err), self.kernel_index, warp, site, message);
+                        e.lanes = lanes;
+                        return Ok(RunStatus::Error(e));
+                    }
                 }
                 return Ok(RunStatus::Deadlock { blocked });
             }
@@ -1480,9 +1587,19 @@ fn blocked_cmd(r: ResourceId) -> SyncCmd {
 /// Declared sync words of a `sync_words` buffer (W5-14 ruling): one word
 /// per element of the polled view's dtype (`bits / 8` bytes, at least 1),
 /// each with its own history; never one word over the whole buffer.
-fn sync_word_spans(b: &crate::program::BufferDecl, offset: u64, len: u64) -> Vec<ByteSpan> {
-    let w = (b.dtype.bits() as u64 / 8).max(1);
-    (0..len.div_ceil(w)).map(|k| ByteSpan::new(offset + k * w, w.min(len - k * w))).collect()
+/// A dtype that is not a whole number of bytes, or a buffer that is not a
+/// whole number of words, has no well-defined word: fail closed
+/// (`incomplete`, coordinator ruling on W5-14).
+fn sync_word_spans(b: &crate::program::BufferDecl, offset: u64, len: u64) -> Result<Vec<ByteSpan>, String> {
+    let bits = b.dtype.bits() as u64;
+    if bits == 0 || !bits.is_multiple_of(8) || !len.is_multiple_of(bits / 8) {
+        return Err(format!(
+            "sync_words buffer {}: {len} bytes are not a whole number of {}-bit words; declared-word verdicts are not modelled for sub-word sizes",
+            b.name, bits
+        ));
+    }
+    let w = bits / 8;
+    Ok((0..len / w).map(|k| ByteSpan::new(offset + k * w, w)).collect())
 }
 
 fn write_param(arena: &mut Arena, params: AllocId, off: u64, bytes: &[u8]) {

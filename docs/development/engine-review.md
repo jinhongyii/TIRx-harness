@@ -209,3 +209,26 @@ A run is `incomplete` when coverage cannot be established. This is never `clean`
 | `run` | `numsim-py::execute` | engine execution. **Includes online racecheck**: `RaceObserver` consumes events during the run |
 | `check` | `numsim-py::execute` | post-run checker work: synccheck exploration, racecheck `finish` |
 | `report` | `v2.run` | Python report assembly |
+
+## Partitioning and the single-partition fallback (2026-10-08)
+
+Every launch runs as CTA-lockstep partitions, one per resident cluster. Each partition has its own copy-on-write overlay (stripes) of global memory, and the partitions are merged deterministically at the end of each round (redesign.md §2.3). A global word written by another cluster becomes visible one round later. That includes `wait_until` polls and `sync_words` words. Results and observer streams do not depend on the worker count: `partitioned_wait_until_is_deterministic_across_workers` checks this at 1, 8 and 32 workers.
+
+**Declared-word history (`wait_until` verdicts).**
+- The launch-wide `WordTable` is authoritative. A partition runs each phase on a copy and logs its own writes.
+- `Scheduler::merge_words` appends each partition's new entries, rebased onto the launch table's last image, after:
+  - the parallel phase, in event replay order;
+  - the serial phase, in partition order;
+  - `drain_all`, in partition order.
+  It then refreshes the partitions' copies.
+- Verdict indices equal the delivery order because the replay order puts a reader of bytes another partition wrote this round before that writer. A read/write cycle is reported as `incomplete` (`cross_cluster_same_round_cycle`).
+- The history exists only for history-consuming observers. Nothing program-visible depends on it (`partitioned_words_do_not_depend_on_the_observer`).
+
+**Single-partition fallback.** These forms run the whole launch as one partition. The merge/replay protocol cannot order them yet; they are documented, not `incomplete`.
+
+| form | why one partition |
+| --- | --- |
+| `cooperative` topology / any `grid.sync` | the grid barrier is launch-wide state that all CTAs must reach in one schedule |
+| `RunConfig::max_resident_ctas == 0` | every CTA resident at once (cooperative launches) |
+| kernels mixing `tcgen05` `cta_group::1` and `::2` | the kernel-wide tcgen05 `cta_group` rule is checked across all CTAs |
+| `RunConfig::single_partition` | explicit request (tests, debugging) |
