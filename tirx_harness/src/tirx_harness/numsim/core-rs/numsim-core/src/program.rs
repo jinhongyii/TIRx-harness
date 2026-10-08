@@ -1767,6 +1767,19 @@ impl DimExpr {
 /// 32-bit aligned, a column outside a live allocation) fails closed
 /// (`Unsupported`/`Misaligned`), never silently. `AddrOf` and raw
 /// `LoadAddr`/`StoreAddr` on TMEM are not allowed.
+///
+/// *Sub-word cells.* For 8- and 16-bit element types, `per_cell = 32 /
+/// bits` consecutive elements share one 32-bit cell: element `offset` lives
+/// in cell `offset / per_cell` (addressed by the lane/column rule above,
+/// with `offset` replaced by the cell index) at bit offset
+/// `(offset % per_cell) * bits` within the cell. A `Store` of a sub-word
+/// element is a read-modify-write of its cell. Other widths (sub-byte,
+/// 64-bit, vectors spanning cells) fail closed.
+///
+/// *Replicated views* (a TIR TMEM layout that maps one logical element to
+/// several lanes/columns) are not representable: lowering emits
+/// `Unsupported { reason: "tmem_replicated_view: <buffer>" }`, which fails
+/// closed as incomplete if reached.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BufferDecl {
@@ -1915,8 +1928,11 @@ pub struct TensorMapSpec {
     pub global_dim: Vec<DimExpr>,
     /// Byte strides of dims 1.. .
     pub global_stride: Vec<DimExpr>,
-    pub box_dim: Vec<u32>,
-    pub element_stride: Vec<u32>,
+    /// Box extents, innermost first. `DimExpr` so host-prologue runtime
+    /// values are expressible; evaluated at bind time like `global_dim`.
+    pub box_dim: Vec<DimExpr>,
+    /// Element (traversal) strides, innermost first; `DimExpr` likewise.
+    pub element_stride: Vec<DimExpr>,
     pub interleave: u8,
     pub swizzle: u8,
     pub l2_promotion: u8,
@@ -2249,6 +2265,8 @@ impl Program {
                     .global_dim
                     .iter()
                     .chain(&m.global_stride)
+                    .chain(&m.box_dim)
+                    .chain(&m.element_stride)
                     .chain(std::iter::once(&m.base_offset))
                 {
                     check_dim(d, &format!("param{i}.tensor_map"));

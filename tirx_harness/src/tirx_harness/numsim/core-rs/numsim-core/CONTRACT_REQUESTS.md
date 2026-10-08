@@ -568,6 +568,24 @@ All of these are JSON-visible. `FORMAT_VERSION` is now **2**.
     - `ld`/`st` require both operands to be warp-uniform. `cp` reads them
       in the issuing lane.
 
+28. **Sub-word TMEM cells.** `Load`/`Store` on a `Space::Tmem` buffer
+    with an 8- or 16-bit element type is allowed. `per_cell = 32 / bits`
+    elements share one 32-bit cell:
+    - the cell index is `offset / per_cell`, addressed by the unchanged
+      lane/column rule;
+    - the element sits at bit `(offset % per_cell) * bits` within the cell;
+    - a sub-word `Store` is a read-modify-write of its cell.
+
+    `validate` accepts these dtypes. Other widths fail closed at run time.
+    The ruling is documented on `BufferDecl`.
+29. **Replicated TMEM views stay fail-closed.** Emit
+    `Unsupported { reason: "tmem_replicated_view: <buffer>" }`. No corpus
+    kernel uses them.
+30. **`TensorMapSpec.box_dim` and `element_stride` are now
+    `Vec<DimExpr>`** (were `Vec<u32>`). Emit `{"Const": n}` for static
+    values. `validate` checks their params. W2's bind-time encode must
+    evaluate them like `global_dim`.
+
 **C.3 acks.**
 - **Accepted:** 1 (`numsim.pack`/`unpack`, W4), 2 (`<name>.value`, W4),
   5, 6, 7, 8, 9 and 10.
