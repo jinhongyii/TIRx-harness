@@ -242,3 +242,24 @@ Every launch runs as CTA-lockstep partitions, one per resident cluster. Each par
 | 1 | 53.4 s | 73.2 s |
 
 W10's earlier 73 s at 32 workers came from an engine 84 commits older. Large single-cluster kernels therefore keep the cluster-level partition.
+
+## Mega MoE max config: where the time goes, and the spin-poll skip decision (2026-10-08)
+
+Case `t8192_m8192_h7168_i3072_e384_k6_g1`, `Engine(max_workers=16)`, NumSim mode. Measured with temporary counters on private builds; the numbers are CPU-seconds summed over threads.
+- **Partitioning.** 74 partitions in every one of 74,478 rounds, so no single-partition fallback. The serial phase is 0.5 s, turnover 0.9 s, host allocation of inputs 9.2 s.
+- **Balanced load.** Partition time totals 3,460–3,712 CPU-s over balanced partitions (about 53 s each for the busiest), against a 203 s critical path. The run is throughput-bound, not serialized.
+- **Split of partition time.** Warp execution (`run_cta`) 1,326. `land` 2,074, of which:
+  - MMA arithmetic (`run_mma` → `oplib::tc_mma_ctas`, block-scaled mxf8f6f4): 1,309–1,356 (W4);
+  - TcgenCp landing: 324 → 131 after the direct-byte fast path;
+  - Copy landing: 163 → 114 after gathering without a `Vec` per span;
+  - landing scan: 86 → 75 with the lazy live-id set.
+  `apply_completions` is 4.
+- **Spin polls.**
+  - 72% of partition-rounds start with every warp blocked, but only 11% make no progress at all (48 CPU-s).
+  - 151 M slices re-poll a parked warp that stays blocked (288 CPU-s).
+
+**Decision: no spin-poll skip (coordinator).**
+- A partition-level skip would save at most 48 CPU-s.
+- A per-warp resource-version skip (≤ 288 CPU-s, about 9%) would have to be disabled whenever an observer is attached, because parked retries emit poll events. That makes it an execution path that exists only without an observer, which the one-execution-path rule forbids.
+- The lever is the MMA arithmetic (W4) and interpreter hot paths (W13).
+

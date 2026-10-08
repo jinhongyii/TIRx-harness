@@ -44,8 +44,8 @@ legacy Python modules).
 | --- | --- | --- |
 | Lowering (Python) | `numsim/v2/lowering/` ([README](../../tirx_harness/src/tirx_harness/numsim/v2/lowering/README.md)) | TIRx PrimFunc → `Module` (one `Program` per launch) |
 | Contract | `core-rs/numsim-core/src/{program,dtype,value,site,observe,report}.rs`, `numsim-types` | `Program`, `Instr`, `Dtype`, `SiteInfo`, the `Observer` trait, `Finding` |
-| Interpreter | `numsim-core/src/interp/` | `WarpState`, the mask stack, one handler per instruction family |
-| Scheduler | `numsim-core/src/sched/` | Rounds, seeded warp rotation, async landing, deadlock and budget detection, cluster partitions |
+| Interpreter | `numsim-core/src/interp/` ([README](../../tirx_harness/src/tirx_harness/numsim/core-rs/numsim-core/src/interp/README.md)) | `WarpState`, the mask stack, one handler per instruction family |
+| Scheduler | `numsim-core/src/sched/` ([README](../../tirx_harness/src/tirx_harness/numsim/core-rs/numsim-core/src/sched/README.md)) | Rounds, seeded warp rotation, async landing, deadlock and budget detection, cluster partitions |
 | Arena | `numsim-core/src/arena.rs` | Allocations, views, validity bits, address encodings |
 | SyncTable | `numsim-core/src/sync/` | Protocol states, `step` functions, the completion queue |
 | OpLib | `numsim-core/src/oplib/`, `core-rs/numsim-oplib/` | Pure numerics: conversions, low-precision formats, MMA, TMA and swizzle addressing, the operation registry |
