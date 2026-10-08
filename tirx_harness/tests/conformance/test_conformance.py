@@ -27,7 +27,10 @@ def test_conformance_snapshot(entry, mode, implementation, request) -> None:
     update = request.config.getoption("update_snapshots")
     if update and implementation.name != "legacy":
         pytest.fail("snapshots are the legacy oracle; regenerate them only with NUMSIM_IMPL=legacy")
-    expected = snap.load_snapshot(entry.name, mode)
+    expected = (
+        snap.load_snapshot(entry.name, mode) if update
+        else snap.load_expected(entry.name, mode, implementation.name)
+    )
     if not update and implementation.name != "legacy" and expected is not None and "error" in expected:
         pytest.skip(f"legacy failed this case ({expected['error']}); there is no oracle to compare")
 
@@ -63,3 +66,6 @@ def test_snapshot_directory_matches_corpus() -> None:
     names = {entry.name for entry in CANONICAL_KERNEL_CASES}
     present = {path.name for path in snap.SNAPSHOT_ROOT.iterdir() if path.is_dir()} if snap.SNAPSHOT_ROOT.exists() else set()
     assert present <= names, sorted(present - names)
+    # Every delta snapshot names its behaviour-delta row.
+    for path in snap.SNAPSHOT_ROOT.glob("*/*.delta.json"):
+        assert snap.json.loads(path.read_text()).get("delta"), path

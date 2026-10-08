@@ -70,6 +70,27 @@ def load_snapshot(case_name: str, mode: str, root: Path = SNAPSHOT_ROOT) -> dict
     return json.loads(path.read_text())
 
 
+def delta_snapshot_path(case_name: str, mode: str, root: Path = SNAPSHOT_ROOT) -> Path:
+    return root / case_name / f"{mode}.delta.json"
+
+
+def load_expected(case_name: str, mode: str, impl_name: str, root: Path = SNAPSHOT_ROOT) -> dict[str, Any] | None:
+    """The oracle for ``impl_name``.
+
+    Legacy always compares with ``<mode>.json`` (legacy output). A new
+    implementation compares with ``<mode>.delta.json`` when present: the
+    legacy snapshot corrected by a behaviour-delta row (its ``delta`` field
+    names the row and is not part of the comparison)."""
+
+    if impl_name != "legacy":
+        path = delta_snapshot_path(case_name, mode, root)
+        if path.exists():
+            data = json.loads(path.read_text())
+            data.pop("delta", None)
+            return data
+    return load_snapshot(case_name, mode, root)
+
+
 def write_snapshot(
     case_name: str, mode: str, snapshot: Mapping[str, Any], root: Path = SNAPSHOT_ROOT
 ) -> Path:
@@ -607,6 +628,7 @@ __all__ = [
     "collect_snapshot",
     "diff_snapshots",
     "load_implementation",
+    "load_expected",
     "load_snapshot",
     "normalize_analysis_phase",
     "normalize_numsim",

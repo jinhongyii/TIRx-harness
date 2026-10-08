@@ -27,6 +27,21 @@ while that module is missing or does not yet expose `transpile`, `Engine`
 legacy snapshot is an exception are skipped under v2 (no oracle), and so is
 any v2 run that raises `NotImplementedError` (unfinished numsim-core bodies).
 
+## Delta snapshots
+
+When a behaviour-delta row rules that legacy was wrong, the corrected oracle
+for new implementations lives next to the legacy snapshot as
+`snapshots/<case>/<mode>.delta.json`, with a `delta` field naming the row
+(checked by `test_snapshot_directory_matches_corpus`). Legacy runs always
+compare with `<mode>.json`; `NUMSIM_IMPL=v2` uses the delta file when it
+exists. `--update-snapshots` never touches delta files. The legacy corpus
+gates (`canonical_cases.py` expectations) keep the legacy numbers until the
+legacy engine is deleted.
+
+| case / mode | delta row | change |
+| --- | --- | --- |
+| `msa_sparse_atten_fwd_nvfp4_kv_sm100` / racecheck | racecheck-behaviour-deltas T12 | `tmem_lifetime_review` covers columns 64-128 (4 load/store pairs, true positives); legacy reported 64-80 and 96-112 only |
+
 ## What a snapshot contains (`snapshot.py`)
 
 - **numsim**: per output buffer `dtype`, `shape` and `sha256` of the raw bytes;
