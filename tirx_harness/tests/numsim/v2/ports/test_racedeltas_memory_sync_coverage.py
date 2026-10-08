@@ -11,9 +11,8 @@ Legacy required both checkers clean and the listed outputs for every kernel.
   reach CTA 1 through their own complete-tx (delta B3), CTA 1's
   ``shared[1] = 99`` is its own write, and ``cluster_sync`` orders the final
   reads. Synccheck clean and the outputs are unchanged.
-- ``address_queries``: ``v2_gap`` xfail (``other_assertion_triage.tsv``:
-  ``isspacep.shared::cta`` of a ``mapa``-ed peer-CTA generic address returns
-  1, expected 0; the checkers are clean).
+- ``address_queries``: passes since the isspacep peer-rank fix (the earlier
+  ``v2_gap`` from ``other_assertion_triage.tsv`` is dropped).
 - The other five params pass unchanged.
 
 The kernels are copied verbatim from the legacy file.
@@ -25,7 +24,7 @@ import numpy as np
 import pytest
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 from ._racedeltas import assert_b7_scope_mismatch
@@ -217,11 +216,6 @@ def scalar_async_store(out: T.Buffer((4,), "uint32")):
         out[lane] = shared[lane]
 
 
-_ISSPACEP_GAP = v2_gap(
-    "[W2] interp: isspacep.shared::cta of a mapa'd peer-CTA generic address returns 1 (expected 0); "
-    "mem::isspacep treats .shared::cta like .shared::cluster (other_assertion_triage.tsv)"
-)
-
 CASES = (
     pytest.param(
         scalar_atomic_sinks,
@@ -262,7 +256,6 @@ CASES = (
         {"out": np.zeros((2, 10), dtype=np.uint32)},
         {"out": [[1, 1, 1, 0, 1, 0, 1, 1, 1, 1], [0, 0, 1, 0, 1, 0, 1, 1, 1, 1]]},
         id="address_queries",
-        marks=_ISSPACEP_GAP,
     ),
     pytest.param(
         scalar_async_store,
@@ -282,7 +275,7 @@ def test_memory_sync_extensions(kernel, inputs, expected, tmp_path):
 
     Both checkers clean and the legacy outputs, except ``scalar_async_store``
     whose Racecheck is racecheck delta B7 (one ``scope_mismatch``), and
-    ``address_queries`` which is a ``v2_gap`` (isspacep).
+    ``address_queries`` (isspacep, fixed).
     """
 
     def args():

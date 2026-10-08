@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from tirx_harness import numsim
+from tests.numsim.support.host_bindings import host_layout
 
 
 NUMSIM_GPU_MARK = pytest.mark.numsim_gpu
@@ -420,7 +421,6 @@ def run_gpu_primfunc(
     import torch
     from tvm.ir.type import PointerType
     from tvm.tirx import TensorMapType
-    from tirx_harness.numsim.bindings import prepare_bindings
 
     parameter_names = _parameter_names(prim_func)
     # GPU execution must remain available for instructions NumSim cannot model.
@@ -436,13 +436,14 @@ def run_gpu_primfunc(
         raise ValueError(f"GPU arguments do not match PrimFunc: missing={missing}, extra={extra}")
 
     device_arguments: dict[str, Any] = {}
-    # Reuse the host binding owner's alias groups. Exact (pointer, size, dtype)
-    # keys split a TensorMap's subview from its ordinary backing argument.
-    bindings = prepare_bindings({
+    # Group aliased host arrays into physical allocations (NumPy owner and
+    # backing-range connectivity, plus memory addressed by embedded TensorMap
+    # images). A TensorMap's subview keeps its own offset into the backing.
+    bindings = host_layout({
         name: value if isinstance(value, np.ndarray) else value.array
         for name, value in arguments.items()
         if isinstance(value, (np.ndarray, PairedBuffer, PairedTensorMap))
-    }, expected_buffer_dtypes={
+    }, expected_dtypes={
         name: value.logical_dtype
         for name, value in arguments.items()
         if isinstance(value, (PairedBuffer, PairedTensorMap)) and value.logical_dtype is not None

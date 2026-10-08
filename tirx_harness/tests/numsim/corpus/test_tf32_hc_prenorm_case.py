@@ -16,8 +16,8 @@ from tests.numsim.corpus.kernels.deepgemm import (
 from tests.numsim.microtests.harness import NUMSIM_GPU_MARK, require_numsim_gpu
 from tests.numsim.support._tirx_kernels import config_params, load_tirx_kernel
 from tests.numsim.support.three_way import run_three_way_case
-from tirx_harness.numsim.bindings import _decode_tensor_maps, _tensor_map_base_array
-from tirx_harness.numsim.transpiler.frontend import analyze
+from tests.numsim.support.host_bindings import decode_tensor_maps, tensor_map_base_array
+from tests.numsim.support.kernel_facts import launch_topology, unsupported_reasons
 
 _tf32_hc = load_tirx_kernel("deepgemm_sm100_tf32_hc_prenorm_gemm")
 CONFIGS = _tf32_hc.CONFIGS
@@ -32,16 +32,14 @@ def test_tf32_hc_numsim_corpus_covers_unsplit_and_multi_split_paths():
 @pytest.mark.parametrize("config", CONFIGS, ids=lambda config: config["label"])
 def test_all_tf32_hc_configs_are_supported(config):
     kernel = get_kernel(**config)
-    spec = analyze(kernel)
-
-    assert spec.unsupported == ()
+    assert unsupported_reasons(kernel) == ()
 
 
 @pytest.mark.parametrize("config", NUMSIM_CONFIGS, ids=lambda config: config["label"])
 def test_prepare_tf32_hc_numsim_case_is_deterministic_and_full_launch(config):
     case = prepare_numsim_case(**config_params(config))
     repeated = prepare_numsim_case(**config_params(config))
-    topology = analyze(case.kernel).topology
+    topology = launch_topology(case.kernel)
 
     assert topology.clusters == config["num_splits"] * math.ceil(config["m"] / 64)
     assert topology.ctas_per_cluster == 1
@@ -53,11 +51,11 @@ def test_prepare_tf32_hc_numsim_case_is_deterministic_and_full_launch(config):
     assert np.any((b_bits & np.uint32(0x1FFF)) != 0)
     assert case.args["b"].shape == (config["n"] * config["k"],)
     b_map = case.args["b_map"]
-    descriptors = _decode_tensor_maps(b_map)
+    descriptors = decode_tensor_maps(b_map)
     assert len(descriptors) == 1
     assert descriptors[0].dtype == "tf32"
     assert descriptors[0].address == case.args["b"].__array_interface__["data"][0]
-    assert np.shares_memory(_tensor_map_base_array(b_map), case.args["b"])
+    assert np.shares_memory(tensor_map_base_array(b_map), case.args["b"])
     np.testing.assert_array_equal(case.reference()["D"], repeated.reference()["D"])
     np.testing.assert_array_equal(case.reference()["sqr_sum"], repeated.reference()["sqr_sum"])
 
@@ -83,7 +81,7 @@ def test_tf32_rounding_uses_round_to_nearest_even():
 def test_tf32_hc_accepts_one_k_block_per_split():
     kernel = get_kernel(m=13, n=24, k=128, num_splits=2, seed=0)
 
-    topology = analyze(kernel).topology
+    topology = launch_topology(kernel)
     assert topology.clusters == 2
 
 

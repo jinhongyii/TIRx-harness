@@ -66,7 +66,10 @@ def replacements(wave: str, rows: list[dict[str, str]]) -> dict[str, list[str]]:
                 for row in csv.DictReader(handle, delimiter="\t"):
                     tests = [t for t in row["v2_tests"].split(";") if t.strip()]
                     if tests:
-                        out[row["legacy_test"]] = [t.strip() for t in tests]
+                        # Union across port maps: a legacy function may be covered
+                        # by copies listed in several files (one per porter).
+                        merged = out.setdefault(row["legacy_test"], [])
+                        merged += [t.strip() for t in tests if t.strip() not in merged]
     return out
 
 
@@ -79,7 +82,10 @@ def passing(node_ids: set[str], results: Path | None) -> set[str]:
         os.close(handle)
         results = Path(name)
         cmd = [sys.executable, "-m", "pytest", "-q", "-n", "16", "-p", "no:cacheprovider", f"--junitxml={results}"]
-        subprocess.run(cmd + sorted(node_ids), cwd=TESTS_BASE, stdout=subprocess.DEVNULL, check=False)
+        # Run whole files: one stale node id would abort a node-id run and
+        # make every replacement look failed.
+        files = sorted({n.split("::", 1)[0] for n in node_ids if (TESTS_BASE / n.split("::", 1)[0]).exists()})
+        subprocess.run(cmd + files, cwd=TESTS_BASE, stdout=subprocess.DEVNULL, check=False)
     outcome: dict[str, bool] = {}
     for case in ET.parse(results).iter("testcase"):
         file = case.get("classname", "").replace(".", "/")

@@ -25,8 +25,8 @@ from tests.numsim.corpus.kernels.gemm import (
 from tests.numsim.microtests.harness import NUMSIM_GPU_MARK, require_numsim_gpu
 from tests.numsim.support._tirx_kernels import load_tirx_kernel
 from tests.numsim.support.three_way import run_three_way_case
-from tirx_harness.numsim.bindings import _decode_tensor_maps, _tensor_map_base_array
-from tirx_harness.numsim.transpiler.frontend import analyze
+from tests.numsim.support.host_bindings import decode_tensor_maps, tensor_map_base_array
+from tests.numsim.support.kernel_facts import launch_topology
 
 
 def _params(config):
@@ -34,7 +34,7 @@ def _params(config):
 
 
 def _descriptor_semantics(descriptor: np.ndarray) -> tuple[object, ...]:
-    decoded = _decode_tensor_maps(descriptor)[0]
+    decoded = decode_tensor_maps(descriptor)[0]
     return (
         decoded.required_byte_len,
         decoded.global_shape,
@@ -145,11 +145,11 @@ def test_prepare_fp8_numsim_case_is_cpu_only_deterministic_and_full_launch(confi
     )
     case = prepare_numsim_case(**_params(config))
     repeated = prepare_numsim_case(**_params(config))
-    spec = analyze(case.kernel)
+    topology = launch_topology(case.kernel)
 
-    assert spec.topology.clusters == FP8_1D1D_NUM_SMS // spec.topology.ctas_per_cluster
-    assert spec.topology.ctas_per_cluster == 2
-    assert spec.topology.warps_per_cta == 8
+    assert topology.clusters == FP8_1D1D_NUM_SMS // topology.ctas_per_cluster
+    assert topology.ctas_per_cluster == 2
+    assert topology.warps_per_cta == 8
     assert case.subset is None
     assert case.outputs == {"D": "tensor_map_cd"}
     assert set(case.args) == {
@@ -185,8 +185,8 @@ def test_prepare_fp8_numsim_case_is_cpu_only_deterministic_and_full_launch(confi
         assert descriptor.shape == (128,)
         assert _descriptor_semantics(descriptor) == _descriptor_semantics(repeated.args[name])
         np.testing.assert_array_equal(
-            _tensor_map_base_array(descriptor),
-            _tensor_map_base_array(repeated.args[name]),
+            tensor_map_base_array(descriptor),
+            tensor_map_base_array(repeated.args[name]),
         )
     np.testing.assert_array_equal(case.reference()["D"], repeated.reference()["D"])
 

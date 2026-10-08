@@ -8,7 +8,6 @@ import pytest
 
 from tirx_kernels.registry import discover_kernels
 from tirx_harness.numsim import Engine, run_case, transpile
-from tirx_harness.numsim.api import ExecutionSubset
 from tests.numsim.corpus.canonical_cases import (
     CANONICAL_KERNEL_CASES,
     CANONICAL_KERNEL_MANIFEST,
@@ -115,6 +114,10 @@ def test_flashmla_small_topk_task_steal_matches_independent_numerical_oracle() -
     case = entry.prepare()
     # Leave the second logical cluster non-resident.  The resident CTA pair
     # must claim it through CLC and still produce both query rows.
+    # ExecutionSubset is not public API (legacy ``numsim.api`` only; v2 reads
+    # ``cluster_ids`` from any object): import it where it is used.
+    from tirx_harness.numsim.api import ExecutionSubset
+
     case.subset = ExecutionSubset(cluster_ids=[0])
 
     report = run_case(case)

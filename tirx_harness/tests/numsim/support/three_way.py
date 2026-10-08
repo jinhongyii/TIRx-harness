@@ -14,14 +14,13 @@ from tests.numsim.microtests.harness import (
     PairedTensorMap,
     run_gpu_primfunc,
 )
-from tirx_harness import numsim
-from tirx_harness.numsim.bindings import (
-    _decode_tensor_maps,
-    _tensor_map_array_from_buffer,
-    _tensor_map_physical_dtype,
+from tests.numsim.support.host_bindings import (
+    decode_tensor_maps,
+    tensor_map_array_from_buffer,
+    tensor_map_physical_dtype,
 )
-from tirx_harness.numsim.host_abi import build_host_abi
-from tirx_harness.numsim.transpiler.frontend import analyze
+from tests.numsim.support.kernel_facts import parameter_buffer_dtypes
+from tirx_harness import numsim
 
 
 @dataclass(frozen=True)
@@ -46,14 +45,14 @@ class ThreeWayReport:
 
 
 def _host_tensor_map_base(value: np.ndarray) -> tuple[Any, np.ndarray] | None:
-    descriptors = _decode_tensor_maps(value)
+    descriptors = decode_tensor_maps(value)
     if value.shape != (128,) or len(descriptors) != 1:
         return None
     descriptor = descriptors[0]
     raw = np.ctypeslib.as_array(
         (ctypes.c_uint8 * descriptor.required_byte_len).from_address(descriptor.address)
     )
-    return descriptor, raw.view(_tensor_map_physical_dtype(descriptor.dtype))
+    return descriptor, raw.view(tensor_map_physical_dtype(descriptor.dtype))
 
 
 def _clone_array(value: np.ndarray) -> np.ndarray:
@@ -159,7 +158,7 @@ def _gpu_arguments(kernel: Any, arguments: dict[str, Any]) -> tuple[dict[str, An
     gpu_arguments: dict[str, Any] = {}
     argument_to_gpu_name: dict[str, str] = {}
     consumed: set[str] = set()
-    buffer_dtypes = build_host_abi(analyze(kernel)).buffer_dtypes
+    buffer_dtypes = parameter_buffer_dtypes(kernel)
     for parameter in kernel.params:
         gpu_name = parameter.name
         candidates = [
@@ -198,12 +197,12 @@ def _gpu_output(argument: Any, output: np.ndarray) -> np.ndarray:
     array = np.asarray(output)
     if not isinstance(argument, np.ndarray):
         return array.copy()
-    descriptors = _decode_tensor_maps(argument)
+    descriptors = decode_tensor_maps(argument)
     if argument.shape != (128,) or len(descriptors) != 1:
         return array.copy()
     descriptor = descriptors[0]
     raw = np.ascontiguousarray(array).view(np.uint8)
-    return _tensor_map_array_from_buffer(
+    return tensor_map_array_from_buffer(
         raw,
         data_offset=0,
         global_shape=descriptor.physical_global_shape,

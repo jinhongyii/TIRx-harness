@@ -366,6 +366,7 @@ tests/analysis_tools/test_report.py::test_incomplete_reasons_keep_distinct_ident
 tests/analysis_tools/test_report.py::test_access_pairs_keep_distinct_identities_under_data_race,analysis_tools,1,C,delete,override,legacy report payload shape,,internal:checker_report,,semantic
 tests/conformance/test_conformance.py::test_conformance_snapshot,conformance,?,N,keep,path,new-layer test,,public,,runs
 tests/conformance/test_conformance.py::test_snapshot_directory_matches_corpus,conformance,1,N,keep,path,new-layer test,,public,,
+tests/conformance/test_conformance.py::test_post_deletion_mode_selects_v2,conformance,1,N,keep,path,new-layer test,,public,,semantic
 tests/numsim/abi/test_abi_version.py::test_numsim_uses_one_artifact_abi_version,numsim/abi,1,C,delete,override,legacy engine ABI / public engine surface,,internal:abi,,c:.rs
 tests/numsim/abi/test_abi_version.py::test_module_manifest_has_no_parallel_semantic_or_boundary_versions,numsim/abi,1,C,delete,override,legacy engine ABI / public engine surface,,internal:abi,,"runs;c:emit_rust_module,to_manifest"
 tests/numsim/abi/test_engine_public_api.py::test_generated_rust_uses_only_the_declared_engine_boundaries,numsim/abi,1,C,delete,override,legacy engine ABI / public engine surface,,internal:transpiler.frontend,,runs;c:emit_rust_module
@@ -375,52 +376,52 @@ tests/numsim/corpus/test_canonical_kernels.py::test_fastcu_k96_uses_nonzero_scal
 tests/numsim/corpus/test_canonical_kernels.py::test_rubin_gather_swiglu_reuses_all_eight_a_stages,numsim/corpus,1,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
 tests/numsim/corpus/test_canonical_kernels.py::test_maximum_mega_moe_numsim_completes_within_performance_budget,numsim/corpus,1,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
 tests/numsim/corpus/test_canonical_kernels.py::test_flashmla_small_topk_task_steal_matches_independent_numerical_oracle,numsim/corpus,1,A,conformance,signals:mixed,semantic asserts plus implementation pins (ExecutionSubset); port the semantic part only,,public,,runs;semantic;c:ExecutionSubset
-tests/numsim/corpus/test_flash_attention4_case.py::test_flash_attention_numsim_corpus_covers_every_gqa_ratio_and_causal_branch,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,
-tests/numsim/corpus/test_flash_attention4_case.py::test_prepare_flash_attention_numsim_case_is_deterministic,numsim/corpus,2,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:bindings,,runs;semantic
-tests/numsim/corpus/test_flash_attention4_case.py::test_flash_attention_corpus_has_expected_full_launch_topologies,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:bindings,,runs
-tests/numsim/corpus/test_flash_attention4_case.py::test_numpy_attention_reference_matches_independent_scalar_gqa,numsim/corpus,2,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_flash_attention_backward_case.py::test_flash_attention_backward_case_is_deterministic_and_full_launch,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:transpiler.frontend,,runs;semantic
-tests/numsim/corpus/test_flash_attention_backward_case.py::test_flash_attention_backward_matches_independent_numpy_backward,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:transpiler.frontend,,runs;semantic
-tests/numsim/corpus/test_fp16_bf16_gemm_case.py::test_gemm_numsim_corpus_matches_bootstrap_target,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:transpiler.frontend,,
-tests/numsim/corpus/test_fp16_bf16_gemm_case.py::test_prepare_gemm_numsim_case_is_deterministic_and_full_launch,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:transpiler.frontend,,runs;semantic
-tests/numsim/corpus/test_fp16_bf16_gemm_case.py::test_independent_bfloat16_codec_rounds_to_nearest_even,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:transpiler.frontend,,semantic
-tests/numsim/corpus/test_fp16_bf16_gemm_case.py::test_every_gemm_numsim_config_matches_gpu_and_reference,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:transpiler.frontend,,runs
-tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_fp8_numsim_configs_cover_both_deepgemm_layout_branches,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,
-tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_e4m3fn_codec_handles_subnormals_rounding_saturation_and_nan,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_e8m0_scale_encoding_and_uint32_packing_are_exact,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_fp8_reference_applies_one_e8m0_scale_per_128_k_values,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,
-tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_prepare_fp8_numsim_case_is_cpu_only_deterministic_and_full_launch,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:bindings,,runs;semantic
-tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_fp8_blockwise_kernel_selects_each_128_k_scale_block,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:bindings,,runs
-tests/numsim/corpus/test_mqa_cases.py::test_mqa_numsim_inputs_have_valid_bindings,numsim/corpus,?,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,
-tests/numsim/corpus/test_mqa_cases.py::test_mqa_shared_pointer_views_keep_their_physical_scope,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:bindings,,runs
-tests/numsim/corpus/test_mqa_cases.py::test_dense_mqa_numsim_corpus_covers_dense_compressed_and_cooperative,numsim/corpus,?,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,
-tests/numsim/corpus/test_mqa_cases.py::test_mqa_numsim_cases_are_deterministic_and_full_launch,numsim/corpus,2,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:bindings,,runs;semantic
-tests/numsim/corpus/test_mqa_cases.py::test_dense_mqa_numpy_reference_matches_independent_scalar_reference,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_mqa_cases.py::test_mqa_low_precision_packing_round_trips_physical_codes,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_mqa_cases.py::test_compressed_mqa_comparison_regions_map_prefix_to_kv_range,numsim/corpus,?,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_mqa_cases.py::test_dense_mqa_comparison_regions_exclude_unspecified_columns,numsim/corpus,?,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
+tests/numsim/corpus/test_flash_attention4_case.py::test_flash_attention_numsim_corpus_covers_every_gqa_ratio_and_causal_branch,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,
+tests/numsim/corpus/test_flash_attention4_case.py::test_prepare_flash_attention_numsim_case_is_deterministic,numsim/corpus,2,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
+tests/numsim/corpus/test_flash_attention4_case.py::test_flash_attention_corpus_has_expected_full_launch_topologies,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
+tests/numsim/corpus/test_flash_attention4_case.py::test_numpy_attention_reference_matches_independent_scalar_gqa,numsim/corpus,2,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_flash_attention_backward_case.py::test_flash_attention_backward_case_is_deterministic_and_full_launch,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
+tests/numsim/corpus/test_flash_attention_backward_case.py::test_flash_attention_backward_matches_independent_numpy_backward,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
+tests/numsim/corpus/test_fp16_bf16_gemm_case.py::test_gemm_numsim_corpus_matches_bootstrap_target,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,
+tests/numsim/corpus/test_fp16_bf16_gemm_case.py::test_prepare_gemm_numsim_case_is_deterministic_and_full_launch,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
+tests/numsim/corpus/test_fp16_bf16_gemm_case.py::test_independent_bfloat16_codec_rounds_to_nearest_even,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_fp16_bf16_gemm_case.py::test_every_gemm_numsim_config_matches_gpu_and_reference,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
+tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_fp8_numsim_configs_cover_both_deepgemm_layout_branches,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,
+tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_e4m3fn_codec_handles_subnormals_rounding_saturation_and_nan,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_e8m0_scale_encoding_and_uint32_packing_are_exact,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_fp8_reference_applies_one_e8m0_scale_per_128_k_values,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,
+tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_prepare_fp8_numsim_case_is_cpu_only_deterministic_and_full_launch,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
+tests/numsim/corpus/test_fp8_blockwise_gemm_case.py::test_fp8_blockwise_kernel_selects_each_128_k_scale_block,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
+tests/numsim/corpus/test_mqa_cases.py::test_mqa_numsim_inputs_have_valid_bindings,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:transpiler.frontend,,runs
+tests/numsim/corpus/test_mqa_cases.py::test_mqa_shared_pointer_views_keep_their_physical_scope,numsim/corpus,?,C,delete,override,phase 6 (P6-A): asserts a legacy-frontend unsupported message,,internal:transpiler.frontend,,runs
+tests/numsim/corpus/test_mqa_cases.py::test_dense_mqa_numsim_corpus_covers_dense_compressed_and_cooperative,numsim/corpus,?,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:transpiler.frontend,,
+tests/numsim/corpus/test_mqa_cases.py::test_mqa_numsim_cases_are_deterministic_and_full_launch,numsim/corpus,2,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:transpiler.frontend,,runs;semantic
+tests/numsim/corpus/test_mqa_cases.py::test_dense_mqa_numpy_reference_matches_independent_scalar_reference,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:transpiler.frontend,,semantic
+tests/numsim/corpus/test_mqa_cases.py::test_mqa_low_precision_packing_round_trips_physical_codes,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:transpiler.frontend,,semantic
+tests/numsim/corpus/test_mqa_cases.py::test_compressed_mqa_comparison_regions_map_prefix_to_kv_range,numsim/corpus,?,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:transpiler.frontend,,semantic
+tests/numsim/corpus/test_mqa_cases.py::test_dense_mqa_comparison_regions_exclude_unspecified_columns,numsim/corpus,?,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:transpiler.frontend,,semantic
 tests/numsim/corpus/test_native_alphamoe.py::test_alphamoe_matches_gpu_and_reference,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
 tests/numsim/corpus/test_native_alphamoe.py::test_native_alphamoe_public_m8_matches_reference,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
 tests/numsim/corpus/test_native_alphamoe.py::test_native_alphamoe_graph_replay_refreshes_tagged_partials,numsim/corpus,3,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
 tests/numsim/corpus/test_native_kda_backward.py::test_backward_oracle_rejects_exp_of_log2_gate,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
 tests/numsim/corpus/test_native_kda_backward.py::test_backward_matches_gpu_and_reference,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
-tests/numsim/corpus/test_nvfp4_gemm_case.py::test_e2m1_codec_and_nibble_order_are_exact,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_nvfp4_gemm_case.py::test_nvfp4_128x4_scale_layout_has_expected_physical_offsets,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_nvfp4_gemm_case.py::test_nvfp4_reference_applies_local_e4m3_scales_and_global_alpha,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_nvfp4_gemm_case.py::test_prepare_nvfp4_numsim_case_is_deterministic_and_full_launch,numsim/corpus,1,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:bindings,,runs;semantic
-tests/numsim/corpus/test_nvfp4_gemm_case.py::test_every_nvfp4_numsim_config_matches_gpu_and_reference,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:bindings,,runs
-tests/numsim/corpus/test_recurrent_cases.py::test_native_kda_case_is_one_complete_head_cta,numsim/corpus,1,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:bindings,,runs;semantic
-tests/numsim/corpus/test_recurrent_cases.py::test_native_kda_fixed_route_matches_independent_oracle,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:bindings,,runs
-tests/numsim/corpus/test_recurrent_cases.py::test_gdn_prefill_case_is_deterministic_and_full_launch,numsim/corpus,1,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:bindings,,runs;semantic
-tests/numsim/corpus/test_recurrent_cases.py::test_gdn_oracle_detects_value_corruption,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_tf32_hc_numsim_corpus_covers_unsplit_and_multi_split_paths,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,
-tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_all_tf32_hc_configs_are_supported,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:bindings,,runs
-tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_prepare_tf32_hc_numsim_case_is_deterministic_and_full_launch,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,internal:bindings,,runs;semantic
-tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_first_tf32_hc_case_matches_independent_reference_in_numsim,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:bindings,,runs
-tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_tf32_rounding_uses_round_to_nearest_even,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_tf32_hc_accepts_one_k_block_per_split,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:bindings,,runs
-tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_multi_split_reference_partials_reduce_to_unsplit_result,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,internal:bindings,,semantic
-tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_every_tf32_hc_numsim_config_matches_gpu_and_reference,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:bindings,,runs
+tests/numsim/corpus/test_nvfp4_gemm_case.py::test_e2m1_codec_and_nibble_order_are_exact,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_nvfp4_gemm_case.py::test_nvfp4_128x4_scale_layout_has_expected_physical_offsets,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_nvfp4_gemm_case.py::test_nvfp4_reference_applies_local_e4m3_scales_and_global_alpha,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_nvfp4_gemm_case.py::test_prepare_nvfp4_numsim_case_is_deterministic_and_full_launch,numsim/corpus,1,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
+tests/numsim/corpus/test_nvfp4_gemm_case.py::test_every_nvfp4_numsim_config_matches_gpu_and_reference,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
+tests/numsim/corpus/test_recurrent_cases.py::test_native_kda_case_is_one_complete_head_cta,numsim/corpus,1,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
+tests/numsim/corpus/test_recurrent_cases.py::test_native_kda_fixed_route_matches_independent_oracle,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
+tests/numsim/corpus/test_recurrent_cases.py::test_gdn_prefill_case_is_deterministic_and_full_launch,numsim/corpus,1,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
+tests/numsim/corpus/test_recurrent_cases.py::test_gdn_oracle_detects_value_corruption,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_tf32_hc_numsim_corpus_covers_unsplit_and_multi_split_paths,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,
+tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_all_tf32_hc_configs_are_supported,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
+tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_prepare_tf32_hc_numsim_case_is_deterministic_and_full_launch,numsim/corpus,?,A,conformance,signals,corpus/wiki kernel verdict or output,,public,,runs;semantic
+tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_first_tf32_hc_case_matches_independent_reference_in_numsim,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
+tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_tf32_rounding_uses_round_to_nearest_even,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_tf32_hc_accepts_one_k_block_per_split,numsim/corpus,1,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
+tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_multi_split_reference_partials_reduce_to_unsplit_result,numsim/corpus,1,F,keep,path:corpus-fixture,corpus fixture / independent reference self-test (conformance relies on these oracles),,public,,semantic
+tests/numsim/corpus/test_tf32_hc_prenorm_case.py::test_every_tf32_hc_numsim_config_matches_gpu_and_reference,numsim/corpus,?,A,conformance,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,,runs
 tests/numsim/integration/test_api.py::test_execution_subset_uses_subset_api_name,numsim/integration,1,A,v2-api,override,"public API contract (compare / run_case / Engine); v2 keeps the legacy signatures, rerun under NUMSIM_IMPL=v2",,internal:bindings,,c:ExecutionSubset
 tests/numsim/integration/test_api.py::test_execution_subset_is_not_publicly_exported,numsim/integration,1,A,v2-api,override,"public API contract (compare / run_case / Engine); v2 keeps the legacy signatures, rerun under NUMSIM_IMPL=v2",,internal:bindings,,
 tests/numsim/integration/test_api.py::test_multi_kernel_subsets_are_phase_indexed_and_never_broadcast,numsim/integration,1,A,v2-api,override,"public API contract (compare / run_case / Engine); v2 keeps the legacy signatures, rerun under NUMSIM_IMPL=v2",,internal:bindings,,semantic;c:ExecutionSubset
@@ -444,7 +445,7 @@ tests/numsim/integration/test_api.py::test_comparison_region_normalizes_integer_
 tests/numsim/integration/test_api.py::test_run_case_requires_reference_keys_to_name_selected_outputs,numsim/integration,1,A,v2-api,override,"public API contract (compare / run_case / Engine); v2 keeps the legacy signatures, rerun under NUMSIM_IMPL=v2",,internal:bindings,,runs;semantic
 tests/numsim/integration/test_api.py::test_run_case_rejects_empty_reference_before_execution,numsim/integration,1,A,v2-api,override,"public API contract (compare / run_case / Engine); v2 keeps the legacy signatures, rerun under NUMSIM_IMPL=v2",,internal:bindings,,runs;semantic
 tests/numsim/integration/test_api.py::test_run_case_freezes_bindings_before_mutating_reference,numsim/integration,1,A,v2-api,override,"public API contract (compare / run_case / Engine); v2 keeps the legacy signatures, rerun under NUMSIM_IMPL=v2",,internal:bindings,,runs;semantic
-tests/numsim/integration/test_artifact_build.py::test_codegen_rejects_a_spec_paired_with_different_primfuncs,numsim/integration,1,A,v2-kernel-case,signals:mixed,semantic asserts plus implementation pins (emit_rust_module); port the semantic part only,,internal:abi,,runs;semantic;c:emit_rust_module
+tests/numsim/integration/test_artifact_build.py::test_codegen_rejects_a_spec_paired_with_different_primfuncs,numsim/integration,1,C,delete,override,phase 6: only feeds a legacy spec into emit_rust_module; v2 has no separate spec/codegen step,,internal:abi,,runs;semantic;c:emit_rust_module
 tests/numsim/integration/test_artifact_build.py::test_codegen_rejects_alpha_renamed_host_abi_with_the_same_structural_hash,numsim/integration,1,A,v2-kernel-case,signals:mixed,semantic asserts plus implementation pins (emit_rust_module); port the semantic part only,,internal:abi,,runs;semantic;c:emit_rust_module
 tests/numsim/integration/test_artifact_build.py::test_transpiled_artifact_runs_one_future_per_warp,numsim/integration,1,C,delete,signals:impl,"pins implementation: rust_source,fn warp_main(,let mut ,poll_order,task_count",,internal:abi,,"runs;c:rust_source,fn warp_main(,let mut ,poll_order,task_count"
 tests/numsim/integration/test_artifact_build.py::test_engine_parallelizes_independent_cluster_domains,numsim/integration,1,C,delete,signals:impl,"pins implementation: poll_order,task_count",,internal:abi,,"runs;c:poll_order,task_count"
@@ -594,7 +595,7 @@ tests/numsim/integration/test_emission_errors.py::test_valid_signature_control_e
 tests/numsim/integration/test_emission_errors.py::test_analysis_collects_unvisited_calls_after_an_emission_failure,numsim/integration,?,C,delete,name:impl,test name describes the legacy implementation (emission),,internal:transpiler.frontend,,runs;semantic
 tests/numsim/integration/test_emission_errors.py::test_error_recovery_controls_keep_normal_emission_and_execution,numsim/integration,?,C,delete,name:impl,test name describes the legacy implementation (emission),,internal:transpiler.frontend,,runs;semantic
 tests/numsim/integration/test_emission_errors.py::test_error_recovery_respects_expression_let_scope,numsim/integration,2,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
-tests/numsim/integration/test_emission_errors.py::test_native_topology_returns_semantic_errors_as_data,numsim/integration,2,C,delete,signals:internals,"legacy NumSim Python internals, no kernel run",,internal:transpiler.frontend,,semantic
+tests/numsim/integration/test_emission_errors.py::test_native_topology_returns_semantic_errors_as_data,numsim/integration,2,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
 tests/numsim/integration/test_emission_errors.py::test_foreign_exception_messages_are_not_parsed_as_frontend_errors,numsim/integration,1,C,delete,signals:internals,"legacy NumSim Python internals, no kernel run",,internal:transpiler.frontend,,semantic
 tests/numsim/integration/test_float8_artifact.py::test_float8_buffers_use_one_byte_physical_storage_and_native_codecs,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/integration/test_fp8_cta1_descriptor_layout.py::test_fp8_cta1_extended_shared_addresses,numsim/integration,2,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,engine-stops,runs;checker;semantic
@@ -832,7 +833,7 @@ tests/numsim/integration/test_register_layout_artifact.py::test_tcgen_atom_layou
 tests/numsim/integration/test_reported_layout_regressions.py::test_lane_owner_layout_has_one_private_register_slot_per_lane,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_one_register_m64_fragment_roundtrips_all_thread_values,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_explicit_shared_strides_use_executed_affine_addresses,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/integration/test_reported_layout_regressions.py::test_explicit_shared_strides_still_reject_an_executed_oob_address,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,v2-accepts-legacy-rejection,runs;semantic
+tests/numsim/integration/test_reported_layout_regressions.py::test_explicit_shared_strides_still_reject_an_executed_oob_address,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,pin-message,runs;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_dynamic_shared_tile_view_uses_its_static_parent_bounds,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_reported_layouts_reach_each_semantic_checker,numsim/integration,6,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/integration/test_reported_layout_regressions.py::test_tma_reductions_are_atomic_but_plain_overlapping_stores_still_race,numsim/integration,1,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.copy_async: TIRx schedule dispatch failed: op=tirx.tile.copy_async target=cuda no variant named 'tma' is registered,,public,,runs;checker;semantic
@@ -888,11 +889,11 @@ tests/numsim/integration/test_tcgen_transfer_artifact.py::test_same_width_tmem_d
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_dynamic_tmem_origin_can_be_reused_across_transfers,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_wg_local_to_tmem_uses_one_physical_writer,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_16xb_roundtrip_preserves_16bit_register_halves,numsim/integration,3,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_expands_tlane_replicas,numsim/integration,1,E,delete,override,W1 001a09f: replicated TMEM view (contract item 29 fail-closed),,public,,runs;semantic
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_supports_rank3_multi_instruction_layout,numsim/integration,1,E,delete,override,W1 001a09f: replicated TMEM view (contract item 29 fail-closed),,public,,runs;semantic
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_expands_tlane_replicas,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,other-assertion:delta,runs;semantic
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_supports_rank3_multi_instruction_layout,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,other-assertion:delta,runs;semantic
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,lowering-rejects,runs;semantic
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_reads_and_writes_each_cta_scale_backing,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,lowering-rejects,runs;semantic
-tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_supports_float16_payloads,numsim/integration,1,E,delete,override,W1 001a09f: replicated TMEM view (contract item 29 fail-closed),,public,,runs;semantic
+tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_supports_float16_payloads,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,other-assertion:delta,runs;semantic
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_routes_each_pair_in_four_cta_cluster,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,lowering-rejects,runs;semantic
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_all_inactive_tcgen_transfer_is_a_noop,numsim/integration,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_ldst_rejects_tmem_layout_outside_fixed_instruction_abi,numsim/integration,1,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.copy_async: TIRx schedule dispatch failed: op=tirx.tile.copy_async target=cuda +------------------------+-------------------------------------,,public,,runs;semantic
@@ -1150,13 +1151,13 @@ tests/numsim/runtime/test_cuda_packed_vector_forms.py::test_cuda_ldg_supports_fl
 tests/numsim/runtime/test_cuda_packed_vector_forms.py::test_cuda_shfl_sync_preserves_float16x2_payload_bits,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
 tests/numsim/runtime/test_cuda_packed_vector_forms.py::test_cuda_directional_shuffles_preserve_float16x2_payload_bits,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
 tests/numsim/runtime/test_cuda_packed_vector_forms.py::test_cuda_shuffles_preserve_bfloat16x2_payload_bits,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
-tests/numsim/runtime/test_cvt_carriers.py::test_cvt_carriers_truncate_extend_and_gate_reads,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,other-assertion,runs;semantic
+tests/numsim/runtime/test_cvt_carriers.py::test_cvt_carriers_truncate_extend_and_gate_reads,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,synccheck-verdict,runs;semantic
 tests/numsim/runtime/test_cvt_integer_sat.py::test_integer_cvt_sat_clamps_before_narrowing_and_preserves_predicates,numsim/runtime,2,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_cvt_predicates.py::test_cvt_predicates_and_wide_carriers_match_gpu_goldens,numsim/runtime,?,C,delete,signals:impl,pins implementation: decode_ptx_call,,internal:transpiler.ptx_dialect,,runs;semantic;c:decode_ptx_call
 tests/numsim/runtime/test_cvt_predicates.py::test_stochastic_cvt_predicates_preserve_random_bits,numsim/runtime,1,A,v2-kernel-case,signals:mixed,semantic asserts plus implementation pins (.rs); port the semantic part only,,internal:transpiler.ptx_dialect,,runs;semantic;c:.rs
 tests/numsim/runtime/test_dense_mma_forms.py::test_m16n8k32_mixed_int8_mma_matches_integer_reference,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_dense_mma_forms.py::test_m16n8k32_no_c_uses_zero_accumulator,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_dense_mma_forms.py::test_legacy_m16n8k32_int8_reuses_dense_form_and_engine,numsim/runtime,1,E,delete,override,"W1 001a09f: ptx_legacy surface, out of scope",,public,,runs;semantic
+tests/numsim/runtime/test_dense_mma_forms.py::test_legacy_m16n8k32_int8_reuses_dense_form_and_engine,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,lowering-rejects,runs;semantic
 tests/numsim/runtime/test_dense_mma_forms.py::test_m16n8k16_integer_satfinite_clamps_after_accumulation,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_dense_mma_forms.py::test_m16n8k8_f16_accumulator_uses_packed_output_registers,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_dense_mma_forms.py::test_m16n8k8_f16_accepts_b32_backed_input_registers,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
@@ -1170,7 +1171,7 @@ tests/numsim/runtime/test_dense_mma_forms.py::test_m16n8k32_mixed_fp8_uses_packe
 tests/numsim/runtime/test_dense_mma_forms.py::test_m16n8k16_mixed_fp8_supports_f16_accumulator,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_dense_mma_forms.py::test_m8n8k4_f16_executes_four_independent_mmas,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_discard.py::test_discard_range_and_predication,numsim/runtime,2,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_discard.py::test_discard_indeterminate_read_and_alignment,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,other-assertion:bug,runs;checker;semantic
+tests/numsim/runtime/test_discard.py::test_discard_indeterminate_read_and_alignment,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/runtime/test_dtype_abi.py::test_storage_width_does_not_grant_scalar_cast_support,numsim/runtime,1,C,delete,signals:impl,"pins implementation: evaluated_kernel,resolved_kernel",,internal:dtype_abi,,"runs;semantic;c:evaluated_kernel,resolved_kernel"
 tests/numsim/runtime/test_dtype_abi.py::test_vector_dtype_abi_is_derived_from_element_and_total_width,numsim/runtime,6,C,delete,signals:internals,"legacy NumSim Python internals, no kernel run",,internal:dtype_abi,,
 tests/numsim/runtime/test_dtype_abi.py::test_vector_dtype_abi_rejects_nonvector_or_unrepresentable_widths,numsim/runtime,4,C,delete,signals:internals,"legacy NumSim Python internals, no kernel run",,internal:dtype_abi,,
@@ -1208,7 +1209,7 @@ tests/numsim/runtime/test_float8_address_shuffle.py::test_scalar_fp8_identity_re
 tests/numsim/runtime/test_float8_address_shuffle.py::test_cuda_four_argument_shfl_sync_uses_implicit_warp_size,numsim/runtime,1,A,v2-kernel-case,signals:mixed,"semantic asserts plus implementation pins (rust_source,fn warp_shuffle(); port the semantic part only",,public,pin-internals,"runs;semantic;c:rust_source,fn warp_shuffle("
 tests/numsim/runtime/test_ftz_rounding.py::test_ftz_rounding_boundary,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_ftz_rounding.py::test_ftz_rounding_boundary_gpu,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,skip,runs;semantic
-tests/numsim/runtime/test_gate_intrinsics.py::test_gate_intrinsics_match_float32_semantics,numsim/runtime,1,A,v2-kernel-case,signals:mixed,semantic asserts plus implementation pins (rust_source); port the semantic part only,,public,engine-stops,runs;semantic;c:rust_source
+tests/numsim/runtime/test_gate_intrinsics.py::test_gate_intrinsics_match_float32_semantics,numsim/runtime,1,A,v2-kernel-case,signals:mixed,semantic asserts plus implementation pins (rust_source); port the semantic part only,,public,pin-internals,runs;semantic;c:rust_source
 tests/numsim/runtime/test_im2col_cache_hints.py::test_im2col_cache_hints,numsim/runtime,4,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_launch_resource_facts.py::test_smid_defaults_to_zero_in_execution_and_both_checkers,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/runtime/test_launch_resource_facts.py::test_pointer_bits_preserve_binding_address_and_subview_offset,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,other-assertion,runs;semantic
@@ -1245,7 +1246,7 @@ tests/numsim/runtime/test_matrix_instruction_codegen.py::test_ptx_mma_mixed_accu
 tests/numsim/runtime/test_matrix_instruction_codegen.py::test_ptx_mma_legacy_executes_actual_pointer_offset_abi,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
 tests/numsim/runtime/test_matrix_instruction_codegen.py::test_ptx_mma_sp_selector1_expands_nonuniform_metadata,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
 tests/numsim/runtime/test_matrix_memory_domain_oracle.py::test_ptx_ldmatrix_x1_x2_domain_matches_independent_lane_byte_mapping,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_matrix_memory_domain_oracle.py::test_legacy_ldmatrix_x1_domain_matches_independent_fragment_mapping,numsim/runtime,1,E,delete,override,"W1 001a09f: ptx_legacy surface, out of scope",,public,,runs;semantic
+tests/numsim/runtime/test_matrix_memory_domain_oracle.py::test_legacy_ldmatrix_x1_domain_matches_independent_fragment_mapping,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,lowering-rejects,runs;semantic
 tests/numsim/runtime/test_matrix_memory_domain_oracle.py::test_stmatrix_b16_x1_domain_matches_independent_lane_half_mapping,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_matrix_memory_domain_oracle.py::test_stmatrix_b8_x4_domain_matches_independent_lane_byte_mapping,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_mbarrier_drop.py::test_mbarrier_drop,numsim/runtime,?,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
@@ -1262,15 +1263,15 @@ tests/numsim/runtime/test_mbarrier_lane_semantics.py::test_current_mbarrier_arri
 tests/numsim/runtime/test_mbarrier_lane_semantics.py::test_standalone_mbarrier_expect_tx_arms_without_consuming_an_arrival,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_mbarrier_lane_semantics.py::test_mbarrier_init_honors_elected_lane_predicate,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_mbarrier_lane_semantics.py::test_relaxed_query_does_not_acquire_arriving_threads_memory,numsim/runtime,1,B,ported,other_b.tsv,two write_read races (global + shared); consistent with sync/racecheck delta B2,racecheck_legacy_ports.rs::g6_relaxed_query_does_not_acquire_arriving_threads_memory;synccheck_legacy_ports.rs::relaxed_test_wait_poll_is_clean,public,,runs;checker;semantic
-tests/numsim/runtime/test_mbarrier_maintenance.py::test_maintenance_predicates_and_carriers,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,other-assertion,runs;checker;semantic
+tests/numsim/runtime/test_mbarrier_maintenance.py::test_maintenance_predicates_and_carriers,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/runtime/test_mbarrier_maintenance.py::test_maintenance_active_addresses_still_checked,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,other-assertion:delta,runs;checker;semantic
 tests/numsim/runtime/test_mbarrier_multicast.py::test_mbarrier_multicast32,numsim/runtime,?,A,v2-kernel-case,signals,small kernel output / error,,public,racecheck-verdict,runs;semantic
 tests/numsim/runtime/test_mbarrier_multicast.py::test_mbarrier_multicast_lane_masks,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,racecheck-verdict,runs;semantic
 tests/numsim/runtime/test_mbarrier_multicast.py::test_mbarrier_multicast_outside_cluster,numsim/runtime,1,B,v2_kernel_test,other_b.tsv,ctaMask bit 20 of a 20-CTA cluster is rejected at address/target resolution in the interpreter (outside the cluster); no contract event exists for it,tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_mbarrier_multicast_outside_cluster,public,,runs;checker;semantic
 tests/numsim/runtime/test_mbarrier_pending_count.py::test_pending_count_snapshot,numsim/runtime,2,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_mbarrier_report.py::test_report_queries_and_phase_reset,numsim/runtime,6,A,v2-kernel-case,signals,small kernel output / error,,public,synccheck-verdict,runs;semantic
+tests/numsim/runtime/test_mbarrier_report.py::test_report_queries_and_phase_reset,numsim/runtime,6,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_mbarrier_report.py::test_tensor_copy_report,numsim/runtime,2,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_mbarrier_report.py::test_gather4_report_samples_only_selected_source_rows,numsim/runtime,4,A,v2-kernel-case,signals,small kernel output / error,,public,synccheck-verdict,runs;semantic
+tests/numsim/runtime/test_mbarrier_report.py::test_gather4_report_samples_only_selected_source_rows,numsim/runtime,4,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_mbarrier_report.py::test_multicast_report_targets,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_memory_coverage_next.py::test_next_memory_contracts,numsim/runtime,?,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/runtime/test_memory_coverage_next.py::test_no_complete_rejects_exhausted_arrivals,numsim/runtime,2,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,other-assertion:delta,runs;checker;semantic
@@ -1306,12 +1307,12 @@ tests/numsim/runtime/test_memory_ops.py::test_raw_tma_reduce_uses_retained_logic
 tests/numsim/runtime/test_memory_ops.py::test_raw_tma_reduce_bfloat16_uses_plain_logical_dtype_array,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
 tests/numsim/runtime/test_memory_ops.py::test_memory_family_public_ops_have_closed_world_registration,numsim/runtime,1,A,v2-kernel-case,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:transpiler.frontend,,runs
 tests/numsim/runtime/test_memory_ops.py::test_scalar_atomic_add_has_no_s64_form_while_min_and_max_do,numsim/runtime,2,A,v2-kernel-case,signals:mixed,semantic asserts plus implementation pins (v2::); port the semantic part only,,internal:transpiler.frontend,,runs;semantic;c:v2::
-tests/numsim/runtime/test_memory_sync_coverage.py::test_memory_sync_extensions,numsim/runtime,?,A,v2-kernel-case,other_b.tsv,"op tests (atomics sinks, cp.async.wait_all, barrier queries, mapa/isspacep, st.async) asserting numeric outputs and clean checker verdicts",,public,other-assertion:bug+racecheck-verdict,runs;checker;semantic
+tests/numsim/runtime/test_memory_sync_coverage.py::test_memory_sync_extensions,numsim/runtime,?,A,v2-kernel-case,other_b.tsv,"op tests (atomics sinks, cp.async.wait_all, barrier queries, mapa/isspacep, st.async) asserting numeric outputs and clean checker verdicts",,public,racecheck-verdict,runs;checker;semantic
 tests/numsim/runtime/test_memory_sync_coverage.py::test_half_vector_predicate_alias_is_captured_before_either_result_store,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/runtime/test_memory_sync_coverage.py::test_half_atomic_old_value_preserves_signed_zero_subnormal_and_nan_bits,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_mixed_version_reads.py::test_mixed_version_does_not_publish_later_data,numsim/runtime,1,B,ported,other_b.tsv,"[volatile|acquire|relaxed|cas]; race on data, no incomplete. The b128 mixed-version value itself is interpreter numerics",racecheck_legacy_ports.rs::g6_mixed_version_does_not_publish_later_data,public,,runs;checker;semantic
 tests/numsim/runtime/test_mov_forms.py::test_mov_aliased_sources_destinations_and_predicate,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_mov_forms.py::test_mov_pointer_identity_masks_and_nulls,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,synccheck-verdict,runs;semantic
+tests/numsim/runtime/test_mov_forms.py::test_mov_pointer_identity_masks_and_nulls,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_multicast16.py::test_bulk_multicast16_preserves_lane_resolved_targets,numsim/runtime,2,C,delete,signals:impl,pins implementation: decode_ptx_call,,internal:transpiler.ptx_dialect,,runs;checker;semantic;c:decode_ptx_call
 tests/numsim/runtime/test_multicast16.py::test_tensor_multicast16_completes_each_target,numsim/runtime,4,C,delete,signals:impl,pins implementation: decode_ptx_call,,internal:transpiler.ptx_dialect,,runs;checker;semantic;c:decode_ptx_call
 tests/numsim/runtime/test_multicast16.py::test_tcgen_multicast16_preserves_commit_targets,numsim/runtime,4,C,delete,signals:impl,pins implementation: decode_ptx_call,,internal:transpiler.ptx_dialect,,runs;checker;semantic;c:decode_ptx_call
@@ -1332,7 +1333,7 @@ tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_copies_only_
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_dead_bytes_are_zero_filled_and_require_review_if_read,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_rejects_counts_outside_ptx_range,numsim/runtime,2,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_allows_the_ignored_right_edge_outside_the_binding,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_st_bulk_size_is_evaluated_per_issuing_lane,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,other-assertion:bug,runs;checker;semantic
+tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_st_bulk_size_is_evaluated_per_issuing_lane,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_s2g_size_and_byte_mask_are_evaluated_per_issuing_lane,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_multicast_cta_mask_is_evaluated_per_issuing_lane,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_bulk_g2s_cluster_accepts_static_true_predicate_as_unconditional,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pin-internals,runs;semantic
@@ -1604,13 +1605,13 @@ tests/numsim/runtime/test_scalar_control.py::test_cta_votes_grid_sync_and_orderi
 tests/numsim/runtime/test_scalar_control.py::test_mbarrier_one_shot_queries_observe_parity,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_scalar_control.py::test_mbarrier_arrival_state_token_selects_the_exact_completed_generation,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_scalar_control.py::test_mbarrier_state_token_rejects_a_generation_older_than_the_previous_one,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pin-message,runs;semantic
-tests/numsim/runtime/test_scalar_control.py::test_pointer_conversions_and_runtime_descriptor_patch,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,engine-stops,runs;semantic
+tests/numsim/runtime/test_scalar_control.py::test_pointer_conversions_and_runtime_descriptor_patch,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_scalar_control.py::test_ptx_dps_sub_and_f64_arithmetic,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_scalar_control.py::test_ptx_dps_rounding_ftz_and_saturation_forms,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_scalar_control.py::test_canonical_mapa_integer_address_resolves_shared_memory,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
+tests/numsim/runtime/test_scalar_control.py::test_canonical_mapa_integer_address_resolves_shared_memory,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,engine-stops,runs;semantic
 tests/numsim/runtime/test_scalar_control.py::test_public_mapa_u64_and_shared_cluster_widths_transpile,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_scalar_control.py::test_public_cvta_shared_cluster_u64_zero_extends_shared_addresses,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_scalar_control.py::test_mapa_and_cvta_expose_the_device_validated_integer_bits,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,other-assertion:bug,runs;semantic
+tests/numsim/runtime/test_scalar_control.py::test_mapa_and_cvta_expose_the_device_validated_integer_bits,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_scalar_control.py::test_mapped_addresses_survive_integer_storage_select_and_shuffle,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/runtime/test_scalar_control.py::test_mapa_u32_preserves_the_remote_cta_rank,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_scalar_control.py::test_fetch_register_models_logical_coordinates_and_uses_stable_time_tokens,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
@@ -1650,7 +1651,7 @@ tests/numsim/runtime/test_tcgen05_block_tmem.py::test_block_scaled_tmem_a,numsim
 tests/numsim/runtime/test_tcgen05_block_tmem.py::test_block_scale_implicit_size_with_discard,numsim/runtime,4,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.ptx_dialect,,runs;semantic
 tests/numsim/runtime/test_tcgen05_ld_red.py::test_tcgen_load_reduction_matches_column_oracle,numsim/runtime,4,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tcgen05_ld_red.py::test_tcgen_load_reduction_preserves_the_store_wait_contract,numsim/runtime,1,B,covered,other_b.tsv,"single warp tcgen05.st (no wait::st) then tcgen05.ld.red = lifetime mode 2 (write_read async_lifetime_not_drained), waited = mode 3 (clean); the .red footprint is interpreter emission",racecheck_tcgen.rs::tcgen_transfer_lifetime,public,,runs;checker;semantic
-tests/numsim/runtime/test_tcgen05_ld_spcompress.py::test_tcgen_load_compression,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,synccheck-verdict,runs;semantic
+tests/numsim/runtime/test_tcgen05_ld_spcompress.py::test_tcgen_load_compression,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tcgen05_ld_spcompress.py::test_tcgen_compression_preserves_store_wait,numsim/runtime,1,B,covered,other_b.tsv,"same shape as ld_red (st without wait::st, then tcgen05.ld.spcompress): mode 2; the spcompress footprint is interpreter emission",racecheck_tcgen.rs::tcgen_transfer_lifetime,public,,runs;checker;semantic
 tests/numsim/runtime/test_tcgen05_restricted_commit.py::test_restricted_commit_preserves_full_mma_completion,numsim/runtime,3,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/runtime/test_tcgen05_sparse_b16.py::test_sparse_b16_layouts_and_codecs,numsim/runtime,?,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
@@ -1698,11 +1699,11 @@ tests/numsim/runtime/test_tcgen_misc_runtime_domain.py::test_tcgen_matrix_descri
 tests/numsim/runtime/test_tcgen_misc_runtime_domain.py::test_tcgen_matrix_descriptor_encodes_offset_without_cluster_rank,numsim/runtime,1,A,v2-kernel-case,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,public,pass,runs
 tests/numsim/runtime/test_tcgen_misc_runtime_domain.py::test_tcgen_lifecycle_accepts_full_256_column_allocation,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tcgen_misc_runtime_domain.py::test_tcgen_commit_accepts_explicit_uint32_predicate,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_tensormap_predicates.py::test_tensor_map_predicate_effects,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,racecheck-verdict,runs;semantic
+tests/numsim/runtime/test_tensormap_predicates.py::test_tensor_map_predicate_effects,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tensormap_predicates.py::test_tensor_map_predicates_retain_errors,numsim/runtime,1,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,public,pass,runs;checker;semantic
 tests/numsim/runtime/test_tensormap_publication.py::test_descriptor_publication_does_not_capture_future_writes,numsim/runtime,1,B,ported,other_b.tsv,replace|bytes|helper are the same generic descriptor writes at the contract; after (same/cross warp) and stale give missing_proxy_bridge(tensormap); ordered control clean,racecheck_legacy_ports.rs::g6_descriptor_publication_does_not_capture_future_writes,public,,runs;checker;semantic
 tests/numsim/runtime/test_tf32_layout_f_poison.py::test_tf32_layout_f_unwritten_holes_are_zero_filled_and_require_review,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,engine-stops,runs;semantic
-tests/numsim/runtime/test_tile_codegen.py::test_frontend_keeps_tile_calls_as_tirx_nodes_until_direct_lowering,numsim/runtime,1,A,v2-kernel-case,signals:weak,runs a kernel without recognisable semantic asserts (smoke),,internal:transpiler.frontend,,runs
+tests/numsim/runtime/test_tile_codegen.py::test_frontend_keeps_tile_calls_as_tirx_nodes_until_direct_lowering,numsim/runtime,1,C,delete,override,phase 6: only asserts the legacy analyze source map node types,,internal:transpiler.frontend,,runs
 tests/numsim/runtime/test_tile_codegen.py::test_copy_cast_and_mul_emit_direct_native_rust,numsim/runtime,1,C,delete,name:impl,test name describes the legacy implementation (rust),,internal:transpiler.frontend,,runs;semantic
 tests/numsim/runtime/test_tile_codegen.py::test_explicit_elementwise_rounding_is_layout_independent_and_not_ftz,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
 tests/numsim/runtime/test_tile_codegen.py::test_even_but_noncontiguous_f32_layout_uses_scalar_fallback,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,internal:transpiler.frontend,,runs;semantic
@@ -1748,8 +1749,8 @@ tests/numsim/runtime/test_tile_general_semantics.py::test_elementwise_maximum_ma
 tests/numsim/runtime/test_tile_general_semantics.py::test_float64_elementwise_forms_use_native_double_semantics,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tile_general_semantics.py::test_float64_directed_rounding_fails_closed,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tile_general_semantics.py::test_cast_uses_general_scalar_conversion_without_dispatch_semantics,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_tile_general_semantics.py::test_mxfp4_uses_ue8m0_scales_over_32_element_vectors,numsim/runtime,1,E,delete,override,W1 001a09f: replicated TMEM view (contract item 29 fail-closed),,public,,runs;semantic
-tests/numsim/runtime/test_tile_owner_transport.py::test_copy_transports_unique_owners_across_warps,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,engine-stops,runs;semantic
+tests/numsim/runtime/test_tile_general_semantics.py::test_mxfp4_uses_ue8m0_scales_over_32_element_vectors,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,lowering-rejects,runs;semantic
+tests/numsim/runtime/test_tile_owner_transport.py::test_copy_transports_unique_owners_across_warps,numsim/runtime,1,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tile_owner_transport.py::test_pointwise_transports_unique_owners_across_warps,numsim/runtime,1,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.copy: TIRx schedule dispatch failed: op=tirx.tile.mul target=cuda +----------------+----------------------------------------------------------,,public,,runs;semantic
 tests/numsim/runtime/test_tile_owner_transport.py::test_cast_unary_and_binary_share_owner_transport,numsim/runtime,1,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.copy: TIRx schedule dispatch failed: op=tirx.tile.cast target=cuda +----------------+---------------------------------------------------------,,public,,runs;semantic
 tests/numsim/runtime/test_tile_reduction_variants.py::test_shared_cta_reductions_support_float16_and_scope_completion,numsim/runtime,1,E,delete,tile_dispatch_rejections,1/1 kernels rejected; tirx.TilePrimitiveCall: tile op tirx.tile.min: TIRx schedule dispatch failed: op=tirx.tile.sum target=cuda +------------------+---------------------------------------------------------,,public,,runs;semantic
@@ -1781,13 +1782,13 @@ tests/numsim/runtime/test_tma_dtype_runtime_domain.py::test_typed_tma_rejects_un
 tests/numsim/runtime/test_tma_im2col.py::test_im2col_interleaved,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tma_im2col.py::test_im2col_spatial,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tma_im2col.py::test_im2col_store_and_reduce,numsim/runtime,4,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
-tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_im2col_per_thread_coordinates_and_offsets,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
+tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_im2col_per_thread_coordinates_and_offsets,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,synccheck-verdict,runs;semantic
 tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_im2col_multiissuer_requires_completion_wait,numsim/runtime,1,B,ported,other_b.tsv,"rank 3, per-lane TMAs into disjoint rows, unwaited",racecheck_legacy_ports.rs::g6_im2col_multiissuer_requires_completion_wait,public,,runs;checker;semantic
 tests/numsim/runtime/test_tma_im2col_multiissuer.py::test_wide_im2col_per_thread_halo_offset_and_completion,numsim/runtime,2,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_prefetch_preserves_memory,numsim/runtime,2,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_transfer_rejects_only_when_issued,numsim/runtime,3,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
 tests/numsim/runtime/test_tma_interleave_hints.py::test_swizzled_interleave_still_rejects_malformed_geometry,numsim/runtime,1,F,keep,fallback,"no kernel, no legacy internals",,public,,semantic
-tests/numsim/runtime/test_tma_multiissuer.py::test_tma_multiissuer_coordinates_and_target_completion,numsim/runtime,?,A,v2-kernel-case,signals,small kernel output / error,,public,pass,runs;semantic
+tests/numsim/runtime/test_tma_multiissuer.py::test_tma_multiissuer_coordinates_and_target_completion,numsim/runtime,?,A,v2-kernel-case,signals,small kernel output / error,,public,synccheck-verdict,runs;semantic
 tests/numsim/runtime/test_tma_multiissuer.py::test_tma_multiissuer_requires_wait_and_disjoint_destinations,numsim/runtime,1,B,ported,other_b.tsv,"(no wait) read_write/write_read and (wait, overlap) write_write; waited disjoint control clean",racecheck_legacy_ports.rs::g6_tma_multiissuer_requires_wait_and_disjoint_destinations,public,,runs;checker;semantic
 tests/numsim/runtime/test_tma_overrides.py::test_tma_override_data_and_descriptor_isolation,numsim/runtime,?,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,internal:transpiler.frontend,,runs;checker;semantic
 tests/numsim/runtime/test_tma_overrides.py::test_tma_override_rejects_invalid_operands,numsim/runtime,5,A,v2-kernel-case,signals:three-mode,op test that also runs the checkers for a clean verdict (keep as a three-mode v2 kernel case),,internal:transpiler.frontend,,runs;checker;semantic
@@ -1850,8 +1851,8 @@ tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_mbarrier_multicast_out
 tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_cp_mask_readonly_overlap_uses_selected_bytes,numsim/v2,6,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_raw_st_async_preserves_mapped_remote_cta_ownership,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_raw_st_async_mapped_expression_offsets_are_disjoint,numsim/v2,?,N,keep,path,new-layer test,,public,,runs
-tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_sparse_b16_metadata_and_b_lifetimes,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;checker;semantic
-tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_lut_b_async_read_lifetimes,numsim/v2,4,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_sparse_b16_metadata_and_b_lifetimes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_lut_b_async_read_lifetimes,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/checkers/test_needs_kernel_batch.py::test_tma_override_keeps_async_destination_race,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/checkers/test_remote_mbarrier_address.py::test_synccheck_rejects_local_arrive_on_mapped_remote_address,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker
 tests/numsim/v2/checkers/test_remote_mbarrier_address.py::test_synccheck_rejects_local_expect_tx_on_mapped_remote_address,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker
@@ -1869,6 +1870,7 @@ tests/numsim/v2/ports/test_deltas_copy_multicast32.py::test_multicast_high_bit_t
 tests/numsim/v2/ports/test_deltas_cp_async_mbarrier_visibility.py::test_copy_arrival_is_not_an_explicit_commit,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/ports/test_deltas_layout_lowering_contract.py::test_physical_buffers_preserve_coordinates_aliases_and_lane_private_storage,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/ports/test_deltas_pointer_slot_arrays.py::test_pointer_array_initialization_and_bounds,numsim/v2,3,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_deltas_sync_instruction_predicates.py::test_pending_count_instruction_predicates,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/ports/test_error_kinds.py::test_host_tensor_map_integer_expressions_fail_closed_on_unregistered_nodes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_error_kinds.py::test_warp_collectives_reject_invalid_participant_contracts,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_error_kinds.py::test_if_then_else_mixed_pointer_spaces_fail_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
@@ -1883,6 +1885,12 @@ tests/numsim/v2/ports/test_error_kinds.py::test_integer_trap_predicate_uses_cpp_
 tests/numsim/v2/ports/test_error_kinds.py::test_floating_trap_rejects_signed_zero,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_error_kinds.py::test_cuda_pointer_helpers_check_typed_dereference_alignment,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_error_kinds.py::test_a_candidate_index_outside_its_local_table_is_an_execution_error,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_failclosed_lowering.py::test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_failclosed_lowering.py::test_tcgen_cp_cta_group2_reads_and_writes_each_cta_scale_backing,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_failclosed_lowering.py::test_tcgen_cp_cta_group2_routes_each_pair_in_four_cta_cluster,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_failclosed_lowering.py::test_mxfp4_uses_ue8m0_scales_over_32_element_vectors,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_failclosed_lowering.py::test_legacy_m16n8k32_int8_reuses_dense_form_and_engine,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_failclosed_lowering.py::test_legacy_ldmatrix_x1_domain_matches_independent_fragment_mapping,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_internals_async_group_domain_oracle.py::test_async_group_wait_counts_complete_on_an_empty_queue,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
 tests/numsim/v2/ports/test_internals_atomic_domain_oracle.py::test_every_cuda_atomic_add_and_cas_form_executes_with_exact_bits,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
 tests/numsim/v2/ports/test_internals_atomic_f32_noftz.py::test_atomic_f32_noftz,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
@@ -1897,6 +1905,8 @@ tests/numsim/v2/ports/test_internals_known_cuda_func_artifact.py::test_known_shl
 tests/numsim/v2/ports/test_internals_large_buffer_artifact.py::test_large_register_buffer_table_is_heap_backed_and_executes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_internals_launch_resource_facts.py::test_subview_keeps_its_offset_inside_the_bound_region,numsim/v2,4,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_internals_launch_resource_facts.py::test_lone_binding_gets_an_aligned_base,numsim/v2,3,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_launch_resource_facts.py::test_exclusive_tmem_576_column_lifecycle_is_clean,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_internals_launch_resource_facts.py::test_ordinary_alloc_while_exclusive_is_live_is_an_error,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/ports/test_internals_loop_bounds.py::test_uniform_loop_var_preserves_tir_dtype_in_select,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_internals_loop_bounds.py::test_lane_varying_min_extent_and_step_use_masked_native_loop,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:WarpValue
 tests/numsim/v2/ports/test_internals_loop_bounds.py::test_lane_varying_for_rejects_zero_step,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
@@ -1926,12 +1936,240 @@ tests/numsim/v2/ports/test_internals_wait_until.py::test_bit_typed_word_matches_
 tests/numsim/v2/ports/test_internals_wait_until.py::test_a_backoff_is_the_cuda_loops_business_and_not_the_engines,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic;c:poll
 tests/numsim/v2/ports/test_messages_tmem_artifact.py::test_tmem_runtime_address_without_a_dynamic_lease_is_rejected,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_messages_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges,numsim/v2,3,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_api.py::test_run_case_requires_reference_keys_to_name_selected_outputs,numsim/v2,1,N,keep,path,new-layer test,,internal:cases,,runs;semantic
+tests/numsim/v2/ports/test_p6b_api.py::test_run_case_rejects_empty_reference_before_execution,numsim/v2,1,N,keep,path,new-layer test,,internal:cases,,runs;semantic
+tests/numsim/v2/ports/test_p6b_api.py::test_run_case_freezes_bindings_before_mutating_reference,numsim/v2,1,N,keep,path,new-layer test,,internal:cases,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_codegen_rejects_alpha_renamed_host_abi_with_the_same_structural_hash,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_warpgroup_relative_scope_ids_map_native_warp_coordinates,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_integer_elect_sync_condition_becomes_lane_mask,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_lane_add_uses_native_masked_warp_control,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_divergent_break_and_continue_use_loop_masks,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_divergent_while_preserves_lane_mask_and_scheduler_observation,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_empty_mask_after_continue_skips_mbarrier_wait,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_empty_mask_after_continue_skips_named_barrier_argument_evaluation,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_empty_mask_after_continue_skips_cta_sync,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_empty_mask_after_continue_skips_dynamic_for_argument_evaluation,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_scalar_expression_lowering_matches_floor_and_select_semantics,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_composite_masks_cannot_reactivate_lanes_outside_parent_scope,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_if_then_else_does_not_evaluate_an_unselected_buffer_load,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_multidimensional_default_layout_lowers_to_physical_offsets,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_shared_allocations_alias_and_are_isolated_per_cta,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_local_register_arrays_are_isolated_per_lane,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_runtime_shape_scalars_are_bound_from_consistent_buffer_descriptors,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:fn extract_shape_extent(
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_runtime_shape_scalars_reject_disagreeing_bindings,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_warp_local_raw_calls_execute_inside_one_warp_unit,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_native_varying_assert_reports_failed_lane_mask,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_physical_mbarrier_reuses_phase_and_completes_numeric_transactions_directly,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_physical_mbarrier_deadlock_reports_missing_lane_arrivals,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_mapa_remote_shared_writes_use_the_target_ctas_owner,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_parallel_clusters_keep_remote_shared_ownership_isolated,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_local_mbarrier_arrive_rejects_mapped_remote_address,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_local_mbarrier_arrive_expect_tx_rejects_mapped_remote_address,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_artifact_build.py::test_scoped_and_named_barriers_rendezvous_across_warps_and_ctas,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6b_bindings.py::test_tensor_map_numpy_is_copyable_descriptor_state,numsim/v2,1,N,keep,path,new-layer test,,internal:cases,,runs;checker
+tests/numsim/v2/ports/test_p6b_block_scaled_gemm_artifact.py::test_cta_group2_batched_gemm_accumulates_both_target_ctas,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_block_scaled_gemm_artifact.py::test_cta_group2_batched_gemm_replicated_scale_view_fails_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_device_payload_ops.py::test_payload_runtime,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6b_device_protocol_ops.py::test_protocol_runtime,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6b_direct_memory_artifact.py::test_cuda_ldg_reads_typed_global_memory,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_direct_memory_artifact.py::test_tvm_access_ptr_applies_element_offset_to_shared_pointer,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_emission_errors.py::test_analysis_collects_independent_failures_after_a_failed_binding,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_emission_errors.py::test_valid_signature_control_emits_and_executes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_emission_errors.py::test_error_recovery_respects_expression_let_scope,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_source_spans_exclude_process_local_source_name_addresses,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6b_frontend.py::test_no_op_topology_is_one_future_per_warp,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_warpgroup_scope_topology_uses_four_warps_per_group,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_warpgroup_local_coordinate_does_not_imply_one_group_per_cta,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6b_frontend.py::test_bound_launch_extent_is_resolved_in_statement_order,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6b_frontend.py::test_constant_if_then_else_launch_extent_only_evaluates_selected_branch,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6b_frontend.py::test_constant_if_then_else_launch_extent_only_evaluates_selected_branch_true,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6b_frontend.py::test_constant_if_then_else_launch_extent_not_static_fails_closed,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_cta_pair_rank_does_not_override_cluster_cta_extent,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6b_frontend.py::test_conflicting_or_invalid_topology_constraints_fail_closed,numsim/v2,5,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_numerically_irrelevant_launch_metadata_is_explicitly_supported,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_unknown_attr_semantics_fail_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_serial_and_unrolled_loop_metadata_are_explicitly_supported,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_unknown_loop_annotations_fail_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_non_serial_loop_semantics_are_not_silently_sequentialized,numsim/v2,3,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_frontend.py::test_unknown_reachable_nodes_fail_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_integer_addresses.py::test_typed_pointer_load_rejects_active_lane_from_another_space,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_partitioned_integer_address_flow_preserves_lane_values,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_accessed_out_of_bounds_shared_view_is_rejected,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_global_acquire_poll_reschedules_and_atomic_makes_progress,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_cross_cluster_atomic_progresses_with_shared_or_parallel_workers,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_direct_global_acquire_poll_reschedules_same_cluster_peer,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_global_volatile_poll_performs_first_reload_without_short_loop_suspend,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_global_poll_reschedules_with_lane_varying_active_mask,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_plain_global_buffer_poll_uses_general_time_slice,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_native_loop_with_extra_body_effect_uses_engine_budget,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_native_loop_with_extra_body_effect_uses_engine_budget_reports_error_status,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_all_native_while_shapes_use_engine_loop_budget,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_memory_artifact.py::test_all_native_while_shapes_use_engine_loop_budget_reports_error_status,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_multi_kernel_artifact.py::test_multi_kernel_rejects_an_alias_with_multiple_canonical_targets,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_multi_kernel_artifact.py::test_multi_kernel_rejects_unqualified_scalar_collisions_and_unknown_inputs,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_multi_kernel_artifact.py::test_multi_kernel_pointer_parameters_are_phase_qualified,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_native_gate_intrinsics.py::test_native_synccheck_accepts_scalar_gate_intrinsics,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6b_native_statement_tree.py::test_frontend_rejects_unknown_native_nodes_in_a_known_parent,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_native_sub_word_accesses.py::test_synccheck_accepts_the_ordered_sub_word_kernel,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker
+tests/numsim/v2/ports/test_p6b_native_vector_destination_loads.py::test_synccheck_accepts_the_ordered_vector_destination_load_kernels,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;checker
+tests/numsim/v2/ports/test_p6b_opaque_helper_artifact.py::test_opaque_or_spoofed_cuda_helpers_are_rejected,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_raw_memory_artifact.py::test_get_tmem_addr_packs_wrapped_row_and_column_offsets_per_lane,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:fn get_tmem_addr(
+tests/numsim/v2/ports/test_p6b_raw_memory_artifact.py::test_ordered_b128_load_retains_16_byte_alignment_contract,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_raw_memory_artifact.py::test_ordered_v2_destination_loads_keep_their_memory_semantics,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:v2::
+tests/numsim/v2/ports/test_p6b_raw_memory_artifact.py::test_volatile_b128_load_preserves_uninitialized_review,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic;c:v2::
+tests/numsim/v2/ports/test_p6b_raw_memory_artifact.py::test_pointer_derived_shared_views_raw_memory_and_cvta_preserve_aliasing,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_raw_memory_artifact.py::test_raw_load_rejects_an_unmapped_integer_when_the_address_is_consumed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6b_raw_memory_artifact.py::test_raw_load_rejects_an_unmapped_integer_when_the_address_is_consumed_is_incomplete,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6b_scalar_parameter_artifact.py::test_scalar_parameter_range_is_checked_before_execution,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_scalar_parameter_artifact.py::test_scalar_shape_consistency_is_checked_by_engine_api,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_scheduler_polling_artifact.py::test_finite_for_uses_native_loop_iteration_budget,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_scheduler_polling_artifact.py::test_finite_for_uses_native_loop_iteration_budget_stops_incomplete,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_scheduler_polling_artifact.py::test_finite_loop_can_exceed_default_budget_when_configured,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:poll_order
+tests/numsim/v2/ports/test_p6b_scheduler_polling_artifact.py::test_finite_loop_can_exceed_default_budget_when_configured_stops_incomplete,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_stmatrix_artifact.py::test_stmatrix_registry_accepts_reviewed_shared_forms,numsim/v2,18,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6b_stmatrix_artifact.py::test_stmatrix_analyze_rejects_a_pointer_without_backing,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_stmatrix_artifact.py::test_stmatrix_registry_accepts_repository_and_x2_forms,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6b_topology_artifact.py::test_cta_pair_uses_two_cta_residue_without_reducing_cluster_topology,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_vector_ir_artifact.py::test_vector_ir_roundtrip_executes_packed_and_f32x4_semantics,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_vector_ir_artifact.py::test_vector_shuffle_classifier_and_frontend_reject_out_of_range_extract,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_vector_ir_artifact.py::test_packed_storage_vectors_fail_closed_for_ordinary_arithmetic,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_vector_ir_artifact.py::test_generic_vector_extract_fails_during_analysis,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_vector_ir_artifact.py::test_128bit_vector_reinterpret_is_a_bitwise_roundtrip,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6b_written_buffer_inference.py::test_dynamic_raw_write_requires_bound_address,numsim/v2,3,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6c_bitwise_nodes.py::test_bitwise_nodes_match_integer_oracle,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6c_byte_copy_vector_store.py::test_vector_store_registry_is_exact,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6c_byte_copy_vector_store.py::test_vector_store_checks_total_access_width_alignment,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cache_hint_ops.py::test_async_applypriority_bulk_groups_are_visible_to_checkers,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cache_hint_ops.py::test_valid_address_prefetch_checks_only_predicate_selected_lanes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_call_resolution.py::test_frontend_discovers_typed_tensor_map_parameters_from_exact_owners,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6c_call_resolution.py::test_host_abi_rejects_distinct_tensor_map_parameters_with_one_public_name,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_call_resolution.py::test_frontend_records_typed_implicit_tmem_requirement,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_copy_dispatch_contract.py::test_cross_warp_copy_owner_remap_is_accepted_statically,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6c_cuda_generic_scalar_forms.py::test_warp_float64_reductions_use_generic_typed_runtime,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cuda_generic_scalar_forms.py::test_cta_int32_reductions_preserve_typed_scratch,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cuda_generic_scalar_forms.py::test_cuda_ldg_supports_cuda_scalar_overloads,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cuda_generic_scalar_forms.py::test_cuda_ldg_keeps_natural_alignment_checks,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cuda_ldg_overloads.py::test_cuda_ldg_public_dtype_contract_is_accepted_or_rejected_exactly,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6c_cuda_ldg_overloads.py::test_cuda_ldg_public_dtype_contract_rejects_exactly,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cuda_ldg_overloads.py::test_cuda_ldg_packed_vectors_preserve_physical_bits,numsim/v2,8,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cuda_low_precision_reductions.py::test_cuda_low_precision_reductions_follow_typed_butterfly_semantics,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cuda_packed_vector_forms.py::test_cuda_ldg_supports_float32x2_as_one_packed_64bit_load,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_cuda_packed_vector_forms.py::test_cuda_shfl_sync_preserves_float16x2_payload_bits,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_log2.py::test_log2_matches_independent_reference,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_loop_bounds.py::test_lane_varying_loop_supports_break_and_continue,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_loop_bounds.py::test_static_single_trip_for_preserves_masks_and_loop_path,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_matrix_instruction_codegen.py::test_matrix_family_supports_dense_and_sparse_ptx,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6c_mbarrier_lane_semantics.py::test_blocking_wait_fails_closed_for_mixed_lane_readiness,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_mbarrier_lane_semantics.py::test_blocking_wait_mixed_lane_readiness_stops_incomplete,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_memory_ops.py::test_raw_tma_reduce_uses_retained_logical_dtype,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_memory_ops.py::test_raw_tma_reduce_bfloat16_uses_plain_logical_dtype_array,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_memory_ops.py::test_memory_family_public_ops_have_closed_world_registration,numsim/v2,?,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6c_ordering_calls.py::test_default_full_mask_warp_sync_rejects_divergent_execution,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_ordering_calls.py::test_default_full_mask_warp_sync_divergence_stops_incomplete,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_packed_f32x2_float32_destination.py::test_checkers_accept_the_float32_pair_destination,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6c_packed_f32x2_float32_destination.py::test_packed_store_footprint_covers_the_second_element,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6c_ptx_addr_runtime.py::test_ptx_addr_applies_a_signed_byte_offset,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_ptx_spdecompress_registry.py::test_spdecompress_rejects_same_physical_register_through_alias_views,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_ptx_spdecompress_registry.py::test_spdecompress_rejects_unknown_dynamic_register_overlap,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_ptx_warp_collectives.py::test_raw_ptx_match_collectives_execute_in_checkers,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6c_raw_tcgen_codegen.py::test_shared_span_above_18_bits_requires_a_supported_sm107_descriptor_form,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tcgen_codegen.py::test_f8f6f4_cta2_k32_extended_shared_span_is_gated_by_arch_not_k_bit,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tcgen_codegen.py::test_raw_tcgen_f8f6f4_cta2_requires_exact_kernel_architecture,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tcgen_codegen.py::test_raw_tcgen_dense_mma_gate_names_the_exact_legal_set,numsim/v2,3,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_host_bound_descriptor_acquire_enables_raw_tma,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_host_bound_descriptor_without_acquire_fails_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_raw_shared_address_binding_and_offset_preserve_tma_destination,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_raw_shared_address_outside_declared_views_fails_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_raw_descriptor_copy_replace_release_and_acquire_drive_raw_tma,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_raw_descriptor_v4_load_scalar_stores_drive_raw_tma,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_96b_descriptor_copy_ignores_tail_and_drives_raw_tma,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_32b_raw_descriptor_copy_fails_when_tma_decodes_missing_metadata,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_host_descriptor_store_updates_declared_base,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tensor_map_descriptors.py::test_conflicting_host_descriptor_slots_fail_closed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tma_codegen.py::test_static_bulk_wait_group_immediates_execute_in_source_order,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tma_codegen.py::test_bulk_wait_group_rejects_runtime_count_during_numsim_transpilation,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tma_codegen.py::test_sm100_two_cta_barrier_address_targets_pair_base,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_raw_tma_codegen.py::test_raw_tensor_map_under_delivery_reports_exact_bytes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_registry_bitwise_nodes.py::test_vector_bitwise_nodes_are_rejected,numsim/v2,6,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_reinterpret_runtime_domain.py::test_complete_reinterpret_public_domain_preserves_physical_bits,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_runtime_form_domain_oracles.py::test_cuda_ldg_complete_finite_domain_executes_with_exact_physical_oracle,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_tcgen_codegen.py::test_tcgen_control_registry_covers_exact_source_signatures,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6c_tcgen_codegen.py::test_tcgen_fence_forms_are_numerical_noops,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_tcgen_codegen.py::test_frontend_records_dynamic_tmem_lifecycle_from_tcgen_alloc,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_p6c_tcgen_codegen.py::test_tmem_pool_non_power_of_two_columns_fail_at_engine,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_tcgen_codegen.py::test_tcgen_dealloc_non_power_of_two_columns_fail_at_engine,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_tcgen_codegen.py::test_tcgen_two_cta_lifecycle_rendezvous,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6c_tcgen_codegen.py::test_tcgen_dealloc_runtime_rejects_lane_disagreement,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_tile_codegen.py::test_tma_multicast_writes_each_target_cta_and_credits_each_copy,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:task_count
+tests/numsim/v2/ports/test_p6c_tile_codegen.py::test_tma_transaction_under_delivery_reports_deterministic_deadlock,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_tile_codegen.py::test_tma_transaction_under_delivery_is_an_error,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6c_tma_overrides.py::test_tma_override_rejects_invalid_operands,numsim/v2,5,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6d_api.py::test_engine_native_loop_knobs_accept_positive_values,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_api.py::test_engine_native_loop_policy_is_explicit_and_validated,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_artifact_build.py::test_physical_numpy_aliases_survive_the_artifact_boundary,numsim/v2,1,N,keep,path,new-layer test,,internal:cases,,runs;semantic
+tests/numsim/v2/ports/test_p6d_artifact_build.py::test_run_case_uses_declared_output_bindings,numsim/v2,1,N,keep,path,new-layer test,,internal:cases,,runs;semantic
+tests/numsim/v2/ports/test_p6d_artifact_build.py::test_cuda_float_reductions_match_nan_and_signed_zero_bits,numsim/v2,1,N,keep,path,new-layer test,,internal:cases,,runs;semantic
+tests/numsim/v2/ports/test_p6d_bulk_reduce_s2g_f32.py::test_bulk_reduce_is_atomic_captures_source_and_publishes_only_at_full_wait,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6d_cache_hint_ops.py::test_cache_hint_family_validates_operands_without_changing_memory,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6d_copy_dispatch_contract.py::test_auto_local_to_local_copy_runs_for_every_active_lane,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_copy_dispatch_contract.py::test_single_element_local_copy_runs_for_every_active_lane,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_cuda_low_precision_reductions.py::test_cuda_low_precision_max_min_select_the_rhs_for_equal_zeros,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_cvt_predicates.py::test_stochastic_cvt_predicates_preserve_random_bits,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic;c:.rs
+tests/numsim/v2/ports/test_p6d_expr_codegen.py::test_low_precision_arithmetic_rounds_at_every_expression_node,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_fp8_cta1_descriptor_layout.py::test_fp8_cta1_extended_shared_addresses,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6d_gemm_async_artifact.py::test_dense_gemm_async_starts_the_fma_chain_from_input_d,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_gemm_async_artifact.py::test_m64_tcgen_mma_uses_layout_f_independently_of_declared_tmem_layout,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_gemm_async_artifact.py::test_bf16_m64_tcgen_mma_uses_layout_f,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_gemm_async_artifact.py::test_m64_tcgen_mma_infers_weight_stationary_from_packed_layout_e,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_gemm_async_artifact.py::test_large_bf16_gemm_async_uses_one_engine_gemm,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_gemm_async_artifact.py::test_dense_gemm_async_reads_tmem_a_and_transposed_b_storage,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_gemm_async_artifact.py::test_cta_group2_banked_a_selects_matching_b_shard,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_layout_lowering_contract.py::test_tmem_tlane_tcol_coordinates_are_observable_through_a_physical_alias,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_memory_artifact.py::test_bulk_read_wait_does_not_publish_destination_before_full_wait,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6d_memory_ops.py::test_cuda_uint64x2_atomic_cas_compares_and_replaces_one_128bit_value,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic;c:.rs
+tests/numsim/v2/ports/test_p6d_memory_ops.py::test_cuda_128bit_atomic_cas_compares_float_vectors_by_bits,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_multi_kernel_artifact.py::test_pointer_words_keep_allocation_binding_across_phases,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_ordering_calls.py::test_setmaxnreg_is_an_ordering_call_not_a_tcgen_lifecycle_call,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_ordering_calls.py::test_setmaxnreg_static_expressions_follow_public_parser_and_runtime,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_ordering_calls.py::test_deleting_setmaxnreg_keeps_the_numerical_result,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_ptx_bitops.py::test_ptx_bitop_forms_and_predicates_match_independent_oracle_non_pred_forms,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6d_ptx_bitops.py::test_ptx_bitop_forms_and_predicates_match_independent_oracle_pred_forms,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6d_ptx_warp_collectives.py::test_raw_ptx_shuffle_reads_only_selected_source_lanes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_ptx_warp_collectives.py::test_raw_ptx_match_redux_and_activemask_match_warp_oracles,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tcgen_codegen.py::test_raw_tcgen_cp_warpx4_replicates_source_into_all_warp_lanes,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tcgen_codegen.py::test_raw_tcgen_cp_128x256b_decodes_matrix_descriptor_swizzle,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tcgen_codegen.py::test_raw_tcgen_cp_covers_4x256b_and_both_warpx2_pairings,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tcgen_codegen.py::test_raw_tcgen_cp_decompression_expands_packed_codes,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tcgen_codegen.py::test_raw_tcgen_cp_128b_base32b_descriptor_uses_32byte_atomic_swizzle,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tcgen_codegen.py::test_raw_tcgen_cp_cta_group2_writes_both_ctas_with_warpx2_routing,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tcgen_codegen.py::test_raw_tcgen_cp_128x256b_swizzle64_routes_both_k_halves_for_every_row,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tcgen_codegen.py::test_raw_tcgen_descriptor_can_cross_a_short_pool_alias_within_its_backing,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tcgen_codegen.py::test_raw_tcgen_mxf4_bulk_smem_and_tmem_reads_require_review,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic;c:.rs
+tests/numsim/v2/ports/test_p6d_raw_tensor_map_descriptors.py::test_typed_param_descriptor_scalar_copy_preserves_payload,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tensor_map_descriptors.py::test_ordinary_u64x4_copy_does_not_require_descriptor_metadata,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tensor_map_descriptors.py::test_raw_descriptor_store_updates_replaced_backing,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_tma_codegen.py::test_raw_fp4_tensor_map_keeps_align8_shared_bytes_packed,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6d_raw_versus_typed_cta2_mma.py::test_raw_cta2_mma_matches_the_typed_gemm_async_exactly,numsim/v2,3,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_raw_versus_typed_cta2_mma.py::test_raw_cta2_ts_m128_selects_the_matching_a_lane_bank,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_scalar_parameter_artifact.py::test_plain_and_numpy_int32_scalar_parameters_affect_generated_code,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_scalar_parameter_artifact.py::test_multi_kernel_scalar_names_are_phase_qualified,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_tf32_layout_f_poison.py::test_tf32_layout_f_unwritten_holes_are_zero_filled_and_require_review,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_tile_codegen.py::test_explicit_elementwise_rounding_is_layout_independent_and_not_ftz,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_tile_codegen.py::test_contiguous_f32_uses_canonical_rn_without_ftz,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_tile_codegen.py::test_thread_owned_scalar_buffer_load_uses_canonical_rn,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_tile_codegen.py::test_owner_driven_shifted_alias_falls_back,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_tile_codegen.py::test_reduction_preserves_subnormal_inputs_in_lexicographic_order,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_tma_overrides.py::test_tma_override_data_and_descriptor_isolation,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_p6d_tmem_artifact.py::test_tmem_layout_f_maps_rows_to_half_slabs,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_p6d_written_buffer_inference.py::test_selected_outputs_preserve_all_host_writes,numsim/v2,2,N,keep,path,new-layer test,,internal:cases,,runs;semantic
 tests/numsim/v2/ports/test_partial_tile_forms.py::test_ldstmatrix_dispatch_hint_does_not_select_numsim_semantics,numsim/v2,4,N,keep,path,new-layer test,,public,,runs
 tests/numsim/v2/ports/test_partial_tile_forms.py::test_ordinary_copy_dispatch_does_not_select_semantics,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
 tests/numsim/v2/ports/test_partial_tile_forms.py::test_warpgroup_shared_copy_snapshots_overlap_independent_of_dispatch,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_partial_tile_forms.py::test_typed_tma_reduce_reuses_raw_tensor_map_reduction_abi,numsim/v2,7,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_partial_tile_forms.py::test_typed_tma_reduce_rejects_invalid_operation_dtype_pairs,numsim/v2,4,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_partial_tile_forms.py::test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair,numsim/v2,?,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_partial_tile_forms.py::test_validshape_typed_tma_reduce_reuses_raw_tensor_map_reduction_abi,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_partial_tile_forms.py::test_validshape_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair,numsim/v2,?,N,keep,path,new-layer test,,public,,runs
 tests/numsim/v2/ports/test_racedeltas_cp_async_mbarrier_visibility.py::test_copy_arrival_retains_earlier_copy_history,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/ports/test_racedeltas_mbarrier_multicast.py::test_mbarrier_multicast32,numsim/v2,?,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/ports/test_racedeltas_mbarrier_multicast.py::test_mbarrier_multicast_lane_masks,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
@@ -1953,6 +2191,46 @@ tests/numsim/v2/ports/test_triage_scheduler_polling_artifact.py::test_finite_for
 tests/numsim/v2/ports/test_triage_tile_general_semantics.py::test_right_aligned_buffer_broadcast_maps_destination_coordinates,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_triage_tile_unary_codegen.py::test_warpgroup_shared_owner_is_independent_of_vector_chunk,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/ports/test_triage_tma_atomicity.py::test_tma_atomicity_direction_restrictions,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_validshape_block_scaled_gemm_artifact.py::test_block_scaled_gemm_normalizes_instruction_kind_and_shape,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_validshape_block_scaled_gemm_artifact.py::test_fp8_block_scaled_gemm_derives_scale_columns_from_each_invocation,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_block_scaled_gemm_artifact.py::test_repeated_block_scaled_callsites_inside_a_loop_do_not_share_history,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_block_scaled_gemm_artifact.py::test_interleaved_block_scaled_calls_are_independent_of_prior_calls,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_block_scaled_gemm_artifact.py::test_block_scale_region_min_selects_the_physical_scale_coordinates,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_dense_gemm_async_gathers_physical_operands_and_accumulates_tmem,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_dense_fp8_gemm_async_matches_numpy,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_cta_group2_gathers_both_shared_shards_and_scatters_tmem,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_dense_gemm_async_handles_repeated_dynamic_index_loads,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_cta_group2_gathers_both_tmem_a_shards,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_dense_gemm_async_runs_numpy_backend_on_two_cluster_workers,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_all_inactive_gemm_async_is_a_noop,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_cta_group2_m64_tcgen_mma_uses_layout_b_independently_of_declared_layout,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_dense_gemm_async_no_swizzle_descriptor_matches_numpy,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_cta_group2_routes_each_pair_within_a_four_cta_cluster,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_gemm_async_artifact.py::test_thread_scope_gemm_async_requires_one_runtime_issuer,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_native_tcgen_thread_fence.py::test_cross_thread_cp_to_mma_requires_both_thread_fences,numsim/v2,5,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_validshape_native_tcgen_thread_fence.py::test_empty_commit_does_not_republish_tcgen_imported_from_another_thread,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_validshape_native_tcgen_thread_fence.py::test_commit_republishes_causal_predecessors_of_local_work,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_validshape_native_tcgen_thread_fence.py::test_repeated_thread_fence_handoff_keeps_full_frontier_ordered,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_validshape_reported_layout_regressions.py::test_numsim_rejects_a_misaligned_tma_shared_component,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_validshape_reported_layout_regressions.py::test_checkers_reject_a_misaligned_tma_shared_component,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_w11_compare_predicates.py::test_compare_instruction_predicates,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_w11_cvt_carriers.py::test_cvt_carriers_truncate_extend_and_gate_reads,numsim/v2,3,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_w11_registry.py::test_fetch_register_alias_normalization_is_explicit,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/ports/test_w11_registry.py::test_spdecompress_accepts_each_b32_carrier_without_changing_static_shape,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/ports/test_w11_registry.py::test_fallback_hint_is_accepted_for_thread_owned_local_copy,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/ports/test_w11_registry.py::test_same_warp_copy_remaps_lane_owned_values,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_w11_registry.py::test_default_thread_owned_local_copy_uses_physical_owners,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_w11_registry.py::test_default_thread_owned_local_copy_trap_is_anchored_at_the_copy,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_w11_reproducers.py::test_w11_1_guarded_pred_destination_is_a_boolean_carrier,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_w11_reproducers.py::test_w11_2_ptx_op_resolves_per_use_carrier_types,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_w11_reproducers.py::test_w11_3_pool_access_beyond_committed_dyn_smem_is_out_of_bounds,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_w11_reproducers.py::test_w11_4_narrow_cvt_extends_into_a_128_bit_carrier,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_w11_sm107_register_predicates.py::test_sm107_register_predicates,numsim/v2,2,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_w11_tcgen_transfer_artifact.py::test_tcgen_cp_expands_tlane_replicas,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_w11_tcgen_transfer_artifact.py::test_tcgen_cp_supports_rank3_multi_instruction_layout,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_w11_tcgen_transfer_artifact.py::test_tcgen_cp_cta_group2_supports_float16_payloads,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
+tests/numsim/v2/ports/test_w4_gate_intrinsics.py::test_gate_intrinsics_match_float32_semantics,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
+tests/numsim/v2/ports/test_w4_gate_intrinsics.py::test_gate_intrinsics_special_values_follow_the_host_rule,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;semantic
 tests/numsim/v2/test_lowering_control.py::test_wait_until_predicate_program,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_control.py::test_wait_until_predicate_that_reads_memory,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_control.py::test_while_break_and_guarded_select,numsim/v2,1,N,keep,path,new-layer test,,public,,
@@ -1983,6 +2261,13 @@ tests/numsim/v2/test_lowering_memory.py::test_register_layout_local_indexes_by_r
 tests/numsim/v2/test_lowering_memory.py::test_predicated_vector_atomic_is_guarded,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_memory.py::test_vector_red_packs_pieces_that_tile_the_access_type,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_memory.py::test_dtype_changing_view_over_offset_global_view_applies_the_offset_once,numsim/v2,1,N,keep,path,new-layer test,,public,,runs
+tests/numsim/v2/test_lowering_memory.py::test_packed_eight_conversions_read_their_first_pointer,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/test_lowering_memory.py::test_cross_owner_fragment_copy_is_transported_through_shared_scratch,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/test_lowering_memory.py::test_legacy_mma_fill_and_store_follow_the_lane_register_layout,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;c:.rs
+tests/numsim/v2/test_lowering_ops_inventory.py::test_lowering_ops_inventory_is_current,numsim/v2,1,N,keep,path,new-layer test,,public,,c:cargo
+tests/numsim/v2/test_lowering_pred_bridge_and_dyn_pool.py::test_guarded_pred_destination_is_bridged_before_the_guard,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/test_lowering_pred_bridge_and_dyn_pool.py::test_unguarded_pred_sources_are_bridged,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/test_lowering_pred_bridge_and_dyn_pool.py::test_committed_dyn_smem_bounds_the_pool_not_its_strided_view,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_sync_async.py::test_host_prelude_becomes_implicit_tensor_map_slot,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_sync_async.py::test_tma_load_and_mbarrier_protocol,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic
 tests/numsim/v2/test_lowering_sync_async.py::test_bulk_groups_cp_async_and_named_barriers,numsim/v2,1,N,keep,path,new-layer test,,public,,
@@ -1994,6 +2279,8 @@ tests/numsim/v2/test_lowering_sync_async.py::test_guarded_ptx_keeps_its_destinat
 tests/numsim/v2/test_lowering_sync_async.py::test_ptx_call_sites_carry_their_source_text,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_sync_async.py::test_site_text_reads_the_source_line_when_the_span_has_a_file,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_sync_async.py::test_guarded_load_evaluates_its_address_only_under_the_guard,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/test_lowering_sync_async.py::test_per_16bytes_report_carries_its_pattern_and_width,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/test_lowering_sync_async.py::test_sites_name_one_logical_buffer_per_pointer_operand,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_tcgen05.py::test_tcgen05_lifecycle_and_mma,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic
 tests/numsim/v2/test_lowering_tcgen05.py::test_tmem_view_direct_access,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_lowering_tcgen05.py::test_subword_tmem_view_packs_elements_per_cell,numsim/v2,1,N,keep,path,new-layer test,,public,,
@@ -2028,6 +2315,12 @@ tests/numsim/v2/test_v2_layer.py::test_require_clean_raises_check_failed,numsim/
 tests/numsim/v2/test_v2_layer.py::test_public_checkers_report_missing_bindings_as_incomplete,numsim/v2,1,N,keep,path,new-layer test,,public,,runs;checker;semantic
 tests/numsim/v2/test_v2_layer.py::test_renderer_prints_classification_and_hint,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/numsim/v2/test_v2_layer.py::test_incomplete_reason_is_the_message_when_message_is_empty,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/tile_forms/test_legacy_compiled_tile_forms.py::test_legacy_compiled_kernel_lowers,numsim/v2,?,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/tile_forms/test_tile_form_ports.py::test_permute_layout_is_a_warp_snapshot_copy,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/tile_forms/test_tile_form_ports.py::test_shared_cta_reduction_is_sequential_with_identity_and_completion_barrier,numsim/v2,1,N,keep,path,new-layer test,,public,,semantic
+tests/numsim/v2/tile_forms/test_tile_form_ports.py::test_partial_lane_fill_requires_the_full_warp,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/tile_forms/test_tile_form_ports.py::test_repairs_drop_dispatch_hints_and_type_fill_literals,numsim/v2,1,N,keep,path,new-layer test,,public,,
+tests/numsim/v2/tile_forms/test_tile_form_ports.py::test_snapshot_copy_with_runtime_minimum_evaluates_it_once,numsim/v2,1,N,keep,path,new-layer test,,public,,
 tests/test_dump_kernel.py::test_dump_cuda_walks_imported_modules,(top),1,F,keep,override,dump_kernel tool,,public,,
 tests/test_dump_kernel.py::test_extract_symbols_handles_launch_bounds_and_duplicates,(top),1,F,keep,override,dump_kernel tool,,public,,
 tests/test_dump_kernel.py::test_parse_ptxas_extracts_resource_counts,(top),1,F,keep,override,dump_kernel tool,,public,,

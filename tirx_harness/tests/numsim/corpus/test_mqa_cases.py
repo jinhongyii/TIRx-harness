@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tirx_harness.numsim.bindings import prepare_bindings
 from tests.numsim.corpus.kernels.deepgemm import (
     FP4_MQA_CONFIGS,
     FP8_MQA_CONFIGS,
@@ -19,7 +18,9 @@ from tests.numsim.corpus.kernels.deepgemm import (
     prepare_fp8_mqa_case,
 )
 from tests.numsim.support._tirx_kernels import config_params, load_tirx_kernel
-from tirx_harness.numsim.transpiler.frontend import analyze
+from tests.numsim.support.host_bindings import decode_tensor_maps, host_layout, tensor_map_base_array
+from tests.numsim.support.kernel_facts import launch_topology
+from tirx_harness.numsim import v2
 
 _DENSE_KERNELS = (
     "deepgemm_sm100_fp4_mqa_logits",
@@ -40,6 +41,29 @@ def _case_family(module_name: str):
     return _CORPUS[module_name]
 
 
+def _host_identity(args: dict) -> tuple:
+    """Address-free identity of the host arguments: how arrays alias, their
+    bytes (TensorMap images without their host pointer), the tensor each image
+    addresses, and every scalar."""
+
+    arrays = {name: value for name, value in args.items() if isinstance(value, np.ndarray)}
+    contents = {}
+    for name, value in arrays.items():
+        raw = np.ascontiguousarray(value).view(np.uint8).reshape(-1).copy()
+        bases = []
+        for descriptor in decode_tensor_maps(value):
+            raw[descriptor.byte_offset : descriptor.byte_offset + 8] = 0
+            start = descriptor.byte_offset
+            bases.append(tensor_map_base_array(value.view(np.uint8).reshape(-1)[start : start + 128]).tobytes())
+        contents[name] = (value.dtype.str, value.shape, raw.tobytes(), tuple(bases))
+    scalars = {name: value for name, value in args.items() if name not in arrays}
+    return (
+        host_layout(arrays).buffers,
+        contents,
+        sorted((name, type(value).__name__, repr(value)) for name, value in scalars.items()),
+    )
+
+
 def _case(module_name: str, index: int):
     family = _case_family(module_name)
     return family.prepare(**config_params(family.configs[index]))
@@ -50,11 +74,15 @@ def test_mqa_numsim_inputs_have_valid_bindings(module_name):
     family = _case_family(module_name)
 
     for index in range(len(family.configs)):
-        prepare_bindings(_case(module_name, index).args)
+        case = _case(module_name, index)
+        v2.canonicalize_inputs(v2.transpile(case.kernel), case.args)
 
 
 @pytest.mark.parametrize("module_name", _DENSE_KERNELS)
 def test_mqa_shared_pointer_views_keep_their_physical_scope(module_name):
+    # Asserts a legacy-frontend diagnostic; retires with the legacy frontend.
+    from tirx_harness.numsim.transpiler.frontend import analyze
+
     spec = analyze(_case(module_name, 0).kernel)
 
     assert not any(
@@ -87,14 +115,12 @@ def test_mqa_numsim_cases_are_deterministic_and_full_launch(module_name, config_
     first = _case(module_name, config_index)
     second = _case(module_name, config_index)
 
-    assert analyze(first.kernel).topology.clusters == 2
-    assert analyze(first.kernel).topology.ctas_per_cluster == 1
-    assert analyze(first.kernel).topology.warps_per_cta == 12
+    topology = launch_topology(first.kernel)
+    assert topology.clusters == 2
+    assert topology.ctas_per_cluster == 1
+    assert topology.warps_per_cta == 12
     np.testing.assert_array_equal(first.reference()["logits"], second.reference()["logits"])
-    assert (
-        prepare_bindings(first.args).identity_payload()
-        == prepare_bindings(second.args).identity_payload()
-    )
+    assert _host_identity(first.args) == _host_identity(second.args)
 
 
 def test_dense_mqa_numpy_reference_matches_independent_scalar_reference():

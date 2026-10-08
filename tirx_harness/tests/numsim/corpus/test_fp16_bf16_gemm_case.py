@@ -8,7 +8,7 @@ from tests.numsim.corpus.kernels.gemm import _bfloat16_bits_to_float32, _float32
 from tests.numsim.corpus.kernels.gemm import prepare_fp16_bf16_case as prepare_numsim_case
 from tests.numsim.microtests.harness import NUMSIM_GPU_MARK, require_numsim_gpu
 from tests.numsim.support.three_way import run_three_way_case
-from tirx_harness.numsim.transpiler.frontend import analyze
+from tests.numsim.support.kernel_facts import launch_topology
 
 
 def test_gemm_numsim_corpus_matches_bootstrap_target():
@@ -22,11 +22,11 @@ def test_prepare_gemm_numsim_case_is_deterministic_and_full_launch(config):
     params = {key: value for key, value in config.items() if key != "label"}
     case = prepare_numsim_case(**params)
     repeated = prepare_numsim_case(**params)
-    spec = analyze(case.kernel)
+    topology = launch_topology(case.kernel)
 
-    assert spec.topology.clusters == 8
-    assert spec.topology.ctas_per_cluster == 2
-    assert spec.topology.warps_per_cta == 8
+    assert topology.clusters == 8
+    assert topology.ctas_per_cluster == 2
+    assert topology.warps_per_cta == 8
     assert case.subset is None
     assert case.args["a"].shape == (256, 64)
     assert case.args["b"].shape == (2048, 64)

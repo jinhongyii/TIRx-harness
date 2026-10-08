@@ -12,6 +12,7 @@ import torch
 import tvm
 
 from tests.numsim.support._tirx_kernels import load_tirx_kernel
+from tests.numsim.support.host_bindings import decode_tensor_maps, tensor_map_base_array
 from tirx_harness.numsim.cases import ComparisonSpec, NumSimCase, TensorMap
 
 
@@ -149,11 +150,9 @@ def _prepare(name, config, launch=None):
                     if data_ptr(value) == data_ptr(case[output]):
                         outputs[output] = key
     # Tensor-map-only outputs retain the real contiguous output owner.
-    from tirx_harness.numsim.bindings import _decode_tensor_maps, _tensor_map_base_array
-
     for key, value in args.items():
-        if isinstance(value, np.ndarray) and _decode_tensor_maps(value):
-            base = _tensor_map_base_array(value)
+        if isinstance(value, np.ndarray) and decode_tensor_maps(value):
+            base = tensor_map_base_array(value)
             for output in references:
                 if np.shares_memory(base, _numpy(case[output])):
                     outputs[output] = key
@@ -161,7 +160,7 @@ def _prepare(name, config, launch=None):
     expected_arrays = {}
     for output, reference in references.items():
         binding = args[outputs[output]]
-        maps = _decode_tensor_maps(binding)
+        maps = decode_tensor_maps(binding)
         values = reference.float().contiguous().numpy()
         if maps:
             descriptor = maps[0]

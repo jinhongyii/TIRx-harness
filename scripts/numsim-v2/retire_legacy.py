@@ -45,6 +45,7 @@ import argparse
 import ast
 import collections
 import csv
+import json
 import re
 import subprocess
 import sys
@@ -307,8 +308,8 @@ def rewrites() -> list[Edit]:
         Edit("tirx_harness/tests/conftest.py", "drop the NUMSIM_IMPL=v2 rebinding shim (numsim *is* v2)",
              manual=True),
         Edit("tirx_harness/tests/conformance/snapshot.py",
-             "IMPLS = ('v2',); --update-snapshots only rewrites <mode>.delta.json with a named delta row "
-             "(snapshots become the oracle, no legacy regeneration)", manual=True),
+             "IMPLS = ('v2',); drop delta_snapshot_path (deltas are folded); --update-snapshots regenerates from v2 "
+             "(decision: every changed snapshot cites a delta row in the commit message)", manual=True),
         Edit("tirx_harness/tests/conformance/test_conformance.py", "drop the legacy import path and the v2 skip guards",
              manual=True),
         Edit("tirx_harness/tests/conformance/README.md", "v2 is the implementation; regeneration rule", manual=True),
@@ -321,8 +322,12 @@ def rewrites() -> list[Edit]:
         Edit("tirx_harness/tests/numsim/support/paths.py", "drop ENGINE_ROOT (engine-rs)", manual=True),
         Edit(f"{NUMSIM}/CLAUDE.md", "remove the legacy-engine paragraph and the legacy snapshot policy", manual=True),
         Edit(f"{NUMSIM}/AGENTS.md", "mirror CLAUDE.md", manual=True),
-        Edit(f"{NUMSIM}/v2/options.py", "optional: NUMSIM_V2_* -> NUMSIM_* (pending marker in dev-loop.md / docs/api/numsim.md)",
-             manual=True),
+        Edit(".github/workflows/tests.yml", "add `python scripts/numsim-v2/check_snapshot_deltas.py --base origin/main` "
+             "(fails when a snapshot changes without a delta row cited in the commit message)", manual=True),
+        Edit(f"{NUMSIM}/v2/run.py", "decision: a failed codegen build raises NumSimBuildError (today ValueError) [W8]", manual=True),
+        Edit(f"{NUMSIM}/v2/api.py", "decision: missing bindings report `incomplete` instead of raising InputError [W8]", manual=True),
+        Edit(f"{NUMSIM}/core-rs/numsim-oplib/tools/gen_registry.py",
+             "decision: SUPPORTED_OPS.md becomes generated from the oplib registry (invert the generator) [W4]", manual=True),
     ]
     return edits
 
@@ -335,23 +340,44 @@ SUBMODULE_DOC_LINES = [
 ]
 
 # (pending: ...) markers fall in three classes:
-#   resolve - the deletion itself (or one of the rewrites above) makes the text
-#             true; the parenthetical is removed;
-#   action  - needs a decision or an extra change made as part of step 5
-#             (snapshot policy, env prefix, error types, report classes, ...);
+#   resolve - the deletion itself, one of the rewrites above, or a recorded
+#             DECISION makes the text true; the parenthetical is removed;
+#   action  - an undecided question (none left after the 2026-10-08 decisions);
 #   keep    - unrelated to the legacy engine (backend decision, worker count).
-ACTION = re.compile(
-    r"policy|regeneration|prefix|moves next|raise|single launch|AssertionError|InputError", re.I
-)
 RESOLVES = re.compile(r"legacy|delet|submodule|switch|migration completes|numsim_core_py", re.I)
+KEEP = re.compile(r"backend decision|detected CPU count", re.I)
+
+# Coordinator decisions for the step-5 open items (2026-10-08). Each names the
+# marker text it settles and the change step 5 must make.
+DECISIONS = [
+    ("snapshot", re.compile(r"snapshot policy|regeneration rule|policy for generating snapshots", re.I),
+     "fold every <mode>.delta.json into its base snapshot and delete the delta files (v2 becomes the oracle); "
+     "afterwards --update-snapshots regenerates from v2, and every changed snapshot must be justified by a delta "
+     "row cited in the commit message (CI: scripts/numsim-v2/check_snapshot_deltas.py)"),
+    ("env-prefix", re.compile(r"NUMSIM_V2_. prefix", re.I),
+     "rename NUMSIM_V2_* to NUMSIM_*; v2/options.py keeps NUMSIM_V2_* as aliases for one release"),
+    ("build-error", re.compile(r"NumSimBuildError", re.I),
+     "NumSimBuildError stays: a failed codegen build raises NumSimBuildError (W8 change in v2/run.py)"),
+    ("check-failed", re.compile(r"CheckFailed", re.I),
+     "CheckFailed stays: reports raise tirx_harness._report.CheckFailed (already the v2 behaviour)"),
+    ("ops-table", re.compile(r"table moves", re.I),
+     "SUPPORTED_OPS.md moves to numsim-oplib and becomes generated from the oplib registry (W4)"),
+    ("multi-launch", re.compile(r"single launch", re.I),
+     "multi-launch entry points are the v2 behaviour"),
+    ("missing-bindings", re.compile(r"InputError", re.I),
+     "missing bindings report `incomplete` (W8 change in the v2 entry points)"),
+]
 
 
 def marker_class(body: str) -> str:
-    if ACTION.search(body):
-        return "action"
+    if KEEP.search(body):
+        return "keep"
+    for name, pattern, _ in DECISIONS:
+        if pattern.search(body):
+            return f"resolve:{name}"
     if RESOLVES.search(body):
         return "resolve"
-    return "keep"
+    return "action"
 
 
 def pending_markers() -> list[tuple[str, int, str, str]]:
@@ -466,33 +492,92 @@ DELETED_MODULES = {
 } | {"tirx_harness.numsim.transpiler"}
 
 
-def broken_imports(removed: set[str]) -> list[str]:
-    """Surviving test / support modules that import a deleted legacy module."""
+def _deleted(mod: str) -> bool:
+    return any(mod == d or mod.startswith(d + ".") for d in DELETED_MODULES)
+
+
+def legacy_import_uses(path: Path, cut: set[str]) -> tuple[dict[str, str], set[str]]:
+    """(bound name -> deleted module) imported at any level, and the subset of
+    those names still used outside the functions in ``cut``."""
+    tree = ast.parse(path.read_text())
+    bound: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and _deleted(node.module):
+            for alias in node.names:
+                bound[alias.asname or alias.name] = node.module
+        elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("tirx_harness.numsim"):
+            for alias in node.names:
+                if _deleted(f"{node.module}.{alias.name}"):
+                    bound[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _deleted(alias.name):
+                    bound[(alias.asname or alias.name).split(".")[0]] = alias.name
+    skip = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in cut:
+            skip.add(id(node))
+        if isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and f"{node.name}::{sub.name}" in cut:
+                    skip.add(id(sub))
+    used: set[str] = set()
+
+    def visit(node: ast.AST) -> None:
+        if id(node) in skip or isinstance(node, (ast.Import, ast.ImportFrom)):
+            return
+        if isinstance(node, ast.Name) and node.id in bound:
+            used.add(node.id)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(tree)
+    return bound, used
+
+
+def broken_imports(removed: set[str], cut: dict[str, list[str]] | None = None) -> list[str]:
+    """Surviving test / support modules whose surviving code still USES a name
+    from a deleted legacy module. Unused legacy imports are pruned by --apply."""
     base = retire_tests.TESTS_BASE
+    cut = cut or {}
     out = []
     for path in sorted((base / "tests").rglob("*.py")):
         rel = path.relative_to(base).as_posix()
         if rel in removed or "/v2/" in rel:
             continue
-        hits = set()
-        for node in ast.walk(ast.parse(path.read_text())):
-            mods = []
-            if isinstance(node, ast.ImportFrom) and node.module:
-                mods = [node.module] + [f"{node.module}.{a.name}" for a in node.names]
-            elif isinstance(node, ast.Import):
-                mods = [a.name for a in node.names]
-            for mod in mods:
-                if any(mod == d or mod.startswith(d + ".") for d in DELETED_MODULES):
-                    hits.add(mod.rsplit(".", 1)[0] if mod.count(".") > 2 else mod)
-        if hits:
-            out.append(f"{rel}  ({', '.join(sorted(hits))})")
+        bound, used = legacy_import_uses(path, set(cut.get(rel, ())))
+        if used:
+            out.append(f"{rel}  ({', '.join(sorted(used))})")
     return out
 
 
-def blockers(info: dict[str, str], removed: set[str] | None = None) -> dict[str, list[str]]:
+def prune_legacy_imports(path: Path) -> None:
+    """Drop imports of deleted modules whose names nothing uses any more."""
+    bound, used = legacy_import_uses(path, set())
+    unused = set(bound) - used
+    if not unused:
+        return
+    tree = ast.parse(path.read_text())
+    lines = path.read_text().split("\n")
+    for node in sorted(ast.walk(tree), key=lambda n: -getattr(n, "lineno", 0)):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        names = [a for a in node.names if (a.asname or a.name).split(".")[0] in unused or (a.asname or a.name) in unused]
+        if names and len(names) == len(node.names):
+            del lines[node.lineno - 1 : node.end_lineno]
+        elif names:
+            keep = [a for a in node.names if a not in names]
+            text = ", ".join(a.name + (f" as {a.asname}" if a.asname else "") for a in keep)
+            indent = lines[node.lineno - 1][: len(lines[node.lineno - 1]) - len(lines[node.lineno - 1].lstrip())]
+            head = f"from {'.' * node.level}{node.module or ''} import " if isinstance(node, ast.ImportFrom) else "import "
+            lines[node.lineno - 1 : node.end_lineno] = [indent + head + text]
+    path.write_text("\n".join(lines))
+
+
+def blockers(info: dict[str, str], removed: set[str] | None = None, cut: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
     out: dict[str, list[str]] = collections.defaultdict(list)
-    for entry in broken_imports(removed or set()):
-        out["surviving test module imports a deleted legacy module"].append(entry)
+    for entry in broken_imports(removed or set(), cut):
+        out["surviving code uses a deleted legacy module"].append(entry)
     status = COVERAGE / "step5_a_status.tsv"
     if status.exists():
         for row in csv.DictReader(status.open(), delimiter="\t"):
@@ -507,6 +592,11 @@ def blockers(info: dict[str, str], removed: set[str] | None = None) -> dict[str,
 # ----------------------------------------------------------------------------
 
 
+ENV_HELPER = '''def _env(name: str, default: str = "") -> str:
+    """``NUMSIM_<name>``; ``NUMSIM_V2_<name>`` is accepted for one release."""
+    return os.environ.get(f"NUMSIM_{name}", os.environ.get(f"NUMSIM_V2_{name}", default))'''
+
+
 @dataclass
 class Plan:
     remove: list[str] = field(default_factory=list)
@@ -519,6 +609,8 @@ class Plan:
     doc_lines: list[tuple[str, str]] = field(default_factory=list)
     markers: list[tuple[str, int, str, str]] = field(default_factory=list)
     tooling: list[str] = field(default_factory=list)
+    delta_snapshots: list[str] = field(default_factory=list)
+    env_files: list[str] = field(default_factory=list)
     blockers: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -567,7 +659,17 @@ def build(waves: list[str], results: Path | None) -> Plan:
         "scripts/numsim-v2/tile_rejections.py",  # needs a legacy capture run
         "scripts/numsim-v2/lower_sweep.py",  # consumes the legacy capture
     ]
-    plan.blockers = blockers(info, set(plan.whole_tests) | set(plan.support))
+    plan.blockers = blockers(info, set(plan.whole_tests) | set(plan.support), plan.cut_tests)
+    plan.delta_snapshots = sorted(
+        p.relative_to(REPO).as_posix() for p in (REPO / "tirx_harness/tests/conformance/snapshots").glob("*/*.delta.json")
+    )
+    plan.env_files = sorted(
+        rel for rel in tracked(".")
+        if rel.endswith((".py", ".md", ".yml", ".sh", ".toml"))
+        and rel not in ("scripts/numsim-v2/retire_legacy.py", "docs/development/test-migration.md")
+        and (REPO / rel).is_file()
+        and "NUMSIM_V2_" in (REPO / rel).read_text(errors="replace")
+    )
     return plan
 
 
@@ -617,10 +719,20 @@ def show(plan: Plan, listing: bool) -> None:
     section("5. docs")
     for path, line in plan.doc_lines:
         print(f"edit   {path}    # remove `{line.strip()}`")
-    kinds = collections.Counter(m[3] for m in plan.markers)
+    kinds = collections.Counter(m[3].split(":")[0] for m in plan.markers)
     print(f"# (pending: ...) markers: {len(plan.markers)} total; " + ", ".join(f"{v} {k}" for k, v in sorted(kinds.items())))
     for rel, line, body, kind in plan.markers:
-        print(f"{kind:7s} {rel}:{line}  {body[:150]}")
+        print(f"{kind:22s} {rel}:{line}  {body[:130]}")
+
+    section("5b. decisions (2026-10-08) and the changes they require")
+    for name, _, change in DECISIONS:
+        print(f"{name:16s} {change}")
+    print(f"# fold {len(plan.delta_snapshots)} delta snapshots into their base snapshots:")
+    for path in plan.delta_snapshots:
+        print(f"fold   {path}")
+    print(f"# NUMSIM_V2_* -> NUMSIM_* in {len(plan.env_files)} files (options.py keeps the aliases)")
+    for path in plan.env_files:
+        print(f"rename {path}")
 
     section("6. migration tooling that needs the legacy engine")
     for path in plan.tooling:
@@ -648,15 +760,34 @@ def apply(plan: Plan) -> None:
     subprocess.run(["git", "rm", "-q", *[f"tirx_harness/{f}" for f in plan.whole_tests + plan.support]], cwd=REPO, check=True)
     for file, funcs in plan.cut_tests.items():
         retire_tests.cut(retire_tests.TESTS_BASE / file, funcs)
+    for path in (retire_tests.TESTS_BASE / "tests").rglob("*.py"):
+        prune_legacy_imports(path)
     for path, line in plan.doc_lines:
         target = REPO / path
         target.write_text(target.read_text().replace(line + "\n", "", 1))
     for rel, _, body, kind in plan.markers:
-        if kind == "resolve":
+        if kind.startswith("resolve"):
             target = REPO / rel
             text = target.read_text()
             target.write_text(re.sub(r"\s*\(pending:[^()]*(\([^()]*\)[^()]*)*\)", "", text, count=1)
                               if " ".join(text.split()).count(body) else text)
+    for rel in plan.delta_snapshots:
+        delta = REPO / rel
+        data = json.loads(delta.read_text())
+        data.pop("delta", None)
+        base = delta.with_name(delta.name.replace(".delta.json", ".json"))
+        base.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n")
+        subprocess.run(["git", "rm", "-q", rel], cwd=REPO, check=True)
+    for rel in plan.env_files:
+        target = REPO / rel
+        text = target.read_text()
+        if rel.endswith("numsim/v2/options.py"):
+            text = re.sub(r'os\.environ\.get\("NUMSIM_V2_(\w+)"', r'_env("\1"', text)
+            text = text.replace("NUMSIM_V2_", "NUMSIM_")
+            text = text.replace("def ", ENV_HELPER + "\n\ndef ", 1)
+        else:
+            text = text.replace("NUMSIM_V2_", "NUMSIM_")
+        target.write_text(text)
     subprocess.run(["git", "rm", "-q", *plan.tooling], cwd=REPO, check=True)
     print("applied; now do the `manual` items, rebuild numsim_core_py, run the suite and conformance", file=sys.stderr)
 

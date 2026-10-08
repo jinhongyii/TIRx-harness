@@ -60,7 +60,6 @@ def _code(kernel):
     return [str(instr) for instr in program.code], [r.to_json() for r in program.regs]
 
 
-@v2_gap("W11-6: lowering rejects mov_sreg(32, '%laneid') as 'special register %%laneid' instead of normalizing the % prefix")
 def test_fetch_register_alias_normalization_is_explicit():
     """Copy; ``laneid`` and ``%laneid`` lower to identical code and registers."""
     plain, prefixed = _code(_mov_sreg_kernel("laneid")), _code(_mov_sreg_kernel("%laneid"))

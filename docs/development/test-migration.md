@@ -693,6 +693,84 @@ In short, step 5 can run when:
 The rest (585 flips, 80 retired copies, waves 0, 1 and 5b) is mechanical.
 
 
+## Phase 6 status (2026-10-08, working tree on bfcd920)
+
+### Decisions encoded in `retire_legacy.py`
+
+- **Snapshots.** Every `<mode>.delta.json` (17 today) is folded into its base
+  snapshot, and the delta files are deleted. After that, `--update-snapshots`
+  regenerates from v2. The CI gate `scripts/numsim-v2/check_snapshot_deltas.py`
+  enforces the policy on every commit that touches a snapshot:
+  - the commit message cites a table-qualified delta row, such as
+    `racecheck B7`;
+  - it names every changed case;
+  - a regeneration that changes no verdict carries the trailer
+    `Snapshot-Regen: schema <reason>` instead.
+- **Environment variables.** `NUMSIM_V2_*` becomes `NUMSIM_*`, with the old
+  names kept as aliases for one release.
+- **Unchanged APIs.** `NumSimBuildError` and `CheckFailed` stay.
+- **SUPPORTED_OPS.md** moves to `numsim-oplib`, and is generated there.
+- **Multi-launch** is the v2 behaviour.
+- **Missing bindings** report `incomplete`.
+
+With these decisions, 19 of the 23 `(pending: …)` markers resolve at
+deletion. One still needs an action and 3 stay.
+
+### Blockers
+
+The four blockers below are from the phase-6 dispatch:
+
+1. **Corpus fixtures: done.**
+   - `state_update`, `attention` and `native_multishape` no longer use legacy
+     code. They rely on two new test-only helpers:
+     `support/host_bindings.py` (a TensorMap decoder and the host layout) and
+     `support/kernel_facts.py` (parameter dtypes and v2 topology).
+   - All 101 prepared cases are byte-identical before and after.
+   - `kda_forward_portfolio_multishape` is fixed for the current `kda_fwd`
+     signature (`items` and `item_counts` from `packed_schedule`; q and k box
+     shape (64, 32, 1)). It is clean on legacy, and on v2 for numsim and
+     racecheck.
+2. **Legacy imports.** `microtests/harness.py` and `support/three_way.py` are
+   ported. The legacy views in `support/manifest.py` are now imported inside
+   the functions that use them.
+   - After the planned cuts, 33 surviving modules still use a deleted legacy
+     name; `retire_legacy.py --list` names them.
+   - 12 of the 33 are in W11's area (`numsim/registry`, `numsim/abi`,
+     `analysis_tools/*`).
+   - 21 are mine: `numsim/runtime` 11, `numsim/integration` 7, `corpus` 1,
+     `microtests` 1, `support/manifest.py`.
+3. **A ports.** P6-B ported 92 functions, P6-C 64, P6-D 56, and the
+   valid-shape batch 25. Remaining:
+   - 11 needs-port functions (public 6, internal 5);
+   - 25 uses-legacy-internals functions (all internal).
+4. **Blocked-v2.**
+   - The 14 TMEM-slice functions (T4) and the 3 setmaxnreg-dec functions (sync
+     R1) are ported as expected errors.
+   - The 40 internal other-assertion functions were triaged: 10 port,
+     25 delta, 5 bugs filed.
+   - Remaining: public 9, internal 54.
+   - 72 replacements are still xfail and hold their legacy tests.
+
+The valid-shape batch (L4 to L7) found a likely v2 `tcgen05.mma` swizzle bug.
+With 32B or 128B swizzled operands, the MMA reads the wrong 16-byte K chunk,
+and 13 copies are `v2_gap` because of it.
+
+### Step-5 status per A function
+
+Fresh `NUMSIM_IMPL=v2` runs:
+
+- public: 552 of 761 items pass;
+- internal: 522 of 793 items pass.
+
+| bucket | public | internal |
+| --- | ---: | ---: |
+| flip | 318 | 274 |
+| retired (passing copy, wave 4) | 102 | 165 |
+| needs-port | 6 | 5 |
+| uses-legacy-internals | 0 | 25 |
+| blocked-v2 | 9 | 54 |
+| gpu-only | 4 | 0 |
+
 ## Semantics in legacy tests that no new spec mentions
 
 Each item below was confirmed by grep across `racecheck-semantics.md`,

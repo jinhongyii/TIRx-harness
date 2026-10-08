@@ -175,14 +175,18 @@ def test_warpgroup_shared_copy_snapshots_overlap_independent_of_dispatch(kernel)
 # -- tests/numsim/runtime/test_tile_codegen.py -------------------------------
 
 
-def _typed_tma_reduce_kernel(dtype: str, reduction: str):
+def _typed_tma_reduce_kernel(dtype: str, reduction: str, extent: int = 4):
+    """Legacy kernel; ``extent`` is 4 as in legacy, or 8 for the row-L6
+    valid-shape copies (a 4-element 16-bit box is 8 bytes, not a multiple of
+    16, so no tensor map encodes it; 8 x 16-bit = 16 bytes)."""
+
     @T.prim_func
-    def kernel(source: T.Buffer((4,), dtype), output: T.Buffer((4,), dtype)):
+    def kernel(source: T.Buffer((extent,), dtype), output: T.Buffer((extent,), dtype)):
         T.device_entry()
         _warp = T.warp_id([1])
         lane = T.lane_id([32])
-        shared = T.alloc_buffer((4,), dtype, scope="shared")
-        if lane < 4:
+        shared = T.alloc_buffer((extent,), dtype, scope="shared")
+        if lane < extent:
             shared[lane] = source[lane]
         T.cuda.warp_sync()
         T.ptx.fence.proxy.async_.shared__cta()
@@ -310,3 +314,56 @@ def test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair(reduction, dtyp
     Legacy ``analyze``/``verify``/``emit_rust_module`` becomes ``v2.transpile``."""
 
     v2.transpile(_typed_tma_reduce_kernel(dtype, reduction))
+
+
+# -- row L6 valid-shape copies (numsim-behaviour-deltas.md L6) ---------------
+# The legacy 16-bit params used a 4-element (8-byte) TMA box, which no tensor
+# map can encode (cuTensorMapEncodeTiled: boxDim[0] * elemsize must be a
+# multiple of 16). These copies give the kernel 8 16-bit elements (16 bytes).
+
+
+@pytest.mark.parametrize(
+    ("reduction", "dtype", "source", "initial", "expected"),
+    [
+        (
+            "min",
+            "float16",
+            np.asarray([3.0, -10.0, 20.0, 7.0, 0.5, -0.25, 1024.0, -3.0], dtype=np.float16),
+            np.asarray([5.0, -5.0, 9.0, 7.0, -0.5, 0.25, 2048.0, -4.0], dtype=np.float16),
+            # Element-wise min, written out by hand (first four are legacy's).
+            np.asarray([3.0, -10.0, 9.0, 7.0, -0.5, -0.25, 1024.0, -4.0], dtype=np.float16),
+        ),
+    ],
+    ids=["min-float16"],
+)
+def test_validshape_typed_tma_reduce_reuses_raw_tensor_map_reduction_abi(
+    reduction, dtype, source, initial, expected
+):
+    """Replaces the ``min-float16`` param of ``tests/numsim/runtime/test_tile_codegen.py::test_typed_tma_reduce_reuses_raw_tensor_map_reduction_abi``.
+
+    Row L6: the legacy box was 4 x float16 = 8 bytes; this copy uses 8 x
+    float16 = 16 bytes. Same reduction (min) and the same first four
+    elements; four more elements extend the hand-computed expectation."""
+
+    module = v2.transpile(_typed_tma_reduce_kernel(dtype, reduction, extent=8))
+    result = v2.Engine().run(module, {"source": source, "output": initial.copy()})
+
+    np.testing.assert_array_equal(result.outputs["output"], expected)
+
+
+@pytest.mark.parametrize(
+    ("reduction", "dtype"),
+    [
+        (reduction, dtype)
+        for reduction in ("add", "min", "max")
+        for dtype in ("bfloat16", "float16")
+    ],
+)
+def test_validshape_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair(reduction, dtype):
+    """Replaces the ``add|min|max`` x ``bfloat16|float16`` params of ``tests/numsim/runtime/test_tile_codegen.py::test_typed_tma_reduce_accepts_every_ptx_operation_dtype_pair``.
+
+    Row L6: legacy box 4 x 16-bit = 8 bytes; this copy uses 8 elements (16
+    bytes). Legacy ``analyze``/``verify``/``emit_rust_module`` becomes
+    ``v2.transpile``."""
+
+    v2.transpile(_typed_tma_reduce_kernel(dtype, reduction, extent=8))

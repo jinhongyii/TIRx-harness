@@ -12,8 +12,8 @@ from tirx_harness.numsim.cases import (
     NumSimCase,
     TensorMap,
 )
-from tirx_harness.numsim.bindings import _tensor_map_base_array
 from tests.numsim.support._tirx_kernels import load_tirx_kernel
+from tests.numsim.support.host_bindings import tensor_map_base_array
 
 flash_attention4 = load_tirx_kernel("flash_attention4")
 flash_attention_backward = load_tirx_kernel("flash_attention_backward_sm100")
@@ -308,7 +308,7 @@ def prepare_flash_attention4_case(
         ),
         args=args,
         outputs={"O": "O_tensor_map"},
-        reference=lambda: {"O": _tensor_map_base_array(expected_map).copy()},
+        reference=lambda: {"O": tensor_map_base_array(expected_map).copy()},
         comparisons={"O": ComparisonSpec(rtol=1e-2, atol=1e-2)},
     )
 

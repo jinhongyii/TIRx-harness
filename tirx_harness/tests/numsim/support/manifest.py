@@ -6,13 +6,19 @@ The frontend records every rejected call as an ``op#<id>:...`` entry of
 specialization is the engine instruction its site emits.  The helpers below
 expose exactly those facts, plus the complete native module text, so a test never
 needs a Python-side resolution object.
+
+The kernel builders (``parse_kernel``, ``device_kernel``, ``evaluated_kernel``,
+``replace_call``) are plain TIRx. The manifest and emission views read the
+legacy frontend and Rust artifact emitter, which redesign step 5 deletes; they
+import it on call, so a test module that only builds kernels (or whose other
+tests do not use these views) still imports without the legacy modules.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import tvm
 from tvm import tirx
@@ -21,9 +27,8 @@ from tvm.script import tirx as T
 from tvm.tirx import Stmt
 from tvm_ffi import structural_map
 
-from tirx_harness.numsim.transpiler.artifact_template import emit_rust_module
-from tirx_harness.numsim.transpiler.frontend import PrimFuncSpec, analyze, verify
-from tirx_harness.numsim.transpiler.host_prelude import normalize_host_tensor_map_prelude
+if TYPE_CHECKING:
+    from tirx_harness.numsim.transpiler.frontend import PrimFuncSpec
 
 DEVICE_ENTRY_ATTR = "tirx.device_entry"
 
@@ -66,11 +71,15 @@ def replace_call(func: tirx.PrimFunc, original: Any, replacement: Any) -> tirx.P
 def kernel_manifest(func: Any) -> PrimFuncSpec:
     """The kernel's manifest, rejected calls included in ``unsupported``."""
 
+    from tirx_harness.numsim.transpiler.frontend import analyze
+
     return analyze(func).kernels[0]
 
 
 def resolved_kernel(func: Any) -> PrimFuncSpec:
     """The kernel's manifest, raising ``UnsupportedTIRxError`` for any rejected call."""
+
+    from tirx_harness.numsim.transpiler.frontend import analyze, verify
 
     spec = analyze(func)
     verify(spec)
@@ -133,6 +142,10 @@ def emitted_calls(
     Calls follow their order in the complete emitted module.
     """
 
+    from tirx_harness.numsim.transpiler.artifact_template import emit_rust_module
+    from tirx_harness.numsim.transpiler.frontend import analyze, verify
+    from tirx_harness.numsim.transpiler.host_prelude import normalize_host_tensor_map_prelude
+
     func = normalize_host_tensor_map_prelude(func)
     spec = analyze(func)
     verify(spec)
@@ -156,6 +169,10 @@ def emitted_calls(
 
 def emitted_module(func: tirx.PrimFunc) -> str:
     """The complete native plain-mode module containing one kernel."""
+
+    from tirx_harness.numsim.transpiler.artifact_template import emit_rust_module
+    from tirx_harness.numsim.transpiler.frontend import analyze
+    from tirx_harness.numsim.transpiler.host_prelude import normalize_host_tensor_map_prelude
 
     func = normalize_host_tensor_map_prelude(func)
     return emit_rust_module(analyze(func), func)

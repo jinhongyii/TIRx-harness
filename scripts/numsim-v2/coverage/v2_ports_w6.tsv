@@ -1,0 +1,2 @@
+legacy_test	v2_tests	note
+tests/numsim/runtime/test_launch_resource_facts.py::test_exclusive_tmem_uses_cta_local_lifecycle_without_placement	tests/numsim/v2/ports/test_internals_launch_resource_facts.py::test_exclusive_tmem_576_column_lifecycle_is_clean;tests/numsim/v2/ports/test_internals_launch_resource_facts.py::test_ordinary_alloc_while_exclusive_is_live_is_an_error	W6 ruling (b), sync delta T8: ordinary alloc while an exclusive allocation is live is an error (legacy accepted); 576-column lifecycle stays clean
