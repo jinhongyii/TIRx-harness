@@ -7,8 +7,8 @@
 _numsim_repo="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")/.." && pwd)"
 
 # The login shell points these at a local TVM 0.26 development tree, which
-# shadows the pinned `apache-tvm` wheel (the frontend then panics with
-# `sym.Analyzer is not registered`).
+# shadows the TIRx-enabled `tvm` installed in the venv, so `import tvm` loads
+# the wrong build.
 unset PYTHONPATH TVM_LIBRARY_PATH TVM_HOME
 
 export PY="${PY:-$_numsim_repo/.venv/bin/python}"

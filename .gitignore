@@ -19,7 +19,6 @@ tirx_harness/src/tirx_harness/numsim/_tvm_rust_ext.*.so
 tirx_harness/src/tirx_harness/numsim/v2/numsim_core_py.*.so
 tirx_harness/src/tirx_harness/numsim/_tvm_rust_ext.pyd
 tirx_harness/src/tirx_harness/numsim/_tvm_rust_ext.identity
-tirx_harness/src/tirx_harness/numsim/_thirdparty_licenses/
 
 # KDA run outputs
 /kda_flow_runs/
