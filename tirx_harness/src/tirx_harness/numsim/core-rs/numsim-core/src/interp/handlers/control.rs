@@ -306,6 +306,12 @@ pub fn exit(ctx: &mut ExecCtx<'_>) -> HResult {
     if lanes.is_empty() {
         return Ok(Flow::Next);
     }
+    // Lanes exiting while other lanes of the warp wait at a non-`.aligned`
+    // barrier for them: the Q3/Q5 fail-closed case.
+    if let Some(p) = ctx.aux.named_partial.get(&ctx.warp.id).filter(|p| p.gen.is_none()) {
+        let (mask, live) = (p.lanes, ctx.warp.live);
+        return Err(super::sync::named_partial_error(ctx, mask, live, "the other lanes exited"));
+    }
     ctx.warp.live = ctx.warp.live.and_not(lanes);
     ctx.warp.active = WarpMask::NONE;
     if ctx.loaded.uses_cluster_barrier {

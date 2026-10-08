@@ -2296,3 +2296,41 @@ not by `tmem-columns`.
    - Scenarios: `readonly_proxy(clean|disjoint|after|before|cross_cta)`, with 1 and 2 workers.
    - `test_readonly_proxy.py` and the `test_needs_kernel_batch` readonly items pass; 2 of those were `xpassed`, so their xfail marks can go.
 6. **`SyncKind::AsyncIssue::restricted`.** Set from `Issue::restricted`: `true` only for the `tcgen05.commit .sync_restrict` issue, `false` everywhere else.
+
+## v2 conformance, sweep 4 (W8, 2026-10-08, at 5895aa2)
+
+Matches out of 101: numsim 96, racecheck 87, synccheck 95 (B7 delta snapshots for six racecheck rows,
+`tmem_lifetime_review` compared by kind + anchors, schema 4). Public-API set: 489 of 762 pass. Open rows:
+V2C-36 (4 racecheck: `flash_attention_backward_sm100`, `sparse_flashmla_prefill_head128{,_small_topk}_phase1`,
+`sm100_fp8_fp4_mega_moe` -- the last pending its R4/B1 delta), V2C-38 (`gdn_prefill_sm100`,
+`gdn_cp_prefill_sm100` anchors), V2C-22 (`deepgemm_sm100_tf32_hc_prenorm_gemm`), V2C-28
+(`msa_prefill_multishape` synccheck), and V2C-39 below (pending). V2C-35 is gone with the address
+reversal; W8-8 is resolved by d5b0f09.
+
+### V2C-39 [interp + sync (in progress)]: PENDING: W2/W6 are changing the non-aligned `barrier.sync` partial-warp rule this case depends on; it currently stops with `bad_address` on unmapped global address 0x1000000a9800 (re-check after that change)
+
+- Cases (1): `sparse_flashmla_decode_head64` (numsim/racecheck/synccheck)
+- Minimal reproduction: `sparse_flashmla_decode_head64` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "sparse_flashmla_decode_head64-numsim"`
+- Observed: ExecutionError: NumSim execution error: bad_address: Global address 0x1000000a9800 is not mapped at /localhome/local-hongyij/TIRx-harness/.venv/lib/python3.12/site-packages/tirx_kernels/ported/flashmla/sparse_decode_head64.py:2191
+
+
+## W2 (2026-10-08): partial-warp non-aligned named barriers (Q3 ruling)
+
+- A non-`.aligned` `barrier.{sync,arrive,red}` executed by a strict subset of a warp's non-exited lanes no longer fails at once (`interp/handlers/sync.rs::barrier_partial`, `LaunchAux::named_partial`).
+- **Blocking and arrival.**
+  - The executing lanes block, so the divergent-switch rule runs the complementary arm.
+  - Lanes accumulate per warp at the same barrier id and flavor, from any site, with an equal `b`.
+  - The group that completes the set makes ONE warp arrival with the full `live` mask. Its Protocol event and the Arrive event (over all gathered lanes) are logged there.
+  - Each group then continues when the generation completes; for `arrive`, at once.
+  - `bar.red` predicates are accumulated across the groups.
+- **Errors.**
+  - Missing lanes that reach a different barrier id or flavor, or exit, raise `PartialWarp`, the fail-closed Q3/Q5 case.
+  - A different `b` raises `ContractMismatch`.
+  - `.aligned` forms keep the immediate full-warp check.
+- **Scenarios.** `divergent_named_barrier(same|other_id|exit)` covers both outcomes; it also runs in the checker smoke test.
+- **Overlap with W6.** W6's in-progress `named::Gather` has the same semantics. The engine can call `named::gather` for these decisions once it lands. The sync_differential and synccheck_legacy_ports failures in the tree right now are W6's in-flight edits.
+- **`sparse_flashmla_decode_head64`.**
+  - Now passes the barrier at line 1743.
+  - It next stops at line 2191 with `bad_address`: global 0x1000000a9800, which is 2048 bytes past the end of `out` (planned at 0x100000099000, 65536 bytes).
+  - The op is `st.global.u64` through `o_ptr.view("uint64")` of a bf16 global `decl_buffer(data=out.data, elem_offset=out_offset)`.
+  - Likely view / element-offset scaling in lowering (W1, aed5b1b "C-style global view offsets"). Please triage.

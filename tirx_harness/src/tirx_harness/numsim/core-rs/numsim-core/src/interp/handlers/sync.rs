@@ -87,6 +87,12 @@ pub fn barrier(ctx: &mut ExecCtx<'_>, kind: BarKind, id: Operand, count: Option<
         Some(_) => ctx.aux.named_registered.get(&ctx.warp.id).copied().unwrap_or(b),
         None => b,
     };
+    // Non-`.aligned` forms under a partial mask (or while the warp's partial
+    // arrival is in progress): the executing lanes wait for the rest of the
+    // warp (Q3 ruling).
+    if !aligned && ctx.warp.resume.is_none() && (active != ctx.warp.live || ctx.aux.named_partial.contains_key(&ctx.warp.id)) {
+        return barrier_partial(ctx, kind, res, idb, b, count.is_none());
+    }
     let extra = || ProtoExtra {
         counts: Counts { expected_threads: Some(b), contributed_threads: Some(named::WARP_SIZE), ..Default::default() },
         ..Default::default()
@@ -154,6 +160,150 @@ pub fn barrier(ctx: &mut ExecCtx<'_>, kind: BarKind, id: Operand, count: Option<
             Ok(Flow::Blocked(res))
         }
         named::Outcome::Blocked => unreachable!(),
+    }
+}
+
+fn bar_flavor(kind: BarKind) -> u8 {
+    match kind {
+        BarKind::Arrive => 0,
+        BarKind::Sync => 1,
+        BarKind::Red { .. } => 2,
+    }
+}
+
+/// The fail-closed Q3/Q5 case: lanes of a warp at a non-`.aligned` barrier
+/// whose missing lanes reached a different barrier (id or flavor) or exited.
+pub(crate) fn named_partial_error(ctx: &ExecCtx<'_>, mask: WarpMask, live: WarpMask, why: &str) -> ExecError {
+    ctx.error(
+        ExecErrorKind::Protocol(crate::sync::SyncError::Named(named::Error::PartialWarp { mask: mask.bits(), live: live.bits() })),
+        format!("named barrier reached by lanes {:#010x} of the warp (non-exited {:#010x}); {why}", mask.bits(), live.bits()),
+    )
+}
+
+/// Lanes `lanes` passed the warp's partial-arrival barrier.
+fn partial_done(ctx: &mut ExecCtx<'_>, lanes: WarpMask) {
+    let w = ctx.warp.id;
+    if let Some(p) = ctx.aux.named_partial.get_mut(&w) {
+        p.waiting = p.waiting.and_not(lanes);
+        if p.waiting.is_empty() {
+            ctx.aux.named_partial.remove(&w);
+        }
+    }
+}
+
+/// A non-`.aligned` `barrier.{sync,arrive,red}` executed by a strict subset
+/// of the warp's non-exited lanes, or by lanes joining / retrying such an
+/// arrival. The lanes block until every non-exited lane has executed a
+/// barrier with the same id and flavor (any site); then the last group
+/// makes ONE warp arrival (full mask) and each group continues once the
+/// generation completes (`arrive`: at once). Missing lanes reaching a
+/// different barrier, or exiting, fail closed (`PartialWarp`).
+fn barrier_partial(ctx: &mut ExecCtx<'_>, kind: BarKind, res: ResourceId, idb: u8, b: u64, implicit: bool) -> HResult {
+    let active = ctx.warp.active;
+    let live = ctx.warp.live;
+    let flavor = bar_flavor(kind);
+    let prev = ctx.aux.named_partial.get(&ctx.warp.id).cloned();
+    if let Some(p) = &prev {
+        if p.waiting.and(active) == active {
+            // Retry of a group that already executed the barrier.
+            let Some(gen) = p.gen else { return Ok(Flow::Blocked(res)) };
+            if flavor != 0 {
+                if let Step::Blocked(r) = support::step(ctx, res, SyncCmd::Named(named::Cmd::Resume { gen }))? {
+                    return Ok(Flow::Blocked(r));
+                }
+                bar_ready(ctx, kind, res, idb, gen, false)?;
+            }
+            partial_done(ctx, active);
+            return Ok(Flow::Next);
+        }
+        if p.gen.is_some() {
+            // Lanes past the barrier reached it again before the rest of the
+            // warp left the previous generation: wait for them.
+            return Ok(Flow::Blocked(res));
+        }
+        if p.id != idb || p.flavor != flavor {
+            return Err(named_partial_error(ctx, p.lanes, live, &format!("the other lanes reached barrier {} (flavor {})", idb, flavor)));
+        }
+        if p.count != b {
+            return Err(ctx.error(
+                ExecErrorKind::Protocol(crate::sync::SyncError::Named(named::Error::ContractMismatch { expected: p.count, observed: b })),
+                format!("lanes of one warp reached barrier {idb} with thread counts {} and {b}", p.count),
+            ));
+        }
+    }
+    let mut p = prev.unwrap_or(crate::interp::aux::NamedPartial {
+        id: idb,
+        flavor,
+        count: b,
+        lanes: WarpMask::NONE,
+        waiting: WarpMask::NONE,
+        gen: None,
+        red: Default::default(),
+    });
+    p.lanes = p.lanes.or(active);
+    p.waiting = p.waiting.or(active);
+    if let BarKind::Red { pred, .. } = kind {
+        let yes = super::control::cond_mask(ctx, pred, active);
+        if !p.red.started {
+            p.red.all = true;
+            p.red.started = true;
+        }
+        p.red.popc += yes.count() as u64;
+        p.red.all &= yes == active;
+        p.red.any |= !yes.is_empty();
+    }
+    if p.lanes.and(live) != live {
+        ctx.aux.named_partial.insert(ctx.warp.id, p);
+        return Ok(Flow::Blocked(res));
+    }
+    // Every non-exited lane is here: one warp arrival.
+    let contribution = named::Contribution { warp: ctx.warp.warp_in_cta, mask: live.bits(), live: live.bits(), count: b, aligned: false };
+    let cmd = SyncCmd::Named(match kind {
+        BarKind::Sync => named::Cmd::Sync(contribution),
+        BarKind::Arrive => named::Cmd::Arrive(contribution),
+        BarKind::Red { .. } => named::Cmd::Red(contribution),
+    });
+    let out = support::step(ctx, res, cmd)?;
+    let Step::Done(Outcome::Named(o)) = out else { return Err(internal(ctx, "named barrier", out)) };
+    let gen = match o {
+        named::Outcome::Arrived { gen, .. } | named::Outcome::Registered { gen } | named::Outcome::Ready { gen } => gen,
+        named::Outcome::Blocked => return Err(internal(ctx, "named barrier", o)),
+    };
+    if implicit {
+        ctx.aux.named_implicit.insert((ctx.cta.id, idb), gen);
+    } else {
+        ctx.aux.named_implicit.remove(&(ctx.cta.id, idb));
+    }
+    if flavor == 2 {
+        let a = ctx.aux.bar_red.entry((ctx.cta.id, idb, gen)).or_default();
+        if !a.started {
+            a.all = true;
+            a.started = true;
+        }
+        a.popc += p.red.popc;
+        a.all &= p.red.all;
+        a.any |= p.red.any;
+    }
+    let lanes = p.lanes.and(live);
+    p.gen = Some(gen);
+    ctx.aux.named_partial.insert(ctx.warp.id, p);
+    support::sync_event(ctx, lanes, SyncKind::Arrive { obj: res, phase: gen, release: Some(true), scope: None });
+    let extra = ProtoExtra {
+        counts: Counts { expected_threads: Some(b), contributed_threads: Some(named::WARP_SIZE), ..Default::default() },
+        ..Default::default()
+    };
+    support::protocol(ctx, live, vec![(res, cmd)], extra);
+    match o {
+        named::Outcome::Arrived { .. } => {
+            partial_done(ctx, active);
+            Ok(Flow::Next)
+        }
+        named::Outcome::Ready { gen } => {
+            bar_ready(ctx, kind, res, idb, gen, false)?;
+            partial_done(ctx, active);
+            Ok(Flow::Next)
+        }
+        _ => Ok(Flow::Blocked(res)),
     }
 }
 

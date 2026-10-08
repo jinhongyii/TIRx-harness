@@ -284,6 +284,25 @@ pub struct RedAcc {
     pub started: bool,
 }
 
+/// A warp's partial-mask arrival at a non-`.aligned` named barrier: the
+/// executing lanes wait for the rest of the warp (PTX §9.7.15.1, Q3); one
+/// warp arrival happens when the arrived lanes cover the non-exited ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedPartial {
+    pub id: u8,
+    /// 0 = arrive, 1 = sync, 2 = red.
+    pub flavor: u8,
+    pub count: u64,
+    /// Lanes that executed the barrier so far.
+    pub lanes: crate::value::WarpMask,
+    /// Arrived lanes not yet past the barrier.
+    pub waiting: crate::value::WarpMask,
+    /// Generation of the warp arrival, once made.
+    pub gen: Option<u64>,
+    /// `bar.red` predicate accumulation of the arrived lanes.
+    pub red: RedAcc,
+}
+
 /// One setmaxnreg warpgroup rendezvous.
 #[derive(Clone, Debug, Default)]
 pub struct SetmaxRendezvous {
@@ -379,6 +398,9 @@ pub struct LaunchAux {
     /// Protocol event, logged at completion, carries that contribution even
     /// if exits shrank the count-less barrier meanwhile).
     pub named_registered: HashMap<WarpId, u64>,
+    /// Non-`.aligned` named-barrier arrival of a divergent warp in progress
+    /// (lanes accumulate until every non-exited lane arrived; Q3 ruling).
+    pub named_partial: HashMap<WarpId, NamedPartial>,
     /// Shared-A read ops (`MmaSharedARead`) per issuing thread that a
     /// `tcgen05.commit.sync_restrict` tracks (W5-10).
     pub tcgen_shared_reads: HashMap<(WarpId, u8), Vec<AsyncId>>,

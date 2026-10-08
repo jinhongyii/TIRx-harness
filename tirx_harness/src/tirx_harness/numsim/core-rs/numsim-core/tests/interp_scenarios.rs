@@ -1254,3 +1254,23 @@ fn readonly_proxy_writes_are_rejected() {
         }
     }
 }
+
+/// Q3 ruling: a non-`.aligned` `barrier.sync` reached by divergent lanes of
+/// a warp waits for the rest of the warp (one warp arrival, any site); the
+/// missing lanes reaching another barrier id, or exiting, is `PartialWarp`.
+#[test]
+fn divergent_named_barrier_waits_for_the_warp() {
+    let o = run(&scenarios::divergent_named_barrier("same"));
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![7; 64]);
+    for v in ["other_id", "exit"] {
+        let o = run(&scenarios::divergent_named_barrier(v));
+        match &o.status {
+            RunStatus::Error(e) => assert!(
+                matches!(e.kind, ExecErrorKind::Protocol(numsim_core::sync::SyncError::Named(numsim_core::sync::named::Error::PartialWarp { .. }))),
+                "{v}: {e:?}"
+            ),
+            other => panic!("{v}: expected PartialWarp, got {other:?}"),
+        }
+    }
+}
