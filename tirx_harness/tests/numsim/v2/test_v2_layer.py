@@ -202,7 +202,9 @@ def test_phase_payload_from_core_findings(module):
     assert {f.kind for f in report.findings} == {"data_race", "uninitialized_read", "budget"}
     text = report.format()
     assert text.startswith("racecheck ERROR") and "data_race" in text
-    with pytest.raises(AssertionError):
+    from tirx_harness._report import CheckFailed
+
+    with pytest.raises(CheckFailed):
         report.require_clean()
     assert report.to_dict()["schema_version"] == 5
 
@@ -308,14 +310,48 @@ def test_aliased_host_buffers_share_one_allocation(module):
     np.testing.assert_array_equal(result.outputs["c"], storage[:1024] + storage[512:1536])
 
 
-def test_address_of_and_host_pointer_low_bits(module):
+def test_address_of_is_deterministic(module):
     """W8-7: ``Engine.address_of`` gives the engine address a binding will
-    get; the synthetic address keeps the host pointer's low 8 bits
-    (``arena::addr`` ruling)."""
+    get, before the run, and it does not depend on host pointers."""
 
     inputs = {"a": np.zeros(1024, np.float32), "b": np.zeros(1024, np.float32), "c": np.zeros(1024, np.float32)}
     engine = v2.Engine()
-    address = _skip_if_unimplemented(lambda: engine.address_of(module, inputs, "a"))
-    assert address % 256 == inputs["a"].ctypes.data % 256
+    first = _skip_if_unimplemented(lambda: engine.address_of(module, inputs, "a"))
+    again = engine.address_of(module, {k: v.copy() for k, v in inputs.items()}, "a")
+    assert first == again and first > 0
+    assert engine.address_of(module, inputs, "b") != first
     with pytest.raises(v2.InputError):
         engine.address_of(module, inputs, "nope")
+
+
+def test_engine_worker_defaults():
+    assert v2.Engine().max_workers == 8
+    assert v2.Engine(max_workers="auto").max_workers >= 1
+    with pytest.raises(ValueError):
+        v2.Engine(max_workers=0)
+
+
+def test_require_clean_raises_check_failed():
+    from tirx_harness._report import CheckFailed
+
+    payload = rep.phase_payload(
+        checker="racecheck", phase_index=0, phase_name="k", records=[],
+        status={"kind": "incomplete"},
+        diagnostics=[{"kind": "analysis_incomplete", "status": "incomplete", "reason": "budget"}],
+    )
+    with pytest.raises(CheckFailed):
+        rep.RaceReport([rep.AnalysisResult("racecheck", payload)]).require_clean()
+
+
+def test_public_checkers_report_missing_bindings_as_incomplete(module, monkeypatch):
+    from tirx_harness.numsim.v2 import api
+
+    monkeypatch.setattr(api, "transpile", lambda kernel: module)
+    for checker in (v2.racecheck, v2.synccheck):
+        report = checker(object(), {"a": np.zeros(1024, np.float32)})
+        assert report.verdict == "incomplete"
+        (finding,) = report.findings
+        assert finding.details["reason"] == "missing_input_bindings"
+        assert finding.details["bindings"] == ["b", "c"]
+    with pytest.raises(v2.InputError):
+        v2.Engine().run(module, {"a": np.zeros(1024, np.float32)})

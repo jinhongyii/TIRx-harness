@@ -70,6 +70,9 @@ runs skip with "numsim_core_py is not built". The hand-built Module fixture
 `ProgramBuilder`; refresh it after a `program.rs` change with
 `UPDATE_FIXTURES=1 cargo test -p numsim-py`.
 
+The `NUMSIM_V2_*` prefix is temporary: these variables become `NUMSIM_*`
+when the legacy engine is deleted (redesign step 5).
+
 v2 reads its environment in one place, `v2/options.py`:
 `NUMSIM_CACHE_DIR` (modules are cached under `<root>/v2-modules/`, keyed by
 TIRx source, format version and the lowering sources), `NUMSIM_V2_BACKEND`
@@ -114,6 +117,14 @@ treat that as a skip, never as a pass.
 - A tensor-map parameter with neither a host value nor an engine-encodable
   spec is bound to an all-zero image, which the descriptor decoder rejects:
   legacy kernels that never use it run, any use fails closed.
+- `Engine(max_workers=8)` (legacy default; `"auto"` = CPU count) sets the
+  scheduler's `RunConfig.workers`; results do not depend on it.
+- Public `racecheck()`/`synccheck()` return an `incomplete` report
+  (`missing_input_bindings` with the missing names, or
+  `native_frontend_unsupported`) instead of raising, as legacy did;
+  `Engine.run` and the `run_*_phase` methods still raise `InputError` /
+  `UnsupportedTIRxError`. `require_clean()` raises `CheckFailed`; a codegen
+  build failure raises `NumSimBuildError`.
 - Execution subsets: `ExecutionSubset(cluster_ids=...)` maps to
   `RunConfig::subset`; `cta_ids` subsets are not supported. Host
   `ExecutionAssumptions` are accepted and ignored (dropped in v2; no corpus

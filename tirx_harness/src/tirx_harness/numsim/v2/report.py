@@ -23,10 +23,11 @@ _VERDICT_RANK = {name: rank for rank, name in enumerate(VERDICTS)}
 # Engine kind name -> public (legacy-stable) kind name.
 _KIND_NAMES = {"uninit_read": "uninitialized_read"}
 # Kinds reported as advisories (review, never a proof of a defect) when a
-# payload is built from raw ``report::Finding``s (the checkers' own
-# ``serialize`` decides placement otherwise). The legacy ``alias_stale_read``
-# is not listed: Racecheck no longer emits it (W5 decides whether it returns).
-ADVISORY_KINDS = frozenset({"uninitialized_read", "undeclared_protocol_word", "cross_cta_async_order"})
+# payload is built from raw ``report::Finding``s; the checkers' own
+# ``serialize`` decides placement otherwise.
+ADVISORY_KINDS = frozenset(
+    {"uninitialized_read", "alias_stale_read", "undeclared_protocol_word", "cross_cta_async_order"}
+)
 
 
 def worst(verdicts: Iterable[str]) -> str:
@@ -456,8 +457,12 @@ class _Report:
         print(self.format())
 
     def require_clean(self) -> None:
+        """Raise ``CheckFailed`` (the legacy ``RuntimeError`` subclass) unless clean."""
+
         if self.verdict != "clean":
-            raise AssertionError(self.format())
+            from tirx_harness._report import CheckFailed
+
+            raise CheckFailed(self.format())
 
 
 class RaceReport(_Report):

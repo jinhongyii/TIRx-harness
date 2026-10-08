@@ -22,7 +22,7 @@ from .report import (
     compare,
     payload_json_schema,
 )
-from .run import Engine, ExecutionError, InputError, canonicalize_inputs
+from .run import Engine, ExecutionError, InputError, MissingBindingsError, canonicalize_inputs
 
 
 def _nonnegative(owner: Any) -> None:
@@ -70,14 +70,54 @@ def run_case(case: Any, *, engine: Engine | None = None) -> NumSimReport:
     return compare(result, expected, tolerances=case.comparisons)
 
 
+def _incomplete_phase(kind: str, name: str, reason: str, message: str, **details: Any) -> AnalysisResult:
+    """A typed fail-closed result for an invocation that cannot run (legacy
+    returned these instead of raising)."""
+
+    from .report import SCHEMA_VERSION as _schema
+
+    record = {"kind": "analysis_incomplete", "status": "incomplete", "reason": reason, "message": message, **details}
+    payload = {
+        "schema_version": _schema,
+        "checker": kind,
+        "engine": "numsim-core",
+        "phase": {"index": 0, "name": name, "kernel_index": 0},
+        "analysis_scope": {"kind": "full_launch"},
+        "verdict": "incomplete",
+        "findings": [],
+        "advisories": [],
+        "incomplete": [record],
+        "execution_error": None,
+        "stats": {"available": False},
+        "coverage": {"status": "not_started", "eligible_for_clean": False, "termination": {"kind": reason}},
+    }
+    return AnalysisResult(kind, payload)
+
+
 def _phases(kind: str, kernel: Any, inputs: dict | None, **kwargs: Any) -> list[AnalysisResult]:
-    module = transpile(kernel)
+    from tirx_harness.numsim.errors import UnsupportedTIRxError
+
+    try:
+        name = str(kernel.attrs["global_symbol"])
+    except Exception:  # noqa: BLE001 - name is only a label
+        name = "kernel"
+    try:
+        module = transpile(kernel)
+    except UnsupportedTIRxError as error:
+        return [_incomplete_phase(kind, name, "native_frontend_unsupported", str(error),
+                                  unsupported=list(getattr(error, "unsupported", ()) or ()))]
     engine = Engine()
     run_phase = getattr(engine, f"run_{kind}_phase")
-    return [
-        run_phase(module, dict(inputs or {}), phase_index=index, advance_prefix=True, **kwargs)
-        for index in range(len(module.spec.kernels))
-    ]
+    try:
+        return [
+            run_phase(module, dict(inputs or {}), phase_index=index, advance_prefix=True, **kwargs)
+            for index in range(len(module.spec.kernels))
+        ]
+    except MissingBindingsError as error:
+        return [_incomplete_phase(
+            kind, module.spec.kernels[0].name, "missing_input_bindings",
+            "native analysis requires complete concrete bindings before execution", bindings=error.missing,
+        )]
 
 
 def racecheck(kernel: Any, inputs: dict | None = None) -> RaceReport:
@@ -109,6 +149,7 @@ __all__ = [
     "ExecutionError",
     "Finding",
     "InputError",
+    "MissingBindingsError",
     "ModuleContractError",
     "NumSimReport",
     "NumSimResult",

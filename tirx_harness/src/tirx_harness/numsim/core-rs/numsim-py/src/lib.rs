@@ -91,7 +91,7 @@ pub struct RunRequest {
     pub synccheck_limits: BTreeMap<String, u64>,
     /// Racecheck: stop recording after this many findings (0 = unlimited).
     pub max_findings: usize,
-    /// Accepted for API stability; the scheduler is single-threaded today.
+    /// Scheduler worker threads (also copied into `RunConfig::workers`).
     pub workers: u32,
     /// Codegen optimization level (0..=3).
     pub opt_level: u32,
@@ -717,6 +717,7 @@ mod py {
         let mut request = RunRequest::new(mode);
         request.backend = backend;
         request.workers = workers;
+        request.config.workers = workers.max(1) as usize;
         request.opt_level = opt_level;
         request.state_budget = state_budget;
         request.transition_budget = transition_budget;

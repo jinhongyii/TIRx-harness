@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import struct
 from collections.abc import Iterable, Mapping
@@ -38,6 +39,14 @@ from tirx_harness.numsim.errors import NumSimExecutionError
 
 class InputError(NumSimExecutionError, ValueError):
     """Inputs do not match the module's host ABI."""
+
+
+class MissingBindingsError(InputError):
+    """Required host bindings are absent (``missing`` lists them)."""
+
+    def __init__(self, missing: list[str]):
+        super().__init__(f"NumSim inputs are missing required bindings: {missing}")
+        self.missing = list(missing)
 
 
 class ExecutionError(NumSimExecutionError):
@@ -304,7 +313,7 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
         if name not in bound and not slot.get("tensor_map") and slot.get("implicit_base") is None
     )
     if missing:
-        raise InputError(f"NumSim inputs are missing required bindings: {missing}")
+        raise MissingBindingsError(missing)
     return bound
 
 
@@ -508,12 +517,17 @@ def _input_digest(bound: Mapping[str, BoundInput]) -> str:
 
 
 class Engine:
-    """Run v2 modules. Single-threaded scheduler; ``max_workers`` is accepted
-    for signature compatibility and forwarded."""
+    """Run v2 modules.
+
+    ``max_workers`` (default 8, ``"auto"`` = detected CPU count) is the
+    scheduler's worker-thread count (``RunConfig.workers``; results do not
+    depend on it). ``native_loop_iteration_budget`` / ``native_loop_reschedule_quantum``
+    map to the loop budget and slice quantum, ``backend`` selects
+    ``"interp"`` or ``"codegen"`` (default ``NUMSIM_V2_BACKEND``)."""
 
     def __init__(
         self,
-        max_workers: int | str = 1,
+        max_workers: int | str = 8,
         *,
         native_loop_iteration_budget: int | None = None,
         native_loop_reschedule_quantum: int | None = None,
@@ -522,7 +536,9 @@ class Engine:
         opt_level: int = 1,
     ):
         opts = options()
-        self.max_workers = 1 if max_workers == "auto" else int(max_workers)
+        self.max_workers = (os.cpu_count() or 1) if max_workers == "auto" else int(max_workers)
+        if self.max_workers < 1:
+            raise ValueError("max_workers must be a positive integer or 'auto'")
         self.loop_budget = native_loop_iteration_budget
         self.quantum = native_loop_reschedule_quantum
         self.seed = opts.seed if seed is None else int(seed)
@@ -537,6 +553,16 @@ class Engine:
                     **extra: Any) -> dict[str, Any]:
         if "synccheck_limits" in extra:
             extra = {**extra, "synccheck_limits": dict(extra["synccheck_limits"])}
+        try:
+            return self._native_call(module, bound, mode, extra)
+        except ValueError as error:
+            if str(error).startswith("codegen backend:"):
+                from tirx_harness.numsim.errors import NumSimBuildError
+
+                raise NumSimBuildError(str(error)) from error
+            raise
+
+    def _native_call(self, module: CompiledModule, bound, mode: str, extra: Mapping[str, Any]) -> dict[str, Any]:
         return native().run(
             module.handle,
             {name: b.native for name, b in bound.items()},
@@ -761,7 +787,7 @@ class Engine:
         max_transitions: int | None = None,
         advance_prefix: bool = False,
     ) -> AnalysisResult:
-        del coverage_bounds, max_polls, advance_prefix
+        del max_polls, advance_prefix
         extra = self._subset_extra(subset, assumptions)
         if resource_limits is not None:
             extra["state_budget"] = int(resource_limits.max_backtrack_nodes)
@@ -773,7 +799,21 @@ class Engine:
             ))
         if max_transitions is not None:
             extra["max_rounds"] = int(max_transitions)
-        return self._checker_phase("synccheck", module, inputs, phase_index, extra)
+        result = self._checker_phase("synccheck", module, inputs, phase_index, extra)
+        coverage = result.payload.setdefault("coverage", {})
+        if not isinstance(coverage, dict):
+            coverage = result.payload["coverage"] = {}
+        # The v2 explorer is not preemption-bounded: it explores every
+        # interleaving of the projected protocol (sleep sets), so any
+        # requested bound is satisfied. The requested bounds are echoed, not
+        # dropped (numsim-behaviour-deltas, "Synccheck bounds and limits").
+        if coverage_bounds is not None:
+            coverage["requested_bounds"] = {
+                "max_warp_preemptions": int(coverage_bounds.max_warp_preemptions),
+                "max_completion_schedule_deviations": int(coverage_bounds.max_completion_schedule_deviations),
+            }
+        coverage["bounded_exploration"] = False
+        return result
 
 
 def _timing(module: CompiledModule, bind_ms: float, raw: Mapping[str, Any], report_started: float) -> dict[str, float]:
@@ -829,4 +869,4 @@ def _span_resolver(module: CompiledModule, kernel_index: int | None):
     return span_of
 
 
-__all__ = ["BoundInput", "Engine", "ExecutionError", "InputError", "canonicalize_inputs"]
+__all__ = ["BoundInput", "Engine", "ExecutionError", "InputError", "MissingBindingsError", "canonicalize_inputs"]
