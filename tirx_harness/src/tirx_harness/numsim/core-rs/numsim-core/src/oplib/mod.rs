@@ -22,6 +22,7 @@
 mod ptx;
 mod registry;
 mod simd;
+pub mod supported_ops;
 mod tc;
 mod tir;
 mod tma;

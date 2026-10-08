@@ -531,16 +531,23 @@ impl<'m> RunImages<'m> {
 pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
     active_or_next!(ctx);
     full_warp(ctx, "tcgen05.ld")?;
-    if args.spcompress {
-        // `.spcompress` needs its max/abs qualifiers (not in the contract form).
-        return Err(support::unsupported(ctx, "tcgen05.ld .spcompress"));
-    }
+    // `.spcompress`: the selection op and `.abs` ride in `red` / `red_abs`
+    // (W4-17: a form without `.red` carries `red = (op, [])`).
+    let compress = if args.spcompress {
+        match &args.red {
+            Some((op, _)) => Some((*op == crate::program::ReduxOp::Max, args.red_abs)),
+            None => return Err(support::unsupported(ctx, "tcgen05.ld .spcompress without its max/min op")),
+        }
+    } else {
+        None
+    };
     let active = ctx.warp.active;
     let taddr = effective_taddr(ctx, args.taddr, args.row, args.col, active)?;
     let map = oplib::tcgen_ldst_map(args.shape, args.num, args.pack, ctx.warp.warp_in_cta, taddr)
         .map_err(|e| support::op_err(ctx, e))?;
     let nregs = map.registers;
     let red = match &args.red {
+        Some((_, regs)) if regs.is_empty() => None,
         Some((op, regs)) => {
             let ty = regs.first().map(|&r| support::reg_ty(ctx, r).elem).unwrap_or(crate::dtype::Dtype::U32);
             Some((oplib::TcgenLdRed::new(*op, ty, args.red_abs, args.red_nan).map_err(|e| support::op_err(ctx, e))?, regs.clone()))
@@ -574,12 +581,24 @@ pub fn tcgen_ld(ctx: &mut ExecCtx<'_>, args: &TcgenLdArgs) -> HResult {
                 }
             }
         }
+        let compressed: Vec<u8>;
+        let out: &[u8] = match compress {
+            Some((max, abs)) => {
+                let words: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+                // Unreadable (invalid) words already failed or reported at the read.
+                let valid = vec![true; words.len()];
+                let (kept, _) = oplib::tcgen_ld_spcompress(&words, &valid, max, abs).map_err(|e| support::op_err(ctx, e))?;
+                compressed = kept.iter().flat_map(|w| w.to_le_bytes()).collect();
+                &compressed
+            }
+            None => &bytes,
+        };
         let mut pos = 0usize;
         for &d in &args.dsts {
             let n = support::reg_ty(ctx, d).mem_bytes() as usize;
-            let end = (pos + n).min(bytes.len());
+            let end = (pos + n).min(out.len());
             if pos < end {
-                write_lane_bytes(ctx, d, t, &bytes[pos..end]);
+                write_lane_bytes(ctx, d, t, &out[pos..end]);
             }
             pos += n;
         }

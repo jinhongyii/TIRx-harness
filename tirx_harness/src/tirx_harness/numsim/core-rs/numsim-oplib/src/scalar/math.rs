@@ -79,3 +79,81 @@ pub fn half_unary(bits: u16, bf16: bool, f: impl Fn(f32) -> f32) -> u16 {
         f32_to_fp16_bits(f(fp16_bits_to_f32(bits)))
     }
 }
+
+// ---------------------------------------------------------------------------
+// v2-only math builtins (`tirx.erf`, `tirx.exp10`, `tirx.log10`,
+// `tirx.nearbyint`). Legacy had no lowering for them. Values come from the
+// pure-Rust `libm` crate (machine independent; < 1 ulp), and NaNs are
+// pinned: a NaN input is returned quieted, and an invalid operation
+// (`log10` of a negative number) gives the x86 default NaN.
+// `nearbyint` rounds to the nearest integer, ties to even (the default
+// rounding mode), and is exact.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn quiet32(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() | 0x0040_0000)
+}
+
+#[inline]
+fn quiet64(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() | 0x0008_0000_0000_0000)
+}
+
+/// `tirx.erf` on binary32.
+pub fn erf_f32(x: f32) -> f32 {
+    if x.is_nan() { quiet32(x) } else { libm::erff(x) }
+}
+
+/// `tirx.erf` on binary64.
+pub fn erf_f64(x: f64) -> f64 {
+    if x.is_nan() { quiet64(x) } else { libm::erf(x) }
+}
+
+/// `tirx.exp10` on binary32: computed in binary64 (`libm::exp10`) and
+/// rounded once (`libm::exp10f` is off by more than one ulp near -4).
+pub fn exp10_f32(x: f32) -> f32 {
+    if x.is_nan() { quiet32(x) } else { libm::exp10(f64::from(x)) as f32 }
+}
+
+/// `tirx.exp10` on binary64.
+pub fn exp10_f64(x: f64) -> f64 {
+    if x.is_nan() { quiet64(x) } else { libm::exp10(x) }
+}
+
+/// `tirx.log10` on binary32: `log10(-0) = log10(+0) = -inf`, negative ->
+/// default NaN.
+pub fn log10_f32(x: f32) -> f32 {
+    if x.is_nan() {
+        quiet32(x)
+    } else if x == 0.0 {
+        f32::NEG_INFINITY
+    } else if x < 0.0 {
+        f32::from_bits(F32_DEFAULT_NAN)
+    } else {
+        libm::log10f(x)
+    }
+}
+
+/// `tirx.log10` on binary64.
+pub fn log10_f64(x: f64) -> f64 {
+    if x.is_nan() {
+        quiet64(x)
+    } else if x == 0.0 {
+        f64::NEG_INFINITY
+    } else if x < 0.0 {
+        f64::from_bits(F64_DEFAULT_NAN)
+    } else {
+        libm::log10(x)
+    }
+}
+
+/// `tirx.nearbyint` on binary32 (ties to even; signed zeros kept).
+pub fn nearbyint_f32(x: f32) -> f32 {
+    if x.is_nan() { quiet32(x) } else { x.round_ties_even() }
+}
+
+/// `tirx.nearbyint` on binary64.
+pub fn nearbyint_f64(x: f64) -> f64 {
+    if x.is_nan() { quiet64(x) } else { x.round_ties_even() }
+}

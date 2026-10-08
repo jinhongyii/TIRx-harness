@@ -269,9 +269,18 @@ pub fn tcgen_ld_reduce(red: TcgenLdRed, values: &[u32]) -> OpResult<u32> {
     Ok(red.0.reduce(values.iter().copied()).unwrap_or(0))
 }
 
-/// One lane of `tcgen05.ld.spcompress` (`num` loaded words and their
-/// byte-complete validity): `num.div_ceil(32)` metadata words followed by
-/// `num / 2` kept values, with per-output validity.
+/// One lane of `tcgen05.ld.spcompress ... .sp::2:4 .f32.b2` (PTX ISA 9.4
+/// 9.7.18.8.3; `num` loaded words and their byte-complete validity).
+///
+/// Definition: each group of 4 consecutive f32 words keeps 2, chosen by
+/// `max` / `min` of the value (of `|value|` with `abs`). NaNs are chosen
+/// first; ties keep the lower index (legacy `sparse_pair_indices`). The
+/// output is `num.div_ceil(32)` metadata words, then the `num / 2` kept
+/// values in ascending index order within each group. Metadata packs one
+/// 2-bit in-group index per kept value, 16 per word (kept value `e` in bits
+/// `2 * (e % 16)` of word `e / 16`). Validity is per output. The
+/// `spcompress_tests` check this against an independent model, including
+/// that decompressing by the metadata reproduces the kept values.
 pub fn tcgen_ld_spcompress(
     values: &[u32],
     valid: &[bool],
@@ -482,6 +491,75 @@ mod run_tests {
             assert_eq!(from_runs.len(), n, "{shape:?}: a cell in two runs");
             assert_eq!(from_runs, from_pieces, "{shape:?}");
             assert!(map.cell_runs().len() <= 32, "{shape:?}: one run per lane expected");
+        }
+    }
+}
+
+#[cfg(test)]
+mod spcompress_tests {
+    use super::*;
+
+    /// Independent model of PTX `tcgen05.ld.spcompress ... .sp::2:4 .f32.b2`
+    /// (9.7.18.x): every group of 4 loaded f32 values keeps 2, chosen by
+    /// `.max`/`.min` of the value (or of `|value|` with `.abs`), NaNs first;
+    /// the kept values are written in ascending index order; the metadata
+    /// packs one 2-bit index per kept value, 16 per 32-bit word. Decompressing
+    /// (scattering kept values back by index) must reproduce them.
+    fn reference(values: &[f32], max: bool, abs: bool) -> (Vec<u32>, Vec<u32>) {
+        let mut meta = vec![0u32; values.len().div_ceil(32)];
+        let mut kept = Vec::new();
+        for group in 0..values.len() / 4 {
+            let v = &values[group * 4..group * 4 + 4];
+            let key = |i: usize| if abs { v[i].abs() } else { v[i] };
+            let mut order: Vec<usize> = (0..4).collect();
+            order.sort_by(|&a, &b| {
+                let (ka, kb) = (key(a), key(b));
+                (!ka.is_nan()).cmp(&!kb.is_nan()).then_with(|| {
+                    let ord = ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal);
+                    if max { ord.reverse() } else { ord }
+                })
+            });
+            let mut pick = [order[0], order[1]];
+            pick.sort_unstable();
+            for (j, &index) in pick.iter().enumerate() {
+                let element = group * 2 + j;
+                meta[element / 16] |= (index as u32) << ((element % 16) * 2);
+                kept.push(v[index].to_bits());
+            }
+        }
+        (meta, kept)
+    }
+
+    #[test]
+    fn spcompress_matches_an_independent_selection_and_decompresses() {
+        let mut seed = 0x1234_5678_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for num in [4usize, 8, 32, 128] {
+            for (max, abs) in [(true, false), (false, false), (true, true), (false, true)] {
+                for _ in 0..20 {
+                    // Distinct finite values (no ties) plus at most two NaNs per group.
+                    let values: Vec<f32> = (0..num)
+                        .map(|i| if next() % 11 == 0 && i % 4 < 2 { f32::NAN } else { (next() % 20_000) as f32 / 7.0 - 1400.0 + i as f32 * 1e-3 })
+                        .collect();
+                    let words: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+                    let (out, valid) = tcgen_ld_spcompress(&words, &vec![true; num], max, abs).unwrap();
+                    assert!(valid.iter().all(|&v| v));
+                    let (meta, kept) = reference(&values, max, abs);
+                    assert_eq!(out.len(), meta.len() + kept.len(), "num {num}");
+                    assert_eq!(&out[..meta.len()], &meta[..], "metadata num {num} max {max} abs {abs}");
+                    assert_eq!(&out[meta.len()..], &kept[..], "values num {num} max {max} abs {abs}");
+                    // Decompress: each kept value sits at its group's index.
+                    for (element, &bits) in kept.iter().enumerate() {
+                        let index = (meta[element / 16] >> ((element % 16) * 2)) & 3;
+                        assert_eq!(words[(element / 2) * 4 + index as usize], bits);
+                    }
+                }
+            }
         }
     }
 }

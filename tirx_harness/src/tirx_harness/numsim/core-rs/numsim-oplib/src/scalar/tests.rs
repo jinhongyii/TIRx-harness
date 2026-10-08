@@ -1098,3 +1098,33 @@ fn sigmoid_special_values_and_accuracy() {
     // bf16 1.0 = 0x3f80; log1p(1) = 0.693147 -> bf16 0x3f31 (RNE).
     assert_eq!(half_unary(0x3f80, true, log1p_f32), 0x3f31);
 }
+
+/// v2-only math builtins: within 1 ulp of a binary64 reference rounded once,
+/// pinned NaNs and edge values; `nearbyint` exact (ties to even).
+#[test]
+fn erf_exp10_log10_nearbyint_definitions() {
+    let f = f32::from_bits;
+    for g in [erf_f32 as fn(f32) -> f32, exp10_f32, log10_f32, nearbyint_f32] {
+        assert_eq!(g(f(0x7fc0_1234)).to_bits(), 0x7fc0_1234);
+        assert_eq!(g(f(0xffa0_0001)).to_bits(), 0xffe0_0001);
+    }
+    assert_eq!(log10_f32(-1.0).to_bits(), 0xffc0_0000);
+    assert_eq!(log10_f32(-0.0), f32::NEG_INFINITY);
+    assert_eq!(log10_f32(1000.0), 3.0);
+    assert_eq!(exp10_f32(2.0), 100.0);
+    assert_eq!(erf_f32(0.0).to_bits(), 0);
+    assert_eq!(erf_f32(-0.0).to_bits(), 0x8000_0000);
+    assert_eq!(erf_f32(f32::INFINITY), 1.0);
+    for (x, want) in [(0.5_f32, 0.0_f32), (1.5, 2.0), (2.5, 2.0), (-0.5, -0.0), (-1.5, -2.0), (1e30, 1e30)] {
+        assert_eq!(nearbyint_f32(x).to_bits(), want.to_bits(), "nearbyint({x})");
+    }
+    for i in 0..400 {
+        let x = -4.0 + i as f32 * 0.02;
+        assert!(ulp_distance(erf_f32(x), libm::erf(f64::from(x)) as f32) <= 1, "erf({x}) vs the binary64 erf");
+        assert!(ulp_distance(exp10_f32(x), 10f64.powf(f64::from(x)) as f32) <= 1, "exp10({x})");
+        let y = 1e-30 * 1.37_f32.powi(i % 200);
+        assert!(ulp_distance(log10_f32(y), (f64::from(y)).log10() as f32) <= 1, "log10({y})");
+    }
+    assert_eq!(log10_f64(-2.0).to_bits(), 0xfff8_0000_0000_0000);
+    assert_eq!(nearbyint_f64(2.5), 2.0);
+}

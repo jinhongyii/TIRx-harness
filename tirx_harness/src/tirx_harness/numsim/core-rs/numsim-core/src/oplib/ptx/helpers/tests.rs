@@ -487,3 +487,13 @@ fn log1p_and_sigmoid_resolve_for_float_carriers() {
     let err = run("tirx.log1p", &[], &[Ty::U32], &[(Ty::U32, 1)]).unwrap_err();
     assert_eq!(err.kind, OpErrorKind::Unsupported);
 }
+
+#[test]
+fn v2_math_builtins_resolve_for_float_carriers() {
+    let one = |name: &str, ty: Ty, bits: u128| run(name, &[], &[ty], &[(ty, bits)]).unwrap()[0];
+    assert_eq!(one("tirx.log10", Ty::F32, u128::from(1000.0_f32.to_bits())), u64::from(3.0_f32.to_bits()));
+    assert_eq!(one("tirx.exp10", Ty::F64, u128::from(2.0_f64.to_bits())), 100.0_f64.to_bits());
+    assert_eq!(one("tirx.nearbyint", Ty::F32, u128::from(2.5_f32.to_bits())), u64::from(2.0_f32.to_bits()));
+    assert_eq!(one("tirx.erf", Ty::scalar(Dtype::F16), 0), 0);
+    assert_eq!(one("tirx.log10", Ty::scalar(Dtype::BF16), 0xbf80), 0xffc0); // log10(-1): default NaN in bf16
+}

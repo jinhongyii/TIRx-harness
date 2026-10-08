@@ -55,6 +55,10 @@ pub(in crate::oplib) const NAMES: &[&str] = &[
     "tirx.reinterpret",
     "tirx.log1p",
     "tirx.sigmoid",
+    "tirx.erf",
+    "tirx.exp10",
+    "tirx.log10",
+    "tirx.nearbyint",
 ];
 
 /// Run `body(lane)` for every executing lane.
@@ -612,6 +616,37 @@ pub(in crate::oplib) fn resolve(
                 Some((Dtype::F64, 1)) => direct(fma_f64, &[64], &[64, 64, 64]),
                 _ => Err(OpError::unsupported(format!("tirx.fma: unmodeled carrier {:?}", ops.dst_tys))),
             }
+        }
+        "tirx.erf" | "tirx.exp10" | "tirx.log10" | "tirx.nearbyint" => {
+            // v2-only math (`numsim_oplib::scalar::math`): f32/f64, and
+            // f16/bf16 through f32 with RNE back.
+            no_mods(mods, name)?;
+            ops.arity(1, 1, name)?;
+            let (d, s) = (ops.dst_tys[0], ops.src_tys[0]);
+            if d != s || d.lanes != 1 {
+                return Err(OpError::unsupported(format!("{name}: expected one scalar float -> same type, got {s:?} -> {d:?}")));
+            }
+            macro_rules! pick {
+                ($f32:path, $f64:path) => {
+                    {
+                        let f: crate::oplib::ptx::DirectFn = match d.elem {
+                            Dtype::F32 => |io| unary32(io, $f32),
+                            Dtype::F64 => |io| unary64(io, $f64),
+                            Dtype::F16 => |io| unary16(io, false, $f32),
+                            Dtype::BF16 => |io| unary16(io, true, $f32),
+                            _ => return Err(OpError::unsupported(format!("{name}: unsupported type {d:?}"))),
+                        };
+                        f
+                    }
+                };
+            }
+            let f = match name {
+                "tirx.erf" => pick!(scalar::erf_f32, scalar::erf_f64),
+                "tirx.exp10" => pick!(scalar::exp10_f32, scalar::exp10_f64),
+                "tirx.log10" => pick!(scalar::log10_f32, scalar::log10_f64),
+                _ => pick!(scalar::nearbyint_f32, scalar::nearbyint_f64),
+            };
+            Ok(Some(Direct(f)))
         }
         "tirx.log1p" | "tirx.sigmoid" => {
             // `numsim_oplib::scalar::{log1p,sigmoid}_*` (host rule, pinned
