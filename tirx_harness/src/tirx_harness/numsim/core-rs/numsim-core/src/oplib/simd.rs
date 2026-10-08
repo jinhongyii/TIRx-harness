@@ -1,8 +1,9 @@
 //! Lane-parallel kernels with runtime CPU dispatch. Each kernel is
 //! bit-identical to its scalar definition: IEEE FMA is exactly rounded, so
 //! hardware `vfmadd` and libm `fma` agree on every non-NaN result; which NaN
-//! payload propagates differs, so NaN lanes are recomputed by the scalar
-//! path. Tests compare both, NaNs included.
+//! payload propagates differs (LLVM may commute `vfmadd` operands in
+//! optimized builds), so NaN lanes take the pinned NaN of
+//! `numsim_oplib::scalar::host_fma_f32/f64`. Tests compare both, NaNs included.
 
 use crate::value::WARP_SIZE;
 
@@ -21,7 +22,7 @@ pub(crate) fn fma_f32(a: &[f32; WARP_SIZE], b: &[f32; WARP_SIZE], c: &[f32; WARP
 
 #[inline(always)]
 fn fma_f32_scalar(a: &[f32; WARP_SIZE], b: &[f32; WARP_SIZE], c: &[f32; WARP_SIZE]) -> [f32; WARP_SIZE] {
-    std::array::from_fn(|l| a[l].mul_add(b[l], c[l]))
+    std::array::from_fn(|l| numsim_oplib::scalar::host_fma_f32(a[l], b[l], c[l]))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -42,7 +43,8 @@ unsafe fn fma_f32_fma(a: &[f32; WARP_SIZE], b: &[f32; WARP_SIZE], c: &[f32; WARP
     }
     for l in 0..WARP_SIZE {
         if r[l].is_nan() {
-            r[l] = a[l].mul_add(b[l], c[l]);
+            // The hardware payload depends on the operand order LLVM picks.
+            r[l] = numsim_oplib::scalar::fma_nan_f32(a[l], b[l], c[l]);
         }
     }
     r
@@ -63,7 +65,7 @@ pub(crate) fn fma_f64(a: &[f64; WARP_SIZE], b: &[f64; WARP_SIZE], c: &[f64; WARP
 
 #[inline(always)]
 fn fma_f64_scalar(a: &[f64; WARP_SIZE], b: &[f64; WARP_SIZE], c: &[f64; WARP_SIZE]) -> [f64; WARP_SIZE] {
-    std::array::from_fn(|l| a[l].mul_add(b[l], c[l]))
+    std::array::from_fn(|l| numsim_oplib::scalar::host_fma_f64(a[l], b[l], c[l]))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -84,7 +86,7 @@ unsafe fn fma_f64_fma(a: &[f64; WARP_SIZE], b: &[f64; WARP_SIZE], c: &[f64; WARP
     }
     for l in 0..WARP_SIZE {
         if r[l].is_nan() {
-            r[l] = a[l].mul_add(b[l], c[l]);
+            r[l] = numsim_oplib::scalar::fma_nan_f64(a[l], b[l], c[l]);
         }
     }
     r

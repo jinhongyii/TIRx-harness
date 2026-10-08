@@ -996,3 +996,47 @@ use std::cmp::Ordering;
     }
 
 
+
+/// The pinned host-FMA NaN (legacy glibc `fmaf` on x86 FMA hardware): first
+/// NaN among (rhs, lhs, addend), quieted; else the x86 default NaN.
+#[test]
+fn host_fma_nan_is_pinned() {
+    let f = f32::from_bits;
+    let (qa, sb) = (f(0x7fc0_1234), f(0xffa0_0001));
+    assert_eq!(host_fma_f32(qa, sb, 1.0).to_bits(), 0xffe0_0001);
+    assert_eq!(host_fma_f32(sb, qa, 1.0).to_bits(), 0x7fc0_1234);
+    assert_eq!(host_fma_f32(1.0, 2.0, sb).to_bits(), 0xffe0_0001);
+    assert_eq!(host_fma_f32(f32::INFINITY, 0.0, 1.0).to_bits(), 0xffc0_0000);
+    assert_eq!(host_fma_f32(f32::INFINITY, 1.0, f32::NEG_INFINITY).to_bits(), 0xffc0_0000);
+    assert_eq!(host_fma_f32(1.5, 2.0, 0.25), 3.25);
+    let d = f64::from_bits;
+    assert_eq!(host_fma_f64(d(0x7ff8_0000_0000_1234), d(0xfff4_0000_0000_0001), 1.0).to_bits(), 0xfffc_0000_0000_0001);
+    assert_eq!(host_fma_f64(0.0, f64::INFINITY, 1.0).to_bits(), 0xfff8_0000_0000_0000);
+}
+
+/// On x86-64 Linux the pinned rule is what the C library's `fmaf`/`fma`
+/// return (legacy called them through `mul_add`).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn host_fma_nan_matches_the_c_library() {
+    extern "C" {
+        fn fmaf(a: f32, b: f32, c: f32) -> f32;
+        fn fma(a: f64, b: f64, c: f64) -> f64;
+    }
+    if !std::arch::is_x86_feature_detected!("fma") {
+        return; // glibc's software path propagates NaNs differently
+    }
+    let vals: [u32; 10] = [0x7fc0_1234, 0xffa0_0001, 0x7f80_0001, 0xffc0_0000, 0x3f80_0000, 0x7f80_0000, 0xff80_0000, 0, 0x8000_0000, 0x4000_0000];
+    for &x in &vals {
+        for &y in &vals {
+            for &z in &vals {
+                let (a, b, c) = (f32::from_bits(x), f32::from_bits(y), f32::from_bits(z));
+                let libc = unsafe { fmaf(std::hint::black_box(a), std::hint::black_box(b), std::hint::black_box(c)) };
+                assert_eq!(host_fma_f32(a, b, c).to_bits(), libc.to_bits(), "{x:#x} {y:#x} {z:#x}");
+                let (a, b, c) = (f64::from(a), f64::from(b), f64::from(c));
+                let libc = unsafe { fma(std::hint::black_box(a), std::hint::black_box(b), std::hint::black_box(c)) };
+                assert_eq!(host_fma_f64(a, b, c).to_bits(), libc.to_bits(), "f64 {x:#x} {y:#x} {z:#x}");
+            }
+        }
+    }
+}

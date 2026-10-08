@@ -69,7 +69,7 @@ fn combine_int_frac_ex2(io: &mut PtxIo<'_>) -> OpResult {
 /// `__fmaf_rn`: one rounding.
 fn flashkda_fmaf_rn(io: &mut PtxIo<'_>) -> OpResult {
     each_lane!(io, |lane| io.dsts[0][lane] =
-        bits32(f32_at(io, 0, lane).mul_add(f32_at(io, 1, lane), f32_at(io, 2, lane))));
+        bits32(scalar::host_fma_f32(f32_at(io, 0, lane), f32_at(io, 1, lane), f32_at(io, 2, lane))));
     Ok(())
 }
 
@@ -103,8 +103,8 @@ fn fma_scale_sub_f32x2(io: &mut PtxIo<'_>) -> OpResult {
     each_lane!(io, |lane| {
         let (s, k, l) = (io.srcs[0][lane], io.srcs[1][lane], io.srcs[2][lane]);
         io.dsts[0][lane] = cvt::make_float2(
-            cvt::float2_x(s).mul_add(cvt::float2_x(k), -cvt::float2_x(l)),
-            cvt::float2_y(s).mul_add(cvt::float2_y(k), -cvt::float2_y(l)),
+            scalar::host_fma_f32(cvt::float2_x(s), cvt::float2_x(k), -cvt::float2_x(l)),
+            scalar::host_fma_f32(cvt::float2_y(s), cvt::float2_y(k), -cvt::float2_y(l)),
         );
     });
     Ok(())

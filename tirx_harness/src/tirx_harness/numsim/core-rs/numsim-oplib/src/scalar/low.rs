@@ -206,7 +206,7 @@ pub fn low_fma_rn(
     let lhs = decode_low(lhs, format);
     let rhs = decode_low(rhs, format);
     let addend = decode_low(addend, format);
-    let host = lhs.mul_add(rhs, addend);
+    let host = host_fma_f32(lhs, rhs, addend);
     if !lhs.is_finite() || !rhs.is_finite() || !addend.is_finite() {
         return format.encode_host_result(host);
     }

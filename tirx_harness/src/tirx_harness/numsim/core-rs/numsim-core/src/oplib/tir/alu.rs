@@ -183,10 +183,10 @@ fn unsupported_bin(op: BinOp, d: Dtype) -> OpError {
 #[inline]
 fn f32_binary(op: BinOp, a: f32, b: f32) -> Option<f32> {
     Some(match op {
-        BinOp::Add => a + b,
-        BinOp::Sub => a - b,
-        BinOp::Mul => a * b,
-        BinOp::Div => a / b,
+        BinOp::Add => sc::pin_nan2_f32(a, b, a + b),
+        BinOp::Sub => sc::pin_nan2_f32(a, b, a - b),
+        BinOp::Mul => sc::pin_nan2_f32(a, b, a * b),
+        BinOp::Div => sc::pin_nan2_f32(a, b, a / b),
         BinOp::Min => sc::cuda_f32_min(a, b),
         BinOp::Max => sc::cuda_f32_max(a, b),
         BinOp::Pow => a.powf(b),
@@ -199,10 +199,10 @@ fn f32_binary(op: BinOp, a: f32, b: f32) -> Option<f32> {
 #[inline]
 fn f64_binary(op: BinOp, a: f64, b: f64) -> Option<f64> {
     Some(match op {
-        BinOp::Add => a + b,
-        BinOp::Sub => a - b,
-        BinOp::Mul => a * b,
-        BinOp::Div => a / b,
+        BinOp::Add => sc::pin_nan2_f64(a, b, a + b),
+        BinOp::Sub => sc::pin_nan2_f64(a, b, a - b),
+        BinOp::Mul => sc::pin_nan2_f64(a, b, a * b),
+        BinOp::Div => sc::pin_nan2_f64(a, b, a / b),
         BinOp::Min => sc::cuda_f64_min(a, b),
         BinOp::Max => sc::cuda_f64_max(a, b),
         BinOp::Pow => a.powf(b),
@@ -293,7 +293,7 @@ pub(super) fn ternary(op: TerOp, d: Dtype, x: u128, y: u128, z: u128) -> OpResul
     match op {
         TerOp::Fma => match d {
             Dtype::F32 => Ok(of32(sc::fma_f32_rn(f32v(x), f32v(y), f32v(z)))),
-            Dtype::F64 => Ok(of64(f64v(x).mul_add(f64v(y), f64v(z)))),
+            Dtype::F64 => Ok(of64(sc::host_fma_f64(f64v(x), f64v(y), f64v(z)))),
             Dtype::F16 => Ok(u128::from(sc::fma_f16_bits_rn(x as u16, y as u16, z as u16))),
             Dtype::BF16 => Ok(u128::from(sc::fma_bf16_bits_rn(x as u16, y as u16, z as u16))),
             _ if d.is_int() => {

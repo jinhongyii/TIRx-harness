@@ -392,13 +392,96 @@ pub fn ptx_sqrt_f64(value: f64, mode: F32RoundingMode) -> f64 {
 }
 
 pub fn fma_f32_rn(lhs: f32, rhs: f32, addend: f32) -> f32 {
-    lhs.mul_add(rhs, addend)
+    host_fma_f32(lhs, rhs, addend)
+}
+
+/// Pinned NaN of a host binary32 `+ - * /` whose result is NaN: the first
+/// NaN among `(lhs, rhs)`, quieted, else the x86 default NaN `0xffc0_0000`
+/// (unoptimized x86 `addss lhs, rhs`; optimized builds may commute the
+/// operands, so the payload is pinned instead of left to codegen).
+#[inline]
+pub fn pin_nan2_f32(lhs: f32, rhs: f32, result: f32) -> f32 {
+    if !result.is_nan() {
+        return result;
+    }
+    for value in [lhs, rhs] {
+        if value.is_nan() {
+            return f32::from_bits(value.to_bits() | 0x0040_0000);
+        }
+    }
+    f32::from_bits(0xffc0_0000)
+}
+
+/// Binary64 [`pin_nan2_f32`] (default NaN `0xfff8_0000_0000_0000`).
+#[inline]
+pub fn pin_nan2_f64(lhs: f64, rhs: f64, result: f64) -> f64 {
+    if !result.is_nan() {
+        return result;
+    }
+    for value in [lhs, rhs] {
+        if value.is_nan() {
+            return f64::from_bits(value.to_bits() | 0x0008_0000_0000_0000);
+        }
+    }
+    f64::from_bits(0xfff8_0000_0000_0000)
+}
+
+/// Host binary32 FMA with a pinned NaN result. A non-NaN result is the
+/// exactly rounded fused value, which every FMA implementation agrees on.
+/// The NaN payload, though, depends on which operand order the code
+/// generator picks for `vfmadd` (LLVM may commute operands in optimized
+/// builds), so it is pinned here to what legacy's host `fmaf` (glibc's x86
+/// FMA path) returns: the first NaN among `(rhs, lhs, addend)`, quieted;
+/// otherwise (an invalid `inf * 0` or `inf - inf`) the x86 default NaN
+/// `0xffc0_0000`.
+#[inline]
+pub fn host_fma_f32(lhs: f32, rhs: f32, addend: f32) -> f32 {
+    let value = lhs.mul_add(rhs, addend);
+    if value.is_nan() {
+        fma_nan_f32(lhs, rhs, addend)
+    } else {
+        value
+    }
+}
+
+/// The pinned NaN of [`host_fma_f32`] (call only when the result is NaN).
+#[inline]
+pub fn fma_nan_f32(lhs: f32, rhs: f32, addend: f32) -> f32 {
+    for value in [rhs, lhs, addend] {
+        if value.is_nan() {
+            return f32::from_bits(value.to_bits() | 0x0040_0000);
+        }
+    }
+    f32::from_bits(0xffc0_0000)
+}
+
+/// Binary64 [`host_fma_f32`]: first NaN among `(rhs, lhs, addend)`,
+/// quieted, else `0xfff8_0000_0000_0000`.
+#[inline]
+pub fn host_fma_f64(lhs: f64, rhs: f64, addend: f64) -> f64 {
+    let value = lhs.mul_add(rhs, addend);
+    if value.is_nan() {
+        fma_nan_f64(lhs, rhs, addend)
+    } else {
+        value
+    }
+}
+
+/// The pinned NaN of [`host_fma_f64`] (call only when the result is NaN).
+#[inline]
+pub fn fma_nan_f64(lhs: f64, rhs: f64, addend: f64) -> f64 {
+    for value in [rhs, lhs, addend] {
+        if value.is_nan() {
+            return f64::from_bits(value.to_bits() | 0x0008_0000_0000_0000);
+        }
+    }
+    f64::from_bits(0xfff8_0000_0000_0000)
 }
 
 /// Correct a nearest binary64 FMA by comparison with its exact dyadic result.
 /// No thread-local rounding environment is changed, including on overflow.
 pub fn fma_f64(lhs: f64, rhs: f64, addend: f64, mode: F32RoundingMode) -> f64 {
-    let rounded = lhs.mul_add(rhs, addend);
+    let rounded = host_fma_f64(lhs, rhs, addend);
     if mode == F32RoundingMode::Nearest
         || !lhs.is_finite()
         || !rhs.is_finite()
@@ -527,7 +610,7 @@ pub(crate) fn compare_division_candidate(rounded: f64, lhs: f64, rhs: f64) -> Or
 }
 
 pub fn fma_f32(lhs: f32, rhs: f32, addend: f32, mode: F32RoundingMode) -> f32 {
-    let rounded = lhs.mul_add(rhs, addend);
+    let rounded = host_fma_f32(lhs, rhs, addend);
     if mode == F32RoundingMode::Nearest
         || !lhs.is_finite()
         || !rhs.is_finite()
