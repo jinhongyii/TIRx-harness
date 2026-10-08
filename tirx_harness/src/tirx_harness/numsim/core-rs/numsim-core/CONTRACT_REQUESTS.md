@@ -1300,3 +1300,66 @@ the legacy "explicit view keeps one logical identity" tests expect. Every
 buffer also needs a non-empty name. Racecheck now ignores unnamed sites (V12),
 so with names missing this kernel stays clean rather than producing a false
 advisory. No racecheck change is needed once lowering carries the names.
+
+## W1 (2026-10-08): v2 conformance items tagged lowering, and W5-9
+
+- **V2C-6, fixed (lowering).** Implicit tensor-map slots, the `TensorMap` slots
+  whose `tensor_map` spec is set and which come from the host prelude, are now
+  named `<prelude var>.tmap`.
+  - If that name is taken, the slot gets `<var>.tmap<N>`.
+  - `local_name` equals the canonical name, so the prelude var (`v`) is never
+    a binding key and cannot shadow the buffer parameter `v`.
+  - Binder rule for W8 (unchanged): slots with `tensor_map` set need no binding.
+    The engine encodes them from `implicit_base`.
+- **V2C-7, fixed (lowering); no contract change.** `ParamSlot::name` stays
+  "unique within a Module" and keeps its meaning of one binding.
+  - In a module with more than one kernel, `lower_module` renames a slot to
+    `k<i>:<name>` (and keeps `local_name = <name>`) when either:
+    - it holds a per-launch value (`Scalar`, `TensorMap`, or a Param-space
+      byte blob), or
+    - its declaration (kind, dtype, space) differs between kernels.
+  - Buffer and pointer slots with matching declarations keep the shared name,
+    because launches run in order on the same memory.
+  - Implicit shape slots follow their buffer.
+  - The existing binder already accepts `k<i>:<name>`. A bare name is
+    ambiguous only when more than one kernel declares it.
+- **V2C-11, fixed (lowering).** `Load`/`Store`/`AddrOf` offsets into a
+  vector-dtype buffer (for example a `uint32x4` view over bf16 `state`) are
+  now counted in `dtype.elem` units: each index is multiplied by the lane
+  count. The engine was right to report misalignment.
+- **V2C-9, partly lowering (fixed), partly engine-side (for W2).**
+  - Fixed: `Tma.tmap_space` is now `Generic` when the operand is a u64
+    address (PTX: the map's generic address in .param, .const or .global).
+    The TVM table tags the operand `.global`, which turned `AddrOf` of a
+    `__grid_constant__` map, an address in the param aperture, into a Global
+    access. This resolves `flash_attention4` and `msa_sparse_atten_fwd*`.
+  - Engine-side: `gdn_prefill_sm100` (`copy_desc`, line 444) and similar code
+    execute a literal `ld.global.v4.b64` from `address_of(<tensor map
+    param>)`. Lowering emits what the PTX says: `LoadAddr{space: Global}` on
+    an `AddrOf(Param buf)` address.
+  - W2 needs to decide whether a Global-space load whose address falls in the
+    param aperture reads the Param buffer read-only, as hardware tolerates for
+    grid-constant params, or reports it as a source bug. Lowering does not
+    rewrite the space.
+  - `fastcu_nvfp4_gemm_gb300` was not re-checked separately and is probably
+    the same pattern.
+- **V2C-10, engine-side (oplib/W2).** The address operand is correct. The
+  kernels themselves encode a template descriptor from a null address, for
+  example:
+  - `nvfp4_gemm.py:474`: `sf_desc.init(reinterpret("handle", uint64(0)), ...)`;
+  - `sparse_prefill_head128_phase1.py:491`: the same pattern.
+
+  The kernels then mask the address field (`& ~0x3FFF`) and overwrite it. The
+  hardware encoding is `(addr & 0x3FFFF) >> 4`, so 0 is legal. The
+  `tcgen05_encode_matrix_descriptor` oplib entry should accept address 0, or
+  more generally encode the bits without requiring a shared aperture.
+- **W5-9, done.**
+  - Every `BufferDecl` has a non-empty name.
+    - Unnamed TIR buffers become `<space><index>`.
+    - Unnamed views become `<parent>+<byte base>.<dtype>`.
+    - Example: `stable_sort_topk_by_value` lowers to `shared2` (u32) and
+      `shared2+0.u16`. The TIR names are empty in the source, so these are the
+      names you will see.
+  - `SiteInfo::buffer` walks the `view_of` chain only while the dtype is
+    unchanged, and stops at the dyn-smem pool. A dtype-changing view is its
+    own identity.

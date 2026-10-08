@@ -492,7 +492,13 @@ def lower_tma(c: PtxCtx) -> None:
         mode = "Im2colNoOffs"
     if mode is None:
         raise _Unsupported(c.node, f"{c.d.op_name}: load mode {mode_token!r}")
-    tmap, tmap_space = c.addr("tmap", "Generic")
+    # PTX: `tensorMap` is the *generic* address of a map in .param, .const or
+    # .global space (V2C-9). The TVM operand table tags it `.global`, but a
+    # `__grid_constant__` map's address (AddrOf of a Param buffer) lies in the
+    # param aperture, so the access space is always Generic.
+    tmap, tmap_space = c.src("tmap"), "Generic"
+    if c.lw.operand_ty(tmap).bits == 32:
+        tmap, tmap_space = c.addr("tmap", "Shared")  # u32 window offset of a map in smem
     coords = c.srcs("coords")
     offsets = c.srcs("im2col_info") if c.has("im2col_info") else []
     if direction in ("Load",):

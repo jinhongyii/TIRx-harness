@@ -135,3 +135,38 @@ def k(out: T.Buffer((32,), "float32"), sel: T.Buffer((32,), "int32")):
     assert store.len == load.len == 8 and store.base == load.base
     assert program.regs[store.base.index].name == "acc"
     assert all(b.space != "Local" for b in program.buffers)
+
+
+VECTOR_VIEW_KERNEL = '''
+@T.prim_func
+def k(state: T.Buffer((1024,), "uint16"), out: T.Buffer((128,), "uint32x4"), out2: T.Buffer((128,), "uint16")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    wide = T.decl_buffer((128,), "uint32x4", data=state.data, scope="global")
+    halves = T.decl_buffer((512,), "uint16", data=state.data, scope="global")
+    out[lane] = wide[lane]
+    out2[lane] = halves[lane]
+'''
+
+
+def test_vector_view_offsets_count_scalar_elements(lower_source):
+    """V2C-11: `Load.offset` counts `dtype.elem`, so a `uint32x4` element is 4 units."""
+    program = lower_source(VECTOR_VIEW_KERNEL)
+    names = [b.name for b in program.buffers]
+    wide = names.index("wide")
+    load = next(i for i in all_of(program, "Load") if i.buf == wide)
+    assert load.ty == pb.Ty("U32", 4)
+    scale = definition(program, load.offset)
+    assert (scale.variant, scale.op, const(program, scale.b)) == ("Binary", "Mul", 4)
+
+
+def test_dtype_changing_view_is_its_own_logical_buffer(lower_source):
+    """W5-9: a dtype-changing view is a new identity; same-dtype views keep the root."""
+    program = lower_source(VECTOR_VIEW_KERNEL)
+    names = [b.name for b in program.buffers]
+    site = lambda instr: program.site_of(program.code.index(instr)).buffer  # noqa: E731
+    loads = {names[i.buf]: i for i in all_of(program, "Load")}
+    assert site(loads["wide"]) == "wide"
+    assert site(loads["halves"]) == "state"
+    assert all(b.name for b in program.buffers)

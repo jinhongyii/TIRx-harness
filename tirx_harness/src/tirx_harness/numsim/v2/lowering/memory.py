@@ -375,6 +375,13 @@ class MemoryMixin:
             return self.binary("Add", idx_dtype, row, col), lanes
         if info.layout is not None:
             flat = self.apply_layout(info.layout, flat, idx_dtype)
+        if isinstance(ref, MemRef):
+            # Buffer-relative offsets count scalar elements of the buffer's
+            # `dtype.elem`, not whole vector elements (V2C-11): a `uint32x4`
+            # buffer's element i starts at scalar element 4*i.
+            vector = _vector_lanes(info.dtype)
+            if vector > 1:
+                flat = self.mul_extent(flat, _imm(vector), idx_dtype)
         return flat, lanes
 
     def mul_extent(self: "Lowerer", value: pb.Operand, factor: Any, dtype: str) -> pb.Operand:
@@ -609,6 +616,13 @@ class MemoryMixin:
             self.store(node, source, indices, temp)
 
         return temp, write_back
+
+
+def _vector_lanes(dtype: str) -> int:
+    try:
+        return pb.Ty.from_tvm(str(dtype)).lanes
+    except pb.UnrepresentableType:
+        return 1
 
 
 def _imm(value: int) -> Any:

@@ -38,7 +38,7 @@ def k(a: T.Buffer((256, 64), "float16")):
 def test_host_prelude_becomes_implicit_tensor_map_slot(lower_source):
     program = lower_source(PIPELINE)
     kinds = [(s.name, s.kind) for s in program.host_abi]
-    assert kinds == [("a", "Buffer"), ("v", "TensorMap")]
+    assert kinds == [("a", "Buffer"), ("v.tmap", "TensorMap")]  # V2C-6: own slot identity
     spec = program.host_abi[1].tensor_map
     assert (spec.dtype, spec.rank, spec.swizzle, spec.l2_promotion) == ("F16", 2, 3, 2)
     assert spec.global_dim == (pb.DimExpr.const(64), pb.DimExpr.const(256))
@@ -66,6 +66,8 @@ def test_tma_load_and_mbarrier_protocol(lower_source):
     assert site(tma) == "tile" and site(only(program, "MbarWait")) == "full"
     tmap_addr = next(i for i in all_of(program, "AddrOf") if i.dst == tma.tmap)
     assert program.buffers[tmap_addr.buf].space == "Param"
+    # V2C-9: the map operand is a generic address (param aperture), never Global.
+    assert tma.tmap_space == "Generic"
 
     arrive = only(program, "MbarArrive")
     assert (arrive.space, const(program, arrive.expect_tx), arrive.count, arrive.sem, arrive.scope) == (

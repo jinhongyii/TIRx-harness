@@ -21,6 +21,7 @@ below, which return JSON-ready values (operands inside them are wrapped with
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -750,6 +751,15 @@ class ProgramBuilder:
         return index
 
     def buffer(self, decl: BufferDecl) -> int:
+        if not decl.name:
+            # Every BufferDecl is named (W5-9): unnamed TIR buffers get a
+            # stable synthetic name (view: parent + byte base + dtype).
+            buffers = self.program.buffers
+            if decl.view_of is not None:
+                ty = decl.dtype.elem.lower() + ("" if decl.dtype.lanes == 1 else f"x{decl.dtype.lanes}")
+                decl = dataclasses.replace(decl, name=f"{buffers[decl.view_of].name}+{decl.base}.{ty}")
+            else:
+                decl = dataclasses.replace(decl, name=f"{decl.space.lower()}{len(buffers)}")
         self.program.buffers.append(decl)
         return len(self.program.buffers) - 1
 

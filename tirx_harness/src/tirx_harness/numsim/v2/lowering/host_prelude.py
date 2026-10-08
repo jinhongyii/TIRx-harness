@@ -264,9 +264,17 @@ class PreludeMixin:
         )
         program = self.builder.program
         slot = len(program.host_abi)
-        name = str(target.name)
+        # Implicit maps get their own slot identity (V2C-6): the prelude var
+        # often shares its name with a buffer parameter (``v``), and the
+        # canonical name and local name are both binding keys. The engine
+        # encodes these slots itself, so no host binding refers to them.
+        taken = {s.name for s in program.host_abi} | {s.local_name for s in program.host_abi}
+        name = f"{target.name}.tmap"
+        serial = 1
+        while name in taken:
+            name, serial = f"{target.name}.tmap{serial}", serial + 1
         program.host_abi.append(pb.ParamSlot(name=name, kind="TensorMap", tensor_map=spec,
-                                             implicit_base=base_slot))
+                                             implicit_base=base_slot, local_name=name))
         self.tensor_map_buffer(target, name, slot)
         encoded.add(handle(target))
 

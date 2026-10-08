@@ -94,3 +94,28 @@ def k(x: T.Buffer((32,), "uint32"), out: T.Buffer((32,), "uint32")):
 ''')
     ops = {(i.op, i.ty) for i in all_of(program, "Unary")}
     assert ops == {("Not", pb.Ty("Pred")), ("BitNot", pb.Ty("U32"))}
+
+
+def test_module_qualifies_per_launch_slots():
+    """V2C-7: memory params stay one Module binding; per-launch values get `k<i>:`."""
+    import tvm
+    from tvm.script import tirx as T
+
+    from tirx_harness.numsim.v2.lowering import lower_module
+
+    def kernel(dtype: str):
+        return tvm.script.from_source(f'''
+@T.prim_func
+def k(a: T.Buffer((32,), "float32"), n: T.{dtype}):
+    T.attr({{"tirx.device_entry": T.bool(True)}})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    a[lane] = a[lane] + T.Cast("float32", n)
+''', {"T": T})
+
+    module = lower_module([kernel("int32"), kernel("int32")])
+    names = [[(s.name, s.local_name or s.name) for s in p.host_abi] for p in module.kernels]
+    assert names[0][0] == ("a", "a") and names[1][0] == ("a", "a")
+    assert names[0][1] == ("k0:n", "n") and names[1][1] == ("k1:n", "n")
+    single = lower_module([kernel("int32")])
+    assert [s.name for s in single.kernels[0].host_abi][:2] == ["a", "n"]
