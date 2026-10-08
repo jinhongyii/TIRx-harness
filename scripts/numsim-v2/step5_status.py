@@ -19,6 +19,8 @@ Writes ``coverage/step5_a_status.tsv`` (``legacy_test``, ``surface``,
 * ``flip`` / ``flip-after-import-fix``: passes under v2 unchanged (internal
   files only need their module-level legacy import removed);
 * ``retired-wave4``: a passing v2 copy exists (``coverage/v2_ports_*.tsv``);
+* ``ported-held``: a v2 copy exists but is still xfail/failing, so wave 4 holds
+  the legacy test (a v2 gap or a pending ruling, named in the copy's marker);
 * ``needs-port``: fails only on implementation pins (W9);
 * ``uses-legacy-internals``: the test itself calls a legacy-only function
   (``analyze``, ``prepare_bindings``, ...): port or delete;
@@ -39,11 +41,17 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import retire_legacy  # noqa: E402
 import retire_tests  # noqa: E402
 import v2_public_status  # noqa: E402
 
 COVERAGE = HERE / "coverage"
 BASE = retire_tests.TESTS_BASE
+DELETED_SUBMODULES = {
+    "api", "bindings", "checker_runner", "checkers", "checker_report", "checker_render",
+    "abi", "host_abi", "value_analysis", "transpiler",
+}
+MANIFEST_LEGACY = {"kernel_manifest", "resolved_kernel", "call_op_names", "emitted_calls", "emitted_module"}
 PUBLIC_MODULES = {"tirx_harness.numsim", "tirx_harness.numsim.api", "tirx_harness.numsim.errors"}
 
 
@@ -62,6 +70,16 @@ def legacy_names_used(test_id: str, cache: dict) -> set[str]:
                 and not node.module.startswith("tirx_harness.numsim.v2")
             ):
                 internal |= {a.asname or a.name for a in node.names}
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("tirx_harness.numsim.") and alias.name not in PUBLIC_MODULES and not alias.name.startswith("tirx_harness.numsim.v2"):
+                        internal.add((alias.asname or alias.name).split(".")[0] if alias.asname else alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module in PUBLIC_MODULES:
+                # ``from tirx_harness.numsim import api as numsim_api`` etc.
+                internal |= {a.asname or a.name for a in node.names if a.name in DELETED_SUBMODULES}
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("tests.numsim.support.manifest"):
+                # legacy-only views of the shared manifest helper (function-local legacy imports)
+                internal |= {a.asname or a.name for a in node.names if a.name in MANIFEST_LEGACY}
         defs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
         cache[path] = (internal, defs)
     internal, defs = cache[path]
@@ -118,21 +136,30 @@ def main() -> int:
     if args.internal is None:
         parser.error("--internal is required")
 
-    retired, _ = retire_tests.selection("4", args.v2_results)
+    retired, info = retire_tests.selection("4", args.v2_results)
+    held = {t for t, reason in info.items() if "replacement not passing" in reason}
     public = {r["legacy_test"]: r["v2_status"] for r in csv.DictReader((COVERAGE / "v2_public_status.tsv").open(), delimiter="\t")}
     internal = junit_status(args.internal)
     cache: dict = {}
+    per_file: dict = {}
     out = []
     for r in a_rows:
         test = r["test_id"]
         surface = "public" if r["surface"] == "public" else "internal"
         status = public.get(test, "") if surface == "public" else internal.get(test, "")
-        used = set() if surface == "public" else legacy_names_used(test, cache)
+        used = legacy_names_used(test, cache) if surface != "public" else set()
+        file, _, func = test.partition("::")
+        if file not in per_file:
+            per_file[file] = retire_legacy.legacy_uses_per_test(BASE / file)
+        module_level, per_test = per_file[file]
+        used |= per_test.get(func, set()) | module_level
         fails = [k for k in status.split("+") if k and k not in ("pass", "skip")]
         if category.get(test) == "C":
             step = "delete-C"
         elif test in retired:
             step = "retired-wave4"
+        elif test in held:
+            step = "ported-held"  # a v2 copy exists but is xfail/failing (v2 gap or ruling pending)
         elif used:
             step = "uses-legacy-internals"
         elif status == "pass":

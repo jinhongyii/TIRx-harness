@@ -95,7 +95,7 @@ tests/numsim/integration/test_tmem_artifact.py::test_tmem_runtime_address_withou
 tests/numsim/integration/test_tmem_artifact.py::test_tmem_runtime_address_uses_a_live_dynamic_lease	pass	pass=1
 tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges	pin-message	pin-message=3
 tests/numsim/integration/test_tmem_artifact.py::test_tmem_allocator_returns_nonzero_bases_and_reuses_released_ranges	pass	pass=1
-tests/numsim/integration/test_tmem_artifact.py::test_tmem_live_allocation_at_kernel_exit_is_rejected	pin-message	pin-message=1
+tests/numsim/integration/test_tmem_artifact.py::test_tmem_live_allocation_at_kernel_exit_is_rejected	pass	pass=1
 tests/numsim/integration/test_tmem_artifact.py::test_tmem_uninitialized_reads_are_zero_filled_and_require_review	pass	pass=1
 tests/numsim/integration/test_warp_gemm_artifact.py::test_warp_gemm_gathers_and_scatters_register_fragments_by_layout	pass	pass=1
 tests/numsim/integration/test_warp_gemm_artifact.py::test_larger_exec_scopes_run_one_mma_fragment_per_warp	pass	pass=2
@@ -328,7 +328,7 @@ tests/numsim/runtime/test_scalar_control.py::test_mbarrier_state_token_rejects_a
 tests/numsim/runtime/test_scalar_control.py::test_pointer_conversions_and_runtime_descriptor_patch	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_ptx_dps_sub_and_f64_arithmetic	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_ptx_dps_rounding_ftz_and_saturation_forms	pass	pass=1
-tests/numsim/runtime/test_scalar_control.py::test_canonical_mapa_integer_address_resolves_shared_memory	engine-stops	engine-stops=1
+tests/numsim/runtime/test_scalar_control.py::test_canonical_mapa_integer_address_resolves_shared_memory	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_public_mapa_u64_and_shared_cluster_widths_transpile	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_public_cvta_shared_cluster_u64_zero_extends_shared_addresses	pass	pass=1
 tests/numsim/runtime/test_scalar_control.py::test_mapa_and_cvta_expose_the_device_validated_integer_bits	pass	pass=1
@@ -437,4 +437,4 @@ tests/numsim/runtime/test_wait_until.py::test_an_ordered_plain_reset_is_not_repo
 tests/numsim/runtime/test_wait_until.py::test_bit_typed_word_matches_raw_spelling	pin-internals	pin-internals=1
 tests/numsim/runtime/test_wait_until.py::test_a_backoff_is_the_cuda_loops_business_and_not_the_engines	pin-internals	pin-internals=1
 tests/numsim/runtime/test_wait_until.py::test_a_candidate_index_outside_its_local_table_is_an_execution_error	pin-message	pin-message=1
-tests/numsim/runtime/test_wait_until.py::test_reading_the_word_once_is_not_made_correct_by_declaring_it	pass	pass=1
+tests/numsim/runtime/test_wait_until.py::test_reading_the_word_once_is_not_made_correct_by_declaring_it	racecheck-verdict	racecheck-verdict=1

@@ -25,7 +25,9 @@ Waves (rows of ``coverage/test_classification.csv``):
 Waves 2 and 4 are gated on the replacements passing. The script runs them
 (``pytest --junitxml``) unless ``--v2-results JUNIT.xml`` is given. A
 function counts as passing when every collected item passed, including a
-non-strict XPASS; any failure, error, xfail or skip keeps the legacy test.
+non-strict XPASS, or a strict xfail whose reason says "documented limitation"
+(a delta row records the gap); any other failure, error, xfail or skip keeps
+the legacy test.
 
 A file whose every test function is selected is removed with ``git rm``;
 otherwise the selected functions (with their decorators) are cut out of the
@@ -87,7 +89,10 @@ def passing(node_ids: set[str], results: Path | None) -> set[str]:
         files = sorted({n.split("::", 1)[0] for n in node_ids if (TESTS_BASE / n.split("::", 1)[0]).exists()})
         subprocess.run(cmd + files, cwd=TESTS_BASE, stdout=subprocess.DEVNULL, check=False)
     outcome: dict[str, bool] = {}
-    for case in ET.parse(results).iter("testcase"):
+    cases = list(ET.parse(results).iter("testcase"))
+    if not cases:
+        raise SystemExit(f"no test results in {results}: the replacement run failed to collect; rerun")
+    for case in cases:
         file = case.get("classname", "").replace(".", "/")
         name = case.get("name", "").split("[")[0]
         # classname is ``tests.x.y.test_mod`` or ``tests.x.y.test_mod.TestClass``
@@ -96,7 +101,11 @@ def passing(node_ids: set[str], results: Path | None) -> set[str]:
             func = f"{'/'.join(parts[:-1])}.py::{parts[-1]}::{name}"
         else:
             func = f"{file}.py::{name}"
-        ok = all(case.find(tag) is None for tag in ("failure", "error", "skipped"))
+        skipped = case.find("skipped")
+        # A strict xfail that names a documented limitation (e.g. racecheck
+        # delta T18) is the accepted contract, so it counts as passing.
+        documented = skipped is not None and "documented limitation" in (skipped.get("message") or "")
+        ok = all(case.find(tag) is None for tag in ("failure", "error")) and (skipped is None or documented)
         outcome[func] = outcome.get(func, True) and ok
     return {f for f in node_ids if outcome.get(f)}
 

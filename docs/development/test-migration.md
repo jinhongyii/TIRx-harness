@@ -58,6 +58,23 @@ Two further rows had the right category but missed a stats pin
 Review each row when its file is converted; the counts are good enough to
 plan from.
 
+## Where tests live
+
+| layer | location | holds |
+| --- | --- | --- |
+| Rust scenarios | `tirx_harness/src/tirx_harness/numsim/core-rs/numsim-core/tests/` | hand-built `Program`s and contract events (Racecheck/Synccheck legacy ports) |
+| lowering | `tests/numsim/v2/test_lowering_*.py` | `Program` contents |
+| v2 kernel checks | `tests/numsim/v2/checkers/` | Racecheck/Synccheck facts contract events cannot express |
+| v2 copies | `tests/numsim/v2/ports/` | public-API legacy tests ported to the v2 API; each docstring cites its legacy test and delta row |
+| tile forms | `tests/numsim/v2/tile_forms/` | tile-op kernels TVM's dispatch rejects |
+| corpus | `tests/conformance/` | canonical cases in three modes against snapshots |
+| performance | `tests/perf/` | relative baselines |
+
+The ledger is `scripts/numsim-v2/coverage/`:
+- `test_classification.csv` with `category_overrides.tsv` gives each legacy test's category;
+- `v2_ports_*.tsv` maps a legacy test to its replacements;
+- `v2_xfail_inventory.tsv` lists the open v2 gaps (`v2_gap` marks) that hold replacements back.
+
 ## Categories
 
 | cat | meaning | fate |
@@ -770,6 +787,44 @@ Fresh `NUMSIM_IMPL=v2` runs:
 | uses-legacy-internals | 0 | 25 |
 | blocked-v2 | 9 | 54 |
 | gpu-only | 4 | 0 |
+
+
+### Phase 6 close-out (working tree after 93b60a8)
+
+- **Legacy-name reachability.** `retire_legacy.py` and `step5_status.py` now
+  trace which tests can reach a deleted legacy name. A test counts when it
+  reaches the name through its own body, the helpers and fixtures it calls,
+  or module-level code (parametrize lists built at import).
+- **New bucket `ported-held`.** A v2 copy exists, but it is still xfail.
+- **Strict xfails that retire.** A strict xfail that names a "documented
+  limitation", such as racecheck T18, counts as passing for retirement.
+- **Port batches.** P7 (12 functions, plus the T18 strict xfails) and P8 (16
+  functions, including the frozen PTX-schema form lists, the descriptor
+  dispatch microtests, and the flashmla subset case).
+- **A functions by step-5 bucket.**
+
+  | bucket | public | internal |
+  | --- | ---: | ---: |
+  | flip | 313 | 252 |
+  | retired in wave 4 | 120 | 196 |
+  | ported but held | 0 | 17 |
+  | blocked by v2 | 2 | 49 |
+  | using legacy internals | 0 | 1 (W11 area) |
+  | GPU-only | 4 | 0 |
+
+- **Modules that still reach deleted code: 14.**
+  - 9 are in the W9 area. Their only legacy users are copies held by a v2
+    gap, so each module clears when its gap is fixed.
+  - `tests/conftest.py` has a legacy `ExecutionSubset` branch (W11). It is
+    removed with the conftest shim at step 5.
+  - The other 4 are in W11's area.
+- **Waves.**
+  - wave 0: 1 file, plus 54 functions in 11 files;
+  - wave 1: 26 files, plus 135 functions in 26 files;
+  - wave 2: 1 file, plus 40 functions in 14 files; 10 held;
+  - wave 4: 29 files, plus 283 functions in 80 files; 313 flip and 29 held;
+  - wave 5b: 43 files, plus 207 functions in 53 files.
+- **v2 port and checker tests:** 812 passed, 2 skipped (GPU), 51 xfailed.
 
 ## Semantics in legacy tests that no new spec mentions
 

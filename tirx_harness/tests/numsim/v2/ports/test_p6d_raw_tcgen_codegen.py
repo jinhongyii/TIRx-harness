@@ -47,7 +47,7 @@ from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_la
 from tvm.script import tirx as T
 from tvm.tirx.layout import S, TCol, TileLayout, TLane
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -1077,15 +1077,7 @@ def _mxf4_bindings(mode):
     ("mode", "expected_space"),
     [
         (1, "shared"),
-        pytest.param(
-            2,
-            "tmem",
-            marks=v2_gap(
-                "tcgen05.mma accumulating into never-written TMEM D is 'clean' (no "
-                "uninitialized_read): sched/partition.rs reports async uninit reads after "
-                "run_mma has written D, so the RMW D read looks valid"
-            ),
-        ),
+        (2, "tmem"),
     ],
     ids=["shared", "tmem"],
 )

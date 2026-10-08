@@ -35,9 +35,18 @@ if os.environ.get("NUMSIM_IMPL", "").strip() == "v2":
 
     for _name in (
         "transpile", "Engine", "compare", "run_case", "CoverageBounds", "ResourceLimits",
-        "CompiledModule", "NumSimResult",
+        "CompiledModule", "NumSimResult", "ExecutionSubset",
     ):
         setattr(_numsim, _name, getattr(_v2, _name))
     _numsim.NativeAnalysisResult = _v2.AnalysisResult
     _harness.racecheck = _v2.racecheck
     _harness.synccheck = _v2.synccheck
+else:
+    # The public launch selector is reached as ``tirx_harness.numsim.ExecutionSubset``
+    # in both modes (v2 exports it from ``numsim.v2``; legacy only from
+    # ``numsim.api``), so tests need no edit when the legacy layer is deleted.
+    import tirx_harness.numsim as _numsim
+    from tirx_harness.numsim.api import ExecutionSubset as _LegacyExecutionSubset
+
+    if not hasattr(_numsim, "ExecutionSubset"):
+        _numsim.ExecutionSubset = _LegacyExecutionSubset

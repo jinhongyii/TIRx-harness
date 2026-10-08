@@ -5,7 +5,7 @@
 - ``test_cuda_128bit_atomic_cas_compares_float_vectors_by_bits``
 
 Both are faithful copies of the legacy assertions (dropped: nothing; the legacy
-functions had no pins) and are ``v2_gap`` today: v2 lowers the call to one
+functions had no pins) and were ``v2_gap`` until W2 fixed 128-bit CAS (now all-or-nothing by bits): v2 lowers the call to one
 ``Atom{Cas}`` of type ``u64x2`` / ``f32x4``, and ``interp/handlers/mem.rs``
 ``rmw_bytes`` applies CAS per vector element (8 / 4 bytes) instead of comparing
 and replacing the whole 16-byte value. A compare that matches only some
@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -70,11 +70,6 @@ def _unpack(array, dtype) -> np.ndarray:
     return np.asarray(array).view(dtype).reshape(-1, 16 // np.dtype(dtype).itemsize)
 
 
-@v2_gap(
-    "[W2] 128-bit atomic CAS is component-wise (interp mem.rs rmw_bytes splits u64x2 into two u64 CAS): "
-    "lane 1's compare [11, 999] against [11, 13] replaces component 0, so lane 2 observes old [17, 13] "
-    "(legacy/PTX: [11, 13])"
-)
 def test_cuda_uint64x2_atomic_cas_compares_and_replaces_one_128bit_value():
     """Replaces ``tests/numsim/runtime/test_memory_ops.py::test_cuda_uint64x2_atomic_cas_compares_and_replaces_one_128bit_value`` (bug, see module docstring)."""
 
@@ -97,10 +92,6 @@ def test_cuda_uint64x2_atomic_cas_compares_and_replaces_one_128bit_value():
     )
 
 
-@v2_gap(
-    "[W2] 128-bit atomic CAS is component-wise: lane 0's compare differs only in component 0 (+0 vs -0 bits) "
-    "yet components 1..3 are replaced, so lane 1 observes old [0x80000000, 2, 3, 4] (legacy/PTX: the initial value)"
-)
 def test_cuda_128bit_atomic_cas_compares_float_vectors_by_bits():
     """Replaces ``tests/numsim/runtime/test_memory_ops.py::test_cuda_128bit_atomic_cas_compares_float_vectors_by_bits`` (bug, see module docstring)."""
 

@@ -320,6 +320,9 @@ def rewrites() -> list[Edit]:
              manual=True),
         Edit("scripts/smoke_wheel.py", "check numsim_core_py instead of the tvm-rust-ext licenses", manual=True),
         Edit("tirx_harness/tests/numsim/support/paths.py", "drop ENGINE_ROOT (engine-rs)", manual=True),
+        Edit("tirx_harness/tests/numsim/support/manifest.py",
+             "delete the legacy-only views (kernel_manifest, resolved_kernel, call_op_names, emitted_calls, "
+             "emitted_module); after the cuts no surviving test calls them (check with --list, section 7)", manual=True),
         Edit(f"{NUMSIM}/CLAUDE.md", "remove the legacy-engine paragraph and the legacy snapshot policy", manual=True),
         Edit(f"{NUMSIM}/AGENTS.md", "mirror CLAUDE.md", manual=True),
         Edit(".github/workflows/tests.yml", "add `python scripts/numsim-v2/check_snapshot_deltas.py --base origin/main` "
@@ -384,7 +387,9 @@ def pending_markers() -> list[tuple[str, int, str, str]]:
     out = []
     for path in sorted(REPO.rglob("*.md")):
         rel = path.relative_to(REPO).as_posix()
-        if any(part in rel for part in ("/target/", ".venv", "thirdparty/", "engine-rs/", "frontend-rs/")):
+        if any(part in rel for part in ("/target/", ".venv", "thirdparty/", "engine-rs/", "frontend-rs/")) or rel.endswith(
+            "docs/development/test-migration.md"  # quotes the markers; not a marker itself
+        ):
             continue
         text = path.read_text(errors="replace")
         for match in re.finditer(r"\(pending:", text):
@@ -513,26 +518,77 @@ def legacy_import_uses(path: Path, cut: set[str]) -> tuple[dict[str, str], set[s
             for alias in node.names:
                 if _deleted(alias.name):
                     bound[(alias.asname or alias.name).split(".")[0]] = alias.name
-    skip = set()
+    # Live code: module-level statements, surviving test functions, and the
+    # helpers / fixtures they reach (by name or by fixture argument).
+    defs: dict[str, ast.AST] = {}
+    roots: list[ast.AST] = []
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in cut:
-            skip.add(id(node))
-        if isinstance(node, ast.ClassDef):
-            for sub in node.body:
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and f"{node.name}::{sub.name}" in cut:
-                    skip.add(id(sub))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defs[node.name] = node
+            if node.name.startswith("test_") and node.name not in cut:
+                roots.append(node)
+        elif isinstance(node, ast.ClassDef):
+            if node.name.startswith("Test"):
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and f"{node.name}::{sub.name}" not in cut:
+                        roots.append(sub)
+            else:
+                defs[node.name] = node
+        elif not isinstance(node, (ast.Import, ast.ImportFrom)):
+            roots.append(node)
     used: set[str] = set()
-
-    def visit(node: ast.AST) -> None:
-        if id(node) in skip or isinstance(node, (ast.Import, ast.ImportFrom)):
-            return
-        if isinstance(node, ast.Name) and node.id in bound:
-            used.add(node.id)
-        for child in ast.iter_child_nodes(node):
-            visit(child)
-
-    visit(tree)
+    seen: set[str] = set()
+    todo = list(roots)
+    while todo:
+        node = todo.pop()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name):
+                if sub.id in bound:
+                    used.add(sub.id)
+                elif sub.id in defs and sub.id not in seen:
+                    seen.add(sub.id)
+                    todo.append(defs[sub.id])
+            elif isinstance(sub, ast.arg) and sub.arg in defs and sub.arg not in seen:
+                seen.add(sub.arg)
+                todo.append(defs[sub.arg])
     return bound, used
+
+
+def legacy_uses_per_test(path: Path) -> tuple[set[str], dict[str, set[str]]]:
+    """Deleted-module names used at module level (import time), and per test
+    function (through the helpers and fixtures it reaches)."""
+    tree = ast.parse(path.read_text())
+    bound, _ = legacy_import_uses(path, set())
+    if not bound:
+        return set(), {}
+    defs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not (isinstance(n, ast.ClassDef) and n.name.startswith("Test"))}
+
+    def reach(roots: list[ast.AST]) -> set[str]:
+        used, seen, todo = set(), set(), list(roots)
+        while todo:
+            node = todo.pop()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name):
+                    if sub.id in bound:
+                        used.add(sub.id)
+                    elif sub.id in defs and sub.id not in seen:
+                        seen.add(sub.id)
+                        todo.append(defs[sub.id])
+                elif isinstance(sub, ast.arg) and sub.arg in defs and sub.arg not in seen:
+                    seen.add(sub.arg)
+                    todo.append(defs[sub.arg])
+        return used
+
+    module_level = reach([n for n in tree.body if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom))])
+    tests: dict[str, set[str]] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            tests[node.name] = reach([node])
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name.startswith("test_"):
+                    tests[f"{node.name}::{sub.name}"] = reach([sub])
+    return module_level, tests
 
 
 def broken_imports(removed: set[str], cut: dict[str, list[str]] | None = None) -> list[str]:
@@ -581,7 +637,7 @@ def blockers(info: dict[str, str], removed: set[str] | None = None, cut: dict[st
     status = COVERAGE / "step5_a_status.tsv"
     if status.exists():
         for row in csv.DictReader(status.open(), delimiter="\t"):
-            if row["step5"] in {"blocked-v2", "needs-port", "uses-legacy-internals"}:
+            if row["step5"] in {"blocked-v2", "needs-port", "uses-legacy-internals", "ported-held"}:
                 out[f"A {row['surface']}: {row['step5']}"].append(row["legacy_test"])
     for test_id, reason in info.items():
         if "hold" in reason and "replacement not passing" in reason:
