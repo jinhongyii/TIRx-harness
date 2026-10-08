@@ -236,3 +236,38 @@ def k(out: T.Buffer((32,), "uint32")):
     assert sf.base == 128 and sf.byte_len == pb.DimExpr.const(128)
     # sf2 aliases sf exactly: base 0 within sf, not 128 past it.
     assert (sf2.view_of, sf2.base) == (sf_index, 0)
+
+
+def test_register_layout_local_indexes_by_register_and_asserts_owner(lower_source):
+    """A fragment layout (laneid, m): storage offset is `m`; the owning lane is asserted."""
+    program = lower_source('''
+@T.prim_func
+def k(out: T.Buffer((64,), "float32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    frag = T.alloc_buffer((64,), "float32", scope="local", layout=T.TileLayout(T.S[(32, 2):(1 @ Axis.laneid, 1)]))
+    for i in range(2):
+        frag[lane * 2 + i] = T.float32(1)
+    for i in range(2):
+        out[lane * 2 + i] = frag[lane * 2 + i]
+''')
+    assert not program.unsupported
+    assert len(all_of(program, "Assert")) == 2
+
+
+def test_predicated_vector_atomic_is_guarded():
+    """W4-12: `@p atom.v2.f32` adds only where the guard holds (the Atom sits inside the If)."""
+    from tests.numsim.runtime.test_atomic_f32_noftz import atomic_kernel
+    from tirx_harness.numsim.v2.lowering import lower
+
+    program = lower(atomic_kernel("atom", 2, "global"))
+    variants = [i.variant for i in program.code]
+    atom = variants.index("Atom")
+    # `if warp == 0` plus the instruction guard, both open at the Atom.
+    open_ifs = 0
+    for variant in variants[:atom]:
+        open_ifs += variant == "If"
+        open_ifs -= variant == "EndIf"
+    assert open_ifs == 2
+    assert program.code[atom].ty == pb.Ty("F32", 2)

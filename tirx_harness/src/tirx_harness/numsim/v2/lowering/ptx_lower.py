@@ -334,14 +334,24 @@ def lower_atom(c: PtxCtx) -> None:
     result = lw.builder.reg(ty) if dsts else None
     op = ATOM_OPS[c.mod("op")]
     sem = c.sem("Relaxed")
-    c.lw.builder.emit("Atom", site=c.site(), op=op, ty=ty, dst=result, addr=addr, space=space, value=value,
-                      cmp=cmp, sem=sem, scope=c.scope(), ftz=not c.flag("noftz") and ty.elem == "F32")
+    b = lw.builder
+    # A guarded atom/red (`@p`, e.g. `pred=lane % 2 == 0` on a vector form) runs,
+    # and writes its destinations, only where the guard holds (W4-12).
+    if_pc = None
+    if c.pred is not None:
+        if_pc = b.emit("If", site=c.site(), cond=c.pred, else_pc=0, end_pc=0, elect=False)
+    b.emit("Atom", site=c.site(), op=op, ty=ty, dst=result, addr=addr, space=space, value=value,
+           cmp=cmp, sem=sem, scope=c.scope(), ftz=not c.flag("noftz") and ty.elem == "F32")
     if result is not None:
         outs = [result] if lanes == 1 else lw.unpack(result, lanes)
         for reg, lane in zip(dsts, outs):
             if reg is not None:
                 lw.assign(reg, lane)
     c.flush()
+    if if_pc is not None:
+        end = b.emit("EndIf")
+        b.patch(if_pc, "If", cond=c.pred, else_pc=end, end_pc=end, elect=False)
+        c.pred = None
 
 
 def lower_cvta(c: PtxCtx) -> None:
@@ -497,10 +507,57 @@ def lower_bulk_prefetch(c: PtxCtx) -> None:
     lower_generic_ordering(c)
 
 
+# `cp.reduce.async.bulk.tensor` .redOp x TensorMap element type (PTX ISA;
+# legacy tensor_map.rs `RawTmaReductionOp::resolve`); and/or/xor take any
+# 32- or 64-bit element type.
+_TMA_REDUCE_DTYPES = {
+    "add": {"U32", "S32", "U64", "F32", "TF32", "F16", "BF16"},
+    "min": {"U32", "S32", "U64", "S64", "F16", "BF16"},
+    "max": {"U32", "S32", "U64", "S64", "F16", "BF16"},
+    "inc": {"U32"},
+    "dec": {"U32"},
+}
+
+
+def _static_tmap_spec(c: PtxCtx) -> Any:
+    """The host-encoded TensorMapSpec the ``tmap`` operand names, if static."""
+    from .memory import handle
+
+    stack = list(c.nodes("tmap"))
+    while stack:
+        node = stack.pop()
+        if type_key(node) == "ir.Var":
+            ref = c.lw.refs.get(handle(node))
+            if ref is None:
+                continue
+            program = c.lw.builder.program
+            slot = program.buffers[ref.buf].param_slot
+            if slot is None:
+                return None
+            decl = program.host_abi[slot]
+            return getattr(decl, "tensor_map", None)
+        stack.extend(getattr(node, "args", ()) or ())
+        if hasattr(node, "buffer"):
+            stack.append(node.buffer.data)
+    return None
+
+
+def _check_tma_reduce_dtype(c: PtxCtx, redop: str) -> None:
+    spec = _static_tmap_spec(c)
+    if spec is None or spec.force_cu_dtype is not None:
+        return  # runtime check (numsim-core oplib `tma_reduce_valid`)
+    dtype = spec.dtype
+    allowed = _TMA_REDUCE_DTYPES.get(redop)
+    ok = pb._DTYPE_BITS.get(dtype) in (32, 64) if allowed is None else dtype in allowed
+    if not ok:
+        raise _Unsupported(c.node, f"cp.reduce.async.bulk.tensor operation .{redop} is invalid for TensorMap dtype {dtype}")
+
+
 def lower_tma(c: PtxCtx) -> None:
     name = c.name
     if name.startswith("cp_reduce_async_bulk_tensor"):
         direction = {"Reduce": ATOM_OPS[c.mod("redop")]}
+        _check_tma_reduce_dtype(c, c.mod("redop"))
     elif "prefetch" in name:
         direction = "Prefetch"
     elif "s2g" in name:

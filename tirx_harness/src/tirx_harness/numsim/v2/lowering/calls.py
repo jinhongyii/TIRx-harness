@@ -171,8 +171,11 @@ class CallsMixin:
         return self.const("int32", 0)
 
     def call_tirx_reinterpret(self: "Lowerer", node: Any) -> pb.Operand:
-        value = self.expr(node.args[0])
         dtype = dtypes.dtype_of(node)
+        reason = _reinterpret_rejection(dtypes.dtype_of(node.args[0]) or "", dtype or "")
+        if reason is not None:
+            raise _Unsupported(node, f"tirx.reinterpret: {reason}")
+        value = self.expr(node.args[0])
         if dtype == "handle":
             return self.as_address(value)
         return self.reinterpret(value, self.ty(dtype, node))
@@ -292,6 +295,8 @@ class CallsMixin:
         return None
 
     call_tirx_cuda_printf = nop
+    # Profiler flush: writes only the host-side trace, numerically a no-op (legacy).
+    call_tirx_timer_finalize_cuda = nop
     call_tirx_cuda_iket_mark = nop
     call_tirx_cuda_iket_range_start = nop
     call_tirx_cuda_iket_range_end = nop
@@ -379,6 +384,7 @@ class CallsMixin:
         src = self.cast_to(self.expr(value), ty)
         lane_op = self.cast_to(self.expr(lane), pb.Ty("U32"))
         width_op = self.cast_to(self.expr(width), pb.Ty("U32"))
+        self.check_shfl_width(node, width_op)
         # CUDA: c = ((32 - width) << 8) | (up ? 0 : 0x1f)
         segment = self.binary("Shl", pb.Ty("U32"), self.binary("Sub", pb.Ty("U32"), self.const("uint32", 32), width_op),
                               self.const("uint32", 8))
@@ -388,6 +394,24 @@ class CallsMixin:
                           dst_pred=None, src=src, lane=lane_op, clamp=clamp,
                           membermask=self.cast_to(self.expr(mask), pb.Ty("U32")))
         return dst
+
+    def check_shfl_width(self: "Lowerer", node: Any, width: pb.Operand) -> None:
+        """CUDA ``__shfl*_sync`` width must be a power of two in [1, 32] (legacy runtime check)."""
+        message = "invalid warp shuffle selector/width (width must be a power of two in [1, 32])"
+        if isinstance(width, pb.Const):
+            value = self.builder.program.const_value(width)
+            if not (1 <= value <= 32 and value & (value - 1) == 0):
+                raise _Unsupported(node, message)
+            return
+        # ok <=> ((w & (w - 1)) | ((w - 1) >> 5)) == 0  (w - 1 wraps for w = 0)
+        u32 = pb.Ty("U32")
+        minus_one = self.binary("Sub", u32, width, self.const("uint32", 1))
+        bad = self.binary("Or", u32, self.binary("And", u32, width, minus_one),
+                          self.binary("Shr", u32, minus_one, self.const("uint32", 5)))
+        ok = self.builder.reg(pb.Ty("Pred"))
+        self.builder.emit("Compare", op="Eq", ty=u32, dst=ok, a=bad, b=self.const("uint32", 0))
+        self.builder.emit("Assert", site=self.site(node, op_name=_op_name(node)), cond=ok,
+                          msg=self.builder.string(message))
 
     def call_tirx_cuda___shfl_sync(self: "Lowerer", node: Any) -> pb.Operand:
         return self.shfl(node, "Idx", *node.args)
@@ -627,8 +651,23 @@ class CallsMixin:
         if name is None or name not in builtins.PURE_FUNC_CALLS:
             raise _Unsupported(node, f"cuda.func_call of unreviewed or effectful helper {name!r}")
         digest = hashlib.sha256("".join(source.split()).encode()).hexdigest()[:16]
+        self.check_reviewed_helper(node, name, digest, args)
         return self.pure_helper(node, f"tirx.cuda.func_call.{name}", "v*", args=args,
                                 extra_mods=(f"source_sha256={digest}",))
+
+    def check_reviewed_helper(self: "Lowerer", node: Any, name: str, digest: str, args: list[Any]) -> None:
+        """Fail closed unless ``name`` is the reviewed helper (signature, then body)."""
+        reviewed = builtins.REVIEWED_HELPERS.get(name)
+        if reviewed is None:
+            return
+        expected_digest, arg_dtypes, result_dtype, description = reviewed
+        if arg_dtypes or result_dtype:
+            actual = [_helper_dtype(a) for a in args]
+            if actual != list(arg_dtypes) or (dtypes.dtype_of(node) or "") != result_dtype:
+                raise _Unsupported(node, f"tirx.cuda.func_call helper {name!r} requires {list(arg_dtypes)} -> "
+                                         f"{result_dtype or 'void'}")
+        if digest != expected_digest:
+            raise _Unsupported(node, f"tirx.cuda.func_call helper {name!r} body does not match the {description}")
 
     def single_asm_helper(self: "Lowerer", node: Any, source: str, args: list[Any]) -> bool:
         """Lower an effectful helper whose body is exactly one reviewed PTX statement.
@@ -786,3 +825,56 @@ class CallsMixin:
 
 
 __all__ = ["CallsMixin"]
+
+
+def _helper_dtype(node: Any) -> str:
+    """Legacy helper argument typing: "handle" for pointers, else the dtype."""
+    ty = getattr(node, "ty", None)
+    if ty is not None and type_key(ty) == "ir.PointerType":
+        return "handle"
+    return dtypes.dtype_of(node) or ""
+
+
+# Legacy reinterpret validation (frontend-rs emit/pure.rs `validate_reinterpret`
+# over dtype_registry.json capability classes). Registers hold bits, so v2 could
+# model more, but scalar low-precision/storage-only payload reinterprets stay
+# rejected exactly as before.
+_SCALAR_CLASSES = {"integer", "boolean", "scalar", "scalar_raw"}
+_RAW_CLASSES = {"integer", "scalar_raw"}
+
+
+def _dtype_classes() -> dict[str, str]:
+    global _DTYPE_CLASSES
+    if _DTYPE_CLASSES is None:
+        import json
+        import pathlib
+
+        path = pathlib.Path(__file__).resolve().parents[2] / "dtype_registry.json"
+        types = json.loads(path.read_text())["types"]
+        _DTYPE_CLASSES = {k: (v.get("class") if isinstance(v, dict) else v) for k, v in types.items()}
+    return _DTYPE_CLASSES
+
+
+_DTYPE_CLASSES: dict[str, str] | None = None
+
+
+def _reinterpret_rejection(source: str, target: str) -> str | None:
+    if {source, target} <= {"handle", "uint64"} and "handle" in (source, target):
+        return None
+    if not (dtypes.known(source) and dtypes.known(target)):
+        return None  # pointer forms and the like are checked elsewhere
+    if dtypes.bits(source) != dtypes.bits(target):
+        return "source and result must have identical bit widths"
+    if (source, target) in {("uint16", "float16"), ("float16", "uint16"), ("uint16", "bfloat16"),
+                            ("bfloat16", "uint16")}:
+        return None
+    classes = _dtype_classes()
+    source_vector = dtypes.split(source)[1] > 1
+    target_vector = dtypes.split(target)[1] > 1
+    if source == target and (classes.get(source) in _SCALAR_CLASSES or source_vector):
+        return None
+    if (classes.get(source) in _RAW_CLASSES or source_vector) and \
+            (classes.get(target) in _RAW_CLASSES or target_vector):
+        return None
+    return ("raw payload reinterpret is not modeled for scalar low-precision/storage-only dtype; "
+            "use an explicitly supported packed storage dtype")

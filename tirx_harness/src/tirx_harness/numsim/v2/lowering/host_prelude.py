@@ -164,7 +164,7 @@ class PreludeMixin:
             return self.dim_expr(node.value)
         op = _DIM_OPS.get(kind)
         if op is None:
-            raise _Unsupported(node, f"extent expression {kind} is not a DimExpr")
+            raise _Unsupported(node, f"unsupported integer operation {kind.rpartition('.')[2]} in a host extent expression (no DimExpr)")
         a, b = self.dim_expr(node.a), self.dim_expr(node.b)
         if a.is_const and b.is_const:
             folded = _fold(op, a.value, b.value)
@@ -273,8 +273,11 @@ class PreludeMixin:
         serial = 1
         while name in taken:
             name, serial = f"{target.name}.tmap{serial}", serial + 1
+        # The prelude var stays an alias when nothing else answers to it, so a
+        # caller that names the map (legacy accepted that) still binds.
+        aliases = () if str(target.name) in taken else (str(target.name),)
         program.host_abi.append(pb.ParamSlot(name=name, kind="TensorMap", tensor_map=spec,
-                                             implicit_base=base_slot, local_name=name))
+                                             implicit_base=base_slot, local_name=name, aliases=aliases))
         self.tensor_map_buffer(target, name, slot)
         encoded.add(handle(target))
 

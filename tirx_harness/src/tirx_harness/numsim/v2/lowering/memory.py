@@ -445,16 +445,38 @@ class MemoryMixin:
             var = tirx.Var("flat", dtype)
             mapped = layout.apply(var)
             axes = {str(k): v for k, v in mapped.items()}
-            if set(axes) != {"m"}:
+            threads = {name: v for name, v in axes.items() if name != "m"}
+            unknown = sorted(set(threads) - set(_THREAD_AXES))
+            if unknown:
                 raise _Unsupported(None, f"layout maps to non-memory axes {sorted(axes)}")
-            cached = (var, axes["m"])
+            cached = (var, axes.get("m"), threads)
             self.layout_exprs[key] = cached
-        var, expr = cached
+        var, expr, threads = cached
         self.vars[handle(var)] = flat
         try:
+            # Register (fragment) layouts: element -> (owning thread coordinates,
+            # register m). The storage is per thread, so the offset is `m`; an
+            # access to an element another thread owns is a runtime Assert.
+            for name, coordinate in threads.items():
+                owner = self.cast_to(self.expr(coordinate), "int32")
+                own = self.thread_coordinate(name)
+                ok = self.builder.reg(pb.Ty("Pred"))
+                self.builder.emit("Compare", op="Eq", ty=pb.Ty("S32"), dst=ok, a=owner, b=own)
+                self.builder.emit("Assert", cond=ok, msg=self.builder.string(
+                    f"register-layout element owned by another thread ({name})"))
+            if expr is None:
+                return self.const(dtype, 0)
             return self.cast_to(self.expr(expr), dtype)
         finally:
             del self.vars[handle(var)]
+
+    def thread_coordinate(self: "Lowerer", axis: str) -> pb.Operand:
+        sreg, modulus = _THREAD_AXES[axis]
+        reg = self.builder.reg(pb.Ty("S32"), name=axis)
+        self.builder.emit("ReadSpecial", dst=reg, sreg=sreg)
+        if modulus is None:
+            return reg
+        return self.binary("FloorMod", "int32", reg, self.const("int32", modulus))
 
     def apply_tmem_layout(self: "Lowerer", layout: Any, flat: pb.Operand, dtype: str) -> tuple[pb.Operand, pb.Operand]:
         from tvm import tirx
@@ -658,6 +680,16 @@ class MemoryMixin:
             self.store(node, source, indices, temp)
 
         return temp, write_back
+
+
+# Thread axes of register (fragment) layouts -> (special register, modulus).
+_THREAD_AXES = {
+    "laneid": ("LaneId", None),
+    "tid_in_wg": ("ThreadInCta", 128),
+    "tid_in_cta": ("ThreadInCta", None),
+    "wid_in_wg": ("WarpInCta", 4),
+    "warpid": ("WarpInCta", None),
+}
 
 
 def _vector_lanes(dtype: str) -> int:

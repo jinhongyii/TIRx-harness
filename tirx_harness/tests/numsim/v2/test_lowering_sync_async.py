@@ -39,6 +39,8 @@ def test_host_prelude_becomes_implicit_tensor_map_slot(lower_source):
     program = lower_source(PIPELINE)
     kinds = [(s.name, s.kind) for s in program.host_abi]
     assert kinds == [("a", "Buffer"), ("v.tmap", "TensorMap")]  # V2C-6: own slot identity
+    # The prelude var still binds (caller override) while no other slot is named `v`.
+    assert program.host_abi[1].aliases == ("v",)
     spec = program.host_abi[1].tensor_map
     assert (spec.dtype, spec.rank, spec.swizzle, spec.l2_promotion) == ("F16", 2, 3, 2)
     assert spec.global_dim == (pb.DimExpr.const(64), pb.DimExpr.const(256))
@@ -138,3 +140,16 @@ def k():
     # A `mapa.shared::cluster` result is a cluster-window address even in a u64.
     assert remote.space == "SharedCluster"
     assert definition(program, wide.mbar).variant != "Cvta"  # no forced shared::cta
+
+
+def test_explicit_tensor_map_param_keeps_its_declared_name(lower_source):
+    """Only implicit prelude maps get the `.tmap` suffix (V2C-6); a declared map param keeps its name."""
+    program = lower_source('''
+@T.prim_func
+def k(a: T.Buffer((64,), "float32"), tensor_map: T.handle("tensormap")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    lane = T.lane_id([32])
+    T.warp_id([1])
+    a[lane] = T.float32(0)
+''')
+    assert [(s.name, s.kind) for s in program.host_abi][:2] == [("a", "Buffer"), ("tensor_map", "TensorMap")]

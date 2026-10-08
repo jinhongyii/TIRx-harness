@@ -1745,3 +1745,85 @@ V2C-5.
    - `test_payload_runtime[*]`: the `incomplete` is `launch_not_executed`. The shim runs the whole module up to `phase_index`, and launch 26 (`scalar_warp_intrinsics`) stops on `Unsupported: tirx.cuda.sm100_2sm_leader_smem_addr` (oplib/lowering). Every later phase then inherits that `incomplete`. Owner: Python shim (run only the requested phase, or keep going after an `incomplete` launch) plus oplib for the intrinsic. Separately, 26 more params fail with `KeyError: 'task_count'`: the shim's `stats` lacks `task_count` (it has `completed_task_count`). Owner: Python shim.
    - `test_shared_descriptor_choices[False-*]`: `Op(Unsupported): raw tcgen05.cp descriptor uses unsupported reserved/base/LBO-mode bits`. Legacy reported an error ("reserved"). The oplib should report reserved descriptor bits as an operation error, not `Unsupported`. Owner: W4.
    - `test_reported_instruction_support[red_vec_packed_bf16]`: `Unsupported: numsim.pack ["ty=BF16x4"]: pieces [BF16, BF16] do not tile bf16x4`. Owner: lowering (W1).
+
+## W1 round 2 (2026-10-08): V2C-33, V2C-7 remainder, lowering rejects, fail-closed gaps, W4-12
+
+- **V2C-33: fixed.** `wait_until` destinations always stay registers.
+  - `uninit.py` pins them, and the destination counts as written before the
+    predicate reads it.
+  - `radix_topk_multi_cta` and `sm100_fp8_fp4_mega_moe` lower again; the
+    corpus test passes.
+- **V2C-7 remainder: fixed, no contract change.**
+  - The cause: one Module bundles unrelated kernels whose same-named buffer
+    params (`high`, `out`, ...) are different arrays.
+  - Rule: in a multi-kernel Module, every slot name that more than one kernel
+    declares becomes `k<i>:<name>` (`local_name` stays the signature name);
+    names declared by a single kernel stay bare.
+  - Kernels that really share memory are bound to the same host array. The
+    binder's identical-span aliasing (W8-6) maps them onto one allocation.
+  - Result: all 42 listed items now bind. The remaining failures are not
+    lowering:
+    - 26 assert legacy `stats.task_count`;
+    - 15 are synccheck phase runs reporting "an earlier launch stopped the
+      module" (W6/W8; a plain numsim run of the whole module completes);
+    - the tensor-map override item passes now that the implicit map keeps
+      its prelude var as an alias.
+- **Implicit tensor maps:** `<var>.tmap` slots also list the prelude var in
+  `aliases` when no other slot uses that name, so a caller override such as
+  `tensor_map` still binds. Explicit TensorMap params keep their declared
+  name; a test covers this.
+- **"lowering rejects the kernel" (29 items): 12 cleared, 17 out of scope or
+  needing a contract change.**
+  - Cleared:
+    - VECTORIZED loops lower as serial loops (4);
+    - `tirx.timer_finalize_cuda` is a Nop (1);
+    - register-fragment layouts are supported, with storage offset = `m` and
+      a runtime `Assert` that the owning laneid / tid_in_wg is the executing
+      thread (6);
+    - the host-extent fail-closed message now names the "unsupported integer
+      operation" (1).
+  - Contract-needed:
+    - sub-word TMEM direct access (f16/u8/u16 cells, 7): the Tmem
+      `BufferDecl` ruling only allows 32-bit cells;
+    - replicated TMEM views (4);
+    - runtime TensorMap box/element strides (2).
+  - Out of scope:
+    - `ptx_legacy` (2);
+    - TVM dispatch semantics differ from the legacy expectation (1);
+    - TVM's copy fallback does cross-thread register access, which our owner
+      Assert rejects (1).
+- **Fail-closed gaps (W9, `v2-accepts-legacy-rejection`): 17 of 17 now
+  raise.**
+  - Reviewed `cuda.func_call` helpers: `builtins.REVIEWED_HELPERS` holds
+    sha256 digests taken from the legacy `*_SOURCE` constants, plus argument
+    and result dtypes, and lowering checks both.
+    - The mutated-body tests now fail with "body does not match the validated
+      ..." and the wrong-dtype test with "requires ...".
+    - For W4: the reviewed helpers themselves (`flashkda_*`, `shl_u32_clamp`,
+      `combine_int_frac_ex2`, `gdn_lg2_approx_ftz`, `fma_scale_sub_f32x2`,
+      `tvm_builtin_cast_*`) have no oplib implementation, so the positive
+      tests stop "incomplete".
+  - Legacy reinterpret validation (dtype_registry classes). Scalar fp8
+    identity reinterpret is rejected again.
+  - `lowering/tile_checks.py`, run before TVM dispatch:
+    - unknown tile config keys (union of the legacy per-op key lists);
+    - directed float64 rounding (TVM silently emits round-to-nearest);
+    - the warp `tile.gemm` mma.sync m16n8k{16,8} fragment ABI (the legacy
+      check, ported).
+  - `__shfl*_sync` width is checked: a constant must be a power of two in
+    [1, 32], otherwise lowering rejects it; a runtime width gets an `Assert`.
+  - The TMEM-at-exit, tensormap-release and ignore_oob items pass from engine
+    changes.
+- **W4-12 (1) tile reductions: TVM-side, not our invocation.**
+  - TVM's own `LowerTIRx` pipeline fails the same way on
+    `shared_cta_accum_sum`, `shared_cta_f16_reductions` and
+    `shared_empty_axis_reductions`.
+  - The errors are "undefined variable tid_in_scope" / "undefined variable
+    threadIdx.x", raised in
+    `tvm/backend/cuda/tile_primitive/reduction/shared.py` (cta scope).
+  - These are TVM dispatch bugs (category E), not a scope or layout we pass
+    wrongly.
+- **W4-12 (2) vector atomics: fixed.** `lower_atom` emitted `Atom` without
+  the instruction guard. A guarded atom/red now runs inside `If(pred)`, and
+  so do its destination write-backs. The `test_atomic_f32_noftz` numerics
+  pass; the remaining failures assert the legacy `rust_source`.

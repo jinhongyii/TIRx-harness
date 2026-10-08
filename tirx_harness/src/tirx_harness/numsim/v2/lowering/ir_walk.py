@@ -26,6 +26,7 @@ from .calls import CallsMixin
 from .dtypes import dtype_of, type_key
 from .host_prelude import PreludeMixin
 from .memory import MemoryMixin, MemRef, _Unsupported, escaped_locals, handle, promotable_locals
+from .tile_checks import tile_rejection
 from .uninit import maybe_uninit_locals
 
 
@@ -429,7 +430,9 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin):
 
     def stmt_tirx_For(self, node: Any) -> None:
         kind = int(node.kind)
-        if kind not in (0, 3):  # SERIAL, UNROLLED (kept as loops: decision 2)
+        # SERIAL, VECTORIZED, UNROLLED: kept as loops (decision 2). A vectorized
+        # loop is one thread's elementwise work, so serial order is exact.
+        if kind not in (0, 2, 3):
             raise _Unsupported(node, f"for-loop kind {kind}")
         if node.thread_binding is not None:
             raise _Unsupported(node, "thread-bound loop")
@@ -852,13 +855,21 @@ def dispatch_tile_primitives(func: Any) -> Any:
     unchanged; a dispatch failure leaves the tile op in place (fail closed).
     """
     found = False
+    unknown: list[str] = []
 
     def on_tile(node: Any, visitor: Any) -> None:
         nonlocal found
         found = True
+        reason = tile_rejection(node)
+        if reason is not None:
+            unknown.append(reason)
 
     structural_visit(func.body, [(tirx.TilePrimitiveCall, on_tile)])
     if not found:
+        return func
+    if unknown:
+        # Legacy fail-closed rules TVM's dispatch does not enforce (tile_checks).
+        _DISPATCH_ERRORS[id(func)] = "; ".join(unknown)
         return func
     attrs = func.attrs
     arch = str(attrs["tirx.cuda_arch"]) if attrs is not None and "tirx.cuda_arch" in attrs else "sm_100a"
@@ -874,6 +885,7 @@ def dispatch_tile_primitives(func: Any) -> Any:
 _DISPATCH_ERRORS: dict[int, str] = {}
 
 
+
 def lower_module(funcs: Any, *, strict: bool = True) -> pb.Module:
     """Lower one PrimFunc or a sequence (kernels launched in order)."""
     items = list(funcs) if isinstance(funcs, (list, tuple)) else [funcs]
@@ -883,55 +895,28 @@ def lower_module(funcs: Any, *, strict: bool = True) -> pb.Module:
     return pb.Module(kernels=programs)
 
 
-_BY_VALUE_KINDS = ("Scalar", "TensorMap")
-
-
-def _slot_signature(slot: pb.ParamSlot, program: pb.Program) -> Any:
-    space = None if slot.buf is None else program.buffers[slot.buf].space
-    dtype = None if slot.dtype is None else (slot.dtype.elem, slot.dtype.lanes)
-    return (slot.kind, dtype, space)
-
-
 def qualify_module_slots(programs: list[pb.Program]) -> None:
     """Keep canonical slot names unique per binding across a Module (V2C-7).
 
-    A canonical name is one binding for the whole Module, so memory params
-    (global buffers, pointers) that several kernels name alike stay shared:
-    launches in order see each other's writes. Per-launch values (scalars,
-    tensor maps, Param-space byte blobs) and params whose declarations
-    disagree across kernels are renamed ``k<i>:<name>``; the local name stays
-    the signature name, so the binder accepts ``k<i>:<name>`` (and the bare
-    name only while it is unambiguous).
+    A canonical name is one binding for the whole Module, but kernels of one
+    Module are often unrelated (a test artifact bundling many kernels) and
+    reuse parameter names for different arrays. Every slot name that more than
+    one kernel declares is therefore renamed ``k<i>:<name>`` (the legacy
+    kernel-qualified binding key); the local name stays the signature name.
+    Kernels that really share memory are bound to the same host array, which
+    the binder aliases onto one allocation (W8-6 identical-span aliasing), so
+    launches in order still see each other's writes. Names declared by a
+    single kernel stay bare.
     """
-    seen: dict[str, list[tuple[int, pb.ParamSlot]]] = {}
+    owners: dict[str, set[int]] = {}
     for index, program in enumerate(programs):
         for slot in program.host_abi:
-            seen.setdefault(slot.name, []).append((index, slot))
-    renamed: dict[tuple[int, int], str] = {}
-    for name, uses in seen.items():
-        if len({index for index, _ in uses}) < 2:
-            continue
-        signatures = {_slot_signature(slot, programs[index]) for index, slot in uses}
-        by_value = any(
-            slot.kind in _BY_VALUE_KINDS
-            or (slot.buf is not None and programs[index].buffers[slot.buf].space == "Param")
-            for index, slot in uses
-        )
-        if len(signatures) == 1 and not by_value:
-            continue
-        for index, slot in uses:
-            renamed[(index, id(slot))] = f"k{index}:{name}"
+            owners.setdefault(slot.name, set()).add(index)
     for index, program in enumerate(programs):
         for slot in program.host_abi:
-            qualified = renamed.get((index, id(slot)))
-            if qualified is None and slot.shape_of is not None:
-                # Implicit shapes follow their buffer's identity.
-                base = program.host_abi[slot.shape_of[0]]
-                if (index, id(base)) in renamed:
-                    qualified = f"k{index}:{slot.name}"
-            if qualified is not None:
+            if len(owners[slot.name]) > 1:
                 slot.local_name = slot.local_name or slot.name
-                slot.name = qualified
+                slot.name = f"k{index}:{slot.name}"
 
 
 __all__ = ["LoweringUnsupported", "Lowerer", "lower", "lower_module", "qualify_module_slots"]
