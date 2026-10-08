@@ -100,7 +100,8 @@ def findings_of(checker: str, payload: Mapping[str, Any]) -> list[Finding]:
                 id=_finding_id(checker, record),
                 status=status,
                 kind=str(record.get("kind", key)),
-                message=str(record.get("message", "")),
+                # An incomplete record may carry its reason without a message.
+                message=str(record.get("message") or record.get("reason") or ""),
                 details=dict(record),
             )
             out.setdefault(finding.id, finding)
@@ -542,10 +543,19 @@ def render(report: _Report) -> str:
     for finding in findings:
         where = _location(finding.details)
         lines.append(f"  [{finding.status.upper()}] {finding.kind}: {finding.message}".rstrip())
+        # Same order as legacy checker_render: classification lines, the
+        # evidence (location, bytes), then the hint.
+        for key, label in (("access_pair", "Access pair"), ("reason", "Reason"), ("cause", "Cause")):
+            value = finding.details.get(key)
+            if isinstance(value, (str, int)) and value != "":
+                lines.append(f"    {label}: {value}")
         if where:
             lines.append(f"    at {where}")
         for overlap in finding.details.get("overlaps") or ():
             lines.append(f"    bytes [{overlap['byte_offset']}, {overlap['byte_end']})")
+        hint = finding.details.get("hint")
+        if hint:
+            lines.append(f"    Hint: {hint}")
     return "\n".join(lines)
 
 

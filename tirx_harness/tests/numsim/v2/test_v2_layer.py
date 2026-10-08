@@ -355,3 +355,28 @@ def test_public_checkers_report_missing_bindings_as_incomplete(module, monkeypat
         assert finding.details["bindings"] == ["b", "c"]
     with pytest.raises(v2.InputError):
         v2.Engine().run(module, {"a": np.zeros(1024, np.float32)})
+
+
+def test_renderer_prints_classification_and_hint():
+    """The one renderer keeps legacy's lines: Access pair / Reason / Cause,
+    the location and bytes, then ``Hint:`` (legacy ``checker_render``)."""
+
+    record = {
+        "kind": "data_race", "status": "error", "message": "write_read conflict",
+        "access_pair": "write_read", "reason": "missing_release_acquire",
+        "hint": "If this access relies on a hand-written spin wait, consider wait_until.",
+        "sources": [{"site": 0, "source_span": {"kind": "span", "source_name": "k.py", "line": 7,
+                                                 "column": 1, "end_line": 7, "end_column": 9}}],
+        "overlaps": [{"byte_offset": 0, "byte_len": 4, "byte_end": 4}],
+    }
+    payload = rep.phase_payload(checker="racecheck", phase_index=0, phase_name="k", records=[record],
+                                status={"kind": "completed"}, diagnostics=[])
+    lines = rep.RaceReport([rep.AnalysisResult("racecheck", payload)]).format().splitlines()
+    body = lines[lines.index("  [ERROR] data_race: write_read conflict"):]
+    assert body[1:] == [
+        "    Access pair: write_read",
+        "    Reason: missing_release_acquire",
+        "    at k.py:7",
+        "    bytes [0, 4)",
+        "    Hint: If this access relies on a hand-written spin wait, consider wait_until.",
+    ]
