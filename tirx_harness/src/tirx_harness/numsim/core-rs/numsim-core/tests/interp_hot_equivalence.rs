@@ -447,3 +447,64 @@ fn vector_store_fast_path() {
         }
     }
 }
+
+/// Register files of at least `interp::DEFER_REGS_BYTES` are allocated at a
+/// warp's first step. (1) A launch that stops on a trap in its first warp
+/// leaves the other warps never stepped (never allocated): the run still
+/// returns the same status as with an eagerly allocated file. (2) A
+/// completed run reads registers placed past the deferral threshold.
+#[test]
+fn deferred_register_files() {
+    fn trap_program(pad: u32) -> numsim_core::Module {
+        let mut b = ProgramBuilder::new("deferred_trap", 64);
+        b.grid(3, 1, 1);
+        for _ in 0..pad {
+            b.reg(Ty::U32);
+        }
+        let f = b.konst(Ty::PRED, 0);
+        b.push(Instr::Assert { cond: f, msg: None });
+        b.exit();
+        b.build_module()
+    }
+    let slots = numsim_core::interp::DEFER_REGS_BYTES / 256;
+    let big = sched::run_with_config(&trap_program(slots as u32 + 8), &Default::default(), &mut NoopObserver, &Default::default()).unwrap();
+    let small = sched::run_with_config(&trap_program(0), &Default::default(), &mut NoopObserver, &Default::default()).unwrap();
+    match (&big.status, &small.status) {
+        (RunStatus::Error(a), RunStatus::Error(b)) => {
+            assert_eq!((a.kind.clone(), a.warp, a.pc, a.lanes, &a.message), (b.kind.clone(), b.warp, b.pc, b.lanes, &b.message));
+        }
+        other => panic!("expected the trap in both runs, got {other:?}"),
+    }
+    assert_eq!(big.stats, small.stats);
+
+    // Completed run: every thread writes and reads a register beyond the
+    // threshold (slot > DEFER_REGS_BYTES / 256).
+    let mut b = ProgramBuilder::new("deferred_regs", 64);
+    b.grid(2, 1, 1);
+    let out = b.global("out", Dtype::U32);
+    let tid = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let idx = b.reg(Ty::U32);
+    for _ in 0..slots + 8 {
+        b.reg(Ty::U32);
+    }
+    let far = b.reg(Ty::U32);
+    b.thread_rank(tid);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let k3 = b.k_u32(3);
+    b.mul(Ty::U32, far, tid, k3);
+    let k64 = b.k_u32(64);
+    b.mul(Ty::U32, idx, cta, k64);
+    b.add_u32(idx, idx, tid);
+    b.add_u32(far, far, cta);
+    b.st_u32(out, idx, far);
+    b.exit();
+    let o = sched::run_with_config(&b.build_module(), &inputs(vec![("out", u32_buf(vec![0; 128]))]), &mut NoopObserver, &Default::default()).unwrap();
+    assert_eq!(o.status, RunStatus::Completed, "{:?}", o.status);
+    let got: Vec<u32> = o.outputs.buffers["out"].0.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    for c in 0..2u32 {
+        for t in 0..64u32 {
+            assert_eq!(got[(c * 64 + t) as usize], t * 3 + c);
+        }
+    }
+}

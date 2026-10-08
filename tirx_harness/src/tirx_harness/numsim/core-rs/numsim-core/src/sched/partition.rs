@@ -76,6 +76,8 @@ pub(crate) struct EventBuffer {
     events: Vec<Event>,
     /// Lane spans of the buffered accesses (`OwnedAccess::spans`).
     spans: Vec<LaneSpan>,
+    /// Number of buffered `Event::Access` entries.
+    accesses: u64,
 }
 
 impl EventBuffer {
@@ -119,6 +121,7 @@ impl EventBuffer {
     /// Deliver and clear the buffered events; `Access::seq` is assigned
     /// here, in delivery order.
     pub fn replay(&mut self, observer: &mut dyn Observer, next_seq: &mut u64) {
+        debug_assert_eq!(self.accesses, self.events.iter().filter(|e| matches!(e, Event::Access(_))).count() as u64);
         let pool = &self.spans;
         for e in self.events.drain(..) {
             match e {
@@ -149,16 +152,18 @@ impl EventBuffer {
             }
         }
         self.spans.clear();
+        self.accesses = 0;
     }
 
     pub fn clear(&mut self) {
         self.events.clear();
         self.spans.clear();
+        self.accesses = 0;
     }
 
     /// Buffered accesses (each takes one `Access::seq` at replay).
     pub fn access_count(&self) -> u64 {
-        self.events.iter().filter(|e| matches!(e, Event::Access(_))).count() as u64
+        self.accesses
     }
 }
 
@@ -175,6 +180,7 @@ impl Observer for EventBuffer {
         }
         let at = self.spans.len();
         self.spans.extend_from_slice(a.spans);
+        self.accesses += 1;
         self.events.push(Event::Access(OwnedAccess {
             actor: a.actor,
             site: a.site,
@@ -237,7 +243,7 @@ impl Partition {
             counters: LaunchCounters::default(),
             completions: 0,
             rng: Rng::new(seed ^ ((first_cluster as u64 + 1) << 32)),
-            events: EventBuffer { enabled: observing, history, events: Vec::new(), spans: Vec::new() },
+            events: EventBuffer { enabled: observing, history, events: Vec::new(), spans: Vec::new(), accesses: 0 },
             serial: Vec::new(),
             ends: Vec::new(),
             deferred: Vec::new(),

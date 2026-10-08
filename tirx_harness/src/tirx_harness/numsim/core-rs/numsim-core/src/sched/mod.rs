@@ -780,7 +780,7 @@ impl<'p> Scheduler<'p> {
             let mut warps = Vec::with_capacity(wpc as usize);
             for w in 0..wpc {
                 let wid = WarpId(cid.0 * wpc + w);
-                let mut ws = WarpState::new(wid, cid, w, nslots, shape.warp_lanes(w));
+                let mut ws = WarpState::new_deferred(wid, cid, w, nslots, shape.warp_lanes(w));
                 if self.loaded.local_per_lane > 0 {
                     let size = self.loaded.local_per_lane * 32;
                     let a = match self.free_local.pop() {

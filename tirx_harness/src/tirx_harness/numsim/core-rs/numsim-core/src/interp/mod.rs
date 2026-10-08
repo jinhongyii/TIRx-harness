@@ -152,6 +152,9 @@ pub struct WarpState {
     pub suspended: Vec<Suspension>,
     /// Exact memo of [`WarpState::spin_hash`] (W13): the last hashed state.
     pub spin_memo: Option<Box<SpinMemo>>,
+    /// Register slots still to allocate (zeroed) before the warp's first
+    /// instruction ([`WarpState::new_deferred`]); 0 once allocated.
+    pub pending_slots: usize,
 }
 
 /// The last state [`WarpState::spin_hash`] hashed, with its hash. A spin
@@ -163,6 +166,10 @@ pub struct SpinMemo {
     hash: u64,
     regs: Vec<WarpValue<u64>>,
 }
+
+/// Register files at least this large are allocated at the warp's first
+/// step ([`WarpState::new_deferred`]).
+pub const DEFER_REGS_BYTES: usize = 128 << 10;
 
 /// A zeroed register file of `n` slots from one zeroed allocation (W13).
 /// `RegFile::new` builds it slot by slot (`vec!` only uses a zeroed
@@ -295,6 +302,33 @@ impl WarpState {
             regbuf: None,
             suspended: Vec::new(),
             spin_memo: None,
+            pending_slots: 0,
+        }
+    }
+
+    /// [`WarpState::new`] whose register file, when it is at least
+    /// [`DEFER_REGS_BYTES`], is allocated (zeroed) by the warp's first
+    /// [`step_warp`] on whichever worker runs it, instead of at admission on
+    /// the scheduler thread (W13: a Mega MoE launch admits 2,368 warps of
+    /// ~910 KiB each at once). Smaller files stay eager: zeroed at admission
+    /// they come from fresh heap whose untouched pages are never faulted,
+    /// which first-step zeroing loses (measured 5x slower on rmsnorm).
+    pub fn new_deferred(id: WarpId, cta: CtaId, warp_in_cta: u32, nslots: usize, live: WarpMask) -> WarpState {
+        if nslots * std::mem::size_of::<WarpValue<u64>>() < DEFER_REGS_BYTES {
+            return WarpState::new(id, cta, warp_in_cta, nslots, live);
+        }
+        let mut w = WarpState::new(id, cta, warp_in_cta, 0, live);
+        w.pending_slots = nslots;
+        w
+    }
+
+    /// Allocate a deferred register file (all zero). The one place a
+    /// deferred file is materialized; registers are only read by executing
+    /// the warp (`step_warp`), which calls this first.
+    #[inline]
+    pub fn materialize_regs(&mut self) {
+        if self.pending_slots != 0 {
+            self.regs = zeroed_regs(std::mem::take(&mut self.pending_slots));
         }
     }
 
@@ -915,6 +949,7 @@ pub fn fall_off_end(ctx: &mut ExecCtx<'_>) -> StepResult {
 
 /// Interpreter: execute up to `quantum` instructions of `ctx.warp`.
 pub fn step_warp(ctx: &mut ExecCtx<'_>, quantum: u32) -> StepResult {
+    ctx.warp.materialize_regs();
     let program = ctx.program;
     for _ in 0..quantum {
         let pc = ctx.warp.pc;
