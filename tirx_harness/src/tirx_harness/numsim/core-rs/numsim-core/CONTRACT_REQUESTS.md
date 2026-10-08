@@ -2711,3 +2711,50 @@ Behaviour changes seen in this triage with no delta row yet (asserted as v2 beha
     0 bytes (`smem[cta0]`) and reported as out_of_bounds.
   - Legacy reports a null dereference. For W2: a generic address 0 should
     fail as `null`, not fall into the shared aperture.
+
+## W11-other-assertion (2026-10-08): public-API other-assertion triage
+
+The 25 public-API functions with class `other-assertion` in `scripts/numsim-v2/coverage/v2_public_status.tsv`, plus the one `v2-accepts-legacy-rejection` function, were rerun under `NUMSIM_IMPL=v2`. The full mapping is in `scripts/numsim-v2/coverage/v2_ports_w11.tsv`. Three v2 bugs remain. Each has a runnable reproducer in `tirx_harness/tests/numsim/v2/ports/test_w11_reproducers.py`; the reproducers assert the correct behaviour and are marked `v2_gap`, so an XPASS means the bug is fixed. The four W9-public-API bugs (discard alignment, `st.bulk` size, `isspacep.shared::cta` rank, generic shared window bits) were fixed by W2 during this pass ("W2 (2026-10-08): W9-public-API engine bugs fixed"), and their legacy tests now pass unchanged.
+
+### W11-1 [W1 lowering]: a guarded op with a `.pred` destination keeps the raw carrier value
+
+- **Legacy tests:**
+  - `tests/numsim/runtime/test_compare_predicates.py::test_compare_instruction_predicates[True]` and `[False]` (the `setp.*` and `testp.*` rows).
+  - `tests/numsim/runtime/test_mbarrier_maintenance.py::test_maintenance_predicates_and_carriers`, cases `(preserve=True, layout=1 or 0)` of `mbarrier.check_layout`.
+- **Reproducer:** `test_w11_1_guarded_pred_destination_is_a_boolean_carrier`. Every lane is predicated off, and `d[i] = 91` beforehand:
+  `T.ptx["setp.lt.s32"](d[0], 1, 2, pred=lane < 0, preserve_dst=True)`
+  `T.ptx["setp.lt.s32"](d[1], 1, 2, pred=lane < 0)`
+  `T.ptx["testp.normal.f32"](d[2], 1.0, pred=lane < 0, preserve_dst=True)`
+  `T.ptx["set.lt.u32.s32"](d[3], 1, 2, pred=lane < 0, preserve_dst=True)`
+- **Expected:** `[1, 0 or 1, 1, 91]`. Legacy gives `[1, 0, 1, 91]`. TVM's helpers bridge a `.pred` operand through a predicate register:
+  - `_pred_keep`: `setp.ne.b32 pd, %0, 0; @p setp... pd; selp.b32 %0, 1, 0, pd`, so a kept value becomes `old != 0`.
+  - `_pred_undef`: `selp.b32 %0, 1, 0, pd`, so the value is always 0 or 1.
+- **Actual:** `[91, 91, 91, 91]`. In the maintenance test, `-7` (0xFFFFFFF9) is kept raw where 1 is expected.
+- **Cause:** the same as the W9-public-API phase 6 [W1] `.pred` bridge item (`test_ptx_bitops`): `ptx_decode.decode` drops the `p<i>` flags. The fix requested there covers this: write `p<i>` destinations back as 0/1, *including the kept value* of a guarded or `preserve_dst` op. Destinations that are plain `uint32` keep their old value (numsim-behaviour-deltas P8).
+
+### W11-2 [W2 interp]: each `Ptx` op is resolved with the operand types of its first use only
+
+- **Legacy test:** `tests/numsim/runtime/test_cvt_carriers.py::test_cvt_carriers_truncate_extend_and_gate_reads[s]`. The modes 0 and 3 rows of every signed type with a wider destination carrier fail; `[u]` and `[f]` fail only on the P8 rows.
+- **Reproducer:** `test_w11_2_ptx_op_resolves_per_use_carrier_types`. `src = int8(-1)`, then:
+  `T.ptx["cvt.s8.s8"](h, src)` with an `int16` carrier
+  `T.ptx["cvt.s8.s8"](w, src)` with an `int32` carrier
+  `T.ptx["cvt.s8.s8"](q, src)` with an `int64` carrier
+- **Expected:** `h = w = q = -1`. This is sign extension to the destination register width, as legacy computes.
+- **Actual:** `h = -1`, `w = q = 0xFFFF`. Each call alone is correct.
+- **Cause:** `interp/mod.rs::Loaded::new` keeps "Operand types of the first use of each op" and calls `resolve_ptx(key, first_dst_tys, first_src_tys)` once per `OpId`. The `OpKey` is `(name, mods)` without operand types, so every later use with different carrier types runs the handler resolved for the first use's types. In the legacy test the first `cvt.s8.s8` form has an 8-bit destination, so the `int16`/`int32`/`int64` forms are zero-extended from 8 bits.
+- **Fix:** resolve per `(OpId, dst_tys, src_tys)`, for example a per-pc handler table. Alternatively, W1 can intern ops with the carrier types in `mods`, but that changes the `OpKey` contract (coordinator).
+
+### W11-3 [W1 lowering]: a `shared.dyn` pool is sized from its views, not from the committed `tirx.dyn_smem_bytes`
+
+- **Legacy test:** `tests/numsim/integration/test_reported_layout_regressions.py::test_explicit_shared_strides_still_reject_an_executed_oob_address` (class `v2-accepts-legacy-rejection`).
+- **Reproducer:** `test_w11_3_pool_access_beyond_committed_dyn_smem_is_out_of_bounds`. The kernel is verbatim:
+  ```
+  pool = T.SMEMPool()
+  scratch = pool.alloc((2, 4, 64), "float32", strides=(8192, 64, 1), align=16)
+  pool.commit()
+  if lane == 0: scratch[1, 0, 0] = 1.0
+  ```
+- **Expected:** `ExecutionError` `out_of_bounds`, as legacy raises. `SMEMPool.alloc` bumps by `prod(shape) * 4 = 2048` bytes, and `commit()` emits `tirx.dyn_smem_bytes = 2048`. On the GPU the CTA's dynamic shared memory is 2048 bytes, and `scratch[1, 0, 0]` is byte 32768.
+- **Actual:** the run completes, and racecheck and synccheck are clean. The lowered `pool_buf` has `byte_len = 33792`.
+- **Cause:** `lowering/memory.py::finish_shared` sizes a dynamic pool as `max(view extents, dyn_smem_bytes)`, so a view whose strided extent overruns the committed pool silently enlarges it.
+- **Fix:** when `tirx.dyn_smem_bytes` is present, use it as the pool size and let the view's accesses be bounds-checked against it. A view that is larger than the pool could also be flagged at lowering time.
