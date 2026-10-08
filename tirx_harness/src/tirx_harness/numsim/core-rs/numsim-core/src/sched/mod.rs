@@ -72,22 +72,21 @@
 //!   change behaviour, so buffering is invisible).
 //! * **Grid barrier / cooperative launches** stay single-threaded.
 
+mod partition;
+mod pool;
+
+pub use partition::Partition;
+use partition::{sched_error, Env};
+
 use crate::arena::{addr, AllocId, Arena, BitSet, ByteSpan, Init, Owner, Space, ValidityPolicy, View};
-use crate::interp::support::{self, AccessSpec, Accesses};
-use crate::interp::{
-    step_warp, BufBinding, CtaCtx, ExecCtx, ExecError, ExecErrorKind, LaunchAux, LaunchCounters, Loaded, StepResult,
-    WarpState, WarpStatus, WarpStepFn,
-};
-use crate::observe::{
-    AccessKind, Actor, CtaId, LaneSpan, LaunchInfo, Observer, ProtocolStatus, PublishTarget, Side, SyncEvent, SyncKind,
-    WarpEnd, WarpId, Window, ALL_LANES,
-};
+use crate::interp::support;
+use crate::interp::{step_warp, BufBinding, CtaCtx, ExecError, ExecErrorKind, LaunchAux, Loaded, WarpState, WarpStatus, WarpStepFn};
+use crate::observe::{Actor, CtaId, LaunchInfo, Observer, ProtocolStatus, SyncEvent, SyncKind, WarpEnd, WarpId};
 use crate::oplib::OpErrorKind;
-use crate::program::{Instr, LaunchShape, Module, ParamKind, Pc, Program, Scope, Sem};
+use crate::program::{Instr, LaunchShape, Module, ParamKind, Program};
 use crate::report::Finding;
 use crate::site::SiteId;
-use crate::sync::completion::Payload;
-use crate::sync::{async_group, cluster, mbarrier, setmaxnreg, Completion, Outcome, Policy, ResourceId, ResourceInit, Step, SyncCmd, SyncError, SyncTable};
+use crate::sync::{async_group, cluster, mbarrier, setmaxnreg, Policy, ResourceId, ResourceInit, SyncCmd, SyncError, SyncTable};
 use crate::value::WarpMask;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -310,18 +309,13 @@ pub struct Scheduler<'p> {
     pub kernel_index: u32,
     pub shape: LaunchShape,
     pub config: RunConfig,
-    /// Resident CTAs (cluster-contiguous, in admission order).
-    pub ctas: Vec<CtaState>,
-    pub sync: SyncTable,
-    pub rng: Rng,
+    /// Resident partitions, in admission (cluster) order.
+    pub partitions: Vec<Partition>,
     pub round: u64,
     pub stats: RunStats,
     pub loaded: Loaded,
-    pub aux: LaunchAux,
-    pub counters: LaunchCounters,
     /// Kernel parameter block.
     pub params: AllocId,
-    outbox: Vec<InboxMsg>,
     /// Buffer bindings (identical for every CTA: shared bindings are
     /// window-relative).
     bindings: Vec<BufBinding>,
@@ -332,6 +326,20 @@ pub struct Scheduler<'p> {
     free_local: Vec<AllocId>,
     ends: BTreeMap<WarpId, WarpEnd>,
     observing: bool,
+    wants_history: bool,
+    /// One partition for every cluster (grid-wide state); see `single_partition`.
+    single: bool,
+    /// Next `Access::seq` (assigned at replay).
+    next_seq: u64,
+    /// Exit-check violations of retired partitions.
+    leftovers: Vec<(ResourceId, SyncError)>,
+    /// Review diagnostics (uninitialized reads), in partition order.
+    pub diagnostics: Vec<Finding>,
+    /// Instructions of retired partitions.
+    retired_instrs: u64,
+    retired_completions: u64,
+    /// Declared words seeded into new partitions (launch-scope regions).
+    launch_words: crate::interp::aux::WordTable,
 }
 
 /// Linear cluster id and rank of a CTA (ctaid coordinates).
@@ -356,10 +364,6 @@ fn cta_coords(shape: &LaunchShape, id: u32, rank: u32) -> [u32; 3] {
 
 fn linear(shape: &LaunchShape, c: [u32; 3]) -> u32 {
     c[0] + c[1] * shape.grid[0] + c[2] * shape.grid[0] * shape.grid[1]
-}
-
-fn sched_error(kind: ExecErrorKind, kernel: u32, warp: WarpId, site: SiteId, message: String) -> ExecError {
-    ExecError { kind, kernel, warp, pc: Pc(0), site, lanes: WarpMask::NONE, message }
 }
 
 /// The error kinds that mean "coverage could not be established".
@@ -422,8 +426,8 @@ impl<'p> Scheduler<'p> {
         }
         let scalar = |arena: &Arena, p: crate::program::ParamId| -> Option<i64> {
             let off = *loaded.param_offsets.get(p.0 as usize)? as usize;
-            let b = &arena.get(params).bytes;
-            Some(i64::from_le_bytes(b[off..off + 8].try_into().ok()?))
+            let b = arena.read_raw(params, ByteSpan::new(off as u64, 8));
+            Some(i64::from_le_bytes(b.try_into().ok()?))
         };
         // Buffer bindings.
         let n = program.buffers.len();
@@ -473,7 +477,9 @@ impl<'p> Scheduler<'p> {
                     BufBinding::Local { offset, per_lane } => {
                         BufBinding::Local { offset: offset + d.base, per_lane: len.unwrap_or(per_lane.saturating_sub(d.base)) }
                     }
-                    BufBinding::Tmem { base_col, cols } => BufBinding::Tmem { base_col: base_col + d.base as u32, cols },
+                    BufBinding::Tmem { base_col, cols, base_reg } => {
+                        BufBinding::Tmem { base_col: base_col + d.base as u32, cols, base_reg: d.base_reg.or(base_reg) }
+                    }
                     BufBinding::Unbound => BufBinding::Unbound,
                 }
             } else {
@@ -488,7 +494,7 @@ impl<'p> Scheduler<'p> {
                                 ParamKind::TensorMap => BufBinding::View(View { alloc: params, offset: poff, len: 128 }),
                                 ParamKind::Buffer | ParamKind::Pointer => {
                                     let va = u64::from_le_bytes(
-                                        arena.get(params).bytes[poff as usize..poff as usize + 8].try_into().unwrap(),
+                                        arena.read_raw(params, ByteSpan::new(poff, 8)).try_into().unwrap(),
                                     );
                                     match arena.resolve_global(va, 0) {
                                         Ok((alloc, off)) => {
@@ -514,7 +520,11 @@ impl<'p> Scheduler<'p> {
                     },
                     Space::Tmem => {
                         let cols = d.shape.last().and_then(|e| e.eval(&|p| scalar(arena, p))).unwrap_or(addr::TMEM_COLS as i64);
-                        BufBinding::Tmem { base_col: d.base as u32, cols: cols.clamp(1, addr::TMEM_COLS as i64) as u32 }
+                        BufBinding::Tmem {
+                            base_col: d.base as u32,
+                            cols: cols.clamp(1, addr::TMEM_COLS as i64) as u32,
+                            base_reg: d.base_reg,
+                        }
                     }
                     Space::Reg => BufBinding::Unbound,
                 }
@@ -527,34 +537,34 @@ impl<'p> Scheduler<'p> {
         }
         let bindings: Vec<BufBinding> = bindings.into_iter().map(|b| b.unwrap_or(BufBinding::Unbound)).collect();
 
-        let wpc = shape.warps_per_cta();
-        let init = ResourceInit { policy: Policy::Numeric, cluster_warps: shape.ctas_per_cluster() * wpc, warps_per_cta: wpc };
         let mut pending: VecDeque<u32> = (0..shape.num_clusters()).collect();
         if let Some(s) = &config.subset {
             pending.retain(|c| s.contains(c));
         }
-        let aux = LaunchAux { kernel: kernel_index, ..LaunchAux::default() };
         Ok(Scheduler {
             program,
             kernel_index,
             shape,
-            rng: Rng::new(config.seed),
             config,
-            ctas: Vec::new(),
-            sync: SyncTable::new(init),
+            partitions: Vec::new(),
             round: 0,
             stats: RunStats::default(),
             loaded,
-            aux,
-            counters: LaunchCounters::default(),
             params,
-            outbox: Vec::new(),
             bindings,
             pending,
             free_cta: Vec::new(),
             free_local: Vec::new(),
             ends: BTreeMap::new(),
             observing: false,
+            wants_history: false,
+            single: false,
+            next_seq: 0,
+            leftovers: Vec::new(),
+            diagnostics: Vec::new(),
+            retired_instrs: 0,
+            retired_completions: 0,
+            launch_words: Default::default(),
         })
     }
 
@@ -570,13 +580,63 @@ impl<'p> Scheduler<'p> {
             || self.program.code.iter().any(|i| matches!(i, Instr::GridSync))
     }
 
-    /// Admit cluster `id`: allocate its CTAs and warps.
+    /// Launches with launch-wide state run as one partition: cooperative /
+    /// `grid.sync` (grid barrier), declared synchronization words /
+    /// `wait_until` (a word's history is one stream), and kernels mixing
+    /// `cta_group` values (the kernel-wide tcgen05 rule). Independent of the
+    /// worker count and of the observer.
+    fn single_partition(&self) -> bool {
+        let p = self.program;
+        let mut groups = std::collections::BTreeSet::new();
+        for i in &p.code {
+            let g = match i {
+                Instr::TcgenAlloc { cta_group, .. }
+                | Instr::TcgenDealloc { cta_group, .. }
+                | Instr::TcgenRelinquish { cta_group }
+                | Instr::TcgenCommit { cta_group, .. } => Some(*cta_group),
+                Instr::TcgenMma(a) => Some(a.cta_group),
+                Instr::TcgenCp(a) => Some(a.cta_group),
+                _ => None,
+            };
+            if let Some(g) = g {
+                groups.insert(g.max(1));
+            }
+        }
+        // Never depends on the observer: observers must not change
+        // program-visible behaviour (and partitioning changes when other
+        // partitions' global writes become visible).
+        self.all_resident()
+            || groups.len() > 1
+            || p.buffers.iter().any(|b| b.sync_words)
+            || p.code.iter().any(|i| matches!(i, Instr::WaitUntil { .. }))
+    }
+
+    fn new_partition(&self, cluster: u32) -> Partition {
+        let wpc = self.shape.warps_per_cta();
+        let init = ResourceInit { policy: Policy::Numeric, cluster_warps: self.shape.ctas_per_cluster() * wpc, warps_per_cta: wpc };
+        let mut aux = LaunchAux { kernel: self.kernel_index, wants_history: self.wants_history, ..LaunchAux::default() };
+        aux.words = self.launch_words.clone();
+        // Async op ids are partition-scoped so they do not depend on the
+        // order partitions run in.
+        aux.next_async = (cluster as u64 + 1) << 40;
+        Partition::new(cluster, SyncTable::new(init), aux, self.config.seed, self.observing, self.wants_history)
+    }
+
+    /// Admit cluster `id`: allocate its CTAs and warps into a partition.
     fn admit(&mut self, id: u32, arena: &mut Arena, observer: &mut dyn Observer) -> Result<(), ExecError> {
         let shape = self.shape;
         let n = shape.ctas_per_cluster().max(1);
         let wpc = shape.warps_per_cta();
         let nslots = *self.loaded.slots.last().unwrap_or(&0) as usize;
         let tmem_bytes = if self.loaded.uses_tmem { addr::TMEM_BYTES } else { 0 };
+        let pi = if self.single && !self.partitions.is_empty() {
+            self.partitions[0].clusters.push(id);
+            0
+        } else {
+            let p = self.new_partition(id);
+            self.partitions.push(p);
+            self.partitions.len() - 1
+        };
         let mut ctas: Vec<CtaCtx> = Vec::with_capacity(n as usize);
         for rank in 0..n {
             let c = cta_coords(&shape, id, rank);
@@ -596,8 +656,9 @@ impl<'p> Scheduler<'p> {
                     arena.alloc(Space::Tmem, Owner::Cta(cid.0), &format!("tmem[cta{}]", cid.0), tmem_bytes, Init::Uninit),
                 ),
             };
-            self.aux.owner_cta.insert(smem, cid);
-            self.aux.owner_cta.insert(tmem, cid);
+            let part = &mut self.partitions[pi];
+            part.aux.owner_cta.insert(smem, cid);
+            part.aux.owner_cta.insert(tmem, cid);
             ctas.push(CtaCtx {
                 id: cid,
                 ctaid: c,
@@ -645,31 +706,51 @@ impl<'p> Scheduler<'p> {
                 if self.observing {
                     let size = self.program.regs.len() as u64 * 32 * 8;
                     let ra = arena.alloc(Space::Reg, Owner::Warp(wid.0), &format!("regs[w{}]", wid.0), size, Init::Uninit);
+                    let part = &mut self.partitions[pi];
                     let i = wid.0 as usize;
-                    if self.aux.reg_allocs.len() <= i {
-                        self.aux.reg_allocs.resize(i + 1, AllocId(u32::MAX));
+                    if part.aux.reg_allocs.len() <= i {
+                        part.aux.reg_allocs.resize(i + 1, AllocId(u32::MAX));
                     }
-                    self.aux.reg_allocs[i] = ra;
+                    part.aux.reg_allocs[i] = ra;
                     self.host_event(observer, SyncKind::AllocBegin { alloc: ra, space: Space::Reg, size, cta: cid });
                 }
                 warps.push(ws);
             }
             // Declared words in the shared window.
-            if self.aux.wants_history {
+            if self.wants_history {
                 for (i, b) in self.program.buffers.iter().enumerate() {
                     if let (true, BufBinding::SharedWindow { offset, len }) = (b.sync_words, self.bindings[i]) {
                         let span = ByteSpan::new(offset as u64, len);
-                        self.aux.words.declare(arena, ctx.smem, span);
+                        self.partitions[pi].aux.words.declare(arena, ctx.smem, span);
                         self.host_event(observer, SyncKind::DeclareWord { alloc: ctx.smem, span });
                     }
                 }
             }
+            let part = &mut self.partitions[pi];
             if self.program.topology.regs_per_thread != 0 {
                 let res = ResourceId::RegPool { cta: cid };
                 let cmd = SyncCmd::RegPool(setmaxnreg::Cmd::Configure { count: self.program.topology.regs_per_thread });
-                self.sync.step(res, cmd).map_err(|e| {
+                part.sync.step(res, cmd).map_err(|e| {
                     sched_error(ExecErrorKind::Protocol(e.clone()), self.kernel_index, WarpId(cid.0 * wpc), SiteId::NONE, format!("{e:?}"))
                 })?;
+                // Launch-bounds register budget: a host-side protocol command
+                // that precedes every warp of the CTA.
+                if self.observing {
+                    observer.sync(&SyncEvent {
+                        kernel: self.kernel_index,
+                        actor: Actor::Host,
+                        seq: 0,
+                        site: SiteId::NONE,
+                        frames: Vec::new(),
+                        lanes: WarpMask::NONE,
+                        kind: SyncKind::Protocol {
+                            cmds: vec![crate::observe::ProtocolCmd { res, cmd, counts: Default::default(), observed_parity: None }],
+                            collective: None,
+                            issued: Vec::new(),
+                            status: ProtocolStatus::Committed,
+                        },
+                    });
+                }
             }
             if self.loaded.uses_cluster_barrier {
                 // Lanes beyond the CTA's thread count never take part.
@@ -679,54 +760,72 @@ impl<'p> Scheduler<'p> {
                         let res = ResourceId::Cluster { cluster: id };
                         let warp = ctx.rank_in_cluster * wpc + ws.warp_in_cta;
                         let cmd = SyncCmd::Cluster(cluster::Cmd::Exit { warp, lanes: missing.bits() });
-                        self.sync.step(res, cmd).map_err(|e| {
+                        part.sync.step(res, cmd).map_err(|e| {
                             sched_error(ExecErrorKind::Internal, self.kernel_index, ws.id, SiteId::NONE, format!("{e:?}"))
                         })?;
                     }
                 }
             }
-            self.ctas.push(CtaState { ctx, warps, inbox: Inbox::default(), buffers: self.bindings.clone() });
+            part.ctas.push(CtaState { ctx, warps, inbox: Inbox::default(), buffers: self.bindings.clone() });
         }
         Ok(())
     }
 
-    /// Retire finished clusters (all CTAs of the cluster finished) and
-    /// admit pending ones. Returns whether anything changed.
+    /// Retire finished clusters and empty partitions, admit pending
+    /// clusters. Returns whether anything changed.
     fn turnover(&mut self, arena: &mut Arena, observer: &mut dyn Observer) -> Result<bool, ExecError> {
         let mut changed = false;
-        let mut i = 0;
-        while i < self.ctas.len() {
-            let cl = self.ctas[i].ctx.cluster;
-            let mut j = i;
-            while j < self.ctas.len() && self.ctas[j].ctx.cluster == cl {
-                j += 1;
-            }
-            let done = self.ctas[i..j].iter().all(|c| c.finished() && c.inbox.msgs.is_empty());
-            // Async ops still writing into the cluster keep it resident.
-            let busy = self.sync.async_ops.iter().any(|op| self.ctas[i..j].iter().any(|c| c.ctx.id == op.source.cta));
-            if done && !busy && !self.pending.is_empty() {
-                let gone: Vec<CtaState> = self.ctas.drain(i..j).collect();
-                for c in gone {
-                    for a in [c.ctx.smem, c.ctx.tmem] {
-                        self.host_event(observer, SyncKind::AllocEnd { alloc: a });
+        if !self.pending.is_empty() {
+            for pi in 0..self.partitions.len() {
+                let mut i = 0;
+                while i < self.partitions[pi].ctas.len() {
+                    let part = &self.partitions[pi];
+                    let cl = part.ctas[i].ctx.cluster;
+                    let mut j = i;
+                    while j < part.ctas.len() && part.ctas[j].ctx.cluster == cl {
+                        j += 1;
                     }
-                    self.free_cta.push((c.ctx.smem, c.ctx.tmem));
-                    for w in c.warps {
-                        if let Some(a) = w.local {
-                            self.host_event(observer, SyncKind::AllocEnd { alloc: a });
-                            self.free_local.push(a);
+                    let done = part.ctas[i..j].iter().all(|c| c.finished() && c.inbox.msgs.is_empty());
+                    // Async ops still writing into the cluster keep it resident.
+                    let busy = part.sync.async_ops.iter().any(|op| part.ctas[i..j].iter().any(|c| c.ctx.id == op.source.cta));
+                    if done && !busy {
+                        let gone: Vec<CtaState> = self.partitions[pi].ctas.drain(i..j).collect();
+                        self.partitions[pi].clusters.retain(|&c| c != cl);
+                        for c in gone {
+                            for a in [c.ctx.smem, c.ctx.tmem] {
+                                self.host_event(observer, SyncKind::AllocEnd { alloc: a });
+                            }
+                            self.free_cta.push((c.ctx.smem, c.ctx.tmem));
+                            for w in c.warps {
+                                if let Some(a) = w.local {
+                                    self.host_event(observer, SyncKind::AllocEnd { alloc: a });
+                                    self.free_local.push(a);
+                                }
+                            }
                         }
+                        changed = true;
+                        continue;
                     }
+                    i = j;
                 }
-                changed = true;
-                continue;
             }
-            i = j;
+            // Drop emptied partitions (their exit checks are final).
+            let mut k = 0;
+            while k < self.partitions.len() {
+                if self.partitions[k].ctas.is_empty() && self.partitions[k].sync.async_ops.is_empty() {
+                    let p = self.partitions.remove(k);
+                    self.leftovers.extend(p.sync.quiescent());
+                    self.retired_instrs += p.counters.instrs;
+                    self.retired_completions += p.completions;
+                    continue;
+                }
+                k += 1;
+            }
         }
         let cap = if self.all_resident() { u32::MAX } else { self.config.max_resident_ctas };
         let per = self.shape.ctas_per_cluster().max(1);
         while let Some(&id) = self.pending.front() {
-            let resident = self.ctas.len() as u32;
+            let resident: u32 = self.partitions.iter().map(|p| p.ctas.len() as u32).sum();
             if resident > 0 && resident + per > cap {
                 break;
             }
@@ -755,7 +854,8 @@ impl<'p> Scheduler<'p> {
             },
         };
         self.observing = observer.enabled();
-        self.aux.wants_history = self.observing && observer.wants_word_history();
+        self.wants_history = self.observing && observer.wants_word_history();
+        self.single = self.single_partition();
         observer.begin_launch(&LaunchInfo { program: self.program, kernel_index: self.kernel_index, shape: self.shape, arena });
         // Launch-scope allocations and declared global words.
         if self.observing {
@@ -775,16 +875,31 @@ impl<'p> Scheduler<'p> {
                 self.host_event(observer, SyncKind::AllocBegin { alloc: a, space, size, cta: CtaId(u32::MAX) });
             }
         }
-        if self.aux.wants_history {
+        if self.wants_history {
             for (i, b) in self.program.buffers.iter().enumerate() {
                 if let (true, BufBinding::View(v)) = (b.sync_words, self.bindings[i]) {
                     let span = ByteSpan::new(v.offset, v.len);
-                    self.aux.words.declare(arena, v.alloc, span);
+                    self.launch_words.declare(arena, v.alloc, span);
                     self.host_event(observer, SyncKind::DeclareWord { alloc: v.alloc, span });
                 }
             }
         }
-        let status = match self.run_loop(arena, observer, step_fn) {
+        let workers = self.config.workers.max(1);
+        let result = if workers > 1 && !self.single {
+            // A launch-lifetime pool; the calling thread is one of the workers.
+            let pool = pool::Pool::new(workers - 1);
+            std::thread::scope(|scope| {
+                for _ in 0..workers - 1 {
+                    scope.spawn(|| pool.worker());
+                }
+                let r = self.run_loop(arena, observer, step_fn, Some(&pool));
+                pool.shutdown();
+                r
+            })
+        } else {
+            self.run_loop(arena, observer, step_fn, None)
+        };
+        let status = match result {
             Ok(s) => s,
             Err(e) => classify(e),
         };
@@ -792,51 +907,202 @@ impl<'p> Scheduler<'p> {
         status
     }
 
-    fn run_loop(&mut self, arena: &mut Arena, observer: &mut dyn Observer, step_fn: WarpStepFn) -> Result<RunStatus, ExecError> {
+    /// Replay partition `pi`'s buffered events and absorb its round results.
+    fn absorb(&mut self, pi: usize, observer: &mut dyn Observer) {
+        let p = &mut self.partitions[pi];
+        p.events.replay(observer, &mut self.next_seq);
+        for (w, e) in p.ends.drain(..) {
+            self.ends.insert(w, e);
+        }
+        self.diagnostics.append(&mut p.aux.diagnostics);
+    }
+
+    /// The parallel phase of a round: every partition runs its CTAs against
+    /// its own arena shard (or directly on `arena` when one partition is
+    /// resident), on up to `workers` threads. Shards are merged in partition
+    /// order; buffered events are replayed in partition order. Results do
+    /// not depend on the worker count.
+    fn parallel_phase(
+        &mut self,
+        arena: &mut Arena,
+        observer: &mut dyn Observer,
+        step_fn: WarpStepFn,
+        pool: Option<&pool::Pool>,
+    ) -> Result<bool, ExecError> {
+        let n = self.partitions.len();
+        if n == 0 {
+            return Ok(false);
+        }
+        if n == 1 {
+            let env = Env {
+                program: self.program,
+                loaded: &self.loaded,
+                shape: &self.shape,
+                config: &self.config,
+                kernel: self.kernel_index,
+                step_fn,
+                round: self.round,
+                observing: self.observing,
+            };
+            let r = self.partitions[0].run_round(&env, arena);
+            self.absorb(0, observer);
+            return r;
+        }
+        let mut shards: Vec<Arena> = Vec::with_capacity(n);
+        for p in &self.partitions {
+            // The ownership list only feeds a debug assertion.
+            let private = if cfg!(debug_assertions) { p.private_allocs() } else { Vec::new() };
+            shards.push(arena.make_shard(&private));
+        }
+        let mut results: Vec<Option<Result<bool, ExecError>>> = (0..n).map(|_| None).collect();
+        {
+            let env = Env {
+                program: self.program,
+                loaded: &self.loaded,
+                shape: &self.shape,
+                config: &self.config,
+                kernel: self.kernel_index,
+                step_fn,
+                round: self.round,
+                observing: self.observing,
+            };
+            let kernel = self.kernel_index;
+            let items: Vec<std::cell::UnsafeCell<(&mut Partition, &mut Arena, &mut Option<Result<bool, ExecError>>)>> = self
+                .partitions
+                .iter_mut()
+                .zip(shards.iter_mut())
+                .zip(results.iter_mut())
+                .map(|((p, a), r)| std::cell::UnsafeCell::new((p, a, r)))
+                .collect();
+            struct Items<'a, 'b>(&'b [std::cell::UnsafeCell<(&'a mut Partition, &'a mut Arena, &'a mut Option<Result<bool, ExecError>>)>]);
+            // SAFETY: `par_for` hands every index to exactly one thread.
+            unsafe impl Sync for Items<'_, '_> {}
+            impl<'a> Items<'a, '_> {
+                #[allow(clippy::mut_from_ref)]
+                unsafe fn item(&self, i: usize) -> &mut (&'a mut Partition, &'a mut Arena, &'a mut Option<Result<bool, ExecError>>) {
+                    &mut *self.0[i].get()
+                }
+            }
+            let items = Items(&items);
+            let env = &env;
+            let run_one = |i: usize| {
+                // SAFETY: see `Items`.
+                let (p, a, r) = unsafe { items.item(i) };
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.run_round(env, a)));
+                **r = Some(out.unwrap_or_else(|payload| {
+                    Err(sched_error(
+                        ExecErrorKind::Internal,
+                        kernel,
+                        WarpId(u32::MAX),
+                        SiteId::NONE,
+                        format!("panic in partition: {}", crate::codegen::rt::panic_message(&*payload)),
+                    ))
+                }));
+            };
+            match pool {
+                Some(pool) => pool.par_for(n, &run_one),
+                None => (0..n).for_each(run_one),
+            }
+        }
+        // Merge in partition order; stop at the first error (later
+        // partitions' effects are discarded, as if never run).
+        let mut progress = false;
+        let mut first_err = None;
+        for (k, shard) in shards.into_iter().enumerate() {
+            if first_err.is_some() {
+                arena.discard_shard(shard);
+                self.partitions[k].events.clear();
+                self.partitions[k].ends.clear();
+                continue;
+            }
+            arena.merge_shard(shard);
+            self.absorb(k, observer);
+            match results[k].take().expect("ran") {
+                Ok(p) => progress |= p,
+                Err(e) => first_err = Some(e),
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(progress),
+        }
+    }
+
+    /// The serial phase of a round (main arena): parked global RMWs and
+    /// deferred global reductions, in partition order.
+    fn serial_phase(&mut self, arena: &mut Arena, observer: &mut dyn Observer, step_fn: WarpStepFn) -> Result<bool, ExecError> {
+        let mut progress = false;
+        for pi in 0..self.partitions.len() {
+            let env = Env {
+                program: self.program,
+                loaded: &self.loaded,
+                shape: &self.shape,
+                config: &self.config,
+                kernel: self.kernel_index,
+                step_fn,
+                round: self.round,
+                observing: self.observing,
+            };
+            let r = self.partitions[pi].run_serial(&env, arena);
+            self.absorb(pi, observer);
+            progress |= r?;
+        }
+        Ok(progress)
+    }
+
+    /// Land / apply everything ready in every partition (main arena).
+    fn drain_all(&mut self, arena: &mut Arena, observer: &mut dyn Observer, step_fn: WarpStepFn) -> Result<bool, ExecError> {
+        let mut any = false;
+        for pi in 0..self.partitions.len() {
+            let env = Env {
+                program: self.program,
+                loaded: &self.loaded,
+                shape: &self.shape,
+                config: &self.config,
+                kernel: self.kernel_index,
+                step_fn,
+                round: self.round,
+                observing: self.observing,
+            };
+            let p = &mut self.partitions[pi];
+            let r = p.land(None, &env, arena, true).and_then(|a| Ok(a | p.apply_completions(&env)?));
+            self.absorb(pi, observer);
+            any |= r?;
+        }
+        Ok(any)
+    }
+
+    fn run_loop(
+        &mut self,
+        arena: &mut Arena,
+        observer: &mut dyn Observer,
+        step_fn: WarpStepFn,
+        pool: Option<&pool::Pool>,
+    ) -> Result<RunStatus, ExecError> {
         self.turnover(arena, observer)?;
         loop {
             if self.round >= self.config.max_rounds {
                 return Ok(RunStatus::Incomplete { reason: format!("round budget of {} exhausted", self.config.max_rounds), site: None });
             }
-            let mut progress = false;
-            for ci in 0..self.ctas.len() {
-                progress |= self.drain_inbox(ci, arena, observer)?;
-                progress |= self.run_cta(ci, arena, observer, step_fn)?;
-                let cta = self.ctas[ci].ctx.id;
-                progress |= self.land(Some(cta), arena, observer, self.config.completions == CompletionPolicy::Eager)?;
-                progress |= self.apply_completions(arena, observer)?;
-            }
-            progress |= self.route_outbox();
+            let mut progress = self.parallel_phase(arena, observer, step_fn, pool)?;
+            progress |= self.serial_phase(arena, observer, step_fn)?;
             progress |= self.turnover(arena, observer)?;
             self.round += 1;
             self.stats.rounds = self.round;
-            let all_done = self.pending.is_empty() && self.ctas.iter().all(|c| c.finished() && c.inbox.msgs.is_empty());
+            let all_done = self.pending.is_empty() && self.partitions.iter().all(|p| p.finished());
             if all_done {
                 // Drain the async queues.
-                loop {
-                    let a = self.land(None, arena, observer, true)?;
-                    let b = self.apply_completions(arena, observer)?;
-                    let c = self.route_outbox();
-                    let mut d = false;
-                    for ci in 0..self.ctas.len() {
-                        d |= self.drain_inbox(ci, arena, observer)?;
-                    }
-                    if !(a || b || c || d) {
-                        break;
-                    }
-                }
+                while self.drain_all(arena, observer, step_fn)? {}
                 return Ok(RunStatus::Completed);
             }
             if !progress {
                 // Before declaring a deadlock, land everything that is ready.
-                let a = self.land(None, arena, observer, true)?;
-                let b = self.apply_completions(arena, observer)?;
-                if a || b {
+                if self.drain_all(arena, observer, step_fn)? {
                     continue;
                 }
                 let mut blocked = Vec::new();
                 let mut divergent = None;
-                for c in &self.ctas {
+                for c in self.partitions.iter().flat_map(|p| p.ctas.iter()) {
                     for w in &c.warps {
                         if let WarpStatus::Blocked(r) = w.status {
                             blocked.push((w.id, r));
@@ -859,345 +1125,46 @@ impl<'p> Scheduler<'p> {
         }
     }
 
-    /// One slice per runnable warp of resident CTA `ci`.
-    fn run_cta(&mut self, ci: usize, arena: &mut Arena, observer: &mut dyn Observer, step_fn: WarpStepFn) -> Result<bool, ExecError> {
-        let nw = self.ctas[ci].warps.len();
-        if nw == 0 {
-            return Ok(false);
-        }
-        let cid = self.ctas[ci].ctx.id.0 as u64;
-        let start = (Rng::new(self.config.seed ^ self.round.wrapping_mul(0x2545_f491_4f6c_dd1d) ^ (cid << 32)).next_u64() % nw as u64) as usize;
-        let mut progress = false;
-        for k in 0..nw {
-            let w = (start + k) % nw;
-            let Scheduler { program, loaded, shape, config, ctas, sync, outbox, counters, aux, observing, ends, .. } = self;
-            let cta = &mut ctas[ci];
-            let CtaState { ctx: cctx, warps, buffers, .. } = cta;
-            let warp = &mut warps[w];
-            if !matches!(warp.status, WarpStatus::Running | WarpStatus::Blocked(_)) {
-                continue;
-            }
-            let (pc0, prog0) = (warp.pc, counters.progress);
-            let mut ctx = ExecCtx {
-                program,
-                loaded,
-                launch: shape,
-                config,
-                warp,
-                cta: cctx,
-                buffers,
-                arena: &mut *arena,
-                sync,
-                outbox,
-                observer: &mut *observer,
-                observing: *observing,
-                counters,
-                aux,
-            };
-            let r = crate::codegen::rt::guard(&mut ctx, config.quantum, step_fn);
-            let (pc1, prog1) = (ctx.warp.pc, ctx.counters.progress);
-            drop(ctx);
-            let warp = &mut ctas[ci].warps[w];
-            match r {
-                StepResult::Continue | StepResult::Yield => {
-                    warp.status = WarpStatus::Running;
-                    progress = true;
-                }
-                StepResult::Blocked(res) => {
-                    // Only committed effects count: a warp that merely moved
-                    // to (or swapped between) blocking points changed
-                    // nothing another warp could wait on.
-                    let _ = (pc0, pc1);
-                    if prog1 != prog0 {
-                        progress = true;
-                    }
-                    warp.status = WarpStatus::Blocked(res);
-                }
-                StepResult::Exit => {
-                    warp.status = WarpStatus::Exited;
-                    ends.insert(warp.id, WarpEnd::Exited);
-                    observer.warp_done(warp.id, WarpEnd::Exited);
-                    progress = true;
-                }
-                StepResult::Error(e) => {
-                    let end = match e.kind {
-                        ExecErrorKind::Trap => WarpEnd::Trapped,
-                        ExecErrorKind::Budget => WarpEnd::Budget,
-                        _ => WarpEnd::Error,
-                    };
-                    warp.status = if end == WarpEnd::Trapped { WarpStatus::Trapped } else { WarpStatus::Errored };
-                    ends.insert(warp.id, end);
-                    observer.warp_done(warp.id, end);
-                    return Err(e);
-                }
-            }
-        }
-        Ok(progress)
-    }
-
-    /// Deliver CTA `ci`'s inbox.
-    fn drain_inbox(&mut self, ci: usize, arena: &mut Arena, observer: &mut dyn Observer) -> Result<bool, ExecError> {
-        let msgs = std::mem::take(&mut self.ctas[ci].inbox.msgs);
-        let cta = self.ctas[ci].ctx.id;
-        let any = !msgs.is_empty();
-        for m in msgs {
-            match m {
-                InboxMsg::Write { alloc, offset, bytes, actor, site } => {
-                    let span = ByteSpan::new(offset, bytes.len() as u64);
-                    arena
-                        .write(support::whole(arena, alloc), &[span], &bytes)
-                        .map_err(|e| sched_error(ExecErrorKind::OutOfBounds, self.kernel_index, actor_warp(actor), site, e.to_string()))?;
-                    if self.observing {
-                        let mut acc = Accesses::default();
-                        acc.items.push((alloc, Some(Window::SharedCluster), LaneSpan { lane: ALL_LANES, span }));
-                        let spec = AccessSpec {
-                            actor,
-                            site,
-                            kind: AccessKind::Write,
-                            sem: Sem::Weak,
-                            scope: Scope::Cluster,
-                            atomic: false,
-                            returns_value: false,
-                            proxy: crate::program::Proxy::Generic,
-                        };
-                        support::emit_accesses(observer, &mut self.counters, &mut self.aux, arena, spec, &mut acc);
-                    }
-                }
-                InboxMsg::Sync { resource, cmd, actor, site } => {
-                    let out = self.sync.step(resource, cmd).map_err(|e| {
-                        sched_error(ExecErrorKind::Protocol(e.clone()), self.kernel_index, actor_warp(actor), site, format!("{e:?}"))
-                    })?;
-                    if let Step::Done(Outcome::Mbarrier(mbarrier::Outcome::Arrived { gen, .. })) = out {
-                        if self.observing {
-                            observer.sync(&SyncEvent {
-                                kernel: self.kernel_index,
-                                actor,
-                                seq: 0,
-                                site,
-                                frames: Vec::new(),
-                                lanes: WarpMask::NONE,
-                                kind: SyncKind::Arrive { obj: resource, phase: gen, release: None, scope: None },
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        observer.inbox_drain(cta, self.round);
-        Ok(any)
-    }
-
-    /// Move outbox messages to their target CTAs' inboxes.
-    fn route_outbox(&mut self) -> bool {
-        if self.outbox.is_empty() {
-            return false;
-        }
-        for m in std::mem::take(&mut self.outbox) {
-            let target = match &m {
-                InboxMsg::Sync { resource: ResourceId::Mbarrier { cta, .. }, .. } => Some(*cta),
-                _ => m.target_hint().and_then(|a| self.aux.owner_cta.get(&a).copied()),
-            };
-            match target.and_then(|t| self.ctas.iter_mut().find(|c| c.ctx.id == t)) {
-                Some(c) => c.inbox.msgs.push(m),
-                // The target CTA is gone: the effect is lost (accessing an
-                // exited CTA's shared memory is undefined).
-                None => {}
-            }
-        }
-        true
-    }
-
-    /// Land ready async ops (of `cta`, or all with `None`). `all` = every
-    /// ready op; otherwise a seeded subset. Returns whether any landed.
-    fn land(&mut self, cta: Option<CtaId>, arena: &mut Arena, observer: &mut dyn Observer, all: bool) -> Result<bool, ExecError> {
-        let mut any = false;
-        loop {
-            let mut landed_one = false;
-            let mut i = 0;
-            while i < self.sync.async_ops.len() {
-                let op = &self.sync.async_ops[i];
-                let mine = cta.is_none_or(|c| op.source.cta == c);
-                let ready = op.after.iter().all(|d| !self.sync.async_ops.iter().any(|o| o.id == *d));
-                if mine && ready && (all || self.rng.below(2) == 0) {
-                    self.fire_completion(i, arena, observer)?;
-                    landed_one = true;
-                    any = true;
-                    continue;
-                }
-                i += 1;
-            }
-            if !landed_one || !all {
-                break;
-            }
-        }
-        Ok(any)
-    }
-
-    /// Apply enabled sync completions in FIFO order until none is enabled.
-    fn apply_completions(&mut self, _arena: &mut Arena, _observer: &mut dyn Observer) -> Result<bool, ExecError> {
-        let mut any = false;
-        loop {
-            let Some(i) = self.sync.completions.iter().position(|c| self.sync.enabled(c)) else { break };
-            let c = self.sync.completions.remove(i).expect("index valid");
-            match self.sync.apply_completion(c) {
-                Ok(Step::Done(out)) => {
-                    any = true;
-                    self.stats.completions += 1;
-                    if let (
-                        Completion::GroupMilestone { res, ordinal, milestone: async_group::Milestone::FullyDone },
-                        Outcome::AsyncGroup(async_group::Outcome::Completed { .. }),
-                    ) = (c, out)
-                    {
-                        if let Some(arr) = self.aux.groups.arrivals.remove(&(res, ordinal)) {
-                            self.sync.completions.extend(arr);
-                        }
-                    }
-                }
-                Ok(Step::Blocked(_)) => {
-                    // Not applicable yet after all; keep it at the back.
-                    self.sync.completions.push_back(c);
-                    break;
-                }
-                Err(e) => {
-                    return Err(sched_error(
-                        ExecErrorKind::Protocol(e.clone()),
-                        self.kernel_index,
-                        WarpId(u32::MAX),
-                        SiteId::NONE,
-                        format!("completion {c:?}: {e:?}"),
-                    ))
-                }
-            }
-        }
-        Ok(any)
-    }
-
-    /// Fire one pending async op (payload, then targets), emitting
-    /// observer events. Exposed for tests.
+    /// Fire async op `index` of the first partition (tests).
     pub fn fire_completion(&mut self, index: usize, arena: &mut Arena, observer: &mut dyn Observer) -> Result<(), ExecError> {
-        let Some(op) = self.sync.async_ops.remove(index) else {
-            return Err(sched_error(ExecErrorKind::Internal, self.kernel_index, WarpId(u32::MAX), SiteId::NONE, "no such async op".into()));
+        let env = Env {
+            program: self.program,
+            loaded: &self.loaded,
+            shape: &self.shape,
+            config: &self.config,
+            kernel: self.kernel_index,
+            step_fn: step_warp,
+            round: self.round,
+            observing: self.observing,
         };
-        let meta = self.aux.async_meta.remove(&op.id);
-        let proxy = meta.as_ref().map(|m| m.proxy).unwrap_or_default();
-        let lane = meta.as_ref().map(|m| m.lane).unwrap_or(ALL_LANES);
-        let kernel = self.kernel_index;
-        let src_err = |e: String| sched_error(ExecErrorKind::OutOfBounds, kernel, op.source.warp, op.source.site, e);
-        let mut reads: Vec<(AllocId, ByteSpan)> = Vec::new();
-        let mut writes: Vec<(AllocId, ByteSpan)> = Vec::new();
-        let mut rmw = false;
-        match &op.payload {
-            Payload::None => {}
-            Payload::Copy { src, dst, zero_fill } => {
-                copy_spans(arena, src, dst).map_err(src_err)?;
-                reads.extend(src.iter().copied());
-                writes.extend(dst.iter().copied());
-                let pattern = meta.as_ref().map(|m| m.fill_pattern.as_slice()).unwrap_or(&[]);
-                for &(a, s) in zero_fill {
-                    if pattern.is_empty() {
-                        arena.fill(support::whole(arena, a), &[s], 0).map_err(|e| src_err(e.to_string()))?;
-                    } else {
-                        let bytes: Vec<u8> = (0..s.len as usize).map(|i| pattern[i % pattern.len()]).collect();
-                        arena.write(support::whole(arena, a), &[s], &bytes).map_err(|e| src_err(e.to_string()))?;
-                    }
-                    writes.push((a, s));
-                }
-                if meta.as_ref().is_some_and(|m| m.tf32_round) {
-                    // TF32 tensor-map loads round each copied f32 element.
-                    for &(a, s) in dst {
-                        let al = arena.get_mut(a);
-                        let (st, en) = (s.start as usize, s.end() as usize);
-                        for w in al.bytes[st..en].chunks_exact_mut(4) {
-                            let v = u32::from_le_bytes(w.try_into().unwrap());
-                            w.copy_from_slice(&crate::oplib::tma_tf32_round(v).to_le_bytes());
-                        }
-                    }
-                }
-            }
-            Payload::TcgenCp { src, dst, decompress_bits } => {
-                if *decompress_bits != 0 {
-                    return Err(sched_error(ExecErrorKind::Unsupported, kernel, op.source.warp, op.source.site, "tcgen05.cp decompression".into()));
-                }
-                copy_spans(arena, src, dst).map_err(src_err)?;
-                reads.extend(src.iter().copied());
-                writes.extend(dst.iter().copied());
-            }
-            Payload::Reduce { op: aop, dtype, src, dst } => {
-                let s = gather_bytes(arena, src).map_err(src_err)?;
-                let mut d = gather_bytes(arena, dst).map_err(src_err)?;
-                crate::interp::handlers::mem::rmw_bytes(*aop, *dtype, &mut d, &s, &[], false)
-                    .map_err(|e| sched_error(ExecErrorKind::Op(e.kind), kernel, op.source.warp, op.source.site, e.message))?;
-                scatter_bytes(arena, dst, &d).map_err(src_err)?;
-                reads.extend(src.iter().copied());
-                writes.extend(dst.iter().copied());
-                rmw = true;
-            }
-            Payload::Data { dst, bytes } => {
-                scatter_bytes(arena, dst, bytes).map_err(src_err)?;
-                writes.extend(dst.iter().copied());
-            }
-            Payload::ReduceData { op: aop, dtype, dst, bytes } => {
-                let mut d = gather_bytes(arena, dst).map_err(src_err)?;
-                crate::interp::handlers::mem::rmw_bytes(*aop, *dtype, &mut d, bytes, &[], false)
-                    .map_err(|e| sched_error(ExecErrorKind::Op(e.kind), kernel, op.source.warp, op.source.site, e.message))?;
-                scatter_bytes(arena, dst, &d).map_err(src_err)?;
-                writes.extend(dst.iter().copied());
-                rmw = true;
-            }
-            Payload::TcgenMma(p) => {
-                let (r, w) = run_mma(arena, p, tc_arch(self.program.arch.as_deref())).map_err(|e| sched_error(ExecErrorKind::Op(e.kind), kernel, op.source.warp, op.source.site, e.message))?;
-                reads.extend(r);
-                writes.extend(w);
-                rmw = true;
-            }
+        let r = match self.partitions.first_mut() {
+            Some(p) => p.fire_op(index, &env, arena),
+            None => Err(sched_error(ExecErrorKind::Internal, self.kernel_index, WarpId(u32::MAX), SiteId::NONE, "no partition".into())),
+        };
+        if !self.partitions.is_empty() {
+            self.absorb(0, observer);
         }
-        if self.observing {
-            let site = op.source.site;
-            let mk = |side, kind| AccessSpec {
-                actor: Actor::Async { op: op.id, side },
-                site,
-                kind,
-                sem: Sem::Weak,
-                scope: Scope::Gpu,
-                atomic: false,
-                returns_value: false,
-                proxy,
-            };
-            let window = |arena: &Arena, a: AllocId| match arena.get(a).space {
-                Space::Global => Some(Window::Global),
-                Space::Shared => Some(Window::SharedCta),
-                _ => None,
-            };
-            let mut acc = Accesses::default();
-            acc.items = reads.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
-            support::emit_accesses(observer, &mut self.counters, &mut self.aux, arena, mk(Side::Read, AccessKind::Read), &mut acc);
-            acc.items = writes.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
-            let wk = if rmw { AccessKind::Rmw } else { AccessKind::Write };
-            support::emit_accesses(observer, &mut self.counters, &mut self.aux, arena, mk(Side::Write, wk), &mut acc);
-            for c in &op.signals {
-                if let Completion::MbarTx { res, gen, .. } | Completion::MbarArrive { res, gen, .. } = *c {
-                    observer.sync(&SyncEvent {
-                        kernel: self.kernel_index,
-                        actor: Actor::Async { op: op.id, side: Side::Write },
-                        seq: 0,
-                        site,
-                        frames: Vec::new(),
-                        lanes: WarpMask::NONE,
-                        kind: SyncKind::AsyncComplete { op: op.id, milestone: Side::Write, target: PublishTarget::Phase { obj: res, phase: gen } },
-                    });
-                }
-            }
-        }
-        self.sync.completions.extend(op.signals.iter().copied());
-        let open = self.aux.groups.is_open(op.id);
-        let due = self.aux.groups.landed(op.id, open);
-        self.sync.completions.extend(due);
-        Ok(())
+        r
     }
 
     /// Why a warp ended, for `Observer::warp_done`.
     pub fn end_reason(&self, warp: WarpId) -> Option<WarpEnd> {
         self.ends.get(&warp).copied()
+    }
+
+    /// `SyncTable::quiescent` of every partition (retired and resident).
+    pub fn leftovers(&self) -> Vec<(ResourceId, SyncError)> {
+        let mut out = self.leftovers.clone();
+        for p in &self.partitions {
+            out.extend(p.sync.quiescent());
+        }
+        out.sort_by_cached_key(|(id, _)| format!("{id:?}"));
+        out
+    }
+
+    /// Async ops never landed, over every partition.
+    pub fn pending_async_ops(&self) -> usize {
+        self.partitions.iter().map(|p| p.sync.async_ops.len()).sum()
     }
 
     /// End-of-launch events: blocked-at-exit, warp_done, AllocEnd, end_launch.
@@ -1208,7 +1175,7 @@ impl<'p> Scheduler<'p> {
             _ => WarpEnd::Error,
         };
         let mut blocked_events = Vec::new();
-        for c in &self.ctas {
+        for c in self.partitions.iter().flat_map(|p| p.ctas.iter()) {
             for w in &c.warps {
                 if self.ends.contains_key(&w.id) {
                     continue;
@@ -1241,17 +1208,21 @@ impl<'p> Scheduler<'p> {
                 observer.sync(e);
             }
         }
-        for c in &self.ctas {
+        let mut done = Vec::new();
+        for c in self.partitions.iter().flat_map(|p| p.ctas.iter()) {
             for w in &c.warps {
                 if !self.ends.contains_key(&w.id) {
-                    self.ends.insert(w.id, end);
-                    observer.warp_done(w.id, end);
+                    done.push(w.id);
                 }
             }
         }
+        for w in done {
+            self.ends.insert(w, end);
+            observer.warp_done(w, end);
+        }
         if self.observing {
             let mut ends = Vec::new();
-            for c in &self.ctas {
+            for c in self.partitions.iter().flat_map(|p| p.ctas.iter()) {
                 ends.push(c.ctx.smem);
                 ends.push(c.ctx.tmem);
                 ends.extend(c.warps.iter().filter_map(|w| w.local));
@@ -1260,7 +1231,8 @@ impl<'p> Scheduler<'p> {
                 self.host_event(observer, SyncKind::AllocEnd { alloc: a });
             }
         }
-        self.stats.instrs = self.counters.instrs;
+        self.stats.instrs = self.retired_instrs + self.partitions.iter().map(|p| p.counters.instrs).sum::<u64>();
+        self.stats.completions = self.retired_completions + self.partitions.iter().map(|p| p.completions).sum::<u64>();
         observer.end_launch(&LaunchInfo { program: self.program, kernel_index: self.kernel_index, shape: self.shape, arena });
     }
 }
@@ -1278,149 +1250,9 @@ fn blocked_cmd(r: ResourceId) -> SyncCmd {
     }
 }
 
-fn actor_warp(a: Actor) -> WarpId {
-    match a {
-        Actor::Warp { warp, .. } => warp,
-        _ => WarpId(u32::MAX),
-    }
-}
-
 fn write_param(arena: &mut Arena, params: AllocId, off: u64, bytes: &[u8]) {
     let v = support::whole(arena, params);
     let _ = arena.write(v, &[ByteSpan::new(off, bytes.len() as u64)], bytes);
-}
-
-/// Copy concatenated `src` spans onto concatenated `dst` spans (equal
-/// totals), carrying validity.
-fn copy_spans(arena: &mut Arena, src: &[(AllocId, ByteSpan)], dst: &[(AllocId, ByteSpan)]) -> Result<(), String> {
-    let total = |v: &[(AllocId, ByteSpan)]| v.iter().map(|s| s.1.len).sum::<u64>();
-    if total(src) != total(dst) {
-        return Err(format!("copy length mismatch: {} vs {}", total(src), total(dst)));
-    }
-    let (mut si, mut so, mut di, mut doff) = (0usize, 0u64, 0usize, 0u64);
-    while si < src.len() && di < dst.len() {
-        let (sa, ss) = src[si];
-        let (da, ds) = dst[di];
-        let n = (ss.len - so).min(ds.len - doff);
-        if n > 0 {
-            arena
-                .copy_with_validity((sa, ByteSpan::new(ss.start + so, n)), (da, ds.start + doff))
-                .map_err(|e| e.to_string())?;
-        }
-        so += n;
-        doff += n;
-        if so == ss.len {
-            si += 1;
-            so = 0;
-        }
-        if doff == ds.len {
-            di += 1;
-            doff = 0;
-        }
-    }
-    Ok(())
-}
-
-fn gather_bytes(arena: &Arena, spans: &[(AllocId, ByteSpan)]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    for &(a, s) in spans {
-        let mut b = vec![0u8; s.len as usize];
-        arena.read(support::whole(arena, a), &[s], &mut b).map_err(|e| e.to_string())?;
-        out.extend(b);
-    }
-    Ok(out)
-}
-
-fn scatter_bytes(arena: &mut Arena, spans: &[(AllocId, ByteSpan)], bytes: &[u8]) -> Result<(), String> {
-    let mut pos = 0usize;
-    for &(a, s) in spans {
-        let n = s.len as usize;
-        if pos + n > bytes.len() {
-            return Err("payload shorter than its spans".into());
-        }
-        arena.write(support::whole(arena, a), &[s], &bytes[pos..pos + n]).map_err(|e| e.to_string())?;
-        pos += n;
-    }
-    Ok(())
-}
-
-type Spans = Vec<(AllocId, ByteSpan)>;
-
-/// Target architecture of a program (`Program::arch`).
-fn tc_arch(arch: Option<&str>) -> crate::oplib::TcArch {
-    match arch {
-        Some(a) if a.starts_with("sm_103") => crate::oplib::TcArch::Sm103,
-        Some(a) if a.starts_with("sm_107") => crate::oplib::TcArch::Sm107,
-        _ => crate::oplib::TcArch::Sm100,
-    }
-}
-
-/// tcgen05.mma numerics through oplib (`tc_mma_ctas`), recording the spans
-/// it touched. `p.smem` / `p.tmem` are indexed by CTA within the issuing
-/// group (0 = even CTA of the pair for `cta_group::2`).
-fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch: crate::oplib::TcArch) -> crate::oplib::OpResult<(Spans, Spans)> {
-    use crate::oplib::OpError;
-    use std::cell::RefCell;
-    let cell = RefCell::new(arena);
-    let reads: RefCell<Spans> = RefCell::new(Vec::new());
-    let mut writes: Spans = Vec::new();
-    let options = crate::oplib::TcMmaOptions { arch, ti16: p.args.ti16, ..Default::default() };
-    let smem = |cta: u32, a: u32, out: &mut [u8]| -> crate::oplib::OpResult {
-        let al = *p.smem.get(cta as usize).ok_or_else(|| OpError::invalid("mma smem operand of a CTA outside the group"))?;
-        let off = addr::decode_shared(a).1 as u64;
-        let ar = cell.borrow();
-        let span = ByteSpan::new(off, out.len() as u64);
-        ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
-        reads.borrow_mut().push((al, span));
-        Ok(())
-    };
-    let tmem_of = |cta: u32, lane: u32, col: u32| -> crate::oplib::OpResult<(AllocId, u64)> {
-        let al = *p.tmem.get(cta as usize).ok_or_else(|| OpError::invalid("mma tmem operand of a CTA outside the group"))?;
-        if lane >= addr::TMEM_LANES || col >= addr::TMEM_COLS {
-            return Err(OpError::invalid(format!("tmem cell ({lane}, {col}) out of range")));
-        }
-        Ok((al, addr::tmem_byte_offset(lane, col)))
-    };
-    let tmem_read = |cta: u32, lane: u32, col: u32, out: &mut [u8]| -> crate::oplib::OpResult {
-        let (al, off) = tmem_of(cta, lane, col)?;
-        let ar = cell.borrow();
-        let span = ByteSpan::new(off, out.len() as u64);
-        ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
-        reads.borrow_mut().push((al, span));
-        Ok(())
-    };
-    let mut tmem_write = |cta: u32, lane: u32, col: u32, data: &[u8]| -> crate::oplib::OpResult {
-        let (al, off) = tmem_of(cta, lane, col)?;
-        let mut ar = cell.borrow_mut();
-        let span = ByteSpan::new(off, data.len() as u64);
-        let v = support::whole(&ar, al);
-        ar.write(v, &[span], data).map_err(|e| OpError::invalid(e.to_string()))?;
-        writes.push((al, span));
-        Ok(())
-    };
-    crate::oplib::tc_mma_ctas(p, &options, &smem, &tmem_read, &mut tmem_write)?;
-    let mut r = reads.into_inner();
-    ByteSpanList::coalesce(&mut r);
-    ByteSpanList::coalesce(&mut writes);
-    Ok((r, writes))
-}
-
-struct ByteSpanList;
-impl ByteSpanList {
-    fn coalesce(v: &mut Spans) {
-        v.sort();
-        let mut out: Spans = Vec::with_capacity(v.len());
-        for (a, s) in v.drain(..) {
-            match out.last_mut() {
-                Some((la, ls)) if *la == a && s.start <= ls.end() => {
-                    let end = ls.end().max(s.end());
-                    ls.len = end - ls.start;
-                }
-                _ => out.push((a, s)),
-            }
-        }
-        *v = out;
-    }
 }
 
 /// Resolve a declared launch against inputs (`DimExpr` over scalar params).
@@ -1654,16 +1486,16 @@ pub fn run_with_config(
         outcome.stats.instrs += sched.stats.instrs;
         outcome.stats.rounds += sched.stats.rounds;
         outcome.stats.completions += sched.stats.completions;
-        outcome.diagnostics.append(&mut sched.aux.diagnostics);
+        outcome.diagnostics.append(&mut sched.diagnostics);
         if status == RunStatus::Completed {
-            outcome.sync_leftovers.extend(sched.sync.quiescent());
-            if !sched.sync.async_ops.is_empty() {
+            outcome.sync_leftovers.extend(sched.leftovers());
+            if sched.pending_async_ops() != 0 {
                 let e = sched_error(
                     ExecErrorKind::Internal,
                     k as u32,
                     WarpId(u32::MAX),
                     SiteId::NONE,
-                    format!("{} async operations never became ready", sched.sync.async_ops.len()),
+                    format!("{} async operations never became ready", sched.pending_async_ops()),
                 );
                 outcome.status = RunStatus::Error(e);
                 outcome.failed_kernel = Some(k as u32);

@@ -386,14 +386,22 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
             let off = lane as u64 * ctx.loaded.local_per_lane + offset + byte.unwrap() as u64;
             Ok(Loc { alloc, offset: off, window: None, remote: None })
         }
-        BufBinding::Tmem { base_col, cols } => {
+        BufBinding::Tmem { base_col, cols, base_reg } => {
+            let (base_lane, base_col) = match base_reg {
+                Some(r) => {
+                    let t = uniform_over(ctx, Operand::Reg(r), ctx.warp.active)? as u32;
+                    let (l, c) = addr::tmem_decode(t);
+                    (l, base_col + c)
+                }
+                None => (0, base_col),
+            };
             let b = byte.ok_or_else(|| err(ctx, ExecErrorKind::OutOfBounds, lanes, "tmem offset overflows"))?;
             if b < 0 || b % 4 != 0 || len % 4 != 0 {
                 return Err(err(ctx, ExecErrorKind::Misaligned, lanes, format!("{}[{idx}]: tmem access is not 32-bit aligned", decl.name)));
             }
             let word = (b / 4) as u64;
             let cols = cols.max(1) as u64;
-            let tl = ((word / cols) % addr::TMEM_LANES as u64) as u32;
+            let tl = ((base_lane as u64 + word / cols) % addr::TMEM_LANES as u64) as u32;
             let col = base_col as u64 + word % cols;
             let ncols = len / 4;
             if word % cols + ncols > cols || col + ncols > addr::TMEM_COLS as u64 {
@@ -422,7 +430,7 @@ pub fn resolve_buf(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, lane: usize, len: u64)
 }
 
 /// Columns `[col, col+n)` lie in a live tcgen05 allocation of this CTA.
-fn tmem_live(ctx: &ExecCtx<'_>, col: u32, n: u32) -> bool {
+pub fn tmem_live(ctx: &ExecCtx<'_>, col: u32, n: u32) -> bool {
     let rank = ctx.cta.rank_in_cluster;
     let id = crate::sync::ResourceId::TcgenLifecycle { cluster: ctx.cta.cluster, pair_rank: (rank >> 1) as u8 };
     match ctx.sync.get(id) {

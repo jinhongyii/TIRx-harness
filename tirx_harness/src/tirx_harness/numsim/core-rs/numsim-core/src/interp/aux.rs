@@ -30,6 +30,11 @@ pub struct AsyncMeta {
     pub fill_pattern: Vec<u8>,
     /// TMA loads of TF32 maps: round copied f32 elements to tf32.
     pub tf32_round: bool,
+    /// `_report` copy forms: inspect the copied source bytes and OR the
+    /// result into the report bit of every completion phase.
+    pub report: Option<crate::program::ReportMode>,
+    /// tcgen05.mma `.lut_b`: TMEM address of the lookup table.
+    pub lut_b: Option<u32>,
 }
 
 /// Per-lane async-group membership of in-flight async ops.
@@ -210,12 +215,7 @@ impl WordTable {
 }
 
 fn snapshot(arena: &Arena, alloc: AllocId, span: ByteSpan) -> Vec<u8> {
-    let a = arena.get(alloc);
-    let end = (span.end() as usize).min(a.bytes.len());
-    let start = (span.start as usize).min(end);
-    let mut v = a.bytes[start..end].to_vec();
-    v.resize(span.len as usize, 0);
-    v
+    arena.read_raw(alloc, span)
 }
 
 /// Incremental `WaitUntil` verdicts of one (warp, pc, word): per lane, the
@@ -302,13 +302,31 @@ pub struct LaunchAux {
     /// tcgen05.ld/st ops not yet waited, per warp: (op, lanes, is_store).
     pub tcgen_ldst: HashMap<WarpId, Vec<(AsyncId, WarpMask, bool)>>,
     pub grid: GridBarrier,
+    /// layout::v1 copy-report bits per (mbarrier, generation): OR of the
+    /// inspections of copies completing on that phase (legacy
+    /// `PhysicalBarrierEntry.phase.report`); read by report test/try_wait.
+    pub mbar_reports: HashMap<(ResourceId, u64), bool>,
+    /// Divergent `__syncwarp` rendezvous per warp: (lanes arrived, generation).
+    pub warp_sync: HashMap<WarpId, (WarpMask, u64)>,
     /// Warps whose every lane exited.
     pub exited_warps: u32,
     /// Next collective instance id.
     pub next_collective: u64,
+    /// Next async op id (partition-scoped: high bits name the partition).
+    pub next_async: u64,
+    /// Set by a handler that must run as a serial point (a global
+    /// read-modify-write inside an arena shard); the scheduler re-runs the
+    /// instruction after the round's merge.
+    pub serial_request: bool,
 }
 
 impl LaunchAux {
+    pub fn next_async_id(&mut self) -> AsyncId {
+        let id = AsyncId(self.next_async);
+        self.next_async += 1;
+        id
+    }
+
     pub fn next_collective_id(&mut self) -> u64 {
         let id = self.next_collective;
         self.next_collective += 1;

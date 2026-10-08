@@ -1067,3 +1067,132 @@ default it to `.cluster`.
   differing schedule proves the base depends on the order. Recording the
   engine's observed base on the `Alloc` `ProtocolCmd` would let the finding
   name the run's actual value; this is optional.
+
+## v2 conformance (W8, 2026-10-08)
+
+Filed from the sweep in `docs/development/v2-conformance-status.md` (all canonical cases x
+{numsim, racecheck, synccheck} under `NUMSIM_IMPL=v2`). Reproduce one row from `tirx_harness/`
+after `source scripts/dev-env.sh` and `core-rs/numsim-py/build_dev.sh` with
+`NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "<case>-<mode>"`. Owners are
+W8's best guess; reassign freely.
+
+### V2C-1 [oplib]: `tirx.ptx.prefetch` has no oplib implementation (tensormap / global L2 forms)
+
+- Cases (37): `alphamoe_fp8_blockscale_qwen3next` (numsim/racecheck/synccheck), `blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin` (numsim/racecheck/synccheck), `bmm_fp8_rubin` (numsim/racecheck/synccheck), `cudnn_sm100_bsa_backward_blk128` (numsim/racecheck/synccheck), `cudnn_sm100_bsa_backward_blk64` (numsim/racecheck/synccheck), `cudnn_sm100_bsa_forward_blk64` (numsim/racecheck/synccheck), `cudnn_sm100_dense_blockscaled_gemm_persistent_amax` (numsim/racecheck/synccheck), `cudnn_sm100_dense_blockscaled_gemm_persistent_dsrelu_quant` (numsim/racecheck/synccheck), `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` (numsim/racecheck/synccheck), `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` (numsim/racecheck/synccheck), `cudnn_sm100_dense_gemm_persistent_swiglu` (numsim/racecheck/synccheck), `cudnn_sm100_dsa_sparse_attention_backward` (numsim/racecheck/synccheck), `cudnn_sm100_flex_attention_backward` (numsim/racecheck/synccheck), `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in` (numsim/racecheck/synccheck), `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` (numsim/racecheck/synccheck), `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` (numsim/racecheck/synccheck), `cudnn_sm100_moe_grouped_gemm_dglu_dbias` (numsim/racecheck/synccheck), `deepgemm_sm100_fp4_mqa_logits` (numsim/racecheck/synccheck), `deepgemm_sm100_fp4_paged_mqa_logits` (numsim/racecheck/synccheck), `deepgemm_sm100_fp8_bmm` (numsim/racecheck/synccheck), `deepgemm_sm100_fp8_gemm_1d1d` (numsim/racecheck/synccheck), `deepgemm_sm100_fp8_mqa_logits` (numsim/racecheck/synccheck), `deepgemm_sm100_fp8_paged_mqa_logits` (numsim/racecheck/synccheck), `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` (numsim/racecheck/synccheck), `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` (numsim/racecheck/synccheck), `deepgemm_sm100_m_grouped_fp8_gemm_masked` (numsim/racecheck/synccheck), `deepgemm_sm100_tf32_hc_prenorm_gemm` (numsim/racecheck/synccheck), `dense_blockscaled_gemm_sm107` (numsim/racecheck/synccheck), `flash_attention4_fp4` (numsim/racecheck/synccheck), `flash_attention_backward_sm100` (numsim/racecheck/synccheck), `flash_mla_sparse_fwd` (numsim/racecheck/synccheck), `grouped_gemm_masked_rubin` (numsim/racecheck/synccheck), `kda_backward_packed` (numsim/racecheck/synccheck), `msa_decode_multishape` (numsim/racecheck/synccheck), `sparse_flashmla_prefill_head128_small_topk_phase1` (numsim/racecheck/synccheck), `sparse_flashmla_prefill_head64_phase1` (numsim/racecheck/synccheck), `vsa_multishape` (numsim/racecheck/synccheck)
+- Minimal reproduction: `bmm_fp8_rubin` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "bmm_fp8_rubin-numsim"`
+- Observed: analysis_incomplete/incomplete: Unsupported: tirx.ptx.prefetch ["tensormap=tensormap"]: no oplib implementation for tirx.ptx.prefetch ["tensormap=tensormap"] (site 14)
+
+### V2C-6 [lowering]: implicit tensor-map slots share the canonical name of a buffer parameter (`v`)
+
+- Cases (5): `cudnn_sm100_bsa_forward_blk128` (numsim/racecheck/synccheck), `cudnn_sm100_flex_attention_forward_hd256` (numsim/racecheck/synccheck), `cudnn_sm103_flex_attention_forward` (numsim/racecheck/synccheck), `msa_sparse_atten_fwd_nvfp4_kv_sm100` (numsim/racecheck/synccheck), `msa_sparse_atten_fwd_sm100` (numsim/racecheck/synccheck)
+- Minimal reproduction: `msa_sparse_atten_fwd_sm100` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "msa_sparse_atten_fwd_sm100-numsim"`
+- Observed: ValueError: bad argument "v": argument does not match a TensorMap parameter
+
+### V2C-7 [lowering + contract]: two kernels of one module declare different parameters with the same canonical name
+
+- Cases (1): `gdn_cp_prefill_sm100` (numsim/racecheck/synccheck)
+- Minimal reproduction: `gdn_cp_prefill_sm100` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "gdn_cp_prefill_sm100-numsim"`
+- Observed: InputError: NumSim input 'k_map' is bound more than once with different values
+
+### V2C-8 [oplib]: TensorMapDesc cannot represent FP4 align16-padded element type from a host descriptor
+
+- Cases (1): `sm100_fp8_fp4_mega_moe` (numsim/racecheck/synccheck)
+- Minimal reproduction: `sm100_fp8_fp4_mega_moe` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "sm100_fp8_fp4_mega_moe-numsim"`
+- Observed: ValueError: tensor_map_l1_weights: undecodable tensor map: OpError { kind: Unsupported, message: "TensorMap element type float4_e2m1fn (shared layout Some(Align16Padded)) is not representable as a Dtype" }
+
+### V2C-9 [interp (arena::addr) / lowering]: load/store of global address 0x7d00_0000_00xx (unmapped aperture)
+
+- Cases (3): `fastcu_nvfp4_gemm_gb300` (numsim/racecheck/synccheck), `flash_attention4` (numsim/racecheck/synccheck), `gdn_prefill_sm100` (numsim/racecheck/synccheck)
+- Minimal reproduction: `flash_attention4` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "flash_attention4-numsim"`
+- Observed: bad_address/error: Global address 0x7d0000000000 is not mapped (site 65)
+
+### V2C-10 [lowering / interp]: tcgen05 matrix descriptor encoder receives address 0x0
+
+- Cases (2): `nvfp4_gemm` (numsim/racecheck/synccheck), `sparse_flashmla_prefill_head128_phase1` (numsim/racecheck/synccheck)
+- Minimal reproduction: `nvfp4_gemm` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "nvfp4_gemm-numsim"`
+- Observed: invalid_operand/error: tirx.cuda.tcgen05_encode_matrix_descriptor: address 0x0 is not a generic shared-memory address (site 32)
+
+### V2C-11 [lowering / interp]: 16-byte vector access at offset 3076 of `state`
+
+- Cases (1): `gdn_decode_bf16_wide_vec_t1` (numsim/racecheck/synccheck)
+- Minimal reproduction: `gdn_decode_bf16_wide_vec_t1` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "gdn_decode_bf16_wide_vec_t1-numsim"`
+- Observed: misaligned/error: 16-byte access at offset 3076 of state is not 16-byte aligned (site 170)
+
+### V2C-14 [sync / synccheck]: synccheck rejects setmaxnreg `IncompleteWarpgroup` (cf. sync-behaviour-deltas R1/R2, not the same rule)
+
+- Cases (1): `cudnn_sm100_kda_bprop_f16` (synccheck)
+- Minimal reproduction: `cudnn_sm100_kda_bprop_f16` / synccheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "cudnn_sm100_kda_bprop_f16-synccheck"`
+- Observed: fixed synchronization program rejected Some(Issue(395)): RegPool(IncompleteWarpgroup { wg: 3 })
+
+### V2C-15 [sync / synccheck]: synccheck `Cluster(UnexpectedParticipant)` (cf. sync-behaviour-deltas C1 membership)
+
+- Cases (1): `fast_topk_clusters` (synccheck)
+- Minimal reproduction: `fast_topk_clusters` / synccheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "fast_topk_clusters-synccheck"`
+- Observed: fixed synchronization program rejected Some(Issue(1152)): Cluster(UnexpectedParticipant { warp: 28 })
+
+### V2C-16 [racecheck]: `data_race` `missing_same_warp_lane_order` write/write within one warp
+
+- Cases (2): `gdn_decode_bf16_wide_vec_mtp` (racecheck), `gdn_decode_fp32_mtp_warp` (racecheck)
+- Minimal reproduction: `gdn_decode_fp32_mtp_warp` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "gdn_decode_fp32_mtp_warp-racecheck"`
+- Observed: write_write conflict on bytes [3200..3204) of allocation 14: missing_same_warp_lane_order; write_write conflict on bytes [3216..3220) of allocation 14: missing_same_warp_lane_order
+
+### V2C-17 [racecheck]: `data_race` `async_lifetime_not_drained` over a large shared range (cf. deltas X9/P6)
+
+- Cases (1): `cudnn_sm100_kda_bprop_f16` (racecheck)
+- Minimal reproduction: `cudnn_sm100_kda_bprop_f16` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "cudnn_sm100_kda_bprop_f16-racecheck"`
+- Observed: write_read conflict on bytes [1728..229088) of allocation 69: async_lifetime_not_drained; write_read conflict on bytes [34496..261856) of allocation 69: async_lifetime_not_drained
+
+### V2C-18 [racecheck]: racecheck no longer emits `alias_stale_read` (W5 deciding whether to port it)
+
+- Cases (1): `stable_sort_topk_by_value` (racecheck)
+- Minimal reproduction: `stable_sort_topk_by_value` / racecheck: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "stable_sort_topk_by_value-racecheck"`
+- Observed: expected diagnostics [{"diagnostics": [{"anchors": ["tirx_kernels/ported/flashinfer/utils/topk_radix.py:29:1-29:55", "tirx_kernels/ported/flashinfer/utils/topk_radix.py:44:1-44:57"], "bytes": {"shared": "128-130,512-514,898-900,902-904,906-908,910-912,914-916,918-920,922 / actual [{"verdict": "clean", "diagnostics": []}]
+
+### V2C-19 [interp]: an uninitialized read legacy reports is not reported under `ZeroAndReport`
+
+- Cases (2): `flashinfer_rmsnorm_quant` (numsim/racecheck/synccheck), `gdn_decode_fp32_mtp_warp` (numsim/synccheck)
+- Minimal reproduction: `flashinfer_rmsnorm_quant` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "flashinfer_rmsnorm_quant-numsim"`
+- Observed: expected diagnostics [{"anchors": ["<TensorLoad> buffer"], "bytes": {"register": "0-128"}, "category": "diagnostics", "kind": "uninitialized_read", "space": "register", "status": "review"}, {"anchors": ["tirx_kernels/ported/flashinfer/norm/rmsnorm_quant.py:195:1-195:67"] / actual null
+
+### V2C-20 [interp]: legacy reports register-space uninitialized reads; v2 reports a different shared footprint
+
+- Cases (1): `flashinfer_qk_rmsnorm` (numsim/racecheck/synccheck)
+- Minimal reproduction: `flashinfer_qk_rmsnorm` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "flashinfer_qk_rmsnorm-numsim"`
+- Observed: expected diagnostics [{"anchors": ["<TensorLoad> buffer[0]"], "bytes": {"register": "4-6,8-10,12-14,16-18,20-22,24-26,28-30,36-38,40-42,44-46,48-50,52-54,56-58,60-62,68-70,72-74,76-78,80-82,84-86,88-90,92-94,100-102,104-106,108-110,112-114,116-118,120-122,124-126"}, "cat / actual [{"category": "diagnostics", "kind": "uninitialized_read", "status": "review", "space": "shared", "anchors": [], "bytes": {"shared": "32-512"}}]
+
+### V2C-22 [interp / oplib]: outputs differ from legacy AND fail the independent reference
+
+- Cases (1): `cudnn_sm100_kda_bprop_f16` (numsim)
+- Minimal reproduction: `cudnn_sm100_kda_bprop_f16` / numsim: `NUMSIM_IMPL=v2 $PY -m pytest -q -n 1 tests/conformance -k "cudnn_sm100_kda_bprop_f16-numsim"`
+- Observed: outputs differ: ['dgate']; reference_ok=False
+
+### W8-6 [contract (sched)]: buffer parameters aliasing one host array
+
+19 canonical cases bind the *same* host array (or overlapping views) to two
+buffer parameters (`selective_state_update_*`: `x`/`z`,
+`dst_indices`/`rand_seed`; cudnn gdn/kda: `scheduler`/`work_item_staging`;
+...; full list under W8-6 in `docs/development/v2-conformance-status.md`).
+Legacy mapped them to one engine allocation with per-parameter offsets, so
+racecheck saw the aliasing and writes through one name were visible through
+the other. `sched::run_with_config` allocates one allocation per
+`ArgValue::Buffer` name, so v2 would silently give each parameter its own
+copy; the binder therefore fails closed (`NotImplementedError`; rule in
+`dev-loop.md`). Request: `ArgValue::View { target: String, offset: u64, len: u64 }`
+accepted for `ParamKind::Buffer` slots (and as a `Pointer` target), bound
+to the target's allocation at `offset`. The binder will then emit one
+`Buffer` per distinct host memory region (the union of overlapping spans) and
+a `View` per parameter, and read each parameter's output as a slice of the
+region.
+
+### V2C-23 [synccheck]: verdict on a truncated event log
+
+When a launch stops early (runtime error or fail-closed `Incomplete`, e.g.
+V2C-1/V2C-9), `synccheck::check` still explores the partial log and reports
+`execution_error: executor deadlock; N blocked warps` (e.g.
+`selective_state_update_stp_vertical`/synccheck, `bmm_fp8_rubin`/synccheck).
+The explorer cannot tell a truncated log from a hang. numsim-py now gives the
+engine's own error/incomplete precedence and keeps the checker's verdict as
+`checker_on_truncated_log`, but the checker should fail closed itself:
+request a `SynccheckConfig`/input flag (or a `RecordingObserver` marker from
+`warp_done`) saying which warps never ended, so the explorer reports
+`Incomplete { reason: "truncated_log" }` instead of a deadlock.

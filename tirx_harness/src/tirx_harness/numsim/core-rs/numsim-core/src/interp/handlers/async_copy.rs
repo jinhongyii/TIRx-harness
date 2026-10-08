@@ -48,11 +48,15 @@ pub struct Issue {
     /// TMA loads: OOB fill pattern and TF32 rounding (`oplib::TmaPlan`).
     pub fill_pattern: Vec<u8>,
     pub tf32_round: bool,
+    /// `_report` copy forms (layout::v1 completion mbarriers).
+    pub report: Option<ReportMode>,
+    /// tcgen05.mma `.lut_b`: TMEM address of the lookup table.
+    pub lut_b: Option<u32>,
 }
 
 /// Issue an async op: allocate its id, emit `AsyncIssue`, queue it.
 pub fn issue_async(ctx: &mut ExecCtx<'_>, lanes: WarpMask, is: Issue) -> AsyncId {
-    let id = ctx.sync.next_async_id();
+    let id = ctx.aux.next_async_id();
     let phases = is
         .signals
         .iter()
@@ -79,7 +83,16 @@ pub fn issue_async(ctx: &mut ExecCtx<'_>, lanes: WarpMask, is: Issue) -> AsyncId
     let lane = lanes.first().unwrap_or(0) as u8;
     ctx.aux.async_meta.insert(
         id,
-        AsyncMeta { lane, class: is.class, proxy: is.proxy, phases, fill_pattern: is.fill_pattern, tf32_round: is.tf32_round },
+        AsyncMeta {
+            lane,
+            class: is.class,
+            proxy: is.proxy,
+            phases,
+            fill_pattern: is.fill_pattern,
+            tf32_round: is.tf32_round,
+            report: is.report,
+            lut_b: is.lut_b,
+        },
     );
     if is.queue {
         let source = AsyncSource { warp: ctx.warp.id, cta: ctx.cta.id, site: ctx.site(), seq: ctx.warp.sync_seq };
@@ -199,6 +212,8 @@ pub fn cp_async(
                 queue: true,
                 fill_pattern: Vec::new(),
                 tf32_round: false,
+                report: None,
+                lut_b: None,
             },
         );
         ctx.aux.groups.issue(group_res(ctx, l, Domain::CpAsync), op);
@@ -356,18 +371,24 @@ fn bind_mbar_tx(
 pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
     active_or_next!(ctx);
     let active = ctx.warp.active;
-    if args.report.is_some() {
-        return Err(support::unsupported(ctx, "cp.async.bulk report forms"));
-    }
+    check_report(ctx, args.report, &args.completion)?;
     let mut cmds = Vec::new();
     let mut issued = Vec::new();
     for l in active.lanes() {
         let size = lane_val(ctx, args.size, l);
         let sa = lane_val(ctx, args.src, l);
-        // `.ignore_oob`: only the in-bounds prefix of the source is read;
-        // the destination keeps its bytes beyond it (tx counts `size`).
-        let copy = if args.ignore_oob { in_bounds_prefix(ctx, args.src_space, sa, l, size)? } else { size };
-        let sl = support::resolve(ctx, args.src_space, sa, l, copy)?;
+        // `.ignore_oob`: the first `left` and last `right` source bytes are
+        // not read and their destination bytes are left unchanged (tx still
+        // counts `size`).
+        let (left, right) = match args.ignore_oob {
+            Some(io) => (
+                io.ignore_bytes_left.map(|o| lane_val(ctx, o, l)).unwrap_or(0).min(size),
+                io.ignore_bytes_right.map(|o| lane_val(ctx, o, l)).unwrap_or(0),
+            ),
+            None => (0, 0),
+        };
+        let copy = size.saturating_sub(left).saturating_sub(right);
+        let sl = support::resolve(ctx, args.src_space, sa.wrapping_add(left), l, copy)?;
         let dl = support::resolve(ctx, args.dst_space, lane_val(ctx, args.dst, l), l, size)?;
         let mask = args.byte_mask.map(|m| lane_val(ctx, m, l) as u16);
         // Destination CTAs (multicast: same offset in every masked CTA).
@@ -387,13 +408,21 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
                 ranks.push(None);
             }
         }
-        // Byte runs actually copied (byte mask per 16-byte chunk, OOB prefix).
-        let runs = byte_runs(copy, mask);
+        // Byte runs actually copied (byte mask per 16-byte chunk of the
+        // full range, minus the ignored edges).
+        let runs: Vec<(u64, u64)> = byte_runs(size, mask)
+            .into_iter()
+            .filter_map(|(o, n)| {
+                let lo = o.max(left);
+                let hi = (o + n).min(left + copy);
+                (lo < hi).then_some((lo, hi - lo))
+            })
+            .collect();
         let mut srcs: Vec<(AllocId, ByteSpan)> = Vec::new();
         let mut dsts2: Vec<(AllocId, ByteSpan)> = Vec::new();
         for (da, ds) in &dsts {
             for &(o, n) in &runs {
-                srcs.push((sl.alloc, ByteSpan::new(sl.offset + o, n)));
+                srcs.push((sl.alloc, ByteSpan::new(sl.offset + (o - left), n)));
                 dsts2.push((*da, ByteSpan::new(ds.start + o, n)));
             }
         }
@@ -408,6 +437,9 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
         match args.completion {
             BulkCompletion::Mbarrier { mbar, space } => {
                 let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
+                if args.report.is_some() {
+                    require_layout_v1(ctx, res)?;
+                }
                 let res_list: Vec<ResourceId> = ranks
                     .iter()
                     .map(|r| match r {
@@ -429,7 +461,20 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
         let op = issue_async(
             ctx,
             WarpMask::lane(l),
-            Issue { kind, class: AsyncClass::Copy, proxy: Proxy::Async, payload, signals, after: Vec::new(), targets, queue: true, fill_pattern: Vec::new(), tf32_round: false },
+            Issue {
+                kind,
+                class: AsyncClass::Copy,
+                proxy: Proxy::Async,
+                payload,
+                signals,
+                after: Vec::new(),
+                targets,
+                queue: true,
+                fill_pattern: Vec::new(),
+                tf32_round: false,
+                report: args.report,
+                lut_b: None,
+            },
         );
         if let Some(g) = group {
             ctx.aux.groups.issue(g, op);
@@ -440,11 +485,31 @@ pub fn bulk_copy(ctx: &mut ExecCtx<'_>, args: BulkCopyArgs) -> HResult {
     Ok(Flow::Next)
 }
 
-/// Bytes of `[a, a+size)` that lie inside the allocation `a` resolves to.
-fn in_bounds_prefix(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, size: u64) -> Result<u64, ExecError> {
-    let loc = support::resolve(ctx, space, a, lane, 0)?;
-    let avail = ctx.arena.get(loc.alloc).size.saturating_sub(loc.offset);
-    Ok(size.min(avail))
+/// `_report` copy forms: completion must be an mbarrier; the pattern of
+/// `.per_16bytes` is not carried by `ReportMode` yet (W2-8), fail closed.
+fn check_report(ctx: &ExecCtx<'_>, report: Option<ReportMode>, completion: &BulkCompletion) -> Result<(), ExecError> {
+    match (report, completion) {
+        (None, _) => Ok(()),
+        (Some(ReportMode::Per16Bytes), _) => {
+            Err(support::unsupported(ctx, "copy report .per_16bytes (pattern not in the contract, W2-8)"))
+        }
+        (Some(_), BulkCompletion::Group) => Err(ctx.error(
+            ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+            "copy report forms require an mbarrier completion",
+        )),
+        (Some(ReportMode::PerElementFf), BulkCompletion::Mbarrier { .. }) => Ok(()),
+    }
+}
+
+/// The completion mbarrier of a report copy must use layout::v1.
+pub fn require_layout_v1(ctx: &ExecCtx<'_>, res: ResourceId) -> Result<(), ExecError> {
+    match ctx.sync.get(res) {
+        Some(crate::sync::Resource::Mbarrier(s)) if s.live && s.layout_v1 => Ok(()),
+        _ => Err(ctx.error(
+            ExecErrorKind::Op(crate::oplib::OpErrorKind::Invalid),
+            "copy reporting requires an initialized mbarrier with layout::v1",
+        )),
+    }
 }
 
 /// `(offset, len)` runs of the first `n` bytes selected by a `.cp_mask`
@@ -486,18 +551,16 @@ fn read_tmap(
 #[inline]
 pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
     active_or_next!(ctx);
-    if args.report.is_some() {
-        return Err(support::unsupported(ctx, "cp.async.bulk.tensor report forms"));
-    }
+    check_report(ctx, args.report, &args.completion)?;
     let active = ctx.warp.active;
     let mut cmds = Vec::new();
     let mut issued = Vec::new();
     let mut acc = Accesses::default();
     for l in active.lanes() {
         let (mut desc, _) = read_tmap(ctx, args.tmap, args.tmap_space, l, &mut acc)?;
-        for o in &args.overrides {
-            let v = lane_val(ctx, o.value, l);
-            desc.replace(o.field, o.ord, v).map_err(|e| support::op_err(ctx, e))?;
+        if !args.overrides.is_empty() {
+            let ov: Vec<_> = args.overrides.iter().map(|o| (o.field, o.ord, lane_val(ctx, o.value, l))).collect();
+            desc.apply_overrides(&ov).map_err(|e| support::op_err(ctx, e))?;
         }
         let coords: Vec<i64> = args.coords.iter().map(|&c| lane_int(ctx, c, l)).collect();
         let offs: Vec<i64> = args.im2col_offsets.iter().map(|&c| lane_int(ctx, c, l)).collect();
@@ -561,6 +624,9 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
         match args.completion {
             BulkCompletion::Mbarrier { mbar, space } => {
                 let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
+                if args.report.is_some() {
+                    require_layout_v1(ctx, res)?;
+                }
                 let list: Vec<ResourceId> = ranks
                     .iter()
                     .map(|r| match r {
@@ -584,7 +650,20 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
         let op = issue_async(
             ctx,
             WarpMask::lane(l),
-            Issue { kind, class: AsyncClass::Copy, proxy: Proxy::Async, payload, signals, after: Vec::new(), targets, queue: true, fill_pattern, tf32_round },
+            Issue {
+                kind,
+                class: AsyncClass::Copy,
+                proxy: Proxy::Async,
+                payload,
+                signals,
+                after: Vec::new(),
+                targets,
+                queue: true,
+                fill_pattern,
+                tf32_round,
+                report: args.report,
+                lut_b: None,
+            },
         );
         if let Some(g) = group {
             ctx.aux.groups.issue(g, op);
@@ -639,6 +718,8 @@ pub fn st_async(ctx: &mut ExecCtx<'_>, args: StAsyncArgs) -> HResult {
                 queue: true,
                 fill_pattern: Vec::new(),
                 tf32_round: false,
+                report: None,
+                lut_b: None,
             },
         );
     }

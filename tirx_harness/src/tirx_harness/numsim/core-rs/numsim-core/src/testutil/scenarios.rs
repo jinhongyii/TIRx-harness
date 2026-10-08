@@ -304,7 +304,7 @@ pub fn mbarrier_producer_consumer() -> Scenario {
         multicast: None,
         reduce: None,
         byte_mask: None,
-        ignore_oob: false,
+        ignore_oob: None,
         report: None,
         mods: MemMods::default(),
     }));
@@ -739,16 +739,28 @@ pub fn tcgen_ld_st() -> Scenario {
     b.binary(BinOp::Shl, Ty::U32, lanebits, lanebits, k16);
     b.add_u32(t2, t, lanebits);
     b.site("tcgen_st", 2);
-    b.push(Instr::TcgenSt(Box::new(TcgenStArgs { srcs: vec![tid.into()], taddr: t2.into(), shape: TcShape::S32x32b, num: 1, unpack: false })));
+    b.push(Instr::TcgenSt(Box::new(TcgenStArgs {
+        srcs: vec![tid.into()],
+        taddr: t2.into(),
+        row: k0,
+        col: k0,
+        shape: TcShape::S32x32b,
+        num: 1,
+        unpack: false,
+    })));
     b.push(Instr::TcgenWait { st: true });
     b.site("tcgen_ld", 3);
     b.push(Instr::TcgenLd(Box::new(TcgenLdArgs {
         dsts: vec![v],
         taddr: t2.into(),
+        row: k0,
+        col: k0,
         shape: TcShape::S32x32b,
         num: 1,
         pack: false,
         red: None,
+        red_abs: false,
+        red_nan: false,
         spcompress: false,
     })));
     b.push(Instr::TcgenWait { st: false });
@@ -875,6 +887,7 @@ pub fn tma_load() -> Scenario {
         align: 64,
         view_of: None,
         sync_words: false,
+        base_reg: None,
     });
     prog.host_abi.push(ParamSlot {
         name: "tmap".into(),
@@ -914,6 +927,676 @@ pub fn tma_load() -> Scenario {
     )
 }
 
+/// layout::v1 copy reports: two phases of a 128-byte bulk copy with
+/// `mbarrier::report::validity::per_element::ff`; the second source contains
+/// a 0xff byte. After each wait, `try_wait.parity` with a report register
+/// reads the phase's report bit into `out[phase]`.
+pub fn copy_report() -> Scenario {
+    let mut b = ProgramBuilder::new("copy_report", 32);
+    let ga = b.global("ga", Dtype::U32);
+    let gb = b.global("gb", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let data = b.shared("data", Dtype::U32, 32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let e = b.reg(Ty::PRED);
+    let ready = b.reg(Ty::PRED);
+    let rep = b.reg(Ty::PRED);
+    let repv = b.reg(Ty::U8);
+    let barr = b.reg(Ty::U32);
+    let daddr = b.reg(Ty::U32);
+    let g = b.reg(Ty::U64);
+    let v = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    b.smem_addr(barr, bar, k0);
+    b.smem_addr(daddr, data, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.push(Instr::MbarInit { mbar: barr.into(), space: AddrSpace::Shared, count: k1, layout_v1: true });
+    b.end_if();
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    let full = b.k_u32(u32::MAX);
+    let k128 = b.k_u32(128);
+    for (phase, src) in [(0u32, ga), (1, gb)] {
+        b.push(Instr::Elect { dst_pred: e, dst_lane: None, membermask: full });
+        b.if_(e);
+        b.push(Instr::MbarArrive(MbarArriveArgs {
+            mbar: barr.into(),
+            space: AddrSpace::Shared,
+            count: None,
+            expect_tx: Some(k128),
+            drop: false,
+            no_complete: false,
+            sem: Sem::Release,
+            scope: Scope::Cta,
+            multicast: None,
+            state: None,
+        }));
+        b.addr_of(g, src, k0);
+        b.site("report_copy", 1 + phase);
+        b.push(Instr::BulkCopy(BulkCopyArgs {
+            dst: daddr.into(),
+            dst_space: AddrSpace::SharedCluster,
+            src: g.into(),
+            src_space: AddrSpace::Global,
+            size: k128,
+            completion: BulkCompletion::Mbarrier { mbar: barr.into(), space: AddrSpace::Shared },
+            multicast: None,
+            reduce: None,
+            byte_mask: None,
+            ignore_oob: None,
+            report: Some(ReportMode::PerElementFf),
+            mods: MemMods::default(),
+        }));
+        b.no_site();
+        b.end_if();
+        let kp = b.k_u32(phase);
+        b.mbar_wait_parity(barr, kp);
+        b.push(Instr::MbarTestWait {
+            kind: WaitKind::Try,
+            mbar: barr.into(),
+            space: AddrSpace::Shared,
+            phase: PhaseArg::Parity(kp),
+            sem: Sem::Acquire,
+            scope: Scope::Cta,
+            dst: Some(ready),
+            report: Some(rep),
+            report_value: Some(repv),
+        });
+        b.if_(p);
+        b.cast(Ty::PRED, Ty::U32, v, rep);
+        b.st_u32(out, kp, v);
+        b.end_if();
+        // Every lane reads the data before the next phase reuses it; the
+        // async-proxy overwrite needs the generic reads fenced.
+        b.ld_u32(v, data, lane);
+        b.fence(FenceKind::ProxyAsync(Some(AddrSpace::Shared)), Sem::Weak, Scope::Cta);
+        b.push(Instr::WarpSync { membermask: full });
+    }
+    b.exit();
+    let mut prog = b.build();
+    mark_elect(&mut prog, e);
+    let mut gbv: Vec<u32> = (0..32).collect();
+    gbv[5] = 0x00ff_0000;
+    scenario(
+        "copy_report",
+        Module::new(vec![prog]),
+        inputs(vec![("ga", u32_buf(0..32)), ("gb", u32_buf(gbv)), ("out", u32_buf([7, 7]))]),
+    )
+}
+
+/// `if lane < 16 { s[lane] = 10*lane; __syncwarp(); x = s[lane ^ 16] } else
+/// { s[lane] = 10*lane; __syncwarp(); x = s[lane ^ 16] }; out[lane] = x`:
+/// a `__syncwarp` rendezvous across divergent arms.
+pub fn divergent_syncwarp() -> Scenario {
+    let mut b = ProgramBuilder::new("divergent_syncwarp", 32);
+    let out = b.global("out", Dtype::U32);
+    let sm = b.shared("s", Dtype::U32, 32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let v = b.reg(Ty::U32);
+    let o = b.reg(Ty::U32);
+    let x = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k16 = b.k_u32(16);
+    let k10 = b.k_u32(10);
+    let full = b.k_u32(u32::MAX);
+    b.compare(CmpOp::Lt, Ty::U32, p, lane, k16);
+    b.if_(p);
+    for arm in 0..2 {
+        if arm == 1 {
+            b.else_();
+        }
+        b.mul(Ty::U32, v, lane, k10);
+        b.st_u32(sm, lane, v);
+        b.site("syncwarp", 1 + arm);
+        b.push(Instr::WarpSync { membermask: full });
+        b.no_site();
+        b.binary(BinOp::Xor, Ty::U32, o, lane, k16);
+        b.ld_u32(x, sm, o);
+    }
+    b.end_if();
+    b.st_u32(out, lane, x);
+    b.exit();
+    scenario("divergent_syncwarp", b.build_module(), inputs(vec![("out", u32_buf([0; 32]))]))
+}
+
+/// Experts of the MoE synthetic.
+pub const MOE_EXPERTS: u32 = 8;
+
+/// A Mega-MoE-shaped synthetic: `ctas` CTAs x 256 threads (8 warps). Every
+/// iteration each thread loads its token from global memory, mixes it with
+/// a neighbour's value exchanged through shared memory (`bar.sync`) and an
+/// ALU chain; at the end it stores its result and lane 0 of every warp
+/// counts the CTA's tokens into its expert with a global `red.add` (a
+/// cross-partition read-modify-write). Expected values: [`moe_expected`].
+pub fn moe_synthetic(ctas: u32, iters: u32) -> Scenario {
+    let threads = 256u32;
+    let mut b = ProgramBuilder::new("moe_synthetic", threads);
+    b.grid(ctas, 1, 1);
+    let x_in = b.global("tokens", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let counts = b.global("counts", Dtype::U32);
+    let sm = b.shared("s", Dtype::U32, threads as u64);
+    let tid = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let gi = b.reg(Ty::U32);
+    let acc = b.reg(Ty::U32);
+    let x = b.reg(Ty::U32);
+    let nb = b.reg(Ty::U32);
+    let ni = b.reg(Ty::U32);
+    let k = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let lane = b.reg(Ty::U32);
+    let expert = b.reg(Ty::U32);
+    let ca = b.reg(Ty::U64);
+    b.thread_rank(tid);
+    b.lane_id(lane);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let kt = b.k_u32(threads);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k3 = b.k_u32(3);
+    let kmask = b.k_u32(threads - 1);
+    let kn = b.k_u32(iters);
+    let ke = b.k_u32(MOE_EXPERTS);
+    b.mul(Ty::U32, gi, cta, kt);
+    b.add_u32(gi, gi, tid);
+    b.mov(acc, tid);
+    b.add_u32(ni, tid, k1);
+    b.binary(BinOp::And, Ty::U32, ni, ni, kmask);
+    b.mov(k, k0);
+    b.site("moe_loop", 1);
+    b.loop_begin();
+    b.no_site();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, kn);
+    b.loop_if(p);
+    b.ld_u32(x, x_in, gi);
+    b.mul(Ty::U32, acc, acc, k3);
+    b.add_u32(acc, acc, x);
+    b.add_u32(acc, acc, k);
+    b.st_u32(sm, tid, acc);
+    b.bar_sync(0);
+    b.ld_u32(nb, sm, ni);
+    b.add_u32(acc, acc, nb);
+    b.bar_sync(0);
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.st_u32(out, gi, acc);
+    b.binary(BinOp::Mod, Ty::U32, expert, cta, ke);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.addr_of(ca, counts, expert);
+    b.site("expert_count", 2);
+    b.red_add(Ty::U32, ca, k1);
+    b.end_if();
+    b.exit();
+    let n = (ctas * threads) as usize;
+    let mut s = scenario(
+        "moe_synthetic",
+        b.build_module(),
+        inputs(vec![
+            ("tokens", u32_buf((0..n as u32).map(|i| i.wrapping_mul(2654435761) >> 7))),
+            ("out", u32_buf(vec![0; n])),
+            ("counts", u32_buf(vec![0; MOE_EXPERTS as usize])),
+        ]),
+    );
+    s.config.completions = CompletionPolicy::Eager;
+    s
+}
+
+/// Expected `(out, counts)` of [`moe_synthetic`].
+pub fn moe_expected(ctas: u32, iters: u32) -> (Vec<u32>, Vec<u32>) {
+    let t = 256usize;
+    let mut out = vec![0u32; ctas as usize * t];
+    let mut counts = vec![0u32; MOE_EXPERTS as usize];
+    for c in 0..ctas as usize {
+        let mut acc: Vec<u32> = (0..t as u32).collect();
+        for k in 0..iters {
+            let mut s = vec![0u32; t];
+            for i in 0..t {
+                let x = ((c * t + i) as u32).wrapping_mul(2654435761) >> 7;
+                acc[i] = acc[i].wrapping_mul(3).wrapping_add(x).wrapping_add(k);
+                s[i] = acc[i];
+            }
+            for i in 0..t {
+                acc[i] = acc[i].wrapping_add(s[(i + 1) & (t - 1)]);
+            }
+        }
+        out[c * t..(c + 1) * t].copy_from_slice(&acc);
+        counts[c % MOE_EXPERTS as usize] += 8; // lane 0 of each of 8 warps
+    }
+    (out, counts)
+}
+
+/// `ldmatrix.m8n8.x4.b16` (plain into `out_ld`, `.trans` into `out_ldt`)
+/// from a 4x8x8 u16 matrix block, and `stmatrix.m8n8.x4` of the plain
+/// fragments into a second block copied to `out_st` (a round trip).
+pub fn matrix_roundtrip() -> Scenario {
+    let mut b = ProgramBuilder::new("matrix_roundtrip", 32);
+    let input = b.global("input", Dtype::U16);
+    let out_ld = b.global("out_ld", Dtype::U32);
+    let out_ldt = b.global("out_ldt", Dtype::U32);
+    let out_st = b.global("out_st", Dtype::U16);
+    let a = b.shared("a", Dtype::U16, 256);
+    let c = b.shared("c", Dtype::U16, 256);
+    let lane = b.reg(Ty::U32);
+    let i = b.reg(Ty::U32);
+    let v = b.reg(Ty::U16);
+    let row = b.reg(Ty::U32);
+    let ra = b.reg(Ty::U32);
+    let rc = b.reg(Ty::U32);
+    let frag: Vec<Reg> = (0..4).map(|_| b.reg(Ty::U32)).collect();
+    let fragt: Vec<Reg> = (0..4).map(|_| b.reg(Ty::U32)).collect();
+    let p = b.reg(Ty::PRED);
+    let j = b.reg(Ty::U32);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k4 = b.k_u32(4);
+    let k8 = b.k_u32(8);
+    let k32 = b.k_u32(32);
+    // Fill `a` from `input` (8 u16 per lane).
+    b.mov(j, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, j, k8);
+    b.loop_if(p);
+    b.mul(Ty::U32, i, j, k32);
+    b.add_u32(i, i, lane);
+    b.ld(Ty::U16, v, input, i);
+    b.st(Ty::U16, a, i, v);
+    b.add_u32(j, j, k1);
+    b.loop_end();
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::WarpSync { membermask: full });
+    // Lane l provides row (l % 8) of matrix (l / 8): element 8 * l.
+    b.mul(Ty::U32, row, lane, k8);
+    b.smem_addr(ra, a, row);
+    b.smem_addr(rc, c, row);
+    b.site("ldmatrix", 1);
+    b.push(Instr::LdMatrix { dsts: frag.clone(), addr: ra.into(), space: AddrSpace::Shared, shape: MatrixShape::M8N8, num: 4, trans: false, fmt: MatrixFmt::B16 });
+    b.push(Instr::LdMatrix { dsts: fragt.clone(), addr: ra.into(), space: AddrSpace::Shared, shape: MatrixShape::M8N8, num: 4, trans: true, fmt: MatrixFmt::B16 });
+    b.site("stmatrix", 2);
+    b.push(Instr::StMatrix { srcs: frag.iter().map(|&r| r.into()).collect(), addr: rc.into(), space: AddrSpace::Shared, shape: MatrixShape::M8N8, num: 4, trans: false });
+    b.no_site();
+    for (k, (&f, &ft)) in frag.iter().zip(&fragt).enumerate() {
+        let kk = b.k_u32(k as u32);
+        b.mul(Ty::U32, i, lane, k4);
+        b.add_u32(i, i, kk);
+        b.st_u32(out_ld, i, f);
+        b.st_u32(out_ldt, i, ft);
+    }
+    b.push(Instr::WarpSync { membermask: full });
+    b.mov(j, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, j, k8);
+    b.loop_if(p);
+    b.mul(Ty::U32, i, j, k32);
+    b.add_u32(i, i, lane);
+    b.ld(Ty::U16, v, c, i);
+    b.st(Ty::U16, out_st, i, v);
+    b.add_u32(j, j, k1);
+    b.loop_end();
+    b.exit();
+    let u16_buf = |v: Vec<u16>| ArgValue::Buffer { bytes: v.into_iter().flat_map(|x| x.to_le_bytes()).collect(), valid: None };
+    scenario(
+        "matrix_roundtrip",
+        b.build_module(),
+        inputs(vec![
+            ("input", u16_buf((0..256).map(|x| (x * 7 + 1) as u16).collect())),
+            ("out_ld", u32_buf([0; 128])),
+            ("out_ldt", u32_buf([0; 128])),
+            ("out_st", u16_buf(vec![0; 256])),
+        ]),
+    )
+}
+
+/// Matrix descriptor of the `tcgen_cp_ld` scenario's source (window offset
+/// 0, LBO 128 B, SBO 256 B, no swizzle; legacy `encode_matrix_descriptor`).
+pub const TCGEN_CP_SDESC: u64 = (8u64 << 16) | (16u64 << 32) | (1u64 << 46);
+
+/// `tcgen05.cp.128x256b` of a 4 KiB shared block into TMEM columns 0..8 of
+/// a fresh 32-column allocation, committed to an mbarrier; every warp then
+/// reads its sub-partition back with `tcgen05.ld.32x32b.x8` into `out`
+/// (`out[tid * 8 + j]` = TMEM lane `tid`, column `j`).
+pub fn tcgen_cp_ld() -> Scenario {
+    let mut b = ProgramBuilder::new("tcgen_cp_ld", 128);
+    let input = b.global("input", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let src = b.shared("src", Dtype::U32, 1024);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let slot = b.shared("taddr", Dtype::U32, 1);
+    let tid = b.reg(Ty::U32);
+    let w = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let i = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    let j = b.reg(Ty::U32);
+    let sa = b.reg(Ty::U32);
+    let barr = b.reg(Ty::U32);
+    let t = b.reg(Ty::U32);
+    let t2 = b.reg(Ty::U32);
+    let lb = b.reg(Ty::U32);
+    let dst: Vec<Reg> = (0..8).map(|_| b.reg(Ty::U32)).collect();
+    b.thread_rank(tid);
+    b.warp_id(w);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k8 = b.k_u32(8);
+    let k16 = b.k_u32(16);
+    let k32 = b.k_u32(32);
+    let k128 = b.k_u32(128);
+    // Fill the source block (8 words per thread).
+    b.mov(j, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, j, k8);
+    b.loop_if(p);
+    b.mul(Ty::U32, i, j, k128);
+    b.add_u32(i, i, tid);
+    b.ld_u32(v, input, i);
+    b.st_u32(src, i, v);
+    b.add_u32(j, j, k1);
+    b.loop_end();
+    b.smem_addr(sa, slot, k0);
+    b.smem_addr(barr, bar, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b.if_(p);
+    b.push(Instr::TcgenAlloc { dst: sa.into(), ncols: k32, cta_group: 1, exclusive: false });
+    b.end_if();
+    b.compare(CmpOp::Eq, Ty::U32, p, tid, k0);
+    b.if_(p);
+    b.mbar_init(barr, 1);
+    b.end_if();
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    b.fence(FenceKind::ProxyAsync(Some(AddrSpace::Shared)), Sem::Weak, Scope::Cta);
+    b.fence(FenceKind::Tcgen05Before, Sem::Weak, Scope::Cta);
+    b.bar_sync(0);
+    b.fence(FenceKind::Tcgen05After, Sem::Weak, Scope::Cta);
+    b.ld_u32(t, slot, k0);
+    b.if_(p);
+    let kdesc = b.konst(Ty::U64, TCGEN_CP_SDESC as u128);
+    b.site("tcgen_cp", 1);
+    b.push(Instr::TcgenCp(TcgenCpArgs {
+        taddr: t.into(),
+        row: k0,
+        col: k0,
+        sdesc: kdesc,
+        rows: 128,
+        bits: 256,
+        multicast: 0,
+        decompress_bits: 0,
+        cta_group: 1,
+    }));
+    b.push(Instr::TcgenCommit { mbar: barr.into(), space: AddrSpace::Shared, cta_group: 1, multicast: None, sync_restrict: false, multicast_width: None });
+    b.no_site();
+    b.end_if();
+    b.mbar_wait_parity(barr, k0);
+    b.fence(FenceKind::Tcgen05After, Sem::Weak, Scope::Cta);
+    b.mul(Ty::U32, lb, w, k32);
+    b.binary(BinOp::Shl, Ty::U32, lb, lb, k16);
+    b.add_u32(t2, t, lb);
+    b.site("tcgen_ld", 2);
+    b.push(Instr::TcgenLd(Box::new(TcgenLdArgs {
+        dsts: dst.clone(),
+        taddr: t2.into(),
+        row: k0,
+        col: k0,
+        shape: TcShape::S32x32b,
+        num: 8,
+        pack: false,
+        red: None,
+        red_abs: false,
+        red_nan: false,
+        spcompress: false,
+    })));
+    b.push(Instr::TcgenWait { st: false });
+    b.no_site();
+    for (k, &d) in dst.iter().enumerate() {
+        let kk = b.k_u32(k as u32);
+        b.mul(Ty::U32, i, tid, k8);
+        b.add_u32(i, i, kk);
+        b.st_u32(out, i, d);
+    }
+    b.fence(FenceKind::Tcgen05Before, Sem::Weak, Scope::Cta);
+    b.bar_sync(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b.if_(p);
+    b.push(Instr::TcgenDealloc { taddr: t.into(), ncols: k32, cta_group: 1, exclusive: false });
+    b.end_if();
+    b.exit();
+    scenario(
+        "tcgen_cp_ld",
+        b.build_module(),
+        inputs(vec![("input", u32_buf((0..1024).map(|x| x * 3 + 7))), ("out", u32_buf(vec![0; 1024]))]),
+    )
+}
+
+/// Elected-lane helper: `elect.sync` into `e`, `If{elect}` on it.
+fn elect_if(b: &mut ProgramBuilder, e: Reg) {
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::Elect { dst_pred: e, dst_lane: None, membermask: full });
+    b.if_(e);
+}
+
+/// A 64-byte global->shared bulk copy with `.cp_mask` 0x00ff (bytes 0..8 of
+/// every 16) and `.ignore_oob` left 4 / right 8 over a shared block
+/// pre-filled with 0xEE; `out` = the block afterwards. Expected bytes:
+/// [`bulk_masked_expected`].
+pub fn bulk_masked_copy() -> Scenario {
+    let mut b = ProgramBuilder::new("bulk_masked_copy", 32);
+    let input = b.global("input", Dtype::U8);
+    let out = b.global("out", Dtype::U8);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let blk = b.shared("blk", Dtype::U8, 64);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let e = b.reg(Ty::PRED);
+    let barr = b.reg(Ty::U32);
+    let da = b.reg(Ty::U32);
+    let g = b.reg(Ty::U64);
+    let i = b.reg(Ty::U32);
+    let v = b.reg(Ty::U8);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k2 = b.k_u32(2);
+    let k32 = b.k_u32(32);
+    let kee = b.konst(Ty::U8, 0xee);
+    for half in [k0, k32] {
+        b.add_u32(i, lane, half);
+        b.st(Ty::U8, blk, i, kee);
+    }
+    b.smem_addr(barr, bar, k0);
+    b.smem_addr(da, blk, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.mbar_init(barr, 1);
+    b.end_if();
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    b.fence(FenceKind::ProxyAsync(Some(AddrSpace::Shared)), Sem::Weak, Scope::Cta);
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::WarpSync { membermask: full });
+    elect_if(&mut b, e);
+    let k64 = b.k_u32(64);
+    b.push(Instr::MbarArrive(MbarArriveArgs {
+        mbar: barr.into(),
+        space: AddrSpace::Shared,
+        count: None,
+        expect_tx: Some(k64),
+        drop: false,
+        no_complete: false,
+        sem: Sem::Release,
+        scope: Scope::Cta,
+        multicast: None,
+        state: None,
+    }));
+    b.addr_of(g, input, k0);
+    let mask = b.k_u32(0x00ff);
+    let k4 = b.k_u32(4);
+    let k8 = b.k_u32(8);
+    b.site("masked_bulk", 1);
+    b.push(Instr::BulkCopy(BulkCopyArgs {
+        dst: da.into(),
+        dst_space: AddrSpace::SharedCluster,
+        src: g.into(),
+        src_space: AddrSpace::Global,
+        size: k64,
+        completion: BulkCompletion::Mbarrier { mbar: barr.into(), space: AddrSpace::Shared },
+        multicast: None,
+        reduce: None,
+        byte_mask: Some(mask),
+        ignore_oob: Some(IgnoreOob { ignore_bytes_left: Some(k4), ignore_bytes_right: Some(k8) }),
+        report: None,
+        mods: MemMods::default(),
+    }));
+    b.no_site();
+    b.end_if();
+    b.mbar_wait_parity(barr, k0);
+    for half in [k0, k32] {
+        b.add_u32(i, lane, half);
+        b.ld(Ty::U8, v, blk, i);
+        b.st(Ty::U8, out, i, v);
+    }
+    let _ = (k1, k2);
+    let mut prog = b.build();
+    mark_elect(&mut prog, e);
+    scenario(
+        "bulk_masked_copy",
+        Module::new(vec![prog]),
+        inputs(vec![
+            ("input", ArgValue::Buffer { bytes: (0..64).map(|x| x as u8 + 1).collect(), valid: None }),
+            ("out", ArgValue::Buffer { bytes: vec![0; 64], valid: None }),
+        ]),
+    )
+}
+
+/// Expected `out` of [`bulk_masked_copy`].
+pub fn bulk_masked_expected() -> Vec<u8> {
+    (0..64usize).map(|i| if i % 16 < 8 && (4..56).contains(&i) { i as u8 + 1 } else { 0xee }).collect()
+}
+
+/// `ctas` CTAs each bulk-reduce (`cp.reduce.async.bulk .add.u32`, bulk
+/// group) their 32-word shared block `cta * 1000 + i` into one global
+/// `acc` buffer (cross-partition reductions are serial points).
+pub fn bulk_reduce(ctas: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("bulk_reduce", 32);
+    b.grid(ctas, 1, 1);
+    let acc = b.global("acc", Dtype::U32);
+    let blk = b.shared("blk", Dtype::U32, 32);
+    let lane = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    let e = b.reg(Ty::PRED);
+    let sa = b.reg(Ty::U32);
+    let g = b.reg(Ty::U64);
+    b.lane_id(lane);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let k0 = b.k_u32(0);
+    let k1000 = b.k_u32(1000);
+    b.mul(Ty::U32, v, cta, k1000);
+    b.add_u32(v, v, lane);
+    b.st_u32(blk, lane, v);
+    b.fence(FenceKind::ProxyAsync(Some(AddrSpace::Shared)), Sem::Weak, Scope::Cta);
+    let full = b.k_u32(u32::MAX);
+    b.push(Instr::WarpSync { membermask: full });
+    b.smem_addr(sa, blk, k0);
+    b.addr_of(g, acc, k0);
+    elect_if(&mut b, e);
+    let k128 = b.k_u32(128);
+    b.site("bulk_reduce", 1);
+    b.push(Instr::BulkCopy(BulkCopyArgs {
+        dst: g.into(),
+        dst_space: AddrSpace::Global,
+        src: sa.into(),
+        src_space: AddrSpace::Shared,
+        size: k128,
+        completion: BulkCompletion::Group,
+        multicast: None,
+        reduce: Some((AtomOp::Add, Dtype::U32)),
+        byte_mask: None,
+        ignore_oob: None,
+        report: None,
+        mods: MemMods::default(),
+    }));
+    b.push(Instr::AsyncCommit { domain: Domain::Bulk });
+    b.push(Instr::AsyncWait { domain: Domain::Bulk, n: 0, read: false });
+    b.no_site();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    mark_elect(&mut prog, e);
+    scenario("bulk_reduce", Module::new(vec![prog]), inputs(vec![("acc", u32_buf((0..32).map(|i| i * 7)))]))
+}
+
+/// Warp 0's lanes break out of a loop at different iterations, then every
+/// thread of both warps joins `bar.sync 0`: broken lanes are live again
+/// after the loop (not exited), so the barrier completes.
+pub fn break_then_barrier() -> Scenario {
+    let mut b = ProgramBuilder::new("break_then_barrier", 64);
+    let out = b.global("out", Dtype::U32);
+    let tid = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let w = b.reg(Ty::U32);
+    let k = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    b.thread_rank(tid);
+    b.lane_id(lane);
+    b.warp_id(w);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k40 = b.k_u32(40);
+    b.compare(CmpOp::Eq, Ty::U32, p, w, k0);
+    b.if_(p);
+    b.mov(k, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, k40);
+    b.loop_if(p);
+    b.compare(CmpOp::Ge, Ty::U32, p, k, lane);
+    b.if_(p);
+    b.break_();
+    b.end_if();
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.end_if();
+    b.site("bar_after_break", 1);
+    b.bar_sync(0);
+    b.no_site();
+    let k5 = b.k_u32(5);
+    b.st_u32(out, tid, k5);
+    b.exit();
+    scenario("break_then_barrier", b.build_module(), inputs(vec![("out", u32_buf([0; 64]))]))
+}
+
+/// Launch-bounds register budget (`regs_per_thread = 128`, a host
+/// `Configure`), then warpgroup 0 `setmaxnreg.dec 96` and warpgroup 1
+/// `setmaxnreg.inc 160` (granted from the released registers).
+pub fn setmaxnreg_launch_bounds() -> Scenario {
+    let mut b = ProgramBuilder::new("setmaxnreg_launch_bounds", 256);
+    let out = b.global("out", Dtype::U32);
+    let tid = b.reg(Ty::U32);
+    let wg = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    b.thread_rank(tid);
+    b.read_special(wg, SpecialReg::WarpgroupInCta);
+    let k0 = b.k_u32(0);
+    b.compare(CmpOp::Eq, Ty::U32, p, wg, k0);
+    b.site("setmaxnreg", 1);
+    b.if_(p);
+    b.push(Instr::SetMaxNReg { inc: false, count: 96 });
+    b.else_();
+    b.push(Instr::SetMaxNReg { inc: true, count: 160 });
+    b.end_if();
+    b.no_site();
+    b.st_u32(out, tid, wg);
+    b.exit();
+    let mut prog = b.build();
+    prog.topology.regs_per_thread = 128;
+    scenario("setmaxnreg_launch_bounds", Module::new(vec![prog]), inputs(vec![("out", u32_buf(vec![9; 256]))]))
+}
+
 /// Every scenario (for differential runs across backends).
 pub fn all() -> Vec<Scenario> {
     vec![
@@ -935,5 +1618,14 @@ pub fn all() -> Vec<Scenario> {
         warp_ldst(20),
         tcgen_ld_st(),
         tma_load(),
+        copy_report(),
+        divergent_syncwarp(),
+        moe_synthetic(12, 3),
+        matrix_roundtrip(),
+        tcgen_cp_ld(),
+        bulk_masked_copy(),
+        bulk_reduce(6),
+        break_then_barrier(),
+        setmaxnreg_launch_bounds(),
     ]
 }

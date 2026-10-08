@@ -266,12 +266,68 @@ fn codegen_backend_shape_uses_the_same_path() {
     }
 }
 
+/// Every observer callback, in order, as text (Access seq included).
+#[derive(Default)]
+struct Trace(Vec<String>, bool);
+
+impl numsim_core::observe::Observer for Trace {
+    fn wants_word_history(&self) -> bool {
+        self.1
+    }
+    fn begin_launch(&mut self, i: &numsim_core::observe::LaunchInfo<'_>) {
+        self.0.push(format!("begin {}", i.kernel_index));
+    }
+    fn end_launch(&mut self, i: &numsim_core::observe::LaunchInfo<'_>) {
+        self.0.push(format!("end {}", i.kernel_index));
+    }
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        self.0.push(format!("{a:?}"));
+    }
+    fn sync(&mut self, e: &SyncEvent) {
+        self.0.push(format!("{e:?}"));
+    }
+    fn warp_done(&mut self, w: numsim_core::observe::WarpId, end: numsim_core::observe::WarpEnd) {
+        self.0.push(format!("done {w:?} {end:?}"));
+    }
+    fn inbox_drain(&mut self, c: numsim_core::observe::CtaId, r: u64) {
+        self.0.push(format!("drain {c:?} {r}"));
+    }
+}
+
 #[test]
-fn workers_do_not_change_results() {
+fn workers_do_not_change_results_or_streams() {
     for s in scenarios::all() {
-        let a = run(&s);
-        let b = run_cfg(&s, &RunConfig { workers: 8, ..s.config.clone() });
-        assert_eq!(a, b, "{}", s.name);
+        for history in [false, true] {
+            let mut t1 = Trace(Vec::new(), history);
+            let a = sched::run_with_config(&s.module, &s.inputs, &mut t1, &Backend::Interp, &s.config).unwrap();
+            for workers in [2, 8, 33] {
+                let mut tn = Trace(Vec::new(), history);
+                let cfg = RunConfig { workers, ..s.config.clone() };
+                let b = sched::run_with_config(&s.module, &s.inputs, &mut tn, &Backend::Interp, &cfg).unwrap();
+                assert_eq!(a, b, "{} workers={workers}", s.name);
+                assert!(t1.0 == tn.0, "{} workers={workers}: observer streams differ", s.name);
+            }
+        }
+        // NumSim (no observer) gives the same outputs as observed runs.
+        let mut o = numsim_core::observe::NoopObserver;
+        let c = sched::run_with_config(&s.module, &s.inputs, &mut o, &Backend::Interp, &RunConfig { workers: 8, ..s.config.clone() }).unwrap();
+        let mut t = Trace(Vec::new(), true);
+        let d = sched::run_with_config(&s.module, &s.inputs, &mut t, &Backend::Interp, &s.config).unwrap();
+        assert_eq!(c.outputs, d.outputs, "{}: observer changed outputs", s.name);
+        assert_eq!(c.status, d.status, "{}", s.name);
+    }
+}
+
+#[test]
+fn moe_synthetic_partitions_and_serial_atomics() {
+    let (ctas, iters) = (24, 4);
+    let s = scenarios::moe_synthetic(ctas, iters);
+    let (want_out, want_counts) = scenarios::moe_expected(ctas, iters);
+    for workers in [1, 4, 16] {
+        let o = run_cfg(&s, &RunConfig { workers, ..s.config.clone() });
+        completed(&o);
+        assert_eq!(u32s(&o, "out"), want_out, "workers={workers}");
+        assert_eq!(u32s(&o, "counts"), want_counts, "workers={workers}");
     }
 }
 
@@ -302,4 +358,150 @@ fn tma_tile_loads_with_oob_fill() {
             }
         }
     }
+}
+
+#[test]
+fn copy_report_bits() {
+    let o = run(&scenarios::copy_report());
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![0, 1]);
+}
+
+#[test]
+fn syncwarp_across_divergent_arms() {
+    let o = run(&scenarios::divergent_syncwarp());
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), (0..32u32).map(|l| (l ^ 16) * 10).collect::<Vec<_>>());
+}
+
+fn u16s(o: &RunOutcome, name: &str) -> Vec<u16> {
+    o.outputs.buffers[name].0.chunks(2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+#[test]
+fn ldmatrix_stmatrix_m8n8() {
+    let o = run(&scenarios::matrix_roundtrip());
+    completed(&o);
+    let m: Vec<u16> = (0..256).map(|x| (x * 7 + 1) as u16).collect();
+    // Element (matrix i, row r, col c) = m[64 i + 8 r + c] (PTX m8n8.b16).
+    let el = |i: usize, r: usize, c: usize| m[64 * i + 8 * r + c] as u32;
+    let ld = u32s(&o, "out_ld");
+    let ldt = u32s(&o, "out_ldt");
+    for t in 0..32 {
+        for i in 0..4 {
+            let (r, c) = (t / 4, 2 * (t % 4));
+            assert_eq!(ld[t * 4 + i], el(i, r, c) | el(i, r, c + 1) << 16, "ld lane {t} matrix {i}");
+            assert_eq!(ldt[t * 4 + i], el(i, c, r) | el(i, c + 1, r) << 16, "ld.trans lane {t} matrix {i}");
+        }
+    }
+    assert_eq!(u16s(&o, "out_st"), m, "stmatrix round trip");
+}
+
+#[test]
+fn tcgen_cp_then_ld() {
+    let o = run(&scenarios::tcgen_cp_ld());
+    completed(&o);
+    // Expected: oplib's cp plan applied to the source block.
+    let plan = numsim_core::oplib::tcgen_cp_plan(128, 256, 0, 0, scenarios::TCGEN_CP_SDESC, 0, 1, numsim_core::oplib::TcArch::Sm100).unwrap();
+    let (srcs, cells) = plan.pairs();
+    let input: Vec<u32> = (0..1024).map(|x| x * 3 + 7).collect();
+    let mut want = vec![0u32; 1024];
+    for (s, &(lane, col)) in srcs.iter().zip(&cells) {
+        assert_eq!(s.len, 4);
+        assert!(col < 8 && lane < 128);
+        want[lane as usize * 8 + col as usize] = input[(s.start / 4) as usize];
+    }
+    assert_eq!(u32s(&o, "out"), want);
+}
+
+/// Records accesses (owned) and sync events.
+#[derive(Default)]
+struct Events {
+    accesses: Vec<(numsim_core::observe::AccessKind, bool, numsim_core::arena::Space, Vec<numsim_core::observe::LaneSpan>)>,
+    syncs: Vec<SyncEvent>,
+}
+
+impl Observer for Events {
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        self.accesses.push((a.kind, a.atomic, a.space, a.spans.to_vec()));
+    }
+    fn sync(&mut self, e: &SyncEvent) {
+        self.syncs.push(e.clone());
+    }
+}
+
+fn run_events(s: &Scenario) -> (RunOutcome, Events) {
+    let mut ev = Events::default();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut ev, &Backend::Interp, &s.config).unwrap();
+    (o, ev)
+}
+
+#[test]
+fn bulk_copy_mask_and_ignore_oob_narrow_bytes_and_footprint() {
+    let s = scenarios::bulk_masked_copy();
+    let (o, ev) = run_events(&s);
+    completed(&o);
+    assert_eq!(o.outputs.buffers["out"].0, scenarios::bulk_masked_expected());
+    // The async write side covers exactly the transferred bytes.
+    let want: Vec<u64> = (0..64u64).filter(|i| i % 16 < 8 && (4..56).contains(i)).collect();
+    let mut got: Vec<u64> = ev
+        .accesses
+        .iter()
+        .filter(|(k, _, sp, _)| *k == numsim_core::observe::AccessKind::Write && *sp == numsim_core::arena::Space::Shared)
+        .flat_map(|(_, _, _, spans)| spans.iter().flat_map(|s| s.span.start..s.span.end()))
+        .filter(|&b| b >= 16) // the block follows the 8-byte mbarrier at a 16-byte boundary
+        .map(|b| b - 16)
+        .collect();
+    got.sort();
+    got.dedup();
+    // Warp stores of the 0xEE prefill also write the block; keep async bytes only.
+    let async_bytes: Vec<u64> = got.into_iter().filter(|b| want.contains(b)).collect();
+    assert_eq!(async_bytes, want);
+}
+
+#[test]
+fn bulk_reductions_are_atomic_and_serialized() {
+    for workers in [1, 8] {
+        let s = scenarios::bulk_reduce(6);
+        let cfg = RunConfig { workers, ..s.config.clone() };
+        let mut ev = Events::default();
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut ev, &Backend::Interp, &cfg).unwrap();
+        completed(&o);
+        let want: Vec<u32> = (0..32u32).map(|i| i * 7 + (0..6u32).map(|c| c * 1000 + i).sum::<u32>()).collect();
+        assert_eq!(u32s(&o, "acc"), want, "workers={workers}");
+        let rmw: Vec<_> = ev.accesses.iter().filter(|(k, _, sp, _)| *k == numsim_core::observe::AccessKind::Rmw && *sp == numsim_core::arena::Space::Global).collect();
+        assert_eq!(rmw.len(), 6);
+        for (_, atomic, _, spans) in rmw {
+            assert!(*atomic);
+            assert_eq!(spans.len(), 32);
+            assert!(spans.iter().all(|s| s.span.len == 4));
+        }
+    }
+}
+
+#[test]
+fn broken_lanes_join_a_later_barrier() {
+    let o = run(&scenarios::break_then_barrier());
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![5; 64]);
+}
+
+#[test]
+fn launch_bounds_setmaxnreg_is_logged_and_completes() {
+    let s = scenarios::setmaxnreg_launch_bounds();
+    let (o, ev) = run_events(&s);
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), (0..256u32).map(|t| t / 128).collect::<Vec<_>>());
+    let configure = ev.syncs.iter().any(|e| matches!(&e.kind, SyncKind::Protocol { cmds, .. }
+        if cmds.iter().any(|c| matches!(c.cmd, numsim_core::sync::SyncCmd::RegPool(numsim_core::sync::setmaxnreg::Cmd::Configure { count: 128 })))));
+    assert!(configure, "the launch-bounds Configure is logged");
+}
+
+#[test]
+fn tcgen_alloc_orders_the_warp() {
+    let (o, ev) = run_events(&scenarios::tcgen_ld_st());
+    completed(&o);
+    let site_of = |e: &SyncEvent| e.site;
+    let alloc_site = scenarios::tcgen_ld_st().module.kernels[0].sites.iter().position(|s| s.op_name == "tcgen_alloc").unwrap();
+    assert!(ev.syncs.iter().any(|e| site_of(e).0 as usize == alloc_site && matches!(e.kind, SyncKind::WarpSync { .. })));
 }

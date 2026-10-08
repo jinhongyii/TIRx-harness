@@ -112,41 +112,77 @@ pub fn warp_sync(ctx: &mut ExecCtx<'_>, membermask: Operand) -> HResult {
     if !active.and_not(m).is_empty() {
         return Err(support::err(ctx, ExecErrorKind::Divergence, active, format!("__syncwarp({m}) executed by lanes outside the mask")));
     }
-    if !m.and(ctx.warp.live).and_not(active).is_empty() {
-        // Lanes named by the mask reach a different __syncwarp later: the
-        // structured interpreter cannot rendezvous divergent paths.
-        return Err(support::unsupported(ctx, "__syncwarp across divergent paths"));
+    let required = m.and(ctx.warp.live);
+    if !required.and_not(active).is_empty() {
+        // Lanes named by the mask reach a `__syncwarp` on another path:
+        // a rendezvous per warp, completed by the arm that brings the last
+        // lanes (the divergent scheduling rule runs the other arm while this
+        // one blocks).
+        let id = ctx.warp.id;
+        let tag = 1u64 << 59;
+        let entry = ctx.aux.warp_sync.entry(id).or_default();
+        if let Some(tok) = ctx.warp.resume.filter(|t| t & tag != 0) {
+            if entry.1 > tok & !tag {
+                ctx.warp.resume = None;
+                support::sync_event(ctx, active, SyncKind::WarpSync { mask: required });
+                return Ok(Flow::Next);
+            }
+            return Ok(Flow::Blocked(crate::sync::ResourceId::WarpSync { warp: id }));
+        }
+        entry.0 = entry.0.or(active);
+        if entry.0.and(required) == required {
+            entry.0 = WarpMask::NONE;
+            entry.1 += 1;
+            support::sync_event(ctx, active, SyncKind::WarpSync { mask: required });
+            return Ok(Flow::Next);
+        }
+        ctx.warp.resume = Some(tag | entry.1);
+        return Ok(Flow::Blocked(crate::sync::ResourceId::WarpSync { warp: id }));
     }
     support::sync_event(ctx, active, SyncKind::WarpSync { mask: active });
     Ok(Flow::Next)
 }
 
-/// Bytes of one `m8n8.b16` row and rows per matrix.
-const ROW_BYTES: usize = 16;
-
-fn check_ldst_matrix(ctx: &ExecCtx<'_>, shape: MatrixShape, num: u8, fmt: MatrixFmt) -> Result<(), ExecError> {
-    if shape != MatrixShape::M8N8 || fmt != MatrixFmt::B16 || !matches!(num, 1 | 2 | 4) {
-        return Err(support::unsupported(ctx, &format!("ldmatrix/stmatrix {shape:?} {fmt:?} x{num}")));
-    }
+fn full_warp(ctx: &ExecCtx<'_>, what: &str) -> Result<(), ExecError> {
     if ctx.warp.active != ctx.warp.live {
-        return Err(support::err(ctx, ExecErrorKind::Divergence, ctx.warp.active, ".sync.aligned matrix op with divergent lanes"));
+        return Err(support::err(ctx, ExecErrorKind::Divergence, ctx.warp.active, format!("{what}.sync.aligned with divergent lanes")));
     }
     Ok(())
 }
 
-/// Byte offset inside the 8x16-byte matrix tile of the 4 bytes thread `t`
-/// holds: `(row, byte_in_row)` for each of its two b16 halves.
-#[inline]
-fn frag(t: usize, trans: bool) -> [(usize, usize); 2] {
-    if trans {
-        let c = t / 4;
-        let r = 2 * (t % 4);
-        [(r, 2 * c), (r + 1, 2 * c)]
-    } else {
-        let r = t / 4;
-        let c = 2 * (t % 4);
-        [(r, 2 * c), (r, 2 * c + 2)]
+/// Spread 32-bit words (per lane) over destination registers by bytes.
+fn write_words(ctx: &mut ExecCtx<'_>, dsts: &[Reg], words: &[WarpValue<u32>], lanes: WarpMask) {
+    for t in lanes.lanes() {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w[t].to_le_bytes()).collect();
+        let mut pos = 0usize;
+        for &d in dsts {
+            let n = reg_ty(ctx, d).mem_bytes() as usize;
+            let end = (pos + n).min(bytes.len());
+            if pos < end {
+                support::write_lane_bytes(ctx, d, t, &bytes[pos..end]);
+            }
+            pos += n;
+        }
     }
+}
+
+/// Source operands flattened to 32-bit words per lane, register-major.
+fn read_words(ctx: &ExecCtx<'_>, srcs: &[Operand], count: usize) -> Vec<WarpValue<u32>> {
+    let mut out = vec![[0u32; 32]; count];
+    for t in 0..32 {
+        let mut bytes = Vec::with_capacity(count * 4);
+        for &s in srcs {
+            let ty = support::operand_ty(ctx, s);
+            let mut tmp = [0u8; 32];
+            support::lane_bytes(ctx, s, ty, t, &mut tmp);
+            bytes.extend_from_slice(&tmp[..ty.mem_bytes() as usize]);
+        }
+        bytes.resize(count * 4, 0);
+        for (r, w) in out.iter_mut().enumerate() {
+            w[t] = u32::from_le_bytes(bytes[4 * r..4 * r + 4].try_into().unwrap());
+        }
+    }
+    out
 }
 
 #[inline]
@@ -161,41 +197,43 @@ pub fn ldmatrix(
     fmt: MatrixFmt,
 ) -> HResult {
     active_or_next!(ctx);
-    check_ldst_matrix(ctx, shape, num, fmt)?;
+    full_warp(ctx, "ldmatrix")?;
+    let plan = oplib::ldmatrix_plan(shape, num, trans, fmt).map_err(|e| support::op_err(ctx, e))?;
     let active = ctx.warp.active;
     support::sync_event(ctx, active, SyncKind::WarpSync { mask: active });
+    let rows: Vec<u64> = (0..32).map(|l| lane_val(ctx, addr, l)).collect();
     let mut acc = Accesses::default();
-    // rows[i][r] = 16 bytes of row r of matrix i.
-    let mut rows = [[[0u8; ROW_BYTES]; 8]; 4];
-    for i in 0..num as usize {
-        for (r, row) in rows[i].iter_mut().enumerate() {
-            let lane = 8 * i + r;
-            if !active.contains(lane) {
-                continue;
+    let mut err = None;
+    let frags = {
+        let observing = ctx.observing;
+        let ctx_cell = std::cell::RefCell::new(&mut *ctx);
+        let acc_cell = std::cell::RefCell::new(&mut acc);
+        let read = |provider: usize, delta: usize, len: usize| -> oplib::OpResult<Vec<u8>> {
+            let mut c = ctx_cell.borrow_mut();
+            let loc = match support::resolve(&c, space, rows[provider].wrapping_add(delta as u64), provider, len as u64) {
+                Ok(l) => l,
+                Err(e) => {
+                    err = Some(e);
+                    return Err(oplib::OpError::invalid("ldmatrix row"));
+                }
+            };
+            let mut out = vec![0u8; len];
+            if let Err(e) = support::mem_read(&mut c, loc, provider, &mut out) {
+                err = Some(e);
+                return Err(oplib::OpError::invalid("ldmatrix row"));
             }
-            let a = lane_val(ctx, addr, lane);
-            let loc = support::resolve(ctx, space, a, lane, ROW_BYTES as u64)?;
-            support::mem_read(ctx, loc, lane, row)?;
-            if ctx.observing {
-                acc.push(loc, lane as u8, ROW_BYTES as u64);
+            if observing {
+                acc_cell.borrow_mut().push(loc, provider as u8, len as u64);
             }
-        }
+            Ok(out)
+        };
+        oplib::ldmatrix_fragments(&plan, |p| Ok(rows[p]), read)
+    };
+    if let Some(e) = err {
+        return Err(e);
     }
-    for t in active.lanes() {
-        let mut bytes = [0u8; 16];
-        for i in 0..num as usize {
-            for (h, (r, c)) in frag(t, trans).into_iter().enumerate() {
-                bytes[4 * i + 2 * h..4 * i + 2 * h + 2].copy_from_slice(&rows[i][r][c..c + 2]);
-            }
-        }
-        let mut pos = 0usize;
-        for &d in dsts {
-            let n = reg_ty(ctx, d).mem_bytes() as usize;
-            let end = (pos + n).min(4 * num as usize);
-            support::write_lane_bytes(ctx, d, t, &bytes[pos..end]);
-            pos += n;
-        }
-    }
+    let frags = frags.map_err(|e| support::op_err(ctx, e))?;
+    write_words(ctx, dsts, &frags, active);
     let sp = support::spec(ctx, AccessKind::Read, Sem::Weak, Scope::Cta, Proxy::Generic);
     support::emit(ctx, sp, &mut acc);
     support::sync_event(ctx, active, SyncKind::WarpSync { mask: active });
@@ -213,46 +251,23 @@ pub fn stmatrix(
     trans: bool,
 ) -> HResult {
     active_or_next!(ctx);
-    check_ldst_matrix(ctx, shape, num, MatrixFmt::B16)?;
+    full_warp(ctx, "stmatrix")?;
+    let plan = oplib::stmatrix_plan(shape, num, trans).map_err(|e| support::op_err(ctx, e))?;
     let active = ctx.warp.active;
     support::sync_event(ctx, active, SyncKind::WarpSync { mask: active });
-    let mut rows = [[[0u8; ROW_BYTES]; 8]; 4];
-    for t in active.lanes() {
-        let mut bytes = [0u8; 16];
-        let mut pos = 0usize;
-        for &s in srcs {
-            let ty = support::operand_ty(ctx, s);
-            let n = ty.mem_bytes() as usize;
-            let mut tmp = [0u8; 32];
-            support::lane_bytes(ctx, s, ty, t, &mut tmp);
-            let end = (pos + n).min(16);
-            bytes[pos..end].copy_from_slice(&tmp[..end - pos]);
-            pos += n;
-        }
-        for i in 0..num as usize {
-            for (h, (r, c)) in frag(t, trans).into_iter().enumerate() {
-                rows[i][r][c..c + 2].copy_from_slice(&bytes[4 * i + 2 * h..4 * i + 2 * h + 2]);
-            }
-        }
-    }
+    let rows: Vec<u64> = (0..32).map(|l| lane_val(ctx, addr, l)).collect();
+    let sources = read_words(ctx, srcs, plan.registers);
+    let writes = oplib::stmatrix_writes(&plan, &sources, |p| Ok(rows[p])).map_err(|e| support::op_err(ctx, e))?;
     let mut acc = Accesses::default();
-    for i in 0..num as usize {
-        for (r, row) in rows[i].iter().enumerate() {
-            let lane = 8 * i + r;
-            if !active.contains(lane) {
-                continue;
-            }
-            let a = lane_val(ctx, addr, lane);
-            let loc = support::resolve(ctx, space, a, lane, ROW_BYTES as u64)?;
-            support::mem_write(ctx, loc, lane, row)?;
-            if ctx.observing {
-                acc.push(loc, lane as u8, ROW_BYTES as u64);
-            }
+    for (provider, delta, bytes) in writes {
+        let loc = support::resolve(ctx, space, rows[provider].wrapping_add(delta as u64), provider, bytes.len() as u64)?;
+        support::mem_write(ctx, loc, provider, &bytes)?;
+        if ctx.observing {
+            acc.push(loc, provider as u8, bytes.len() as u64);
         }
     }
     let sp = support::spec(ctx, AccessKind::Write, Sem::Weak, Scope::Cta, Proxy::Generic);
     support::emit(ctx, sp, &mut acc);
     support::sync_event(ctx, active, SyncKind::WarpSync { mask: active });
-    let _: Option<WarpValue<u64>> = None;
     Ok(Flow::Next)
 }

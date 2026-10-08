@@ -281,7 +281,10 @@ pub enum BufBinding {
     /// Tensor-memory view (`Space::Tmem` buffer, BufferDecl TMEM rule):
     /// 32-bit element `e` at TMEM lane `(e / cols) % 128`, column
     /// `base_col + e % cols`.
-    Tmem { base_col: u32, cols: u32 },
+    /// `base_reg`: a warp-uniform register holding the view's runtime base
+    /// taddr (`lane << 16 | col`), read at each access (added to the
+    /// static `base_col`).
+    Tmem { base_col: u32, cols: u32, base_reg: Option<Reg> },
     /// Not bound (missing host argument): any access is an error.
     Unbound,
 }

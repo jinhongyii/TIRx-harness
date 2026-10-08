@@ -155,6 +155,7 @@ impl ProgramBuilder {
             align: 16,
             view_of: None,
             sync_words: false,
+            base_reg: None,
         });
         self.param(name, ParamKind::Buffer, Some(dtype.into()), Some(buf));
         buf
@@ -183,6 +184,7 @@ impl ProgramBuilder {
             align: 16,
             view_of: None,
             sync_words: false,
+            base_reg: None,
         })
     }
 

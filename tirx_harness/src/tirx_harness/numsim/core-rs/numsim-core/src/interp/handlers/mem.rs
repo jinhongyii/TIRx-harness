@@ -41,9 +41,94 @@ fn load_proxy(mods: &MemMods) -> Proxy {
     }
 }
 
+/// Fast-path target of a buffer access: the allocation, the buffer's byte
+/// base in it, its byte length, and the window. `None` = use the general
+/// path (local/tmem/unbound buffers, overlaid allocations, sub-byte dtypes).
+#[inline]
+fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<(crate::arena::AllocId, u64, u64, Option<crate::observe::Window>)> {
+    use crate::interp::BufBinding;
+    if ctx.program.buffers[buf.0 as usize].dtype.bits() % 8 != 0 {
+        return None;
+    }
+    let (alloc, base, len) = match ctx.buffers[buf.0 as usize] {
+        BufBinding::View(v) => (v.alloc, v.offset, v.len),
+        BufBinding::SharedWindow { offset, len } => (ctx.cta.smem, offset as u64, len),
+        _ => return None,
+    };
+    if ctx.arena.is_overlaid(alloc) {
+        return None;
+    }
+    let a = ctx.arena.get(alloc);
+    if a.metadata_only || base.checked_add(len).is_none_or(|e| e > a.size) {
+        return None;
+    }
+    let window = match a.space {
+        crate::arena::Space::Global => Some(crate::observe::Window::Global),
+        crate::arena::Space::Shared => Some(crate::observe::Window::SharedCta),
+        _ => None,
+    };
+    Some((alloc, base, len, window))
+}
+
+/// Byte offset of `buf[idx]` for an `n`-byte access within `len`, or
+/// `None` (out of bounds / misaligned: the general path reports it).
+#[inline(always)]
+fn fast_offset(ctx: &ExecCtx<'_>, buf: Buf, idx: i64, n: u64, len: u64, abs_base: u64) -> Option<u64> {
+    let eb = (ctx.program.buffers[buf.0 as usize].dtype.bits() / 8) as i64;
+    let byte = idx.checked_mul(eb)?;
+    if byte < 0 || (byte as u64).checked_add(n)? > len {
+        return None;
+    }
+    let off = abs_base + byte as u64;
+    let align = n.next_power_of_two().clamp(1, 32);
+    (off % align == 0).then_some(off)
+}
+
 #[inline]
 pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, sem: Sem, scope: Scope, mods: MemMods) -> HResult {
     active_or_next!(ctx);
+    let n = ty.mem_bytes() as u64;
+    if n <= 8 && ty.slots() == 1 {
+        if let Some((alloc, base, len, window)) = fast_target(ctx, buf) {
+            let active = ctx.warp.active;
+            let mut vals = [0u64; 32];
+            let mut ok = true;
+            {
+                let a = ctx.arena.get(alloc);
+                let allow = ctx.arena.policy() == crate::arena::ValidityPolicy::Allow;
+                for l in active.lanes() {
+                    let idx = lane_int(ctx, offset, l);
+                    match fast_offset(ctx, buf, idx, n, len, base) {
+                        Some(off) if allow || a.valid.first_clear(off, n).is_none() => {
+                            let mut b = [0u8; 8];
+                            b[..n as usize].copy_from_slice(&a.bytes[off as usize..(off + n) as usize]);
+                            vals[l] = u64::from_le_bytes(b);
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok {
+                let s = ctx.slot(dst);
+                support::write_masked(ctx.warp.regs.get_mut(s), &vals, active);
+                if ctx.observing {
+                    let mut acc = Accesses::default();
+                    for l in active.lanes() {
+                        let idx = lane_int(ctx, offset, l);
+                        let off = fast_offset(ctx, buf, idx, n, len, base).expect("checked");
+                        acc.push(Loc { alloc, offset: off, window, remote: None }, l as u8, n);
+                    }
+                    let sp = support::spec(ctx, AccessKind::Read, sem, scope, load_proxy(&mods));
+                    support::emit(ctx, sp, &mut acc);
+                }
+                return Ok(Flow::Next);
+            }
+            // Some lane needs the general path (error / uninit report).
+        }
+    }
     let n = ty.mem_bytes() as u64;
     let mut acc = Accesses::default();
     let mut bytes = [0u8; 32];
@@ -67,6 +152,44 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
 pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Operand, sem: Sem, scope: Scope, mods: MemMods) -> HResult {
     active_or_next!(ctx);
     let _ = mods;
+    let n = ty.mem_bytes() as u64;
+    if n <= 8 && ty.slots() == 1 && !(ctx.aux.wants_history && !ctx.aux.words.is_empty()) {
+        if let Some((alloc, base, len, window)) = fast_target(ctx, buf) {
+            let active = ctx.warp.active;
+            let mut offs = [0u64; 32];
+            let mut ok = true;
+            for l in active.lanes() {
+                let idx = lane_int(ctx, offset, l);
+                match fast_offset(ctx, buf, idx, n, len, base) {
+                    Some(off) => offs[l] = off,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let vals = ctx.read(value);
+                {
+                    let a = ctx.arena.get_mut(alloc);
+                    for l in active.lanes() {
+                        let off = offs[l] as usize;
+                        a.bytes[off..off + n as usize].copy_from_slice(&vals[l].to_le_bytes()[..n as usize]);
+                        a.valid.set_range(offs[l], n, true);
+                    }
+                }
+                if ctx.observing {
+                    let mut acc = Accesses::default();
+                    for l in active.lanes() {
+                        acc.push(Loc { alloc, offset: offs[l], window, remote: None }, l as u8, n);
+                    }
+                    let sp = support::spec(ctx, AccessKind::Write, sem, scope, Proxy::Generic);
+                    support::emit(ctx, sp, &mut acc);
+                }
+                return Ok(Flow::Next);
+            }
+        }
+    }
     let n = ty.mem_bytes() as u64;
     let mut acc = Accesses::default();
     let mut bytes = [0u8; 32];
@@ -238,6 +361,20 @@ pub fn atom(
     let n = ty.mem_bytes() as u64;
     if ty.elem.bits() < 8 {
         return Err(support::unsupported(ctx, "sub-byte atomics"));
+    }
+    // A read-modify-write of memory shared across partitions (global) is
+    // a serial point inside an arena shard: the scheduler re-executes this
+    // instruction after the round's merge, in partition order, so no
+    // update is lost and results do not depend on the worker count.
+    if ctx.arena.is_shard() {
+        for l in ctx.warp.active.lanes() {
+            let v = lane_val(ctx, a, l);
+            let loc = support::resolve(ctx, space, v, l, n)?;
+            if ctx.arena.is_overlaid(loc.alloc) {
+                ctx.aux.serial_request = true;
+                return Ok(Flow::Yield(ctx.pc()));
+            }
+        }
     }
     let mut acc = Accesses::default();
     let mut old = [0u8; 32];

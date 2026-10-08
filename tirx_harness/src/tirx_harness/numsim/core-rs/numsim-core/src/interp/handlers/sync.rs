@@ -430,11 +430,6 @@ pub fn mbar_test_wait(
 ) -> HResult {
     active_or_next!(ctx);
     let _ = kind;
-    if report.is_some() || report_value.is_some() {
-        // layout::v1 copy-report / conditional parity (sync-semantics §2.8
-        // G1) is not modeled: fail closed.
-        return Err(support::unsupported(ctx, "mbarrier test/try_wait report forms"));
-    }
     let active = ctx.warp.active;
     // One query per distinct (target, command), in lane order.
     let mut seen: Vec<(ResourceId, SyncCmd, Option<Option<u64>>, WarpMask)> = Vec::new();
@@ -456,6 +451,19 @@ pub fn mbar_test_wait(
         seen[i].3 = seen[i].3.or(WarpMask::lane(l));
         if let Some(d) = dst {
             write_lane(ctx, d, l, seen[i].2.is_some() as u64);
+        }
+        // Report forms: the report bit of the observed phase, from the same
+        // snapshot (legacy `query_many`); the value register is always 0
+        // for copy-validity reports.
+        if let Some(r) = report {
+            let bit = match seen[i].2 {
+                Some(Some(g)) => ctx.aux.mbar_reports.get(&(res, g)).copied().unwrap_or(false),
+                _ => false,
+            };
+            write_lane(ctx, r, l, bit as u64);
+        }
+        if let Some(r) = report_value {
+            write_lane(ctx, r, l, 0);
         }
     }
     for (res, cmd, ready, lanes) in seen {
@@ -852,6 +860,7 @@ pub fn clc_try_cancel(ctx: &mut ExecCtx<'_>, resp: Operand, mbar: Operand, multi
     // response is all-zero ("not canceled").
     let active = ctx.warp.active;
     let mut cmds = Vec::new();
+    let mut issued_all = Vec::new();
     for l in active.lanes() {
         let rl = support::resolve(ctx, AddrSpace::SharedCluster, lane_val(ctx, resp, l), l, CLC_RESPONSE_BYTES)?;
         let res = mbar_res(ctx, AddrSpace::SharedCluster, lane_val(ctx, mbar, l), l)?;
@@ -868,6 +877,7 @@ pub fn clc_try_cancel(ctx: &mut ExecCtx<'_>, resp: Operand, mbar: Operand, multi
             signals.push(Completion::MbarTx { res: mres, gen, bytes: CLC_RESPONSE_BYTES });
             targets.push(AsyncTarget { res: mres, bytes: CLC_RESPONSE_BYTES, arrivals: 0 });
         }
+        issued_all.extend(targets.iter().copied());
         let bytes = vec![0u8; (CLC_RESPONSE_BYTES as usize) * dst.len()];
         issue_async(
             ctx,
@@ -883,9 +893,11 @@ pub fn clc_try_cancel(ctx: &mut ExecCtx<'_>, resp: Operand, mbar: Operand, multi
                 queue: true,
                 fill_pattern: Vec::new(),
                 tf32_round: false,
+                report: None,
+                lut_b: None,
             },
         );
     }
-    support::protocol(ctx, active, cmds, ProtoExtra::default());
+    support::protocol(ctx, active, cmds, ProtoExtra { issued: issued_all, ..Default::default() });
     Ok(Flow::Next)
 }

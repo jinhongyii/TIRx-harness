@@ -107,6 +107,8 @@ fn special(ctx: &ExecCtx<'_>, sreg: SpecialReg, lane: usize) -> u64 {
             (sh.smem_bytes.saturating_sub(ctx.program.topology.static_smem_bytes)) as u64
         }
         SpecialReg::TotalSmemSize => sh.smem_bytes as u64,
+        // Deterministic representative: max warps per SM (sm_100).
+        SpecialReg::NWarpId => 64,
     }
 }
 
@@ -129,9 +131,9 @@ pub fn read_param(ctx: &mut ExecCtx<'_>, dst: Reg, slot: ParamId) -> HResult {
     let off = ctx.loaded.param_offsets[slot.0 as usize];
     let ty = reg_ty(ctx, dst);
     let n = (ty.mem_bytes() as usize).min(8);
-    let a = ctx.arena.get(ctx.cta.params);
+    let raw = ctx.arena.read_raw(ctx.cta.params, crate::arena::ByteSpan::new(off, n as u64));
     let mut b = [0u8; 8];
-    b[..n].copy_from_slice(&a.bytes[off as usize..off as usize + n]);
+    b[..n].copy_from_slice(&raw);
     let v = u64::from_le_bytes(b);
     for l in ctx.warp.active.lanes() {
         write_lane(ctx, dst, l, v);

@@ -370,7 +370,8 @@
      "byte_len": null,
      "align": 64,
      "view_of": null,
-     "sync_words": false
+     "sync_words": false,
+     "base_reg": null
     },
     {
      "name": "b",
@@ -390,7 +391,8 @@
      "byte_len": null,
      "align": 64,
      "view_of": null,
-     "sync_words": false
+     "sync_words": false,
+     "base_reg": null
     },
     {
      "name": "c",
@@ -410,7 +412,8 @@
      "byte_len": null,
      "align": 64,
      "view_of": null,
-     "sync_words": false
+     "sync_words": false,
+     "base_reg": null
     }
    ],
    "ops": [],

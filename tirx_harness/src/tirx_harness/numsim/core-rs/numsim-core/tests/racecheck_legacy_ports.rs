@@ -1387,3 +1387,201 @@ fn g5_bulk_reduction_element_width_and_boundary() {
         }
     }
 }
+
+// ======================================================================= g6
+//
+// Checker-verdict tests outside tests/analysis_tools/racecheck (numsim/runtime,
+// numsim/integration, analysis_tools/shared), reviewed in the "unreviewed B"
+// batch. Coverage map: scripts/numsim-v2/coverage/other_b.tsv.
+
+const G6_TMEM1: AllocId = AllocId(6); // second CTA's tensor memory
+const G6_ALL: u32 = u32::MAX;
+
+/// One async-actor access with full control over order, scope, proxy and
+/// per-lane spans (the `K::aacc` family is always weak and single-span).
+#[allow(clippy::too_many_arguments)]
+fn g6_acc(
+    k: &mut K,
+    op: AsyncId,
+    side: Milestone,
+    kind: AccessKind,
+    sem: Sem,
+    scope: Scope,
+    proxy: Proxy,
+    alloc: AllocId,
+    space: Space,
+    window: Option<Window>,
+    spans: &[(u8, std::ops::Range<u64>)],
+) {
+    let atomic = kind == AccessKind::Rmw;
+    k.ev.push(Ev::Access {
+        actor: Actor::Async { op, side },
+        site: SiteId(960_000 + op.0 as u32 * 2 + u32::from(side == Milestone::Write)),
+        alloc,
+        space,
+        kind,
+        sem,
+        scope,
+        atomic,
+        returns_value: false,
+        proxy,
+        window,
+        spans: spans.iter().map(|(l, r)| LaneSpan { lane: *l, span: ByteSpan::new(r.start, r.end - r.start) }).collect(),
+    });
+}
+
+/// `n`-byte element spans of `r`, all for `lane`.
+fn g6_elems(lane: u8, r: std::ops::Range<u64>, n: u64) -> Vec<(u8, std::ops::Range<u64>)> {
+    (r.start..r.end).step_by(n as usize).map(|s| (lane, s..(s + n).min(r.end))).collect()
+}
+
+fn g6_lanes(n: u8) -> Vec<u8> {
+    (0..n).collect()
+}
+
+// ------------------------------------ shared/test_native_dense_cta2_mma_ordering.py --
+
+/// One cluster of two CTAs, two warps each (CTA0 = warps 0,1; CTA1 = 2,3).
+/// Warp 0/2 lane 0 stage A/B in their CTA's smem, `fence.proxy.async`,
+/// cluster sync; CTA0 warp 0 lane 0 issues one `cta_group::2` MMA that reads
+/// both CTAs' smem and writes both CTAs' TMEM accumulators; with
+/// `with_commit` it commits to its barrier and warp 0 waits; cluster sync;
+/// warp 1 of each CTA reads its CTA's accumulator.
+fn g6_dense_cta2(with_commit: bool, reader_tcgen: bool) -> Report {
+    let mut k = K::new(2, 2, 2);
+    k.alloc_cta(SMEM1, 1);
+    k.alloc(G6_TMEM1, Space::Tmem, 1 << 16);
+    k.alloc_cta(G6_TMEM1, 1);
+    for (w, s) in [(0u32, SMEM), (2, SMEM1)] {
+        k.st(w, 0, s, 0..2560);
+    }
+    for w in 0..4 {
+        k.fence(w, G6_ALL, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+    }
+    k.cluster_bar(&[0, 1, 2, 3]);
+    let mma = k.issue(0, 0, AsyncKind::TcgenPipelined, Proxy::Tcgen, &[], &[(TMEM, 0..8192), (G6_TMEM1, 0..8192)]);
+    for s in [SMEM, SMEM1] {
+        k.aacc(mma, Milestone::Read, AccessKind::Read, Proxy::Async, s, 0..2560);
+    }
+    for t in [TMEM, G6_TMEM1] {
+        k.aacc(mma, Milestone::Write, AccessKind::Write, Proxy::Tcgen, t, 0..8192);
+    }
+    if with_commit {
+        let c = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[mma], &[]);
+        k.done_phase(c, Milestone::Write, 0, 0).wait(0, G6_ALL, 0, 0, true);
+    }
+    k.cluster_bar(&[0, 1, 2, 3]);
+    for (w, t) in [(1u32, TMEM), (3, G6_TMEM1)] {
+        if reader_tcgen {
+            let ld = k.issue(w, 0, AsyncKind::TcgenLd, Proxy::Tcgen, &[], &[(t, 0..8192)]);
+            k.aacc(ld, Milestone::Read, AccessKind::Read, Proxy::Tcgen, t, 0..8192).done_warp(ld, Milestone::Write, w, 1);
+        } else {
+            k.ld(w, 0, t, 0..8192);
+        }
+        k.st(w, 0, GMEM, u64::from(w) * 1024..u64::from(w) * 1024 + 1024);
+    }
+    k.run()
+}
+
+/// shared/test_native_dense_cta2_mma_ordering.py::test_committed_dense_cta2_mma_pipeline_is_race_free
+#[test]
+fn g6_committed_dense_cta2_mma_pipeline_is_race_free() {
+    for reader_tcgen in [false, true] {
+        let r = g6_dense_cta2(true, reader_tcgen);
+        assert!(clean(&r) && r.findings.is_empty(), "tcgen reader {reader_tcgen}: {:?} {:?}", r.findings, r.incomplete);
+    }
+}
+
+/// shared/test_native_dense_cta2_mma_ordering.py::test_uncommitted_dense_cta2_mma_pipeline_is_flagged
+/// Every error is the CTA-pair MMA's TMEM write racing a reader
+/// (`write_read`). Legacy saw exactly one error; delta P1: findings are
+/// deduplicated per `(alloc, class, prior site, current site)`, so each
+/// CTA's accumulator reports its own.
+#[test]
+fn g6_uncommitted_dense_cta2_mma_pipeline_is_flagged() {
+    for reader_tcgen in [false, true] {
+        let r = g6_dense_cta2(false, reader_tcgen);
+        let errors: Vec<_> = r.errors().collect();
+        assert!(!errors.is_empty(), "{r:?}");
+        for f in errors {
+            assert!(matches!(f.kind, FindingKind::DataRace { class: RaceClass::WriteRead, .. }), "{f:?}");
+            assert!(f.alloc == TMEM || f.alloc == G6_TMEM1, "{f:?}");
+            assert!(f.prior.as_ref().unwrap().async_op.is_some(), "{f:?}");
+        }
+    }
+}
+
+// ------------------------------------------ integration/test_fp8_tmem_a_effects.py --
+
+/// Warpgroup (4 warps); TMEM cell (warp w's lanes, column c) at
+/// `w*4096 + 4c`. Every warp `tcgen05.st` x16 at col 0 + wait::st, then x8
+/// (the TMEM A operand) at col 16, waited + `fence::after_thread_sync` only
+/// when `publish`; `cta_sync`; two phases of warp 0 lane 0 MMA (reads A cols
+/// 16..24 and, in phase 1, D; writes D cols 0..16 of rows 0..m) + commit +
+/// warp-0 wait + `cta_sync`; every warp loads D.
+fn g6_fp8_tmem_a(m: u32, publish: bool) -> Report {
+    let mut k = K::new(4, 1, 1);
+    let cell = |w: u32, c: std::ops::Range<u64>| u64::from(w) * 4096 + c.start * 4..u64::from(w) * 4096 + c.end * 4;
+    k.st(0, 0, SMEM, 0..512).fence(0, G6_ALL, FenceKind::ProxyAsync(Some(Domain::SharedCta)));
+    k.bar(0, &[0, 1, 2, 3]);
+    let mut late = vec![];
+    for w in 0..4u32 {
+        let st1 = k.issue(w, 0, AsyncKind::TcgenSt, Proxy::Tcgen, &[], &[(TMEM, cell(w, 0..16))]);
+        k.aacc(st1, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, cell(w, 0..16)).done_warp(st1, Milestone::Write, w, G6_ALL);
+        let st2 = k.issue(w, 0, AsyncKind::TcgenSt, Proxy::Tcgen, &[], &[(TMEM, cell(w, 16..24))]);
+        k.aacc(st2, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, cell(w, 16..24));
+        if publish {
+            k.done_warp(st2, Milestone::Write, w, G6_ALL).fence(w, G6_ALL, FenceKind::TcgenAfter);
+        } else {
+            late.push((w, st2));
+        }
+    }
+    k.bar(0, &[0, 1, 2, 3]);
+    let rows = m / 32;
+    for phase in 0..2u64 {
+        let mma = k.issue(0, 0, AsyncKind::TcgenPipelined, Proxy::Tcgen, &[], &[(TMEM, 0..16384)]);
+        k.aacc(mma, Milestone::Read, AccessKind::Read, Proxy::Async, SMEM, 0..512);
+        for w in 0..rows {
+            k.aacc(mma, Milestone::Read, AccessKind::Read, Proxy::Tcgen, TMEM, cell(w, 16..24));
+            if phase == 1 {
+                k.aacc(mma, Milestone::Read, AccessKind::Read, Proxy::Tcgen, TMEM, cell(w, 0..16));
+            }
+            k.aacc(mma, Milestone::Write, AccessKind::Write, Proxy::Tcgen, TMEM, cell(w, 0..16));
+        }
+        let c = k.issue(0, 0, AsyncKind::TcgenCommit, Proxy::Tcgen, &[mma], &[]);
+        k.done_phase(c, Milestone::Write, 0, phase).wait(0, G6_ALL, 0, phase, true);
+        k.bar(0, &[0, 1, 2, 3]);
+    }
+    for w in 0..4u32 {
+        let ld = k.issue(w, 0, AsyncKind::TcgenLd, Proxy::Tcgen, &[], &[(TMEM, cell(w, 0..16))]);
+        k.aacc(ld, Milestone::Read, AccessKind::Read, Proxy::Tcgen, TMEM, cell(w, 0..16)).done_warp(ld, Milestone::Write, w, G6_ALL);
+    }
+    // The unwaited stores drain at exit.
+    for (w, st2) in late {
+        k.done_warp(st2, Milestone::Write, w, G6_ALL);
+    }
+    k.run()
+}
+
+/// integration/test_fp8_tmem_a_effects.py::test_fp8_tmem_a_requires_published_stores[64-False|128-True]
+/// Published TMEM-A stores are clean; without `wait::st` the MMA's TMEM-A
+/// read races the store (`write_read`, `async_lifetime_not_drained`, TMEM,
+/// overlap = the 8 A columns at byte 64 of the warp's row block).
+#[test]
+fn g6_fp8_tmem_a_requires_published_stores() {
+    for m in [64u32, 128] {
+        let r = g6_fp8_tmem_a(m, true);
+        assert!(clean(&r) && r.findings.is_empty(), "m={m}: {:?} {:?}", r.findings, r.incomplete);
+        let r = g6_fp8_tmem_a(m, false);
+        let errors: Vec<_> = r.errors().collect();
+        assert!(!errors.is_empty(), "m={m}: {r:?}");
+        for f in &errors {
+            assert!(
+                matches!(f.kind, FindingKind::DataRace { class: RaceClass::WriteRead, failure: OrderingFailure::AsyncLifetimeNotDrained }),
+                "m={m}: {f:?}"
+            );
+            assert_eq!(f.alloc, TMEM);
+            assert_eq!((f.bytes.start % 4096, f.bytes.end - f.bytes.start), (64, 32), "m={m}: {f:?}");
+        }
+    }
+}
