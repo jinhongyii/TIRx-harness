@@ -99,7 +99,10 @@ pub enum Window {
     SharedCluster,
 }
 
-/// One lane's byte range. For async actors `lane` is [`ALL_LANES`].
+/// One lane's byte range. For async actors `lane` is the ISSUING lane of
+/// that per-thread async op (async groups and copies are per thread, PTX ISA
+/// §9.7.10.28); [`ALL_LANES`] is permitted only for genuinely warp-collective
+/// accesses (ldmatrix/stmatrix, tcgen05.ld/st 32x32b, tile ops).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LaneSpan {
     pub lane: u8,
