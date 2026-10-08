@@ -94,6 +94,7 @@
 //! and loop-exit divergence (`for i < lane { wait }`).
 
 mod partition;
+pub use partition::{MMA_SHARED_A, MMA_SHARED_B};
 mod pool;
 
 pub use partition::Partition;
@@ -334,6 +335,8 @@ pub struct Scheduler<'p> {
     retired_completions: u64,
     /// Declared words seeded into new partitions (launch-scope regions).
     launch_words: crate::interp::aux::WordTable,
+    /// Launch-wide CLC task queue (W12-gaps 6), shared by every partition.
+    clc: std::sync::Arc<crate::interp::aux::ClcTasks>,
 }
 
 /// Linear cluster id and rank of a CTA (ctaid coordinates); the inverse
@@ -570,6 +573,7 @@ impl<'p> Scheduler<'p> {
         if let Some(s) = &config.subset {
             pending.retain(|c| s.contains(c));
         }
+        let clc = std::sync::Arc::new(crate::interp::aux::ClcTasks::new(shape.num_clusters(), shape.ctas_per_cluster(), config.subset.clone()));
         Ok(Scheduler {
             program,
             kernel_index,
@@ -596,6 +600,7 @@ impl<'p> Scheduler<'p> {
             retired_instrs: 0,
             retired_completions: 0,
             launch_words: Default::default(),
+            clc,
         })
     }
 
@@ -691,6 +696,7 @@ impl<'p> Scheduler<'p> {
         let init = ResourceInit { policy: Policy::Numeric, cluster_warps: self.shape.ctas_per_cluster() * wpc, warps_per_cta: wpc };
         let mut aux = LaunchAux { kernel: self.kernel_index, wants_history: self.wants_history, ..LaunchAux::default() };
         aux.words = self.launch_words.clone();
+        aux.clc = self.clc.clone();
         // Async op ids are partition-scoped so they do not depend on the
         // order partitions run in.
         aux.next_async = (cluster as u64 + 1) << 40;

@@ -1449,6 +1449,10 @@ pub struct MmaSpec {
     /// Issue one MMA per entry with that `collector::a` usage (later MMAs
     /// accumulate); empty = one MMA without a collector qualifier.
     pub collectors: &'static [CollectorOp],
+    /// `kind::f16` sparse A (logical K = 32; `b` is N x 32): metadata
+    /// 0x4444_4444 (elements 0 and 1 of every group of four) at TMEM column
+    /// 16 of every lane, written by each warp with `tcgen05.st`.
+    pub sparse: bool,
 }
 
 /// M x N x K of [`tcgen_mma_f16`] (`kind::f16`, cta_group::1, f32 D).
@@ -1486,6 +1490,8 @@ pub fn kmajor_core_bytes(rows: usize, k: usize, vals: &[u16]) -> Vec<u8> {
 /// `d0`): `out[m][n] = d0 + sum_k a[m][k] * b[n][k]`.
 pub fn tcgen_mma_f16(spec: MmaSpec, a: &[u16], b: &[u16]) -> Scenario {
     let (m, n, k) = (MMA_M, MMA_N, MMA_K);
+    // B's K extent (logical K): doubled for sparse A.
+    let kb = if spec.sparse { 2 * k } else { k };
     let mut bld = ProgramBuilder::new("tcgen_mma_f16", 128);
     let b_ = &mut bld;
     let out = b_.global("out", Dtype::F32);
@@ -1494,7 +1500,7 @@ pub fn tcgen_mma_f16(spec: MmaSpec, a: &[u16], b: &[u16]) -> Scenario {
     let slot = b_.shared("taddr", Dtype::U32, 1);
     let bar = b_.shared("bar", Dtype::U64, 1);
     let a_s = b_.shared("a_s", Dtype::U32, (m * k * 2 / 4) as u64);
-    let b_s = b_.shared("b_s", Dtype::U32, (n * k * 2 / 4) as u64);
+    let b_s = b_.shared("b_s", Dtype::U32, (n * kb * 2 / 4) as u64);
     let tid = b_.reg(Ty::U32);
     let w = b_.reg(Ty::U32);
     let p = b_.reg(Ty::PRED);
@@ -1527,7 +1533,7 @@ pub fn tcgen_mma_f16(spec: MmaSpec, a: &[u16], b: &[u16]) -> Scenario {
     });
     b_.end_if();
     // Operands into shared memory (word copies of the host layout).
-    for (src, dst, words) in [(ag, a_s, m * k / 2), (bg, b_s, n * k / 2)] {
+    for (src, dst, words) in [(ag, a_s, m * k / 2), (bg, b_s, n * kb / 2)] {
         for j in 0..words.div_ceil(128) {
             let kj = b_.k_u32((j * 128) as u32);
             b_.add_u32(idx, tid, kj);
@@ -1565,6 +1571,26 @@ pub fn tcgen_mma_f16(spec: MmaSpec, a: &[u16], b: &[u16]) -> Scenario {
     b_.binary(BinOp::Mul, Ty::U32, tw, w, k32);
     b_.binary(BinOp::Shl, Ty::U32, tw, tw, k16);
     b_.add_u32(tw, t, tw);
+    if spec.sparse {
+        let tm = b_.reg(Ty::U32);
+        b_.add_u32(tm, tw, k16);
+        let km = b_.k_u32(0x4444_4444);
+        b_.site("tcgen_st_meta", 4);
+        b_.push(Instr::TcgenSt(Box::new(TcgenStArgs {
+            srcs: (0..16).map(|_| km).collect(),
+            taddr: tm.into(),
+            row: k0,
+            col: k0,
+            shape: TcShape::S32x32b,
+            num: 16,
+            unpack: false,
+        })));
+        b_.push(Instr::TcgenWait { st: true });
+        b_.no_site();
+        b_.push(Instr::Fence { kind: FenceKind::Tcgen05Before, sem: Sem::Weak, scope: Scope::Cta });
+        b_.bar_sync(0);
+        b_.push(Instr::Fence { kind: FenceKind::Tcgen05After, sem: Sem::Weak, scope: Scope::Cta });
+    }
     if let Some(d0) = spec.init_d {
         let kd = b_.k_f32(d0);
         let srcs: Vec<Operand> = (0..n).map(|_| kd).collect();
@@ -1605,10 +1631,12 @@ pub fn tcgen_mma_f16(spec: MmaSpec, a: &[u16], b: &[u16]) -> Scenario {
     b_.smem_addr(b_addr, b_s, k0);
     let _ = (aa, bb);
     b_.smem_desc(da, a_addr, 128, (k / 8 * 128) as u32, 0);
-    b_.smem_desc(db, b_addr, 128, (k / 8 * 128) as u32, 0);
+    b_.smem_desc(db, b_addr, 128, (kb / 8 * 128) as u32, 0);
+    let meta = b_.reg(Ty::U32);
+    b_.add_u32(meta, t, k16);
     let idesc = numsim_oplib::tcgen05::encode::encode_dense_instr_descriptor_fields(
-        "float32", "float16", "float16", m as i64, n as i64, k as i64, false, false, 1, false,
-        false, false, false,
+        "float32", "float16", "float16", m as i64, n as i64, kb as i64, false, false, 1, false,
+        false, false, spec.sparse,
     )
     .expect("valid f16 idesc") as u32;
     let ki = b_.k_u32(idesc);
@@ -1629,7 +1657,7 @@ pub fn tcgen_mma_f16(spec: MmaSpec, a: &[u16], b: &[u16]) -> Scenario {
             ws_b_buffer: 0,
             block_scale: None,
             scale_input_d: None,
-            sparse_meta: None,
+            sparse_meta: spec.sparse.then_some(meta.into()),
             disable_output_lane: Vec::new(),
             collector_a: collector,
             collector_b: CollectorOp::None,
@@ -1710,7 +1738,7 @@ pub fn tcgen_mma_f16(spec: MmaSpec, a: &[u16], b: &[u16]) -> Scenario {
         bld.build_module(),
         inputs(vec![
             ("a", words(kmajor_core_bytes(m, k, a))),
-            ("b", words(kmajor_core_bytes(n, k, b))),
+            ("b", words(kmajor_core_bytes(n, kb, b))),
             ("out", f32_buf(vec![0.0; m * n])),
         ]),
     )
@@ -1732,10 +1760,96 @@ pub fn tcgen_mma_f16_default() -> Scenario {
             init_d: Some(1.0),
             two_issuers: false,
             collectors: &[],
+            sparse: false,
         },
         &a,
         &b,
     )
+}
+
+/// [`tcgen_mma_f16`] with sparse A (metadata in TMEM column 16): the MMA's
+/// sparse-metadata TMEM read is its own operand (checker smoke instance).
+pub fn tcgen_mma_sparse() -> Scenario {
+    let f16 = numsim_oplib::arith::half::encode_f16;
+    let a: Vec<u16> = (0..MMA_M * MMA_K).map(|i| f16((i % 3) as f32 - 1.0)).collect();
+    let b: Vec<u16> = (0..MMA_N * 2 * MMA_K).map(|i| f16((i % 5) as f32 - 2.0)).collect();
+    let mut s = tcgen_mma_f16(MmaSpec { accumulate: true, init_d: Some(1.0), two_issuers: false, collectors: &[], sparse: true }, &a, &b);
+    s.name = "tcgen_mma_sparse";
+    s
+}
+
+/// W12-gaps 6: CLC task stealing under a cluster subset. Grid of 4
+/// one-CTA clusters, subset {0, 1} (two resident partitions, tasks 2 and 3
+/// non-resident). Each CTA's lane 0 marks `out[ctaid]`, then loops:
+/// `try_cancel` into a shared response (mbarrier, expect_tx 16), and marks
+/// `out[base CTA]` of every claimed cluster with `100 + ctaid` until the
+/// "no cluster" sentinel. Every task is done exactly once: `out` =
+/// [1, 1, 100 + claimer, 100 + claimer].
+pub fn clc_task_steal() -> Scenario {
+    let mut b = ProgramBuilder::new("clc_task_steal", 32);
+    b.grid(4, 1, 1);
+    let out = b.global("out", Dtype::U32);
+    let resp = b.shared("resp", Dtype::U32, 4);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let lane = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let ra = b.reg(Ty::U32);
+    let ba = b.reg(Ty::U32);
+    let ph = b.reg(Ty::U32);
+    let word = b.reg(Ty::U32);
+    let tag = b.reg(Ty::U32);
+    b.lane_id(lane);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k16 = b.k_u32(16);
+    let k100 = b.k_u32(100);
+    let kmax = b.k_u32(u32::MAX);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.st_u32(out, cta, k1);
+    b.smem_addr(ra, resp, k0);
+    b.smem_addr(ba, bar, k0);
+    b.mbar_init(ba, 1);
+    b.fence(FenceKind::MbarrierInit, Sem::Release, Scope::Cluster);
+    b.mov(ph, k0);
+    b.add_u32(tag, cta, k100);
+    b.loop_begin();
+    b.loop_if(p);
+    b.push(Instr::MbarArrive(MbarArriveArgs {
+        mbar: ba.into(),
+        space: AddrSpace::Shared,
+        count: None,
+        expect_tx: Some(k16),
+        drop: false,
+        no_complete: false,
+        sem: Sem::Release,
+        scope: Scope::Cta,
+        multicast: None,
+        state: None,
+    }));
+    // The previous response was read through the generic proxy; the next
+    // try_cancel writes it through the async proxy.
+    b.fence(FenceKind::ProxyAsync(Some(AddrSpace::Shared)), Sem::Weak, Scope::Cta);
+    b.site("clc_try_cancel", 1);
+    b.push(Instr::ClcTryCancel { resp: ra.into(), mbar: ba.into(), multicast: false });
+    b.no_site();
+    b.mbar_wait_parity(ba, ph);
+    b.binary(BinOp::Xor, Ty::U32, ph, ph, k1);
+    b.ld_u32(word, resp, k0);
+    let done = b.reg(Ty::PRED);
+    b.compare(CmpOp::Eq, Ty::U32, done, word, kmax);
+    b.if_(done);
+    b.break_();
+    b.end_if();
+    b.st_u32(out, word, tag);
+    b.loop_end();
+    b.end_if();
+    b.exit();
+    let mut s = scenario("clc_task_steal", b.build_module(), inputs(vec![("out", u32_buf([0; 4]))]));
+    s.config.subset = Some(vec![0, 1]);
+    s
 }
 
 /// W12-gaps 9: [`tcgen_mma_f16`] issuing `collector::a::fill`, then an MMA
@@ -1751,7 +1865,7 @@ pub fn tcgen_mma_collectors(valid: bool) -> Scenario {
     } else {
         &[CollectorOp::Fill, CollectorOp::None, CollectorOp::LastUse]
     };
-    let mut s = tcgen_mma_f16(MmaSpec { accumulate: false, init_d: None, two_issuers: false, collectors }, &a, &b);
+    let mut s = tcgen_mma_f16(MmaSpec { accumulate: false, init_d: None, two_issuers: false, collectors, sparse: false }, &a, &b);
     s.name = if valid { "tcgen_mma_collectors" } else { "tcgen_mma_collectors_discarded" };
     s
 }
@@ -4278,6 +4392,8 @@ pub fn all() -> Vec<Scenario> {
         tcgen_mma_f16_default(),
         tcgen_mma_collectors(true),
         tcgen_mma_collectors(false),
+        tcgen_mma_sparse(),
+        clc_task_steal(),
         cas128(),
         tmap_replace_generic_shared(),
         ptx_op_per_signature(),

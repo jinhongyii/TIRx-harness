@@ -4,11 +4,10 @@
 //! Response encoding (legacy `instructions/control.rs` `clc_try_cancel` +
 //! `frontend-rs/src/emit/clc.rs`): bytes 0..4 hold the linear base CTA id of
 //! the cancelled cluster (NumSim's logical launch domain is linear: x = that
-//! id, y = z = 0); legacy wrote `0xFFFF_FFFF` when no cluster could be
-//! cancelled. The v2 engine's deterministic representative never cancels and
-//! writes an all-zero response; a real cancel can never return base CTA 0
-//! (cluster 0 is always resident), so `is_canceled = low32 != 0 && low32 !=
-//! u32::MAX` decodes both representatives as "not cancelled". Operands (W1
+//! id, y = z = 0); `0xFFFF_FFFF` when no cluster could be cancelled (legacy
+//! and the v2 engine). Under an execution subset a non-resident cluster 0 can
+//! be claimed (base CTA 0), so `is_canceled = low32 != u32::MAX` (W12-gaps
+//! 6). Operands (W1
 //! `lower_generic`): `is_canceled` dsts `[p]`, srcs `[response]`;
 //! `get_first_ctaid::*` dsts `[d]`, srcs `[d, response]` (read-write `d`);
 //! `.v4` dsts `[d0..d3]`, srcs `[d0..d3, response]`. The response is the last
@@ -50,7 +49,7 @@ fn first_word(ops: &Operands, io: &PtxIo<'_>, lane: usize) -> u32 {
 
 #[inline]
 fn canceled(word: u32) -> bool {
-    word != 0 && word != u32::MAX
+    word != u32::MAX
 }
 
 pub(in crate::oplib) fn resolve(name: &str, mods: &Mods, ops: &Operands) -> OpResult<Option<Resolved>> {
@@ -121,11 +120,12 @@ mod tests {
     }
 
     #[test]
-    fn query_cancel_decodes_both_not_cancelled_representatives() {
-        // Lane 0: v2 all-zero response; lane 1: legacy 0xFFFF_FFFF; others: a
-        // cancelled cluster at base CTA 6 (inactive lanes untouched).
+    fn query_cancel_decodes_the_no_cluster_sentinel() {
+        // Lane 0: the "no cluster" sentinel 0xFFFF_FFFF; lane 1: also the
+        // sentinel; others: a cancelled cluster at base CTA 6 (inactive lanes
+        // untouched). Base CTA 0 is a real claim under a subset (W12-gaps 6).
         let mut lo = [6u64; 32];
-        lo[0] = 0;
+        lo[0] = 0xffff_ffff;
         lo[1] = 0xffff_ffff;
         let resp = vec![lo, [0u64; 32]];
         let b128 = [Ty::B128];
@@ -147,6 +147,16 @@ mod tests {
             &cancelled,
         );
         assert_eq!(p[0][0], 1);
+        let mut zero = resp.clone();
+        zero[0][0] = 0;
+        let p = run(
+            "tirx.ptx.clusterlaunchcontrol_query_cancel_is_canceled",
+            &["query_cancel", "is_canceled", "pred", "b128"],
+            &[Ty::PRED],
+            &b128,
+            &zero,
+        );
+        assert_eq!(p[0][0], 1, "base CTA 0 is a cancelled cluster");
         let mut srcs = vec![[7u64; 32]];
         srcs.extend(cancelled.clone());
         for (axis, want) in [("get_first_ctaid::x", 6), ("get_first_ctaid::y", 0), ("get_first_ctaid::z", 0)] {

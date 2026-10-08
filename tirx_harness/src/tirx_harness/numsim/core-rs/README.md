@@ -129,11 +129,21 @@ the `sync` type shapes, the `interp::handlers` signatures, `report.rs` and
     - `observe::Access.operand: u8` is the index of the pointer operand that
       produced the access, so checkers name the right buffer per access.
       - Loads, stores, atomics, `st.bulk`, `discard`, `tensormap.replace`,
-        `st.async`/`red.async`, and the remote DSMEM inbox write: 0.
+        `st.async`/`red.async`, and remote DSMEM writes: 0.
       - Async copies (bulk, `cp.async`, TMA, bulk reductions): destination
         (write side) 0, source (read side) 1. The TMA tensor-map read at
         issue is 1 for loads/prefetch and 0 for stores/reductions.
       - `tensormap.cp_fenceproxy`: dst 0, src 1.
-      - `tcgen05.mma`: D (TMEM) 0, A 1 (the shared-A read op), B 2.
+      - `tcgen05.mma` (addendum, approved 2026-10-08): TMEM operand
+        reads carry their pointer-operand index in `SiteInfo.buffers` order
+        — d 0, then [a_tmem], [b_decompress_metadata | sp_meta_tmem],
+        [sfa_tmem, sfb_tmem] as present in the form (the TVM table's `addr`
+        slots); D's write side is 0. Every TMEM operand read is a read of
+        the MMA op itself (its async token), so an A-only `.sync_restrict`
+        commit never publishes it. Shared A/B reads go through descriptors,
+        which are not pointer operands: `MMA_SHARED_A` = 240 (the shared-A
+        read op) and `MMA_SHARED_B` = 241 (the MMA op).
       - `tcgen05.cp`: TMEM 0, shared source 1.
       - `tcgen05.ld/st` TMEM and register spans: 0.
+      - Reserved range: operand values >= 240 name operands without a
+        logical buffer (never an index into `SiteInfo.buffers`).

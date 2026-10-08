@@ -1192,11 +1192,18 @@ pub const CLC_RESPONSE_BYTES: u64 = 16;
 #[inline]
 pub fn clc_try_cancel(ctx: &mut ExecCtx<'_>, resp: Operand, mbar: Operand, multicast: bool) -> HResult {
     active_or_next!(ctx);
-    // Deterministic representative: the cancel request never succeeds (every
-    // cluster is resident). The response carries legacy's "no cluster"
-    // encoding: first CTA id word 0xFFFF_FFFF, the rest zero (kernels that
-    // read `get_first_ctaid` without `is_canceled` test that sentinel; oplib
-    // decodes it as not cancelled).
+    // Every cluster of the launch is resident unless an execution subset
+    // names the resident ones; then each non-resident cluster's task goes to
+    // exactly one `try_cancel` (`LaunchAux::clc`, legacy `ClcTaskCounter`,
+    // W12-gaps 6). The response's first word is the claimed cluster's linear
+    // base CTA id, or legacy's "no cluster" 0xFFFF_FFFF; the rest is zero.
+    // Claims are launch-wide state: inside an arena shard (parallel phase)
+    // the instruction is a serial point, re-run on the main arena in
+    // partition order, so who claims what does not depend on the workers.
+    if ctx.arena.is_shard() && ctx.aux.clc.claimable() {
+        ctx.aux.serial_request = true;
+        return Ok(Flow::Yield(ctx.pc()));
+    }
     let active = ctx.warp.active;
     let mut cmds = Vec::new();
     let mut issued_all = Vec::new();
@@ -1218,7 +1225,7 @@ pub fn clc_try_cancel(ctx: &mut ExecCtx<'_>, resp: Operand, mbar: Operand, multi
         }
         issued_all.extend(targets.iter().copied());
         let mut one = vec![0u8; CLC_RESPONSE_BYTES as usize];
-        one[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        one[..4].copy_from_slice(&ctx.aux.clc.try_cancel().to_le_bytes());
         let bytes: Vec<u8> = (0..dst.len()).flat_map(|_| one.iter().copied()).collect();
         issue_async(
             ctx,

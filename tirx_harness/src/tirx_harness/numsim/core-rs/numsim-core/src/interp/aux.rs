@@ -367,9 +367,67 @@ pub type MmaFootprintKey = (u64, u64, u32, u8);
 /// prior cp.async ops).
 pub type DeferredPublish = (ResourceId, u64, Vec<AsyncId>);
 
+/// Launch-wide CLC task queue (legacy `ClcTaskCounter`): the clusters of an
+/// execution subset are the resident ones; `try_cancel` walks the logical
+/// cluster ids once and hands each non-resident cluster's task to exactly
+/// one caller (its linear base CTA id), then `u32::MAX` ("no cluster").
+/// Without a subset every cluster is resident and nothing is claimable.
+/// Shared by all partitions; claims are made only on the main arena (the
+/// serial phase, or a single partition), so their order is deterministic.
+#[derive(Debug, Default)]
+pub struct ClcTasks {
+    next: std::sync::atomic::AtomicU32,
+    clusters: u32,
+    ctas_per_cluster: u32,
+    /// Resident clusters (sorted); `None` = all.
+    resident: Option<Vec<u32>>,
+}
+
+impl ClcTasks {
+    pub fn new(clusters: u32, ctas_per_cluster: u32, resident: Option<Vec<u32>>) -> Self {
+        let resident = resident.map(|mut r| {
+            r.sort_unstable();
+            r.dedup();
+            r
+        });
+        ClcTasks { next: Default::default(), clusters, ctas_per_cluster, resident }
+    }
+
+    /// Can a claim still return a task? (Otherwise every response is the
+    /// "no cluster" sentinel and no serialization is needed.)
+    pub fn claimable(&self) -> bool {
+        let Some(r) = &self.resident else { return false };
+        let mut t = self.next.load(std::sync::atomic::Ordering::Relaxed);
+        while t < self.clusters {
+            if r.binary_search(&t).is_err() {
+                return true;
+            }
+            t += 1;
+        }
+        false
+    }
+
+    /// Claim the next non-resident cluster: its base CTA id, or `u32::MAX`.
+    pub fn try_cancel(&self) -> u32 {
+        let Some(r) = &self.resident else { return u32::MAX };
+        loop {
+            let t = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if t >= self.clusters {
+                self.next.store(self.clusters, std::sync::atomic::Ordering::Relaxed);
+                return u32::MAX;
+            }
+            if r.binary_search(&t).is_err() {
+                return t.saturating_mul(self.ctas_per_cluster);
+            }
+        }
+    }
+}
+
 /// All launch-wide engine bookkeeping.
 #[derive(Clone, Debug, Default)]
 pub struct LaunchAux {
+    /// Launch-wide CLC task queue (shared by every partition).
+    pub clc: std::sync::Arc<ClcTasks>,
     /// Kernel index within the `Module`.
     pub kernel: u32,
     /// `ValidityPolicy::ZeroAndReport` findings (one per read range).

@@ -1510,6 +1510,7 @@ fn tcgen_mma_f16_program_matches_the_reference() {
             init_d: None,
             two_issuers: false,
             collectors: &[],
+            sparse: false,
         },
         &a,
         &b,
@@ -1522,6 +1523,7 @@ fn tcgen_mma_f16_program_matches_the_reference() {
             init_d: Some(1.0),
             two_issuers: false,
             collectors: &[],
+            sparse: false,
         },
         &a,
         &b,
@@ -1552,6 +1554,7 @@ fn tcgen_mma_into_never_written_tmem_reports_uninit_read() {
             init_d: None,
             two_issuers: false,
             collectors: &[],
+            sparse: false,
         },
         &a,
         &b,
@@ -1710,7 +1713,7 @@ fn unbound_integer_address_is_incomplete() {
 #[test]
 fn tcgen_mma_from_two_lanes_is_an_error() {
     let (a, b, _) = mma_operands();
-    let o = run(&scenarios::tcgen_mma_f16(scenarios::MmaSpec { accumulate: false, init_d: None, two_issuers: true, collectors: &[] }, &a, &b));
+    let o = run(&scenarios::tcgen_mma_f16(scenarios::MmaSpec { accumulate: false, init_d: None, two_issuers: true, collectors: &[], sparse: false }, &a, &b));
     let RunStatus::Error(e) = &o.status else { panic!("{:?}", o.status) };
     assert!(e.message.contains("single thread"), "{e:?}");
     assert_eq!(e.lanes.0, 0b11);
@@ -1782,7 +1785,7 @@ fn cluster_barrier_gathers_partial_warp_arrivals() {
 fn tcgen_collector_use_requires_a_live_fill() {
     use numsim_core::program::CollectorOp as C;
     let (a, b, want) = mma_operands();
-    let spec = |collectors| scenarios::MmaSpec { accumulate: false, init_d: None, two_issuers: false, collectors };
+    let spec = |collectors| scenarios::MmaSpec { accumulate: false, init_d: None, two_issuers: false, collectors, sparse: false };
     let o = run(&scenarios::tcgen_mma_f16(spec(&[C::Fill, C::Use, C::LastUse]), &a, &b));
     completed(&o);
     assert_eq!(f32s(&o, "out"), want.iter().map(|x| 3.0 * x).collect::<Vec<_>>());
@@ -1792,4 +1795,105 @@ fn tcgen_collector_use_requires_a_live_fill() {
         assert_eq!(e.kind, ExecErrorKind::Op(OpErrorKind::Invalid), "{e:?}");
         assert!(e.message.contains("requires a valid previous fill"), "{seq:?}: {}", e.message);
     }
+}
+
+/// Async-side reads of every MMA (actor `Async`, read kind): (operand,
+/// space, allocation-relative spans).
+#[derive(Default)]
+struct MmaReads(Vec<(u8, numsim_core::arena::Space, Vec<numsim_core::arena::ByteSpan>)>);
+impl Observer for MmaReads {
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        if matches!(a.actor, numsim_core::observe::Actor::Async { .. }) && a.kind == numsim_core::observe::AccessKind::Read {
+            self.0.push((a.operand, a.space, a.spans.iter().map(|s| s.span).collect()));
+        }
+    }
+}
+
+/// Coordinator ruling (A-only restricted commit): every TMEM operand read
+/// of an MMA (D when accumulating, sparse metadata, ...) is an async read of
+/// the MMA op itself, named by its own pointer-operand index (site
+/// `buffers` order: d, [a_tmem], [lut | sp_meta], [sfa, sfb]); shared A/B
+/// reads (descriptors, not pointer operands) are MMA_SHARED_A/_B. Sparse
+/// f16 (metadata 0x4444_4444 keeps elements 0 and 1 of each group of four)
+/// also checks the numerics.
+#[test]
+fn tcgen_mma_operand_reads_are_named_per_operand() {
+    use numsim_core::arena::{addr, Space};
+    use numsim_core::sched::{MMA_SHARED_A, MMA_SHARED_B};
+    let f16 = numsim_oplib::arith::half::encode_f16;
+    let (m, n, k) = (scenarios::MMA_M, scenarios::MMA_N, scenarios::MMA_K);
+    let av: Vec<f32> = (0..m * k).map(|i| ((i / k + 2 * (i % k)) % 5) as f32 - 2.0).collect();
+    let bv: Vec<f32> = (0..n * 2 * k).map(|i| ((3 * (i / (2 * k)) + i % (2 * k)) % 4) as f32 - 1.0).collect();
+    let mut want = vec![0f32; m * n];
+    for r in 0..m {
+        for c in 0..n {
+            for g in 0..k / 2 {
+                want[r * n + c] += av[r * k + 2 * g] * bv[c * 2 * k + 4 * g] + av[r * k + 2 * g + 1] * bv[c * 2 * k + 4 * g + 1];
+            }
+        }
+    }
+    let s = scenarios::tcgen_mma_f16(
+        scenarios::MmaSpec { accumulate: true, init_d: Some(0.0), two_issuers: false, collectors: &[], sparse: true },
+        &av.iter().map(|&x| f16(x)).collect::<Vec<_>>(),
+        &bv.iter().map(|&x| f16(x)).collect::<Vec<_>>(),
+    );
+    let mut obs = MmaReads::default();
+    let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &s.config).unwrap();
+    completed(&o);
+    assert_eq!(f32s(&o, "out"), want);
+    let cols = |spans: &[numsim_core::arena::ByteSpan]| -> (u32, u32) {
+        let row = addr::TMEM_COLS as u64 * 4;
+        let lo = spans.iter().map(|s| ((s.start % row) / 4) as u32).min().unwrap();
+        let hi = spans.iter().map(|s| (((s.end() - 1) % row) / 4) as u32).max().unwrap();
+        (lo, hi)
+    };
+    let tmem: Vec<_> = obs.0.iter().filter(|r| r.1 == Space::Tmem).collect();
+    let d = tmem.iter().find(|r| r.0 == 0).expect("accumulating D read (operand 0)");
+    assert!(cols(&d.2).1 < 16, "D reads stay in D's columns: {:?}", cols(&d.2));
+    let meta = tmem.iter().find(|r| r.0 == 1).expect("sparse metadata read (operand 1)");
+    assert!(cols(&meta.2).0 >= 16, "metadata reads start at its base column: {:?}", cols(&meta.2));
+    assert!(tmem.iter().all(|r| r.0 <= 1), "{:?}", tmem.iter().map(|r| r.0).collect::<Vec<_>>());
+    let shared: Vec<u8> = obs.0.iter().filter(|r| r.1 == Space::Shared).map(|r| r.0).collect();
+    assert!(shared.contains(&MMA_SHARED_A) && shared.contains(&MMA_SHARED_B), "{shared:?}");
+}
+
+/// W12-gaps 6: under a cluster subset the resident clusters claim every
+/// non-resident cluster's task exactly once through CLC, deterministically
+/// (claims are serial points in partition order): CTA 0 claims 2, CTA 1
+/// claims 3, at any worker count and with or without an observer; a single
+/// partition claims in its own (issue) order, also exactly once.
+#[test]
+fn clc_claims_non_resident_tasks_under_a_subset() {
+    let s = scenarios::clc_task_steal();
+    let mut first = None;
+    for workers in [1usize, 4, 16] {
+        for observe in [false, true] {
+            let cfg = RunConfig { workers, ..s.config.clone() };
+            let o = if observe {
+                let mut log = RecordingObserver::new();
+                sched::run_with_config(&s.module, &s.inputs, &mut log, &cfg).unwrap()
+            } else {
+                sched::run_with_config(&s.module, &s.inputs, &mut numsim_core::observe::NoopObserver, &cfg).unwrap()
+            };
+            completed(&o);
+            let out = u32s(&o, "out");
+            assert_eq!(out, vec![1, 1, 100, 101], "workers {workers} observe {observe}");
+            match &first {
+                None => first = Some(out),
+                Some(f) => assert_eq!(&out, f),
+            }
+        }
+    }
+    let cfg = RunConfig { single_partition: true, ..s.config.clone() };
+    let o = run_cfg(&s, &cfg);
+    completed(&o);
+    let out = u32s(&o, "out");
+    assert_eq!(&out[..2], &[1, 1]);
+    assert!(out[2..].iter().all(|&v| v == 100 || v == 101), "{out:?}");
+    // Without a subset every cluster is resident: nothing to claim.
+    let mut full = scenarios::clc_task_steal();
+    full.config.subset = None;
+    let o = run(&full);
+    completed(&o);
+    assert_eq!(u32s(&o, "out"), vec![1, 1, 1, 1]);
 }

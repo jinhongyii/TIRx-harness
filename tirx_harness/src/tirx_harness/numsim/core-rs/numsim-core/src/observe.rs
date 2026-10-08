@@ -143,8 +143,11 @@ pub struct Access<'a> {
     pub declared_word: bool,
     /// Index of the instruction's pointer operand that produced this
     /// access, into `SiteInfo::buffers` (README decision 15, W5-15): 0 for
-    /// loads/stores/atomics; for copies the destination is 0 and the source
-    /// 1; MMA D/A/B are 0/1/2.
+    /// loads/stores/atomics; for copies the destination is 0 and the
+    /// source 1; MMA TMEM reads carry their pointer-operand index: d, then the
+    /// optional a_tmem, lut or sp_meta, sfa and sfb. Values >= 240 are
+    /// reserved for operands without a logical buffer: MMA shared A/B
+    /// descriptor reads are `sched::MMA_SHARED_A` (240) / `MMA_SHARED_B` (241).
     pub operand: u8,
 }
 

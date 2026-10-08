@@ -689,13 +689,28 @@ impl Partition {
             let tc_op = matches!(op.kind, crate::sync::AsyncKind::TcgenMma | crate::sync::AsyncKind::TcgenCp);
             let (shared_reads, other_reads): (Vec<_>, Vec<_>) =
                 reads.iter().copied().partition(|&(a, _)| tc_op && arena.get(a).space == Space::Shared);
-            // Pointer operand of each read group: MMA d/a/b = 0/1/2 (the
-            // shared-A read op is A, other shared reads B, TMEM reads D);
+            // Operand of each read group (`Access::operand` indexes the
+            // site's pointer operands, W5-15). MMA: TMEM reads take their
+            // pointer operand's index (d, [a_tmem], [lut | sp_meta],
+            // [sfa, sfb]: `mma_tmem_operands`); shared reads go through the
+            // A/B descriptors, which are not pointer operands, and take
+            // MMA_SHARED_A / MMA_SHARED_B (past every pointer operand, so
+            // they never borrow a TMEM operand's buffer name).
             // tcgen05.cp taddr/s-desc = 0/1; copies src = 1.
             let is_mma = op.kind == crate::sync::AsyncKind::TcgenMma;
-            let shared_operand = if is_mma && !is_a_read { 2 } else { 1 };
+            let shared_operand = if is_mma { if is_a_read { MMA_SHARED_A } else { MMA_SHARED_B } } else { 1 };
             let other_operand = if tc_op { 0 } else { 1 };
-            for (group, prox, operand) in [(shared_reads, Proxy::Async, shared_operand), (other_reads, proxy, other_operand)] {
+            let mut groups: Vec<ReadGroup> = vec![(shared_reads, Proxy::Async, shared_operand)];
+            match &op.payload {
+                Payload::TcgenMma(p) if is_mma && !is_a_read => {
+                    let bases = mma_tmem_operands(p, meta.as_ref().and_then(|m| m.lut_b));
+                    for (operand, spans) in split_tmem_reads(&other_reads, &bases) {
+                        groups.push((spans, proxy, operand));
+                    }
+                }
+                _ => groups.push((other_reads, proxy, other_operand)),
+            }
+            for (group, prox, operand) in groups {
                 if group.is_empty() {
                     continue;
                 }
@@ -979,6 +994,84 @@ fn tc_arch(arch: Option<&str>) -> crate::oplib::TcArch {
 /// group (0 = even CTA of the pair for `cta_group::2`).
 /// Returns (reads, writes, TMEM reads that saw invalid bytes when they were
 /// made: the accumulator D read before the MMA writes D, W9 phase 6).
+/// Read spans emitted as one access group: (spans, proxy, operand).
+type ReadGroup = (Vec<(AllocId, ByteSpan)>, Proxy, u8);
+
+/// `Access::operand` of an MMA's shared-memory A / B reads (through
+/// descriptors, not pointer operands).
+pub const MMA_SHARED_A: u8 = 240;
+pub const MMA_SHARED_B: u8 = 241;
+
+/// TMEM pointer operands of an MMA in site operand order (the TVM table's
+/// `addr` slots: d, [a_tmem], [b_decompress_metadata | sp_meta_tmem],
+/// [sfa_tmem, sfb_tmem]): (operand index, lane, column) of each base.
+fn mma_tmem_operands(p: &crate::sync::completion::TcgenMmaPayload, lut_b: Option<u32>) -> Vec<(u8, u32, u32)> {
+    let mut v: Vec<u32> = vec![p.d_taddr];
+    if matches!(p.args.a, crate::program::TcA::Tmem(_)) {
+        v.push(p.a as u32);
+    }
+    if let Some(t) = lut_b.filter(|_| p.args.lut_b) {
+        v.push(t);
+    }
+    if let Some(t) = p.sparse_meta {
+        v.push(t);
+    }
+    if let Some((a, b)) = p.scale_taddrs {
+        v.push(a);
+        v.push(b);
+    }
+    v.iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let (lane, col) = addr::tmem_decode(t);
+            (i as u8, lane, col)
+        })
+        .collect()
+}
+
+/// Split TMEM read spans by operand: each byte belongs to the operand with
+/// the greatest base column at or below its column (ties: greatest base lane
+/// at or below its lane); bytes below every base are D's. Pieces are cut at
+/// lane rows and base columns. Groups come out in operand order.
+fn split_tmem_reads(reads: &[(AllocId, ByteSpan)], bases: &[(u8, u32, u32)]) -> Vec<(u8, Vec<(AllocId, ByteSpan)>)> {
+    let row = addr::TMEM_COLS as u64 * 4;
+    let owner = |lane: u32, col: u32| -> u8 {
+        bases
+            .iter()
+            .filter(|&&(_, bl, bc)| bc <= col && bl <= lane)
+            .max_by_key(|&&(i, bl, bc)| (bc, bl, std::cmp::Reverse(i)))
+            .or_else(|| bases.iter().filter(|&&(_, _, bc)| bc <= col).max_by_key(|&&(i, _, bc)| (bc, std::cmp::Reverse(i))))
+            .map_or(0, |b| b.0)
+    };
+    let mut out: Vec<(u8, Vec<(AllocId, ByteSpan)>)> = Vec::new();
+    for &(a, s) in reads {
+        let mut x = s.start;
+        while x < s.end() {
+            let lane = (x / row) as u32;
+            let col = ((x % row) / 4) as u32;
+            let mut end = s.end().min((x / row + 1) * row);
+            for &(_, _, bc) in bases {
+                let b = (x / row) * row + bc as u64 * 4;
+                if b > x && b < end {
+                    end = b;
+                }
+            }
+            let o = owner(lane, col);
+            let piece = ByteSpan::new(x, end - x);
+            match out.iter_mut().find(|g| g.0 == o) {
+                Some(g) => match g.1.last_mut() {
+                    Some((la, ls)) if *la == a && ls.end() == piece.start => ls.len += piece.len,
+                    _ => g.1.push((a, piece)),
+                },
+                None => out.push((o, vec![(a, piece)])),
+            }
+            x = end;
+        }
+    }
+    out.sort_by_key(|g| g.0);
+    out
+}
+
 fn run_mma(arena: &mut Arena, p: &crate::sync::completion::TcgenMmaPayload, arch: crate::oplib::TcArch, lut_b: Option<u32>) -> crate::oplib::OpResult<(Spans, Spans, Spans)> {
     use crate::oplib::OpError;
     use std::cell::RefCell;

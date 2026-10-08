@@ -3176,3 +3176,24 @@ Review of 934f2b3 (partitioned declared words), invariant I10: verdict indices m
   - Store and `tcgen.st` fast paths are now gated on whether *this* allocation holds declared words (`WordTable::has`), not on the table being non-empty.
   - Fixture loader moved to `testutil::fixtures`.
   - Criterion group `interp/recorded_word_history` added.
+
+## W2 (2026-10-08): MMA `Access::operand` numbering (W5-15 interpretation; coordinator ack requested)
+
+- **Before.** An MMA reported every TMEM read (D, TMEM-A, sparse metadata, scale factors, LUT) as operand 0, so all of them carried D's buffer name. Shared A/B descriptor reads were 1/2. Since `SiteInfo.buffers` indexes only the TVM table's `addr` slots, a TMEM-A sparse form's shared-B read (2) was named after `sp_meta`'s buffer.
+- **Now (sched/partition.rs).**
+  - TMEM reads are split per operand and use their pointer-operand index in `buffers` order: d = 0, then [a_tmem], then [b_decompress_metadata | sp_meta_tmem], then [sfa_tmem, sfb_tmem].
+  - The split is by base column: each byte belongs to the operand whose base column is the greatest at or below the byte's column, with ties broken by base lane.
+  - Shared descriptor reads are `sched::MMA_SHARED_A` (240), on the shared-A read op, and `MMA_SHARED_B` (241), on the MMA op. Both are past every pointer operand, so they have no buffer name.
+  - All TMEM operand reads belong to the MMA op itself (its async token), never to the shared-A read op. An A-only `.sync_restrict` commit therefore does not publish them.
+- **Tests.** Test `tcgen_mma_operand_reads_are_named_per_operand`, using the new `MmaSpec::sparse` builder variant, which also checks sparse f16 numerics. Smoke scenario `tcgen_mma_sparse`.
+
+## W2 (2026-10-08): W12-gaps 6, CLC task claims under a cluster subset
+
+- **Behaviour.** `RunConfig::subset` (W8-4) names the resident clusters, as legacy's `ClcTaskCounter` did. `clusterlaunchcontrol.try_cancel` walks the logical cluster ids once and gives each non-resident cluster's task to exactly one caller. The response's first word is that cluster's linear base CTA id, or 0xFFFF_FFFF once none remain. Without a subset every cluster is resident and nothing is claimable, which is the previous behaviour.
+- **Determinism.**
+  - The queue (`interp::aux::ClcTasks`, an `Arc` in every partition's `LaunchAux`) is touched only on the main arena.
+  - Inside an arena shard (the parallel phase with more than one partition), a claimable `try_cancel` is a serial point. It is re-run in the serial phase in partition order, as global RMWs are.
+  - A single partition claims at issue. The claim order therefore depends neither on the worker count nor on the observer.
+- **Oplib decode.** `is_canceled = low32 != 0xFFFF_FFFF`. Before, it was `!= 0 && != MAX`; that assumed cluster 0 always resident, but under a subset base CTA 0 can be claimed.
+- **Scenario and test.** Scenario `clc_task_steal`: grid 4, subset {0, 1}; it is in `all()` and run by the checker smoke tests. Test `clc_claims_non_resident_tasks_under_a_subset` covers workers 1/4/16, with and without an observer, single-partition mode, and no subset.
+- **Port.** `test_flashmla_small_topk_task_steal_matches_independent_numerical_oracle` now matches the independent oracle numerically. Its remaining `verdict == "clean"` / `diagnostics == []` asserts collide with the W8-4 `subset_execution` incomplete record, which every subset run carries. Other ports filter that record.
