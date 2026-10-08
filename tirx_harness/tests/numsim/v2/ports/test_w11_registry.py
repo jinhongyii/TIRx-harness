@@ -14,24 +14,22 @@ with the legacy layer; these copies keep the observable facts.
 - ``test_copy_dispatch_contract.py::test_same_warp_copy_remaps_lane_owned_values``:
   unchanged output assertion.
 - ``test_copy_dispatch_contract.py::test_default_thread_owned_local_copy_uses_physical_owners``:
-  delta numsim-behaviour-deltas F4. TVM dispatches the warpgroup local->local
-  ``Tx.wg.copy`` to ``copy/fallback`` (scalar, single thread), whose code reads
-  registers other threads own; v2 runs that code and stops with a ``trap``
-  (register-layout element owned by another thread) at the copy, where legacy
-  copied every thread's own elements.
+  unchanged output assertion. TVM dispatches the warpgroup local->local
+  ``Tx.wg.copy`` to ``copy/fallback`` (scalar, single thread), which is not a
+  copy of register operands; v2 lowers it with the legacy owner-driven form
+  (numsim-behaviour-deltas F4).
 """
 
 from __future__ import annotations
 
 import numpy as np
-import pytest
 import tvm
 from tvm.backend.cuda.ptx.table import TABLE, mods, operand_layout
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.tirx.layout import S, TileLayout, laneid, wg_local_layout
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 from tirx_harness.numsim.v2.lowering import lower
 
@@ -184,27 +182,36 @@ def test_same_warp_copy_remaps_lane_owned_values():
 
 
 def test_default_thread_owned_local_copy_uses_physical_owners():
-    """Delta copy (F4): the dispatched single-thread fallback reads other threads'
-    registers, so v2 stops with a ``trap`` at the copy instead of copying."""
+    """Copy; output assertion unchanged (each thread copies the elements it owns)."""
     source = np.arange(128 * 2, dtype=np.float32).reshape(128, 2) + np.float32(0.25)
-    with pytest.raises(v2.ExecutionError) as caught:
-        v2.Engine().run(
-            v2.transpile(_thread_owned_local_copy), {"source": source, "output": np.zeros_like(source)}
-        )
-    stops = [d for d in caught.value.diagnostics if d.get("status") in ("error", "incomplete")]
-    assert stops and (stops[0]["status"], stops[0]["kind"]) == ("error", "trap"), caught.value.diagnostics
-    # The single fallback thread (thread 0 of the warpgroup) is the faulting lane.
-    assert (stops[0]["warp"], stops[0]["lanes"]) == (0, "WarpMask(0x00000001)"), stops[0]
+    result = v2.Engine().run(
+        v2.transpile(_thread_owned_local_copy), {"source": source, "output": np.zeros_like(source)}
+    )
+    np.testing.assert_array_equal(result.outputs["output"], source)
 
 
-@v2_gap("W11-5: the register-owner Assert lowered for a dispatched tile op has no site, so the trap is not anchored at Tx.wg.copy")
-def test_default_thread_owned_local_copy_trap_is_anchored_at_the_copy():
-    source = np.arange(128 * 2, dtype=np.float32).reshape(128, 2) + np.float32(0.25)
-    with pytest.raises(v2.ExecutionError) as caught:
-        v2.Engine().run(
-            v2.transpile(_thread_owned_local_copy), {"source": source, "output": np.zeros_like(source)}
-        )
-    stop = [d for d in caught.value.diagnostics if d.get("status") == "error"][0]
-    span = stop["source_span"]
-    with open(span["source_name"]) as handle:
-        assert "Tx.wg.copy" in handle.read().splitlines()[span["line"] - 1], stop
+def test_register_owner_check_of_a_tile_op_is_anchored_at_the_tile_call():
+    """W11-5: the register-ownership ``Assert`` lowered inside a tile op (TVM's
+    dispatched code or the v2 tile form) carries the tile call's source site."""
+    from tvm import tirx
+    from tvm_ffi import structural_visit
+
+    calls = []
+    structural_visit(_thread_owned_local_copy.body, [(tirx.TilePrimitiveCall, lambda n, v: calls.append(n))])
+    (copy,) = calls
+    copy_line = int(copy.span.line)
+    program = lower(_thread_owned_local_copy)
+    checks = [
+        pc for pc, instr in enumerate(program.code)
+        if instr.variant == "Assert"
+        and "owned by another thread" in program.strings[instr.msg]
+    ]
+    assert checks
+    lines = set()
+    for pc in checks:
+        assert program.code_sites[pc] < len(program.sites), "register-owner check without a source site"
+        site = program.sites[program.code_sites[pc]]
+        lines.update(span.line for span in site.spans)
+    # The copy's own checks point at the Tx.wg.copy line; the kernel's direct
+    # accesses to the views point at their own statements.
+    assert copy_line in lines and len(lines) > 1, (copy_line, lines)

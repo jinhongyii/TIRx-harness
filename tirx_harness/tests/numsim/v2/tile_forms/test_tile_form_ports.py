@@ -173,3 +173,109 @@ def k(source: T.Buffer((2, 32), "float32"), output: T.Buffer((32,), "float32"), 
     assert len(loads) == 2
     first_loop = all_of(program, "LoopBegin")[0]
     assert all(pc_of(program, i) < pc_of(program, first_loop) for i in loads)
+
+
+
+
+def test_register_owner_checks_of_a_tile_op_point_at_the_tile_call(lower_source):
+    """W11-5: every register-ownership check has a source site; the checks the
+    tile op's own loads and stores need point at the tile call (its marker),
+    not at TVM's or the tile form's generated statements, which have no
+    user span."""
+    program = lower_source('''
+@T.prim_func
+def k(source: T.Buffer((128, 2), "float32"), output: T.Buffer((128, 2), "float32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    _warpgroup = T.warpgroup_id([1])
+    _warp = T.warp_id_in_wg([4])
+    thread = T.thread_id_in_wg([128])
+    src = T.alloc_local((128, 2), layout=T.TileLayout(T.S[(128, 2):(1 @ Axis.tid_in_wg, 1)]))
+    dst = T.alloc_local((128, 2), layout=T.TileLayout(T.S[(128, 2):(1 @ Axis.tid_in_wg, 1)]))
+    for column in range(2):
+        src[thread, column] = source[thread, column]
+    T.wg.copy(dst[0:128, 0:2], src[0:128, 0:2])
+    for column in range(2):
+        output[thread, column] = dst[thread, column]
+''')
+    checks = [pc for pc, i in enumerate(program.code)
+              if i.variant == "Assert" and "owned by another thread" in program.strings[i.msg]]
+    # 2 kernel stores + 2 kernel loads, and the copy's snapshot load and store.
+    assert len(checks) >= 4
+    lines = []
+    for pc in checks:
+        assert program.code_sites[pc] < len(program.sites), "register-owner check without a site"
+        spans = program.sites[program.code_sites[pc]].spans
+        assert spans, "register-owner check without a source span"
+        lines.append(spans[0].line)
+    # The copy is line 12 of the kernel source (1-based, after the leading newline).
+    assert lines.count(12) >= 2, lines
+
+
+LOCAL_WARP_COPY = '''
+@T.prim_func
+def k(output: T.Buffer((32, 2), "float32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    _warp = T.warp_id([1])
+    lane = T.lane_id([32])
+    source = T.alloc_local((2,), "float32")
+    destination = T.alloc_local((2,), "float32")
+    source[0] = T.Cast("float32", lane)
+    source[1] = T.Cast("float32", lane)
+    T.warp.copy(destination[0:2], source[0:2])
+    output[lane, 0] = destination[0]
+    output[lane, 1] = destination[1]
+'''
+
+
+def test_tvm_single_thread_fallback_on_registers_takes_the_tile_form(lower_source):
+    """F4: TVM picks copy/fallback (one thread) for this register copy; v2 lowers
+    it with the tile form, where every lane copies its own registers."""
+    import tvm
+    from tvm.script import tirx as T
+    from tvm_ffi import structural_visit
+
+    from tirx_harness.numsim.v2.lowering import tile_forms
+    from tirx_harness.numsim.v2.lowering.ir_walk import dispatch_tile_primitives
+
+    func = tvm.script.from_source(LOCAL_WARP_COPY, {"T": T})
+    placeholders = []
+
+    def on_call(node, visitor):
+        if getattr(node.op, "name", "") == "tirx.call_extern" and node.args[0].value == tile_forms.PLACEHOLDER:
+            placeholders.append(node)
+
+    structural_visit(dispatch_tile_primitives(func).body, [(tvm.ir.Call, on_call)])
+    assert len(placeholders) == 1
+    program = lower_source(LOCAL_WARP_COPY)
+    _full_warp_vote(program)  # the tile form's warp participation
+    # Thread-private operands: every lane runs the copy loop, no owner guard.
+    assert not all_of(program, "If")
+
+
+def test_cross_owner_fragment_copy_is_transported_through_shared_scratch(lower_source):
+    program = lower_source('''
+@T.prim_func
+def k(source: T.Buffer((128, 2), "float32"), output: T.Buffer((128, 2), "float32")):
+    T.attr({"tirx.device_entry": T.bool(True)})
+    _warpgroup = T.warpgroup_id([1])
+    _warp = T.warp_id_in_wg([4])
+    thread = T.thread_id_in_wg([128])
+    src = T.alloc_local((128, 2), layout=T.TileLayout(T.S[(128, 2):(1 @ Axis.tid_in_wg, 1)]))
+    dst = T.alloc_local((128, 2), layout=T.TileLayout(T.S[(128, 2):(1 @ Axis.tid_in_wg, 1)]))
+    for column in range(2):
+        src[thread, column] = source[thread, column]
+    T.wg.copy(dst[64:128, 0:2], src[0:64, 0:2])
+    for column in range(2):
+        output[thread, column] = dst[thread, column]
+''')
+    scratch = [i for i, b in enumerate(program.buffers) if b.name.endswith(".transport")]
+    assert len(scratch) == 1 and program.buffers[scratch[0]].space == "Shared"
+    stores = [i for i in all_of(program, "Store") if i.buf == scratch[0]]
+    loads = [i for i in all_of(program, "Load") if i.buf == scratch[0]]
+    assert len(stores) == 1 and len(loads) == 1
+    barriers = [b for b in all_of(program, "Barrier") if const(program, b.id) == 8
+                and const(program, b.count) == 128]
+    # scope sync -> stage -> scope sync -> restore -> scope sync (legacy transport).
+    assert len(barriers) == 3
+    pcs = [pc_of(program, b) for b in barriers]
+    assert pcs[0] < pc_of(program, stores[0]) < pcs[1] < pc_of(program, loads[0]) < pcs[2]

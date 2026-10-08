@@ -29,6 +29,7 @@ from .host_prelude import PreludeMixin
 from .memory import MemoryMixin, MemRef, _Unsupported, escaped_locals, handle, promotable_locals
 from .owner_transport import OwnerTransportMixin, function_is_owner_transport
 from . import tile_forms
+from .tile_forms import copy as tile_copy
 from .tile_checks import tile_rejection
 from .uninit import maybe_uninit_locals
 
@@ -112,6 +113,7 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
         self.tmem_views = False
         self.tmem_runtime_views = False
         self.wide_params: set[int] = set()
+        self.tile_ops: list[Any] = []  # enclosing `numsim.tile_op` markers (W11-5)
 
     # ------------------------------------------------------------------ util
     def unsupported(self, node: Any, reason: str) -> None:
@@ -368,6 +370,15 @@ class Lowerer(MemoryMixin, CallsMixin, PreludeMixin, OwnerTransportMixin):
             self.builder.emit("ReadSpecial", dst=reg, sreg={sreg: axis.upper()})
             self.vars[handle(iter_var.var)] = self.cast_to(reg, dtype_of(iter_var.var))
             self.stmt(node.body)
+            return
+        if key == TILE_OP_MARK:
+            # The code TVM dispatched (or the v2 tile form) for one tile call:
+            # checks that code raises are anchored at the call (W11-5).
+            self.tile_ops.append(node)
+            try:
+                self.stmt(node.body)
+            finally:
+                self.tile_ops.pop()
             return
         if key not in _IGNORED_ATTRS:
             raise _Unsupported(node, f"attribute {key!r}")
@@ -982,13 +993,13 @@ def dispatch_tile_primitives(func: Any) -> Any:
         return func
     attrs = func.attrs
     arch = str(attrs["tirx.cuda_arch"]) if attrs is not None and "tirx.cuda_arch" in attrs else "sm_100a"
-    original, current, reasons = func, func, {}
+    original, current, reasons = func, _mark_tile_ops(func), {}
     # Amended Decision 6: TVM first; the ops TVM rejects go to the v2 tile
     # forms (tile_forms/), swapped out for placeholders so TVM still lowers the
     # rest of the function. Retried once per rejected op name.
     for _ in range(8):
         try:
-            with tvm.target.Target({"kind": "cuda", "arch": arch}):
+            with tvm.target.Target({"kind": "cuda", "arch": arch}), tile_copy.fallback_watch() as fallbacks:
                 module = tirx.transform.TilePrimitiveDispatch()(tvm.IRModule({"main": current}))
         except Exception as error:  # noqa: BLE001 - dispatch rejection
             message = " ".join(str(error).split())
@@ -1017,9 +1028,47 @@ def dispatch_tile_primitives(func: Any) -> Any:
                     current = repaired
             current = _swap_out_tile_calls(current, match.group(1), message[:300], arch)
             continue
+        rerouted = [c for c in fallbacks if tile_copy.reroute(c)]
+        if rerouted:
+            # TVM's single-thread copy fallback on register operands is not a
+            # copy (F4): those calls take the v2 tile form (tile_forms/copy.py).
+            current = _swap_out_these_calls(
+                current, rerouted, "copy/fallback (scalar single-thread) picked for a register operand")
+            continue
         return module["main"]
     _DISPATCH_ERRORS[id(original)] = "TVM dispatch did not converge"
     return original
+
+
+TILE_OP_MARK = "numsim.tile_op"
+
+
+def _mark_tile_ops(func: Any) -> Any:
+    """Wrap every tile call in an ``AttrStmt(numsim.tile_op)`` carrying its span.
+
+    TVM's dispatch replaces the call inside the marker, so the walker knows
+    which tile call produced each lowered statement (W11-5)."""
+    from tvm_ffi import structural_mutate
+
+    def on_call(node: Any, mutator: Any) -> Any:
+        return tirx.AttrStmt(tvm.ir.StringImm(str(node.op.name)), TILE_OP_MARK, tirx.IntImm("int32", 0), node,
+                             span=node.span)
+
+    return func.with_body(structural_mutate(func.body, [(tirx.TilePrimitiveCall, on_call)]))
+
+
+def _swap_out_these_calls(func: Any, calls: list[Any], reason: str) -> Any:
+    """Replace exactly ``calls`` (by identity) by v2 tile-form placeholders."""
+    from tvm_ffi import structural_mutate
+
+    def on_call(node: Any, mutator: Any) -> Any:
+        if not any(node.same_as(c) for c in calls):
+            return mutator.default_mutate(node)
+        key = len(tile_forms.PENDING)
+        tile_forms.PENDING[key] = (node, reason)
+        return tirx.Evaluate(tirx.call_extern("int32", tile_forms.PLACEHOLDER, key))
+
+    return func.with_body(structural_mutate(func.body, [(tirx.TilePrimitiveCall, on_call)]))
 
 
 def _declare_single_warpgroup(func: Any) -> Any | None:

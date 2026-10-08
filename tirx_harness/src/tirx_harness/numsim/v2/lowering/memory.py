@@ -96,9 +96,10 @@ class MemRef:
 
 @dataclass
 class PtrRef:
-    base: pb.Operand                # u64 generic address
+    base: pb.Operand                # u64 generic address (or a shared::cluster window address)
     info: Shape
     elem_offset: Any                # PrimExpr
+    space: str = "Generic"          # "SharedCluster": base is a mapa.shared::cluster result
 
 
 BufferRef = RegArray | MemRef | PtrRef
@@ -227,7 +228,7 @@ class MemoryMixin:
                 name=name, space=space, dtype=elem_ty,
                 shape=tuple(pb.DimExpr.const(e) for e in static),
                 byte_len=pb.DimExpr.const((_layout_span(info.layout, numel) * dtypes.bits(info.dtype) + 7) // 8),
-                align=max(16, int(ty.data_alignment)),
+                align=max(16, int(ty.data_alignment), _swizzle_period_bytes(info.layout, info.dtype)),
             )
         )
         if scope == "shared.dyn":
@@ -297,10 +298,40 @@ class MemoryMixin:
             # base), not from the backing view's first element: adding the
             # backing's own offset again would apply it twice (W2,
             # sparse_flashmla_decode_head64 `o_ptr.view("uint64")`).
-            self.refs[handle(var)] = PtrRef(base=backing.base, info=info, elem_offset=offset)
+            self.refs[handle(var)] = PtrRef(base=backing.base, info=info, elem_offset=offset, space=backing.space)
             return
-        base = self.as_address(self.expr(data))
-        self.refs[handle(var)] = PtrRef(base=base, info=info, elem_offset=offset)
+        value = self.expr(data)
+        space = "Generic"
+        if scope in ("shared", "shared.dyn") and self.is_cluster_window(value):
+            # A shared-scope buffer over a `mapa.shared::cluster` result: the base
+            # is a shared::cluster window address, not a generic pointer (W2).
+            space = "SharedCluster"
+        base = self.as_address(value)
+        self.refs[handle(var)] = PtrRef(base=base, info=info, elem_offset=offset, space=space)
+
+    def is_cluster_window(self: "Lowerer", value: pb.Operand) -> bool:
+        """Is ``value`` (through Mov/Cast copies) only ever a mapa.shared::cluster result?"""
+        seen: set[int] = set()
+        pending = [value]
+        while pending:
+            operand = pending.pop()
+            if not isinstance(operand, pb.Reg) or operand.index in seen:
+                if not isinstance(operand, pb.Reg):
+                    return False
+                continue
+            seen.add(operand.index)
+            writers = [i for i in self.builder.code if operand in i.writes()]
+            if not writers:
+                return False
+            for instr in writers:
+                if instr.variant == "Mapa":
+                    if instr.space != "SharedCluster":
+                        return False
+                elif instr.variant in ("Mov", "Cast"):
+                    pending.append(instr.fields["src"])
+                else:
+                    return False
+        return True
 
     def declare_tmem_view(self: "Lowerer", node: Any, var: Any, ty: Any, info: Shape, elem_ty: pb.Ty) -> None:
         """TMEM ``DeclBuffer`` -> ``Buf`` in ``Space::Tmem`` (coordinator ruling, phase 3).
@@ -519,7 +550,11 @@ class MemoryMixin:
                 own = self.thread_coordinate(name)
                 ok = self.builder.reg(pb.Ty("Pred"))
                 self.builder.emit("Compare", op="Eq", ty=pb.Ty("S32"), dst=ok, a=owner, b=own)
-                self.builder.emit("Assert", cond=ok, msg=self.builder.string(
+                # Anchor the check at the tile call that produced the access
+                # (W11-5), else at the access itself.
+                anchor = self.tile_ops[-1] if getattr(self, "tile_ops", None) else getattr(self, "access_node", None)
+                site = self.site(anchor) if anchor is not None else None
+                self.builder.emit("Assert", site=site, cond=ok, msg=self.builder.string(
                     f"register-layout element owned by another thread ({name})"))
             if expr is None:
                 return self.const(dtype, 0)
@@ -582,6 +617,7 @@ class MemoryMixin:
             raise _Unsupported(node, f"load from unknown buffer {node.source.name}")
         if isinstance(ref, RegArray):
             return self.reg_array_read(node, ref, node.indices)
+        self.access_node = node
         offset, lanes = self.flat_offset(ref, node.indices)
         ty = self.access_ty(ref, lanes, node)
         dst = self.builder.reg(ty)
@@ -591,7 +627,10 @@ class MemoryMixin:
                               mods=pb.mem_mods(), **_WEAK)
         else:
             addr = self.ptr_address(ref, offset)
-            self.builder.emit("LoadAddr", site=self.site(node), ty=ty, dst=dst, addr=addr, space="Generic",
+            space = ref.space
+            if space == "SharedCluster":
+                addr = self.cast_to(addr, pb.Ty("U32"))  # 32-bit shared::cluster window address
+            self.builder.emit("LoadAddr", site=self.site(node), ty=ty, dst=dst, addr=addr, space=space,
                               mods=pb.mem_mods(), **_WEAK)
         return dst
 
@@ -602,6 +641,7 @@ class MemoryMixin:
         if isinstance(ref, RegArray):
             self.reg_array_write(node, ref, indices, value)
             return
+        self.access_node = node
         offset, lanes = self.flat_offset(ref, indices)
         ty = self.access_ty(ref, lanes, node)
         value = self.cast_to(value, ty)
@@ -611,7 +651,10 @@ class MemoryMixin:
                               mods=pb.mem_mods(), **_WEAK)
         else:
             addr = self.ptr_address(ref, offset)
-            self.builder.emit("StoreAddr", site=self.site(node), ty=ty, addr=addr, space="Generic",
+            space = ref.space
+            if space == "SharedCluster":
+                addr = self.cast_to(addr, pb.Ty("U32"))  # 32-bit shared::cluster window address
+            self.builder.emit("StoreAddr", site=self.site(node), ty=ty, addr=addr, space=space,
                               value=value, mods=pb.mem_mods(), **_WEAK)
 
     def ptr_address(self: "Lowerer", ref: PtrRef, offset: pb.Operand) -> pb.Operand:
@@ -775,6 +818,25 @@ def _tmem_spans(layout: Any) -> tuple[int, int, bool] | None:
             return None
         spans[axis] += (int(iterator.extent.value) - 1) * int(iterator.stride.value)
     return spans["TLane"] + 1, spans["TCol"] + 1, len(layout.replica) > 0
+
+
+def _swizzle_period_bytes(layout: Any, dtype: str) -> int:
+    """Byte period of a swizzled (``ComposeLayout``) allocation, else 0.
+
+    TIRx swizzles relative to the buffer start, while tcgen05/wgmma matrix
+    descriptors and TMA swizzle the absolute shared address (PTX matrix
+    descriptor "base offset" 0): the two agree only when the buffer starts on a
+    multiple of the pattern's repeat, 2**(per_element + atom_len + swizzle_len)
+    elements (256B for SWIZZLE_32B, 512B for 64B, 1024B for 128B). TIRx's own
+    pool allocator places these operands at ``align=1024`` for the same reason.
+    """
+    if layout is None or type_key(layout) != "tirx.ComposeLayout":
+        return 0
+    try:
+        bits = int(layout.per_element) + int(layout.atom_len) + int(layout.swizzle_len)
+    except (AttributeError, TypeError, ValueError):
+        return 0
+    return max(16, ((1 << bits) * dtypes.bits(dtype) + 7) // 8)
 
 
 def _layout_span(layout: Any, numel: int) -> int:

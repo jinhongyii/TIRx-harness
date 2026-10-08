@@ -35,10 +35,11 @@ Shared machinery (also used by ``fill``, ``permute`` and ``reduce``):
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from typing import TYPE_CHECKING, Any, Callable
 
-import tvm
+import tvm_ffi
 from tvm import tirx
 
 from .. import program_builder as pb
@@ -243,6 +244,13 @@ def fragment_guard(ctx: "Lowerer", reg: Region, coords: list[Any]) -> Any:
     return cond
 
 
+def same_owners(a: Region, b: Region) -> bool:
+    """Do two fragment regions give every logical element the same owner thread?"""
+    return a.extents == b.extents and [str(m) for m in a.mins] == [str(m) for m in b.mins] and \
+        [int(s) for s in a.var.ty.shape] == [int(s) for s in b.var.ty.shape] and \
+        tvm_ffi.structural_equal(a.layout.canonicalize(), b.layout.canonicalize())
+
+
 def fragment_owner(regions: list[Region], call: Any) -> Region | None:
     """The fragment operand whose owners execute the op, or None."""
     fragments = [r for r in regions if r.kind == "fragment"]
@@ -250,11 +258,9 @@ def fragment_owner(regions: list[Region], call: Any) -> Region | None:
         return None
     first = fragments[0]
     for other in fragments[1:]:
-        if other.extents != first.extents or not tvm.ir.structural_equal(
-                other.layout.canonicalize(), first.layout.canonicalize()) or [
-                str(m) for m in other.mins] != [str(m) for m in first.mins]:
-            # Values move between threads: owner transport (owner_transport.py)
-            # handles whole-buffer element-wise forms; this one is not modeled.
+        if not same_owners(first, other):
+            # Values move between threads (owner transport): only the copy
+            # form models it (lower_snapshot_copy).
             raise _Unsupported(call, f"tile op {call.op.name}: fragment operands with different thread owners")
     return first
 
@@ -328,6 +334,9 @@ def lower_snapshot_copy(ctx: "Lowerer", call: Any, scope: str, dst: Region, src:
         if reg.scope not in ("global", "local", "shared"):
             raise _Unsupported(call, f"tile op {call.op.name}: unsupported memory pair {src.scope}->{dst.scope}")
     numel = dst.numel
+    if dst.kind == "fragment" and src.kind == "fragment" and not same_owners(dst, src):
+        lower_transported_copy(ctx, call, scope, dst, src)
+        return
     owner = fragment_owner([dst, src], call)
     # Both regions index the same logical element by their own extents.
     dst_coords = lambda linear: unflatten(linear, dst.extents)  # noqa: E731
@@ -350,6 +359,33 @@ def lower_snapshot_copy(ctx: "Lowerer", call: Any, scope: str, dst: Region, src:
     ctx.stmt(element_loop(ctx, call, scope, numel, owner, private,
                           lambda linear: dst.store(dst_coords(linear), snap[linear], span),
                           extents=owner.extents if owner is not None else None))
+    scope_sync(ctx, call, scope)
+
+
+def lower_transported_copy(ctx: "Lowerer", call: Any, scope: str, dst: Region, src: Region) -> None:
+    """Legacy ``tile_emit_owner_transported_copy_or_cast``: a copy between two
+    register fragments whose owners differ moves each value to another thread.
+
+    scope sync -> every source owner stages its elements in a shared scratch
+    -> scope sync -> every destination owner reads its elements -> scope sync.
+    The scratch is the explicit transport (as ``owner_transport.py``); warp
+    and warpgroup scopes still require the full warp.
+    """
+    if scope not in ("warp", "warpgroup", "cta"):
+        raise _Unsupported(call, f"tile op {call.op.name}: owner transport needs a collective scope, got {scope}")
+    numel = dst.numel
+    span = call.span
+    participate(ctx, call, scope)
+    stage = ctx.owner_scratch(src.var, numel)
+    scope_sync(ctx, call, scope)
+    ctx.stmt(element_loop(ctx, call, scope, numel, src, False,
+                          lambda linear: tirx.BufferStore(stage, src.load(unflatten(linear, src.extents)), [linear],
+                                                          span=span),
+                          extents=src.extents))
+    scope_sync(ctx, call, scope)
+    ctx.stmt(element_loop(ctx, call, scope, numel, dst, False,
+                          lambda linear: dst.store(unflatten(linear, dst.extents), stage[linear], span),
+                          extents=dst.extents))
     scope_sync(ctx, call, scope)
 
 
@@ -404,6 +440,54 @@ def elementwise_value(call: Any, op: str, values: list[Any], dtype: str) -> Any:
     if op in _BINARY and len(values) == 2:
         return _BINARY[op](cast(values[0], dtype), cast(values[1], dtype))
     raise _Unsupported(call, f"tile op {call.op.name}: element-wise op {op} with {len(values)} operands")
+
+
+# ------------------------------------------------- TVM's single-thread fallback
+@contextlib.contextmanager
+def fallback_watch() -> Any:
+    """Record the ``tirx.tile.copy`` calls TVM's dispatch lowers with its
+    ``copy/fallback`` variant (scalar, single thread) while the block runs.
+
+    The fallback is TVM's last resort when every vector variant rejects the
+    call; its code runs the whole copy in one thread. That is a copy only for
+    memory operands: a register (``local``) operand belongs to every thread,
+    so the one thread would read registers other threads own (fragments) or
+    copy only its own (thread-private locals). Such calls go to the legacy
+    form instead (``reroute``; numsim-behaviour-deltas F4).
+    """
+    picked: list[Any] = []
+    patched: list[tuple[Any, Any]] = []
+    try:
+        from tvm.tirx.operator.tile_primitive import dispatcher
+
+        table = dispatcher._DISPATCH_TABLE  # noqa: SLF001 - TVM's variant table
+    except (ImportError, AttributeError):
+        table = {}
+    for (op, kind), cases in table.items():
+        if str(op.name) != "tirx.tile.copy" or kind != "cuda":
+            continue
+        for case in cases:
+            if case.variant != "fallback":
+                continue
+            original = case.impl
+
+            def spy(op_call: Any, sctx: Any, _original: Any = original) -> Any:
+                picked.append(op_call)
+                return _original(op_call, sctx)
+
+            case.impl = spy
+            patched.append((case, original))
+    try:
+        yield picked
+    finally:
+        for case, original in patched:
+            case.impl = original
+
+
+def reroute(call: Any) -> bool:
+    """Does a fallback-dispatched copy need the legacy form (a register operand)?"""
+    return any(hasattr(arg, "region") and str(arg.source.ty.storage_scope) == "local"
+               for arg in list(call.args)[:2])
 
 
 # ----------------------------------------------------------------------- entry
