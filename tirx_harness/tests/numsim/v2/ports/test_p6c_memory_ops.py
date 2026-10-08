@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from tvm.script import tirx as T
 
+from tirx_harness.numsim.errors import UnsupportedTIRxError
 from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
 from tirx_harness.numsim import TensorMap, v2
 
@@ -559,12 +560,6 @@ _CLOSED_WORLD_KERNELS = {
 
 
 _CLOSED_WORLD_GAPS = {
-    "guarded_ldg32": "v2.transpile rejects builtin tirx.s_tir.ldg32 (UnsupportedTIRxError); legacy analyze accepted it",
-    "legacy_ldmatrix_x2_trans": (
-        "v2.transpile rejects builtin tirx.ptx_legacy.ldmatrix (UnsupportedTIRxError; "
-        "lowering-inventory.md lists ptx_legacy.* as out of scope, no behaviour-delta row); "
-        "legacy analyze accepted it"
-    ),
 }
 
 
@@ -573,6 +568,7 @@ _CLOSED_WORLD_GAPS = {
     [
         pytest.param(name, marks=v2_gap(_CLOSED_WORLD_GAPS[name])) if name in _CLOSED_WORLD_GAPS else name
         for name in _CLOSED_WORLD_KERNELS
+        if name != "legacy_ldmatrix_x2_trans"
     ],
 )
 def test_memory_family_public_ops_have_closed_world_registration(name):
@@ -584,3 +580,14 @@ def test_memory_family_public_ops_have_closed_world_registration(name):
 
     module = v2.transpile(_CLOSED_WORLD_KERNELS[name])
     assert len(module.spec.kernels) == 1
+
+
+def test_legacy_ldmatrix_surface_is_rejected_at_transpile():
+    """The ``legacy_ldmatrix_x2_trans`` item of the closed-world test, as an
+    expected-outcome test (W11): numsim-behaviour-deltas L2. ``tirx.ptx_legacy.*``
+    is the deprecated pre-table spelling; v2 rejects it at transpile (legacy
+    analyze accepted it). Kernels use the ``T.ptx.ldmatrix`` table form, which
+    v2 lowers."""
+
+    with pytest.raises(UnsupportedTIRxError, match="ptx_legacy"):
+        v2.transpile(_CLOSED_WORLD_KERNELS["legacy_ldmatrix_x2_trans"])

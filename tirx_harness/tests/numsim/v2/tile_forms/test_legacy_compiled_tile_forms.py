@@ -25,11 +25,12 @@ DONE: set[str] = {
     "c9c5f890",  # gemm_async nested_elect_warp_gemm: implicit single warpgroup declared (W1)
 }
 
-# Kernels of a ported family still blocked by a rule outside the tile form.
-BLOCKED: dict[str, str] = {
+# Kernels of a ported family that a rule outside the tile form rejects, by ruling:
+# expected outcome, not a gap (W11). Value: (marker in the unsupported reason, row).
+BLOCKED: dict[str, tuple[str, str]] = {
     # permute_layout lowers; the kernel then reads a replicated TMEM view directly
     # (numsim-behaviour-deltas L1, contract item 29).
-    "afa1d772": "tmem_replicated_view (delta L1)",
+    "afa1d772": ("tmem_replicated_view", "numsim-behaviour-deltas L1"),
 }
 
 # Forms legacy accepted but the hardware rejects (ruling 2026-10-08,
@@ -60,7 +61,11 @@ def test_legacy_compiled_kernel_lowers(row, request):
     if row["family"] not in PORTED and row["capture"][:8] not in DONE:
         request.applymarker(pytest.mark.xfail(reason=f"tile form '{row['family']}' not ported yet", strict=False))
     if row["capture"][:8] in BLOCKED:
-        request.applymarker(pytest.mark.xfail(reason=BLOCKED[row["capture"][:8]], strict=True))
+        marker, delta = BLOCKED[row["capture"][:8]]
+        func = tvm.ir.load_json((HERE / "captures" / f"{row['capture']}.json").read_text())
+        program = lower(func, strict=False)
+        assert any(marker in str(item) for item in program.unsupported), (delta, program.unsupported[:3])
+        return
     func = tvm.ir.load_json((HERE / "captures" / f"{row['capture']}.json").read_text())
     program = lower(func, strict=False)
     assert not program.unsupported, program.unsupported[:3]

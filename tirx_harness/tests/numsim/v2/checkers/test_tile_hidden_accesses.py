@@ -7,8 +7,8 @@ Replaces six ``gap_unportable`` rows of
 must emit these accesses (and barriers) for Racecheck to see them.
 
 No spec mentions these hidden accesses (test-migration.md no-spec item 10).
-The ``cta_sum`` scratch/barrier tests pass; only the ``permute_layout``
-zero-fill tests stay ``xfail(strict=False)`` until the ruling.
+The ``cta_sum`` scratch/barrier tests pass, and so do the ``permute_layout``
+zero-fill tests since W12's permute port (f1e8225; numsim-behaviour-deltas F1).
 """
 
 from __future__ import annotations
@@ -25,14 +25,12 @@ from ._runnable import (
     assert_clean,
     assert_error_kind,
     assert_no_incomplete,
-    no_spec,
     race_access_pairs,
     requires_v2_engine,
 )
 
 pytestmark = [requires_v2_engine]
 
-_ZERO_FILL_NO_SPEC = no_spec(10, "hidden accesses of tile and helper primitives (permute_layout zero-fill)")
 
 _RACECHECK_PERMUTED_SHARED_LAYOUT = TileLayout(S[(4, 32) : (1, 4)])
 
@@ -140,7 +138,6 @@ def test_observes_shared_load_hidden_in_tile_region_index():
     }))
 
 
-@_ZERO_FILL_NO_SPEC
 def test_permute_snapshot_zero_fill_retains_shared_accesses():
     """Replaces ``tests/analysis_tools/racecheck/test_native_racecheck_artifact.py::test_native_racecheck_permute_snapshot_zero_fill_retains_shared_accesses``.
 
@@ -151,7 +148,6 @@ def test_permute_snapshot_zero_fill_retains_shared_accesses():
     _assert_shared_race(v2.racecheck(native_racecheck_shared_permute_snapshot_waw, {}), {"write_write"})
 
 
-@_ZERO_FILL_NO_SPEC
 def test_permute_snapshot_records_zero_fill_source_reads():
     """Replaces ``tests/analysis_tools/racecheck/test_native_racecheck_artifact.py::test_native_racecheck_permute_snapshot_records_zero_fill_source_reads``.
 

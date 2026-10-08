@@ -39,7 +39,8 @@ from tests.numsim.microtests.cases.tcgen05_lifecycle_ldst import (
     tcgen05_cp_warpx4,
 )
 from tests.numsim.support.kernels import raw_tma_roundtrip
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tirx_harness.numsim.errors import UnsupportedTIRxError
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import TensorMap, v2
 
 pytestmark = requires_v2_engine
@@ -529,21 +530,12 @@ def _arguments_by_kernel() -> dict[str, dict[str, Any]]:
     }
 
 
-_LEGACY_SURFACE = (
-    "v2 transpile rejects the legacy {ops} surface (UnsupportedTIRxError; "
-    "synccheck verdict incomplete, native_frontend_unsupported); legacy accepted it "
-    "and reported clean. lowering-inventory.md E.3 lists `ptx_legacy.*` / `mma_*` "
-    "as out of scope, but no delta row rules it"
-)
-
-_GAPS = {
-    "ptx_mma_legacy_f16_m16n8k16": v2_gap(_LEGACY_SURFACE.format(ops="tirx.ptx_legacy.mma")),
-}
+_GAPS: dict = {}
 
 
 @pytest.mark.parametrize(
     "kernel_name",
-    [pytest.param(name, marks=(_GAPS[name],) if name in _GAPS else (), id=name) for name in _BY_NAME],
+    [pytest.param(name, marks=(_GAPS[name],) if name in _GAPS else (), id=name) for name in _BY_NAME if name != "ptx_mma_legacy_f16_m16n8k16"],
 )
 def test_payload_runtime(kernel_name):
     """Port of tests/analysis_tools/synccheck/runtime/test_device_payload_ops.py::test_payload_runtime.
@@ -574,3 +566,18 @@ def test_payload_runtime(kernel_name):
     assert result["verdict"] == "clean", report.format()
     assert result["incomplete"] == [], report.format()
     assert result["coverage"]["eligible_for_clean"] is True
+
+
+def test_payload_runtime_legacy_mma_surface_is_rejected():
+    """The ``ptx_mma_legacy_f16_m16n8k16`` item of :func:`test_payload_runtime`,
+    as an expected-outcome test (W11): numsim-behaviour-deltas L2. v2 rejects
+    ``tirx.ptx_legacy.mma`` at transpile, so the public ``synccheck`` reports
+    ``incomplete`` (``native_frontend_unsupported``) where legacy reported clean."""
+
+    kernel = _BY_NAME["ptx_mma_legacy_f16_m16n8k16"]
+    with pytest.raises(UnsupportedTIRxError, match="ptx_legacy"):
+        v2.transpile(kernel)
+    report = v2.synccheck(kernel, _arguments_by_kernel()["ptx_mma_legacy_f16_m16n8k16"])
+    assert report.verdict == "incomplete", report.format()
+    reasons = [item.get("reason") for phase in report.phases for item in phase.to_dict()["incomplete"]]
+    assert "native_frontend_unsupported" in reasons, report.format()

@@ -6,11 +6,9 @@ stopping diagnostic's status/kind are asserted instead of the pins.
 
 Loop-budget tests: v2 stops an exhausted native loop budget with an
 ``ExecutionError`` whose stopping diagnostic is ``incomplete``
-``analysis_incomplete`` (reason ``Budget: ...``), where legacy raised an error.
-No delta row covers this (test-migration.md, "v2 reports incomplete where
-legacy raised an error": needs a delta row or a v2 fix), so each such test is
-split: the fail-closed half (the run raises) passes, and the legacy
-error-status expectation is kept under ``v2_gap``.
+``analysis_incomplete`` (reason ``Budget: ...``), where legacy raised an error:
+numsim-behaviour-deltas H4 (W11). Each such test is split: the fail-closed half
+(the run raises) and the ``..._stops_incomplete`` half asserting the v2 status.
 """
 
 from __future__ import annotations
@@ -20,18 +18,10 @@ import pytest
 from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 
-from tests.numsim.v2.checkers._runnable import OOB, requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import OOB, requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
-
-_BUDGET_GAP = (
-    "an exhausted native loop iteration budget stops the run with v2.ExecutionError whose "
-    "stopping diagnostic is status 'incomplete' kind 'analysis_incomplete' (reason 'Budget: loop "
-    "exceeded its iteration budget of N'); legacy raised an error (NumSimExecutionError "
-    "'configured native loop iteration budget N'); no delta row"
-)
-
 
 def _first_stop(error: v2.ExecutionError) -> dict:
     """The diagnostic ``Engine.run`` raised for (same selection as run.py)."""
@@ -425,25 +415,24 @@ def test_native_loop_with_extra_body_effect_uses_engine_budget():
 
     Dropped: ``match="configured native loop iteration budget 1"`` (legacy
     text). Asserted: with ``native_loop_iteration_budget=1`` the run raises
-    ``v2.ExecutionError`` (a ``NumSimExecutionError``). The legacy
-    error-status half is ``..._reports_error_status`` (v2 gap).
+    ``v2.ExecutionError`` (a ``NumSimExecutionError``). The
+    incomplete half is ``..._stops_incomplete`` (delta H4).
     """
 
     with pytest.raises(v2.ExecutionError):
         _run(non_polling_loop_with_extra_body_effect, _copy(_EXTRA_BODY_INPUTS), native_loop_iteration_budget=1)
 
 
-@v2_gap(_BUDGET_GAP)
-def test_native_loop_with_extra_body_effect_uses_engine_budget_reports_error_status():
-    """Second half of ``tests/numsim/integration/test_memory_artifact.py::test_native_loop_with_extra_body_effect_uses_engine_budget``.
-
-    Keeps the legacy contract that budget exhaustion is an execution
-    error: the stopping diagnostic has status ``error``.
-    """
+def test_native_loop_with_extra_body_effect_uses_engine_budget_stops_incomplete():
+    """Second half of ``tests/numsim/integration/test_memory_artifact.py::test_native_loop_with_extra_body_effect_uses_engine_budget``
+    (W11 delta copy): legacy raised an error; v2 stops ``incomplete`` with reason
+    ``Budget`` (numsim-behaviour-deltas H4)."""
 
     with pytest.raises(v2.ExecutionError) as caught:
         _run(non_polling_loop_with_extra_body_effect, _copy(_EXTRA_BODY_INPUTS), native_loop_iteration_budget=1)
-    assert _first_stop(caught.value)["status"] == "error", caught.value.diagnostics
+    stop = _first_stop(caught.value)
+    assert (stop["status"], stop["kind"]) == ("incomplete", "analysis_incomplete"), stop
+    assert stop["reason"].startswith("Budget"), stop
 
 
 _WHILE_SHAPES = pytest.mark.parametrize(
@@ -477,19 +466,20 @@ def test_all_native_while_shapes_use_engine_loop_budget(kernel, inputs):
     Dropped: ``match="configured native loop iteration budget 1"``.
     Asserted: with ``native_loop_iteration_budget=1`` the run raises
     ``v2.ExecutionError``. The legacy error-status half is
-    ``..._reports_error_status`` (v2 gap).
+    ``..._stops_incomplete`` (delta H4).
     """
 
     with pytest.raises(v2.ExecutionError):
         _run(kernel, _copy(inputs), native_loop_iteration_budget=1)
 
 
-@v2_gap(_BUDGET_GAP)
 @_WHILE_SHAPES
-def test_all_native_while_shapes_use_engine_loop_budget_reports_error_status(kernel, inputs):
-    """Second half of ``tests/numsim/integration/test_memory_artifact.py::test_all_native_while_shapes_use_engine_loop_budget``:
-    the stopping diagnostic has status ``error`` (legacy contract)."""
+def test_all_native_while_shapes_use_engine_loop_budget_stops_incomplete(kernel, inputs):
+    """Second half of ``tests/numsim/integration/test_memory_artifact.py::test_all_native_while_shapes_use_engine_loop_budget``
+    (W11 delta copy): v2 stops ``incomplete`` with reason ``Budget`` (delta H4)."""
 
     with pytest.raises(v2.ExecutionError) as caught:
         _run(kernel, _copy(inputs), native_loop_iteration_budget=1)
-    assert _first_stop(caught.value)["status"] == "error", caught.value.diagnostics
+    stop = _first_stop(caught.value)
+    assert (stop["status"], stop["kind"]) == ("incomplete", "analysis_incomplete"), stop
+    assert stop["reason"].startswith("Budget"), stop
