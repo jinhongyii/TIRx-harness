@@ -39,6 +39,8 @@ if TYPE_CHECKING:
 _DIM_OPS = {
     "prim.Add": "Add", "prim.Sub": "Sub", "prim.Mul": "Mul", "prim.FloorDiv": "FloorDiv",
     "prim.Min": "Min", "prim.Max": "Max",
+    # Extents are non-negative, where truncating and flooring division agree.
+    "prim.Div": "FloorDiv",
 }
 
 

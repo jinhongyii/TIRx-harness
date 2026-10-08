@@ -1312,3 +1312,58 @@ rejects, which I do not recommend.
 | 8 | `For` kind PARALLEL / VECTORIZED / THREAD_BINDING | fails closed by design |
 | 2 | `%nwarpid` | contract gap (no `SpecialReg`) |
 | ~10 | single-kernel negative tests (`wait_group -1`, unreviewed helper, `boolx128` used as a value, malformed `Shuffle` / `warp_reduce`, host `Div` extent, `address_of(handle)`) | fail closed by design |
+
+---
+
+## Part E: Contract batch 3 and item 27 (2026-10-08)
+
+Emitted:
+
+- `TcMmaKind::Ti16` for `kind::ti16`.
+- Split-stride TMA overrides: per-`ord` `GlobalStride` for the lower strides,
+  plus one `GlobalStrideUpper`.
+- `BufferDecl.base_reg` for TMEM views whose `allocated_addr` or layout
+  offset is runtime. The view's `(TLane, TCol)` layout offset is folded into
+  the base and subtracted from each access.
+- `TcgenLd.red_abs` / `red_nan`, and `.spcompress` forms (dsts = `mdata`
+  lanes then `cdata` lanes, in TVM table order).
+- `BulkCopy.ignore_oob = {ignore_bytes_left, ignore_bytes_right}`.
+- `SpecialReg::NWarpId`.
+- `lut_b_addr` as a TMEM taddr.
+- `TcgenLd` / `TcgenSt` / `TcgenCp` `row` / `col` = `Const 0`. The table
+  forms already carry the full taddr.
+
+Also added:
+
+- address operands of register ops (`createpolicy.range`) are passed as
+  values;
+- `prim.Div` is accepted in extents.
+
+### E.1 Validation tooling
+
+`scripts/numsim-v2/validate.sh` now builds `validate-program` against a
+generated contract-only shim (`make_contract_shim.py`). The shim contains
+`program.rs`, `site.rs`, `numsim-types`, and the `Space` / `Domain` enums,
+so concurrent engine edits cannot break validation.
+
+### E.2 Result
+
+| scope | lowered without `Unsupported` | Rust decode + `validate()` |
+| --- | --- | --- |
+| corpus | 195/195 | yes |
+| full suite | 2196/2343 | 2341/2341 loadable kernels |
+
+### E.3 Remaining residuals
+
+These are only out-of-scope or fail-closed-by-design rows:
+
+- tile ops that TVM's dispatch rejects (D.2);
+- direct access to replicated or non-32-bit TMEM views;
+- register-layout locals (tile-only forms);
+- `ptx_legacy.*` / `mma_*` legacy surface;
+- PARALLEL / VECTORIZED / thread-bound loops;
+- about 20 negative tests that expect rejection;
+- two single-kernel items:
+  - a runtime TensorMap box dim (`TensorMapSpec.box_dim` is static);
+  - `smem_desc_make_lo_uniform`, a warp-collective CUDA helper. It is not
+    reviewed and fails closed.

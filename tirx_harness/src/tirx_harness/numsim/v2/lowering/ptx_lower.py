@@ -45,7 +45,8 @@ EVICT = {"": "Normal", "L1::evict_normal": "Normal", "L1::evict_first": "First",
 L2_PREFETCH = {"": 0, "L2::64B": 64, "L2::128B": 128, "L2::256B": 256}
 TC_SHAPES = {"32x32b": "S32x32b", "16x64b": "S16x64b", "16x128b": "S16x128b", "16x256b": "S16x256b"}
 MMA_KINDS = {"kind::f16": "F16", "kind::tf32": "Tf32", "kind::f8f6f4": "F8f6f4", "kind::i8": "I8",
-             "kind::mxf8f6f4": "MxF8f6f4", "kind::mxf4": "MxF4", "kind::mxf4nvf4": "MxF4Nvf4"}
+             "kind::mxf8f6f4": "MxF8f6f4", "kind::mxf4": "MxF4", "kind::mxf4nvf4": "MxF4Nvf4",
+             "kind::ti16": "Ti16"}
 COLLECTOR = {"": "None", "fill": "Fill", "use": "Use", "lastuse": "LastUse", "discard": "Discard"}
 
 
@@ -200,9 +201,11 @@ def lower_generic(c: PtxCtx) -> None:
     for info, values in zip(c.d.operands, c.d.values):
         if info.literal is not None:
             continue
-        if info.kind == "addr":
-            raise _Unsupported(c.node, f"{c.d.op_name}: memory operand in a register op")
         for value in values:
+            if info.kind == "addr":
+                # A register op that names an address only uses its value (e.g. createpolicy.range).
+                srcs.append(lw.as_address(lw.expr(value)))
+                continue
             if info.rw == "r":
                 srcs.append(lw.expr(value))
                 continue
@@ -414,8 +417,6 @@ def _multicast(c: PtxCtx) -> pb.Operand | None:
 
 
 def lower_bulk_copy(c: PtxCtx) -> None:
-    if c.has("ignore_bytes_left") or c.has("ignore_bytes_right"):
-        raise _Unsupported(c.node, f"{c.d.op_name}: ignore_oob byte counts are not in BulkCopyArgs")
     dst, dst_space = c.addr("dst_mem")
     src, src_space = c.addr("src_mem")
     reduce = None
@@ -425,7 +426,7 @@ def lower_bulk_copy(c: PtxCtx) -> None:
     c.emit("BulkCopy", dst=dst, dst_space=dst_space, src=src, src_space=src_space, size=c.src("size"),
            completion=_completion(c), multicast=_multicast(c), reduce=reduce,
            byte_mask=c.opt_src("byte_mask") if "byte_mask" in c.ops else None,
-           ignore_oob=c.flag("ignore_oob"), report=_report(c), mods=mods)
+           ignore_oob=_ignore_oob(c), report=_report(c), mods=mods)
 
 
 def _report(c: PtxCtx) -> Any:
@@ -450,7 +451,23 @@ def _overrides(c: PtxCtx) -> list[dict]:
     if "tensor_size" in c.ops:
         for ordinal, value in enumerate(c.srcs("tensor_size")):
             out.append({"field": "GlobalDim", "ord": ordinal, "value": pb.opnd(value), "elem_bits": elem_bits})
+    # Contract item 21: per-dimension lower strides + one shared upper operand.
+    if "lower_stride" in c.ops:
+        for ordinal, value in enumerate(c.srcs("lower_stride")):
+            out.append({"field": "GlobalStride", "ord": ordinal, "value": pb.opnd(value), "elem_bits": elem_bits})
+    if "upper_stride" in c.ops and c.has("upper_stride"):
+        out.append({"field": "GlobalStrideUpper", "ord": None, "value": pb.opnd(c.src("upper_stride")),
+                    "elem_bits": elem_bits})
     return out
+
+
+def _ignore_oob(c: PtxCtx) -> Any:
+    """Contract item 24: ``.ignore_oob`` with optional left/right byte counts (null = 0)."""
+    if not c.flag("ignore_oob"):
+        return None
+    left = c.opt_src("ignore_bytes_left") if "ignore_bytes_left" in c.ops else None
+    right = c.opt_src("ignore_bytes_right") if "ignore_bytes_right" in c.ops else None
+    return {"ignore_bytes_left": pb.opt_opnd(left), "ignore_bytes_right": pb.opt_opnd(right)}
 
 
 def lower_bulk_prefetch(c: PtxCtx) -> None:
@@ -459,8 +476,6 @@ def lower_bulk_prefetch(c: PtxCtx) -> None:
 
 def lower_tma(c: PtxCtx) -> None:
     name = c.name
-    if "override_global_dim_stride" in name:
-        raise _Unsupported(c.node, f"{c.d.op_name}: lower/upper stride overrides have no TmapOverride encoding")
     if name.startswith("cp_reduce_async_bulk_tensor"):
         direction = {"Reduce": ATOM_OPS[c.mod("redop")]}
     elif "prefetch" in name:
@@ -738,6 +753,9 @@ def _cta_group(c: PtxCtx) -> int:
 def lower_tcgen05(c: PtxCtx) -> None:
     name = c.name
     lw = c.lw
+    # Contract item 27: the PTX table forms carry the full taddr (row/column folded in
+    # by the kernel, e.g. via cuda.get_tmem_addr), so the separate offsets are 0.
+    zero = lw.const("int32", 0)
     if name.startswith("tcgen05_alloc"):
         dst, _ = c.addr("dst", "Shared")
         c.emit("TcgenAlloc", dst=dst, ncols=c.src("ncols"), cta_group=_cta_group(c), exclusive="exclusive" in name)
@@ -759,26 +777,28 @@ def lower_tcgen05(c: PtxCtx) -> None:
         kind = "Tcgen05Before" if c.mod("action") == "fence::before_thread_sync" else "Tcgen05After"
         c.emit("Fence", kind=kind, sem="Weak", scope="Cta")
     elif name.startswith("tcgen05_ld"):
-        if "spcompress" in name or c.flag("abs") or c.flag("nan"):
-            raise _Unsupported(c.node, f"{c.d.op_name}: spcompress/abs/NaN tcgen05.ld")
         shape = _tc_shape(c)
-        dsts = [d if d is not None else c.scratch(pb.Ty("U32")) for d in c.dsts("r")]
+        spcompress = "spcompress" in name
+        # .spcompress forms: dsts are the metadata lanes then the compressed-data lanes
+        # (TVM table operand order ``mdata``, ``cdata``).
+        groups = ("mdata", "cdata") if spcompress else ("r",)
+        dsts = [d if d is not None else c.scratch(pb.Ty("U32")) for g in groups for d in c.dsts(g)]
         red = None
         if "redval" in c.ops:
             red_regs = [d if d is not None else c.scratch(pb.Ty.from_ptx(c.mod("type"))) for d in c.dsts("redval")]
-            red = [REDUX_OPS[c.mod("redop")], red_regs]
+            red = [REDUX_OPS[c.mod("redop") or c.mod("rowop")], red_regs]
         taddr = c.src("taddr")
-        c.emit("TcgenLd", dsts=dsts, taddr=taddr, shape=shape, num=c.int_mod("num", "x"),
-               pack=c.flag("pack"), red=red, spcompress=False)
+        c.emit("TcgenLd", dsts=dsts, taddr=taddr, row=zero, col=zero, shape=shape, num=c.int_mod("num", "x"),
+               pack=c.flag("pack"), red=red, red_abs=c.flag("abs"), red_nan=c.flag("nan"), spcompress=spcompress)
     elif name.startswith("tcgen05_st"):
         shape = _tc_shape(c)
-        c.emit("TcgenSt", srcs=c.srcs("r"), taddr=c.src("taddr"), shape=shape, num=c.int_mod("num", "x"),
+        c.emit("TcgenSt", srcs=c.srcs("r"), taddr=c.src("taddr"), row=zero, col=zero, shape=shape, num=c.int_mod("num", "x"),
                unpack=c.flag("unpack"))
     elif name == "tcgen05_cp":
         rows, bits = (int(x) for x in c.mod("shape").rstrip("b").split("x"))
         multicast = {"": 0, "warpx2::02_13": 1, "warpx2::01_23": 2, "warpx4": 3}[c.mod("multicast")]
         decompress = {"": 0, "b6x16_p32": 6, "b4x16_p64": 4}[c.mod("src_fmt")]
-        c.emit("TcgenCp", taddr=c.src("taddr"), sdesc=c.src("s_desc"), rows=rows, bits=bits, multicast=multicast,
+        c.emit("TcgenCp", taddr=c.src("taddr"), row=zero, col=zero, sdesc=c.src("s_desc"), rows=rows, bits=bits, multicast=multicast,
                decompress_bits=decompress, cta_group=_cta_group(c))
     elif name.startswith("tcgen05_mma"):
         lower_tcgen05_mma(c)
@@ -831,7 +851,7 @@ def lower_tcgen05_mma(c: PtxCtx) -> None:
            ws=c.flag("ws"), ws_b_buffer=b_buffer, block_scale=block_scale, scale_input_d=None,
            sparse_meta=c.src("sp_meta_tmem") if "sp_meta_tmem" in c.ops else None,
            disable_output_lane=lanes, collector_a=collector_a, collector_b=collector_b,
-           ashift=c.flag("ashift"), ti16=False, lut_b=lut_b, lut_b_addr=lut_b_addr)
+           ashift=c.flag("ashift"), lut_b=lut_b, lut_b_addr=lut_b_addr)
 
 
 # ---------------------------------------------------------------------------

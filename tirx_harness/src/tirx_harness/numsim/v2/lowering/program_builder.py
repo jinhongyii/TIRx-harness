@@ -258,7 +258,7 @@ SCHEMA: dict[str, dict[str, str] | None] = {
     "CpAsyncMbarArrive": {"mbar": "op", "space": "json", "noinc": "bool"},
     "BulkCopy": {"dst": "op", "dst_space": "json", "src": "op", "src_space": "json", "size": "op",
                  "completion": "json", "multicast": "opt_op", "reduce": "json", "byte_mask": "opt_op",
-                 "ignore_oob": "bool", "report": "json", "mods": "json"},
+                 "ignore_oob": "json", "report": "json", "mods": "json"},
     "Tma": {"dir": "json", "mode": "json", "tmap": "op", "tmap_space": "json", "coords": "ops",
             "im2col_offsets": "ops", "smem": "op", "smem_space": "json", "completion": "json",
             "multicast": "opt_op", "cta_group": "int", "overrides": "json", "report": "json", "mods": "json"},
@@ -293,17 +293,17 @@ SCHEMA: dict[str, dict[str, str] | None] = {
     "TcgenRelinquish": {"cta_group": "int"},
     "TcgenCommit": {"mbar": "op", "space": "json", "cta_group": "int", "multicast": "opt_op",
                     "sync_restrict": "bool", "multicast_width": "json"},
-    "TcgenLd": {"dsts": "regs", "taddr": "op", "shape": "json", "num": "int", "pack": "bool",
-                "red": "json", "spcompress": "bool"},
-    "TcgenSt": {"srcs": "ops", "taddr": "op", "shape": "json", "num": "int", "unpack": "bool"},
+    "TcgenLd": {"dsts": "regs", "taddr": "op", "row": "op", "col": "op", "shape": "json", "num": "int", "pack": "bool",
+                "red": "json", "red_abs": "bool", "red_nan": "bool", "spcompress": "bool"},
+    "TcgenSt": {"srcs": "ops", "taddr": "op", "row": "op", "col": "op", "shape": "json", "num": "int", "unpack": "bool"},
     "TcgenWait": {"st": "bool"},
-    "TcgenCp": {"taddr": "op", "sdesc": "op", "rows": "int", "bits": "int", "multicast": "int",
+    "TcgenCp": {"taddr": "op", "row": "op", "col": "op", "sdesc": "op", "rows": "int", "bits": "int", "multicast": "int",
                 "decompress_bits": "int", "cta_group": "int"},
     "TcgenMma": {"kind": "json", "cta_group": "int", "d": "op", "a": "json", "b_desc": "op",
                  "idesc": "op", "enable_input_d": "op", "ws": "bool", "ws_b_buffer": "int",
                  "block_scale": "json", "scale_input_d": "opt_op", "sparse_meta": "opt_op",
                  "disable_output_lane": "ops", "collector_a": "json", "collector_b": "json",
-                 "ashift": "bool", "ti16": "bool", "lut_b": "bool", "lut_b_addr": "opt_op"},
+                 "ashift": "bool", "lut_b": "bool", "lut_b_addr": "opt_op"},
 }
 
 # Variants that may return Blocked (mirror of Instr::may_block).
@@ -483,6 +483,7 @@ class BufferDecl:
     align: int = 16
     view_of: int | None = None
     sync_words: bool = False
+    base_reg: Reg | None = None      # runtime TMEM base (contract item 22); base must be 0
 
     def to_json(self) -> Any:
         return {
@@ -492,6 +493,7 @@ class BufferDecl:
             "param_slot": self.param_slot, "base": self.base,
             "byte_len": None if self.byte_len is None else self.byte_len.to_json(),
             "align": self.align, "view_of": self.view_of, "sync_words": self.sync_words,
+            "base_reg": None if self.base_reg is None else self.base_reg.index,
         }
 
 

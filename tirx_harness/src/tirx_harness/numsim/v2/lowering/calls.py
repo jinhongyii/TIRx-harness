@@ -45,7 +45,7 @@ _SREGS = {
     "clock": "Clock", "clock64": "Clock64", "globaltimer": "GlobalTimer", "lanemask_eq": "LaneMaskEq",
     "lanemask_lt": "LaneMaskLt", "lanemask_le": "LaneMaskLe", "lanemask_gt": "LaneMaskGt",
     "lanemask_ge": "LaneMaskGe", "cluster_ctarank": "ClusterCtaRank", "cluster_nctarank": "ClusterNCtaRank",
-    "dynamic_smem_size": "DynamicSmemSize", "total_smem_size": "TotalSmemSize",
+    "dynamic_smem_size": "DynamicSmemSize", "total_smem_size": "TotalSmemSize", "nwarpid": "NWarpId",
 }
 _SREG_AXIS = {"tid": "Tid", "ntid": "NTid", "ctaid": "CtaId", "nctaid": "NCtaId", "clusterid": "ClusterId",
               "nclusterid": "NClusterId", "cluster_ctaid": "ClusterCtaId", "cluster_nctaid": "ClusterNCtaId"}

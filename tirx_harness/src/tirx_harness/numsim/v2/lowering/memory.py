@@ -64,6 +64,7 @@ class Shape:
     strides: tuple[Any, ...]        # explicit stride PrimExprs, or ()
     layout: Any | None              # non-trivial TVM layout, else None
     tmem_cols: int | None = None    # TMEM view: physical column span (dense lane x column addressing)
+    tmem_origin: tuple[Any, Any] | None = None  # TMEM layout offset (lane, col) folded into the base
 
     @property
     def static_shape(self) -> tuple[int, ...] | None:
@@ -252,8 +253,8 @@ class MemoryMixin:
         accessed directly.
         """
         addrs = list(getattr(ty, "allocated_addr", ()) or ())
-        if len(addrs) != 1 or type_key(addrs[0]) != "ir.IntImm":
-            raise _Unsupported(node, "TMEM view with a runtime allocated_addr (no static taddr base)")
+        if len(addrs) != 1:
+            raise _Unsupported(node, f"TMEM view with {len(addrs)} allocated addresses")
         if type_key(ty.elem_offset) != "ir.IntImm" or int(ty.elem_offset.value) != 0:
             raise _Unsupported(node, "TMEM view with an element offset")
         layout = getattr(ty, "layout", None)
@@ -261,11 +262,35 @@ class MemoryMixin:
         if spans is None:
             raise _Unsupported(node, f"TMEM layout {str(layout)[:80]} is not a dense lane x column map")
         lane_span, col_span, replicated = spans
+        # The layout's (TLane, TCol) offset moves the view's origin: fold it into the
+        # base taddr (``lane << 16 | col``) and subtract it from each access.
+        offsets = {str(axis.name): expr for axis, expr in (layout.offset.items() if layout.offset else ())}
+        lane_off, col_off = offsets.get("TLane"), offsets.get("TCol")
+        start = addrs[0]
+        static = type_key(start) == "ir.IntImm" and all(
+            o is None or type_key(o) == "ir.IntImm" for o in (lane_off, col_off))
+        base, base_reg = 0, None
+        if static:
+            base = int(start.value) + (int(lane_off.value) << 16 if lane_off is not None else 0) + (
+                int(col_off.value) if col_off is not None else 0)
+        else:
+            # Contract item 22: runtime taddr in a register (read at each access); base 0.
+            value = self.cast_to(self.expr(start), pb.Ty("U32"))
+            if lane_off is not None:
+                lane_bits = self.binary("Shl", pb.Ty("U32"), self.cast_to(self.expr(lane_off), pb.Ty("U32")),
+                                        self.const("uint32", 16))
+                value = self.binary("Add", pb.Ty("U32"), value, lane_bits)
+            if col_off is not None:
+                value = self.binary("Add", pb.Ty("U32"), value, self.cast_to(self.expr(col_off), pb.Ty("U32")))
+            base_reg = self.builder.reg(pb.Ty("U32"), name=f"{var.name}.taddr", uniform=self.is_uniform(value))
+            self.builder.emit("Mov", dst=base_reg, src=value)
+        if lane_off is not None or col_off is not None:
+            info.tmem_origin = (lane_off, col_off)
         buf = self.builder.buffer(
             pb.BufferDecl(
                 name=str(var.name), space="Tmem", dtype=elem_ty,
                 shape=(pb.DimExpr.const(lane_span), pb.DimExpr.const(col_span)),
-                base=int(addrs[0].value), byte_len=pb.DimExpr.const(lane_span * col_span * 4), align=4,
+                base=base, byte_len=pb.DimExpr.const(lane_span * col_span * 4), align=4, base_reg=base_reg,
             )
         )
         info.layout = layout
@@ -340,6 +365,12 @@ class MemoryMixin:
             if dtypes.bits(info.dtype) * lanes != 32:
                 raise _Unsupported(None, f"direct TMEM access of {info.dtype}x{lanes} (32-bit cells only)")
             lane, col = self.apply_tmem_layout(info.layout, flat, idx_dtype)
+            if info.tmem_origin is not None:
+                lane_off, col_off = info.tmem_origin
+                if lane_off is not None:
+                    lane = self.binary("Sub", idx_dtype, lane, self.cast_to(self.expr(lane_off), idx_dtype))
+                if col_off is not None:
+                    col = self.binary("Sub", idx_dtype, col, self.cast_to(self.expr(col_off), idx_dtype))
             row = self.mul_extent(lane, _imm(info.tmem_cols), idx_dtype)
             return self.binary("Add", idx_dtype, row, col), lanes
         if info.layout is not None:
@@ -590,7 +621,7 @@ def _tmem_spans(layout: Any) -> tuple[int, int, bool] | None:
     """(lane span, column span, replicated) of a TMEM TileLayout, or None."""
     if layout is None or type_key(layout) != "tirx.TileLayout":
         return None
-    if len(getattr(layout, "offset", {}) or {}):
+    if any(str(axis.name) not in ("TLane", "TCol") for axis in (layout.offset or {}).keys()):
         return None
     spans = {"TLane": 0, "TCol": 0}
     for iterator in list(layout.shard) + list(layout.replica):
