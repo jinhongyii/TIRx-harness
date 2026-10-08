@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import struct
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -500,9 +501,12 @@ class Engine:
         outputs: Iterable[str] | Mapping[str, str] | None = None,
     ) -> NumSimResult:
         extra = self._subset_extra(subset, assumptions)
+        started = time.perf_counter()
         bound = canonicalize_inputs(module, inputs)
         selected = _select_outputs(bound, outputs, module)
+        bind_ms = (time.perf_counter() - started) * 1e3
         raw = self._native_run(module, bound, "numsim", **extra)
+        report_started = time.perf_counter()
         result_outputs = {}
         for canonical, external, selector in selected:
             b = bound[canonical]
@@ -534,9 +538,10 @@ class Engine:
             )
             for d in raw["diagnostics"]
         ]
+        timing = _timing(module, bind_ms, raw, report_started)
         _raise_unless_completed(raw["status"], diagnostics)
         return NumSimResult(outputs=result_outputs, diagnostics=diagnostics, stats=dict(raw["stats"]),
-                            status=dict(raw["status"]))
+                            status=dict(raw["status"]), timing=timing)
 
     # -- checkers ----------------------------------------------------------
     def _checker_run(self, module: CompiledModule, bound, mode: str, extra: Mapping[str, Any]) -> dict[str, Any]:
@@ -553,8 +558,11 @@ class Engine:
         kernels = module.spec.kernels
         if not 0 <= phase_index < len(kernels):
             raise ValueError(f"native {mode} phase {phase_index} is outside [0, {len(kernels)})")
+        started = time.perf_counter()
         bound = canonicalize_inputs(module, inputs)
+        bind_ms = (time.perf_counter() - started) * 1e3
         raw = self._checker_run(module, bound, mode, extra)
+        report_started = time.perf_counter()
         span_of_kernel = _kernel_span_resolver(module)
         launches = {int(p.get("launch", i)): p for i, p in enumerate(raw.get("payloads") or ())}
         reports = [json.loads(r) for r in raw.get("reports") or ()]
@@ -593,6 +601,9 @@ class Engine:
             span_of_kernel=span_of_kernel,
         )
         payload.setdefault("stats", {}).update(raw.get("stats") or {})
+        # One engine run serves every phase of a module; its build/run/check
+        # times are repeated on each phase payload.
+        payload["timing"] = _timing(module, bind_ms, raw, report_started)
         return AnalysisResult(mode, payload)
 
     def run_racecheck_phase(
@@ -643,6 +654,18 @@ class Engine:
         if max_transitions is not None:
             extra["max_rounds"] = int(max_transitions)
         return self._checker_phase("synccheck", module, inputs, phase_index, extra)
+
+
+def _timing(module: CompiledModule, bind_ms: float, raw: Mapping[str, Any], report_started: float) -> dict[str, float]:
+    engine = raw.get("timing") or {}
+    return {
+        "lower": float(module.lower_ms),
+        "bind": bind_ms,
+        "build": float(engine.get("build", 0.0)),
+        "run": float(engine.get("run", 0.0)),
+        "check": float(engine.get("check", 0.0)),
+        "report": (time.perf_counter() - report_started) * 1e3,
+    }
 
 
 def _kernel_span_resolver(module: CompiledModule):

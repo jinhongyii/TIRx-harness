@@ -116,6 +116,18 @@ treat that as a skip, never as a pass.
   `ExecutionAssumptions` are accepted and ignored (dropped in v2; no corpus
   case sets one).
 
+### Timing (for backend comparisons)
+
+`NumSimResult.timing` and each checker phase payload's `timing` hold
+wall-clock milliseconds: `lower` (transpile, or the module-cache load when
+`CompiledModule.cache_hit`), `bind` (Python input canonicalization), `build`
+(codegen print/build/load; 0 for `interp`), `run` (`sched::run_with_config`,
+including arena binding), `check` (checker finish or offline exploration plus
+serialization; 0 for NumSim) and `report` (Python result construction). One
+engine run serves all phases of a module, so phase payloads repeat its
+`build`/`run`/`check`. Select the backend with `Engine(backend="interp" |
+"codegen")` or `NUMSIM_V2_BACKEND`.
+
 ### v2 report decisions (`v2/report.py`)
 
 - Checker payloads come from the checkers' own `serialize` (one per launch);

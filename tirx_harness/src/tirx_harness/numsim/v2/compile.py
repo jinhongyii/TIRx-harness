@@ -15,7 +15,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,10 @@ class CompiledModule:
     data: bytes
     cache_key: str
     cache_path: Path | None = field(default=None, compare=False)
+    # Milliseconds spent producing this module (lowering + validation, or
+    # the cache load) and whether it came from the module cache.
+    lower_ms: float = field(default=0.0, compare=False)
+    cache_hit: bool = field(default=False, compare=False)
 
     @cached_property
     def document(self) -> dict[str, Any]:
@@ -245,9 +250,11 @@ def transpile(
     key = source_key(funcs)
     cache = Path(cache_dir) / "v2-modules" if cache_dir is not None else opts.module_cache_dir
     path = cache / f"{key}.module.json"
+    started = time.perf_counter()
     if opts.use_cache and path.exists():
         try:
-            return from_document(path.read_bytes(), cache_key=key)
+            cached = from_document(path.read_bytes(), cache_key=key)
+            return replace(cached, cache_path=path, lower_ms=(time.perf_counter() - started) * 1e3, cache_hit=True)
         except ModuleContractError:
             # The contract changed without a format-version bump: the cached
             # module no longer decodes. Re-lower instead of failing.
@@ -266,7 +273,8 @@ def transpile(
         tmp = path.with_suffix(f".tmp{os.getpid()}")
         tmp.write_bytes(module.data)
         tmp.replace(path)
-    return CompiledModule(data=module.data, cache_key=key, cache_path=path if opts.use_cache else None)
+    return CompiledModule(data=module.data, cache_key=key, cache_path=path if opts.use_cache else None,
+                          lower_ms=(time.perf_counter() - started) * 1e3)
 
 
 __all__ = [

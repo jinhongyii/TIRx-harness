@@ -362,6 +362,11 @@ class NumSimResult:
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
     status: dict[str, Any] = field(default_factory=dict)
+    # Milliseconds: lower (transpile or cache load), bind (Python input
+    # canonicalization), build (codegen backend; 0 for interp), run (engine,
+    # including arena binding), check (checker; 0 for NumSim), report
+    # (Python result construction).
+    timing: dict[str, float] = field(default_factory=dict)
 
     @property
     def verdict(self) -> str:

@@ -1635,3 +1635,19 @@ element is a nibble). The 16-byte-aligned padded FP4 layout has no
 shared-to-global copy in PTX; legacy rejected it and so does `tma_plan_dir`
 (`Invalid`, "align16 padded FP4 TensorMap does not support shared-to-global
 Tensor Copy"). Scatter4 of sub-byte types stays `Unsupported` (no legacy).
+
+### Public-API triage (W8, 2026-10-08)
+
+The 762-item public-API legacy set under `NUMSIM_IMPL=v2` (367 pass) is
+triaged in `docs/development/v2-conformance-status.md` ("Triage of the
+'other assertion' public-API failures"). New bug groups with owners there:
+`%smid`/fetch registers report the CTA index (interp); f32 atomics and a
+1-ulp rounding leak (oplib); tile reduction order / NaN / signed-zero
+(oplib or tile lowering); U6 TMA layout and `.ignore_oob` fill (oplib);
+multicast out-of-cluster targets `incomplete` instead of `error` (interp);
+a racecheck **false negative** in `test_tcgen05_restricted_commit` (racecheck);
+19 Synccheck `incomplete` verdicts on legacy-clean payload kernels
+(synccheck); an explicit tensor map named `tensor_map.tmap` (lowering).
+Ruling needed (coordinator, `arena::addr`): legacy kept the host pointer's
+low 8 bits in global VAs and exposed device-validated aperture bits through
+`mapa`/`cvta`; two tests assert them.

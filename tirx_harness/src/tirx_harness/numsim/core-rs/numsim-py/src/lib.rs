@@ -136,6 +136,10 @@ pub struct ExecuteResult {
     /// Checker modes: the checker's own legacy-shaped payload per launch
     /// (`racecheck::serialize` / `synccheck::serialize`).
     pub payloads: Vec<Value>,
+    /// Wall-clock milliseconds: `build` (backend: codegen print/build/load,
+    /// 0 for interp), `run` (`sched::run_with_config`, including arena
+    /// binding), `check` (checker finish / offline exploration + serialize).
+    pub timing: Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -373,7 +377,12 @@ fn outcome_result(outcome: RunOutcome, reports: Vec<String>, payloads: Vec<Value
         diagnostics,
         reports,
         payloads,
+        timing: Value::Null,
     }
+}
+
+fn ms(start: std::time::Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1e3
 }
 
 /// Splits the recorded protocol log per launch (synccheck checks one launch
@@ -421,25 +430,34 @@ impl Observer for PerLaunchRecorder {
 /// Run `module` in one mode. Never panics: engine panics become errors.
 pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result<ExecuteResult, ExecuteError> {
     guarded(|| {
+        let started = std::time::Instant::now();
         let backend = backend_for(module, request)?;
+        let build_ms = ms(started);
         let config = &request.config;
-        match request.mode {
+        let run_started = std::time::Instant::now();
+        let run_ms;
+        let result: Result<(ExecuteResult, std::time::Instant), ExecuteError> = match request.mode {
             Mode::Numsim => {
                 let mut observer = NoopObserver;
                 let outcome = sched::run_with_config(module, inputs, &mut observer, &backend, config).map_err(run_error)?;
-                Ok(outcome_result(outcome, Vec::new(), Vec::new()))
+                run_ms = ms(run_started);
+                Ok((outcome_result(outcome, Vec::new(), Vec::new()), std::time::Instant::now()))
             }
             Mode::Racecheck => {
                 let mut observer = RaceObserver::new(RacecheckConfig { max_findings: request.max_findings });
                 let outcome = sched::run_with_config(module, inputs, &mut observer, &backend, config).map_err(run_error)?;
+                run_ms = ms(run_started);
+                let check_started = std::time::Instant::now();
                 observer.finish_launch(); // no-op when end_launch already finalized it
                 let reports: Vec<Report> = racecheck::payload::reports(&observer);
                 let payloads = reports.iter().map(racecheck::serialize).collect();
-                Ok(outcome_result(outcome, reports.iter().map(Report::to_json).collect(), payloads))
+                Ok((outcome_result(outcome, reports.iter().map(Report::to_json).collect(), payloads), check_started))
             }
             Mode::Synccheck => {
                 let mut recorder = PerLaunchRecorder::default();
                 let outcome = sched::run_with_config(module, inputs, &mut recorder, &backend, config).map_err(run_error)?;
+                run_ms = ms(run_started);
+                let check_started = std::time::Instant::now();
                 let mut reports = Vec::new();
                 // One check per launch; the kernel index flows from
                 // `SyncEvent.kernel` into `Report.launch` / `Evidence.kernel`.
@@ -465,9 +483,12 @@ pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result
                     reports.push(synccheck::check(log, &sc));
                 }
                 let payloads = reports.iter().map(synccheck::serialize).collect();
-                Ok(outcome_result(outcome, reports.iter().map(Report::to_json).collect(), payloads))
+                Ok((outcome_result(outcome, reports.iter().map(Report::to_json).collect(), payloads), check_started))
             }
-        }
+        };
+        let (mut result, check_started) = result?;
+        result.timing = json!({"build": build_ms, "run": run_ms, "check": ms(check_started)});
+        Ok(result)
     })
 }
 
@@ -731,6 +752,7 @@ mod py {
         out.set_item("diagnostics", json_to_py(py, &Value::Array(result.diagnostics.clone()))?)?;
         out.set_item("reports", result.reports.clone())?;
         out.set_item("payloads", json_to_py(py, &Value::Array(result.payloads.clone()))?)?;
+        out.set_item("timing", json_to_py(py, &result.timing)?)?;
         Ok(out)
     }
 

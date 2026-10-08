@@ -4,7 +4,7 @@ orphan: true
 
 # v2 conformance status
 
-Generated 2026-10-08 at 62c4226 by the W8 sweep: every canonical case
+Generated 2026-10-08 at 62c4226 (corpus sweep) / 9484204 (public-API run) by the W8 sweep: every canonical case
 (`tests/numsim/corpus/canonical_cases.py`) x {numsim, racecheck, synccheck} run under
 `NUMSIM_IMPL=v2` and compared with the legacy snapshots in `tirx_harness/tests/conformance/`
 (v2 may add source anchors to diagnostics legacy recorded without one; see
@@ -54,21 +54,102 @@ unchanged with `NUMSIM_IMPL=v2`: `tests/conftest.py` rebinds the public names of
 collection.
 
 - legacy: 762 passed, 0 failed (2026-10-08)
-- v2: **365 passed, 397 failed** of 762
+- v2: **367 passed, 395 failed** of 762
 
 | failure class | owner | count | example |
 | --- | --- | --- | --- |
-| synccheck verdict differs from legacy | synccheck / sync | 108 | `tests/numsim/runtime/test_tcgen05_tf32.py::test_tf32_sparse_metadata[case3]` |
-| other assertion (numeric or report shape) | triage | 48 | `tests/numsim/runtime/test_scalar_control.py::test_fetch_register_models_logical_coordinates_and_uses_stable_time_tokens` |
+| synccheck verdict differs from legacy | synccheck / sync | 107 | `tests/numsim/runtime/test_async_release.py::test_async_release_payloads[True-s64]` |
+| other assertion (numeric or report shape) | triage | 64 | `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_raw_bulk_prefetch_preserves_global_memory` |
+| pins legacy internals (generated Rust text, scheduler poll stats); needs porting (test-migration A-internal) | test port | 60 | `tests/numsim/runtime/test_loop_bounds.py::test_lane_varying_min_extent_and_step_use_masked_native_loop` |
 | expects legacy error text or a legacy raise site | test port / delta review | 44 | `tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helper_semantic_mutations_fail_closed[modified_flashkda_fmaf_rn]` |
 | racecheck verdict differs from legacy | racecheck | 42 | `tests/numsim/runtime/test_tma_im2col.py::test_im2col_store_and_reduce[False-False-False]` |
-| two kernels declare different parameters with one canonical name (V2C-7) | lowering + contract | 41 | `tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime[scalar_cvt_narrowing]` |
-| pins legacy internals (generated Rust text, scheduler poll stats); needs porting (test-migration A-internal) | test port | 34 | `tests/numsim/runtime/test_loop_bounds.py::test_lane_varying_min_extent_and_step_use_masked_native_loop` |
 | engine stops fail-closed (unsupported / budget) | interp / oplib | 31 | `tests/numsim/integration/test_gemm_async_artifact.py::test_m64_tcgen_mma_infers_weight_stationary_from_packed_layout_e` |
-| lowering rejects the kernel | lowering | 28 | `tests/numsim/integration/test_tcgen_transfer_artifact.py::test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem` |
-| engine runtime error legacy did not raise | interp / sync | 21 | `tests/numsim/runtime/test_scalar_control.py::test_unaligned_named_barrier_recombines_disjoint_lane_paths` |
+| lowering rejects the kernel | lowering | 28 | `tests/numsim/integration/test_warp_gemm_artifact.py::test_warp_gemm_supports_registered_m16n8_family[bfloat16-8-2-2-3-True-False-1]` |
+| engine runtime error legacy did not raise | interp / sync | 19 | `tests/numsim/runtime/test_scalar_control.py::test_unaligned_named_barrier_recombines_disjoint_lane_paths` |
 
 Files passing completely under v2: 34 of 120.
+
+### Triage of the "other assertion" public-API failures (2026-10-08, at 9484204)
+
+Re-run with the current engine: 65 items fall outside the named classes
+(the "other" bucket grew because several checker-verdict assertions are
+written as `assert verdict == ...` rather than through the report text).
+Classes: **delta** = explained by a behaviour-delta row or ruling (test needs
+updating), **bug** = v2 is wrong (owner), **internals** = pins legacy
+internals or legacy scheduling policy (delete or port to `Program` asserts).
+
+| class | owner | items | node ids (file::test, params collapsed) |
+| --- | --- | --- | --- |
+| internals | test port (W9) | 4 | `test_non_tensor_bulk_forms::{test_raw_bulk_prefetch_preserves_global_memory, test_bulk_g2s_cluster_accepts_static_true_predicate_as_unconditional, test_bulk_g2s_cluster_dynamic_predicate_transpiles}` (legacy `call_op_names(spec)`); `test_ordering_calls::test_ordering_only_calls_preserve_native_source_order` (`KernelSpec.semantic_requirements`) |
+| internals | test port (W9) | 3 | `test_scheduler_polling_artifact::{test_time_slice_does_not_replay_body_side_effects_and_schedules_peer, test_time_slice_uses_configured_reschedule_quantum, test_finite_for_time_slice_schedules_peer_without_pattern_matching}`: assert legacy time-slice/quantum interleavings (schedule policy, not semantics) |
+| delta | test port (W9) | 1 | `test_discard::test_discard_indeterminate_read_and_alignment`: reading discarded bytes is `review` under the W8-5 ruling (`ZeroAndReport`), legacy `error` |
+| delta | test port (W9) | 1 | `test_mbarrier_maintenance::test_maintenance_active_addresses_still_checked`: kind `oob` -> `out_of_bounds` (racecheck delta P5 / test-migration rename list) plus an `uninitialized_read` review |
+| delta | sync (confirm) | 2 | `test_memory_coverage_next::test_no_complete_rejects_exhausted_arrivals[2,3]`: sync delta M6 (typed `NoCompleteWouldComplete`); the test looks for the legacy kind |
+| bug | interp | 3 | `test_launch_resource_facts::test_smid_defaults_to_zero_in_execution_and_both_checkers`, `test_fetch_register_domain_oracle::test_every_fetch_register_form_matches_the_logical_topology`, `test_scalar_control::test_fetch_register_models_logical_coordinates_and_uses_stable_time_tokens`: `%smid` (and related fetch registers) report the CTA index instead of legacy's 0 |
+| bug / contract | arena::addr (coordinator) | 2 | `test_launch_resource_facts::test_pointer_bits_preserve_binding_address_and_subview_offset` (legacy VAs keep the host pointer's low 8 bits), `test_scalar_control::test_mapa_and_cvta_expose_the_device_validated_integer_bits` (device-validated aperture bits): need a ruling on synthetic address bits |
+| bug | oplib | 9 | `test_atomic_f32_noftz::test_atomic_f32_noftz[{atom,red,sink}-{1-shared::cta,2-global,4-}]`: f32 atomics flush/round subnormals |
+| bug | oplib | 1 | `test_approximate_f32_contract::test_worker_normalizes_rounding_without_polluting_the_caller`: 1-ulp rounding-mode leak |
+| bug | oplib / lowering (tile) | 4 | `test_tile_reduction_variants::{test_warp_collective_reduction_follows_physical_lane_ownership, test_local_float64_reductions_match_b200_edge_bits, test_maxmin_uses_canonical_lexicographic_nan_and_signed_zero_order, test_local_collective_uses_lexicographic_order}`: reduction order / NaN and signed-zero ordering |
+| bug | oplib | 2 | `test_tma_u6::test_tma_u6_layout_and_checkers` (U6 TMA layout), `test_non_tensor_bulk_forms::test_ignore_oob_dead_bytes_are_zero_filled_and_require_review_if_read` (ignore_oob fill) |
+| bug | interp | 4 | `test_mov_forms::test_mov_aliased_sources_destinations_and_predicate`, `test_memory_sync_coverage::{test_memory_sync_extensions[address_queries-...], test_half_vector_predicate_alias_is_captured_before_either_result_store}`, `test_non_tensor_bulk_forms::test_st_bulk_size_is_evaluated_per_issuing_lane` |
+| bug | interp / lowering | 1 | `test_global_alias_artifact::test_global_decl_buffer_alias_reuses_parameter_allocation_bytes`: a global `decl_buffer` view of a parameter reads zeros |
+| bug | interp | 4 | `test_copy_multicast32::test_multicast_high_bit_targets_and_bounds[bulk,tensor,commit,im2col]`: out-of-cluster multicast targets are `incomplete`, legacy `error` |
+| bug | sync / interp | 1 | `test_sync_runtime_domain_oracle::test_clc_no_work_completion_and_cluster_acquire_wait`: CLC no-work response value |
+| bug | sync | 1 | `test_launch_resource_facts::test_exclusive_tmem_uses_cta_local_lifecycle_without_placement`: exclusive 96/576-column lifecycle deadlocks (cf. sync delta T2/T4; 576 needs `Program.arch`) |
+| bug | racecheck | 2 | `test_tcgen05_restricted_commit::test_restricted_commit_preserves_full_mma_completion[1-False-False, 1-True-True]`: a race on B after waiting only for A is **not reported** (false negative) |
+| bug | synccheck | 19 | `tests/analysis_tools/synccheck/runtime/test_device_additional_payload_ops.py::test_payload_runtime[*]` (16 params), `test_shared_descriptor_choices::test_shared_descriptor_choices_validate_the_consumed_bits[False-select, False-compose]`, `test_reported_tool_regressions::test_reported_instruction_support[red_vec_packed_bf16]`: Synccheck `incomplete` where legacy was clean/error (V2C-4/V2C-28 class) |
+| bug | lowering | 1 | `test_host_prelude::test_explicit_tensor_map_override_updates_its_distinct_backing`: the explicit tensor map is named `tensor_map.tmap`, so the caller's `tensor_map` binding is unknown |
+
+### Public-API failures that expect legacy error text or raise sites (to W9)
+
+These 44 fail only because they match legacy messages or expect a raise
+where v2 reports a diagnostic; each needs its expectation ported (or a delta
+row) by the test-migration owner:
+
+- `tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helper_semantic_mutations_fail_closed[modified_flashkda_fmaf_rn]`
+- `tests/numsim/integration/test_scheduler_polling_artifact.py::test_finite_for_uses_native_loop_iteration_budget`
+- `tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helper_semantic_mutations_fail_closed[modified_flashkda_rsqrtf]`
+- `tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helper_semantic_mutations_fail_closed[modified_flashkda_tanh_approx]`
+- `tests/numsim/integration/test_scheduler_polling_artifact.py::test_finite_loop_can_exceed_default_budget_when_configured`
+- `tests/numsim/runtime/test_ptx_integer_arithmetic.py::test_ptx_signed_division_overflow_fails_closed[div]`
+- `tests/numsim/runtime/test_scalar_control.py::test_floating_trap_rejects_signed_zero[predicate0]`
+- `tests/numsim/runtime/test_wait_until.py::test_a_candidate_index_outside_its_local_table_is_an_execution_error`
+- `tests/numsim/runtime/test_pointer_slot_arrays.py::test_pointer_array_initialization_and_bounds[oob]`
+- `tests/numsim/runtime/test_ptx_integer_arithmetic.py::test_ptx_signed_division_overflow_fails_closed[rem]`
+- `tests/numsim/runtime/test_float8_address_shuffle.py::test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip[float8_e4m3fn]`
+- `tests/numsim/runtime/test_float8_address_shuffle.py::test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip[float8_e8m0fnu]`
+- `tests/numsim/runtime/test_scalar_control.py::test_floating_trap_rejects_signed_zero[predicate1]`
+- `tests/numsim/runtime/test_scalar_control.py::test_integer_trap_predicate_uses_cpp_truth_conversion`
+- `tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_modified_gdn_lg2_helper_remains_fail_closed`
+- `tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_modified_known_helper_remains_fail_closed`
+- `tests/numsim/runtime/test_ordering_calls.py::test_default_full_mask_warp_sync_rejects_divergent_execution`
+- `tests/analysis_tools/shared/test_known_cuda_func_artifact.py::test_modified_packed_fma_helper_remains_fail_closed`
+- `tests/numsim/runtime/test_ptx_integer_arithmetic.py::test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane[div]`
+- `tests/numsim/runtime/test_ptx_integer_arithmetic.py::test_ptx_integer_division_by_zero_fails_closed_at_the_faulting_lane[rem]`
+- `tests/numsim/runtime/test_scalar_control.py::test_mbarrier_state_token_rejects_a_generation_older_than_the_previous_one`
+- `tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_rejects_warp_disagreement_within_one_occurrence`
+- `tests/numsim/runtime/test_ordering_calls.py::test_setmaxnreg_requires_explicit_warpgroup_sync_before_a_later_call`
+- `tests/numsim/runtime/test_packed_float4_global_views.py::test_direct_one_byte_per_value_float4_array_is_rejected`
+- `tests/numsim/runtime/test_dynamic_pure_call_runtime_domains.py::test_if_then_else_mixed_pointer_spaces_fail_closed`
+- `tests/numsim/runtime/test_memory_coverage_next.py::test_ldu_rejects_nonuniform_or_misaligned_vector[source.ptr_to([lane])]`
+- `tests/numsim/runtime/test_memory_coverage_next.py::test_ldu_rejects_nonuniform_or_misaligned_vector[source.ptr_to([1])]`
+- `tests/numsim/runtime/test_flashkda_cuda_helpers.py::test_flashkda_math_helper_dtype_mismatch_fails_closed`
+- `tests/numsim/runtime/test_mbarrier_lane_semantics.py::test_blocking_wait_fails_closed_for_mixed_lane_readiness`
+- `tests/numsim/integration/test_host_prelude.py::test_host_tensor_map_integer_expressions_fail_closed_on_unregistered_nodes`
+- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_runtime_address_without_a_dynamic_lease_is_rejected`
+- `tests/numsim/integration/test_warp_ops_artifact.py::test_warp_collectives_reject_invalid_participant_contracts`
+- `tests/numsim/runtime/test_memory_coverage_next.py::test_tensor_map_update_requires_release`
+- `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_rejects_counts_outside_ptx_range[ignored0]`
+- `tests/numsim/runtime/test_non_tensor_bulk_forms.py::test_ignore_oob_rejects_counts_outside_ptx_range[ignored1]`
+- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges[dynamic_tmem_use_before_alloc-not covered by any live allocation]`
+- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges[dynamic_tmem_outside_live_lease-not covered by any live allocation]`
+- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges[dynamic_tmem_use_after_dealloc-not covered by any live allocation]`
+- `tests/numsim/runtime/test_tile_unary_codegen.py::test_unary_tile_ops_fail_closed_on_unknown_config`
+- `tests/numsim/integration/test_tmem_artifact.py::test_tmem_live_allocation_at_kernel_exit_is_rejected`
+- `tests/numsim/runtime/test_scalar_control.py::test_cuda_pointer_helpers_check_typed_dereference_alignment`
+- `tests/numsim/runtime/test_scalar_control.py::test_cuda_shuffle_rejects_invalid_width`
+- `tests/numsim/runtime/test_tile_general_semantics.py::test_float64_directed_rounding_fails_closed`
+- `tests/numsim/integration/test_warp_gemm_artifact.py::test_warp_gemm_rejects_layout_that_disagrees_with_instruction_abi`
 
 ## Per case
 
