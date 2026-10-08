@@ -61,7 +61,7 @@ fn intern(identity: String, op: Op) -> OpResult<PtxFn> {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| OpError::invalid("PTX intern table poisoned"))?;
-    let op: &'static super::PtxOp = *index.entry(identity).or_insert_with(|| Box::leak(op));
+    let op = *index.entry(identity).or_insert_with(|| Box::leak(op));
     Ok(PtxFn::from_static(op))
 }
 

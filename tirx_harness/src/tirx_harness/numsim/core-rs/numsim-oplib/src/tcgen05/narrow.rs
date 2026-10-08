@@ -41,6 +41,7 @@ impl NarrowFormat {
         }
     }
 
+    /// The narrow-float codec (`E4M3`/`E5M2`/`E2M3`/`E3M2`/`E2M1` bit layout) of this operand format.
     pub const fn format(self) -> NarrowFloatFormat {
         match self {
             Self::E4M3 => FLOAT8_E4M3,
@@ -60,14 +61,19 @@ impl NarrowFormat {
         }
     }
 
+    /// Packed bytes 16 K elements occupy (2 x element width in bits: 16/12/8).
     pub const fn payload_bytes_per_k16(self) -> usize {
         self.format().width_bits as usize * 2
     }
 
+    /// Exact decode of one narrow code (low `width` bits, sign included) to f32; subnormals
+    /// and E5M2 infinities exact. Any NaN code gives `f32::NAN` (`0x7fc0_0000`, sign dropped).
     pub fn decode_value(self, bits: u8) -> f32 {
         narrow_float_bits_to_f32_checked(bits, self.format()).unwrap_or(f32::NAN)
     }
 
+    /// Decode one 16-byte shared atom to 16 values: E2M1 two nibbles per byte (low first),
+    /// FP6/FP8 little-endian packed fields; per value as [`decode_value`](Self::decode_value).
     pub fn decode_shared_atom(self, bytes: [u8; 16]) -> [f32; 16] {
         if matches!(self, Self::E2M1) {
             return std::array::from_fn(|i| {
@@ -80,6 +86,8 @@ impl NarrowFormat {
         std::array::from_fn(|i| self.decode_value(((packed >> (i as u32 * width)) & mask) as u8))
     }
 
+    /// Decode one K=32 TMEM A word to four values (byte 0 first): FP4 in bits 2..5, FP6 in
+    /// bits 0..5, FP8 the whole byte. Errors on nonzero padding bits; values as `decode_value`.
     pub fn decode_tmem_word(self, word: u32) -> OpResult<[f32; 4]> {
         // PTX K=32 TMEM containers: FP4 uses bits 2..5, FP6 uses
         // bits 0..5, and FP8 consumes the full byte. Numeric formats
@@ -98,6 +106,8 @@ impl NarrowFormat {
         Ok(values)
     }
 
+    /// 32-bit TMEM columns one block-scaled A row uses: K=32 8, K=64 packed FP6 12.
+    /// No numerics; errors for other K/width combinations.
     pub fn block_tmem_columns(self, k: usize) -> OpResult<usize> {
         match (k, self.format().width_bits) {
             (32, _) => Ok(8),
@@ -106,6 +116,8 @@ impl NarrowFormat {
         }
     }
 
+    /// Decode one block-scaled TMEM A row of `k` values (K=32 per-byte containers, K=64
+    /// packed FP6 three words per 16 values). Errors on wrong length or padding bits.
     pub fn decode_block_tmem_row(self, words: &[u32], k: usize) -> OpResult<Vec<f32>> {
         if words.len() != self.block_tmem_columns(k)? {
             return Err(OpError::message("invalid narrow TMEM row length"));
@@ -118,10 +130,10 @@ impl NarrowFormat {
         } else {
             // 16 FP6 values occupy exactly three words; the 6-bit fields
             // crossing a word boundary use the same 96-bit decoder as shared A.
-            for group in words.chunks_exact(3) {
+            for group in words.as_chunks::<3>().0 {
                 let mut bytes = [0_u8; 16];
-                for (dst, word) in bytes.chunks_exact_mut(4).zip(group) {
-                    dst.copy_from_slice(&word.to_le_bytes());
+                for (dst, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(group) {
+                    *dst = word.to_le_bytes();
                 }
                 values.extend(self.decode_shared_atom(bytes));
             }
@@ -143,6 +155,7 @@ pub enum CellDtype {
 }
 
 impl CellDtype {
+    /// `F16` when the descriptor selects an F16 accumulator, else `F32`.
     pub fn from_half(half: bool) -> Self {
         if half {
             Self::F16
@@ -151,6 +164,8 @@ impl CellDtype {
         }
     }
 
+    /// Read a TMEM cell as f32: F32 bit-exact, F16 exact widening of the low half (NaN
+    /// payload kept); the high half is ignored.
     pub fn decode(self, bytes: [u8; 4]) -> f32 {
         match self {
             Self::F32 => f32::from_le_bytes(bytes),
@@ -158,6 +173,8 @@ impl CellDtype {
         }
     }
 
+    /// Write an accumulator value to a TMEM cell: F32 bit-exact; F16 RN-even to binary16
+    /// (overflow to inf, NaN quieted keeping its high payload) with the high half zeroed.
     pub fn encode(self, value: f32) -> [u8; 4] {
         match self {
             Self::F32 => value.to_le_bytes(),

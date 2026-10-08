@@ -16,9 +16,8 @@
 use std::sync::Arc;
 
 use super::descriptor::{
-    analysis_incomplete, Fp4SharedLayout, TensorMapElementType, TensorMapFillMode,
-    TensorMapImage, TensorMapIm2col, MAX_BOX_DIMENSION, MAX_ELEMENT_STRIDE, MAX_GLOBAL_DIMENSION,
-    MAX_GLOBAL_STRIDE,
+    analysis_incomplete, Fp4SharedLayout, TensorMapElementType, TensorMapFillMode, TensorMapIm2col,
+    TensorMapImage, MAX_BOX_DIMENSION, MAX_ELEMENT_STRIDE, MAX_GLOBAL_DIMENSION, MAX_GLOBAL_STRIDE,
 };
 use super::swizzle::{shared_byte_offset, SwizzleAtomicity};
 use super::tiled::TransferTemplate;
@@ -108,6 +107,8 @@ pub struct TensorMapGeometry {
     pub outer_count: usize,
 }
 
+/// Transfer geometry (packing, unit bytes/stride, inner units, outer rows) of a box with
+/// `traversal_shape` and element width; FP4 needs its shared layout. No numerics.
 pub fn tensor_map_geometry_from_metadata(
     traversal_shape: &[usize],
     element_bits: usize,
@@ -118,7 +119,9 @@ pub fn tensor_map_geometry_from_metadata(
         (4, Some(Fp4SharedLayout::Align16Padded)) => (16_usize, 8_usize, 16_usize),
         (6, None) => (16_usize, 12_usize, 16_usize),
         (4, None) => {
-            return Err(OpError::message("FP4 TensorMap is missing its shared layout"));
+            return Err(OpError::message(
+                "FP4 TensorMap is missing its shared layout",
+            ));
         }
         (8 | 16 | 32 | 64 | 128 | 256, None) | (128 | 256, Some(Fp4SharedLayout::Align8Packed)) => {
             // Interleave transfers whole byte slices even for packed FP4;
@@ -158,7 +161,8 @@ pub fn tensor_map_geometry_from_metadata(
 
 /// TMA transaction-byte count for one transfer unit.
 pub fn tensor_map_transaction_bytes(unit_bytes: usize) -> OpResult<u64> {
-    u64::try_from(unit_bytes).map_err(|_| OpError::message("TensorMap transaction byte count overflow"))
+    u64::try_from(unit_bytes)
+        .map_err(|_| OpError::message("TensorMap transaction byte count overflow"))
 }
 
 impl TensorMapLayout {
@@ -232,8 +236,14 @@ impl TensorMapLayout {
                 "TensorMap global dimensions must be at most 2^32",
             ));
         }
-        if im2col.is_none() && box_shape.iter().any(|dimension| *dimension > MAX_BOX_DIMENSION) {
-            return Err(OpError::message("TensorMap box dimensions must be in 1..=256"));
+        if im2col.is_none()
+            && box_shape
+                .iter()
+                .any(|dimension| *dimension > MAX_BOX_DIMENSION)
+        {
+            return Err(OpError::message(
+                "TensorMap box dimensions must be in 1..=256",
+            ));
         }
         if let Some(config) = &im2col {
             super::im2col::validate_im2col_bounds(
@@ -244,7 +254,7 @@ impl TensorMapLayout {
                 swizzle_bytes,
             )?;
         }
-        let address_aligned = |alignment: u64| base_address % alignment == 0;
+        let address_aligned = |alignment: u64| base_address.is_multiple_of(alignment);
         if let Some(bytes) = interleave_bytes {
             if swizzle_bytes == Some(96) {
                 return Err(OpError::message("96B swizzle does not support interleave"));
@@ -293,7 +303,9 @@ impl TensorMapLayout {
         match (element_bits, fp4_shared_layout) {
             (4, Some(_)) | (6 | 8 | 16 | 32 | 64, None) => {}
             (4, None) => {
-                return Err(OpError::message("FP4 TensorMap is missing its shared layout"));
+                return Err(OpError::message(
+                    "FP4 TensorMap is missing its shared layout",
+                ));
             }
             (_, Some(layout)) => {
                 return Err(OpError::message(format!(
@@ -504,6 +516,7 @@ impl TensorMapLayout {
         })
     }
 
+    /// Number of tensor dimensions.
     pub const fn rank(&self) -> usize {
         self.global_shape.len()
     }
@@ -542,8 +555,12 @@ impl TensorMapLayout {
         Ok(())
     }
 
+    /// SM100 U6 maps require the inner box origin to be a multiple of 128 elements.
     pub fn validate_u6_origin(&self, origin: &[i64]) -> OpResult<()> {
-        if self.element_bits == 6 && origin.first().is_some_and(|value| value.rem_euclid(128) != 0)
+        if self.element_bits == 6
+            && origin
+                .first()
+                .is_some_and(|value| value.rem_euclid(128) != 0)
         {
             return Err(OpError::message(
                 "SM100 U6 TensorMap inner origin must be a multiple of 128",
@@ -560,13 +577,21 @@ impl TensorMapLayout {
         match self.fp4_shared_layout {
             Some(Fp4SharedLayout::Align8Packed) => Ok(Some(2)),
             Some(Fp4SharedLayout::Align16Padded) => Ok(Some(128)),
-            None => Err(OpError::message("FP4 TensorMap is missing its shared layout")),
+            None => Err(OpError::message(
+                "FP4 TensorMap is missing its shared layout",
+            )),
         }
     }
 
+    /// Transfer geometry of this map; errors when the rank metadata is inconsistent.
     pub fn geometry(&self) -> OpResult<TensorMapGeometry> {
         if self.global_shape.is_empty()
-            || self.box_shape.len() != if self.im2col.is_some() { 2 } else { self.rank() }
+            || self.box_shape.len()
+                != if self.im2col.is_some() {
+                    2
+                } else {
+                    self.rank()
+                }
             || self.global_shape.len() != self.element_strides.len()
             || self.global_strides.len() + 1 != self.global_shape.len()
         {
@@ -589,6 +614,8 @@ impl TensorMapLayout {
         coordinates
     }
 
+    /// Global coordinates of box element (`inner_element`, `outer`) from `origin`, scaled by
+    /// the element strides. Errors on a rank mismatch or overflow.
     pub fn global_coordinates(
         &self,
         origin: &[i64],
@@ -607,6 +634,7 @@ impl TensorMapLayout {
         Ok(result)
     }
 
+    /// [`Self::global_coordinates`] into a caller-provided buffer of rank length.
     pub fn global_coordinates_into(
         &self,
         origin: &[i64],
@@ -629,7 +657,11 @@ impl TensorMapLayout {
             )));
         }
         for axis in 0..origin.len() {
-            let local = if axis == 0 { inner_element } else { outer[axis] };
+            let local = if axis == 0 {
+                inner_element
+            } else {
+                outer[axis]
+            };
             let delta = local
                 .checked_mul(self.element_strides[axis])
                 .and_then(|value| i64::try_from(value).ok())
@@ -654,7 +686,9 @@ impl TensorMapLayout {
     /// `(byte offset, bit shift)` of an in-bounds element relative to the view.
     pub fn global_byte_offset(&self, coordinates: &[i64]) -> OpResult<(usize, usize)> {
         if !self.coordinates_in_bounds(coordinates) {
-            return Err(OpError::message("TensorMap coordinate is outside global shape"));
+            return Err(OpError::message(
+                "TensorMap coordinate is outside global shape",
+            ));
         }
         let inner = usize::try_from(coordinates[0])
             .map_err(|_| OpError::message("negative TensorMap inner coordinate"))?;

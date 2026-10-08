@@ -81,7 +81,9 @@ pub fn shuffle_sources(
         };
         let source_lane = if valid { candidate } else { lane };
         if participant_mask & (1_u32 << source_lane) == 0 || !active_mask.contains(source_lane) {
-            return Err(OpError::message("warp shuffle reads a non-participant lane"));
+            return Err(OpError::message(
+                "warp shuffle reads a non-participant lane",
+            ));
         }
         source_lanes[lane] = source_lane;
         in_range[lane] = valid;
@@ -181,7 +183,8 @@ mod tests {
             &[31; 32],
         )
         .unwrap();
-        let (xored, _) = shfl_bfly(WarpMask::ALL, &participants, &values, &[1; 32], &[31; 32]).unwrap();
+        let (xored, _) =
+            shfl_bfly(WarpMask::ALL, &participants, &values, &[1; 32], &[31; 32]).unwrap();
         for lane in 0..WARP_SIZE {
             assert_eq!(shuffled[lane], (31 - lane) as u32);
             assert_eq!(xored[lane], (lane ^ 1) as u32);
@@ -207,8 +210,11 @@ mod tests {
     #[test]
     fn shuffle_rejects_nonparticipant_sources() {
         let active = lanes_below(16);
-        let error = shfl_idx(active, &[active.bits(); 32], &iota(), &[31; 32], &[31; 32]).unwrap_err();
-        assert!(error.to_string().contains("warp shuffle reads a non-participant lane"));
+        let error =
+            shfl_idx(active, &[active.bits(); 32], &iota(), &[31; 32], &[31; 32]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("warp shuffle reads a non-participant lane"));
     }
 
     // Ported from instructions/warp.rs

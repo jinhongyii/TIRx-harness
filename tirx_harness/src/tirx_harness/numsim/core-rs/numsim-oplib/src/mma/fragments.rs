@@ -52,6 +52,7 @@ pub enum MatrixF8Type {
     E5M2,
 }
 
+/// Exact widening of one f16/bf16 fragment element to f32 (NaN payloads kept, subnormals exact).
 pub fn decode_b16(dtype: MatrixB16Type, bits: u16) -> f32 {
     match dtype {
         MatrixB16Type::Fp16 => fp16_bits_to_f32(bits),
@@ -59,6 +60,8 @@ pub fn decode_b16(dtype: MatrixB16Type, bits: u16) -> f32 {
     }
 }
 
+/// Exact decode of one E4M3/E5M2 fragment element to f32; NaN codes give `f32::NAN`
+/// (sign and payload dropped), E5M2 infinities kept.
 pub fn decode_f8(dtype: MatrixF8Type, bits: u8) -> f32 {
     match dtype {
         MatrixF8Type::E4M3 => float8_e4m3fn_bits_to_f32(bits),
@@ -71,6 +74,7 @@ pub fn decode_f8(dtype: MatrixF8Type, bits: u8) -> f32 {
     }
 }
 
+/// Bit width of one packed integer operand element (8, 4 or 1).
 pub fn matrix_packed_int_bits(dtype: MatrixPackedIntType) -> usize {
     match dtype {
         MatrixPackedIntType::I8 | MatrixPackedIntType::U8 => 8,
@@ -216,13 +220,15 @@ pub fn matrix_output_registers<T: Copy>(
 /// high), rounding each value with `f32_to_fp16_bits` (RNE). This is the
 /// numeric part of legacy `store_packed_f16_registers`.
 pub fn pack_f16_registers(values: &[WarpValue<f32>]) -> OpResult<Vec<WarpValue<u32>>> {
-    if values.len() % 2 != 0 {
+    if !values.len().is_multiple_of(2) {
         return Err(OpError::message(
             "packed f16 matrix output has the wrong logical register count",
         ));
     }
     Ok(values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             std::array::from_fn(|lane| {
                 u32::from(f32_to_fp16_bits(pair[0][lane]))

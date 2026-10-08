@@ -80,8 +80,8 @@ pub fn vote_ballot(
     let mut result = [0_u32; WARP_SIZE];
     for lane in active_mask.lanes() {
         let mut bits = 0_u32;
-        for source_lane in 0..WARP_SIZE {
-            if participant_mask & (1_u32 << source_lane) != 0 && predicates[source_lane] {
+        for (source_lane, &predicate) in predicates.iter().enumerate() {
+            if participant_mask & (1_u32 << source_lane) != 0 && predicate {
                 bits |= 1_u32 << source_lane;
             }
         }
@@ -163,7 +163,9 @@ fn redux_fold<T: Copy>(
         .expect("validated member mask is nonempty");
     Ok((first + 1..WARP_SIZE)
         .filter(|lane| members & (1_u32 << lane) != 0)
-        .fold(values[first], |accumulator, lane| combine(accumulator, values[lane])))
+        .fold(values[first], |accumulator, lane| {
+            combine(accumulator, values[lane])
+        }))
 }
 
 /// `redux.sync.op.u32` / `.b32` (min/max compare unsigned); result broadcast.
@@ -250,7 +252,9 @@ pub fn fns_b32(
     let mut result = [0_u32; WARP_SIZE];
     for lane in active_mask.lanes() {
         if bases[lane] >= 32 {
-            return Err(OpError::message("fns.b32 base is outside the defined 0..31 range"));
+            return Err(OpError::message(
+                "fns.b32 base is outside the defined 0..31 range",
+            ));
         }
         result[lane] = ptx_fns_b32(masks[lane], bases[lane], offsets[lane]);
     }
@@ -269,7 +273,7 @@ pub fn movmatrix_m8n8_trans_b16(
         "movmatrix.sync.aligned.m8n8.trans.b16",
     )?;
     let mut transposed = [0_u32; WARP_SIZE];
-    for destination_lane in 0..WARP_SIZE {
+    for (destination_lane, slot) in transposed.iter_mut().enumerate() {
         let column = destination_lane / 4;
         let row_pair = destination_lane % 4;
         let source_pair = column / 2;
@@ -278,7 +282,7 @@ pub fn movmatrix_m8n8_trans_b16(
         let source_lane_high = (2 * row_pair + 1) * 4 + source_pair;
         let low = (values[source_lane_low] >> source_shift) & 0xffff;
         let high = (values[source_lane_high] >> source_shift) & 0xffff;
-        transposed[destination_lane] = low | (high << 16);
+        *slot = low | (high << 16);
     }
     Ok(transposed)
 }
@@ -328,12 +332,15 @@ mod tests {
         let bases = [1_u32; 32];
         let offsets = from_fn(|lane| if lane % 2 == 0 { 1 } else { 2 });
         let result = fns_b32(WarpMask::ALL, &masks, &bases, &offsets).unwrap();
-        for lane in 0..WARP_SIZE {
-            assert_eq!(result[lane], if lane % 2 == 0 { 1 } else { 2 });
+        for (lane, &value) in result.iter().enumerate() {
+            assert_eq!(value, if lane % 2 == 0 { 1 } else { 2 });
         }
         let invalid_bases = from_fn(|lane| if lane == 7 { 32 } else { 0 });
         let error = fns_b32(WarpMask::ALL, &masks, &invalid_bases, &offsets).unwrap_err();
-        assert_eq!(error.to_string(), "fns.b32 base is outside the defined 0..31 range");
+        assert_eq!(
+            error.to_string(),
+            "fns.b32 base is outside the defined 0..31 range"
+        );
     }
 
     #[test]
@@ -350,7 +357,9 @@ mod tests {
         assert_eq!(ballot[0], 0xff);
         assert_eq!(ballot[20], 0);
         let error = vote_any(active, &FULL, &mixed).unwrap_err();
-        assert!(error.to_string().starts_with("vote.sync participant mask names an inactive lane"));
+        assert!(error
+            .to_string()
+            .starts_with("vote.sync participant mask names an inactive lane"));
     }
 
     #[test]
@@ -365,15 +374,33 @@ mod tests {
     #[test]
     fn redux_variants_cover_bitwise_signed_and_float_nan_rules() {
         let values = from_fn(|lane| 1_u32 << (lane % 4));
-        assert_eq!(redux_sync_u32(WarpMask::ALL, &FULL, &values, ReduxIntOp::Or).unwrap()[0], 0xf);
-        assert_eq!(redux_sync_u32(WarpMask::ALL, &FULL, &values, ReduxIntOp::And).unwrap()[0], 0);
-        assert_eq!(redux_sync_u32(WarpMask::ALL, &FULL, &values, ReduxIntOp::Xor).unwrap()[0], 0);
+        assert_eq!(
+            redux_sync_u32(WarpMask::ALL, &FULL, &values, ReduxIntOp::Or).unwrap()[0],
+            0xf
+        );
+        assert_eq!(
+            redux_sync_u32(WarpMask::ALL, &FULL, &values, ReduxIntOp::And).unwrap()[0],
+            0
+        );
+        assert_eq!(
+            redux_sync_u32(WarpMask::ALL, &FULL, &values, ReduxIntOp::Xor).unwrap()[0],
+            0
+        );
         let signed = from_fn(|lane| lane as i32 - 16);
-        assert_eq!(redux_sync_i32(WarpMask::ALL, &FULL, &signed, ReduxIntOp::Min).unwrap()[0], -16);
-        assert_eq!(redux_sync_i32(WarpMask::ALL, &FULL, &signed, ReduxIntOp::Max).unwrap()[0], 15);
+        assert_eq!(
+            redux_sync_i32(WarpMask::ALL, &FULL, &signed, ReduxIntOp::Min).unwrap()[0],
+            -16
+        );
+        assert_eq!(
+            redux_sync_i32(WarpMask::ALL, &FULL, &signed, ReduxIntOp::Max).unwrap()[0],
+            15
+        );
         assert!(redux_sync_i32(WarpMask::ALL, &FULL, &signed, ReduxIntOp::Xor).is_err());
         let floats = from_fn(|lane| if lane == 5 { f32::NAN } else { lane as f32 });
-        assert_eq!(redux_sync_f32(WarpMask::ALL, &FULL, &floats, ReduxF32Op::Max).unwrap()[0], 31.0);
+        assert_eq!(
+            redux_sync_f32(WarpMask::ALL, &FULL, &floats, ReduxF32Op::Max).unwrap()[0],
+            31.0
+        );
         let nan = redux_sync_f32(WarpMask::ALL, &FULL, &floats, ReduxF32Op::MaxNan).unwrap()[0];
         assert_eq!(nan.to_bits(), 0x7fff_ffff);
         // A single NaN member is canonicalized without combine.
@@ -392,11 +419,11 @@ mod tests {
             ((row * 8 + col) as u32) | (((row * 8 + col + 1) as u32) << 16)
         });
         let transposed = movmatrix_m8n8_trans_b16(WarpMask::ALL, &values).unwrap();
-        for lane in 0..32 {
+        for (lane, &word) in transposed.iter().enumerate() {
             let row = lane / 4;
             let col = (lane % 4) * 2;
-            assert_eq!(transposed[lane] & 0xffff, (col * 8 + row) as u32);
-            assert_eq!(transposed[lane] >> 16, ((col + 1) * 8 + row) as u32);
+            assert_eq!(word & 0xffff, (col * 8 + row) as u32);
+            assert_eq!(word >> 16, ((col + 1) * 8 + row) as u32);
         }
         assert!(movmatrix_m8n8_trans_b16(WarpMask(0xffff), &values).is_err());
     }

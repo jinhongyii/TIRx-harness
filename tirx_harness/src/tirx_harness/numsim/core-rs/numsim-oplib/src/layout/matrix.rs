@@ -95,7 +95,11 @@ pub fn ldmatrix_b16_fragments(
         for (lane, value) in matrix_fragments.iter_mut().enumerate() {
             let mut bytes = Vec::with_capacity(4);
             for access in ldmatrix_b16_accesses(matrix, lane, transpose, base)? {
-                bytes.extend(read(access.provider_lane, access.byte_delta, access.byte_len)?);
+                bytes.extend(read(
+                    access.provider_lane,
+                    access.byte_delta,
+                    access.byte_len,
+                )?);
             }
             *value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
@@ -127,7 +131,9 @@ pub fn ldmatrix_b8_element(
     let shift = bit % 8;
     let width = (shift + source_bits).div_ceil(8);
     if row_base(provider)? % 16 != 0 {
-        return Err(OpError::message("ldmatrix row address must be 16-byte aligned"));
+        return Err(OpError::message(
+            "ldmatrix row address must be 16-byte aligned",
+        ));
     }
     Ok(MatrixAccess {
         provider_lane: provider,
@@ -150,12 +156,18 @@ pub fn ldmatrix_b8_fragments(
     for (register, fragment) in fragments.iter_mut().enumerate() {
         for (lane, value) in fragment.iter_mut().enumerate() {
             for element in 0..4 {
-                let access =
-                    ldmatrix_b8_element(register, lane, element, transpose, source_bits, &row_base)?;
+                let access = ldmatrix_b8_element(
+                    register,
+                    lane,
+                    element,
+                    transpose,
+                    source_bits,
+                    &row_base,
+                )?;
                 let bytes = read(access.provider_lane, access.byte_delta, access.byte_len)?;
                 let packed = u16::from(bytes[0]) | (u16::from(*bytes.get(1).unwrap_or(&0)) << 8);
-                *value |= u32::from((packed >> access.shift) & ((1 << source_bits) - 1))
-                    << (element * 8);
+                *value |=
+                    u32::from((packed >> access.shift) & ((1 << source_bits) - 1)) << (element * 8);
             }
         }
     }
@@ -306,7 +318,7 @@ mod tests {
     #[test]
     fn ldmatrix_b8_unpacks_sub_byte_rows_and_checks_alignment() {
         // b4 (source_bits 4): row r holds 16 nibble values, nibble k of row r = (r + k) & 15.
-        let mut memory = vec![0_u8; 8 * 16];
+        let mut memory = [0_u8; 8 * 16];
         for r in 0..8 {
             for k in 0..16 {
                 memory[r * 16 + k / 2] |= (((r + k) & 15) as u8) << ((k % 2) * 4);
@@ -317,13 +329,15 @@ mod tests {
             false,
             4,
             |provider| Ok(provider * 16),
-            |provider, delta, len| Ok(memory[provider * 16 + delta..provider * 16 + delta + len].to_vec()),
+            |provider, delta, len| {
+                Ok(memory[provider * 16 + delta..provider * 16 + delta + len].to_vec())
+            },
         )
         .unwrap();
-        for lane in 0..WARP_SIZE {
+        for (lane, &word) in fragments[0].iter().enumerate() {
             for element in 0..4 {
                 let (r, k) = (lane / 4, lane % 4 * 4 + element);
-                assert_eq!((fragments[0][lane] >> (element * 8)) & 0xff, ((r + k) & 15) as u32);
+                assert_eq!((word >> (element * 8)) & 0xff, ((r + k) & 15) as u32);
             }
         }
         let access = ldmatrix_b8_element(0, 1, 2, false, 6, |_| Ok(0)).unwrap();
@@ -338,7 +352,12 @@ mod tests {
             }
         );
         assert!(ldmatrix_b8_element(0, 0, 0, false, 8, |_| Ok(8)).is_err());
-        assert_eq!(ldmatrix_lane_accesses(4, 5, true, 16, |_| Ok(0)).unwrap().len(), 8);
+        assert_eq!(
+            ldmatrix_lane_accesses(4, 5, true, 16, |_| Ok(0))
+                .unwrap()
+                .len(),
+            8
+        );
         assert!(ldmatrix_lane_accesses(3, 0, false, 16, |_| Ok(0)).is_err());
     }
 
@@ -365,15 +384,21 @@ mod tests {
             assert_eq!(written, memory);
         }
         let register = [0x4433_2211_u32; WARP_SIZE];
-        let writes =
-            stmatrix_writes(StmatrixShape::M16n8B8Transposed, &[&register], |p| Ok(p * 16)).unwrap();
+        let writes = stmatrix_writes(StmatrixShape::M16n8B8Transposed, &[&register], |p| {
+            Ok(p * 16)
+        })
+        .unwrap();
         assert_eq!(writes.len(), 128);
         assert_eq!(writes[0], (0, 0, vec![0x11]));
         assert_eq!(writes[1], (1, 0, vec![0x22]));
         assert_eq!(writes[2], (0, 8, vec![0x33]));
-        assert!(stmatrix_writes(StmatrixShape::M16n8B8Transposed, &[&register], |p| Ok(p * 8))
-            .unwrap_err()
-            .to_string()
-            .contains("16-byte alignment on lane 1"));
+        assert!(stmatrix_writes(
+            StmatrixShape::M16n8B8Transposed,
+            &[&register],
+            |p| Ok(p * 8)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("16-byte alignment on lane 1"));
     }
 }

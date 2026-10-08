@@ -113,7 +113,7 @@ pub fn mma_f32_abt_banked_a_increasing_k(
     input_d: Option<(&[f32], f32)>,
     banks: usize,
 ) -> OpResult<Vec<f32>> {
-    if !matches!(banks, 2 | 4) || n % banks != 0 {
+    if !matches!(banks, 2 | 4) || !n.is_multiple_of(banks) {
         return Err(OpError::message(format!(
             "raw banked-A MMA requires N divisible by {banks} banks, got {n}"
         )));

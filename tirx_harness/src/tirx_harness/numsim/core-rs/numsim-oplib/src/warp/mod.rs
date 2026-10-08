@@ -80,11 +80,17 @@ pub(crate) const BINDINGS: &[Binding] = &[
     bind("tirx.ptx.barrier_red_popc", "warp::cta_reduce_publish"),
     bind("tirx.ptx.barrier_red_popc", "warp::bar_red_result"),
     bind("tirx.ptx.barrier_red_popc_count", "warp::bar_red_local"),
-    bind("tirx.ptx.barrier_red_popc_count", "warp::cta_reduce_publish"),
+    bind(
+        "tirx.ptx.barrier_red_popc_count",
+        "warp::cta_reduce_publish",
+    ),
     bind("tirx.ptx.barrier_red_pred", "warp::bar_red_local"),
     bind("tirx.ptx.barrier_red_pred", "warp::cta_reduce_publish"),
     bind("tirx.ptx.barrier_red_pred_count", "warp::bar_red_local"),
-    bind("tirx.ptx.barrier_red_pred_count", "warp::cta_reduce_publish"),
+    bind(
+        "tirx.ptx.barrier_red_pred_count",
+        "warp::cta_reduce_publish",
+    ),
 ];
 
 #[cfg(test)]

@@ -89,8 +89,7 @@ fn fp4_geometry_and_transaction_accounting_match_shared_layout() {
         0,
         128 * 6,
     )
-    .err()
-    .expect("padded interleave remains unmodeled");
+    .expect_err("padded interleave remains unmodeled");
     assert_eq!(
         error,
         analysis_incomplete("tma_padded_fp4_interleave_unmodeled")
@@ -156,7 +155,15 @@ fn fp4_geometry_and_transaction_accounting_match_shared_layout() {
 
 #[test]
 fn rank_coordinates_and_swizzle_are_physical_layout_operations() {
-    let rank3 = make_map(96, vec![4, 3, 2], vec![16, 48], vec![4, 3, 2], 32, None, None);
+    let rank3 = make_map(
+        96,
+        vec![4, 3, 2],
+        vec![16, 48],
+        vec![4, 3, 2],
+        32,
+        None,
+        None,
+    );
     let outer = rank3.outer_coordinates(5);
     assert_eq!(outer, vec![0, 2, 1]);
     let coordinates = rank3.global_coordinates(&[0, 0, 0], 2, &outer).unwrap();
@@ -219,21 +226,46 @@ fn element_stride_controls_traversal_count_and_coordinates() {
 
 #[test]
 fn descriptor_validation_rejects_hardware_illegal_ranges() {
-    let invalid_box = try_make_map(512, vec![16, 2], vec![16], vec![16, 257], vec![1, 1], 8, None, None)
-        .err()
-        .unwrap();
+    let invalid_box = try_make_map(
+        512,
+        vec![16, 2],
+        vec![16],
+        vec![16, 257],
+        vec![1, 1],
+        8,
+        None,
+        None,
+    )
+    .err()
+    .unwrap();
     assert!(invalid_box.to_string().contains("1..=256"));
 
-    let invalid_element_stride =
-        try_make_map(32, vec![16, 2], vec![16], vec![16, 2], vec![1, 9], 8, None, None)
-            .err()
-            .unwrap();
+    let invalid_element_stride = try_make_map(
+        32,
+        vec![16, 2],
+        vec![16],
+        vec![16, 2],
+        vec![1, 9],
+        8,
+        None,
+        None,
+    )
+    .err()
+    .unwrap();
     assert!(invalid_element_stride.to_string().contains("1..=8"));
 
-    let invalid_global_stride =
-        try_make_map(32, vec![16, 2], vec![24], vec![16, 2], vec![1, 1], 8, None, None)
-            .err()
-            .unwrap();
+    let invalid_global_stride = try_make_map(
+        32,
+        vec![16, 2],
+        vec![24],
+        vec![16, 2],
+        vec![1, 1],
+        8,
+        None,
+        None,
+    )
+    .err()
+    .unwrap();
     assert!(invalid_global_stride
         .to_string()
         .contains("multiples of 16 below 2^40"));
@@ -270,9 +302,10 @@ fn descriptor_validation_rejects_hardware_illegal_ranges() {
         .to_string()
         .contains("overlaps the prior 32-byte span"));
 
-    let invalid_inner_transfer = try_make_map(16, vec![16], vec![], vec![15], vec![1], 8, None, None)
-        .err()
-        .unwrap();
+    let invalid_inner_transfer =
+        try_make_map(16, vec![16], vec![], vec![15], vec![1], 8, None, None)
+            .err()
+            .unwrap();
     assert!(invalid_inner_transfer
         .to_string()
         .contains("multiple of 16 bytes"));
@@ -306,13 +339,24 @@ fn descriptor_validation_rejects_hardware_illegal_ranges() {
         )
         .err()
         .unwrap();
-        assert!(invalid_global_dimension.to_string().contains("at most 2^32"));
+        assert!(invalid_global_dimension
+            .to_string()
+            .contains("at most 2^32"));
     }
 
     // View/address checks that the legacy engine derived from its BufferView.
-    let short_view = try_make_map(31, vec![16, 2], vec![16], vec![16, 2], vec![1, 1], 8, None, None)
-        .err()
-        .unwrap();
+    let short_view = try_make_map(
+        31,
+        vec![16, 2],
+        vec![16],
+        vec![16, 2],
+        vec![1, 1],
+        8,
+        None,
+        None,
+    )
+    .err()
+    .unwrap();
     assert_eq!(
         short_view.to_string(),
         "TensorMap requires 32 global bytes, but its view has 31"
@@ -369,7 +413,10 @@ fn image_materializes_with_allocation_relative_view() {
     assert!(image.materialize(2, 320, 8).is_err());
     let mut host = image.clone();
     host.restore_host_address(0x1000).unwrap();
-    assert_eq!((host.allocation_id, host.base_byte_offset, host.host_address), (0x1040, 0, true));
+    assert_eq!(
+        (host.allocation_id, host.base_byte_offset, host.host_address),
+        (0x1040, 0, true)
+    );
     assert!(host.materialize(2, 320, 0).is_err());
     host.relocate(9, 64);
     assert_eq!(host, image);

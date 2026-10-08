@@ -165,49 +165,6 @@ pub fn decode_f8f6f4(
     })
 }
 
-/// `(m, n, k, transpose_a, transpose_b)` of a CTA1 f8f6f4 MMA.
-pub fn f8f6f4_cta1_shape(
-    descriptor: u32,
-    a_format: NarrowFormat,
-    b_format: NarrowFormat,
-    d_f16: bool,
-    weight_stationary: bool,
-    descriptor_layout: MatrixDescriptorLayout,
-) -> OpResult<(usize, usize, usize, bool, bool)> {
-    let i = decode_f8f6f4(
-        descriptor,
-        a_format,
-        b_format,
-        d_f16,
-        1,
-        descriptor_layout.supports_f8f6f4_k64(),
-        weight_stationary,
-        false,
-    )?;
-    Ok((i.m, i.n, i.k, i.transpose_a, i.transpose_b))
-}
-
-/// `(m, n, k, transpose_a, transpose_b)` of a CTA2 f8f6f4 MMA.
-pub fn f8f6f4_cta2_shape(
-    descriptor: u32,
-    a_format: NarrowFormat,
-    b_format: NarrowFormat,
-    d_f16: bool,
-    descriptor_layout: MatrixDescriptorLayout,
-) -> OpResult<(usize, usize, usize, bool, bool)> {
-    let i = decode_f8f6f4(
-        descriptor,
-        a_format,
-        b_format,
-        d_f16,
-        2,
-        descriptor_layout.supports_f8f6f4_k64(),
-        false,
-        false,
-    )?;
-    Ok((i.m, i.n, i.k, i.transpose_a, i.transpose_b))
-}
-
 /// PTX Table 48 gives F16/BF16 and TF32 the same M/N contract.
 pub fn valid_b16_tf32_shape(
     cta_group: usize,
@@ -228,6 +185,9 @@ pub fn valid_b16_tf32_shape(
     }
 }
 
+/// Decode a `kind::tf32` instruction descriptor (F32 D, TF32 A/B): M = bits 24..29 x16,
+/// N = bits 17..23 x8, negate bits 13/14, transpose bits 15/16. No numerics; errors on
+/// reserved bits, sparsity/selector mismatch, wrong formats or an illegal shape.
 pub fn decode_tf32(
     descriptor: u32,
     cta_group: usize,
@@ -277,6 +237,9 @@ pub fn decode_tf32(
     })
 }
 
+/// Decode a `kind::f16` instruction descriptor: D is F16 or F32 (bit 4), A/B both
+/// F16 or both BF16 (bits 7-9/10-12, must match `a_bf16`/`b_bf16`; BF16 needs F32 D).
+/// No numerics; errors on reserved bits, mixed formats or an illegal shape.
 pub fn decode_b16(
     descriptor: u32,
     a_bf16: bool,
@@ -380,6 +343,7 @@ impl Mxf4ScaleSpelling {
         }
     }
 
+    /// PTX spelling of this variant's scale dtype (`UE8M0`, `UE4M3` or `UE5M3`).
     pub fn scale_format_name(self) -> &'static str {
         match self {
             Self::Ue8m0Vec2x | Self::Ue8m0Vec4x => "UE8M0",
@@ -388,6 +352,7 @@ impl Mxf4ScaleSpelling {
         }
     }
 
+    /// `scale_vec::NX` vector count: 2 or 4 scale factors per 64-element K block.
     pub fn vector_count(self) -> usize {
         match self {
             Self::Ue8m0Vec2x | Self::Ue4m3Vec2x | Self::Ue5m3Vec2x => 2,
@@ -395,6 +360,7 @@ impl Mxf4ScaleSpelling {
         }
     }
 
+    /// Whether a SFA/SFB scale ID is legal for this vector count (2X: 0 or 2; 4X: 0).
     pub fn scale_id_is_legal(self, scale_id: usize) -> bool {
         match self.vector_count() {
             2 => matches!(scale_id, 0 | 2),
@@ -402,6 +368,7 @@ impl Mxf4ScaleSpelling {
         }
     }
 
+    /// Diagnostic text naming the legal scale IDs for this vector count.
     pub fn legal_scale_ids(self) -> &'static str {
         match self.vector_count() {
             2 => "scale_vec::2X requires SFA/SFB IDs 0 or 2",
@@ -419,6 +386,7 @@ impl Mxf4ScaleSpelling {
     }
 }
 
+/// `scale_vec::4X` spelling from descriptor bits 23-24 (0 UE4M3, 2 UE5M3, else UE8M0).
 pub fn mxf4nvf4_vec4x_scale(descriptor: u32) -> Mxf4ScaleSpelling {
     match (descriptor >> 23) & 3 {
         0 => Mxf4ScaleSpelling::Ue4m3Vec4x,
@@ -427,6 +395,7 @@ pub fn mxf4nvf4_vec4x_scale(descriptor: u32) -> Mxf4ScaleSpelling {
     }
 }
 
+/// `scale_vec::2X` spelling from descriptor bits 23-24 (0 UE4M3, 2 UE5M3, else UE8M0).
 pub fn mxf4nvf4_vec2x_scale(descriptor: u32) -> Mxf4ScaleSpelling {
     match (descriptor >> 23) & 3 {
         0 => Mxf4ScaleSpelling::Ue4m3Vec2x,
@@ -468,6 +437,9 @@ pub fn decode_mxf4(
     decode_mxf4_for_cta_group(descriptor, scale, 1, descriptor_layout, false)
 }
 
+/// Decode a dense `kind::mxf4`/`mxf4nvf4` descriptor for `cta_group` 1 or 2: K = 64
+/// (96 on SM103/107, 128 on SM107), M = 128 x cta_group, scale block = K (or 64 when
+/// not `fixed_vectors`) / vector count. No numerics; errors on illegal fields or IDs.
 pub fn decode_mxf4_for_cta_group(
     descriptor: u32,
     scale: Mxf4ScaleSpelling,
@@ -614,6 +586,8 @@ pub fn block_mxf4_shape(
     Ok((i.m, i.n, i.k))
 }
 
+/// Decode a sparse `kind::mxf4` descriptor: E2M1 A/B, UE8M0 scales, K = 128, M = 128,
+/// N in 8..=256 by 8, IDs 0 or 2, no transpose. No numerics; errors otherwise.
 pub fn decode_sparse_mxf4(descriptor: u32) -> OpResult<Mxf4Instr> {
     if descriptor & 0x3 != 0
         || descriptor & (1_u32 << 2) == 0
@@ -699,14 +673,20 @@ pub struct Mxf8f6f4Instr {
 }
 
 impl Mxf8f6f4Instr {
+    /// K elements stored per operand row (the sparse K is halved by 2:4 compression).
     pub fn packed_k(self) -> usize {
         self.k / if self.sparse { 2 } else { 1 }
     }
+    /// Whether the stored K is 32, which selects the padded 16-byte shared-atom row
+    /// stride for narrow operands instead of the format's packed stride.
     pub fn padded_atoms(self) -> bool {
         self.packed_k() == 32
     }
 }
 
+/// Decode a `kind::mxf8f6f4` descriptor (A/B E4M3/E5M2/E2M3/E3M2/E2M1, UE8M0 scales):
+/// K = 32 (64 with bit 31 on SM107), doubled when sparse; transpose only for 8-bit
+/// operands. No numerics; errors on reserved bits or illegal M/N.
 pub fn decode_mxf8f6f4(
     descriptor: u32,
     cta_group: usize,
@@ -782,15 +762,6 @@ pub fn decode_mxf8f6f4(
     })
 }
 
-pub fn block_mxf8f6f4_shape(
-    descriptor: u32,
-    cta_group: usize,
-    descriptor_layout: MatrixDescriptorLayout,
-) -> OpResult<(usize, usize, usize)> {
-    let i = decode_mxf8f6f4(descriptor, cta_group, descriptor_layout)?;
-    Ok((i.m, i.n, i.k))
-}
-
 // ---------------------------------------------------------------------------
 // Dense/sparse floating kinds
 // ---------------------------------------------------------------------------
@@ -811,6 +782,8 @@ pub enum FloatKind {
 }
 
 impl FloatKind {
+    /// Sparse-metadata layout for this kind: narrow kinds by dense K, b16/tf32 by the
+    /// descriptor's selector bit 0.
     pub fn metadata_layout(self, descriptor: u32) -> SparseMetadataLayout {
         match self {
             Self::SparseNarrow { .. } => SparseMetadataLayout::Narrow {
@@ -822,6 +795,7 @@ impl FloatKind {
         }
     }
 
+    /// Matrix-descriptor field widths this kind decodes with (SM100 except sparse narrow).
     pub fn descriptor_layout(self) -> MatrixDescriptorLayout {
         match self {
             Self::SparseNarrow {
@@ -831,6 +805,8 @@ impl FloatKind {
         }
     }
 
+    /// Decode the instruction descriptor for this kind into `(cell dtype, M, N, negate,
+    /// transpose)`. Sparse narrow requires `sparse` and selector 0. No numerics.
     pub fn instruction(
         self,
         instruction_descriptor: u32,
@@ -882,6 +858,7 @@ impl FloatKind {
         }
     }
 
+    /// K elements stored per operand row: TF32 8, b16 16, sparse narrow 32 (64 when bit 29 set).
     pub fn packed_k(self, descriptor: u32) -> usize {
         match self {
             Self::Tf32 => 8,
@@ -896,6 +873,7 @@ impl FloatKind {
         }
     }
 
+    /// 32-bit TMEM columns one A row occupies (packed K / 4 for narrow, else 8).
     pub fn tmem_a_columns(self, descriptor: u32) -> usize {
         match self {
             Self::SparseNarrow { .. } => self.packed_k(descriptor) / 4,
@@ -920,18 +898,6 @@ impl FloatKind {
     }
 }
 
-/// `(m, n, transpose_a, transpose_b)` of a floating dense/sparse MMA.
-pub fn float_shape(
-    kind: FloatKind,
-    descriptor: u32,
-    cta_group: usize,
-    ws: bool,
-    sparse: bool,
-) -> OpResult<(usize, usize, bool, bool)> {
-    let value = kind.instruction(descriptor, cta_group, ws, sparse)?;
-    Ok((value.m, value.n, value.transpose_a, value.transpose_b))
-}
-
 // ---------------------------------------------------------------------------
 // Small shared operand checks
 // ---------------------------------------------------------------------------
@@ -946,11 +912,15 @@ pub fn validate_tmem_a_transpose(transpose: bool) -> OpResult<()> {
     Ok(())
 }
 
+/// TMEM address of an f8f6f4 A operand: rejects `transpose` (TMEM A is K-major) and
+/// addresses beyond u32. No numerics.
 pub fn f8_tmem_a_address(bits: u64, transpose: bool) -> OpResult<u32> {
     validate_tmem_a_transpose(transpose)?;
     u32::try_from(bits).map_err(|_| OpError::message("raw f8f6f4 TMEM A address exceeds u32"))
 }
 
+/// LUT-B check: when present, requires K = 64, non-transposed E4M3 B and an in-range
+/// TMEM LUT address. No numerics.
 pub fn validate_lut_b(
     lut_b: Option<u32>,
     k: usize,

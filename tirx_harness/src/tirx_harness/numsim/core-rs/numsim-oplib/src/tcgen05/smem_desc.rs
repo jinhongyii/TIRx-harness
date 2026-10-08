@@ -24,6 +24,7 @@ pub enum MatrixDescriptorLayout {
 }
 
 impl MatrixDescriptorLayout {
+    /// Whether this architecture encodes the f8f6f4 K=64 form (SM107 only).
     pub fn supports_f8f6f4_k64(self) -> bool {
         matches!(self, Self::Sm107)
     }
@@ -86,6 +87,10 @@ pub fn decode_matrix_descriptor(descriptor: u64) -> OpResult<MatrixDescriptor> {
     decode_matrix_descriptor_for_layout(descriptor, MatrixDescriptorLayout::Sm100)
 }
 
+/// Decode a 64-bit shared matrix descriptor with this architecture's field widths
+/// (14 bits SM100/103, 15 bits SM107): start/LBO/SBO in bytes (field << 4) and the
+/// swizzle mode (bits 61..63). No numerics; errors on a wrong version, reserved
+/// bits, a non-zero base offset, an invalid layout type or a misaligned 32B-atom start.
 pub fn decode_matrix_descriptor_for_layout(
     descriptor: u64,
     layout: MatrixDescriptorLayout,
@@ -345,6 +350,8 @@ pub fn matrix_byte_offset(
     finish_shared_byte_offset(source, descriptor, unswizzled, element_bytes)
 }
 
+/// [`matrix_byte_offset`] for 2-byte (f16/bf16) elements: window-relative byte offset
+/// of `(row, column)`, K-major unless `transpose`. No numerics.
 pub fn b16_matrix_byte_offset(
     source: SharedWindow,
     descriptor: MatrixDescriptor,
@@ -355,6 +362,8 @@ pub fn b16_matrix_byte_offset(
     matrix_byte_offset(source, descriptor, row, column, transpose, 2)
 }
 
+/// [`matrix_byte_offset`] for 1-byte elements (FP8, and FP6/FP4 in 8-bit containers).
+/// No numerics.
 pub fn byte8_matrix_byte_offset(
     source: SharedWindow,
     descriptor: MatrixDescriptor,
@@ -365,6 +374,8 @@ pub fn byte8_matrix_byte_offset(
     matrix_byte_offset(source, descriptor, row, column, transpose, 1)
 }
 
+/// Window-relative byte offset of 32-bit word `word` of K-major `row` (the tcgen05.cp
+/// source walk). No numerics; errors as [`shared_byte_offset`].
 pub fn shared_word_offset(
     source: SharedWindow,
     descriptor: MatrixDescriptor,
@@ -483,6 +494,8 @@ pub struct ColumnMask {
 }
 
 impl ColumnMask {
+    /// Validate a zero-column mask descriptor for an `m`-row (32/64/128), `n`-column B:
+    /// reserved bits clear and the column shift within the instruction's maximum. No numerics.
     pub fn new(bits: u64, m: usize, n: usize, instruction: u32) -> OpResult<Self> {
         let maximum_shift = match instruction >> 30 {
             0 => 0,
@@ -505,6 +518,8 @@ impl ColumnMask {
         })
     }
 
+    /// B column that logical `column` reads after the mask's shift, or `None` when the
+    /// use/skip span pattern zeroes it (the MMA then multiplies by zero).
     pub fn source_column(self, column: usize) -> Option<usize> {
         let bank = column / self.bank_columns;
         if self.bits & (1 << 39) != 0 {
@@ -548,6 +563,8 @@ pub struct TileGemmOperandLayout {
 }
 
 impl TileGemmOperandLayout {
+    /// Swizzled operand layout: `atom_columns` per atom, XOR of the element-group index
+    /// (`>> per_element_shift`) with its `outer_mask` bits shifted down by `atom_shift`.
     pub const fn new(
         atom_columns: usize,
         per_element_shift: u32,
@@ -576,6 +593,7 @@ pub struct TileGemmBf16Descriptor {
 }
 
 impl TileGemmBf16Descriptor {
+    /// Build a tile BF16 GEMM descriptor (`m x n x k`, operand layouts, B aliasing A).
     pub const fn new(
         m: usize,
         n: usize,
@@ -609,6 +627,8 @@ impl TileGemmBf16Descriptor {
     }
 }
 
+/// Physical element index of every logical `(row, column)` (row-major order) of a
+/// swizzled tile GEMM operand. No numerics; errors on an invalid or out-of-range layout.
 pub fn tile_gemm_operand_physical_elements(
     rows: usize,
     columns: usize,
@@ -620,7 +640,7 @@ pub fn tile_gemm_operand_physical_elements(
     if rows == 0
         || columns == 0
         || layout.atom_columns == 0
-        || columns % layout.atom_columns != 0
+        || !columns.is_multiple_of(layout.atom_columns)
         || layout.per_element_shift >= usize::BITS
         || layout.atom_shift >= usize::BITS
     {
@@ -670,19 +690,9 @@ pub fn tile_gemm_operand_physical_elements(
     Ok(physical_elements)
 }
 
-/// Expected byte length of a BF16 tile operand snapshot.
-pub fn tile_gemm_bf16_operand_bytes(
-    rows: usize,
-    columns: usize,
-    layout: TileGemmOperandLayout,
-) -> OpResult<usize> {
-    let physical_elements = tile_gemm_operand_physical_elements(rows, columns, layout)?;
-    physical_elements
-        .len()
-        .checked_mul(2)
-        .ok_or_else(|| OpError::message("tile BF16 GEMM operand size overflows usize"))
-}
-
+/// Decode a little-endian BF16 shared snapshot into logical row-major f32 values
+/// through [`tile_gemm_operand_physical_elements`]; exact widening, NaN payloads kept.
+/// Errors on a size mismatch.
 pub fn decode_tile_gemm_bf16_snapshot(
     snapshot: &[u8],
     rows: usize,

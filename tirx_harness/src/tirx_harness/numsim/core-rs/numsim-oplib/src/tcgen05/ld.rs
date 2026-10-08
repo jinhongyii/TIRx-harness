@@ -25,6 +25,9 @@ pub enum LdReduction {
 }
 
 impl LdReduction {
+    /// One `tcgen05.ld.red` step: f32 min/max via [`crate::scalar::ptx_min_f32`]/`ptx_max_f32`
+    /// (no FTZ; `.abs` clears signs first, `.NaN` gives `0x7fff_ffff` on any NaN, else a
+    /// NaN loses), or u32/i32 integer min/max.
     pub fn apply(self, lhs: u32, rhs: u32) -> u32 {
         match self {
             Self::F32 { max, abs, nan } => {

@@ -27,7 +27,8 @@ pub(in crate::oplib) const NAMES: &[&str] = &[
 
 /// (helper, reviewed body digest, destination widths, source widths, body).
 type Body = fn(&mut PtxIo<'_>) -> OpResult;
-const REVIEWED: &[(&str, &str, &[u32], &[u32], Body)] = &[
+type Reviewed = (&'static str, &'static str, &'static [u32], &'static [u32], Body);
+const REVIEWED: &[Reviewed] = &[
     ("combine_int_frac_ex2", "4b134dcd27e35d98", &[32], &[32, 32], combine_int_frac_ex2),
     ("flashkda_fmaf_rn", "f8e53464d3e437cc", &[32], &[32, 32, 32], flashkda_fmaf_rn),
     ("flashkda_rsqrtf", "3c5001e580bc296a", &[32], &[32], flashkda_rsqrtf),

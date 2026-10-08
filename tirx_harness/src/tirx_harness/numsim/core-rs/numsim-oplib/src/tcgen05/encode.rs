@@ -201,7 +201,9 @@ fn block_encoding(
     sfb_dtype: &str,
 ) -> OpResult<&'static BlockEncoding> {
     if d_dtype != "float32" {
-        return Err(OpError::message("tcgen05 block-scaled instruction descriptor requires float32 D"));
+        return Err(OpError::message(
+            "tcgen05 block-scaled instruction descriptor requires float32 D",
+        ));
     }
     match BLOCK_ENCODINGS.iter().find(|row| (row.0, row.1, row.2, row.2) == (a_dtype, b_dtype, sfa_dtype, sfb_dtype)) {
         Some(row) => Ok(row),
@@ -245,7 +247,10 @@ const N_I8_CTA1: &[i64] = &[
 // property of the tile-level SFA/SFB region and is checked by TVM's dispatch;
 // a raw instruction carries no such extent.
 #[rustfmt::skip]
-const SHAPE_ENCODINGS: &[(&str, i64, i64, i64, bool, &[i64])] = &[
+/// `(kind, cta_group, M, K, sparse, valid N values)`.
+type ShapeRow = (&'static str, i64, i64, i64, bool, &'static [i64]);
+
+const SHAPE_ENCODINGS: &[ShapeRow] = &[
     ("f16", 1, 64, 16, false, N8),
     ("f16", 1, 128, 16, false, N16),
     ("f16", 1, 64, 32, true, N8),
@@ -299,6 +304,9 @@ const SHAPE_ENCODINGS: &[(&str, i64, i64, i64, bool, &[i64])] = &[
     ("mxf4nvf4", 2, 256, 128, true, N16),
 ];
 
+/// Check `(kind, cta_group, M, N, K, sparse)` against the PTX tcgen05.mma shape table
+/// before encoding an instruction descriptor. No numerics; the error names the first
+/// failing field (cta_group, kind, M/K or N).
 pub fn validate_tcgen05_instruction_shape(
     kind: &str,
     cta_group: i64,
@@ -380,10 +388,14 @@ pub fn encode_dense_instr_descriptor_fields(
     let kind = dense_kind(d_dtype, a_dtype, b_dtype)?;
     validate_tcgen05_instruction_shape(kind, cta_group, m, n, k, sparse)?;
     if trans_a && !format_encoding(a_dtype).2 {
-        return Err(OpError::message(format!("tcgen05 transpose A is invalid for {a_dtype}")));
+        return Err(OpError::message(format!(
+            "tcgen05 transpose A is invalid for {a_dtype}"
+        )));
     }
     if trans_b && !format_encoding(b_dtype).2 {
-        return Err(OpError::message(format!("tcgen05 transpose B is invalid for {b_dtype}")));
+        return Err(OpError::message(format!(
+            "tcgen05 transpose B is invalid for {b_dtype}"
+        )));
     }
     validate_8bit_transpose_b_shape(b_dtype, trans_b, cta_group, n)?;
     let flag_bits = DENSE_FLAG_ENCODINGS
@@ -392,10 +404,14 @@ pub fn encode_dense_instr_descriptor_fields(
         .expect("mapped dense kind")
         .1;
     if (neg_a || neg_b) && flag_bits & ((1 << 13) | (1 << 14)) == 0 {
-        return Err(OpError::message(format!("tcgen05 negate is invalid for kind {kind}")));
+        return Err(OpError::message(format!(
+            "tcgen05 negate is invalid for kind {kind}"
+        )));
     }
     if sat_d && flag_bits & (1 << 3) == 0 {
-        return Err(OpError::message(format!("tcgen05 saturation is invalid for kind {kind}")));
+        return Err(OpError::message(format!(
+            "tcgen05 saturation is invalid for kind {kind}"
+        )));
     }
     let mut value: i64 = i64::from(sparse) << 2;
     value |= i64::from(sat_d) << 3;
@@ -458,7 +474,6 @@ pub fn encode_block_scaled_instr_descriptor_fields(
     Ok(value & 0xFFFF_FFFF)
 }
 
-
 /// Per-lane `tcgen05_encode_matrix_descriptor` (TVM `SmemDescriptor` helper):
 /// unsigned fields truncate to 14 bits, the version bit 46 is set, and a
 /// swizzle outside 1..=4 leaves the zero-initialized layout. `shared_address`
@@ -487,7 +502,9 @@ mod tests {
     /// written out independently of `SHAPE_ENCODINGS`.
     fn isa_shape(kind: &str, cta: i64, m: i64, n: i64, k: i64, sparse: bool) -> bool {
         let block = matches!(kind, "mxf8f6f4" | "mxf4" | "mxf4nvf4");
-        let rule: Option<(&[(i64, i64)], &[i64])> = match (kind, cta) {
+        // (M -> N step pairs, extra N values)
+        type Rule = (&'static [(i64, i64)], &'static [i64]);
+        let rule: Option<Rule> = match (kind, cta) {
             ("f16" | "tf32" | "f8f6f4", 1) => Some((&[(64, 8), (128, 16)], &[])),
             ("f16" | "tf32" | "f8f6f4", 2) => Some((&[(128, 32), (256, 32)], &[])),
             ("i8", 1) => Some((&[(64, 16), (128, 16)], &[8, 24])),
@@ -496,11 +513,15 @@ mod tests {
             (_, 2) if block => Some((&[(128, 16), (256, 16)], &[])),
             _ => None,
         };
-        let Some((steps, extra)) = rule else { return false };
+        let Some((steps, extra)) = rule else {
+            return false;
+        };
         if block && cta == 2 && sparse && m != 256 {
             return false;
         }
-        let Some(&(_, step)) = steps.iter().find(|(mm, _)| *mm == m) else { return false };
+        let Some(&(_, step)) = steps.iter().find(|(mm, _)| *mm == m) else {
+            return false;
+        };
         if !extra.contains(&n) && !((step..=256).contains(&n) && n % step == 0) {
             return false;
         }
@@ -510,7 +531,10 @@ mod tests {
             "f8f6f4" | "i8" | "mxf8f6f4" => (32, 64),
             _ => (64, 128),
         };
-        let k96 = !sparse && matches!(kind, "mxf4" | "mxf4nvf4") && matches!((cta, m), (1, 128) | (2, 256)) && k == 96;
+        let k96 = !sparse
+            && matches!(kind, "mxf4" | "mxf4nvf4")
+            && matches!((cta, m), (1, 128) | (2, 256))
+            && k == 96;
         k == if sparse { sparse_k } else { dense } || k96
     }
 
@@ -519,14 +543,22 @@ mod tests {
     #[test]
     fn shape_table_matches_the_ptx_isa_grid() {
         let mut accepted = 0;
-        for kind in ["f16", "tf32", "f8f6f4", "i8", "mxf8f6f4", "mxf4", "mxf4nvf4"] {
+        for kind in [
+            "f16", "tf32", "f8f6f4", "i8", "mxf8f6f4", "mxf4", "mxf4nvf4",
+        ] {
             for cta in [1, 2] {
                 for m in (16..=256).step_by(16) {
                     for n in (8..=256).step_by(8) {
                         for k in [8, 16, 32, 64, 96, 128] {
                             for sparse in [false, true] {
-                                let ours = validate_tcgen05_instruction_shape(kind, cta, m, n, k, sparse).is_ok();
-                                assert_eq!(ours, isa_shape(kind, cta, m, n, k, sparse), "{kind} cta{cta} M{m} N{n} K{k} sparse {sparse}");
+                                let ours =
+                                    validate_tcgen05_instruction_shape(kind, cta, m, n, k, sparse)
+                                        .is_ok();
+                                assert_eq!(
+                                    ours,
+                                    isa_shape(kind, cta, m, n, k, sparse),
+                                    "{kind} cta{cta} M{m} N{n} K{k} sparse {sparse}"
+                                );
                                 accepted += usize::from(ours);
                             }
                         }
@@ -564,9 +596,14 @@ mod tests {
             "float32", "int8", "bfloat16", 128, 64, 16, false, false, 1, false, false, false, false,
         )
         .unwrap_err();
-        assert!(err.0.starts_with("tcgen05 dense instruction descriptor has invalid dtype"));
+        assert!(err
+            .0
+            .starts_with("tcgen05 dense instruction descriptor has invalid dtype"));
         let err = validate_tcgen05_instruction_shape("f16", 3, 128, 64, 16, false).unwrap_err();
-        assert_eq!(err.0, "tcgen05 instruction descriptor cta_group must be 1 or 2, got 3");
+        assert_eq!(
+            err.0,
+            "tcgen05 instruction descriptor cta_group must be 1 or 2, got 3"
+        );
         let err = validate_tcgen05_instruction_shape("f16", 1, 128, 12, 16, false).unwrap_err();
         assert_eq!(
             err.0,
@@ -613,7 +650,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(((mx >> 7) & 7, (mx >> 10) & 7, (mx >> 23) & 1), (0, 1, 1));
-        let decoded = decode_mxf8f6f4(mx as u32, 1, crate::tcgen05::smem_desc::MatrixDescriptorLayout::Sm100);
+        let decoded = decode_mxf8f6f4(
+            mx as u32,
+            1,
+            crate::tcgen05::smem_desc::MatrixDescriptorLayout::Sm100,
+        );
         assert!(decoded.is_ok(), "{decoded:?}");
     }
 

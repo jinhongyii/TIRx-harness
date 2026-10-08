@@ -495,13 +495,30 @@ fn f8f6f4_cta1_mn_major_b_requires_sixteen_column_granularity() {
 fn f8f6f4_cta2_n_granularity_follows_b_major() {
     // PTX ISA shape table (delta L4): cta_group::2 takes N % 32 for either
     // B major; N = 16 is not a hardware shape.
-    let decode = |bits| decode_f8f6f4(bits, NarrowFormat::E5M2, NarrowFormat::E5M2, false, 2, false, false, false);
+    let decode = |bits| {
+        decode_f8f6f4(
+            bits,
+            NarrowFormat::E5M2,
+            NarrowFormat::E5M2,
+            false,
+            2,
+            false,
+            false,
+            false,
+        )
+    };
     for transpose in [0, 1 << 16] {
         let n16 = f8f6f4_descriptor(1, 1, 1, 256, 16) | transpose;
         let error = decode(n16).unwrap_err();
-        assert!(error.to_string().contains("N in 32..=256 by 32"), "unexpected error {error}");
+        assert!(
+            error.to_string().contains("N in 32..=256 by 32"),
+            "unexpected error {error}"
+        );
         let decoded = decode(f8f6f4_descriptor(1, 1, 1, 256, 32) | transpose).unwrap();
-        assert_eq!((decoded.m, decoded.n, decoded.transpose_b), (256, 32, transpose != 0));
+        assert_eq!(
+            (decoded.m, decoded.n, decoded.transpose_b),
+            (256, 32, transpose != 0)
+        );
     }
 }
 
@@ -520,8 +537,22 @@ fn dense_shapes_match_the_ptx_isa_table() {
                     _ => false,
                 };
                 let (m32, n32) = (m as u32, n as u32);
-                let b16 = decode_b16(f8f6f4_descriptor(1, 0, 0, m32, n32), false, false, cta_group as u32, false, false).is_ok();
-                let tf32 = decode_tf32(f8f6f4_descriptor(1, 2, 2, m32, n32), cta_group, false, false).is_ok();
+                let b16 = decode_b16(
+                    f8f6f4_descriptor(1, 0, 0, m32, n32),
+                    false,
+                    false,
+                    cta_group as u32,
+                    false,
+                    false,
+                )
+                .is_ok();
+                let tf32 = decode_tf32(
+                    f8f6f4_descriptor(1, 2, 2, m32, n32),
+                    cta_group,
+                    false,
+                    false,
+                )
+                .is_ok();
                 let f8 = decode_f8f6f4(
                     f8f6f4_descriptor(1, 0, 0, m32, n32),
                     NarrowFormat::E4M3,
@@ -536,9 +567,18 @@ fn dense_shapes_match_the_ptx_isa_table() {
                 assert_eq!((b16, tf32, f8), (isa, isa, isa), "cta{cta_group} M{m} N{n}");
                 for (kind, k) in [("f16", 16), ("tf32", 8), ("f8f6f4", 32)] {
                     let encoded = crate::tcgen05::encode::validate_tcgen05_instruction_shape(
-                        kind, cta_group as i64, m as i64, n as i64, k, false,
+                        kind,
+                        cta_group as i64,
+                        m as i64,
+                        n as i64,
+                        k,
+                        false,
                     );
-                    assert_eq!(encoded.is_ok(), isa, "encode {kind} cta{cta_group} M{m} N{n}");
+                    assert_eq!(
+                        encoded.is_ok(),
+                        isa,
+                        "encode {kind} cta{cta_group} M{m} N{n}"
+                    );
                 }
             }
         }

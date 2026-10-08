@@ -151,7 +151,10 @@ mod tests {
         let error = validate_participants(WarpMask::NONE, &[1; 32], "vote.sync").unwrap_err();
         assert_eq!(error.to_string(), "vote.sync has no active lane");
         let error = validate_participants(WarpMask::ALL, &[0; 32], "vote.sync").unwrap_err();
-        assert_eq!(error.to_string(), "vote.sync participant mask must not be zero");
+        assert_eq!(
+            error.to_string(),
+            "vote.sync participant mask must not be zero"
+        );
         let active = lanes_below(16);
         let error = validate_participants(active, &[u32::MAX; 32], "shfl.sync").unwrap_err();
         assert_eq!(
@@ -160,7 +163,10 @@ mod tests {
              shfl.sync requires all 32 lanes, got mask 0x0000ffff"
         );
         // A subset mask is legal when exactly the active lanes agree on it.
-        assert_eq!(validate_participants(active, &[0xffff; 32], "x").unwrap(), 0xffff);
+        assert_eq!(
+            validate_participants(active, &[0xffff; 32], "x").unwrap(),
+            0xffff
+        );
     }
 
     #[test]
@@ -176,7 +182,10 @@ mod tests {
     #[test]
     fn uniform_values_preserve_diagnostics() {
         let uniform = [7_i64; 32];
-        assert_eq!(require_uniform_i64(&uniform, WarpMask::ALL, "field").unwrap(), 7);
+        assert_eq!(
+            require_uniform_i64(&uniform, WarpMask::ALL, "field").unwrap(),
+            7
+        );
         let error = require_uniform_i64(&uniform, WarpMask::NONE, "field").unwrap_err();
         assert_eq!(error.to_string(), "field has no active lane");
         let disagreeing: WarpValue<i64> = std::array::from_fn(|lane| if lane == 3 { 9 } else { 7 });

@@ -36,6 +36,7 @@ pub enum MatrixSparseAccumulatorType {
     I32,
 }
 
+/// Dense K elements per sparsity chunk: TF32 2 (1:2), 4-bit integers 8, others 4 (2:4).
 pub fn sparse_chunk_width(dtype: MatrixSparseOperandType) -> usize {
     match dtype {
         MatrixSparseOperandType::Tf32 => 2,
@@ -44,6 +45,7 @@ pub fn sparse_chunk_width(dtype: MatrixSparseOperandType) -> usize {
     }
 }
 
+/// Stored (non-zero) elements per sparsity chunk: TF32 1, 4-bit integers 4, others 2.
 pub fn sparse_stored_per_chunk(dtype: MatrixSparseOperandType) -> usize {
     match dtype {
         MatrixSparseOperandType::Tf32 => 1,
@@ -97,6 +99,8 @@ pub fn sparse_fragment_counts(
     Ok(counts)
 }
 
+/// Check a sparse `mma.sp` A/B/accumulator dtype triple against the PTX table and that
+/// `.satfinite` is only used with integer multiplicands. No numerics.
 pub fn validate_sparse_type_pair(
     a_dtype: MatrixSparseOperandType,
     b_dtype: MatrixSparseOperandType,
@@ -105,14 +109,15 @@ pub fn validate_sparse_type_pair(
 ) -> OpResult<()> {
     use MatrixSparseAccumulatorType as Acc;
     use MatrixSparseOperandType as Op;
-    let valid = match (a_dtype, b_dtype, accumulator_dtype) {
-        (Op::Fp16, Op::Fp16, Acc::Fp16 | Acc::Fp32) => true,
-        (Op::Bf16, Op::Bf16, Acc::Fp32) | (Op::Tf32, Op::Tf32, Acc::Fp32) => true,
-        (Op::I8 | Op::U8, Op::I8 | Op::U8, Acc::I32)
-        | (Op::I4 | Op::U4, Op::I4 | Op::U4, Acc::I32) => true,
-        (Op::E4M3 | Op::E5M2, Op::E4M3 | Op::E5M2, Acc::Fp32) => true,
-        _ => false,
-    };
+    let valid = matches!(
+        (a_dtype, b_dtype, accumulator_dtype),
+        (Op::Fp16, Op::Fp16, Acc::Fp16 | Acc::Fp32)
+            | (Op::Bf16, Op::Bf16, Acc::Fp32)
+            | (Op::Tf32, Op::Tf32, Acc::Fp32)
+            | (Op::I8 | Op::U8, Op::I8 | Op::U8, Acc::I32)
+            | (Op::I4 | Op::U4, Op::I4 | Op::U4, Acc::I32)
+            | (Op::E4M3 | Op::E5M2, Op::E4M3 | Op::E5M2, Acc::Fp32)
+    );
     if !valid {
         return Err(OpError::message(
             "sparse MMA operand and accumulator types are incompatible",

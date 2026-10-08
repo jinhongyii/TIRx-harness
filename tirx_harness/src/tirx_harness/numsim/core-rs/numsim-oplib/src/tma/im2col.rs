@@ -390,7 +390,10 @@ mod tests {
             [0, 1, 1, 1],
             [0, 2, 1, 1],
         ];
-        assert_eq!(origins, expected.iter().map(|o| o.to_vec()).collect::<Vec<_>>());
+        assert_eq!(
+            origins,
+            expected.iter().map(|o| o.to_vec()).collect::<Vec<_>>()
+        );
         assert!(im2col_origins(&map, &[0, 3, 0, 0], Im2colMode::Spatial, &[0, 0]).is_err());
         assert!(im2col_origins(&map, &[0, 0, 0, 0], Im2colMode::Spatial, &[256, 0]).is_err());
         assert!(im2col_origins(&map, &[0, 0, 0, 0], Im2colMode::Wide, &[0, 0]).is_err());
@@ -466,7 +469,9 @@ mod tests {
     fn padded_pixels_read_zero_and_store_round_trips_in_bounds_pixels() {
         // Lower corner -1 pads one pixel on the left of each W row.
         let map = nhwc_map([-1, 0, 0], [0, 0, 0], 5);
-        let global = (0..384).map(|i| (i as u8).wrapping_mul(7)).collect::<Vec<_>>();
+        let global = (0..384)
+            .map(|i| (i as u8).wrapping_mul(7))
+            .collect::<Vec<_>>();
         let plan = plan_im2col_g2s(&map, &[0, -1, 0, 0], Im2colMode::Spatial, &[0, 0], 0).unwrap();
         assert_eq!(plan.payload_len, 80);
         assert_eq!(plan.geometry.outer_count, 5);
@@ -481,7 +486,10 @@ mod tests {
         let mut destination = vec![0_u8; 384];
         execute_s2g_copy(&store, &shared[16..], 0, &mut destination).unwrap();
         assert_eq!(&destination[64..128], &global[..64]);
-        assert!(destination[..64].iter().chain(&destination[128..]).all(|b| *b == 0));
+        assert!(destination[..64]
+            .iter()
+            .chain(&destination[128..])
+            .all(|b| *b == 0));
         assert!(tma_store_mode(3).is_err());
         assert_eq!(tma_store_mode(2).unwrap(), Some(Im2colMode::Wide));
     }

@@ -204,7 +204,10 @@ mod tests {
             SwizzleAtomicity::B32Flip8,
             SwizzleAtomicity::B64,
         ] {
-            assert_eq!(SwizzleAtomicity::from_tag(0xA7 | atomicity.tag_bits()), atomicity);
+            assert_eq!(
+                SwizzleAtomicity::from_tag(0xA7 | atomicity.tag_bits()),
+                atomicity
+            );
         }
         // Row 1 starts at absolute 96: band 0 (bit 7 clear) -> unchanged.
         assert_eq!(swizzle_96b_offset(1, 0, 0).unwrap(), 96);

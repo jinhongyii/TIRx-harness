@@ -203,9 +203,11 @@ pub struct OpError {
 }
 
 impl OpError {
+    /// An `Unsupported` error: the op or modifier is outside what v2 models.
     pub fn unsupported(m: impl Into<String>) -> OpError {
         OpError { kind: OpErrorKind::Unsupported, message: m.into() }
     }
+    /// An `Invalid` error: an operand value PTX calls illegal or undefined.
     pub fn invalid(m: impl Into<String>) -> OpError {
         OpError { kind: OpErrorKind::Invalid, message: m.into() }
     }
@@ -516,6 +518,7 @@ impl TensorMapDesc {
     pub fn encode(&self) -> [u8; 128] {
         tma::encode(self)
     }
+    /// Decode a 128-byte TensorMap payload; errors on any unencodable or inconsistent field.
     pub fn decode(bytes: &[u8; 128]) -> OpResult<TensorMapDesc> {
         tma::decode(bytes)
     }
@@ -685,6 +688,8 @@ pub struct SmemDesc {
     pub version: u8,
 }
 
+/// Decode a shared-memory matrix descriptor with SM100 field widths (byte-valued
+/// start/LBO/SBO, swizzle code 0..4). No numerics; errors on invalid descriptors.
 pub fn decode_smem_desc(desc: u64) -> OpResult<SmemDesc> {
     tc::decode_smem_desc(desc)
 }
@@ -836,6 +841,7 @@ pub enum Fidelity {
 }
 
 impl Fidelity {
+    /// The SUPPORTED_OPS.md spelling of this fidelity.
     pub const fn name(self) -> &'static str {
         match self {
             Fidelity::Modeled => "modeled",

@@ -127,7 +127,11 @@ pub fn ptx_cvt_f32_to_f32(value: f32, ftz: bool) -> f32 {
 /// `away_from_zero` selects between truncation and the next magnitude up,
 /// which is how `.rz` / `.rm` / `.rp` differ for `u64`/`s64` sources whose
 /// value needs more bits than the destination format has.
-pub(crate) fn round_integer_magnitude(magnitude: u64, mantissa_bits: u32, away_from_zero: bool) -> (u64, u32) {
+pub(crate) fn round_integer_magnitude(
+    magnitude: u64,
+    mantissa_bits: u32,
+    away_from_zero: bool,
+) -> (u64, u32) {
     if magnitude == 0 {
         return (0, 0);
     }
@@ -236,19 +240,15 @@ pub(crate) fn ptx_cvt_integer_to_low(
     }
 }
 
-pub fn ptx_cvt_integer_to_f16(
-    magnitude: u64,
-    negative: bool,
-    rounding: PtxFloatRounding,
-) -> u16 {
+/// PTX `cvt.{rn,rz,rm,rp}.f16.{s,u}*`: integer `±magnitude` rounded once to binary16
+/// (RN-even; directed modes overflow to max finite when rounding toward zero, else inf).
+pub fn ptx_cvt_integer_to_f16(magnitude: u64, negative: bool, rounding: PtxFloatRounding) -> u16 {
     ptx_cvt_integer_to_low(magnitude, negative, rounding, LowPrecisionFormat::F16)
 }
 
-pub fn ptx_cvt_integer_to_bf16(
-    magnitude: u64,
-    negative: bool,
-    rounding: PtxFloatRounding,
-) -> u16 {
+/// PTX `cvt.{rn,rz,rm,rp}.bf16.{s,u}*`: integer `±magnitude` rounded once to bfloat16
+/// (zero gives `+0`/`-0` per `negative`; no NaN or subnormal results arise).
+pub fn ptx_cvt_integer_to_bf16(magnitude: u64, negative: bool, rounding: PtxFloatRounding) -> u16 {
     ptx_cvt_integer_to_low(magnitude, negative, rounding, LowPrecisionFormat::Bf16)
 }
 
@@ -613,4 +613,3 @@ pub fn ptx_cvt_f32_to_tf32(
     }
     bits
 }
-

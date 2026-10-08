@@ -317,6 +317,7 @@ pub struct TcgenCpWord {
 }
 
 impl TcgenCpWord {
+    /// The destination TMEM lanes of this word (1, 2 or 4).
     pub fn lanes(&self) -> &[u32] {
         &self.lanes[..usize::from(self.lane_count)]
     }

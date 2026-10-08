@@ -173,7 +173,7 @@ mod tests {
         };
         let special = [0u32, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x7fa0_0001, 0xffc1_2345, 0x0000_0001, 0x7f7f_ffff];
         for round in 0..2000 {
-            let pick = |x: u64, l: usize| if (l + round) % 5 == 0 { special[(x % 9) as usize] } else { x as u32 };
+            let pick = |x: u64, l: usize| if (l + round).is_multiple_of(5) { special[(x % 9) as usize] } else { x as u32 };
             let a: [f32; 32] = std::array::from_fn(|l| f32::from_bits(pick(next(), l)));
             let b: [f32; 32] = std::array::from_fn(|l| f32::from_bits(pick(next(), l + 1)));
             let c: [f32; 32] = std::array::from_fn(|l| f32::from_bits(pick(next(), l + 2)));

@@ -43,7 +43,7 @@ fn no_op(_io: &mut PtxIo<'_>) -> OpResult {
 fn aligned(io: &PtxIo<'_>, alignment: u64, label: &str) -> OpResult {
     for lane in io.mask.lanes() {
         let address = io.srcs[0][lane];
-        if address % alignment != 0 {
+        if !address.is_multiple_of(alignment) {
             return Err(OpError::invalid(format!(
                 "{label} requires a {alignment}-byte aligned global address on lane {lane}, got {address:#x}"
             )));
@@ -63,7 +63,7 @@ fn applypriority(io: &mut PtxIo<'_>) -> OpResult {
 fn bulk_prefetch(io: &mut PtxIo<'_>) -> OpResult {
     for lane in io.mask.lanes() {
         let size = io.srcs[1][lane] as u32;
-        if size % 16 != 0 {
+        if !size.is_multiple_of(16) {
             return Err(OpError::invalid(format!(
                 "cp.async.bulk.prefetch size {size} must be a multiple of 16 on lane {lane}"
             )));

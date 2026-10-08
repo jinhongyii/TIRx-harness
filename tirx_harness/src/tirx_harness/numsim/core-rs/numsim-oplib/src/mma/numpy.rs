@@ -30,6 +30,8 @@ pub struct F32Matrix {
 }
 
 impl F32Matrix {
+    /// Row-major `rows x cols` f32 matrix; errors when `values.len() != rows * cols` or the
+    /// product overflows.
     pub fn new(rows: usize, cols: usize, values: Vec<f32>) -> Result<Self, NumpyBackendError> {
         let expected = rows
             .checked_mul(cols)
@@ -44,14 +46,17 @@ impl F32Matrix {
         Ok(Self { rows, cols, values })
     }
 
+    /// Row count.
     pub const fn rows(&self) -> usize {
         self.rows
     }
 
+    /// Column count.
     pub const fn cols(&self) -> usize {
         self.cols
     }
 
+    /// The row-major values, bit-exact.
     pub fn into_values(self) -> Vec<f32> {
         self.values
     }

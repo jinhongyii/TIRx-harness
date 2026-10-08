@@ -106,6 +106,8 @@ pub struct SpCompressShape {
 }
 
 impl SpCompressShape {
+    /// Reject shapes outside PTX `spcompress`: element 8/16 bits, index 2/4 bits, num a
+    /// power of two in 1..=64.
     pub fn validate(self) -> OpResult<()> {
         if !matches!(self.elem_bits, 8 | 16)
             || !matches!(self.index_bits, 2 | 4)
@@ -198,12 +200,15 @@ impl SpDecompressShape {
         }
         Ok(())
     }
+    /// 32-bit registers holding the packed `src * index_bits * num` metadata bits.
     pub fn metadata_registers(self) -> usize {
         (self.src * self.index_bits * self.num).div_ceil(32)
     }
+    /// 32-bit registers holding the `src * num` compressed elements.
     pub fn compressed_registers(self) -> usize {
         (self.src * self.elem_bits * self.num).div_ceil(32)
     }
+    /// 32-bit registers of the `dst * num` dense output elements.
     pub fn data_registers(self) -> usize {
         (self.dst * self.elem_bits * self.num).div_ceil(32)
     }

@@ -15,14 +15,13 @@
 //! - [`gather`]: operand gathers over caller-supplied memory closures;
 //! - [`mma`]: sparse expansion, sparse/dense tails, tile GEMM compute;
 //! - [`integer`]: `kind::i8` / `kind::ti16`; [`ld`]: ld.red / spcompress /
-//!   collector state; [`footprints`]: checker address walks; [`tmem`]:
+//!   collector state; [`tmem`]:
 //!   allocation rules.
 //!
 //! Engine plumbing (lifecycle validation, TMEM/shared views, ordering,
 //! register IO) is not here; see each module's notes.
 
 pub mod encode;
-pub mod footprints;
 pub mod gather;
 pub mod instr_desc;
 pub mod integer;
@@ -42,9 +41,18 @@ const fn b(op: &'static str, function: &'static str) -> Binding {
 
 /// Registry bindings for this family: legacy op name -> OpLib function path.
 pub(crate) const BINDINGS: &[Binding] = &[
-    b("tirx.cuda.tcgen05_encode_instr_descriptor", "tcgen05::encode::encode_dense_instr_descriptor_fields"),
-    b("tirx.cuda.tcgen05_encode_instr_descriptor_block_scaled", "tcgen05::encode::encode_block_scaled_instr_descriptor_fields"),
-    b("tirx.cuda.tcgen05_encode_matrix_descriptor", "tcgen05::encode::encode_matrix_descriptor"),
+    b(
+        "tirx.cuda.tcgen05_encode_instr_descriptor",
+        "tcgen05::encode::encode_dense_instr_descriptor_fields",
+    ),
+    b(
+        "tirx.cuda.tcgen05_encode_instr_descriptor_block_scaled",
+        "tcgen05::encode::encode_block_scaled_instr_descriptor_fields",
+    ),
+    b(
+        "tirx.cuda.tcgen05_encode_matrix_descriptor",
+        "tcgen05::encode::encode_matrix_descriptor",
+    ),
     b("tirx.cuda.get_tmem_addr", "tcgen05::layouts::get_tmem_addr"),
     b(
         "tirx.ptx.tcgen05_alloc",
@@ -105,10 +113,6 @@ pub(crate) const BINDINGS: &[Binding] = &[
         "tcgen05::smem_desc::decode_matrix_descriptor_for_layout",
     ),
     b("tirx.ptx.tcgen05_cp", "tcgen05::smem_desc::cp_source_span"),
-    b(
-        "tirx.ptx.tcgen05_cp",
-        "tcgen05::layouts::cp_destination_cells",
-    ),
     b("tirx.ptx.tcgen05_cp", "tcgen05::layouts::cp_decode_word"),
     // dense / ws / sparse floating MMA
     b(

@@ -18,13 +18,53 @@ fn conversions(c: &mut Criterion) {
     let x = inputs();
     let h: Vec<u16> = x.iter().map(|&v| cvt::f32_to_fp16_bits(v)).collect();
     let mut g = c.benchmark_group("cvt_x1024");
-    g.bench_function("f32_to_fp16_rn", |b| b.iter(|| black_box(&x).iter().map(|&v| cvt::f32_to_fp16_bits(v) as u32).sum::<u32>()));
-    g.bench_function("f32_to_bf16_rn", |b| b.iter(|| black_box(&x).iter().map(|&v| cvt::f32_to_bf16_bits(v) as u32).sum::<u32>()));
-    g.bench_function("fp16_to_f32", |b| b.iter(|| black_box(&h).iter().map(|&v| cvt::fp16_bits_to_f32(v)).sum::<f32>()));
-    g.bench_function("f32_to_tf32", |b| b.iter(|| black_box(&x).iter().map(|&v| cvt::f32_to_tf32(v)).sum::<f32>()));
-    g.bench_function("f32_to_e4m3_satfinite", |b| b.iter(|| black_box(&x).iter().map(|&v| cvt::f32_to_float8_e4m3fn_bits(v) as u32).sum::<u32>()));
+    g.bench_function("f32_to_fp16_rn", |b| {
+        b.iter(|| {
+            black_box(&x)
+                .iter()
+                .map(|&v| cvt::f32_to_fp16_bits(v) as u32)
+                .sum::<u32>()
+        })
+    });
+    g.bench_function("f32_to_bf16_rn", |b| {
+        b.iter(|| {
+            black_box(&x)
+                .iter()
+                .map(|&v| cvt::f32_to_bf16_bits(v) as u32)
+                .sum::<u32>()
+        })
+    });
+    g.bench_function("fp16_to_f32", |b| {
+        b.iter(|| {
+            black_box(&h)
+                .iter()
+                .map(|&v| cvt::fp16_bits_to_f32(v))
+                .sum::<f32>()
+        })
+    });
+    g.bench_function("f32_to_tf32", |b| {
+        b.iter(|| {
+            black_box(&x)
+                .iter()
+                .map(|&v| cvt::f32_to_tf32(v))
+                .sum::<f32>()
+        })
+    });
+    g.bench_function("f32_to_e4m3_satfinite", |b| {
+        b.iter(|| {
+            black_box(&x)
+                .iter()
+                .map(|&v| cvt::f32_to_float8_e4m3fn_bits(v) as u32)
+                .sum::<u32>()
+        })
+    });
     g.bench_function("f32_to_e2m1_satfinite", |b| {
-        b.iter(|| black_box(&x).iter().map(|&v| cvt::f32_to_narrow_float_bits_rn_satfinite(v, cvt::FLOAT4_E2M1) as u32).sum::<u32>())
+        b.iter(|| {
+            black_box(&x)
+                .iter()
+                .map(|&v| cvt::f32_to_narrow_float_bits_rn_satfinite(v, cvt::FLOAT4_E2M1) as u32)
+                .sum::<u32>()
+        })
     });
     g.finish();
 }
@@ -32,14 +72,28 @@ fn conversions(c: &mut Criterion) {
 /// The pinned host NaN rule (delta D8): finite inputs vs. all-NaN inputs.
 fn host_nan_rule(c: &mut Criterion) {
     let x = inputs();
-    let nan: Vec<f32> = (0..N).map(|i| f32::from_bits(0x7fc0_0000 | i as u32)).collect();
+    let nan: Vec<f32> = (0..N)
+        .map(|i| f32::from_bits(0x7fc0_0000 | i as u32))
+        .collect();
     let mut g = c.benchmark_group("host_nan_x1024");
     for (name, a) in [("finite", &x), ("all_nan", &nan)] {
         g.bench_function(format!("host_fma_f32_{name}"), |b| {
-            b.iter(|| black_box(a).iter().zip(&x).map(|(&p, &q)| scalar::host_fma_f32(p, q, 1.0).to_bits()).fold(0, u32::wrapping_add))
+            b.iter(|| {
+                black_box(a)
+                    .iter()
+                    .zip(&x)
+                    .map(|(&p, &q)| scalar::host_fma_f32(p, q, 1.0).to_bits())
+                    .fold(0, u32::wrapping_add)
+            })
         });
         g.bench_function(format!("pinned_add_f32_{name}"), |b| {
-            b.iter(|| black_box(a).iter().zip(&x).map(|(&p, &q)| scalar::pin_nan2_f32(p, q, p + q).to_bits()).fold(0, u32::wrapping_add))
+            b.iter(|| {
+                black_box(a)
+                    .iter()
+                    .zip(&x)
+                    .map(|(&p, &q)| scalar::pin_nan2_f32(p, q, p + q).to_bits())
+                    .fold(0, u32::wrapping_add)
+            })
         });
     }
     g.finish();
@@ -56,7 +110,15 @@ fn mma_chain(c: &mut Criterion) {
         ("f32_m16_n8_k16_mma_sync", 16, 8, 16, false),
         ("f32_m128_n256_k16_with_nan", 128, 256, 16, true),
     ] {
-        let a: Vec<f32> = (0..m * k).map(|i| if nan && i % 97 == 0 { f32::NAN } else { (i % 13) as f32 * 0.25 }).collect();
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| {
+                if nan && i % 97 == 0 {
+                    f32::NAN
+                } else {
+                    (i % 13) as f32 * 0.25
+                }
+            })
+            .collect();
         let bt: Vec<f32> = (0..k * n).map(|i| (i % 7) as f32 - 3.0).collect();
         let init = vec![0.5_f32; m * n];
         g.bench_function(name, |bench| {
@@ -81,11 +143,18 @@ fn mma_chain(c: &mut Criterion) {
 
 /// `mma.sync.m16n8k16.f32.bf16` end to end (fragment gather, chain, scatter).
 fn mma_sync(c: &mut Criterion) {
-    let a: Vec<WarpValue<u32>> = (0..4).map(|r| std::array::from_fn(|l| 0x3f80_3f80 ^ ((l + r) as u32) << 4)).collect();
-    let b: Vec<WarpValue<u32>> = (0..2).map(|r| std::array::from_fn(|l| 0x4000_3f80 ^ ((l * 3 + r) as u32) << 4)).collect();
+    let a: Vec<WarpValue<u32>> = (0..4)
+        .map(|r| std::array::from_fn(|l| 0x3f80_3f80 ^ ((l + r) as u32) << 4))
+        .collect();
+    let b: Vec<WarpValue<u32>> = (0..2)
+        .map(|r| std::array::from_fn(|l| 0x4000_3f80 ^ ((l * 3 + r) as u32) << 4))
+        .collect();
     let mut g = c.benchmark_group("mma_sync");
     g.bench_function("m16n8k16_f32_bf16", |bench| {
-        bench.iter(|| mma::sync::mma_sync_f32_b16(black_box(&a), &b, None, 16, mma::MatrixB16Type::Bf16).unwrap())
+        bench.iter(|| {
+            mma::sync::mma_sync_f32_b16(black_box(&a), &b, None, 16, mma::MatrixB16Type::Bf16)
+                .unwrap()
+        })
     });
     g.finish();
 }
@@ -95,9 +164,15 @@ fn reductions(c: &mut Criterion) {
     let v: WarpValue<f32> = std::array::from_fn(|l| l as f32 * 1.25 - 7.0);
     let d: WarpValue<f64> = std::array::from_fn(|l| l as f64 * 1.25 - 7.0);
     let mut g = c.benchmark_group("warp_reduce");
-    g.bench_function("sum_f32_w32", |b| b.iter(|| warp::warp_reduce_sum(WarpMask::ALL, black_box(&v), 32).unwrap()));
-    g.bench_function("max_f32_w32", |b| b.iter(|| warp::warp_reduce_max(WarpMask::ALL, black_box(&v), 32).unwrap()));
-    g.bench_function("sum_f64_w8", |b| b.iter(|| warp::warp_reduce_sum(WarpMask::ALL, black_box(&d), 8).unwrap()));
+    g.bench_function("sum_f32_w32", |b| {
+        b.iter(|| warp::warp_reduce_sum(WarpMask::ALL, black_box(&v), 32).unwrap())
+    });
+    g.bench_function("max_f32_w32", |b| {
+        b.iter(|| warp::warp_reduce_max(WarpMask::ALL, black_box(&v), 32).unwrap())
+    });
+    g.bench_function("sum_f64_w8", |b| {
+        b.iter(|| warp::warp_reduce_sum(WarpMask::ALL, black_box(&d), 8).unwrap())
+    });
     g.finish();
 }
 
@@ -112,10 +187,20 @@ fn math(c: &mut Criterion) {
         ("exp10_f32", scalar::exp10_f32),
         ("log10_f32", scalar::log10_f32),
     ] {
-        g.bench_function(name, |b| b.iter(|| black_box(&x).iter().map(|&v| f(v)).sum::<f32>()));
+        g.bench_function(name, |b| {
+            b.iter(|| black_box(&x).iter().map(|&v| f(v)).sum::<f32>())
+        });
     }
     g.finish();
 }
 
-criterion_group!(benches, conversions, host_nan_rule, mma_chain, mma_sync, reductions, math);
+criterion_group!(
+    benches,
+    conversions,
+    host_nan_rule,
+    mma_chain,
+    mma_sync,
+    reductions,
+    math
+);
 criterion_main!(benches);

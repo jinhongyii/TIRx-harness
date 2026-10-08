@@ -14,9 +14,9 @@ mod scalar;
 #[cfg(test)]
 mod tests;
 
-use crate::cvt::CvtOperands;
 #[cfg(test)]
 use crate::cvt::ptx_cvt;
+use crate::cvt::CvtOperands;
 
 /// How one golden row's operands were formed by its `.cu` harness kernel.
 #[derive(Clone, Copy, Debug)]
@@ -78,13 +78,25 @@ pub(super) fn check(form: &GoldenForm) {
         form.spelling,
         mismatches.len(),
         form.expected.len(),
-        mismatches.iter().take(12).cloned().collect::<Vec<_>>().join("\n")
+        mismatches
+            .iter()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
 /// Every golden form (scalar, fp8, narrow), in file order.
 pub fn all_forms() -> impl Iterator<Item = &'static GoldenForm> {
-    [scalar::FORMS, fp8_0::FORMS, fp8_1::FORMS, narrow_0::FORMS, narrow_1::FORMS, narrow_2::FORMS]
-        .into_iter()
-        .flatten()
+    [
+        scalar::FORMS,
+        fp8_0::FORMS,
+        fp8_1::FORMS,
+        narrow_0::FORMS,
+        narrow_1::FORMS,
+        narrow_2::FORMS,
+    ]
+    .into_iter()
+    .flatten()
 }

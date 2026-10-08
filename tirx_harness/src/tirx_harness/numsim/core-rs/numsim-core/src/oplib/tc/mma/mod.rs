@@ -267,8 +267,8 @@ fn read_run<T>(
     buf.clear();
     buf.resize(indices.len() * 4, 0);
     (io.tmem_read)(cta as u32, lane, column, buf).map_err(|error| io.fail(error))?;
-    for (&index, bytes) in indices.iter().zip(buf.chunks_exact(4)) {
-        values[index] = decode([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    for (&index, bytes) in indices.iter().zip(buf.as_chunks::<4>().0) {
+        values[index] = decode(*bytes);
     }
     Ok(())
 }
@@ -276,7 +276,7 @@ fn read_run<T>(
 /// Write one run of cells.
 fn write_run<T: Copy>(
     io: &Io<'_>,
-    tmem_write: &mut dyn FnMut(u32, u32, u32, &[u8]) -> OpResult,
+    tmem_write: TcTmemWrite<'_>,
     buf: &mut Vec<u8>,
     (cta, lane, column): (usize, usize, usize),
     indices: &[usize],
@@ -398,7 +398,7 @@ fn gather_b16_chunked<Scalar: Default + Copy>(
     mask: Option<ColumnMask>,
     decode: impl Fn(u16) -> LibResult<Scalar>,
 ) -> LibResult<Vec<Scalar>> {
-    if transpose || columns % 8 != 0 {
+    if transpose || !columns.is_multiple_of(8) {
         return gather_b16_rows_with(read_shared, WINDOW, descriptor, rows, columns, transpose, mask, decode);
     }
     let mut values = Vec::with_capacity(
@@ -419,8 +419,8 @@ fn gather_b16_chunked<Scalar: Default + Copy>(
                 && b16_matrix_byte_offset(WINDOW, descriptor, row, first + 7, false)? == start + 14;
             if contiguous {
                 read_shared(start, &mut chunk)?;
-                for pair in chunk.chunks_exact(2) {
-                    values.push(decode(u16::from_le_bytes([pair[0], pair[1]]))?);
+                for pair in chunk.as_chunks::<2>().0 {
+                    values.push(decode(u16::from_le_bytes(*pair))?);
                 }
             } else {
                 for column in first..first + 8 {

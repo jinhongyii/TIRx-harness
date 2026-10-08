@@ -127,11 +127,10 @@ impl CvtType {
             _ => {
                 if let Some(stem) = name.strip_suffix("x2") {
                     Self::NarrowX2(narrow(stem)?)
-                } else if let Some(stem) = name.strip_suffix("x4") {
+                } else {
+                    let stem = name.strip_suffix("x4")?;
                     // `.ue5m3` has no four-element form.
                     Self::NarrowX4(narrow(stem).filter(|kind| *kind != NarrowKind::Ue5m3)?)
-                } else {
-                    return None;
                 }
             }
         })

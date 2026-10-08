@@ -35,7 +35,8 @@ from tvm.script.tirx import tile as Tx
 from tvm.tirx.layout import ComposeLayout, S, TCol, TileLayout, TLane, tmem_datapath_layout
 from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tirx_harness.numsim.errors import UnsupportedTIRxError
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -51,15 +52,6 @@ _TMEM_WRONG_B_ROW_COLUMN_GROUP_N32 = TileLayout(
     S[(2, 32, 2, 16) : (64 @ TLane, 1 @ TLane, 32 @ TLane, 1 @ TCol)]
 )
 
-# Shared by the swizzled-SMEM copies below (see test docstrings).
-_SWIZZLE_GAP = (
-    "v2 gemm_async over SWIZZLE_32B/128B shared operands filled by Tx.copy reads K "
-    "elements from the wrong 16-byte chunk (one-hot probe: B row j, K index k ^ 8 "
-    "when (i//2)%2 != (j//2)%2); scalar stores into the same layout give the same "
-    "result, and the SWIZZLE_NONE copy of the same GEMM matches numpy (as do the "
-    "cta_group::2, TMEM-A, two-CTA and four-CTA kernels with SWIZZLE_NONE operands). "
-    "Observed: 50% of outputs differ from numpy (25-91% for fp8/128B)"
-)
 
 
 def _f16(rows: int, cols: int, mod: int, shift: int) -> np.ndarray:
@@ -562,7 +554,6 @@ def dense_gemm_async_two_cta_pairs_in_one_cluster_n32(
 # -- tests --------------------------------------------------------------------
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_dense_gemm_async_gathers_physical_operands_and_accumulates_tmem():
     """Replaces ``tests/numsim/integration/test_gemm_async_artifact.py::test_dense_gemm_async_gathers_physical_operands_and_accumulates_tmem``.
 
@@ -579,7 +570,6 @@ def test_dense_gemm_async_gathers_physical_operands_and_accumulates_tmem():
     np.testing.assert_array_equal(result.outputs["output"], _matmul(left, right) * np.float32(2))
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_dense_fp8_gemm_async_matches_numpy():
     """Replaces ``tests/numsim/integration/test_gemm_async_artifact.py::test_dense_fp8_gemm_async_matches_numpy``.
 
@@ -596,7 +586,6 @@ def test_dense_fp8_gemm_async_matches_numpy():
     np.testing.assert_array_equal(result.outputs["output"], _matmul(left, right))
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_cta_group2_gathers_both_shared_shards_and_scatters_tmem():
     """Replaces ``tests/numsim/integration/test_gemm_async_artifact.py::test_cta_group2_gathers_both_shared_shards_and_scatters_tmem``.
 
@@ -613,7 +602,6 @@ def test_cta_group2_gathers_both_shared_shards_and_scatters_tmem():
     np.testing.assert_array_equal(result.outputs["output"], _matmul(left, right))
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_dense_gemm_async_handles_repeated_dynamic_index_loads():
     """Replaces ``tests/numsim/integration/test_gemm_async_artifact.py::test_dense_gemm_async_handles_repeated_dynamic_index_loads``.
 
@@ -630,7 +618,6 @@ def test_dense_gemm_async_handles_repeated_dynamic_index_loads():
     np.testing.assert_array_equal(result.outputs["output"], _matmul(left, right[1:17]))
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_cta_group2_gathers_both_tmem_a_shards():
     """Replaces ``tests/numsim/integration/test_gemm_async_artifact.py::test_cta_group2_gathers_both_tmem_a_shards``.
 
@@ -647,7 +634,6 @@ def test_cta_group2_gathers_both_tmem_a_shards():
     np.testing.assert_array_equal(result.outputs["output"], _matmul(left, right))
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_dense_gemm_async_runs_numpy_backend_on_two_cluster_workers():
     """Replaces ``tests/numsim/integration/test_gemm_async_artifact.py::test_dense_gemm_async_runs_numpy_backend_on_two_cluster_workers``.
 
@@ -680,15 +666,12 @@ def test_all_inactive_gemm_async_is_a_noop():
     np.testing.assert_array_equal(result.outputs["output"], np.array([7], dtype=np.int32))
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_cta_group2_m64_tcgen_mma_uses_layout_b_independently_of_declared_layout():
-    """Replaces ``tests/numsim/integration/test_gemm_async_artifact.py::test_cta_group2_m64_tcgen_mma_uses_layout_b_independently_of_declared_layout``.
+    """Replaces the Layout-B half of ``tests/numsim/integration/test_gemm_async_artifact.py::test_cta_group2_m64_tcgen_mma_uses_layout_b_independently_of_declared_layout``.
 
-    Row L4: ``dense_gemm_async_m64_cta2_layout_b`` / ``..._wrong_b_grouping``
-    were M=128 N=16 at cta_group::2; these copies are N=32 (column halves of 16
-    instead of 8). The MMA writes Layout B regardless of the declared layout,
-    so reading through the wrong grouping swaps the off-diagonal quadrants
-    (derived from the two layout definitions)."""
+    Row L4: ``dense_gemm_async_m64_cta2_layout_b`` was M=128 N=16 at
+    cta_group::2; this copy is N=32. The MMA writes Layout B and the kernel
+    reads it back through Layout B: numpy-exact."""
 
     left = _f16(128, 16, 19, 9)
     right = _f16(32, 16, 13, 6)
@@ -700,18 +683,17 @@ def test_cta_group2_m64_tcgen_mma_uses_layout_b_independently_of_declared_layout
     )
     np.testing.assert_array_equal(correct.outputs["output"], product * np.float32(2))
 
-    wrong = v2.Engine().run(
-        v2.transpile(dense_gemm_async_m64_cta2_wrong_b_grouping_n32),
-        {"left": left, "right": right, "output": np.zeros((128, 32), dtype=np.float32)},
-    )
-    assert not np.array_equal(wrong.outputs["output"], product)
-    for cta in range(2):
-        tile = wrong.outputs["output"][cta * 64 : (cta + 1) * 64]
-        expected_tile = product[cta * 64 : (cta + 1) * 64]
-        np.testing.assert_array_equal(tile[:32, :16], expected_tile[:32, :16])
-        np.testing.assert_array_equal(tile[:32, 16:], expected_tile[32:, :16])
-        np.testing.assert_array_equal(tile[32:, :16], expected_tile[:32, 16:])
-        np.testing.assert_array_equal(tile[32:, 16:], expected_tile[32:, 16:])
+
+def test_cta_group2_m64_tcgen_mma_wrong_declared_grouping_fails_closed():
+    """Replaces the wrong-grouping half of ``tests/numsim/integration/test_gemm_async_artifact.py::test_cta_group2_m64_tcgen_mma_uses_layout_b_independently_of_declared_layout``.
+
+    Row L8 (numsim-behaviour-deltas): TVM's tcgen05 dispatch requires the TMEM
+    accumulator's declared layout to equal the MMA output layout, so a kernel
+    declaring the accumulator without Layout B's column grouping is rejected
+    at transpile (legacy ran it and swapped the off-diagonal quadrants)."""
+
+    with pytest.raises(UnsupportedTIRxError, match="StructuralEqual|tile form"):
+        v2.transpile(dense_gemm_async_m64_cta2_wrong_b_grouping_n32)
 
 
 def test_dense_gemm_async_no_swizzle_descriptor_matches_numpy():
@@ -729,7 +711,6 @@ def test_dense_gemm_async_no_swizzle_descriptor_matches_numpy():
     np.testing.assert_array_equal(result.outputs["output"], _matmul(left, right))
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_cta_group2_routes_each_pair_within_a_four_cta_cluster():
     """Replaces ``tests/numsim/integration/test_gemm_async_artifact.py::test_cta_group2_routes_each_pair_within_a_four_cta_cluster``.
 
@@ -754,11 +735,6 @@ def test_cta_group2_routes_each_pair_within_a_four_cta_cluster():
     np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-@v2_gap(
-    "two active lanes issue the thread-scope gemm_async: v2 completes the run (status "
-    "completed, synccheck clean); legacy raised 'exactly one active issuing lane'. No "
-    "delta row rules this"
-)
 def test_thread_scope_gemm_async_requires_one_runtime_issuer():
     """Replaces ``tests/numsim/integration/test_gemm_async_artifact.py::test_thread_scope_gemm_async_requires_one_runtime_issuer``.
 

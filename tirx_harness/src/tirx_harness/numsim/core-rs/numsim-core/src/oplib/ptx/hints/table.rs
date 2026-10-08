@@ -1,5 +1,7 @@
 // @generated from tvm.backend.cuda.ptx.table (prefetch*/applypriority*/cp_async_bulk_prefetch* ops): (op, [(slot, choices, optional)]).
-pub(super) const HINT_OPS: &[(&str, &[(&str, &[&str], bool)])] = &[
+/// `(slot, choices, optional)` of one modifier slot.
+pub(super) type Slot = (&'static str, &'static [&'static str], bool);
+pub(super) const HINT_OPS: &[(&str, &[Slot])] = &[
     ("tirx.ptx.cp_async_bulk_prefetch", &[("api", &["async"], false), ("kind", &["bulk"], false), ("op", &["prefetch"], false), ("level", &["L2"], false), ("src", &["global"], false), ("cache", &["L2::cache_hint"], true)]),
     ("tirx.ptx.cp_async_bulk_prefetch_evict_last", &[("api", &["async"], false), ("kind", &["bulk"], false), ("op", &["prefetch"], false), ("level", &["L2"], false), ("src", &["global"], false), ("priority", &["L2::evict_last"], false)]),
     ("tirx.ptx.applypriority", &[("space", &["global"], true), ("level", &["L2::evict_normal"], false)]),

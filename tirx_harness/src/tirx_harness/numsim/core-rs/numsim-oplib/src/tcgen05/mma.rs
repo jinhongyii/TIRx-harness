@@ -19,10 +19,9 @@ use crate::types::{OpError, OpResult};
 
 /// The dense tail's numeric choice: banked core when A came from TMEM in a
 /// multi-bank layout, else the plain core (legacy `RawMmaTail::run{,_with}`).
+/// `shape` is `(m, n, k)`.
 pub fn mma_dense_tail(
-    m: usize,
-    n: usize,
-    k: usize,
+    (m, n, k): (usize, usize, usize),
     a_values: &[f32],
     b_values: &[f32],
     input_d: Option<(&[f32], f32)>,
@@ -44,6 +43,8 @@ pub fn mma_dense_tail(
     }
 }
 
+/// The two dense indices (0..4, low code bits first) a 2:4 metadata nibble selects;
+/// errors on codes PTX leaves undefined.
 pub fn sparse_2of4_indices(code: u8) -> OpResult<[usize; 2]> {
     if !matches!(code, 0x4 | 0x8 | 0xc | 0x9 | 0xd | 0x6 | 0xe) {
         return Err(OpError::message(format!(
@@ -63,7 +64,9 @@ pub fn expand_sparse_2of4<Scalar: Copy + Default>(
 ) -> OpResult<Vec<Scalar>> {
     let banks = layout.packed_a_banks();
     let packed_banks = packed.len() / (rows * (k / 2));
-    if !matches!(packed_banks, 1) && packed_banks != banks || packed.len() % (rows * (k / 2)) != 0 {
+    if !matches!(packed_banks, 1) && packed_banks != banks
+        || !packed.len().is_multiple_of(rows * (k / 2))
+    {
         return Err(OpError::message("sparse 2:4 packed A has the wrong shape"));
     }
     let mut dense = vec![Scalar::default(); banks * rows * k];
@@ -142,7 +145,7 @@ pub fn sparse_float_mma(
     let banks = layout.packed_a_banks();
     let bank_columns = n / banks;
     let a_banks = a.len() / (m * packed_k);
-    if a.len() % (m * packed_k) != 0 || !(a_banks == 1 || a_banks == banks) {
+    if !a.len().is_multiple_of(m * packed_k) || !(a_banks == 1 || a_banks == banks) {
         return Err(OpError::message(
             "sparse floating MMA packed A has the wrong shape",
         ));
@@ -256,7 +259,7 @@ mod tests {
         let layout = TileGemmOperandLayout::new(64, 3, 0, 3);
         let descriptor = TileGemmBf16Descriptor::new(64, 64, 64, layout, layout, true);
         let mut snapshot = vec![0_u8; 64 * 64 * 2];
-        for (i, pair) in snapshot.chunks_exact_mut(2).enumerate() {
+        for (i, pair) in snapshot.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             pair.copy_from_slice(&crate::cvt::f32_to_bf16_bits((i % 3) as f32).to_le_bytes());
         }
         let out =

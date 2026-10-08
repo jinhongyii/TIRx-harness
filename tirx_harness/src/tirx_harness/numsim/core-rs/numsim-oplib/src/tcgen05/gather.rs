@@ -13,13 +13,14 @@
 //! of per-CTA results in `first_cta..first_cta + cta_group` order. Closures:
 //! - `read_shared(offset, buf)`: bytes at a window-relative offset (that CTA);
 //! - `read_tmem_byte(lane, column, byte)` / `read_tmem_word(lane, column)`.
+//!
 //! Closures are invoked in exactly the legacy read order.
 
 use super::layouts::{
-    block_scale_address, dense_tmem_cells, lut_b_location, packed_tmem_a_cells, scale_chunk,
-    scale_columns, sparse_mxf4_metadata_location, DenseTmemLayout,
+    dense_tmem_cells, lut_b_location, packed_tmem_a_cells, scale_columns,
+    sparse_mxf4_metadata_location, DenseTmemLayout,
 };
-use super::narrow::{tf32_payload_to_f32, CellDtype, NarrowFormat};
+use super::narrow::{tf32_payload_to_f32, NarrowFormat};
 use super::scale::{decode_ue8m0_scale, read_block_scale, ScaleDecoder};
 use super::smem_desc::{
     b16_matrix_byte_offset, byte8_matrix_byte_offset, lut_b_row_accesses, masked_row,
@@ -118,52 +119,6 @@ pub fn gather_mxf4_rows(
         }
     }
     Ok(values)
-}
-
-/// `(first_column, column_count)` of the scale window one CTA of a CTA2 FP4
-/// gather must own (legacy validation in `raw_tcgen05_gather_mxf4_cta2_matrix`).
-#[allow(clippy::too_many_arguments)]
-pub fn mxf4_cta2_scale_column_window(
-    scale_address: u32,
-    scale_id: usize,
-    k: usize,
-    block_elements: usize,
-    rows_per_cta: usize,
-    scale_rows_are_joint: bool,
-    target_offset: usize,
-    lanes_per_column: usize,
-) -> OpResult<(usize, usize)> {
-    let atom_bytes = block_elements / 2;
-    let scale_rows = rows_per_cta * if scale_rows_are_joint { 2 } else { 1 };
-    let first_scale_row = if scale_rows_are_joint {
-        target_offset
-            .checked_mul(rows_per_cta)
-            .ok_or_else(|| OpError::message("raw mxf4 cta2 scale row overflow"))?
-    } else {
-        0
-    };
-    let last_scale_row = first_scale_row
-        .checked_add(rows_per_cta - 1)
-        .ok_or_else(|| OpError::message("raw mxf4 cta2 scale row overflow"))?;
-    let (_, scale_base_column) = block_scale_address(scale_address)?;
-    let first_scale_column = scale_base_column
-        .checked_add(first_scale_row / lanes_per_column)
-        .ok_or_else(|| OpError::message("raw mxf4 cta2 scale column overflow"))?;
-    let (last_address, _) = scale_chunk(
-        scale_address,
-        scale_id,
-        k / (2 * atom_bytes) - 1,
-        scale_rows,
-        lanes_per_column,
-    )?;
-    let (_, last_base_column) = block_scale_address(last_address)?;
-    let last_scale_column = last_base_column
-        .checked_add(last_scale_row / lanes_per_column)
-        .ok_or_else(|| OpError::message("raw mxf4 cta2 scale column overflow"))?;
-    Ok((
-        first_scale_column,
-        last_scale_column - first_scale_column + 1,
-    ))
 }
 
 /// Sparse `mxf4` UE8M0 rows: packed A (64 columns) or dense B (128 columns).
@@ -308,7 +263,7 @@ pub fn validate_f8_gather(
     transpose: bool,
 ) -> OpResult<()> {
     if !matches!(cta_group, 1 | 2)
-        || k_extent % 16 != 0
+        || !k_extent.is_multiple_of(16)
         || (transpose && format.format().width_bits != 8)
     {
         return Err(OpError::message(
@@ -481,16 +436,15 @@ pub fn merge_cta2_packed_a<Scalar: Copy>(
 }
 
 /// Geometry check and TMEM column needs of `raw_tcgen05_gather_scaled_tmem_a`:
-/// returns `(rows_per_cta, layout, scale_columns)`.
+/// returns `(rows_per_cta, layout, scale_columns)`. `scale` is the scale
+/// vector `(scale_id, block_elements, lanes_per_column)`.
 pub fn scaled_tmem_a_geometry(
     m: usize,
     k: usize,
     columns: usize,
     cta_group: usize,
     groups_fit_cluster: bool,
-    scale_id: usize,
-    block_elements: usize,
-    lanes_per_column: usize,
+    (scale_id, block_elements, lanes_per_column): (usize, usize, usize),
 ) -> OpResult<(usize, DenseTmemLayout, usize)> {
     let rows = m / cta_group;
     if !(rows == 128 || (cta_group == 2 && rows == 64))
@@ -662,29 +616,6 @@ pub fn cta2_window_cells(
         }
     }
     Ok(cells)
-}
-
-/// `(base_lane, base_col)` of a block-scaled whole-lane destination (legacy
-/// `RawMmaWindow::scatter_lane_cells` bounds check).
-pub fn lane_cells_window(destination_address: u32, m: usize) -> OpResult<(usize, usize)> {
-    let (base_lane, base_col) = super::layouts::tmem_address(destination_address, 0, 0)?;
-    let end_lane = base_lane
-        .checked_add(m)
-        .ok_or_else(|| OpError::message("raw mxf4 destination lane overflow"))?;
-    if end_lane > 128 {
-        return Err(OpError::message(format!(
-            "raw mxf4 destination lanes [{base_lane}, {end_lane}) exceed 128 TMEM lanes"
-        )));
-    }
-    Ok((base_lane, base_col))
-}
-
-/// Encode one accumulator row for a whole-lane store.
-pub fn encode_lane_row(cell_dtype: CellDtype, row_values: &[f32]) -> Vec<[u8; 4]> {
-    row_values
-        .iter()
-        .map(|&value| cell_dtype.encode(value))
-        .collect()
 }
 
 #[cfg(test)]

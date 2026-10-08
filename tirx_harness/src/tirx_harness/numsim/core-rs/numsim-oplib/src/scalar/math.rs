@@ -102,23 +102,39 @@ fn quiet64(x: f64) -> f64 {
 
 /// `tirx.erf` on binary32.
 pub fn erf_f32(x: f32) -> f32 {
-    if x.is_nan() { quiet32(x) } else { libm::erff(x) }
+    if x.is_nan() {
+        quiet32(x)
+    } else {
+        libm::erff(x)
+    }
 }
 
 /// `tirx.erf` on binary64.
 pub fn erf_f64(x: f64) -> f64 {
-    if x.is_nan() { quiet64(x) } else { libm::erf(x) }
+    if x.is_nan() {
+        quiet64(x)
+    } else {
+        libm::erf(x)
+    }
 }
 
 /// `tirx.exp10` on binary32: computed in binary64 (`libm::exp10`) and
 /// rounded once (`libm::exp10f` is off by more than one ulp near -4).
 pub fn exp10_f32(x: f32) -> f32 {
-    if x.is_nan() { quiet32(x) } else { libm::exp10(f64::from(x)) as f32 }
+    if x.is_nan() {
+        quiet32(x)
+    } else {
+        libm::exp10(f64::from(x)) as f32
+    }
 }
 
 /// `tirx.exp10` on binary64.
 pub fn exp10_f64(x: f64) -> f64 {
-    if x.is_nan() { quiet64(x) } else { libm::exp10(x) }
+    if x.is_nan() {
+        quiet64(x)
+    } else {
+        libm::exp10(x)
+    }
 }
 
 /// `tirx.log10` on binary32: `log10(-0) = log10(+0) = -inf`, negative ->
@@ -150,10 +166,18 @@ pub fn log10_f64(x: f64) -> f64 {
 
 /// `tirx.nearbyint` on binary32 (ties to even; signed zeros kept).
 pub fn nearbyint_f32(x: f32) -> f32 {
-    if x.is_nan() { quiet32(x) } else { x.round_ties_even() }
+    if x.is_nan() {
+        quiet32(x)
+    } else {
+        x.round_ties_even()
+    }
 }
 
 /// `tirx.nearbyint` on binary64.
 pub fn nearbyint_f64(x: f64) -> f64 {
-    if x.is_nan() { quiet64(x) } else { x.round_ties_even() }
+    if x.is_nan() {
+        quiet64(x)
+    } else {
+        x.round_ties_even()
+    }
 }

@@ -44,6 +44,7 @@ pub enum BulkReduction {
 }
 
 impl BulkReduction {
+    /// Bytes one element of this reduction occupies (2 for f16/bf16, 4 for 32-bit, 8 for 64-bit).
     pub fn byte_len(self) -> usize {
         match self {
             Self::AddF16

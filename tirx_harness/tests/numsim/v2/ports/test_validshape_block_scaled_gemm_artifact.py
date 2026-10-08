@@ -33,7 +33,6 @@ on before the read (``tcgen05.mma``/``tcgen05.cp`` are asynchronous).
 from __future__ import annotations
 
 import numpy as np
-import pytest
 from tvm import tirx
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
@@ -42,7 +41,7 @@ from tvm.backend.cuda.tile_primitive.gemm_async.tcgen05 import sf_smem_layout, s
 from tvm.backend.cuda.tile_primitive.tma_utils import SwizzleMode, mma_shared_layout
 from tvm_ffi import structural_map
 
-from tests.numsim.v2.checkers._runnable import requires_v2_engine, v2_gap
+from tests.numsim.v2.checkers._runnable import requires_v2_engine
 from tirx_harness.numsim import v2
 
 pytestmark = requires_v2_engine
@@ -59,14 +58,6 @@ _MXF8_SF_TMEM_K4 = sf_tmem_layout(128, SF_K=2, sf_per_mma=1, sf_reuse=2)
 _MXF8_SF_TMEM_K8_VIEW = sf_tmem_layout(128, SF_K=4, sf_per_mma=1, sf_reuse=2)
 _NVFP4_SF_SMEM = sf_smem_layout(128, SF_K=4, sf_per_mma=4)
 _NVFP4_SF_TMEM = sf_tmem_layout(128, SF_K=4, sf_per_mma=4)
-
-_SWIZZLE_GAP = (
-    "v2 gemm_async over SWIZZLE_32B/128B shared operands filled by Tx.copy reads K "
-    "elements from the wrong 16-byte chunk (see test_validshape_gemm_async_artifact.py; "
-    "the SWIZZLE_NONE dense copy matches numpy). Observed: 25-91% of outputs differ "
-    "from the scaled-matmul oracle; the interleaved test, whose operands are uniform "
-    "(swizzle-invariant), passes, so the K-extent-4 SF path itself matches"
-)
 
 
 # -- oracle helpers (copied from the legacy module) ---------------------------
@@ -472,7 +463,6 @@ def test_block_scaled_gemm_normalizes_instruction_kind_and_shape() -> None:
     }
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_fp8_block_scaled_gemm_derives_scale_columns_from_each_invocation():
     """Replaces ``tests/numsim/integration/test_block_scaled_gemm_artifact.py::test_fp8_block_scaled_gemm_derives_scale_columns_from_each_invocation``.
 
@@ -506,7 +496,6 @@ def test_fp8_block_scaled_gemm_derives_scale_columns_from_each_invocation():
     np.testing.assert_array_equal(result.outputs["output"], 2 * expected_once)
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_repeated_block_scaled_callsites_inside_a_loop_do_not_share_history():
     """Replaces ``tests/numsim/integration/test_block_scaled_gemm_artifact.py::test_repeated_block_scaled_callsites_inside_a_loop_do_not_share_history``.
 
@@ -568,7 +557,6 @@ def test_interleaved_block_scaled_calls_are_independent_of_prior_calls():
     np.testing.assert_array_equal(result.outputs["output"], first + 2 * second)
 
 
-@v2_gap(_SWIZZLE_GAP)
 def test_block_scale_region_min_selects_the_physical_scale_coordinates():
     """Replaces ``tests/numsim/integration/test_block_scaled_gemm_artifact.py::test_block_scale_region_min_selects_the_physical_scale_coordinates``.
 

@@ -146,7 +146,14 @@ fn fma_pinned<T: PinnedFma>(a: T, b: T, c: T) -> T {
 /// SIMD lanes leave a NaN's payload to the instruction's operand order:
 /// recompute every NaN output's chain with the pinned scalar FMA from its
 /// initial accumulator (a NaN, once produced, stays NaN along the chain).
-fn repin_nan_outputs<T: PinnedFma>(n: usize, k: usize, a_values: &[T], b_transposed: &[T], initial: &[T], output: &mut [T]) {
+fn repin_nan_outputs<T: PinnedFma>(
+    n: usize,
+    k: usize,
+    a_values: &[T],
+    b_transposed: &[T],
+    initial: &[T],
+    output: &mut [T],
+) {
     for (index, value) in output.iter_mut().enumerate() {
         if !value.nan() {
             continue;
@@ -154,12 +161,15 @@ fn repin_nan_outputs<T: PinnedFma>(n: usize, k: usize, a_values: &[T], b_transpo
         let (row, column) = (index / n, index % n);
         let mut accumulator = initial[index];
         for inner in 0..k {
-            accumulator = fma_pinned(a_values[row * k + inner], b_transposed[inner * n + column], accumulator);
+            accumulator = fma_pinned(
+                a_values[row * k + inner],
+                b_transposed[inner * n + column],
+                accumulator,
+            );
         }
         *value = accumulator;
     }
 }
-
 
 fn fma_f32_abt_increasing_k_scalar(
     m: usize,
@@ -206,9 +216,9 @@ unsafe fn fma_tile_avx512<const R: usize, const C: usize>(
     // over shape-validated slices.
     unsafe {
         let mut accumulators = [[_mm512_setzero_ps(); C]; R];
-        for r in 0..R {
-            for c in 0..C {
-                accumulators[r][c] =
+        for (r, row_accumulators) in accumulators.iter_mut().enumerate() {
+            for (c, accumulator) in row_accumulators.iter_mut().enumerate() {
+                *accumulator =
                     _mm512_loadu_ps(output.as_ptr().add((row + r) * n + column + c * LANES));
             }
         }
@@ -224,11 +234,11 @@ unsafe fn fma_tile_avx512<const R: usize, const C: usize>(
                 }
             }
         }
-        for r in 0..R {
-            for c in 0..C {
+        for (r, row_accumulators) in accumulators.iter().enumerate() {
+            for (c, &accumulator) in row_accumulators.iter().enumerate() {
                 _mm512_storeu_ps(
                     output.as_mut_ptr().add((row + r) * n + column + c * LANES),
-                    accumulators[r][c],
+                    accumulator,
                 );
             }
         }
@@ -250,7 +260,8 @@ fn fma_scalar_columns(
         for column in columns.clone() {
             let mut accumulator = output[row * n + column];
             for inner in 0..k {
-                accumulator = a_values[row * k + inner].mul_add(b_transposed[inner * n + column], accumulator);
+                accumulator = a_values[row * k + inner]
+                    .mul_add(b_transposed[inner * n + column], accumulator);
             }
             output[row * n + column] = accumulator;
         }
@@ -409,7 +420,6 @@ fn fma_f32_abt_increasing_k_dispatch(
     b_transposed: &[f32],
     output: &mut [f32],
 ) {
-
     #[cfg(target_arch = "x86_64")]
     {
         // AVX-512 first: every AVX-512F host also reports AVX2, so the
@@ -558,7 +568,6 @@ fn fma_f64_abt_increasing_k_dispatch(
     b_transposed: &[f64],
     output: &mut [f64],
 ) {
-
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
@@ -791,7 +800,8 @@ mod tests {
             for column in 0..n {
                 let mut accumulator = initial[row * n + column];
                 for inner in 0..k {
-                    accumulator = a_values[row * k + inner].mul_add(b_transposed[inner * n + column], accumulator);
+                    accumulator = a_values[row * k + inner]
+                        .mul_add(b_transposed[inner * n + column], accumulator);
                 }
                 expected.push(accumulator.to_bits());
             }
@@ -873,9 +883,17 @@ mod pinned_nan_tests {
                 for col in 0..n {
                     let mut acc = init[row * n + col];
                     for inner in 0..k {
-                        acc = crate::scalar::host_fma_f32(a[row * k + inner], b[inner * n + col], acc);
+                        acc = crate::scalar::host_fma_f32(
+                            a[row * k + inner],
+                            b[inner * n + col],
+                            acc,
+                        );
                     }
-                    assert_eq!(fast[row * n + col].to_bits(), acc.to_bits(), "f32 {m}x{n}x{k} ({row}, {col})");
+                    assert_eq!(
+                        fast[row * n + col].to_bits(),
+                        acc.to_bits(),
+                        "f32 {m}x{n}x{k} ({row}, {col})"
+                    );
                 }
             }
             let a: Vec<f64> = a.iter().map(|&v| f64::from(v)).collect();
@@ -887,9 +905,17 @@ mod pinned_nan_tests {
                 for col in 0..n {
                     let mut acc = init[row * n + col];
                     for inner in 0..k {
-                        acc = crate::scalar::host_fma_f64(a[row * k + inner], b[inner * n + col], acc);
+                        acc = crate::scalar::host_fma_f64(
+                            a[row * k + inner],
+                            b[inner * n + col],
+                            acc,
+                        );
                     }
-                    assert_eq!(fast[row * n + col].to_bits(), acc.to_bits(), "f64 {m}x{n}x{k} ({row}, {col})");
+                    assert_eq!(
+                        fast[row * n + col].to_bits(),
+                        acc.to_bits(),
+                        "f64 {m}x{n}x{k} ({row}, {col})"
+                    );
                 }
             }
         }

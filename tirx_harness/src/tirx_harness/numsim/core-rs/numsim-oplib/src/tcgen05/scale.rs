@@ -18,10 +18,14 @@ use crate::types::{OpError, OpResult};
 /// How one block-scale byte in TMEM becomes the factor the MMA multiplies by.
 pub type ScaleDecoder = fn(u8) -> OpResult<f32>;
 
+/// UE8M0 block scale: exactly `2^(bits - 127)` (code 0 is the f32 subnormal `2^-127`);
+/// `0xff` is NaN (`f32::NAN`). Never errors.
 pub fn decode_ue8m0_scale(bits: u8) -> OpResult<f32> {
     Ok(float8_e8m0fnu_bits_to_f32(bits))
 }
 
+/// UE5M3 (unsigned, NaN-only specials) block scale, exact including subnormals; the
+/// all-ones code is NaN (`f32::NAN`). Never errors.
 pub fn decode_ue5m3_scale(bits: u8) -> OpResult<f32> {
     Ok(narrow_float_bits_to_f32_checked(bits, FLOAT8_UE5M3).unwrap_or(f32::NAN))
 }
@@ -60,6 +64,9 @@ pub fn read_block_scale(
     decode(read_byte(lane, column, byte)?)
 }
 
+/// `(locations (lane, column) in read order, lane_end, column_end)`.
+pub type ScaleLocations = (Vec<(usize, usize)>, usize, usize);
+
 /// Every replicated scale location of `rows` rows, in read order, plus the
 /// `(lane_end, column_end)` rectangle legacy validates before reading.
 pub fn mxf8_scale_locations(
@@ -67,7 +74,7 @@ pub fn mxf8_scale_locations(
     scale_id: usize,
     rows: usize,
     layout: ScaleLayout,
-) -> OpResult<(Vec<(usize, usize)>, usize, usize)> {
+) -> OpResult<ScaleLocations> {
     if scale_id >= 4 {
         return Err(OpError::message("raw TCGEN scale byte is outside TMEM"));
     }

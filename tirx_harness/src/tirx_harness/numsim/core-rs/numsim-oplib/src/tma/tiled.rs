@@ -62,7 +62,8 @@ pub struct TransferTemplate {
 
 fn push_merged(runs: &mut Vec<ByteRun>, run: ByteRun, overflow: &'static str) -> OpResult<()> {
     if let Some(previous) = runs.last_mut() {
-        let bytes_contiguous = previous.byte_offset.checked_add(previous.byte_len) == Some(run.byte_offset);
+        let bytes_contiguous =
+            previous.byte_offset.checked_add(previous.byte_len) == Some(run.byte_offset);
         let payload_contiguous =
             previous.payload_offset.checked_add(previous.byte_len) == Some(run.payload_offset);
         if bytes_contiguous && payload_contiguous {
@@ -78,6 +79,9 @@ fn push_merged(runs: &mut Vec<ByteRun>, run: ByteRun, overflow: &'static str) ->
 }
 
 impl TransferTemplate {
+    /// Precompute the per-row byte runs and swizzle phases of a tiled TMA transfer from its
+    /// traversal shape, strides, element width, FP4 layout and swizzle. No numerics; errors on
+    /// overflow or invalid geometry.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         traversal_shape: &[usize],
@@ -147,7 +151,10 @@ impl TransferTemplate {
         }
         let mut source_row_order = (0..rows.len()).collect::<Vec<_>>();
         source_row_order.sort_unstable_by_key(|row| {
-            (rows[*row].global_outer_byte_delta, rows[*row].payload_offset)
+            (
+                rows[*row].global_outer_byte_delta,
+                rows[*row].payload_offset,
+            )
         });
 
         let phase_count = swizzle_bytes.map_or(1, |bytes| {
@@ -186,11 +193,10 @@ impl TransferTemplate {
                             geometry.inner_row_bytes,
                             absolute_base,
                         )?;
-                        byte_extent = byte_extent.max(
-                            byte_offset
-                                .checked_add(atom_bytes)
-                                .ok_or_else(|| OpError::message("TensorMap shared extent overflow"))?,
-                        );
+                        byte_extent =
+                            byte_extent.max(byte_offset.checked_add(atom_bytes).ok_or_else(
+                                || OpError::message("TensorMap shared extent overflow"),
+                            )?);
                         push_merged(
                             &mut runs,
                             ByteRun {
@@ -284,11 +290,11 @@ impl TransferTemplate {
             });
         }
         let mut origin_outer_byte_offset = 0_i128;
-        for axis in 1..origin.len() {
+        for (&coordinate, &stride) in origin.iter().skip(1).zip(&map.global_strides) {
             origin_outer_byte_offset = origin_outer_byte_offset
                 .checked_add(
-                    i128::from(origin[axis])
-                        .checked_mul(map.global_strides[axis - 1] as i128)
+                    i128::from(coordinate)
+                        .checked_mul(stride as i128)
                         .ok_or_else(|| OpError::message("TensorMap stride offset overflow"))?,
                 )
                 .ok_or_else(|| OpError::message("TensorMap byte offset overflow"))?;
@@ -298,12 +304,13 @@ impl TransferTemplate {
         for &row_index in self.source_row_order.iter() {
             let row = &self.rows[row_index];
             let mut in_bounds = true;
-            for axis in 1..origin.len() {
-                let coordinate = origin[axis]
+            for (axis, &start) in origin.iter().enumerate().skip(1) {
+                let coordinate = start
                     .checked_add(row.coordinate_deltas[axis - 1])
                     .ok_or_else(|| OpError::message("TensorMap coordinate overflow"))?;
                 if coordinate < 0
-                    || usize::try_from(coordinate).map_or(true, |value| value >= map.global_shape[axis])
+                    || usize::try_from(coordinate)
+                        .map_or(true, |value| value >= map.global_shape[axis])
                 {
                     in_bounds = false;
                     break;
@@ -357,13 +364,9 @@ impl G2sPlan {
         u64::try_from(self.payload_len)
             .map_err(|_| OpError::message("raw TMA delivered-byte count overflow"))
     }
-
-    /// Bytes past the destination pointer that the plan writes.
-    pub fn destination_extent(&self) -> usize {
-        runs_extent(&self.destination_runs)
-    }
 }
 
+/// One past the last byte any run covers (0 for no runs).
 pub fn runs_extent(runs: &[ByteRun]) -> usize {
     runs.iter()
         .map(|run| run.byte_offset + run.byte_len)
@@ -374,7 +377,10 @@ pub fn runs_extent(runs: &[ByteRun]) -> usize {
 /// Shared checks of every global-to-shared plan (legacy `raw_tma_g2c_layout`
 /// minus lane/pointer/multicast plumbing). Multicast masks are validated by
 /// [`super::bulk::multicast_target_ctas`].
-pub(crate) fn g2s_layout_checks(map: &TensorMapLayout, inner_origin: i64) -> OpResult<TensorMapGeometry> {
+pub(crate) fn g2s_layout_checks(
+    map: &TensorMapLayout,
+    inner_origin: i64,
+) -> OpResult<TensorMapGeometry> {
     let geometry = map.geometry()?;
     if let Some(required_alignment) = map.fp4_origin_alignment()? {
         if inner_origin.rem_euclid(required_alignment) != 0 {
@@ -542,13 +548,18 @@ pub fn materialize_g2s_payload(
             ));
         }
         for unit in payload.chunks_exact_mut(unit_bytes) {
-            for chunk in unit.chunks_exact_mut(2) {
-                chunk.copy_from_slice(&PTX_OOB_NAN.to_le_bytes());
+            for chunk in unit.as_chunks_mut::<2>().0 {
+                *chunk = PTX_OOB_NAN.to_le_bytes();
             }
         }
     }
     for run in source_runs {
-        let source = slice_at(global, run.byte_offset, run.byte_len, "TensorMap global source")?;
+        let source = slice_at(
+            global,
+            run.byte_offset,
+            run.byte_len,
+            "TensorMap global source",
+        )?;
         payload[run.payload_offset..run.payload_offset + run.byte_len].copy_from_slice(source);
     }
     let reported = copy_report_matches_runs(
@@ -567,11 +578,11 @@ pub fn materialize_g2s_payload(
         TensorMapElementType::Tf32 | TensorMapElementType::Tf32Ftz
     ) {
         for run in source_runs {
-            for element in
-                payload[run.payload_offset..run.payload_offset + run.byte_len].chunks_exact_mut(4)
+            for element in payload[run.payload_offset..run.payload_offset + run.byte_len]
+                .as_chunks_mut::<4>()
+                .0
             {
-                let raw: [u8; 4] = element.try_into().expect("four-byte TMA float element");
-                element.copy_from_slice(&tma_f32_to_tf32(f32::from_le_bytes(raw)).to_le_bytes());
+                *element = tma_f32_to_tf32(f32::from_le_bytes(*element)).to_le_bytes();
             }
         }
     }
@@ -603,7 +614,12 @@ pub fn execute_g2s(
 }
 
 /// Copy `payload` bytes to `memory[base + run.byte_offset ..]` for each run.
-pub fn scatter_payload(memory: &mut [u8], base: usize, runs: &[ByteRun], payload: &[u8]) -> OpResult<()> {
+pub fn scatter_payload(
+    memory: &mut [u8],
+    base: usize,
+    runs: &[ByteRun],
+    payload: &[u8],
+) -> OpResult<()> {
     for run in runs {
         let offset = base
             .checked_add(run.byte_offset)
@@ -615,14 +631,23 @@ pub fn scatter_payload(memory: &mut [u8], base: usize, runs: &[ByteRun], payload
 }
 
 /// Gather `memory[base + run.byte_offset ..]` into a payload of `payload_len`.
-pub fn gather_payload(memory: &[u8], base: usize, runs: &[ByteRun], payload_len: usize) -> OpResult<Vec<u8>> {
+pub fn gather_payload(
+    memory: &[u8],
+    base: usize,
+    runs: &[ByteRun],
+    payload_len: usize,
+) -> OpResult<Vec<u8>> {
     let mut payload = vec![0_u8; payload_len];
     for run in runs {
         let offset = base
             .checked_add(run.byte_offset)
             .ok_or_else(|| OpError::message("TensorMap shared offset overflow"))?;
-        payload[run.payload_offset..run.payload_offset + run.byte_len]
-            .copy_from_slice(slice_at(memory, offset, run.byte_len, "TensorMap source")?);
+        payload[run.payload_offset..run.payload_offset + run.byte_len].copy_from_slice(slice_at(
+            memory,
+            offset,
+            run.byte_len,
+            "TensorMap source",
+        )?);
     }
     Ok(payload)
 }
@@ -707,11 +732,7 @@ pub struct S2gPlan {
     pub payload_len: usize,
 }
 
-impl S2gPlan {
-    pub fn source_extent(&self) -> usize {
-        runs_extent(&self.source_runs)
-    }
-}
+impl S2gPlan {}
 
 /// Plan a tiled `cp.async.bulk.tensor` / `cp.reduce.async.bulk.tensor`
 /// shared-to-global transfer.
@@ -790,7 +811,8 @@ pub fn apply_s2g_copy(global: &mut [u8], plan: &S2gPlan, payload: &[u8]) -> OpRe
     scatter_payload(global, 0, &plan.destination_runs, payload)?;
     for fragment in &plan.destination_bits {
         let mask = fragment.mask << fragment.target_shift;
-        let source_bits = (payload[fragment.payload_offset] >> fragment.source_shift) & fragment.mask;
+        let source_bits =
+            (payload[fragment.payload_offset] >> fragment.source_shift) & fragment.mask;
         let byte = slice_at_mut(global, fragment.byte_offset, 1, "TensorMap destination")?;
         byte[0] = (byte[0] & !mask) | ((source_bits << fragment.target_shift) & mask);
     }
@@ -799,7 +821,12 @@ pub fn apply_s2g_copy(global: &mut [u8], plan: &S2gPlan, payload: &[u8]) -> OpRe
 
 /// Execute a plain store plan over byte slices (`shared` holds the source
 /// CTA's shared bytes with the source pointer at `shared_offset`).
-pub fn execute_s2g_copy(plan: &S2gPlan, shared: &[u8], shared_offset: usize, global: &mut [u8]) -> OpResult<()> {
+pub fn execute_s2g_copy(
+    plan: &S2gPlan,
+    shared: &[u8],
+    shared_offset: usize,
+    global: &mut [u8],
+) -> OpResult<()> {
     let payload = gather_payload(shared, shared_offset, &plan.source_runs, plan.payload_len)?;
     apply_s2g_copy(global, plan, &payload)
 }

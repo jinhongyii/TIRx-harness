@@ -33,6 +33,7 @@ impl WarpMaskExt for WarpMask {
 pub struct OpError(pub String);
 
 impl OpError {
+    /// Build an error carrying `message` verbatim.
     pub fn message(message: impl Into<String>) -> Self {
         Self(message.into())
     }

@@ -42,6 +42,7 @@ pub enum Fidelity {
 }
 
 impl Fidelity {
+    /// The SUPPORTED_OPS.md spelling of this fidelity.
     pub const fn as_str(self) -> &'static str {
         match self {
             Fidelity::Modeled => "modeled",
@@ -99,7 +100,8 @@ fn cell(value: &str) -> String {
     value.replace('|', "\\|").replace('\n', " ")
 }
 
-const TILE_PREAMBLE: &str = "Every warp-, warpgroup-, or CTA-scoped tile call validates complete dynamic \
+const TILE_PREAMBLE: &str =
+    "Every warp-, warpgroup-, or CTA-scoped tile call validates complete dynamic \
 participation in its declared execution scope, including register-only \
 lowerings with no completion barrier.";
 
@@ -170,7 +172,10 @@ registered operations; GPU parity is tested where the required hardware is avail
         lines.push("| Operation | Fidelity | Notes |".into());
         lines.push("| --- | --- | --- |".into());
     }
-    for info in OPS.iter().filter(|info| info.section == Section::TilePrimitive) {
+    for info in OPS
+        .iter()
+        .filter(|info| info.section == Section::TilePrimitive)
+    {
         lines.push(format!(
             "| {} | {} | {} |{}",
             cell(&format!("`{}`", info.name)),
@@ -189,7 +194,10 @@ mod tests {
 
     #[test]
     fn render_matches_legacy_supported_ops_byte_for_byte() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../engine-rs/SUPPORTED_OPS.md");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../engine-rs/SUPPORTED_OPS.md"
+        );
         let Ok(legacy) = std::fs::read_to_string(path) else {
             // The legacy engine is deleted in migration step 5; the table is the source then.
             return;
@@ -217,7 +225,11 @@ mod tests {
         for binding in bindings() {
             assert!(!binding.function.is_empty());
             if binding.op.starts_with("tirx.") {
-                assert!(op(binding.op).is_some(), "binding to unknown op {}", binding.op);
+                assert!(
+                    op(binding.op).is_some(),
+                    "binding to unknown op {}",
+                    binding.op
+                );
             }
         }
         let rendered = render_supported_ops_with_bindings(LEGACY_ABI_VERSION);

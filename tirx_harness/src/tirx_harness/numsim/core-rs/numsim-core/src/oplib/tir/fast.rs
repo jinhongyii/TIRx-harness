@@ -204,9 +204,12 @@ macro_rules! per_int_type {
     };
 }
 
+/// (decode, encode) of a 16-bit float format.
+type HalfCodec = (fn(u16) -> f32, fn(f32) -> u16);
+
 /// f16/bf16 codec pair (the legacy codecs the generic path uses).
 #[inline(always)]
-fn half_codec(d: Dtype) -> (fn(u16) -> f32, fn(f32) -> u16) {
+fn half_codec(d: Dtype) -> HalfCodec {
     if d == Dtype::F16 {
         (cvt::fp16_bits_to_f32, cvt::f32_to_fp16_bits)
     } else {

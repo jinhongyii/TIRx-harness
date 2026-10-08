@@ -573,7 +573,6 @@ mod codec_tests {
                 assert_eq!(f32_to_fp16_bits(fp16_bits_to_f32(bits)), bits);
             }
         }
-
     }
 
     #[test]
@@ -987,8 +986,16 @@ mod codec_tests {
         assert!(fp16_bits_to_f32(encoded_nan).is_nan());
 
         let source = vec![1.0, -2.0, 0.5];
-        let encoded = source.iter().copied().map(f32_to_fp16_bits).collect::<Vec<_>>();
-        let decoded = encoded.iter().copied().map(fp16_bits_to_f32).collect::<Vec<_>>();
+        let encoded = source
+            .iter()
+            .copied()
+            .map(f32_to_fp16_bits)
+            .collect::<Vec<_>>();
+        let decoded = encoded
+            .iter()
+            .copied()
+            .map(fp16_bits_to_f32)
+            .collect::<Vec<_>>();
         assert_eq!(encoded, vec![0x3c00, 0xc000, 0x3800]);
         assert_eq!(decoded, source);
     }
@@ -1034,8 +1041,16 @@ mod codec_tests {
         assert!(bf16_bits_to_f32(encoded_nan).is_nan());
 
         let source = vec![1.0, -2.0, 0.5];
-        let encoded = source.iter().copied().map(f32_to_bf16_bits).collect::<Vec<_>>();
-        let decoded = encoded.iter().copied().map(bf16_bits_to_f32).collect::<Vec<_>>();
+        let encoded = source
+            .iter()
+            .copied()
+            .map(f32_to_bf16_bits)
+            .collect::<Vec<_>>();
+        let decoded = encoded
+            .iter()
+            .copied()
+            .map(bf16_bits_to_f32)
+            .collect::<Vec<_>>();
         assert_eq!(encoded, vec![0x3f80, 0xc000, 0x3f00]);
         assert_eq!(decoded, source);
     }
@@ -1049,7 +1064,5 @@ mod codec_tests {
                 assert_eq!(f32_to_bf16_bits(bf16_bits_to_f32(bits)), bits);
             }
         }
-
     }
 }
-

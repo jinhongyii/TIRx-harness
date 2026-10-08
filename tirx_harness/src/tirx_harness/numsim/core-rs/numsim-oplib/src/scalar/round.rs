@@ -16,7 +16,12 @@ pub(crate) fn compare_f32_to_exact_fma(rounded: f32, exact: ExactFmaValue) -> Or
     ExactFmaValue::addend(rounded).compare(exact)
 }
 
-pub(crate) fn round_exact_zero_sum_f32(rounded: f32, lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
+pub(crate) fn round_exact_zero_sum_f32(
+    rounded: f32,
+    lhs: f32,
+    rhs: f32,
+    mode: F32RoundingMode,
+) -> f32 {
     debug_assert_eq!(rounded, 0.0);
     let both_positive_zero = lhs.to_bits() == 0 && rhs.to_bits() == 0;
     if mode == F32RoundingMode::Down && !both_positive_zero {
@@ -107,6 +112,9 @@ pub(crate) fn round_f32_candidate(
     }
 }
 
+/// PTX `add{.rnd}.f32` without `.ftz`: binary32 sum rounded by `mode` (RN/RZ/RM/RP),
+/// corrected from the exact sum. Subnormals kept; NaN result pinned by
+/// [`pin_nan2_f32`] (first NaN operand quieted, else `0xffc0_0000`).
 pub fn add_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
     let rounded = pin_nan2_f32(lhs, rhs, lhs + rhs);
     if mode == F32RoundingMode::Nearest || !lhs.is_finite() || !rhs.is_finite() {
@@ -116,6 +124,8 @@ pub fn add_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
     round_f32_from_exact_sum(rounded, exact, lhs, rhs, mode)
 }
 
+/// PTX `sub{.rnd}.f32` without `.ftz`: binary32 `lhs - rhs` rounded by `mode`
+/// (RN/RZ/RM/RP). Subnormals kept; NaN result pinned by [`pin_nan2_f32`].
 pub fn sub_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
     let rounded = pin_nan2_f32(lhs, rhs, lhs - rhs);
     if mode == F32RoundingMode::Nearest || !lhs.is_finite() || !rhs.is_finite() {
@@ -126,10 +136,17 @@ pub fn sub_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
     round_f32_from_exact_sum(rounded, exact, lhs, rhs, mode)
 }
 
+/// PTX `mul{.rnd}.f32` without `.ftz`: binary32 product rounded by `mode` from the
+/// exact binary64 product. Subnormals kept; NaN result pinned by [`pin_nan2_f32`].
 pub fn mul_f32(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
-    round_f32_from_exact(pin_nan2_f32(lhs, rhs, lhs * rhs), (lhs as f64) * (rhs as f64), mode)
+    round_f32_from_exact(
+        pin_nan2_f32(lhs, rhs, lhs * rhs),
+        (lhs as f64) * (rhs as f64),
+        mode,
+    )
 }
 
+/// [`add_f32`] with `.ftz`: subnormal inputs and results flush to sign-preserving zero.
 pub fn add_f32_ftz(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
     flush_subnormal_f32(add_f32(
         flush_subnormal_f32(lhs),
@@ -138,6 +155,7 @@ pub fn add_f32_ftz(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
     ))
 }
 
+/// [`sub_f32`] with `.ftz`: subnormal inputs and results flush to sign-preserving zero.
 pub fn sub_f32_ftz(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
     flush_subnormal_f32(sub_f32(
         flush_subnormal_f32(lhs),
@@ -146,6 +164,8 @@ pub fn sub_f32_ftz(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
     ))
 }
 
+/// [`mul_f32`] with `.ftz`: subnormal inputs flush to zero; a result that is tiny
+/// before rounding (exact |product| < `f32::MIN_POSITIVE`) flushes to signed zero.
 pub fn mul_f32_ftz(lhs: f32, rhs: f32, mode: F32RoundingMode) -> f32 {
     let lhs = flush_subnormal_f32(lhs);
     let rhs = flush_subnormal_f32(rhs);
@@ -164,10 +184,15 @@ pub(crate) fn flush_f32_result(rounded: f32, is_tiny: impl FnOnce() -> bool) -> 
     }
 }
 
+/// Binary32 `lhs / rhs`, round-to-nearest-even, no FTZ. NaN payload is the host
+/// division's (x86 `divss`: first NaN operand quieted, else `0xffc0_0000`); not pinned.
 pub fn div_f32_rn(lhs: f32, rhs: f32) -> f32 {
     lhs / rhs
 }
 
+/// PTX `div.{rnd}{.ftz}.f32` (IEEE division): RN from the host quotient, RZ/RM/RP by
+/// exact comparison of the candidate. `ftz` flushes subnormal inputs and tiny results
+/// to signed zero. NaN payload as in [`div_f32_rn`].
 pub fn ptx_div_f32(lhs: f32, rhs: f32, mode: F32RoundingMode, ftz: bool) -> f32 {
     let lhs = if ftz { flush_subnormal_f32(lhs) } else { lhs };
     let rhs = if ftz { flush_subnormal_f32(rhs) } else { rhs };
@@ -233,6 +258,8 @@ pub fn ptx_rcp_approx_ftz_f64(value: f64) -> f64 {
     gross_f64_approx(value, |value| 1.0 / value)
 }
 
+/// PTX `rsqrt.approx.ftz.f64`: same contract as [`ptx_rcp_approx_ftz_f64`] (low input
+/// word ignored, NaN -> `0x7fff_ffff_0000_0000`, FTZ, RN to the high word) for `1/sqrt(x)`.
 pub fn ptx_rsqrt_approx_ftz_f64(value: f64) -> f64 {
     gross_f64_approx(value, |value| 1.0 / value.sqrt())
 }
@@ -264,11 +291,15 @@ pub(crate) fn gross_f64_approx(value: f64, operation: impl FnOnce(f64) -> f64) -
     }
 }
 
+/// PTX `neg.ftz.f32`: sign-bit flip after flushing a subnormal input to signed zero.
+/// NaN payload kept (sign flipped), no quieting.
 pub fn ptx_neg_ftz_f32(value: f32) -> f32 {
     let value = flush_subnormal_f32(value);
     flush_subnormal_f32(f32::from_bits(value.to_bits() ^ 0x8000_0000))
 }
 
+/// PTX `neg{.ftz}.f16` on raw binary16 bits: sign-bit flip; `ftz` flushes a subnormal
+/// input to signed zero first. NaN payload kept, no quieting.
 pub fn ptx_neg_f16_bits(value: u16, ftz: bool) -> u16 {
     let value = if ftz {
         flush_subnormal_f16_bits(value)
@@ -278,11 +309,15 @@ pub fn ptx_neg_f16_bits(value: u16, ftz: bool) -> u16 {
     value ^ 0x8000
 }
 
+/// PTX `neg{.ftz}.f16x2`: [`ptx_neg_f16_bits`] on each binary16 half (low half = bits 0..16).
 pub fn ptx_neg_f16x2_bits(value: u32, ftz: bool) -> u32 {
     u32::from(ptx_neg_f16_bits(value as u16, ftz))
         | (u32::from(ptx_neg_f16_bits((value >> 16) as u16, ftz)) << 16)
 }
 
+/// PTX `sqrt.{rnd}{.ftz}.f32`: RN from the host root, RZ/RM/RP by exact square
+/// comparison. `ftz` flushes subnormal input/result to signed zero. `sqrt(-0) = -0`;
+/// negative or NaN input gives the host NaN (NaN operand quieted, else `0xffc0_0000`).
 pub fn ptx_sqrt_f32(value: f32, mode: F32RoundingMode, ftz: bool) -> f32 {
     let value = if ftz {
         flush_subnormal_f32(value)
@@ -373,6 +408,8 @@ pub(crate) fn compare_f64_square_to_input(root: f64, input: f64) -> Ordering {
     compare_positive_dyadics(square, square_exponent, input_significand, input_exponent)
 }
 
+/// PTX `sqrt.{rnd}.f64`: RN from the host root, RZ/RM/RP by exact dyadic square
+/// comparison. Subnormals kept; `sqrt(-0) = -0`; negative/NaN input gives the host NaN.
 pub fn ptx_sqrt_f64(value: f64, mode: F32RoundingMode) -> f64 {
     let nearest = value.sqrt();
     if mode == F32RoundingMode::Nearest || !value.is_finite() || value <= 0.0 || nearest.is_nan() {
@@ -391,6 +428,7 @@ pub fn ptx_sqrt_f64(value: f64, mode: F32RoundingMode) -> f64 {
     }
 }
 
+/// Binary32 fused multiply-add, RN, no FTZ; NaN pinned as in [`host_fma_f32`].
 pub fn fma_f32_rn(lhs: f32, rhs: f32, addend: f32) -> f32 {
     host_fma_f32(lhs, rhs, addend)
 }
@@ -526,7 +564,11 @@ pub(crate) fn round_f64_candidate(
     }
 }
 
-pub(crate) fn rounding_adjustment(comparison: Ordering, negative: bool, mode: F32RoundingMode) -> Ordering {
+pub(crate) fn rounding_adjustment(
+    comparison: Ordering,
+    negative: bool,
+    mode: F32RoundingMode,
+) -> Ordering {
     match mode {
         F32RoundingMode::Down if comparison == Ordering::Greater => Ordering::Less,
         F32RoundingMode::Up if comparison == Ordering::Less => Ordering::Greater,
@@ -536,6 +578,9 @@ pub(crate) fn rounding_adjustment(comparison: Ordering, negative: bool, mode: F3
     }
 }
 
+/// PTX `add{.rnd}.f64`: RN uses [`cuda_f64_add`]'s NaN selection (rhs NaN first,
+/// `inf - inf` -> `0xfff8_0000_0000_0000`); RZ/RM/RP go through the exact [`fma_f64`]
+/// with a unit multiplier. Subnormals kept.
 pub fn add_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
     if mode == F32RoundingMode::Nearest || !lhs.is_finite() || !rhs.is_finite() {
         cuda_f64_add(lhs, rhs)
@@ -544,6 +589,8 @@ pub fn add_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
     }
 }
 
+/// PTX `sub{.rnd}.f64`: RN host difference with NaN pinned by [`pin_nan2_f64`];
+/// RZ/RM/RP via exact [`fma_f64`]. Subnormals kept.
 pub fn sub_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
     if mode == F32RoundingMode::Nearest || !lhs.is_finite() || !rhs.is_finite() {
         pin_nan2_f64(lhs, rhs, lhs - rhs)
@@ -552,6 +599,8 @@ pub fn sub_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
     }
 }
 
+/// PTX `mul{.rnd}.f64`: RN host product with NaN pinned by [`pin_nan2_f64`];
+/// RZ/RM/RP via exact [`fma_f64`] with a signed zero addend (keeps `-0`). Subnormals kept.
 pub fn mul_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
     if mode == F32RoundingMode::Nearest || !lhs.is_finite() || !rhs.is_finite() {
         pin_nan2_f64(lhs, rhs, lhs * rhs)
@@ -562,6 +611,8 @@ pub fn mul_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
     }
 }
 
+/// PTX `div.{rnd}.f64`: RN host quotient, RZ/RM/RP by exact comparison of the
+/// candidate. Subnormals kept; NaN payload is the host division's (not pinned).
 pub fn div_f64(lhs: f64, rhs: f64, mode: F32RoundingMode) -> f64 {
     let rounded = lhs / rhs;
     if mode == F32RoundingMode::Nearest
@@ -609,6 +660,9 @@ pub(crate) fn compare_division_candidate(rounded: f64, lhs: f64, rhs: f64) -> Or
     }
 }
 
+/// PTX `fma.{rnd}.f32` without `.ftz`: exact fused result rounded by `mode`
+/// (RN from the host FMA, others corrected from the exact sum). NaN pinned as in
+/// [`host_fma_f32`]; subnormals kept.
 pub fn fma_f32(lhs: f32, rhs: f32, addend: f32, mode: F32RoundingMode) -> f32 {
     let rounded = host_fma_f32(lhs, rhs, addend);
     if mode == F32RoundingMode::Nearest
@@ -625,6 +679,8 @@ pub fn fma_f32(lhs: f32, rhs: f32, addend: f32, mode: F32RoundingMode) -> f32 {
     round_f32_from_exact_fma(rounded, exact, lhs * rhs, addend, mode)
 }
 
+/// [`fma_f32`] with `.ftz`: subnormal inputs flush to signed zero; a result whose exact
+/// value is below `f32::MIN_POSITIVE` in magnitude flushes to signed zero.
 pub fn fma_f32_ftz(lhs: f32, rhs: f32, addend: f32, mode: F32RoundingMode) -> f32 {
     let lhs = flush_subnormal_f32(lhs);
     let rhs = flush_subnormal_f32(rhs);
@@ -652,11 +708,12 @@ pub(crate) fn saturate_float<T: PartialOrd + From<u8>>(value: T) -> T {
     }
 }
 
+/// PTX `.sat` on binary32: clamp to `[0, 1]`; NaN and both zeros map to `+0`.
 pub fn ptx_saturate_f32(value: f32) -> f32 {
     saturate_float(value)
 }
 
+/// PTX `.sat` on binary64: clamp to `[0, 1]`; NaN and both zeros map to `+0`.
 pub fn ptx_saturate_f64(value: f64) -> f64 {
     saturate_float(value)
 }
-

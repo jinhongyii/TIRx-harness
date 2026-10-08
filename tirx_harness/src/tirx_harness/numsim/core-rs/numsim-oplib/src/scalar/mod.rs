@@ -177,6 +177,8 @@ impl RuntimeScalar for bool {
     }
 }
 
+/// Python-style floor division of i64 (rounds toward -inf). Errors on division by zero
+/// and on `i64::MIN / -1` overflow.
 #[inline]
 pub fn floor_div_i64(lhs: i64, rhs: i64) -> Result<i64, OpError> {
     let quotient = lhs
@@ -192,6 +194,8 @@ pub fn floor_div_i64(lhs: i64, rhs: i64) -> Result<i64, OpError> {
     })
 }
 
+/// Python-style floor modulo of i64 (result takes the divisor's sign); errors as
+/// [`floor_div_i64`], and the final multiply-subtract wraps (`1 mod i64::MIN` is exact).
 #[inline]
 pub fn floor_mod_i64(lhs: i64, rhs: i64) -> Result<i64, OpError> {
     let quotient = floor_div_i64(lhs, rhs)?;
@@ -201,6 +205,9 @@ pub fn floor_mod_i64(lhs: i64, rhs: i64) -> Result<i64, OpError> {
     Ok(lhs.wrapping_sub(quotient.wrapping_mul(rhs)))
 }
 
+/// PTX `fns.b32`: bit position of the `offset`-th set bit of `mask` counting from
+/// `base` (upward for positive, downward for negative, `0` tests `base` itself);
+/// `0xffff_ffff` when there is none. `base` must be < 32.
 pub fn ptx_fns_b32(mask: u32, base: u32, offset: i32) -> u32 {
     debug_assert!(base < 32);
     if offset == 0 {
@@ -225,6 +232,7 @@ pub fn ptx_fns_b32(mask: u32, base: u32, offset: i32) -> u32 {
     u32::MAX
 }
 
+/// FTZ for binary32: a subnormal becomes the zero of the same sign; others unchanged.
 pub fn flush_subnormal_f32(value: f32) -> f32 {
     if value.is_subnormal() {
         f32::from_bits(value.to_bits() & 0x8000_0000)
@@ -233,10 +241,13 @@ pub fn flush_subnormal_f32(value: f32) -> f32 {
     }
 }
 
+/// Whether raw binary16 bits encode a subnormal (exponent 0, fraction non-zero).
 pub const fn is_subnormal_f16_bits(bits: u16) -> bool {
     bits & 0x7c00 == 0 && bits & 0x03ff != 0
 }
 
+/// FTZ for raw binary16 bits: a subnormal becomes the zero of the same sign.
+/// Uses the f16 encoding; not valid for bf16 bits.
 pub const fn flush_subnormal_f16_bits(bits: u16) -> u16 {
     if is_subnormal_f16_bits(bits) {
         bits & 0x8000
@@ -249,6 +260,7 @@ pub(crate) fn cuda_canonical_nan_f32() -> f32 {
     f32::from_bits(0x7fff_ffff)
 }
 
+/// Replace any NaN with the CUDA canonical binary32 NaN `0x7fff_ffff`; others unchanged.
 pub fn cuda_canonicalize_nan_f32(value: f32) -> f32 {
     if value.is_nan() {
         cuda_canonical_nan_f32()
@@ -257,6 +269,8 @@ pub fn cuda_canonicalize_nan_f32(value: f32) -> f32 {
     }
 }
 
+/// CUDA `__float2half_rn`: binary32 to binary16, RN-even (overflow to inf, binary32
+/// subnormals to signed zero); any NaN becomes the canonical `0x7fff`.
 pub fn cuda_f32_to_fp16_bits(value: f32) -> u16 {
     if value.is_nan() {
         0x7fff
@@ -265,10 +279,12 @@ pub fn cuda_f32_to_fp16_bits(value: f32) -> u16 {
     }
 }
 
+/// CUDA `__half2float`: exact binary16 widening; any NaN becomes `0x7fff_ffff`.
 pub fn cuda_fp16_bits_to_f32(bits: u16) -> f32 {
     cuda_canonicalize_nan_f32(fp16_bits_to_f32(bits))
 }
 
+/// CUDA binary32 add, RN, no FTZ; any NaN result is the canonical `0x7fff_ffff`.
 pub fn cuda_f32_add(lhs: f32, rhs: f32) -> f32 {
     let result = lhs + rhs;
     if result.is_nan() {
@@ -286,38 +302,50 @@ pub(crate) fn cuda_round_bf16(value: f32) -> f32 {
     bf16_bits_to_f32(f32_to_bf16_bits(cuda_canonicalize_nan_f32(value)))
 }
 
+/// One fp16 warp-reduce step on f32 carriers: round both to binary16 (RN), add in
+/// binary32, round the sum to binary16; NaN canonical.
 pub fn cuda_reduce_fp16_add(lhs: f32, rhs: f32) -> f32 {
     cuda_round_fp16(cuda_f32_add(cuda_round_fp16(lhs), cuda_round_fp16(rhs)))
 }
 
+/// One fp16 max step: operands rounded to binary16 (RN, NaN canonical), then
+/// `lhs > rhs ? lhs : rhs` (a NaN or an equal/zero pair yields `rhs`).
 pub fn cuda_reduce_fp16_max(lhs: f32, rhs: f32) -> f32 {
     let lhs = cuda_round_fp16(lhs);
     let rhs = cuda_round_fp16(rhs);
     cuda_round_fp16(if lhs > rhs { lhs } else { rhs })
 }
 
+/// One fp16 min step: as [`cuda_reduce_fp16_max`] with `lhs < rhs ? lhs : rhs`.
 pub fn cuda_reduce_fp16_min(lhs: f32, rhs: f32) -> f32 {
     let lhs = cuda_round_fp16(lhs);
     let rhs = cuda_round_fp16(rhs);
     cuda_round_fp16(if lhs < rhs { lhs } else { rhs })
 }
 
+/// One bf16 warp-reduce step on f32 carriers: round both to bfloat16 (RN), add in
+/// binary32, round the sum to bfloat16; NaN canonical.
 pub fn cuda_reduce_bf16_add(lhs: f32, rhs: f32) -> f32 {
     cuda_round_bf16(cuda_f32_add(cuda_round_bf16(lhs), cuda_round_bf16(rhs)))
 }
 
+/// One bf16 max step: operands rounded to bfloat16 (RN, NaN canonical), then
+/// `lhs > rhs ? lhs : rhs` (a NaN or an equal/zero pair yields `rhs`).
 pub fn cuda_reduce_bf16_max(lhs: f32, rhs: f32) -> f32 {
     let lhs = cuda_round_bf16(lhs);
     let rhs = cuda_round_bf16(rhs);
     cuda_round_bf16(if lhs > rhs { lhs } else { rhs })
 }
 
+/// One bf16 min step: as [`cuda_reduce_bf16_max`] with `lhs < rhs ? lhs : rhs`.
 pub fn cuda_reduce_bf16_min(lhs: f32, rhs: f32) -> f32 {
     let lhs = cuda_round_bf16(lhs);
     let rhs = cuda_round_bf16(rhs);
     cuda_round_bf16(if lhs < rhs { lhs } else { rhs })
 }
 
+/// CUDA `fmaxf`: one NaN loses to the other operand, two NaNs give `0x7fff_ffff`;
+/// `max(-0, +0) = +0`. No rounding, no FTZ.
 pub fn cuda_f32_max(lhs: f32, rhs: f32) -> f32 {
     match (lhs.is_nan(), rhs.is_nan()) {
         (true, true) => cuda_canonical_nan_f32(),
@@ -335,6 +363,8 @@ pub fn cuda_f32_max(lhs: f32, rhs: f32) -> f32 {
     }
 }
 
+/// CUDA `fminf`: one NaN loses to the other operand, two NaNs give `0x7fff_ffff`;
+/// `min(-0, +0) = -0`. No rounding, no FTZ.
 pub fn cuda_f32_min(lhs: f32, rhs: f32) -> f32 {
     match (lhs.is_nan(), rhs.is_nan()) {
         (true, true) => cuda_canonical_nan_f32(),
@@ -356,6 +386,8 @@ pub(crate) fn quiet_f64_nan(value: f64) -> f64 {
     f64::from_bits(value.to_bits() | 0x0008_0000_0000_0000)
 }
 
+/// CUDA binary64 add, RN, no FTZ: a NaN `rhs` (else `lhs`) is returned quieted with its
+/// payload; `inf + -inf` gives `0xfff8_0000_0000_0000`.
 pub fn cuda_f64_add(lhs: f64, rhs: f64) -> f64 {
     if rhs.is_nan() {
         quiet_f64_nan(rhs)
@@ -371,6 +403,8 @@ pub fn cuda_f64_add(lhs: f64, rhs: f64) -> f64 {
     }
 }
 
+/// CUDA `fmax`: one NaN loses to the other operand; two NaNs return `rhs` unchanged
+/// (not canonicalized, unlike [`cuda_f32_max`]); `max(-0, +0) = +0`.
 pub fn cuda_f64_max(lhs: f64, rhs: f64) -> f64 {
     match (lhs.is_nan(), rhs.is_nan()) {
         (true, true) => rhs,
@@ -388,6 +422,7 @@ pub fn cuda_f64_max(lhs: f64, rhs: f64) -> f64 {
     }
 }
 
+/// CUDA `fmin`: one NaN loses; two NaNs return `rhs` unchanged; `min(-0, +0) = -0`.
 pub fn cuda_f64_min(lhs: f64, rhs: f64) -> f64 {
     match (lhs.is_nan(), rhs.is_nan()) {
         (true, true) => rhs,
@@ -405,6 +440,8 @@ pub fn cuda_f64_min(lhs: f64, rhs: f64) -> f64 {
     }
 }
 
+/// PTX `ex2.approx.f32` representative: libm binary64 `exp2` rounded once to binary32
+/// (RN), no FTZ. Not a GPU polynomial; a NaN input stays NaN (payload from the host cast).
 pub fn ptx_exp2_approx_f32(value: f32) -> f32 {
     // Use the software f64 implementation as a target-independent canonical
     // representative, then round once to binary32. This deliberately does not
@@ -412,11 +449,14 @@ pub fn ptx_exp2_approx_f32(value: f32) -> f32 {
     libm::exp2(value as f64) as f32
 }
 
+/// [`ptx_exp2_approx_f32`] with `.ftz`: subnormal input and result flush to signed zero.
 pub fn ptx_exp2_approx_ftz_f32(value: f32) -> f32 {
     let value = flush_subnormal_f32(value);
     flush_subnormal_f32(ptx_exp2_approx_f32(value))
 }
 
+/// PTX `sin.approx{.ftz}.f32` representative: libm binary64 `sin` rounded to binary32;
+/// `ftz` flushes subnormal input/result. NaN/inf input gives NaN (host payload).
 pub fn ptx_sin_approx_f32(value: f32, ftz: bool) -> f32 {
     let value = if ftz {
         flush_subnormal_f32(value)
@@ -433,6 +473,8 @@ pub fn ptx_sin_approx_f32(value: f32, ftz: bool) -> f32 {
     }
 }
 
+/// PTX `cos.approx{.ftz}.f32` representative: libm binary64 `cos` rounded to binary32;
+/// `ftz` flushes subnormal input/result. NaN/inf input gives NaN (host payload).
 pub fn ptx_cos_approx_f32(value: f32, ftz: bool) -> f32 {
     let value = if ftz {
         flush_subnormal_f32(value)
@@ -449,11 +491,14 @@ pub fn ptx_cos_approx_f32(value: f32, ftz: bool) -> f32 {
     }
 }
 
+/// PTX `ex2.approx.ftz.bf16x2`: [`ptx_exp2_approx_ftz_bf16`] per half (low = bits 0..16).
 pub fn ptx_exp2_approx_ftz_bf16x2(value: u32) -> u32 {
     u32::from(ptx_exp2_approx_ftz_bf16(value as u16))
         | (u32::from(ptx_exp2_approx_ftz_bf16((value >> 16) as u16)) << 16)
 }
 
+/// PTX `ex2.approx.ftz.bf16`: bf16 widened exactly, [`ptx_exp2_approx_ftz_f32`], RN to
+/// bfloat16; a subnormal bf16 result flushes to signed zero, NaN becomes `0x7fff`.
 pub fn ptx_exp2_approx_ftz_bf16(value: u16) -> u16 {
     let result = ptx_exp2_approx_ftz_f32(bf16_bits_to_f32(value));
     let encoded = f32_to_bf16_bits(cuda_canonicalize_nan_f32(result));
@@ -464,15 +509,20 @@ pub fn ptx_exp2_approx_ftz_bf16(value: u16) -> u16 {
     }
 }
 
+/// PTX `ex2.approx.f16`: exact widening (NaN canonical), [`ptx_exp2_approx_f32`], then
+/// RN to binary16 (subnormals kept, NaN `0x7fff`).
 pub fn ptx_exp2_approx_f16(value: u16) -> u16 {
     cuda_f32_to_fp16_bits(ptx_exp2_approx_f32(cuda_fp16_bits_to_f32(value)))
 }
 
+/// PTX `ex2.approx.f16x2`: [`ptx_exp2_approx_f16`] per half (low = bits 0..16).
 pub fn ptx_exp2_approx_f16x2(value: u32) -> u32 {
     u32::from(ptx_exp2_approx_f16(value as u16))
         | (u32::from(ptx_exp2_approx_f16((value >> 16) as u16)) << 16)
 }
 
+/// PTX `lg2.approx.ftz.f32` representative: subnormal input flushed (so `lg2(±subnormal)
+/// = -inf`), libm binary64 `log2` rounded to binary32; negative input gives NaN.
 pub fn ptx_lg2_approx_ftz_f32(value: f32) -> f32 {
     let value = flush_subnormal_f32(value);
     // As with the exp2 adapter, use a target-independent software value as the
@@ -481,50 +531,66 @@ pub fn ptx_lg2_approx_ftz_f32(value: f32) -> f32 {
     flush_subnormal_f32(libm::log2(value as f64) as f32)
 }
 
+/// PTX `tanh.approx.f32` representative: libm binary64 `tanh` rounded to binary32, no
+/// FTZ; NaN input stays NaN (host payload).
 pub fn ptx_tanh_approx_f32(value: f32) -> f32 {
     // Use one target-independent software representative rather than replaying
     // an architecture-specific tanh.approx polynomial.
     libm::tanh(value as f64) as f32
 }
 
+/// PTX `tanh.approx.f16`: exact widening, [`ptx_tanh_approx_f32`], RN to binary16
+/// (NaN `0x7fff`).
 pub fn ptx_tanh_approx_f16(value: u16) -> u16 {
     cuda_f32_to_fp16_bits(ptx_tanh_approx_f32(cuda_fp16_bits_to_f32(value)))
 }
 
+/// PTX `tanh.approx.f16x2`: [`ptx_tanh_approx_f16`] per half (low = bits 0..16).
 pub fn ptx_tanh_approx_f16x2(value: u32) -> u32 {
     u32::from(ptx_tanh_approx_f16(value as u16))
         | (u32::from(ptx_tanh_approx_f16((value >> 16) as u16)) << 16)
 }
 
+/// PTX `tanh.approx.bf16`: exact widening, [`ptx_tanh_approx_f32`], RN to bfloat16
+/// (subnormals kept, NaN `0x7fff`).
 pub fn ptx_tanh_approx_bf16(value: u16) -> u16 {
     f32_to_bf16_bits(cuda_canonicalize_nan_f32(ptx_tanh_approx_f32(
         bf16_bits_to_f32(value),
     )))
 }
 
+/// PTX `tanh.approx.bf16x2`: [`ptx_tanh_approx_bf16`] per half (low = bits 0..16).
 pub fn ptx_tanh_approx_bf16x2(value: u32) -> u32 {
     u32::from(ptx_tanh_approx_bf16(value as u16))
         | (u32::from(ptx_tanh_approx_bf16((value >> 16) as u16)) << 16)
 }
 
+/// PTX `rsqrt.approx.ftz.f32` representative: `1 / sqrt(x)` in binary32 (two RN roundings),
+/// subnormal input/result flushed; `rsqrt(±0) = ±inf`, negative input gives the host NaN.
 pub fn ptx_rsqrt_approx_ftz_f32(value: f32) -> f32 {
     let value = flush_subnormal_f32(value);
     flush_subnormal_f32(1.0_f32 / value.sqrt())
 }
 
+/// PTX `rsqrt.approx.f32` representative: `1 / sqrt(x)` in binary32, no FTZ.
 pub fn ptx_rsqrt_approx_f32(value: f32) -> f32 {
     1.0_f32 / value.sqrt()
 }
 
+/// PTX `rcp.approx.ftz.f32` representative: binary32 `1 / x` (RN), subnormal input and
+/// result flushed to signed zero; NaN payload from the host division.
 pub fn ptx_rcp_approx_ftz_f32(value: f32) -> f32 {
     let value = flush_subnormal_f32(value);
     flush_subnormal_f32(1.0_f32 / value)
 }
 
+/// PTX `rcp.approx.f32` representative: binary32 `1 / x` (RN), no FTZ.
 pub fn ptx_rcp_approx_f32(value: f32) -> f32 {
     1.0_f32 / value
 }
 
+/// PTX `max{.ftz}{.NaN}.f32`: [`cuda_f32_max`]; `propagate_nan` returns `0x7fff_ffff` if
+/// either operand is NaN; `ftz` flushes subnormal inputs and the result.
 pub fn ptx_max_f32(lhs: f32, rhs: f32, ftz: bool, propagate_nan: bool) -> f32 {
     let lhs = if ftz { flush_subnormal_f32(lhs) } else { lhs };
     let rhs = if ftz { flush_subnormal_f32(rhs) } else { rhs };
@@ -540,6 +606,8 @@ pub fn ptx_max_f32(lhs: f32, rhs: f32, ftz: bool, propagate_nan: bool) -> f32 {
     }
 }
 
+/// PTX `min{.ftz}{.NaN}.f32`: [`cuda_f32_min`]; `propagate_nan` returns `0x7fff_ffff` if
+/// either operand is NaN; `ftz` flushes subnormal inputs and the result.
 pub fn ptx_min_f32(lhs: f32, rhs: f32, ftz: bool, propagate_nan: bool) -> f32 {
     let lhs = if ftz { flush_subnormal_f32(lhs) } else { lhs };
     let rhs = if ftz { flush_subnormal_f32(rhs) } else { rhs };
@@ -555,7 +623,6 @@ pub fn ptx_min_f32(lhs: f32, rhs: f32, ftz: bool, propagate_nan: bool) -> f32 {
     }
 }
 
-
 /// CUDA `__ffs` on a u32: 1-based index of the least-significant set bit, or 0
 /// (frontend `emit/pure.rs` `cuda_ffs_u32`).
 pub fn cuda_ffs_u32(value: u32) -> i32 {
@@ -569,21 +636,72 @@ pub fn cuda_ffs_u32(value: u32) -> i32 {
 /// Bindings for CUDA helper intrinsics the frontend lowers straight to scalar
 /// and packed-lane oracles (`frontend-rs/src/emit/pure.rs`).
 pub(crate) const BINDINGS: &[crate::registry::Binding] = &[
-    crate::registry::Binding { op: "tirx.cuda.bfloat1622float2", function: "cvt::unpack_bf16x2" },
-    crate::registry::Binding { op: "tirx.cuda.bfloat162float", function: "cvt::bf16_bits_to_f32" },
-    crate::registry::Binding { op: "tirx.cuda.bfloat162float", function: "scalar::cuda_canonicalize_nan_f32" },
-    crate::registry::Binding { op: "tirx.cuda.half2float", function: "scalar::cuda_fp16_bits_to_f32" },
-    crate::registry::Binding { op: "tirx.cuda.fadd2_rn", function: "cvt::add_f32x2" },
-    crate::registry::Binding { op: "tirx.cuda.fmul2_rn", function: "cvt::mul_f32x2" },
-    crate::registry::Binding { op: "tirx.cuda.fdividef", function: "scalar::div_f32_rn" },
-    crate::registry::Binding { op: "tirx.cuda.ffs_u32", function: "scalar::cuda_ffs_u32" },
-    crate::registry::Binding { op: "tirx.cuda.float22bfloat162_rn", function: "cvt::pack_bf16x2" },
-    crate::registry::Binding { op: "tirx.cuda.float22bfloat162_rn_from_float2", function: "cvt::pack_bf16x2" },
-    crate::registry::Binding { op: "tirx.cuda.float22half2", function: "scalar::cuda_f32_to_fp16_bits" },
-    crate::registry::Binding { op: "tirx.cuda.half8tofloat8", function: "scalar::cuda_fp16_bits_to_f32" },
-    crate::registry::Binding { op: "tirx.cuda.float8tohalf8", function: "scalar::cuda_f32_to_fp16_bits" },
-    crate::registry::Binding { op: "tirx.cuda.make_float2", function: "cvt::make_float2" },
-    crate::registry::Binding { op: "tirx.cuda.float2_x", function: "cvt::float2_x" },
-    crate::registry::Binding { op: "tirx.cuda.float2_y", function: "cvt::float2_y" },
-    crate::registry::Binding { op: "tirx.cuda.fp8x4_e4m3_from_float4", function: "cvt::fp8x4_e4m3_from_float4" },
+    crate::registry::Binding {
+        op: "tirx.cuda.bfloat1622float2",
+        function: "cvt::unpack_bf16x2",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.bfloat162float",
+        function: "cvt::bf16_bits_to_f32",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.bfloat162float",
+        function: "scalar::cuda_canonicalize_nan_f32",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.half2float",
+        function: "scalar::cuda_fp16_bits_to_f32",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.fadd2_rn",
+        function: "cvt::add_f32x2",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.fmul2_rn",
+        function: "cvt::mul_f32x2",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.fdividef",
+        function: "scalar::div_f32_rn",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.ffs_u32",
+        function: "scalar::cuda_ffs_u32",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.float22bfloat162_rn",
+        function: "cvt::pack_bf16x2",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.float22bfloat162_rn_from_float2",
+        function: "cvt::pack_bf16x2",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.float22half2",
+        function: "scalar::cuda_f32_to_fp16_bits",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.half8tofloat8",
+        function: "scalar::cuda_fp16_bits_to_f32",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.float8tohalf8",
+        function: "scalar::cuda_f32_to_fp16_bits",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.make_float2",
+        function: "cvt::make_float2",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.float2_x",
+        function: "cvt::float2_x",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.float2_y",
+        function: "cvt::float2_y",
+    },
+    crate::registry::Binding {
+        op: "tirx.cuda.fp8x4_e4m3_from_float4",
+        function: "cvt::fp8x4_e4m3_from_float4",
+    },
 ];

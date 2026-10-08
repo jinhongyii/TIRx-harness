@@ -586,7 +586,8 @@ fn fp4_tma_store_matches_the_legacy_planner_packed_and_padded() {
     // Packed FP4 stores write every element as a masked nibble (legacy
     // `append_s2g_bits`); the box is partially out of bounds on the right
     // (cols 192..320 of 256) and the bottom (rows 2..6 of 4).
-    for padded in [false] {
+    {
+        let padded = false;
         let mut d = desc2d(Dtype::E2M1, [256, 4], 128, [128, 4], 3);
         d.fp4_padded = padded;
         let smem_offset = 2048u64;

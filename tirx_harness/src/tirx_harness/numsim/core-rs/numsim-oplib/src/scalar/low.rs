@@ -40,6 +40,7 @@ impl LowPrecisionFormat {
         }
     }
 
+    /// Raw bits of `+inf` in this format (f16 `0x7c00`, bf16 `0x7f80`).
     pub const fn infinity(self) -> u16 {
         match self {
             Self::F16 => 0x7c00,
@@ -154,6 +155,8 @@ pub(crate) fn encode_exact_low(
     sign | subnormal as u16
 }
 
+/// Exact widening of raw f16/bf16 bits to binary32. f16 NaN becomes the CUDA
+/// canonical `0x7fff_ffff`; bf16 NaN keeps its payload (bits shifted left 16).
 pub fn decode_low(bits: u16, format: LowPrecisionFormat) -> f32 {
     match format {
         LowPrecisionFormat::F16 => cuda_fp16_bits_to_f32(bits),
@@ -161,6 +164,10 @@ pub fn decode_low(bits: u16, format: LowPrecisionFormat) -> f32 {
     }
 }
 
+/// PTX `add/sub.rn{.ftz}` on one f16/bf16 payload: exact sum rounded once to the
+/// target format (RN-even, overflow to inf). Any NaN result is canonical `0x7fff`.
+/// `ftz` flushes subnormal inputs (f16 encoding test) and results tiny before
+/// rounding; PTX defines `.ftz` for f16 only, so callers must pass `false` for bf16.
 pub fn low_add_rn(
     lhs: u16,
     rhs: u16,
@@ -187,13 +194,10 @@ pub fn low_add_rn(
     encode_exact_low(exact.negative, &exact.magnitude.0, -149, format, ftz)
 }
 
-pub fn low_fma_rn(
-    lhs: u16,
-    rhs: u16,
-    addend: u16,
-    format: LowPrecisionFormat,
-    ftz: bool,
-) -> u16 {
+/// PTX `fma.rn{.ftz}` on one f16/bf16 payload: exact `lhs*rhs+addend` rounded once
+/// (RN-even, overflow to inf); NaN result canonical `0x7fff`. `ftz` as in
+/// [`low_add_rn`] (f16 only).
+pub fn low_fma_rn(lhs: u16, rhs: u16, addend: u16, format: LowPrecisionFormat, ftz: bool) -> u16 {
     let (lhs, rhs, addend) = if ftz {
         (
             flush_subnormal_f16_bits(lhs),
@@ -220,19 +224,24 @@ pub fn low_fma_rn(
     encode_exact_low(exact.negative, &exact.magnitude.0, -298, format, ftz)
 }
 
+/// `sub.rn.f16` on raw bits, no FTZ (see [`low_add_rn`]).
 pub fn sub_f16_bits_rn(lhs: u16, rhs: u16) -> u16 {
     low_add_rn(lhs, rhs, LowPrecisionFormat::F16, true, false)
 }
 
+/// `sub.rn.f16x2`: [`sub_f16_bits_rn`] per half (low half = bits 0..16).
 pub fn sub_f16x2_bits_rn(lhs: u32, rhs: u32) -> u32 {
     u32::from(sub_f16_bits_rn(lhs as u16, rhs as u16))
         | (u32::from(sub_f16_bits_rn((lhs >> 16) as u16, (rhs >> 16) as u16)) << 16)
 }
 
+/// `mul.rn.f16` on raw bits, no FTZ (see [`low_mul_rn`]).
 pub fn mul_f16_bits_rn(lhs: u16, rhs: u16) -> u16 {
     low_mul_rn(lhs, rhs, LowPrecisionFormat::F16, false)
 }
 
+/// PTX `mul.rn{.ftz}` on one f16/bf16 payload: an exact FMA with a same-signed zero
+/// addend, so `-0` products survive; rounding/NaN/`ftz` as in [`low_fma_rn`].
 pub fn low_mul_rn(lhs: u16, rhs: u16, format: LowPrecisionFormat, ftz: bool) -> u16 {
     // A same-sign zero addend preserves multiplication's signed zero.
     low_fma_rn(lhs, rhs, (lhs ^ rhs) & 0x8000, format, ftz)
@@ -241,33 +250,39 @@ pub fn low_mul_rn(lhs: u16, rhs: u16, format: LowPrecisionFormat, ftz: bool) -> 
 /// TMA's 16-bit OOB-NaN payload; FMA tests its magnitude, not its sign.
 pub const PTX_OOB_NAN: u16 = 0x7ff7;
 
+/// `fma.rn.f16` on raw bits, no FTZ (see [`low_fma_rn`]).
 pub fn fma_f16_bits_rn(lhs: u16, rhs: u16, addend: u16) -> u16 {
     low_fma_rn(lhs, rhs, addend, LowPrecisionFormat::F16, false)
 }
 
+/// `add.rn.bf16` on raw bits (see [`low_add_rn`]).
 pub fn add_bf16_bits_rn(lhs: u16, rhs: u16) -> u16 {
     low_add_rn(lhs, rhs, LowPrecisionFormat::Bf16, false, false)
 }
 
+/// `add.rn.bf16x2`: [`add_bf16_bits_rn`] per half (low half = bits 0..16).
 pub fn add_bf16x2_bits_rn(lhs: u32, rhs: u32) -> u32 {
     u32::from(add_bf16_bits_rn(lhs as u16, rhs as u16))
         | (u32::from(add_bf16_bits_rn((lhs >> 16) as u16, (rhs >> 16) as u16)) << 16)
 }
 
+/// `sub.rn.bf16` on raw bits (see [`low_add_rn`]).
 pub fn sub_bf16_bits_rn(lhs: u16, rhs: u16) -> u16 {
     low_add_rn(lhs, rhs, LowPrecisionFormat::Bf16, true, false)
 }
 
+/// `sub.rn.bf16x2`: [`sub_bf16_bits_rn`] per half (low half = bits 0..16).
 pub fn sub_bf16x2_bits_rn(lhs: u32, rhs: u32) -> u32 {
     u32::from(sub_bf16_bits_rn(lhs as u16, rhs as u16))
         | (u32::from(sub_bf16_bits_rn((lhs >> 16) as u16, (rhs >> 16) as u16)) << 16)
 }
 
+/// `mul.rn.bf16` on raw bits (see [`low_mul_rn`]).
 pub fn mul_bf16_bits_rn(lhs: u16, rhs: u16) -> u16 {
     low_mul_rn(lhs, rhs, LowPrecisionFormat::Bf16, false)
 }
 
+/// `fma.rn.bf16` on raw bits (see [`low_fma_rn`]).
 pub fn fma_bf16_bits_rn(lhs: u16, rhs: u16, addend: u16) -> u16 {
     low_fma_rn(lhs, rhs, addend, LowPrecisionFormat::Bf16, false)
 }
-

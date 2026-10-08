@@ -95,6 +95,8 @@ pub fn warp_reduce<T: Copy>(
     Ok(result)
 }
 
+/// `tirx.cuda.warp_reduce` butterfly sum over `width`-lane groups: integers wrap, f32
+/// is [`cuda_f32_add`] (RN, canonical NaN), f64 [`cuda_f64_add`]. Full warp required.
 pub fn warp_reduce_sum<T: WarpReduceElement>(
     active_mask: WarpMask,
     values: &WarpValue<T>,
@@ -103,6 +105,8 @@ pub fn warp_reduce_sum<T: WarpReduceElement>(
     warp_reduce(active_mask, values, width, T::reduce_sum)
 }
 
+/// Butterfly max over `width`-lane groups ([`cuda_f32_max`]/[`cuda_f64_max`] for floats).
+/// Errors unless all 32 lanes are active and `width` is a power of two <= 32.
 pub fn warp_reduce_max<T: WarpReduceElement>(
     active_mask: WarpMask,
     values: &WarpValue<T>,
@@ -111,6 +115,8 @@ pub fn warp_reduce_max<T: WarpReduceElement>(
     warp_reduce(active_mask, values, width, T::reduce_max)
 }
 
+/// Butterfly min over `width`-lane groups ([`cuda_f32_min`]/[`cuda_f64_min`] for floats).
+/// Errors unless all 32 lanes are active and `width` is a power of two <= 32.
 pub fn warp_reduce_min<T: WarpReduceElement>(
     active_mask: WarpMask,
     values: &WarpValue<T>,

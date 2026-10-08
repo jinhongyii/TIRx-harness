@@ -42,6 +42,7 @@ pub enum CtaReduceOp {
 }
 
 impl CtaReduceOp {
+    /// Lower-case operator name used in diagnostics.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Sum => "sum",
@@ -134,12 +135,15 @@ impl_integer_cta_reduce_element!(u64, U64);
 pub struct Fp16Reduce(u16);
 
 impl Fp16Reduce {
+    /// Round an f32 partial to binary16 (RN-even, NaN quieted keeping high payload).
     pub fn from_f32(value: f32) -> Self {
         Self(f32_to_fp16_bits(value))
     }
+    /// Exact widening of the stored binary16 bits.
     pub fn to_f32(self) -> f32 {
         fp16_bits_to_f32(self.0)
     }
+    /// The stored binary16 bits.
     pub const fn bits(self) -> u16 {
         self.0
     }
@@ -150,12 +154,15 @@ impl Fp16Reduce {
 pub struct Bf16Reduce(u16);
 
 impl Bf16Reduce {
+    /// Round an f32 partial to bfloat16 (RN-even, NaN quieted keeping high payload).
     pub fn from_f32(value: f32) -> Self {
         Self(f32_to_bf16_bits(value))
     }
+    /// Exact widening of the stored bfloat16 bits.
     pub fn to_f32(self) -> f32 {
         bf16_bits_to_f32(self.0)
     }
+    /// The stored bfloat16 bits.
     pub const fn bits(self) -> u16 {
         self.0
     }
@@ -242,6 +249,7 @@ impl_float_cta_reduce_element!(f32, F32, cuda_f32_add, cuda_f32_max, cuda_f32_mi
 impl_float_cta_reduce_element!(f64, F64, cuda_f64_add, cuda_f64_max, cuda_f64_min);
 
 impl CtaReduceValue {
+    /// Scalar type name used in diagnostics.
     pub fn type_name(self) -> &'static str {
         match self {
             Self::I8(_) => "i8",
@@ -305,6 +313,7 @@ impl CtaReduceValue {
         Ok(result)
     }
 
+    /// Whether both values carry the same scalar type.
     pub fn same_type(self, other: Self) -> bool {
         self.type_name() == other.type_name()
     }
@@ -318,6 +327,7 @@ pub struct CtaReduceContribution {
 }
 
 impl CtaReduceContribution {
+    /// A warp's contribution: `operation` and its partial converted to [`CtaReduceValue`].
     pub fn new<T: CtaReduceElement>(operation: CtaReduceOp, warp_partial: T) -> Self {
         Self {
             operation,
@@ -376,7 +386,9 @@ pub fn validate_cta_reduce_warps(warps: usize, warps_per_cta: usize) -> OpResult
         )));
     }
     if warps_per_cta != warps {
-        return Err(OpError::message(format!("cuda_cta_reduce expected {warps} warps")));
+        return Err(OpError::message(format!(
+            "cuda_cta_reduce expected {warps} warps"
+        )));
     }
     Ok(())
 }
@@ -507,9 +519,18 @@ mod tests {
             f64::combine(CtaReduceOp::Max, -0.0, -0.0).to_bits(),
             (-0.0_f64).to_bits()
         );
-        assert_eq!(f64::combine(CtaReduceOp::Min, 0.0, 0.0).to_bits(), 0.0_f64.to_bits());
-        assert_eq!(f64::combine(CtaReduceOp::Max, nan_a, nan_b).to_bits(), nan_b.to_bits());
-        assert_eq!(f64::combine(CtaReduceOp::Min, nan_a, nan_b).to_bits(), nan_b.to_bits());
+        assert_eq!(
+            f64::combine(CtaReduceOp::Min, 0.0, 0.0).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            f64::combine(CtaReduceOp::Max, nan_a, nan_b).to_bits(),
+            nan_b.to_bits()
+        );
+        assert_eq!(
+            f64::combine(CtaReduceOp::Min, nan_a, nan_b).to_bits(),
+            nan_b.to_bits()
+        );
     }
 
     #[test]
@@ -542,17 +563,29 @@ mod tests {
         let result = publish(
             2,
             CtaReduceOp::Sum,
-            &[(0, Fp16Reduce::from_f32(2048.0)), (1, Fp16Reduce::from_f32(1.0))],
+            &[
+                (0, Fp16Reduce::from_f32(2048.0)),
+                (1, Fp16Reduce::from_f32(1.0)),
+            ],
         )
         .unwrap();
-        assert_eq!(Fp16Reduce::from_cta_reduce_value(result).unwrap().to_f32(), 2048.0);
+        assert_eq!(
+            Fp16Reduce::from_cta_reduce_value(result).unwrap().to_f32(),
+            2048.0
+        );
         let result = publish(
             2,
             CtaReduceOp::Min,
-            &[(0, Bf16Reduce::from_f32(1.5)), (1, Bf16Reduce::from_f32(-2.0))],
+            &[
+                (0, Bf16Reduce::from_f32(1.5)),
+                (1, Bf16Reduce::from_f32(-2.0)),
+            ],
         )
         .unwrap();
-        assert_eq!(Bf16Reduce::from_cta_reduce_value(result).unwrap().to_f32(), -2.0);
+        assert_eq!(
+            Bf16Reduce::from_cta_reduce_value(result).unwrap().to_f32(),
+            -2.0
+        );
     }
 
     #[test]
@@ -567,8 +600,14 @@ mod tests {
             "cuda_cta_reduce expected 4 warps"
         );
         let predicates: WarpValue<bool> = std::array::from_fn(|lane| lane < 3);
-        assert_eq!(cta_vote_local(CtaVoteOp::And, WarpMask(0b111), &predicates), 1);
-        assert_eq!(cta_vote_local(CtaVoteOp::And, WarpMask::ALL, &predicates), 0);
+        assert_eq!(
+            cta_vote_local(CtaVoteOp::And, WarpMask(0b111), &predicates),
+            1
+        );
+        assert_eq!(
+            cta_vote_local(CtaVoteOp::And, WarpMask::ALL, &predicates),
+            0
+        );
         assert_eq!(cta_vote_local(CtaVoteOp::Or, WarpMask::ALL, &predicates), 1);
         assert_eq!(bar_red_local(BarRedOp::Popc, &predicates), 3);
         assert_eq!(bar_red_local(BarRedOp::And, &predicates), 0);

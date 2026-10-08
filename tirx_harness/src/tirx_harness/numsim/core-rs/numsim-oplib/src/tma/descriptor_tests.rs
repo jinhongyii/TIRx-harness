@@ -4,7 +4,11 @@
 use super::*;
 use crate::tma::tensor_map::{TensorMapLayout, TensorMapSpec};
 
-fn u32_map(global_shape: Vec<usize>, global_strides: Vec<usize>, box_shape: Vec<usize>) -> TensorMapLayout {
+fn u32_map(
+    global_shape: Vec<usize>,
+    global_strides: Vec<usize>,
+    box_shape: Vec<usize>,
+) -> TensorMapLayout {
     let rank = global_shape.len();
     TensorMapLayout::new(
         TensorMapSpec::tiled(
@@ -41,7 +45,10 @@ fn replacement_fields_use_ptx_encodings_and_preserve_other_image_fields() {
                 } else {
                     expected.element_strides[index] = value;
                 }
-                assert_eq!(TensorMapImage::decode(&image.encode().unwrap()).unwrap(), expected);
+                assert_eq!(
+                    TensorMapImage::decode(&image.encode().unwrap()).unwrap(),
+                    expected
+                );
             }
         }
         for (index, value) in [(0, 0), (0, limit + 1), (0, usize::MAX), (5, 1)] {
@@ -71,7 +78,10 @@ fn replacement_fields_use_ptx_encodings_and_preserve_other_image_fields() {
             element_type: dtype,
             ..original.clone()
         };
-        assert_eq!(TensorMapImage::decode(&image.encode().unwrap()).unwrap(), expected);
+        assert_eq!(
+            TensorMapImage::decode(&image.encode().unwrap()).unwrap(),
+            expected
+        );
     }
     for (field, value) in [
         ("rank", 4),
@@ -99,7 +109,10 @@ fn replacement_fields_use_ptx_encodings_and_preserve_other_image_fields() {
             }
             _ => unreachable!(),
         }
-        assert_eq!(TensorMapImage::decode(&image.encode().unwrap()).unwrap(), expected);
+        assert_eq!(
+            TensorMapImage::decode(&image.encode().unwrap()).unwrap(),
+            expected
+        );
     }
     for (field, value) in [
         ("rank", 5),
@@ -177,7 +190,10 @@ fn override_decodes_all_four_stride_nibbles_without_mutating_source() {
         );
     }
     let overridden = image.materialize(5, 128 * 1024, 0).unwrap();
-    assert_eq!(overridden.physical_global_strides, image.physical_global_strides);
+    assert_eq!(
+        overridden.physical_global_strides,
+        image.physical_global_strides
+    );
     assert_eq!(source.physical_global_strides, [16; 4]);
     assert_eq!(original.physical_global_strides, [16; 4]);
     let mut bad = source.clone();
@@ -215,7 +231,10 @@ fn private_image_write_leaves_descriptor_tail_untouched() {
 
     image.write_descriptor(&mut descriptor).unwrap();
 
-    assert_eq!(TensorMapImage::decode_descriptor(&descriptor).unwrap(), image);
+    assert_eq!(
+        TensorMapImage::decode_descriptor(&descriptor).unwrap(),
+        image
+    );
     assert_eq!(
         &descriptor[TENSOR_MAP_PAYLOAD_BYTES..],
         &[0xa5; TENSOR_MAP_DESCRIPTOR_BYTES - TENSOR_MAP_PAYLOAD_BYTES][..],
@@ -224,7 +243,10 @@ fn private_image_write_leaves_descriptor_tail_untouched() {
     assert_eq!(TensorMapImage::decode_candidate(&descriptor), None);
     // ... while the zero-tailed canonical encoding is.
     descriptor[TENSOR_MAP_PAYLOAD_BYTES..].fill(0);
-    assert_eq!(TensorMapImage::decode_candidate(&descriptor), Some(image.clone()));
+    assert_eq!(
+        TensorMapImage::decode_candidate(&descriptor),
+        Some(image.clone())
+    );
     let mut noisy = descriptor.clone();
     noisy[20] = 2; // inactive global dimension 1 != 1
     assert_eq!(TensorMapImage::decode_candidate(&noisy), None);

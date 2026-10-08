@@ -360,4 +360,3 @@ pub(crate) fn exact_fma_sum<const WORDS: usize>(
         },
     }
 }
-

@@ -65,7 +65,15 @@ fn tensor_copy_round_trips_rank_dtype_swizzle_and_pointer_phase_matrix() {
         assert_eq!(run_bytes(&plan.source_runs), (0..byte_len).collect());
 
         let mut actual_shared = vec![0_u8; shared_byte_len];
-        execute_g2s(&source_map, &plan, &source_bytes, &mut actual_shared, pointer_base, 0).unwrap();
+        execute_g2s(
+            &source_map,
+            &plan,
+            &source_bytes,
+            &mut actual_shared,
+            pointer_base,
+            0,
+        )
+        .unwrap();
         let mut expected_shared = vec![0_u8; shared_byte_len];
         let mut expected_shared_footprint = BTreeSet::new();
         for outer in 0..outer_count {
@@ -196,19 +204,25 @@ fn tensor_reduction_applies_each_in_bounds_element_once() {
         .flat_map(u32::to_le_bytes)
         .collect::<Vec<_>>();
     let plan = plan_tiled_s2g(&tensor_map, &[1], 0).unwrap();
-    let payload = gather_payload(&contribution_bytes, 0, &plan.source_runs, plan.payload_len).unwrap();
+    let payload =
+        gather_payload(&contribution_bytes, 0, &plan.source_runs, plan.payload_len).unwrap();
     let (reduction, elements) =
         s2g_reduction_elements(&tensor_map, &plan, &payload, RawTmaReductionOp::Add).unwrap();
     assert_eq!(reduction, TmaReduction::AddU32);
-    let mut global = initial.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    let mut global = initial
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
     for element in &elements {
         let current = &mut global[element.byte_offset..element.byte_offset + 4];
         let updated = reduction.apply(current, &element.source);
         current.copy_from_slice(&updated);
     }
     let actual = global
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| u32::from_le_bytes(*bytes))
         .collect::<Vec<_>>();
     assert_eq!(actual, vec![10, 21, 32, 43]);
 }
@@ -216,8 +230,17 @@ fn tensor_reduction_applies_each_in_bounds_element_once() {
 #[test]
 fn tensor_copy_observes_outer_element_stride_in_both_directions() {
     let source_bytes = (0_u8..80).collect::<Vec<_>>();
-    let source_map =
-        try_make_map(80, vec![16, 5], vec![16], vec![16, 5], vec![1, 2], 8, None, None).unwrap();
+    let source_map = try_make_map(
+        80,
+        vec![16, 5],
+        vec![16],
+        vec![16, 5],
+        vec![1, 2],
+        8,
+        None,
+        None,
+    )
+    .unwrap();
     let plan = plan_tiled_g2s(&source_map, &[0, 0], 0).unwrap();
     assert_eq!(plan.bytes_per_target().unwrap(), 48);
     let mut shared = vec![0_u8; 48];
@@ -295,7 +318,10 @@ fn fp4_read_codec_matches_packed_and_padded_shared_layouts() {
         Some(Fp4SharedLayout::Align8Packed),
         None,
     );
-    assert_eq!(read(&[vec![0x21, 0x43], vec![0; 14]].concat(), &align8)[..1], [0x21]);
+    assert_eq!(
+        read(&[vec![0x21, 0x43], vec![0; 14]].concat(), &align8)[..1],
+        [0x21]
+    );
 
     let packed = vec![0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe];
     let align16 = make_map(
@@ -315,8 +341,16 @@ fn fp4_read_codec_matches_packed_and_padded_shared_layouts() {
 
 #[test]
 fn tf32_maps_round_in_bounds_data_and_canonicalize_nan() {
-    let values = [1.0_f32 + f32::EPSILON, f32::from_bits(0x7fc0_0001), 3.0, -0.0];
-    let global = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    let values = [
+        1.0_f32 + f32::EPSILON,
+        f32::from_bits(0x7fc0_0001),
+        3.0,
+        -0.0,
+    ];
+    let global = values
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
     let map = TensorMapLayout::new(
         TensorMapSpec::tiled(
             vec![4],
@@ -336,10 +370,20 @@ fn tf32_maps_round_in_bounds_data_and_canonicalize_nan() {
     let mut shared = vec![0_u8; 16];
     execute_g2s(&map, &plan, &global, &mut shared, 0, 0).unwrap();
     let words = shared
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect::<Vec<_>>();
-    assert_eq!(words, [3.0_f32.to_bits(), (-0.0_f32).to_bits(), 0x7ff7_7ff7, 0x7ff7_7ff7]);
+    assert_eq!(
+        words,
+        [
+            3.0_f32.to_bits(),
+            (-0.0_f32).to_bits(),
+            0x7ff7_7ff7,
+            0x7ff7_7ff7
+        ]
+    );
     assert_eq!(tma_f32_to_tf32(values[1]).to_bits(), 0x7fff_e000);
     assert_eq!(tma_f32_to_tf32(values[0]), 1.0);
 }

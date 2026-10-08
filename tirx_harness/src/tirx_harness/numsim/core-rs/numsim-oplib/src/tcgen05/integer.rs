@@ -21,6 +21,7 @@ pub enum IntegerKind {
 }
 
 impl IntegerKind {
+    /// K elements per operand row: TI16 16, I8 32.
     pub fn packed_k(self) -> usize {
         match self {
             Self::Ti16 => 16,
@@ -40,6 +41,8 @@ impl IntegerKind {
         }
     }
 
+    /// Window-relative byte offset of `(row, column)` of an integer operand (2-byte TI16,
+    /// 1-byte I8), K-major unless `transpose`. No numerics.
     pub fn shared_offset(
         self,
         source: SharedWindow,
@@ -60,6 +63,8 @@ impl IntegerKind {
     }
 }
 
+/// Decode one s1z4m11 (sign-magnitude, 11-bit magnitude) element to i32, flipping the
+/// sign when `negate`; `-0` decodes to 0. Errors when reserved bits 11..15 are set.
 pub fn decode_ti16(bits: u16, negate: bool) -> OpResult<i32> {
     if bits & 0x7800 != 0 {
         return Err(OpError::message(
@@ -170,50 +175,6 @@ pub fn gather_integer_rows(
         }
     }
     Ok(values)
-}
-
-/// `(offset, bytes)` shared accesses of an integer operand on one CTA
-/// (legacy `raw_tcgen05_integer_shared_footprints`).
-#[allow(clippy::too_many_arguments)]
-pub fn integer_shared_accesses(
-    kind: IntegerKind,
-    source: SharedWindow,
-    descriptor: MatrixDescriptor,
-    rows: usize,
-    columns: usize,
-    transpose: bool,
-    mask: Option<ColumnMask>,
-) -> OpResult<Vec<(usize, usize)>> {
-    let width = kind.element_bytes();
-    let atom_elements = if transpose { 1 } else { 16 / width };
-    let mut accesses = Vec::new();
-    for row in 0..rows {
-        let Some(row) = masked_row(mask, row) else {
-            continue;
-        };
-        for column in (0..columns).step_by(atom_elements) {
-            let offset = kind.shared_offset(source, descriptor, row, column, transpose)?;
-            accesses.push((offset, atom_elements * width));
-        }
-    }
-    Ok(accesses)
-}
-
-/// Decode packed TMEM A words: TI16 two halves, I8 four bytes.
-pub fn decode_integer_tmem_word(
-    kind: IntegerKind,
-    word: u32,
-    decode_a: impl Fn(u16) -> OpResult<i32>,
-) -> OpResult<Vec<i32>> {
-    Ok(match kind {
-        IntegerKind::Ti16 => vec![decode_a(word as u16)?, decode_a((word >> 16) as u16)?],
-        IntegerKind::I8 => vec![
-            decode_a(word as u8 as u16)?,
-            decode_a((word >> 8) as u8 as u16)?,
-            decode_a((word >> 16) as u8 as u16)?,
-            decode_a((word >> 24) as u16)?,
-        ],
-    })
 }
 
 /// Exact banked integer accumulation: `output` (`m x n` i64, input D or

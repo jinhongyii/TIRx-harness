@@ -5,14 +5,17 @@ use crate::cvt::*;
 use crate::scalar::*;
 use crate::types::OpError;
 use std::cmp::Ordering;
+/// Pack two binary32 values bit-exactly into a `float2` b64 (`x` in bits 0..32); no numerics.
 pub fn make_float2(x: f32, y: f32) -> u64 {
     x.to_bits() as u64 | ((y.to_bits() as u64) << 32)
 }
 
+/// Low (`x`) binary32 lane of a packed `float2`, bit-exact (NaN payload kept).
 pub fn float2_x(value: u64) -> f32 {
     f32::from_bits(value as u32)
 }
 
+/// High (`y`) binary32 lane of a packed `float2`, bit-exact (NaN payload kept).
 pub fn float2_y(value: u64) -> f32 {
     f32::from_bits((value >> 32) as u32)
 }
@@ -77,6 +80,8 @@ pub fn ptx_cvt_pack<const BITS: u32, const SIGNED: bool>(a: i32, b: i32, c: u32)
     }
 }
 
+/// `cvt.rn.bf16x2.f32`-style pack: each f32 to bf16 with RN-even (overflow to inf,
+/// subnormals kept); any NaN becomes canonical `0x7fff`. `lhs` goes in bits 0..16.
 pub fn pack_bf16x2(lhs: f32, rhs: f32) -> u32 {
     let encode = |value: f32| {
         if value.is_nan() {
@@ -88,6 +93,7 @@ pub fn pack_bf16x2(lhs: f32, rhs: f32) -> u32 {
     encode(lhs) as u32 | ((encode(rhs) as u32) << 16)
 }
 
+/// Exact widening of a bf16x2 word into a `float2` (low half -> `x`); NaN payloads kept.
 pub fn unpack_bf16x2(value: u32) -> u64 {
     make_float2(
         bf16_bits_to_f32(value as u16),
@@ -116,10 +122,7 @@ pub fn ptx_cvt_pack_narrow_x2<const CLAMP_NEGATIVE: bool>(
     format: NarrowFloatFormat,
 ) -> u16 {
     let encode = |value: f32| {
-        f32_to_narrow_float_bits_rn_satfinite(
-            clamp_negative::<CLAMP_NEGATIVE>(value),
-            format,
-        )
+        f32_to_narrow_float_bits_rn_satfinite(clamp_negative::<CLAMP_NEGATIVE>(value), format)
     };
     (u16::from(encode(high)) << format.storage_bits) | u16::from(encode(low))
 }
@@ -258,11 +261,8 @@ pub fn ptx_cvt_pack_narrow_x4<const CLAMP_NEGATIVE: bool>(
 ) -> u32 {
     let mut packed = 0_u32;
     for (index, (value, random)) in values.into_iter().zip(randoms).enumerate() {
-        let code = f32_to_narrow_float_bits_rs(
-            clamp_negative::<CLAMP_NEGATIVE>(value),
-            random,
-            format,
-        );
+        let code =
+            f32_to_narrow_float_bits_rs(clamp_negative::<CLAMP_NEGATIVE>(value), random, format);
         packed |= u32::from(code) << (format.storage_bits * (3 - index as u32));
     }
     packed
@@ -464,18 +464,23 @@ pub(crate) const BF16_INFINITY: u16 = 0x7f80;
 /// The single E8M0 NaN encoding.
 pub(crate) const E8M0_NAN_CODE: u8 = 0xff;
 
+/// PTX `min.bf16x2` per half: selects an existing operand by ordered encoding
+/// (`-0 < +0`, no rounding, subnormals kept); one NaN loses, two NaNs give `0x7fff`.
 pub fn hmin2_bf16(lhs: u32, rhs: u32) -> u32 {
     low_minmax2(lhs, rhs, LowPrecisionFormat::Bf16, false)
 }
 
+/// PTX `min.f16x2` per half, no FTZ; NaN handling as in [`hmin2_bf16`].
 pub fn hmin2_f16(lhs: u32, rhs: u32) -> u32 {
     low_minmax2(lhs, rhs, LowPrecisionFormat::F16, false)
 }
 
+/// PTX `max.bf16x2` per half (`+0 > -0`); NaN handling as in [`hmin2_bf16`].
 pub fn hmax2_bf16(lhs: u32, rhs: u32) -> u32 {
     low_minmax2(lhs, rhs, LowPrecisionFormat::Bf16, true)
 }
 
+/// PTX `max.f16x2` per half, no FTZ; NaN handling as in [`hmin2_bf16`].
 pub fn hmax2_f16(lhs: u32, rhs: u32) -> u32 {
     low_minmax2(lhs, rhs, LowPrecisionFormat::F16, true)
 }
@@ -534,14 +539,11 @@ pub fn low_minmax(
             bits ^ 0x8000
         }
     };
-    let result = if lhs_nan {
+    // A NaN operand loses to the other (rhs when both are NaN).
+    let result = if lhs_nan || (!rhs_nan && (order(lhs) > order(rhs)) != maximum) {
         rhs
-    } else if rhs_nan {
-        lhs
-    } else if (order(lhs) > order(rhs)) == maximum {
-        lhs
     } else {
-        rhs
+        lhs
     };
     if xor_sign {
         (result & 0x7fff) | sign
@@ -550,6 +552,8 @@ pub fn low_minmax(
     }
 }
 
+/// Four f32 to E4M3FN bytes ([`f32_to_float8_e4m3fn_bits`]: RN-even, satfinite,
+/// NaN to `0x7f`, inf to signed max finite); `x` in bits 0..8.
 pub fn fp8x4_e4m3_from_float4(x: f32, y: f32, z: f32, w: f32) -> u32 {
     f32_to_float8_e4m3fn_bits(x) as u32
         | ((f32_to_float8_e4m3fn_bits(y) as u32) << 8)
@@ -568,6 +572,8 @@ pub(crate) fn pack_f32x2_result(low: f32, high: f32) -> u64 {
     )
 }
 
+/// PTX `add{.rnd}{.ftz}.f32x2`: [`add_f32`]/[`add_f32_ftz`] per lane (low = bits
+/// 0..32); any NaN lane result becomes the canonical `0x7fff_ffff`.
 pub fn add_f32x2(lhs: u64, rhs: u64, mode: F32RoundingMode, ftz: bool) -> u64 {
     let lhs_x = f32::from_bits(lhs as u32);
     let lhs_y = f32::from_bits((lhs >> 32) as u32);
@@ -577,6 +583,7 @@ pub fn add_f32x2(lhs: u64, rhs: u64, mode: F32RoundingMode, ftz: bool) -> u64 {
     pack_f32x2_result(operation(lhs_x, rhs_x, mode), operation(lhs_y, rhs_y, mode))
 }
 
+/// PTX `fma{.rnd}{.ftz}.f32x2`: [`fma_f32`]/[`fma_f32_ftz`] per lane; NaN lanes canonical `0x7fff_ffff`.
 pub fn fma_f32x2(lhs: u64, rhs: u64, addend: u64, mode: F32RoundingMode, ftz: bool) -> u64 {
     let lhs_x = f32::from_bits(lhs as u32);
     let lhs_y = f32::from_bits((lhs >> 32) as u32);
@@ -591,6 +598,7 @@ pub fn fma_f32x2(lhs: u64, rhs: u64, addend: u64, mode: F32RoundingMode, ftz: bo
     )
 }
 
+/// PTX `sub{.rnd}{.ftz}.f32x2`: [`sub_f32`]/[`sub_f32_ftz`] per lane; NaN lanes canonical `0x7fff_ffff`.
 pub fn sub_f32x2(lhs: u64, rhs: u64, mode: F32RoundingMode, ftz: bool) -> u64 {
     let lhs_low = f32::from_bits(lhs as u32);
     let lhs_high = f32::from_bits((lhs >> 32) as u32);
@@ -603,6 +611,7 @@ pub fn sub_f32x2(lhs: u64, rhs: u64, mode: F32RoundingMode, ftz: bool) -> u64 {
     )
 }
 
+/// PTX `mul{.rnd}{.ftz}.f32x2`: [`mul_f32`]/[`mul_f32_ftz`] per lane; NaN lanes canonical `0x7fff_ffff`.
 pub fn mul_f32x2(lhs: u64, rhs: u64, mode: F32RoundingMode, ftz: bool) -> u64 {
     let lhs_low = f32::from_bits(lhs as u32);
     let lhs_high = f32::from_bits((lhs >> 32) as u32);
@@ -614,4 +623,3 @@ pub fn mul_f32x2(lhs: u64, rhs: u64, mode: F32RoundingMode, ftz: bool) -> u64 {
         operation(lhs_high, rhs_high, mode),
     )
 }
-

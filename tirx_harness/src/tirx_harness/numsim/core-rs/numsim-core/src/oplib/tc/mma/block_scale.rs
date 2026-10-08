@@ -129,9 +129,7 @@ pub(super) fn mxf4_mma(
             columns,
             cg,
             true,
-            instruction.sfa_id,
-            instruction.block_elements,
-            instruction.sfa_lanes,
+            (instruction.sfa_id, instruction.block_elements, instruction.sfa_lanes),
         ))?;
         let mut values = vec![0.0_f32; layout.packed_a_banks() * m * k];
         for cta in 0..cg {
@@ -403,9 +401,7 @@ pub(super) fn mxf8f6f4_mma(
             columns,
             cg,
             true,
-            instruction.sfa_id,
-            packed_k,
-            instruction.sfa_lanes,
+            (instruction.sfa_id, packed_k, instruction.sfa_lanes),
         ))?;
         let mut values = vec![0.0_f32; a_layout.packed_a_banks() * m * packed_k];
         let format = instruction.a_format;
@@ -508,9 +504,7 @@ pub(super) fn mxf8f6f4_mma(
             ))?
         }
         None => io.lib(mma_dense_tail(
-            m,
-            n,
-            k,
+            (m, n, k),
             &a,
             &b,
             input,

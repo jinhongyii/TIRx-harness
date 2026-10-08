@@ -10,6 +10,8 @@ pub(in crate::oplib) struct Mods {
 }
 
 impl Mods {
+    /// Split `OpKey.mods` into `(slot, token)` pairs (`slot=token`, or a bare token with an
+    /// empty slot); empty strings are dropped.
     pub fn parse(mods: &[String]) -> Mods {
         Mods {
             pairs: mods
@@ -88,6 +90,7 @@ pub(in crate::oplib) struct Operands {
 }
 
 impl Operands {
+    /// Operand layout from destination/source types: each operand's register-slot offset.
     pub fn new(dst_tys: &[Ty], src_tys: &[Ty]) -> Operands {
         let offsets = |tys: &[Ty]| {
             let mut at = 0usize;

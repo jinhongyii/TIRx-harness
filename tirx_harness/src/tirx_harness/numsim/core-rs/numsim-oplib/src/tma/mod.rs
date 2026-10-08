@@ -154,40 +154,121 @@ const REPLACE: &[Binding] = &bind!("tma::TensorMapImage::replace_field":
 );
 
 const MISC: &[Binding] = &[
-    Binding { op: "tirx.ptx.cp_reduce_async_bulk_tensor", function: "tma::RawTmaReductionOp::resolve" },
-    Binding { op: "tirx.ptx.cp_reduce_async_bulk_tensor", function: "tma::s2g_reduction_elements" },
-    Binding { op: "tirx.ptx.cp_async_bulk_tensor_s2g", function: "tma::execute_s2g_copy" },
-    Binding { op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta", function: "tma::execute_g2s" },
-    Binding { op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta", function: "tma::materialize_g2s_payload" },
-    Binding { op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta", function: "tma::shared_byte_offset" },
-    Binding { op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta_report", function: "tma::copy_report_matches_runs" },
-    Binding { op: "tirx.ptx.cp_async_bulk_tensor_g2s_cluster_multicast16", function: "tma::multicast_target_ctas" },
-    Binding { op: "tirx.ptx.cp_async_bulk_tensor_g2s_cluster_multicast32", function: "tma::multicast_target_ctas" },
-    Binding { op: "tirx.ptx.cp_async_bulk_g2s_cluster_multicast16", function: "tma::multicast_target_ctas" },
-    Binding { op: "tirx.ptx.cp_async_bulk_g2s_cluster_multicast32", function: "tma::multicast_target_ctas" },
-    Binding { op: "tirx.ptx.cp_async_bulk_g2s_cta", function: "tma::bulk_byte_len" },
-    Binding { op: "tirx.ptx.cp_async_bulk_g2s_cluster", function: "tma::bulk_byte_len" },
-    Binding { op: "tirx.ptx.cp_async_bulk_s2g", function: "tma::bulk_issue_byte_len" },
-    Binding { op: "tirx.ptx.cp_async_bulk_s2c", function: "tma::bulk_issue_byte_len" },
-    Binding { op: "tirx.ptx.cp_reduce_async_bulk_s2g", function: "tma::bulk_issue_byte_len" },
-    Binding { op: "tirx.ptx.cp_async_bulk_g2s_cta_report", function: "tma::copy_report_matches" },
-    Binding { op: "tirx.ptx.cp_async_bulk_g2s_cluster_report", function: "tma::copy_report_matches" },
-    Binding { op: "tirx.ptx.cp_async_bulk_s2g", function: "tma::masked_destination_runs" },
-    Binding { op: "tirx.ptx.cp_async_bulk_g2s_cta", function: "tma::ignore_oob_window" },
-    Binding { op: "tirx.ptx.st_bulk", function: "tma::st_bulk_byte_count" },
-    Binding { op: "tirx.ptx.prefetch_valid_addr", function: "tma::validate_cache_hint_alignment" },
-    Binding { op: "tirx.ptx.applypriority_async_bulk", function: "tma::validate_bulk_cache_hint_size" },
-    Binding { op: "tirx.ptx.cp_async_bulk_prefetch", function: "tma::validate_bulk_cache_hint_size" },
-    Binding { op: "tirx.ptx.cp_async_bulk_prefetch_evict_last", function: "tma::validate_bulk_cache_hint_size" },
-    Binding { op: "tirx.ptx.tensormap_cp_fenceproxy", function: "tma::validate_descriptor_address" },
-    Binding { op: "tirx.ptx.fence_proxy_tensormap_acquire", function: "tma::validate_descriptor_address" },
-    Binding { op: "tirx.ptx.applypriority_async_bulk_tensor", function: "tma::TensorMapImage::decode_descriptor" },
-    Binding { op: "tirx.ptx.applypriority_async_bulk_tensor_im2col", function: "tma::TensorMapImage::decode_descriptor" },
-    Binding { op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta", function: "tma::TensorMapImage::materialize" },
+    Binding {
+        op: "tirx.ptx.cp_reduce_async_bulk_tensor",
+        function: "tma::RawTmaReductionOp::resolve",
+    },
+    Binding {
+        op: "tirx.ptx.cp_reduce_async_bulk_tensor",
+        function: "tma::s2g_reduction_elements",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_tensor_s2g",
+        function: "tma::execute_s2g_copy",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta",
+        function: "tma::execute_g2s",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta",
+        function: "tma::materialize_g2s_payload",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta",
+        function: "tma::shared_byte_offset",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta_report",
+        function: "tma::copy_report_matches_runs",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_tensor_g2s_cluster_multicast16",
+        function: "tma::multicast_target_ctas",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_tensor_g2s_cluster_multicast32",
+        function: "tma::multicast_target_ctas",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_g2s_cluster_multicast16",
+        function: "tma::multicast_target_ctas",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_g2s_cluster_multicast32",
+        function: "tma::multicast_target_ctas",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_g2s_cta",
+        function: "tma::bulk_byte_len",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_g2s_cluster",
+        function: "tma::bulk_byte_len",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_g2s_cta_report",
+        function: "tma::copy_report_matches",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_g2s_cluster_report",
+        function: "tma::copy_report_matches",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_s2g",
+        function: "tma::masked_destination_runs",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_g2s_cta",
+        function: "tma::ignore_oob_window",
+    },
+    Binding {
+        op: "tirx.ptx.st_bulk",
+        function: "tma::st_bulk_byte_count",
+    },
+    Binding {
+        op: "tirx.ptx.prefetch_valid_addr",
+        function: "tma::validate_cache_hint_alignment",
+    },
+    Binding {
+        op: "tirx.ptx.applypriority_async_bulk",
+        function: "tma::validate_bulk_cache_hint_size",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_prefetch",
+        function: "tma::validate_bulk_cache_hint_size",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_prefetch_evict_last",
+        function: "tma::validate_bulk_cache_hint_size",
+    },
+    Binding {
+        op: "tirx.ptx.tensormap_cp_fenceproxy",
+        function: "tma::validate_descriptor_address",
+    },
+    Binding {
+        op: "tirx.ptx.fence_proxy_tensormap_acquire",
+        function: "tma::validate_descriptor_address",
+    },
+    Binding {
+        op: "tirx.ptx.applypriority_async_bulk_tensor",
+        function: "tma::TensorMapImage::decode_descriptor",
+    },
+    Binding {
+        op: "tirx.ptx.applypriority_async_bulk_tensor_im2col",
+        function: "tma::TensorMapImage::decode_descriptor",
+    },
+    Binding {
+        op: "tirx.ptx.cp_async_bulk_tensor_g2s_cta",
+        function: "tma::TensorMapImage::materialize",
+    },
 ];
 
 const fn concat<const N: usize>(parts: &[&[Binding]]) -> [Binding; N] {
-    let mut out = [Binding { op: "", function: "" }; N];
+    let mut out = [Binding {
+        op: "",
+        function: "",
+    }; N];
     let mut index = 0;
     let mut part = 0;
     while part < parts.len() {

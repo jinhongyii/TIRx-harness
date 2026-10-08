@@ -201,9 +201,7 @@ pub(super) fn float_mma(
             ))?
         }
         None => io.lib(mma_dense_tail(
-            m,
-            n,
-            k,
+            (m, n, k),
             &a,
             &b,
             input,
@@ -341,9 +339,7 @@ pub(super) fn f8f6f4_mma(
         None
     };
     let output = io.lib(mma_dense_tail(
-        m,
-        n,
-        k,
+        (m, n, k),
         &a,
         &b,
         input_d.as_deref().map(|values| (values, 1.0)),

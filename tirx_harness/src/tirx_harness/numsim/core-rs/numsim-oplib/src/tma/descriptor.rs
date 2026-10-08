@@ -92,6 +92,7 @@ pub enum TensorMapElementType {
 }
 
 impl TensorMapElementType {
+    /// Element width in bits (FP4 4, U6 6, up to 64; `U32x2` is 64).
     pub const fn bits(self) -> usize {
         match self {
             Self::Float4E2M1Fn => 4,
@@ -103,6 +104,8 @@ impl TensorMapElementType {
         }
     }
 
+    /// Whether the `NaN_REQUEST_ZERO_FMA` OOB fill is legal: floating types only
+    /// (f16, bf16, f32, tf32, f64 and their FTZ forms).
     pub const fn supports_oob_nan(self) -> bool {
         matches!(
             self,
@@ -143,6 +146,7 @@ impl TensorMapElementType {
         }
     }
 
+    /// Inverse of `image_code`; errors on an unknown code.
     pub fn from_image_code(code: u8) -> OpResult<Self> {
         Ok(match code {
             0 => Self::Float4E2M1Fn,
@@ -259,6 +263,8 @@ pub struct TensorMapImage {
 }
 
 impl TensorMapImage {
+    /// Serialize this image into NumSim's private TensorMap byte payload. No numerics;
+    /// errors when the rank is outside 1..=5 or a field exceeds its descriptor range.
     pub fn encode(&self) -> OpResult<Vec<u8>> {
         if self.rank == 0 || self.rank > 5 {
             return Err(OpError::message(format!(
@@ -382,6 +388,8 @@ impl TensorMapImage {
         Ok(bytes)
     }
 
+    /// Parse a NumSim TensorMap payload back into an image. No numerics; errors on a length
+    /// or format-tag mismatch or out-of-range fields.
     pub fn decode(bytes: &[u8]) -> OpResult<Self> {
         if bytes.len() < TENSOR_MAP_PAYLOAD_BYTES
             || bytes.len() != tensor_map_payload_bytes(bytes[63])
@@ -591,12 +599,15 @@ impl TensorMapImage {
         (canonical.as_slice() == &bytes[..payload_bytes]).then_some(image)
     }
 
+    /// Point the image at `allocation_id` + `byte_offset` (a device allocation, not a host address).
     pub fn relocate(&mut self, allocation_id: u64, byte_offset: usize) {
         self.allocation_id = allocation_id;
         self.base_byte_offset = byte_offset;
         self.host_address = false;
     }
 
+    /// Fold the base offset into a raw host `address` and mark the image as host-addressed.
+    /// Errors on overflow.
     pub fn restore_host_address(&mut self, address: u64) -> OpResult<()> {
         self.allocation_id = address
             .checked_add(
@@ -609,6 +620,8 @@ impl TensorMapImage {
         Ok(())
     }
 
+    /// `tensormap.replace.global_dim`: set dimension `index` (0 encodes 2^32). Errors when the
+    /// index or value is outside descriptor ranges.
     pub fn replace_global_dimension(&mut self, index: usize, value: usize) -> OpResult<()> {
         if index >= self.physical_global_shape.len() || value as u128 >= MAX_GLOBAL_DIMENSION {
             return Err(OpError::message(format!(
@@ -624,10 +637,12 @@ impl TensorMapImage {
         Ok(())
     }
 
+    /// `tensormap.replace.global_stride`: set byte stride `index` (a multiple of 16, below the
+    /// field maximum). Errors otherwise.
     pub fn replace_global_stride(&mut self, index: usize, value: usize) -> OpResult<()> {
         if index >= self.physical_global_strides.len()
             || value as u128 >= MAX_GLOBAL_STRIDE
-            || (value != 0 && value % 16 != 0)
+            || (value != 0 && !value.is_multiple_of(16))
         {
             return Err(OpError::message(format!(
                 "TensorMap global stride field {index}={value} is outside descriptor ranges"
@@ -640,7 +655,12 @@ impl TensorMapImage {
     /// `tensormap.replace` with PTX field encodings. Cross-field legality is
     /// checked when the updated image is materialized: several replace
     /// instructions may be needed to build a valid new shape.
-    pub fn replace_field(&mut self, field: &str, index: Option<usize>, value: usize) -> OpResult<()> {
+    pub fn replace_field(
+        &mut self,
+        field: &str,
+        index: Option<usize>,
+        value: usize,
+    ) -> OpResult<()> {
         match (field, index) {
             ("global_dim", Some(index)) => return self.replace_global_dimension(index, value),
             ("global_stride", Some(index)) => return self.replace_global_stride(index, value),
@@ -716,7 +736,9 @@ impl TensorMapImage {
         }
         if dimensions.len() != rank || lower_strides.len() != rank - 1 || coordinates.len() != rank
         {
-            return Err(OpError::message("TMA override rank/operand counts disagree"));
+            return Err(OpError::message(
+                "TMA override rank/operand counts disagree",
+            ));
         }
         if coordinates.iter().any(|coordinate| *coordinate != 0) {
             return Err(OpError::message(
@@ -734,7 +756,9 @@ impl TensorMapImage {
         let upper = u16::try_from(upper_strides)
             .map_err(|_| OpError::message("TMA upper strides must fit 16 bits"))?;
         if u32::from(upper) >> (4 * (rank - 1)) != 0 {
-            return Err(OpError::message("TMA upper strides have nonzero unused bits"));
+            return Err(OpError::message(
+                "TMA upper strides have nonzero unused bits",
+            ));
         }
         for (axis, &lower) in lower_strides.iter().enumerate() {
             let lower = u32::try_from(lower)
@@ -751,7 +775,7 @@ impl TensorMapImage {
 /// Override-address legality: 16-byte aligned (absolute address) with at
 /// least 128 KiB of accessible memory behind it.
 pub fn validate_override_address(absolute_address: u64, accessible_bytes: usize) -> OpResult<()> {
-    if absolute_address % 16 != 0 {
+    if !absolute_address.is_multiple_of(16) {
         return Err(OpError::message(
             "TMA override address must be 16-byte aligned",
         ));
@@ -801,6 +825,8 @@ pub enum RawTmaReductionOp {
 pub type TmaReduction = crate::atomic::BulkReduction;
 
 impl RawTmaReductionOp {
+    /// The element reduction this op performs on `element_type` (TF32 reduces as F32; FTZ
+    /// types use the FTZ add). Errors on unsupported op/type pairs.
     pub fn resolve(self, element_type: TensorMapElementType) -> OpResult<TmaReduction> {
         use RawTmaReductionOp as Op;
         use TensorMapElementType as T;

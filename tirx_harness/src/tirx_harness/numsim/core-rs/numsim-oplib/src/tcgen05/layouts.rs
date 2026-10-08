@@ -44,11 +44,6 @@ pub fn tmem_access_column_count(byte_in_cell: usize, access_bytes: usize) -> OpR
         .ok_or_else(|| OpError::message("TMEM access column span overflow"))
 }
 
-/// First CTA of a `cta_group` (`cta & !(cta_group - 1)`).
-pub fn cta_group_first(cta_id_in_cluster: usize, cta_group: usize) -> usize {
-    cta_id_in_cluster & !(cta_group - 1)
-}
-
 // ---------------------------------------------------------------------------
 // tcgen05.ld / tcgen05.st
 // ---------------------------------------------------------------------------
@@ -236,11 +231,15 @@ impl CpDestinationLanes {
         Self { values, len: 4 }
     }
 
+    /// The destination lanes in use (1, 2 or 4 entries).
     pub const fn as_slice(&self) -> &[usize] {
         self.values.split_at(self.len).0
     }
 }
 
+/// TMEM lanes that source row `source_row` of a tcgen05.cp lands in, per [`cp_shape`]
+/// code (warpx4 replicates to four 32-lane partitions, warpx2 to two). No numerics;
+/// errors on an unknown shape code or lane overflow. Only tests call it today.
 pub fn cp_destination_lanes(shape: u8, source_row: usize) -> OpResult<CpDestinationLanes> {
     match shape {
         0 => Ok(CpDestinationLanes::four([
@@ -277,6 +276,8 @@ pub fn cp_destination_lanes(shape: u8, source_row: usize) -> OpResult<CpDestinat
     }
 }
 
+/// Split three little-endian bytes into four 6-bit codes (bits 0..6 first), zero-extended
+/// to bytes. Bit-exact; no float interpretation.
 pub fn unpack_b6(packed: [u8; 3]) -> [u8; 4] {
     let bits = u32::from(packed[0]) | (u32::from(packed[1]) << 8) | (u32::from(packed[2]) << 16);
     [
@@ -308,68 +309,6 @@ pub fn cp_decode_word(
     }
 }
 
-/// Target CTAs of a tcgen05.cp (legacy cta_group check in `raw_tcgen05_cp`).
-pub fn cp_target_ctas(
-    cta_id_in_cluster: usize,
-    ctas_per_cluster: usize,
-    cta_group: usize,
-) -> OpResult<Vec<usize>> {
-    let mut targets = vec![cta_id_in_cluster];
-    if cta_group == 2 {
-        let peer = cta_id_in_cluster ^ 1;
-        if peer >= ctas_per_cluster {
-            return Err(OpError::message(
-                "raw tcgen05.cp cta_group=2 has no paired CTA",
-            ));
-        }
-        targets.push(peer);
-    } else if cta_group != 1 {
-        return Err(OpError::message(format!(
-            "raw tcgen05.cp cta_group must be 1 or 2, got {cta_group}"
-        )));
-    }
-    Ok(targets)
-}
-
-/// Every destination `(source_row, word, lane, column)` of a tcgen05.cp, with
-/// the legacy lane-range check; returns also `(lane_end, column_end)`.
-pub fn cp_destination_cells(
-    address: u32,
-    row_offset: i64,
-    col_offset: i64,
-    shape: u8,
-) -> OpResult<(Vec<(usize, usize, usize, usize)>, usize, usize)> {
-    let (base_row, base_col) = tmem_address(address, row_offset, col_offset)?;
-    let (rows, words) = cp_rows_words(shape)?;
-    let column_end = base_col
-        .checked_add(words)
-        .ok_or_else(|| OpError::message("raw tcgen05.cp TMEM column overflow"))?;
-    let mut lane_end = 0;
-    let mut cells = Vec::with_capacity(rows * words);
-    for source_row in 0..rows {
-        let lanes = cp_destination_lanes(shape, source_row)?;
-        let mut absolute = [0_usize; 4];
-        for (slot, &destination_lane) in lanes.as_slice().iter().enumerate() {
-            let lane = base_row
-                .checked_add(destination_lane)
-                .ok_or_else(|| OpError::message("raw tcgen05.cp TMEM lane overflow"))?;
-            if lane >= 128 {
-                return Err(OpError::message(format!(
-                    "raw tcgen05.cp TMEM lane {lane} is outside 128 lanes"
-                )));
-            }
-            lane_end = lane_end.max(lane + 1);
-            absolute[slot] = lane;
-        }
-        for word in 0..words {
-            for &lane in &absolute[..lanes.as_slice().len()] {
-                cells.push((source_row, word, lane, base_col + word));
-            }
-        }
-    }
-    Ok((cells, lane_end, column_end))
-}
-
 // ---------------------------------------------------------------------------
 // Dense accumulator / packed-A TMEM layouts
 // ---------------------------------------------------------------------------
@@ -377,6 +316,8 @@ pub fn cp_destination_cells(
 /// F16 K=16 and FP8 K=32 occupy the same eight 32-bit words per CTA1 row.
 pub const CTA1_PACKED_A_COLUMNS: usize = 8;
 
+/// TMEM lane of accumulator row `row` (< 64) in PTX Layout F (M=64 non-`.ws`):
+/// 16 rows per 32-lane partition. No numerics; errors when `row >= 64`.
 pub fn layout_f_lane(row: usize) -> OpResult<usize> {
     if row >= 64 {
         return Err(OpError::message(format!(
@@ -399,6 +340,8 @@ pub enum DenseTmemLayout {
     G,
 }
 
+/// Accumulator TMEM layout of a CTA1 dense MMA: M128 D, M64 `.ws` E, M64 F,
+/// M32 `.ws` G. No numerics; errors on other M/`.ws` combinations.
 pub fn cta1_dense_tmem_layout(m: usize, weight_stationary: bool) -> OpResult<DenseTmemLayout> {
     match (m, weight_stationary) {
         (128, _) => Ok(DenseTmemLayout::D),
@@ -412,6 +355,8 @@ pub fn cta1_dense_tmem_layout(m: usize, weight_stationary: bool) -> OpResult<Den
 }
 
 impl DenseTmemLayout {
+    /// TMEM columns a `logical_columns`-wide matrix occupies (banked E/G layouts divide
+    /// by the bank count). No numerics; errors when not divisible.
     pub fn physical_columns(self, logical_columns: usize) -> OpResult<usize> {
         match self {
             Self::D | Self::F => Ok(logical_columns),
@@ -424,6 +369,8 @@ impl DenseTmemLayout {
         }
     }
 
+    /// `(lane, column)` offset of logical `(row, column)` in a `rows x columns` matrix in
+    /// this layout. No numerics; errors when out of the matrix or the bank shape is wrong.
     pub fn location(
         self,
         row: usize,
@@ -455,6 +402,7 @@ impl DenseTmemLayout {
         }
     }
 
+    /// Number of TMEM banks packed A is split across (E 2, G 4, otherwise 1).
     pub fn packed_a_banks(self) -> usize {
         match self {
             Self::E => 2,
@@ -463,6 +411,8 @@ impl DenseTmemLayout {
         }
     }
 
+    /// `(lane, column)` offset of packed-A word `packed_column` of `row` in `bank`.
+    /// No numerics; errors on an out-of-range bank or wrong banked row count.
     pub fn packed_a_location(
         self,
         bank: usize,
@@ -489,15 +439,6 @@ impl DenseTmemLayout {
             return Ok((lane, packed_column));
         }
         self.location(row, packed_column, rows, columns)
-    }
-}
-
-/// F32 CTA-pair accumulators use two 64-row banks for M=128, one for M=256.
-pub fn cta2_columns_per_bank(m: usize, n: usize) -> usize {
-    if m == 128 {
-        n / 2
-    } else {
-        n
     }
 }
 
@@ -545,14 +486,17 @@ pub fn dense_tmem_cells(
     Ok(cells)
 }
 
-/// Absolute `(bank, row, packed_column, lane, column)` of each packed TMEM A
-/// word (legacy `raw_tcgen05_gather_packed_tmem_a_columns` / footprints).
+/// `(bank, row, packed_column, lane, column)` of one packed TMEM A word.
+pub type PackedACell = (usize, usize, usize, usize, usize);
+
+/// Absolute [`PackedACell`]s of each packed TMEM A word (legacy
+/// `raw_tcgen05_gather_packed_tmem_a_columns`).
 pub fn packed_tmem_a_cells(
     address: u32,
     rows: usize,
     layout: DenseTmemLayout,
     columns: usize,
-) -> OpResult<Vec<(usize, usize, usize, usize, usize)>> {
+) -> OpResult<Vec<PackedACell>> {
     let (base_lane, base_col) = tmem_address(address, 0, 0)?;
     let capacity = rows
         .checked_mul(columns)
@@ -674,6 +618,7 @@ pub enum ScaleLayout {
 }
 
 impl ScaleLayout {
+    /// TMEM copies each scale row has (4 replicated partitions, or 2 for split B).
     pub fn replicas(self) -> usize {
         match self {
             Self::Replicated => 4,
@@ -681,6 +626,8 @@ impl ScaleLayout {
         }
     }
 
+    /// Absolute `(lane, column)` of scale `row`, copy `replica`, in a scale TMEM region at
+    /// `address`: 32 rows per column. No numerics; errors outside TMEM.
     pub fn location(self, address: u32, row: usize, replica: usize) -> OpResult<(usize, usize)> {
         let (base_lane, base_column) = block_scale_address(address)?;
         let (partition, row) = match self {
@@ -698,6 +645,8 @@ impl ScaleLayout {
     }
 }
 
+/// Scale TMEM layout for one operand: SFB of an M128 CTA2 MMA is split in N halves,
+/// all others replicate over four partitions.
 pub fn mxf8_scale_layout(m: usize, n: usize, cta_group: usize, is_b: bool) -> ScaleLayout {
     if is_b && cta_group == 2 && m == 128 {
         ScaleLayout::SplitB {
@@ -719,6 +668,7 @@ pub enum SparseMetadataLayout {
 }
 
 impl SparseMetadataLayout {
+    /// 4-bit metadata codes per row (b16 8, narrow K/4).
     pub fn chunks(self) -> usize {
         match self {
             Self::B16 { .. } => 8,
@@ -818,6 +768,8 @@ pub fn validate_sparse_metadata_address(metadata: u32, destination_address: u32)
     Ok(())
 }
 
+/// `(lane, column)` of LUT-B word `word` of group `group` at TMEM `address` (must be
+/// two-column aligned). No numerics; errors outside TMEM.
 pub fn lut_b_location(address: u32, group: usize, word: usize) -> OpResult<(usize, usize)> {
     let (base_row, base_column) = tmem_address(address, 0, 0)?;
     if address & 1 != 0 {

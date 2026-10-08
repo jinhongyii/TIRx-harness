@@ -668,4 +668,3 @@ fn narrow_bf16x2_e2m1x2_scaled_satfinite() {
 fn narrow_bf16x2_e2m1x2_scaled_relu_satfinite() {
     check(&narrow_2::FORMS[12]);
 }
-

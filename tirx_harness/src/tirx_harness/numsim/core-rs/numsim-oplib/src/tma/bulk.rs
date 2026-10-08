@@ -110,9 +110,8 @@ pub fn copy_report_matches_runs<'a>(
 
 /// `st.bulk` size operand: a multiple of 8 up to 16 MiB.
 pub fn st_bulk_byte_count(value: i64, lane: usize) -> OpResult<usize> {
-    let byte_len = usize::try_from(value).map_err(|_| {
-        OpError::message(format!("st.bulk byte count is negative on lane {lane}"))
-    })?;
+    let byte_len = usize::try_from(value)
+        .map_err(|_| OpError::message(format!("st.bulk byte count is negative on lane {lane}")))?;
     if byte_len % 8 != 0 || byte_len > 16_777_216 {
         return Err(OpError::message(format!(
             "st.bulk byte count {byte_len} must be a multiple of 8 with maximum 16777216 on lane {lane}"
@@ -135,18 +134,6 @@ pub fn bulk_byte_len(value: i64, lane: usize, operation: &str) -> OpResult<usize
     Ok(byte_len)
 }
 
-/// Single-issuer `cp.async.bulk` size operand (no lane suffix).
-pub fn bulk_issue_byte_len(value: i64, operation: &str) -> OpResult<usize> {
-    let byte_len = usize::try_from(value)
-        .map_err(|_| OpError::message(format!("{operation} byte count is negative")))?;
-    if byte_len == 0 || byte_len % 16 != 0 {
-        return Err(OpError::message(format!(
-            "{operation} byte count {byte_len} must be a positive multiple of 16"
-        )));
-    }
-    Ok(byte_len)
-}
-
 /// Both ends of a bulk copy must be 16-byte aligned (physical addresses).
 pub fn validate_bulk_alignment(
     source_address: usize,
@@ -154,7 +141,7 @@ pub fn validate_bulk_alignment(
     lane: usize,
     operation: &str,
 ) -> OpResult<()> {
-    if source_address % 16 != 0 || destination_address % 16 != 0 {
+    if !source_address.is_multiple_of(16) || !destination_address.is_multiple_of(16) {
         return Err(OpError::message(format!(
             "{operation} requires 16-byte aligned source and destination addresses on lane {lane}"
         )));
@@ -202,6 +189,9 @@ pub struct IgnoreOobWindow {
     pub valid_len: usize,
 }
 
+/// Window of a `cp.async.bulk ... .ignore_oob` copy of `num_bytes`: bytes
+/// `[left, len - right)` are read, the ignored edges keep prior contents. No numerics;
+/// errors on negative/over-15 ignore counts, bad length or misaligned addresses.
 pub fn ignore_oob_window(
     num_bytes: i64,
     ignore_bytes_left: i64,
@@ -243,7 +233,7 @@ pub fn validate_cache_hint_alignment(
     lane: usize,
     label: &str,
 ) -> OpResult<()> {
-    if physical_byte_offset % alignment != 0 {
+    if !physical_byte_offset.is_multiple_of(alignment) {
         return Err(OpError::message(format!(
             "{label} requires a {alignment}-byte aligned global address on lane {lane}, got byte offset {physical_byte_offset}"
         )));
@@ -333,10 +323,12 @@ mod tests {
     fn address_cache_hints_enforce_alignment_and_bulk_size_only() {
         // async_copy.rs cache_hint_tests (adapted to the pure checks).
         validate_cache_hint_alignment(0, 128, 0, "bulk applypriority").unwrap();
-        assert!(validate_cache_hint_alignment(16, 128, 0, "bulk applypriority")
-            .unwrap_err()
-            .to_string()
-            .contains("128-byte aligned"));
+        assert!(
+            validate_cache_hint_alignment(16, 128, 0, "bulk applypriority")
+                .unwrap_err()
+                .to_string()
+                .contains("128-byte aligned")
+        );
         assert!(validate_bulk_cache_hint_size(12, 0, "bulk prefetch")
             .unwrap_err()
             .to_string()

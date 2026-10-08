@@ -11,7 +11,7 @@
 //!
 //! Submodules: [`int`] integer arithmetic, [`bits`] bit manipulation,
 //! [`float`] f32/f64, [`half`] f16/bf16 and mixed precision, [`compare`]
-//! setp/set/selp/slct/testp, [`mov`] moves and policy, [`sparse`]
+//! setp/set/selp/slct/testp, [`mod@mov`] moves and policy, [`sparse`]
 //! spcompress/spdecompress.
 
 pub mod bits;

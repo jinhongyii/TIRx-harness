@@ -19,9 +19,11 @@ pub struct TcgenAllocation {
 }
 
 impl TcgenAllocation {
+    /// First TMEM column of the allocation.
     pub const fn base_column(self) -> u32 {
         self.base_column
     }
+    /// Allocated column count.
     pub const fn columns(self) -> usize {
         self.columns
     }
@@ -31,7 +33,7 @@ impl TcgenAllocation {
 pub fn valid_columns(columns: usize, exclusive: bool, capacity: usize) -> bool {
     (32..=capacity).contains(&columns)
         && if exclusive {
-            columns % TMEM_ALLOCATION_GRANULARITY == 0
+            columns.is_multiple_of(TMEM_ALLOCATION_GRANULARITY)
         } else {
             columns <= TMEM_COLUMN_CAPACITY && columns.is_power_of_two()
         }

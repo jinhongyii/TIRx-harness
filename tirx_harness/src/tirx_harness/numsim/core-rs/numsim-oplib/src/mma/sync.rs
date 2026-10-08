@@ -623,7 +623,11 @@ mod tests {
                 for col in 0..8 {
                     let mut acc = 0.0_f32;
                     for inner in 0..4 {
-                        acc = crate::scalar::host_fma_f32(a_val(row + computation, inner), b_val(inner, col), acc);
+                        acc = crate::scalar::host_fma_f32(
+                            a_val(row + computation, inner),
+                            b_val(inner, col),
+                            acc,
+                        );
                     }
                     let (lane, slot) = m8n8k4_f32_acc_owner(computation, row, col).unwrap();
                     assert_eq!(d[slot][lane], acc);
