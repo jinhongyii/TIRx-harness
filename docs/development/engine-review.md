@@ -1037,3 +1037,13 @@ Aligning `Chunk` to a cache line changed nothing measurable.
 - `--locked` passes with the new lock entries: mimalloc 0.1.52, libmimalloc-sys 0.1.49, cc 1.6.0, find-msvc-tools 0.1.14, shlex 2.0.1.
 - The extension still links only libc, libm and libgcc_s (mimalloc is static).
 - Not verified here: the CI toolchain 1.89.0 and the aarch64 image (W8).
+
+**mimalloc TLS mode (c3e214e, `local_dynamic_tls`): no measurable cost.** The extension was built from archives of 1581dfe (initial-exec TLS; `readelf` shows `STATIC_TLS`) and c3e214e (local-dynamic, no `STATIC_TLS`). Both were timed through the dlopen'ed extension (`numsim_core_py.run` on the recorded fixtures). A static Rust driver would relax the TLS model to local-exec and hide the difference.
+
+| | 1581dfe (initial-exec) | c3e214e (local-dynamic) |
+| --- | --- | --- |
+| e24, 1 worker (min of 3) | 7.95 s (7.95–7.98) | 7.93 s (7.93–8.23) |
+| e24, 16 workers (min of 3) | 4.18 s (4.18–4.77) | 4.14 s (4.14–4.93) |
+| medium, 2000 rounds, 16 workers (one run each) | 148.9 s (load 23 → 8) | 128.7 s (load 6 → 23) |
+
+Load average was 5.5–8.7 for e24. The medium difference is within the load swing.
