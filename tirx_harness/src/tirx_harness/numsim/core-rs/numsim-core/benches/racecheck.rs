@@ -516,5 +516,73 @@ fn gc_parallel(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words, gc_backoff, shadow_slow_path, gc_parallel);
+/// Token re-attribution (checker/tokens.rs, design §17): a TMA-style
+/// pipeline where every iteration copies a fresh global slice into one
+/// shared stage, the consumer warp waits the copy's mbarrier phase and reads
+/// the stage, fences proxy.async and releases the stage on a second
+/// mbarrier the producer waits. Without tokens each copy's global read
+/// witness pins its slot
+/// (and a clock component) for the whole run; with them the slot is
+/// reclaimed once the copy completes. The guard: `on` stays roughly linear
+/// in N (compare /1024 and /4096); `off` grows faster.
+fn reattribution_tokens(c: &mut Criterion) {
+    use numsim_core::racecheck::tuning;
+    use std::sync::atomic::Ordering::Relaxed;
+    let topo = Topology { warps_per_cta: 2, ctas_per_cluster: 1, num_ctas: 1 };
+    let mut g = c.benchmark_group("reattribution_tokens");
+    g.sample_size(10);
+    for n in [1024u64, 4096] {
+        let (glob, stage) = (AllocId(1), AllocId(2));
+        let bar = SyncObjId::Mbarrier { cta: CtaId(0), alloc: AllocId(3), offset: 0 };
+        let mut ev = vec![
+            Event::Sync(SyncEvent::AllocBegin { alloc: glob, space: Space::Global, size: n * 128, cta: 0 }),
+            Event::Sync(SyncEvent::AllocBegin { alloc: stage, space: Space::Shared, size: 128, cta: 0 }),
+        ];
+        let mut seq = 0u64;
+        let mut access = |who: Who, alloc: AllocId, range: std::ops::Range<u64>, kind: AccessKind, proxy: Proxy, domain: Domain| {
+            seq += 1;
+            Event::Access(Access { seq, who, alloc, range, kind, order: MemOrder::Weak, scope: None, atomic: false, proxy, domain: Some(domain), site: SiteId(1), returns_value: false, operand: 0 })
+        };
+        let empty = SyncObjId::Mbarrier { cta: CtaId(0), alloc: AllocId(3), offset: 8 };
+        for i in 0..n {
+            let op = AsyncId(1 + i);
+            let (p, c) = (3 * i as u32, 4 * i as u32);
+            if i > 0 {
+                // Producer waits the consumer's release of the stage.
+                ev.push(Event::Sync(SyncEvent::Wait { warp: 0, lanes: LaneMask::lane(0), obj: empty, phase: i - 1, acquire: Some(true), scope: Some(Scope::Cta), site: SiteId(4), epoch: p + 1 }));
+            }
+            ev.push(Event::Sync(SyncEvent::AsyncIssue {
+                op,
+                warp: 0,
+                lanes: LaneMask::lane(0),
+                kind: AsyncKind::Copy,
+                proxy: Proxy::Async,
+                preds: vec![],
+                footprint: vec![(stage, 0..128)],
+                restricted: false,
+                site: SiteId(2),
+                epoch: p + 2,
+            }));
+            ev.push(access(Who::Async { op, side: Milestone::Read }, glob, i * 128..i * 128 + 128, AccessKind::Read, Proxy::Async, Domain::Global));
+            ev.push(access(Who::Async { op, side: Milestone::Write }, stage, 0..128, AccessKind::Write, Proxy::Async, Domain::SharedCta));
+            for m in [Milestone::Read, Milestone::Write] {
+                ev.push(Event::Sync(SyncEvent::AsyncComplete { op, milestone: m, target: CompletionTarget::Phase { obj: bar, phase: i } }));
+            }
+            ev.push(Event::Sync(SyncEvent::Wait { warp: 1, lanes: LaneMask::ALL, obj: bar, phase: i, acquire: Some(true), scope: Some(Scope::Cta), site: SiteId(3), epoch: c + 1 }));
+            ev.push(access(Who::Lane { warp: 1, lane: 0, epoch: c + 2 }, stage, 0..128, AccessKind::Read, Proxy::Generic, Domain::SharedCta));
+            ev.push(Event::Sync(SyncEvent::Fence { warp: 1, lanes: LaneMask::ALL, kind: FenceKind::ProxyAsync(None), site: SiteId(5), epoch: c + 3 }));
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: 1, lanes: LaneMask::ALL, obj: empty, phase: i, release: Some(true), scope: Some(Scope::Cta), site: SiteId(6), epoch: c + 4 }));
+        }
+        for on in [true, false] {
+            g.bench_function(BenchmarkId::new(if on { "on" } else { "off" }, n), |b| {
+                tuning::REATTRIBUTE_TOKENS.store(on, Relaxed);
+                b.iter(|| black_box(Checker::run(topo, ev.iter().cloned())));
+                tuning::REATTRIBUTE_TOKENS.store(true, Relaxed);
+            });
+        }
+    }
+    g.finish();
+}
+
+criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words, gc_backoff, shadow_slow_path, gc_parallel, reattribution_tokens);
 criterion_main!(benches);

@@ -337,6 +337,15 @@ impl Frontier {
         }
     }
 
+    /// Visit every entry mutably (stamp rewrite at re-attribution).
+    pub fn for_each_mut(&mut self, mut f: impl FnMut(&mut Entry)) {
+        match self {
+            Frontier::Empty => {}
+            Frontier::One(e) => f(e),
+            Frontier::Many(v) => v.iter_mut().for_each(f),
+        }
+    }
+
     pub fn retain(&mut self, mut keep: impl FnMut(&Entry) -> bool) {
         match self {
             Frontier::Empty => {}

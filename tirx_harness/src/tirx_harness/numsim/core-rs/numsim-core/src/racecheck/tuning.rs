@@ -42,6 +42,10 @@ pub static FORK_JOIN: AtomicBool = AtomicBool::new(true);
 /// given a child checker (cost only; results are identical either way).
 pub static FORK_MIN_ACCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Token re-attribution of completed copies (checker/tokens.rs; cost
+/// only, verdicts identical either way).
+pub static REATTRIBUTE_TOKENS: AtomicBool = AtomicBool::new(true);
+
 #[inline(always)]
 pub fn on(s: &AtomicBool) -> bool {
     s.load(Relaxed)

@@ -116,6 +116,7 @@ impl Warp {
             tcgen_waited: self.tcgen_waited.clone(),
             tcgen_pub: self.tcgen_pub.clone(),
             g2t_ranges: self.g2t_ranges.clone(),
+            dtok: self.dtok,
             sites: Vec::new(),
         })
     }
@@ -123,7 +124,7 @@ impl Warp {
 
 impl Checker {
     /// Cluster owning a barrier object, if any.
-    fn obj_cluster(&self, obj: SyncObjId) -> Option<u32> {
+    pub(super) fn obj_cluster(&self, obj: SyncObjId) -> Option<u32> {
         let cpc = self.topo.ctas_per_cluster.max(1);
         match obj {
             SyncObjId::Mbarrier { cta, .. } | SyncObjId::Named { cta, .. } | SyncObjId::RegPool { cta } => Some(cta.0 / cpc),
@@ -318,7 +319,14 @@ impl Checker {
                 SyncEvent::AsyncComplete { op, target, .. } => {
                     self.op_slot(*op).is_none()
                         || match target {
-                            CompletionTarget::Phase { obj, .. } => !self.obj_cluster(*obj).is_some_and(|c| p.clusters.contains(&c)),
+                            CompletionTarget::Phase { obj, phase } => {
+                                !self.obj_cluster(*obj).is_some_and(|c| p.clusters.contains(&c))
+                                    // A tokenised fold needs a record token: from the
+                                    // reserved pool only (tokens.rs).
+                                    || (self.op_slot(*op).is_some_and(|i| self.tokenised(i))
+                                        && self.phases.get(obj).and_then(|m| m.get(phase)).and_then(|ph| ph.tok).is_none()
+                                        && !self.token_available(*obj))
+                            }
                             CompletionTarget::Warp { warp, .. } => !self.warp_held(*warp),
                         }
                 }
@@ -568,7 +576,8 @@ impl Checker {
         for _ in free..reserve {
             let i = self.next_slot;
             self.next_slot += 1;
-            self.asyncs.0.put(i, Box::new(AsyncActor::placeholder(nw + i as u32)));
+            let _ = nw;
+            self.asyncs.0.put(i, Box::new(AsyncActor::placeholder(self.slot_base() + i as u32)));
             let p = self.pools.entry(pool).or_default();
             p.slots.push(i);
             p.free.insert(0, i);
@@ -611,6 +620,20 @@ impl Checker {
         let objs: Vec<SyncObjId> = clusters.iter().flat_map(|c| self.phase_index.remove(c).unwrap_or_default()).collect();
         for o in objs {
             child.phases.insert(o, self.phases.remove(&o).unwrap());
+        }
+        // Token re-attribution: records (read-only), and each cluster's
+        // record-token pool topped up to the reservation.
+        child.tk.vrecs = self.tk.vrecs.clone();
+        let mut sorted: Vec<u32> = clusters.iter().copied().collect();
+        sorted.sort_unstable();
+        for cl in sorted {
+            let mut pool = self.tk.pools.remove(&cl).unwrap_or_default();
+            while pool.len() < tokens::TOKEN_RESERVE {
+                let i = self.next_slot;
+                self.next_slot += 1;
+                pool.push((self.slot_base() + i as u32, 0));
+            }
+            child.tk.pools.insert(cl, pool);
         }
         child.part = Some(Box::new(PartCtx {
             meta,
@@ -689,6 +712,19 @@ impl Checker {
         }
         for (o, ph) in child.phases.drain() {
             self.phases.insert(o, ph);
+        }
+        for (cl, pool) in child.tk.pools.drain() {
+            self.tk.pools.insert(cl, pool);
+        }
+        for (id, v) in child.tk.logs.drain() {
+            self.tk.logs.entry(id).or_default().extend(v);
+        }
+        for (id, v) in child.tk.pend.drain() {
+            self.tk.pend.entry(id).or_default().extend(v);
+        }
+        self.tk.retired.append(&mut child.tk.retired);
+        for (id, v) in child.tk.attr_users.drain() {
+            self.tk.attr_users.entry(id).or_default().extend(v);
         }
         for (k, v) in child.sc.drain() {
             self.sc.insert(k, v);

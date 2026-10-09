@@ -1165,3 +1165,380 @@ with a note line.
 
 The rule was: at least 1.5x over serial on e24 at 16 workers, and no 1-worker
 regression beyond noise. It is met.
+
+## 17. Token re-attribution of completed copies (W5; reviewed and signed off by W6, 2026-10-09)
+
+Goal: free the async slot of a completed copy as soon as its completion has
+been delivered (F1). The copy's witnesses, global and shared, stay exact.
+Clock width is then bounded by live state, not by run length (§16: 140K
+slots and 2752 chunks per warp clock on medium).
+
+### 17.1 Where a copy's completion enters the clock world
+
+A copy S's component (`actor = slot`, epoch `gen + 1` read side, `gen + 2`
+write side) is raised *raw*, without any other actor's stamp, at exactly two
+places:
+
+- **(P) Phase target.** `AsyncComplete{Phase}` joins the completion
+  projection (hb and a2g[d] for every d) into `Phase::completion` of record
+  (obj, phase).
+- **(W) Warp target.** `AsyncComplete{Warp}` (wait_group, bulk group) joins
+  it straight into the waiting warp's lanes.
+
+Every other move of S's component is a whole-clock operation.
+
+- Joins: `Warp::acquire`, payloads, release heads, word history, SC table,
+  `pending_acq` and `acquire_rel`, tensormap heads moved into g2t. Each
+  carries hb, g2a and a2g together (`Knowledge::propagating`).
+- Proxy bridges: they copy all of hb into a2g/g2a.
+- `Clock::meet`, used only by GC.
+- Filters drop whole payloads, never single components: scope checks on
+  arrivals and release heads, and the tensormap releaser filter
+  (`required_scope` on the releaser).
+- `Clock::filter` (per-actor) has no caller in the checker.
+- Commit forwarding raises its preds' components raw, but preds are tcgen
+  ops. A copy that appears in any commit's `preds` is made ineligible: a
+  defensive check, not observed today.
+
+### 17.2 Tokens
+
+Two kinds of token actor. Both are ordinary clock components, in a dense id
+range after the slots.
+
+- **Record token R_P**, one per retained phase record P that has received
+  at least one copy completion.
+  - P keeps a counter `n_P`.
+  - When copy S's completion is folded into P (event P), `n_P += 1` and R_P
+    is raised to `base(R_P) + n_P` in the completion's views: hb and a2g[d]
+    for every d, the same views as S.
+  - S is attributed `(R_P, base + n_P)`.
+- **Delivery tokens** (revised after W6's review, blocker (b)). A single
+  scalar per warp is unsound when lanes acquire separately: lane 0 acquires
+  A's record (v = 1), lane 5 acquires B's (v = 2), lane 5 releases, and the
+  receiver "knows D_W ≥ 1" without lane 5 ever holding A. Guard
+  `s17b_lane_split_delivery_tokens_do_not_order`. There are therefore two
+  kinds, each monotone along exactly one holder lineage:
+  - **D_W, the full-warp token**, for acquisitions whose lane mask is all 32
+    lanes. These land in `base`, which every lane holds.
+  - **D_{W,l}, the per-lane token**, for partial-mask acquisitions. It is
+    raised only in `extra[l]`, so it is held only by lane l's lineage
+    (lane l itself, and whatever lane l later publishes, or merges at a warp
+    sync).
+  Ids are allocated on first use. Elected-lane waits make that mostly one
+  per-lane id per warp: at most num_warps × 33.
+
+  A delivery token is raised at every acquisition of raw token-bearing
+  knowledge, in the acquiring lanes and in the views the acquired completion
+  carries:
+  - (W) a warp-target completion of a copy;
+  - a `Wait` with acquire semantics on a record whose `n_P > 0`;
+  - a later `fence.acquire` (`acquire_rel`) of a `pending_acq` entry that
+    came from a relaxed wait on such a record. The `Rel` carries
+    `tok: Option<(R_P, n)>`.
+
+  Each such event bumps the counter of the token for its mask (D_W if all
+  lanes, else D_{W,l} for each acquiring lane l). It raises the token through
+  the same `Warp::acquire(lanes, …)` call that carries the completion, so
+  the token lands in base exactly when the completion does, and in
+  `extra[l]` exactly when it does. It also logs
+  `(R_P, n_P at the acquire) -> {token, value}` in R_P's waiter log; for (W)
+  it attributes S those entries directly.
+
+  **View uniformity (W6).** Every delivery-token raise uses one view set: hb
+  plus a2g[d] for every d. That is the set every copy completion projection
+  carries, through `completion()` for both the phase and the warp target. If
+  one acquisition raised hb only and a later one a2g too, "a2g knows D ≥ v"
+  would wrongly imply that a2g holds S_v. To be asserted at the raise.
+
+  **Every reader of `Phase::completion` is a logged hook (W6 (c)).** Grep at
+  e5d1582: `checker.rs` `sync_unwatched` AsyncComplete{Phase} (the fold,
+  writer) and `wait()` (the only reader). An acquire `wait` (mbarrier
+  wait, test_wait or try_wait success, named or cluster barrier) acquires it
+  directly. A relaxed `wait` packs it into a `pending_acq` Rel, which is
+  acquired at a later `fence.acquire` through `acquire_rel`. Both are
+  hooks. Fork/join `split`/`absorb` only move the record. A debug assert
+  in the token code checks that R_P is never raised in a warp outside these
+  hooks.
+
+Invariant: for every clock C and view v in {hb, a2g[d]}, after S's
+completions are all delivered, C.v[S] ≥ e_S ⇔ C.v knows one of S's
+attributions. It holds because:
+
+- Raw raises of S happen only at (P) and (W), each in the same clock and the
+  same views as its token.
+- R_P's value is monotone and P's completion clock accumulates, so
+  R_P ≥ base + k implies holding P's completion as of fold k, which contains
+  S_1..S_k.
+- A delivery token ≥ v implies holding its lineage's knowledge as of
+  acquisition v (base for D_W, `extra[l]` for D_{W,l}), which contains
+  everything W acquired then.
+- Every later operation moves whole clocks (§17.1), so S and its tokens
+  travel together. Bridges copy hb, with tokens, into a2g in one step.
+
+### 17.3 Re-attribution and slot reclaim
+
+At each GC, every in-use copy with `done == 2`, every completion target
+delivered (F1), no appearance in a commit's `preds`, and issue proxy
+`Async` is re-attributed. The last condition comes from W6: st.async /
+red.async and cp.async are generic-proxy async writes (T13). Their witnesses
+can be folded into the retired-generic summary (`Alloc.retired`, keyed by
+actor), which this design does not remap, so those ops keep today's
+slot-pinned path. Wide-span entries are keyed by span, not actor. The
+fork/join decode registry `op_reg` is keyed (actor, epoch); its entries for
+a remapped (slot, gen) are dropped at re-attribution, since no witness names
+them any more.
+
+- **Before the shadow walk.** Build `remap: slot -> VBASE + rec`. The record
+  holds the decode snapshot (as v1: warp, lane, site, op, `completed_ctas`;
+  k cleared) and the attribution list (token, value).
+- **During the existing walk.** Every kept witness of a remapped actor gets
+  its stamp rewritten in place, global and shared allocations alike. There
+  is no extra pass and no "global only" restriction: a copy's witnesses are
+  async-proxy, so they are only ever judged in Hb or A2g(d), and the tokens
+  mirror both.
+- **Then the normal reclaim loop** frees the slot: no witness names it.
+  Slots in use are bounded by copies in flight plus completed-but-undelivered
+  ones.
+- **Ordering test** for a virtual witness:
+  `cur.view(v).observes((tok, value))` for any attribution. That is a
+  standard scalar lookup: lane-precise through `extra[lane]` for warps, and
+  through `act.k` for async cur. There are no observer-stamp rules, which
+  replaces v1's three a2g rules.
+- **Decode** (`slot_of_w`, `info`, `classify`, `cross_cta_async`) reads the
+  record's snapshot, as in v1.
+
+There is no observation hook and no clock diff: the only new work is O(1)
+at (P), (W), waits on token-bearing records, and fences consuming tokened
+pending entries.
+
+### 17.4 Token lifetime
+
+Delivery tokens are permanent: one D_W per warp plus one D_{W,l} per lane
+that ever acquires partially. That is at most 33 × num_warps, about 2.2K
+plus the per-lane ids in practice (elected-lane waits).
+
+An R_P token is retired when all of these hold:
+
+- (a) P has left the retained list (`phase_mut` keeps 4 phases per object);
+- (b) no `pending_acq` entry still holds P's completion. The token keeps a
+  `Weak<Rel>` per relaxed wait; dropped and consumed entries both release
+  their `Arc`.
+- (c) It is converted in the next GC (main checker).
+
+Conversion replaces every attribution `(R_P, k)` in the records with the
+delivery-token entries from R_P's waiter log that have `n ≥ k`. That is exact:
+once (a) and (b) hold, nobody can acquire R_P raw any more, and every holder
+got it through a logged acquisition, so they hold the matching delivery
+token.
+
+The id then returns to the token pool with its generation base raised above
+the last value. Clocks may still carry old R_P values, but they are below
+every future value of that id, and no witness names them any more. This is
+the slot-reuse argument, applied to tokens.
+
+Bound on live R_P: retained records with copy completions (at most 4 × the
+barrier objects; 10.5K records on medium at most) plus records held only
+by pending relaxed waits (at most `MAX_PENDING` per warp lane, in practice a
+handful). Tokens are per record, never per op, so there is no growth with
+run length.
+
+Clock width becomes warps + in-flight slots + live record tokens + delivery
+tokens, all
+bounded. On medium that is about 2.2K + a few thousand + at most about 10K +
+2.2K, against 140K slot ids today.
+
+Attribution lists per copy: one R_P per target record (multicast: one per
+CTA), converted to the waiters of each record. In practice 1–8 entries.
+
+### 17.5 W6's acceptance list
+
+1. **Wait after pruning.** `phase_mut` creates a fresh record with
+   `n_P = 0`. The waiter acquires no completion and no token, exactly as
+   today: never ordered. At contract level a stale-phase wait then reports
+   a race (MissingProxyBridge), per W6's `item1_*` guards. The pruned
+   record's token is never acquired again; conversion already covers its
+   earlier waiters.
+2. **Parity aliasing.** Records are keyed by the full phase number, so R_P is
+   per generation. A wait at g+2 reads record g+2's token only.
+3. **Relaxed wait, later fence.acquire.**
+   - The relaxed wait pushes `Rel { k: completion (carrying R_P), tok }`
+     into `pending_acq`. No delivery-token raise happens at the wait.
+   - At the fence, `acquire_rel` acquires the payload, with the same scope
+     check as today. That raises the delivery token for the fencing lanes,
+     logs (R_P, n) → (token, v), and drops
+     the `Arc`.
+   - Pending entries dropped by the `MAX_PENDING` bound are never acquired,
+     so they give neither S nor a token. The token's `Weak` dies with them.
+4. **Multicast.** One completion lands in several CTAs' records, each with
+   its own R_P and counter. S gets one attribution per record. Acquiring one
+   record's token implies only that record's completion.
+5. **Remote and cluster-barrier arrivals.** Tokens live only in
+   `Phase::completion`, never in arrivals, so remote `mbarrier.arrive` and
+   cluster/named barrier records are untouched. A remote complete_tx into
+   another CTA's mbarrier creates that record's token in the record's owner,
+   which is the main checker under fork/join, since a foreign object
+   suspends.
+6. **tcgen05 commit forwarding.**
+   - A commit's completion forwards its preds' raw tcgen components and the
+     issuer's knowledge. Tokens there travel inside the issuer's whole clock.
+   - A commit completion folded into a record does not bump `n_P`.
+   - R_P therefore orders exactly the copy completions folded into P,
+     nothing about uncommitted or commit-forwarded work.
+   - A copy in any commit's preds is ineligible (§17.1).
+7. **Fork/join.**
+   - R_P ids come from a per-partition token pool, keyed like the async-slot
+     pools and reserved at split, so serial and fork/join allocate the same
+     ids in the same order. Delivery-token ids are fixed per (warp) and
+     (warp, lane).
+   - Waiter logs live with the record in the child and are merged back at
+     absorb. They are sets keyed by (n, token, v), so merge order cannot
+     change the result; they are still appended in tag order.
+   - Re-attribution and conversion run only in the main checker's GC, after
+     settle.
+8. **Scope-filtered arrivals.** The completion part of a record is accepted
+   by an acquire wait of any scope (today's rule; racecheck-isa-answers.md
+   R4: the complete-tx thread is ISA-silent for the mutual-scope test). R_P lives in that part,
+   so it is acquired exactly where the copy's own completion is. A `.cta`
+   waiter that rejects a remote `.release.cluster` arrival still drops that
+   arrival's payload, which carries no token.
+9. **Tensormap path.**
+   - `TensormapRelease` snapshots the releasing lanes' whole hb, tokens
+     included. `TensormapAcquire` keeps or drops whole heads by releaser
+     scope and joins them into g2t.
+   - S and its tokens therefore stay together on this path too.
+   - g2t is not a view a copy's async witness is judged in (`select_view`
+     sends Async priors to Hb or A2g), so this path cannot order a
+     re-attributed witness differently from today.
+   - Guards (W6, `item9_*`): an async-written descriptor read by a TMA is
+     ordered by hb alone today, with or without the fence pair; a
+     generic-written descriptor needs the pair. Both stay as they are.
+
+### 17.6 Cost
+
+| Hook | Cost | Medium estimate per round (about 2300 rounds) |
+| --- | --- | --- |
+| (P) fold into a record | `n_P += 1`, one raise in hb + 3 a2g | ≈ copies per round ≈ 60 |
+| (W) warp-target delivery | one delivery-token raise | bulk-group copies only: tens |
+| Wait on a token-bearing record | one Knowledge acquire for the delivery token, one log entry | ≈ mbarrier acquire waits ≈ a few hundred |
+| Fence consuming a tokened pending entry | the same | rare (relaxed waits) |
+| GC: remap build | O(eligible copies) | per GC |
+| GC: stamp rewrite | inside the existing walk, one hash lookup per kept async witness | per GC |
+| GC: token conversion | O(attributions of retired tokens) | per GC |
+
+There is no per-event clock diff and no watch set: v1's 5x came from diffing
+every warp sync event against about 90K watched actors.
+
+### 17.7 Gates and measurement plan
+
+Guards (`racecheck_reattribution.rs`, contract events, `gc_every = 1` and
+the default period, identical payloads):
+- W6's nine items above, each as a scenario. For 9, the tensormap
+  release/acquire chain around a copy completion.
+- The existing C1, F1, F2, C3 and a3 guards.
+- The fresh-source slot guard un-ignored (peak ≤ same-source + 8).
+- A new bounded-width guard: slots and token ids stay bounded over 256
+  iterations of the stage pipeline with a fresh source.
+
+Gates:
+- Findings byte-identical against HEAD on the 7 fixtures at 1/8/16/32
+  workers, serial and fork/join.
+- `racecheck_parallel_review` 27/27 in release.
+- All racecheck test files.
+- `cargo test --workspace`.
+- Conformance `-k racecheck`.
+
+Measurement:
+- medium, MAX_ROUNDS=2000, 16 workers, serial and fork/join, min of 3:
+  - the window 1800→2000, access + sync;
+  - per GC: slots in use, live R_P, delivery tokens, chunks per warp clock,
+    memo map
+    size.
+- Criterion: slots and chunks flat over the run, and window access + sync at
+  least 1.5x faster. The unsound ceiling gave about 2.3x.
+- e24 at 1/16 workers: no regression beyond noise.
+- Criterion bench: `reattribution_tokens` — a stage pipeline over N
+  iterations; cost per iteration flat in N.
+
+### 17.8 Open points for W6
+
+- (a) Is "accepted by an acquire wait of any scope" for `Phase::completion`
+  the right basis for item 8? Today's code applies no scope test to the
+  completion part.
+- (b) Resolved: per-lane delivery tokens (§17.2). W6, please re-review.
+- (c) Conversion timing: are there carriers of raw R_P besides retained
+  records and `pending_acq` Rels? Candidates I ruled out: arrivals (never
+  tokened), word history and release heads (warp payloads that carry the
+  releaser's delivery-token chain), and the SC table (warp knowledge).
+
+### 17.9 Implementation (landed)
+
+The code is `racecheck/checker/tokens.rs`, with hooks in `checker.rs` and
+`checker/partition.rs`. The switch is `tuning::REATTRIBUTE_TOKENS`, default
+on, for A/B runs.
+
+Actor ids:
+
+| Range | What |
+| --- | --- |
+| `[0, nw)` | warps |
+| `nw + 33·w` | delivery token D_W (full mask, raised in `base`) |
+| `nw + 33·w + 1 + l` | delivery token D_{W,l} (partial mask, raised in `extra[l]`) |
+| from `34·nw` | async slots and record tokens, both drawn from `next_slot` |
+
+Delivery-token ids come from a formula (W6 condition 1), so they are the
+same in serial and fork/join replay. Everything stays dense: a first cut
+put tokens at 2^26, and clock joins then copied a huge top-level group
+slice, making e24 20x slower. Partitions draw record tokens from
+per-cluster pools, topped up to 8 at split in sorted cluster order. A
+tokenised fold with an empty pool suspends to the main checker
+(`needs_main`). `Rel::tok` carries a relaxed wait's record token to the
+fence. Copies that are generic-proxy or tracked by a commit keep the
+slot-pinned path.
+
+Bookkeeping cost:
+
+- The users index (token → records) and the attr index (token → in-flight
+  ops) are hash sets, so retiring a token touches only what names it.
+- The stamp rewrite is a lookup in an Fx map inside the existing GC walk.
+
+**Medium.** Prof harness, MAX_ROUNDS=2000, serial checker, 16 workers. Base
+40bc7f1 and the token build ran side by side; each cell is wall time, then
+access and sync seconds.
+
+| Round | Base 40bc7f1 | Tokens |
+| --- | --- | --- |
+| 1399 | 223.8 / 111.5 / 92.6 | 214.9 / 102.8 / 65.4 |
+| 1599 | 346.5 / 180.5 / 145.1 | 300.2 / 150.0 / 88.6 |
+| 1799 | 599.2 / 311.4 / 265.8 | 431.2 / 228.6 / 117.0 |
+| 1999 | 922.6 / 530.8 / 345.5 | 585.1 / 330.2 / 146.1 |
+
+- Window 1800→2000, access + sync: 299.1 s → 130.7 s, **2.29x**.
+- Wall at round 2000: 1.58x.
+- Slots used over the run (`async_slots`): 218K → 26K. Clock chunks per
+  warp at the end: about 900, against 2752.
+- `phase_end` is heavier: 98 s against 34 s. The cause is that collections
+  run 89 times instead of 30. Each one still costs about 1.1 s, but W16's
+  GC back-off counts a collection as productive when it reclaims at least a
+  quarter of the slots in use, and with tokens almost every collection
+  does, so the back-off never engages. Tuning that interplay is a separate
+  item, as is the slow growth of slots in use (13.8K → 21.3K), which is
+  generic-proxy and commit-tracked copies.
+
+**Gates.**
+- Findings byte-identical against 40bc7f1 on the 7 fixtures at
+  1/8/16/32 workers, serial and fork/join: 56 of 56.
+- `racecheck_reattribution` 17/17, and `racecheck_retirement` 12/12 with
+  the fresh-source guard un-ignored.
+- Release: `racecheck_parallel_review` 27/27 (corpus loaded through
+  `RACE_FIXTURES`, 160 s) and all other racecheck test files;
+  `sched_partition_review` and `interp_spin_apply` unchanged.
+- `cargo test --workspace` green.
+- Conformance `-k racecheck` 101/101 on a private build.
+
+**Bench `reattribution_tokens`.** A single-producer TMA pipeline with a
+fresh global source each iteration, a consumer wait, `fence.proxy.async`
+and an empty-barrier release. Cost per iteration is flat: 21.4 → 21.3 µs
+from 1024 to 4096 iterations with tokens, 13.7 → 14.6 µs without. Tokens
+add about 1.5x bookkeeping on this single-warp shape, where clock width
+never grows; the gain needs many warps learning the copies (medium above).
+The bench guards linearity.

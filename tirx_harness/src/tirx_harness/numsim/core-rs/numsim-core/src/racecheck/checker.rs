@@ -26,6 +26,7 @@ use super::knowledge::{fence_domains, join_tmap, select_view, Heads, Knowledge, 
 use super::shadow::IntervalShadow;
 
 mod partition;
+mod tokens;
 pub(crate) use partition::Stashed;
 
 // ---------------------------------------------------------------- report --
@@ -244,6 +245,8 @@ struct Warp {
     /// Tensormap ranges each lane acquired (`fence.proxy.tensormap::generic
     /// .acquire`), with the release knowledge that reached it.
     g2t_ranges: Vec<Arc<G2tRanges>>,
+    /// Delivery-token counters: per lane, then [32] = full mask (tokens.rs).
+    dtok: [Epoch; 33],
     /// `(epoch, site)` of every instruction that accessed memory, ascending;
     /// pruned below the oldest epoch any witness still references.
     sites: Vec<(Epoch, SiteId)>,
@@ -267,6 +270,7 @@ impl Warp {
             tcgen_waited: vec![Clock::default(); 32],
             tcgen_pub: vec![Clock::default(); 32],
             g2t_ranges: (0..32).map(|_| Arc::new(Vec::new())).collect(),
+            dtok: [0; 33],
             sites: Vec::new(),
         }
     }
@@ -401,6 +405,10 @@ struct AsyncActor {
     drained: bool,
     /// Ever issued into (statistics: slots used, not slots reserved).
     used: bool,
+    /// Issue proxy.
+    proxy: Proxy,
+    /// Token attributions of this generation's completion (tokens.rs).
+    attr: Vec<(ActorId, Epoch)>,
 }
 
 impl AsyncActor {
@@ -423,6 +431,8 @@ impl AsyncActor {
             done: 0,
             drained: false,
             used: false,
+            proxy: Proxy::Generic,
+            attr: Vec::new(),
         }
     }
 }
@@ -648,6 +658,8 @@ struct Phase {
     /// Async completions (complete-tx: release at cluster scope for the
     /// op's own bytes; accepted by an acquire wait of any scope).
     completion: Knowledge,
+    /// Record token (id, current value) once a tokenised copy folded here.
+    tok: Option<(ActorId, Epoch)>,
 }
 
 struct PollStash {
@@ -865,6 +877,8 @@ pub struct Checker {
     /// Main checker, during a parallel phase: barrier objects per cluster
     /// (built once per phase; what each fork moves).
     phase_index: HashMap<u32, Vec<SyncObjId>>,
+    /// Token re-attribution state (checker/tokens.rs).
+    tk: tokens::Tokens,
 }
 
 /// Insert `r` into sorted, disjoint, non-adjacent `spans` (bounded: past
@@ -979,6 +993,7 @@ impl Checker {
             lent: None,
             batch_writes: HashMap::new(),
             phase_index: HashMap::new(),
+            tk: Default::default(),
         }
     }
 
@@ -1191,6 +1206,9 @@ impl Checker {
         if actor < self.topo.num_warps() {
             return None;
         }
+        if actor >= tokens::VBASE {
+            return self.vrec(actor).map(|r| &r.snap);
+        }
         match self.slot_of(actor) {
             Some(a) => Some(a),
             None => self.op_reg.get(&(actor, w.stamp.epoch())).map(|a| &**a),
@@ -1199,11 +1217,11 @@ impl Checker {
 
     #[inline(always)]
     fn slot_of(&self, actor: ActorId) -> Option<&AsyncActor> {
-        let nw = self.topo.num_warps();
-        if actor < nw {
+        let base = self.slot_base();
+        if actor < base {
             return None;
         }
-        self.asyncs.get((actor - nw) as usize)
+        self.asyncs.get((actor - base) as usize)
     }
 
     /// Performing warp (issuing warp for async actors), for scope tests.
@@ -1256,6 +1274,9 @@ impl Checker {
         // the tcgen pipeline view.
         if view == View::Tcgen && prior.stamp.actor() < self.topo.num_warps() {
             view = View::Hb;
+        }
+        if prior.stamp.actor() >= tokens::VBASE {
+            return self.vordered(cur, prior, view);
         }
         match cur {
             Cur::Lane { w, lane, epoch } => {
@@ -1707,12 +1728,12 @@ impl Checker {
                 let warp = &self.warps[wi];
                 if matches!(a.order, MemOrder::Release | MemOrder::AcqRel) {
                     let k = warp.publication(one_lane(lane), epoch, &self.memo);
-                    Some(Arc::new(Rel { k, scope: a.scope, warp: wi as u32, site: a.site }))
+                    Some(Arc::new(Rel { k, scope: a.scope, warp: wi as u32, site: a.site, tok: None }))
                 } else if let Some(f) = &warp.fence_rel[lane as usize] {
                     Some(f.clone())
                 } else {
                     let k = Knowledge { tcgen_rel: warp.tcgen_publication(one_lane(lane), &self.memo), ..Default::default() };
-                    Some(Arc::new(Rel { k, scope: None, warp: wi as u32, site: a.site }))
+                    Some(Arc::new(Rel { k, scope: None, warp: wi as u32, site: a.site, tok: None }))
                 }
             }
             // st.async / red.async `.release` (PTX §9.7.10.12, §9.7.15.7: a
@@ -1727,7 +1748,7 @@ impl Checker {
                     self.asyncs[i].drained = true;
                 }
                 let act = &self.asyncs[i];
-                Some(Arc::new(Rel { k: act.k.propagating(), scope: a.scope, warp: act.warp, site: act.site }))
+                Some(Arc::new(Rel { k: act.k.propagating(), scope: a.scope, warp: act.warp, site: act.site, tok: None }))
             }
             _ => None,
         };
@@ -1981,6 +2002,10 @@ impl Checker {
         if self.covers(rs, rel.warp, me) && self.covers(my_scope, me, rel.warp) {
             let memo = &self.memo;
             self.warps[me as usize].acquire(lanes, &rel.k, memo);
+            if let Some((id, v)) = rel.tok {
+                let ds = self.deliver(me, lanes);
+                self.token_log(id, v, &ds);
+            }
         } else {
             self.report_scope_mismatch(rs, my_scope, rel.warp, me, rel.site, acq_site);
         }
@@ -2137,11 +2162,14 @@ impl Checker {
                 }
                 self.fence(warp, lanes, kind, site, epoch);
             }
-            SyncEvent::AsyncIssue { op, warp, lanes, kind, proxy: _, preds, footprint, restricted, site, epoch } => {
+            SyncEvent::AsyncIssue { op, warp, lanes, kind, proxy, preds, footprint, restricted, site, epoch } => {
                 if !self.tick(warp, epoch) {
                     return;
                 }
                 self.async_issue(op, warp, lanes, kind, preds, footprint, restricted, site, epoch);
+                if let Some(i) = self.op_slot(op) {
+                    self.asyncs[i].proxy = proxy;
+                }
             }
             SyncEvent::AsyncComplete { op, milestone, target } => {
                 let Some(i) = self.async_idx(op) else { return };
@@ -2154,7 +2182,8 @@ impl Checker {
                         self.asyncs[p].done = 2;
                     }
                 }
-                let c = self.completion(i, m);
+                let mut c = self.completion(i, m);
+                let tokenised = self.tokenised(i);
                 match target {
                     CompletionTarget::Phase { obj, phase } => {
                         if let SyncObjId::Mbarrier { cta, .. } = obj {
@@ -2162,6 +2191,9 @@ impl Checker {
                             self.asyncs[i].completed_ctas.push((t, cta.0));
                         }
                         self.phase_mut(obj, phase);
+                        if tokenised {
+                            self.token_fold(i, obj, phase, &mut c);
+                        }
                         let ph = self.phases.get_mut(&obj).and_then(|m| m.get_mut(&phase)).unwrap();
                         ph.completion.join_propagating(&c, &self.memo);
                     }
@@ -2191,7 +2223,13 @@ impl Checker {
                                 done.hb.raise(actor, gen_base + 2);
                                 w.acquire(lanes, &done, memo);
                             }
-                            _ => w.acquire(lanes, &c, memo),
+                            _ => {
+                                w.acquire(lanes, &c, memo);
+                                if tokenised {
+                                    let ds = self.deliver(warp, lanes);
+                                    self.asyncs[i].attr.extend(ds);
+                                }
+                            }
                         }
                     }
                 }
@@ -2218,11 +2256,19 @@ impl Checker {
         let m = self.phases.entry(obj).or_default();
         if let std::collections::btree_map::Entry::Vacant(v) = m.entry(phase) {
             v.insert(Phase::default());
+            let mut gone = Vec::new();
             while m.len() > 4 {
-                m.pop_first();
+                if let Some((_, p)) = m.pop_first() {
+                    if let Some(t) = p.tok {
+                        gone.push(t);
+                    }
+                }
+            }
+            for t in gone {
+                self.token_retire(obj, t);
             }
         }
-        m.entry(phase).or_default()
+        self.phases.get_mut(&obj).unwrap().entry(phase).or_default()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2279,11 +2325,12 @@ impl Checker {
                     mismatches.push((a, s, x.warp, x.site));
                 }
             } else {
-                pend.push(Arc::new(Rel { k: (*x.k).clone(), scope: Some(a), warp: x.warp, site: x.site }));
+                pend.push(Arc::new(Rel { k: (*x.k).clone(), scope: Some(a), warp: x.warp, site: x.site, tok: None }));
             }
         }
         let tcgen_rel = ph.tcgen_rel.clone();
         let completion = ph.completion.clone();
+        let ptok = ph.tok;
         if lost {
             self.note_incomplete(Incomplete::SyncQualifierUnknown { warp });
         }
@@ -2302,10 +2349,19 @@ impl Checker {
         }
         if acquire {
             w.acquire(lanes, &completion, memo);
+            if let Some((id, v)) = ptok {
+                let ds = self.deliver(warp, lanes);
+                self.token_log(id, v, &ds);
+            }
         } else {
             // A relaxed wait synchronises nothing until a later acquire
             // fence; the copy's own bytes then need no scope match.
-            pend.push(Arc::new(Rel { k: completion, scope: Some(Scope::Sys), warp, site }));
+            let rel = Arc::new(Rel { k: completion, scope: Some(Scope::Sys), warp, site, tok: ptok });
+            if let Some((id, _)) = ptok {
+                self.tk.pend.entry(id).or_default().push(Arc::downgrade(&rel));
+            }
+            pend.push(rel);
+            let w = &mut self.warps[warp as usize];
             for rel in pend {
                 for c in lanes.lanes8() {
                     w.push_pending(c, rel.clone());
@@ -2474,7 +2530,6 @@ impl Checker {
             }
         }
         let lane = lanes.lanes8().next().unwrap_or(0);
-        let nw = self.topo.num_warps();
         let key = pool_key(op);
         let idx = match self.pools.get_mut(&key).and_then(|p| {
             p.taken += 1;
@@ -2486,7 +2541,7 @@ impl Checker {
                 self.next_slot += 1;
                 self.asyncs.0.put(i, Box::new(AsyncActor {
                     op,
-                    actor: nw + i as u32,
+                    actor: self.slot_base() + i as u32,
                     gen_base: 0,
                     in_use: false,
                     warp,
@@ -2502,6 +2557,8 @@ impl Checker {
                     done: 0,
                     drained: false,
                     used: false,
+                    proxy: Proxy::Generic,
+                    attr: Vec::new(),
                 }));
                 self.pools.entry(key).or_default().slots.push(i);
                 i
@@ -2523,6 +2580,7 @@ impl Checker {
         slot.k = k;
         slot.g2t_ranges = g2t_ranges;
         slot.completed_ctas.clear();
+        slot.attr.clear();
         slot.preds = pred_idx;
         // Only the first range per allocation is ever read (the AllocEnd
         // lifetime check); keep one entry per allocation so that check is
@@ -2688,7 +2746,7 @@ impl Checker {
                 let w = &mut self.warps[warp as usize];
                 for c in lanes.lanes8() {
                     let k = w.publication(one_lane(c), epoch, &self.memo);
-                    w.fence_rel[c as usize] = Some(Arc::new(Rel { k, scope: Some(scope), warp, site }));
+                    w.fence_rel[c as usize] = Some(Arc::new(Rel { k, scope: Some(scope), warp, site, tok: None }));
                 }
             }
             FenceKind::ProxyAsync(dom) => {
@@ -2929,6 +2987,9 @@ impl Checker {
         // the retired summary decode witnesses through `self` (whose memo is
         // not `Sync`), so they run afterwards, per allocation, in the
         // allocation map's order as before.
+        let remap = self.reattribute_plan();
+        let vrecs = self.tk.vrecs.clone();
+        let re = Reattr { remap: &remap, vrecs: &vrecs };
         let mut allocs = std::mem::take(&mut self.allocs);
         let total_cells: usize = allocs.values().map(|a| a.shadow.len()).sum();
         let async_live = async_meet.is_some();
@@ -2945,7 +3006,7 @@ impl Checker {
         let threads = if total_cells >= self.gc_par_min_cells { self.gc_threads.min(jobs.len()).max(1) } else { 1 };
         let outs: Vec<(&mut Alloc, GcWalk)> = if threads <= 1 {
             jobs.into_iter().map(|(al, m, l)| {
-                let o = gc_walk(al, m, l);
+                let o = gc_walk(al, m, l, &re);
                 (al, o)
             }).collect()
         } else {
@@ -2963,7 +3024,7 @@ impl Checker {
                     }
                     let i = order[k];
                     let (al, m, l) = slots[i].lock().unwrap().take().unwrap();
-                    let o = gc_walk(al, m, l);
+                    let o = gc_walk(al, m, l, &re);
                     *res[i].lock().unwrap() = Some((al, o));
                 };
                 for _ in 1..threads {
@@ -3038,6 +3099,8 @@ impl Checker {
                 });
             }
         }
+        drop(vrecs);
+        self.tokens_after_gc(&live_actors);
         // Async-slot reclaim: completed ops with no witness left.
         let held: Vec<usize> = self.asyncs.iter_indexed().map(|(i, _)| i).collect();
         let reclaimed_before = self.stats.async_slots_reclaimed;
@@ -3118,13 +3181,27 @@ struct GcWalk {
     min_epoch: HashMap<ActorId, Epoch>,
 }
 
+/// Re-attribution inputs of one collection (tokens.rs).
+struct Reattr<'a> {
+    remap: &'a HashMap<ActorId, ActorId, crate::sync::FxBuild>,
+    vrecs: &'a [Option<Arc<tokens::VRec>>],
+}
+
 /// The shadow walk of `gc` for one allocation: retire dead witnesses and
 /// collect the generic ones to fold into the retired summary. Reads only
 /// the meet, so allocations walk in parallel.
-fn gc_walk(alloc: &mut Alloc, meet: &Option<Knowledge>, live: bool) -> GcWalk {
-    // `None` meet with nobody live: nothing can access it any more.
+fn gc_walk(alloc: &mut Alloc, meet: &Option<Knowledge>, live: bool, re: &Reattr<'_>) -> GcWalk {
+    // `None` meet with nobody live: nothing can access it any more. A
+    // re-attributed witness is dead once the meet knows one attribution.
     let dead_in = |w: &Witness, pcs: &[Proxy]| match meet {
         None => !live,
+        Some(m) if w.stamp.actor() >= tokens::VBASE => {
+            let refs = re.vrecs.get((w.stamp.actor() - tokens::VBASE) as usize).and_then(|r| r.as_deref()).map_or(&[][..], |r| &r.refs[..]);
+            pcs.iter().all(|pc| {
+                let c = m.view(select_view(w.proxy(), *pc, w.domain()));
+                refs.iter().any(|&(t, v)| c.observes(Stamp::new(t, v), 0))
+            })
+        }
         Some(m) => pcs.iter().all(|pc| m.view(select_view(w.proxy(), *pc, w.domain())).observes(w.stamp, w.lane())),
     };
     let (space, seen) = (alloc.space, alloc.seen);
@@ -3134,6 +3211,15 @@ fn gc_walk(alloc: &mut Alloc, meet: &Option<Knowledge>, live: bool) -> GcWalk {
     let mut folded: Vec<Witness> = Vec::new();
     let mut min_epoch: HashMap<ActorId, Epoch> = HashMap::new();
     alloc.shadow.retain_mut(|cell| {
+        if !re.remap.is_empty() {
+            let mut f = |e: &mut Entry| {
+                if let Some(v) = re.remap.get(&e.w.stamp.actor()) {
+                    e.w.stamp = Stamp::new(*v, e.w.stamp.epoch());
+                }
+            };
+            cell.writes.for_each_mut(&mut f);
+            cell.reads.for_each_mut(&mut f);
+        }
         let last = cell.writes.last().map(|e| e.w);
         let mut decide = |w: &Witness, pinned: bool| -> bool {
             if pinned {

@@ -87,6 +87,9 @@ pub struct Rel {
     pub warp: u32,
     /// Site of the releasing operation (evidence for `ScopeMismatch`).
     pub site: SiteId,
+    /// A relaxed wait's payload: the record token it carries (acquired at
+    /// the fence, which then raises the delivery token; checker/tokens.rs).
+    pub tok: Option<(super::clock::ActorId, super::clock::Epoch)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
