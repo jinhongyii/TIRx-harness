@@ -9,14 +9,14 @@ Source: `backend-comparison.json` (`head.cases`, engine wall, min of the samples
 | numsim | 1 | 30 | 4.12x faster | 1 | 7.49x faster | 0 |
 | numsim | 8 | 30 | 3.44x faster | 0 | 6.67x faster | 0 |
 | numsim | 32 | 30 | 2.95x faster | 0 | 6.70x faster | 0 |
-| racecheck | 1 | 24 | 2.96x faster | 0 | 5.94x faster | 0 |
-| racecheck | 8 | 23 | 1.87x faster | 5 | 3.61x faster | 3 |
-| racecheck | 32 | 23 | 1.77x faster | 7 | 3.58x faster | 3 |
+| racecheck | 1 | 24 | 2.96x faster | 0 | 5.91x faster (a4d8d37 rows: fork/join default) | 0 |
+| racecheck | 8 | 23 | 1.87x faster | 5 | 3.73x faster (a4d8d37 rows: fork/join default) | 2 |
+| racecheck | 32 | 23 | 1.77x faster | 7 | 3.68x faster (a4d8d37 rows: fork/join default) | 2 |
 | synccheck | 1 | 29 | 3.43x faster | 0 | 6.67x faster | 0 |
 | synccheck | 8 | 29 | 3.00x faster | 0 | 5.87x faster | 0 |
 | synccheck | 32 | 29 | 2.82x faster | 3 | 6.11x faster | 0 |
 
-**v2 now (243f9f4), racecheck and synccheck** (W16, 2026-10-09): private release build of a `git archive 243f9f4` copy; `Engine(max_workers=w, native_loop_iteration_budget=10_000_000)`, fresh engine per sample, every phase via `run_racecheck_phase` / `run_synccheck_phase` (synccheck with the conformance coverage bounds and resource limits), engine wall, min of 3 samples interleaved over 1/8/32 workers; serial racecheck checker (`FORK_JOIN` off), default collector threads (W14's parallel GC not in HEAD). Host: 256 CPUs, 1-minute load 4.3-12.7 during the run. The legacy and 6ba4190 columns are unchanged (legacy is not re-measurable: deleted in 79f04eb). Rows still >10% slower than legacy now: `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` racecheck 8 (1.25x); `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` racecheck 8 (1.23x); `kda_decode_multishape` racecheck 8 (1.66x); `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` racecheck 32 (1.26x); `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` racecheck 32 (1.45x); `kda_decode_multishape` racecheck 32 (1.58x).
+**v2 now (243f9f4), racecheck and synccheck** (W16, 2026-10-09): private release build of a `git archive 243f9f4` copy; `Engine(max_workers=w, native_loop_iteration_budget=10_000_000)`, fresh engine per sample, every phase via `run_racecheck_phase` / `run_synccheck_phase` (synccheck with the conformance coverage bounds and resource limits), engine wall, min of 3 samples interleaved over 1/8/32 workers; serial racecheck checker (`FORK_JOIN` off), default collector threads (W14's parallel GC not in HEAD). Host: 256 CPUs, 1-minute load 4.3-12.7 during the run. The legacy and 6ba4190 columns are unchanged (legacy is not re-measurable: deleted in 79f04eb). Rows still >10% slower than legacy now: `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` racecheck 8 (1.23x); `kda_decode_multishape` racecheck 8 (1.11x); `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` racecheck 32 (1.27x); `kda_decode_multishape` racecheck 32 (1.14x). The three racecheck rows `kda_decode_multishape`, `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` and `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` were re-taken at a4d8d37 with fork/join on by default (W16, same driver and metric, min of 3 interleaved, load 1.8-2.5); every other racecheck/synccheck cell is the 243f9f4 serial-checker measurement, and the racecheck summary geomeans combine both.
 
 **v2 now (243f9f4), numsim** (W13, 2026-10-09):
 - Build: private release build of a `git archive 243f9f4` copy.
@@ -146,7 +146,7 @@ v2 now: `bench_backends.py mega --impls interp` on the 243f9f4 build (148 SMs, `
 
 | case | workers | legacy | v2 (6ba4190) | v2 vs legacy (6ba4190) | v2 now (243f9f4) | now vs legacy |
 | --- | --- | --- | --- | --- | --- | --- |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 1 | 275 ms | 302 ms | 1.10x slower | 127 ms | **2.16x faster** |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 1 | 275 ms | 302 ms | 1.10x slower | 138 ms (a4d8d37, fork/join default) | **2.00x faster** |
 | `cudnn_sm100_dense_gemm_persistent_swiglu` | 1 | 495 ms | 288 ms | **1.72x faster** | 131 ms | **3.78x faster** |
 | `cudnn_sm100_flex_attention_backward` | 1 | 340 ms | 96 ms | **3.54x faster** | 53 ms | **6.36x faster** |
 | `cudnn_sm100_gdn2_bprop_f16` | 1 | 1.13 s | 229 ms | **4.92x faster** | 79 ms | **14.22x faster** |
@@ -154,7 +154,7 @@ v2 now: `bench_backends.py mega --impls interp` on the 243f9f4 build (148 SMs, `
 | `cudnn_sm100_gdn_bprop_f16` | 1 | 5.13 s | 956 ms | **5.37x faster** | 285 ms | **18.03x faster** |
 | `cudnn_sm100_gdn_prefill_f16` | 1 | 2.87 s | 304 ms | **9.44x faster** | 140 ms | **20.56x faster** |
 | `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in` | 1 | 121.14 s | 40.30 s | **3.01x faster** | 13.88 s | **8.73x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 1 | 45.73 s | 35.19 s | **1.30x faster** | 13.79 s | **3.32x faster** |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 1 | 45.73 s | 35.19 s | **1.30x faster** | 14.35 s (a4d8d37, fork/join default) | **3.19x faster** |
 | `cudnn_sm100_kda_bprop_f16` | 1 | 1.17 s | 198 ms | **5.92x faster** | 57 ms | **20.70x faster** |
 | `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 1 | 1.89 s | 1.22 s | **1.55x faster** | 474 ms | **3.99x faster** |
 | `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 1 | 1.57 s | 587 ms | **2.67x faster** | 259 ms | **6.07x faster** |
@@ -166,18 +166,18 @@ v2 now: `bench_backends.py mega --impls interp` on the 243f9f4 build (148 SMs, `
 | `flash_attention4` | 1 | 16.44 s | 3.45 s | **4.76x faster** | 2.13 s | **7.71x faster** |
 | `gdn_decode_bf16_ilp4` | 1 | 352 ms | 97 ms | **3.62x faster** | 71 ms | **4.93x faster** |
 | `gdn_decode_bf16_wide_vec_mtp` | 1 | 2.13 s | 1.36 s | **1.57x faster** | 854 ms | **2.50x faster** |
-| `kda_decode_multishape` | 1 | 494 ms | 344 ms | **1.44x faster** | 216 ms | **2.29x faster** |
+| `kda_decode_multishape` | 1 | 494 ms | 344 ms | **1.44x faster** | 207 ms (a4d8d37, fork/join default) | **2.39x faster** |
 | `msa_sparse_atten_fwd_sm100` | 1 | 241 ms | 45 ms | **5.34x faster** | 30 ms | **8.12x faster** |
 | `recurrent_kda_decode_one_warp` | 1 | 8.94 s | 1.94 s | **4.62x faster** | 1.51 s | **5.90x faster** |
 | `selective_state_update_stp_simple` | 1 | 57 ms | 20 ms | **2.80x faster** | 16 ms | **3.61x faster** |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 8 | 110 ms | 275 ms | 2.50x slower | 137 ms | 1.25x slower |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 8 | 110 ms | 275 ms | 2.50x slower | 135 ms (a4d8d37, fork/join default) | 1.23x slower |
 | `cudnn_sm100_dense_gemm_persistent_swiglu` | 8 | 204 ms | 293 ms | 1.43x slower | 137 ms | **1.49x faster** |
 | `cudnn_sm100_flex_attention_backward` | 8 | 350 ms | 102 ms | **3.45x faster** | 50 ms | **7.05x faster** |
 | `cudnn_sm100_gdn2_bprop_f16` | 8 | 1.14 s | 234 ms | **4.86x faster** | 78 ms | **14.54x faster** |
 | `cudnn_sm100_gdn2_recompute_f16` | 8 | 1.80 s | 251 ms | **7.17x faster** | 142 ms | **12.68x faster** |
 | `cudnn_sm100_gdn_bprop_f16` | 8 | 4.89 s | 795 ms | **6.15x faster** | 286 ms | **17.07x faster** |
 | `cudnn_sm100_gdn_prefill_f16` | 8 | 2.79 s | 308 ms | **9.07x faster** | 138 ms | **20.15x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 8 | 9.07 s | 20.05 s | 2.21x slower | 11.20 s | 1.23x slower |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 8 | 9.07 s | 20.05 s | 2.21x slower | 8.30 s (a4d8d37, fork/join default) | **1.09x faster** |
 | `cudnn_sm100_kda_bprop_f16` | 8 | 1.17 s | 194 ms | **6.03x faster** | 56 ms | **20.85x faster** |
 | `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 8 | 950 ms | 1.02 s | 1.07x slower | 383 ms | **2.48x faster** |
 | `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 8 | 739 ms | 507 ms | **1.46x faster** | 198 ms | **3.72x faster** |
@@ -189,18 +189,18 @@ v2 now: `bench_backends.py mega --impls interp` on the 243f9f4 build (148 SMs, `
 | `flash_attention4` | 8 | 3.15 s | 2.52 s | **1.25x faster** | 1.52 s | **2.07x faster** |
 | `gdn_decode_bf16_ilp4` | 8 | 198 ms | 71 ms | **2.79x faster** | 42 ms | **4.73x faster** |
 | `gdn_decode_bf16_wide_vec_mtp` | 8 | 784 ms | 1.09 s | 1.38x slower | 654 ms | **1.20x faster** |
-| `kda_decode_multishape` | 8 | 123 ms | 312 ms | 2.54x slower | 204 ms | 1.66x slower |
+| `kda_decode_multishape` | 8 | 123 ms | 312 ms | 2.54x slower | 137 ms (a4d8d37, fork/join default) | 1.11x slower |
 | `msa_sparse_atten_fwd_sm100` | 8 | 230 ms | 46 ms | **4.98x faster** | 30 ms | **7.75x faster** |
 | `recurrent_kda_decode_one_warp` | 8 | 3.89 s | 1.49 s | **2.61x faster** | 1.11 s | **3.51x faster** |
 | `selective_state_update_stp_simple` | 8 | 33 ms | 15 ms | **2.15x faster** | 11 ms | **2.87x faster** |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 32 | 108 ms | 297 ms | 2.74x slower | 136 ms | 1.26x slower |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 32 | 108 ms | 297 ms | 2.74x slower | 137 ms (a4d8d37, fork/join default) | 1.27x slower |
 | `cudnn_sm100_dense_gemm_persistent_swiglu` | 32 | 169 ms | 305 ms | 1.80x slower | 144 ms | **1.17x faster** |
 | `cudnn_sm100_flex_attention_backward` | 32 | 372 ms | 98 ms | **3.79x faster** | 48 ms | **7.81x faster** |
 | `cudnn_sm100_gdn2_bprop_f16` | 32 | 1.22 s | 241 ms | **5.06x faster** | 78 ms | **15.63x faster** |
 | `cudnn_sm100_gdn2_recompute_f16` | 32 | 1.91 s | 252 ms | **7.57x faster** | 142 ms | **13.47x faster** |
 | `cudnn_sm100_gdn_bprop_f16` | 32 | 4.96 s | 831 ms | **5.96x faster** | 285 ms | **17.42x faster** |
 | `cudnn_sm100_gdn_prefill_f16` | 32 | 2.84 s | 317 ms | **8.95x faster** | 139 ms | **20.49x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 32 | 6.71 s | 18.98 s | 2.83x slower | 9.74 s | 1.45x slower |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 32 | 6.71 s | 18.98 s | 2.83x slower | 6.57 s (a4d8d37, fork/join default) | **1.02x faster** |
 | `cudnn_sm100_kda_bprop_f16` | 32 | 1.16 s | 200 ms | **5.81x faster** | 56 ms | **20.73x faster** |
 | `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 32 | 968 ms | 893 ms | **1.08x faster** | 401 ms | **2.41x faster** |
 | `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 32 | 795 ms | 526 ms | **1.51x faster** | 199 ms | **4.00x faster** |
@@ -212,7 +212,7 @@ v2 now: `bench_backends.py mega --impls interp` on the 243f9f4 build (148 SMs, `
 | `flash_attention4` | 32 | 1.64 s | 2.33 s | 1.43x slower | 1.43 s | **1.15x faster** |
 | `gdn_decode_bf16_ilp4` | 32 | 171 ms | 69 ms | **2.47x faster** | 37 ms | **4.60x faster** |
 | `gdn_decode_bf16_wide_vec_mtp` | 32 | 673 ms | 1.04 s | 1.54x slower | 625 ms | **1.08x faster** |
-| `kda_decode_multishape` | 32 | 129 ms | 325 ms | 2.52x slower | 204 ms | 1.58x slower |
+| `kda_decode_multishape` | 32 | 129 ms | 325 ms | 2.52x slower | 147 ms (a4d8d37, fork/join default) | 1.14x slower |
 | `msa_sparse_atten_fwd_sm100` | 32 | 252 ms | 48 ms | **5.24x faster** | 30 ms | **8.53x faster** |
 | `recurrent_kda_decode_one_warp` | 32 | 4.98 s | 1.38 s | **3.60x faster** | 987 ms | **5.04x faster** |
 | `selective_state_update_stp_simple` | 32 | 32 ms | 17 ms | **1.94x faster** | 12 ms | **2.74x faster** |
