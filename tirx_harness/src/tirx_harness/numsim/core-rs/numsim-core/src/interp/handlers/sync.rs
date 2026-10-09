@@ -1083,6 +1083,7 @@ pub fn wait_until(
     }
     let mut vals = [0u64; 32];
     let mut locs: Vec<(usize, support::Loc)> = Vec::with_capacity(todo.count() as usize);
+    let mut declared = false;
     for l in todo.lanes() {
         let loc = support::resolve(ctx, space, lane_val(ctx, a, l), l, n)?;
         super::mem::check_align(ctx, loc, n, l)?;
@@ -1091,6 +1092,7 @@ pub fn wait_until(
             // Undeclared word: declared at first use (history and the write
             // count start now), in every mode (W13-1).
             ctx.aux.words.declare(ctx.arena, loc.alloc, loc.span(n));
+            declared = true;
             support::sync_event(ctx, WarpMask::lane(l), SyncKind::DeclareWord { alloc: loc.alloc, span: loc.span(n) });
         }
         let mut b = [0u8; 8];
@@ -1099,7 +1101,9 @@ pub fn wait_until(
         locs.push((l, loc));
     }
     let reads_memory = ctx.program.preds[pred.0 as usize].reads_memory;
-    if reads_memory && ctx.observing {
+    // The predicate's memory reads, captured in every mode: verdicts use
+    // them when observing, the repeat record (`BlockedWait`) always.
+    if reads_memory {
         ctx.aux.capture_reads = Some(Vec::new());
     }
     let accepted = eval_pred(ctx, pred, &vals, todo);
@@ -1133,7 +1137,7 @@ pub fn wait_until(
         }
         if ctx.aux.wants_history && ctx.observing {
             let locs: Vec<(usize, support::Loc)> = locs.iter().copied().filter(|(l, _)| accepted.contains(*l)).collect();
-            emit_verdicts(ctx, pred, scope, captures, &locs, n, pred_reads)?;
+            emit_verdicts(ctx, pred, scope, captures, &locs, n, pred_reads.clone())?;
         }
     }
     let latched = latched.or(accepted);
@@ -1144,7 +1148,16 @@ pub fn wait_until(
     ctx.warp.resume = Some(WAIT_TAG | latched.bits() as u64);
     let l = active.and_not(latched).first().unwrap_or(0);
     let loc = locs.iter().find(|(x, _)| *x == l).map(|x| x.1).unwrap_or(locs[0].1);
-    Ok(Flow::Blocked(ResourceId::Word { alloc: loc.alloc, offset: loc.offset }))
+    let res = ResourceId::Word { alloc: loc.alloc, offset: loc.offset };
+    // A retry repeats this attempt while the bytes it read are unchanged
+    // (`crate::interp::BlockedWait`): nothing accepted, nothing declared.
+    if accepted.is_empty() && !declared {
+        let words = locs.iter().map(|&(l, loc)| (loc.alloc, loc.span(n), vals[l]));
+        crate::interp::note_repeatable_word_wait(ctx, res, words, &pred_reads);
+    } else {
+        ctx.warp.blocked_wait = None;
+    }
+    Ok(Flow::Blocked(res))
 }
 
 /// `WaitVerdicts` for lanes that just accepted: per word, lanes grouped by

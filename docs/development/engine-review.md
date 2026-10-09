@@ -836,7 +836,55 @@ Medium wall at 32 workers, minimum: glibc 4.06 s, mimalloc 3.62 s (1.12x), glibc
 - No variant closes half the inflation, and none reaches 1.5x on medium wall at 32 workers. Nothing lands.
 - mimalloc is a standalone candidate worth roughly 10% CPU. That would be a separate decision: a new dependency, and the allocator choice of the Python extension.
 
-**Still unexplained.** The working set moves between cores: partitions are handed out dynamically each round, while independent processes stay put. That is consistent with the earlier pinned, static-assignment result (about 1.2x at 16 workers on a quiet host). Confirming it needs cache-miss counters (`perf_event_paranoid`).
+**Attribution: partitions migrating across CCDs (W13, 2026-10-09, after W14's lead).**
+
+Medium, process pinned with `taskset`, partition CPU, min of 3 interleaved runs (load 13–37):
+
+| Placement | glibc partition CPU | Parallel-phase wall | mimalloc partition CPU | mimalloc wall |
+|---|---|---|---|---|
+| 1 worker, core 0 | 21.9 s | 22.2 s | 17.2 s | 17.4 s |
+| 8 workers, one CCD (cores 0–7) | 22.7 s (1.04x) | 3.58 s | 20.8 s (1.21x) | 3.22 s |
+| 8 workers, one per CCD, one NUMA node | 27.0 s (1.23x) | 4.95 s | 24.4 s (1.42x) | 4.17 s |
+| 8 workers, 4 CCDs on each NUMA node | 33.1 s (1.51x) | 6.39 s | 28.2 s (1.64x) | 5.11 s |
+
+Bisect, on the one-per-CCD placement:
+
+| Variant | Partition CPU | Parallel-phase wall |
+|---|---|---|
+| Dynamic handout (today) | 26.4–27.9 s | 4.5–5.4 s |
+| Static assignment (partition k on participant k mod 8) | 23.3–23.9 s | 6.4–6.7 s (load imbalance) |
+| `Partition` aligned to 256 bytes (no false sharing between neighbours) | 25.5–28.1 s | — (unchanged) |
+| Reference: one CCD | 22.6 s | 3.6 s |
+
+- **Cause:** a partition's working set (warp register files, shared memory, TMEM) moves between CCD L3s under dynamic handout. Static assignment removes 80–90% of the cross-CCD inflation.
+- **Not the cause:** false sharing between neighbouring partitions, which W14 found in its racecheck children (shared written lines).
+- **NUMA correction:** spreading over both NUMA nodes adds another 1.2x on top. The earlier "NUMA ruled out" was measured unpinned and is withdrawn.
+- **Lever:** CCD-aware sticky handout with pool threads pinned one per core.
+
+## Parked spin-loop replay: validated prototype, not landed (W13, 2026-10-09)
+
+**Why not landed.** The design below was implemented in scratch and validated. No corpus case parks on a spin loop in a way that matters: medium spends 0.1–0.3 s in re-polls, and the max config has 0 replays. The max config's re-polls are blocked retries at `mbar_wait` (107 M checks, most already applied by `BlockedWait`), `wait_until` (29.5 M) and `barrier` (19.1 M), with no parked loops. Landing would add a recorder and replayer to the interpreter for no corpus gain. It can be revived if a spinning kernel shows up.
+
+**Prototype.** Scratch tree `w13/sa/` (on 40bc7f1):
+- `sched/partition.rs`: `SpinRecording`, and `spin_repeats` / `spin_replay` / `spin_record` in `run_cta`; the switch `SPIN_REPLAY` and the counter `SPIN_REPLAYS`.
+- `interp/aux.rs`: `SpinCapture`.
+- `interp/mod.rs`: `spin_replayable`, the instruction whitelist.
+- `interp/handlers/sync.rs`: `test_wait` query recording.
+- `benches/interp_hot.rs`: the `spin_flag` rows.
+
+**W6's six conditions, all met.**
+1. Reads are re-read live through `Arena::read`, in recorded order and stopping at the first changed span, so the shard read set is re-derived.
+2. A replay requires n ≤ quantum and a loop budget that allows the iteration.
+3. Interp handlers keep no side records beyond `warp.poll`, which is merged idempotently. Loads with `.nc` or `.uniform` and report forms of `test_wait` are not replayable.
+4. The recording's epoch advances on every replay.
+5. Interp handlers draw nothing from the RNG.
+6. Debug builds replay into a scratch `EventBuffer`, interpret, and compare events, counters, recording and result.
+
+**Validation.**
+- W6's `interp_spin_apply`, including the apply arm, passes in release and debug; `sched_partition_review` and `interp_hot_equivalence` pass in debug.
+- Digests at 1/8/32, with and without an observer, on all scenarios, 10 fixtures and medium: identical.
+- W16's racecheck hashes on 11 fixtures at 1/8/32: identical.
+- Bench `spin_flag/ctas8_spinners7_iters4096`: 34.0–35.5 ms interpreting vs 15.3–16.0 ms replaying. After the producer's share (7.3 ms) is subtracted, the re-poll cost drops from 27 to 8.3 ms (3.2x).
 
 ## Parked spin-loop replay: design for W6 review (W13, 2026-10-09; no code)
 

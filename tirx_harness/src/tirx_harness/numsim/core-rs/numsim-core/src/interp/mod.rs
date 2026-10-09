@@ -162,20 +162,30 @@ pub struct WarpState {
 
 /// A blocked wait whose retry is known to block again (W13).
 ///
-/// Recorded by a handler whose retry is one `SyncTable::step` of a fixed
-/// command on one resource, with no other effect when it blocks:
-/// `mbar_wait` when every retried lane waits on one mbarrier with one phase
-/// command and no lane is latched, and a named-barrier `Resume`. `state` is
-/// that resource's state right after the blocked attempt. A blocked step is
-/// deterministic and idempotent (it commits nothing, or only the mbarrier
-/// `armed` flag, see `crate::sync`); the warp's registers, masks and frames
-/// cannot change while it does not run (`epoch` unchanged); and with no
-/// suspended arm `divergent_switch` decides from those alone. So while the
-/// warp is still at `epoch`, has no suspended arm and the resource still
-/// equals `state`, re-executing would block again with no effect besides
-/// the per-instruction counters (`steps`, `epoch`, `LaunchCounters::instrs`)
+/// Recorded by a handler whose retry is a deterministic function of the
+/// warp (unchanged while it does not run) and of recorded engine state, with
+/// no other effect when it blocks:
+/// - `mbar_wait` when every retried lane waits on one mbarrier with one
+///   phase command and no lane is latched, and a named-barrier `Resume`:
+///   one `SyncTable::step` of a fixed command on one resource; `state` is
+///   that resource's state right after the blocked attempt. A blocked step
+///   is deterministic and idempotent (it commits nothing, or only the
+///   mbarrier `armed` flag, see `crate::sync`).
+/// - `wait_until` that accepted no lane and declared nothing: its outcome
+///   is a function of the bytes it read (the lanes' words, then the
+///   predicate's memory reads), recorded in `reads` with their values; all
+///   were valid. The repeat check re-reads them in that order through the
+///   arena, so a shard's read tracking records what the retry's reads
+///   would (up to the first changed span the retry is the recorded one).
+///
+/// The warp's registers, masks and frames cannot change while it does not
+/// run (`epoch` unchanged); and with no suspended arm `divergent_switch`
+/// decides from those alone. So while the warp is still at `epoch`, has no
+/// suspended arm and the recorded state is unchanged, re-executing would
+/// block again with no effect besides the per-instruction counters
+/// (`steps`, `epoch`, `LaunchCounters::instrs`), the read tracking above,
 /// and no observer event (blocked attempts are not delivered). The
-/// scheduler then applies exactly those counters instead of re-executing
+/// scheduler then applies exactly those effects instead of re-executing
 /// ([`WarpState::repeat_blocked_wait`]); the decision depends only on engine
 /// state, never on the observer. Debug builds execute the retry anyway and
 /// check the prediction.
@@ -184,7 +194,10 @@ pub struct BlockedWait {
     pub epoch: u64,
     pub pc: Pc,
     pub res: crate::sync::ResourceId,
-    pub state: crate::sync::Resource,
+    pub state: Option<crate::sync::Resource>,
+    /// Spans read, in order, and their bytes concatenated.
+    pub reads: Vec<(AllocId, crate::arena::ByteSpan)>,
+    pub bytes: Vec<u8>,
 }
 
 /// Record that the current instruction blocked on `res` in a way its retry
@@ -198,10 +211,52 @@ pub fn note_repeatable_block(ctx: &mut ExecCtx<'_>, res: crate::sync::ResourceId
             b.epoch = epoch;
             b.pc = pc;
             b.res = res;
-            b.state.clone_from(st);
+            match b.state.as_mut() {
+                Some(s) => s.clone_from(st),
+                None => b.state = Some(st.clone()),
+            }
+            b.reads.clear();
+            b.bytes.clear();
         }
-        None => ctx.warp.blocked_wait = Some(Box::new(BlockedWait { epoch, pc, res, state: st.clone() })),
+        None => ctx.warp.blocked_wait = Some(Box::new(BlockedWait { epoch, pc, res, state: Some(st.clone()), reads: Vec::new(), bytes: Vec::new() })),
     }
+}
+
+/// Record that the current `wait_until` blocked on `res` having read the
+/// lanes' `words` (span and the bytes the instruction used, in lane order)
+/// and then the predicate's memory `reads` ([`BlockedWait`]). The words'
+/// bytes are taken as the instruction used them: the repeat check requires
+/// every recorded byte to be valid and equal when re-read, which is when a
+/// retry would read the same values with no uninitialized-read report.
+pub fn note_repeatable_word_wait(
+    ctx: &mut ExecCtx<'_>,
+    res: crate::sync::ResourceId,
+    words: impl Iterator<Item = (AllocId, crate::arena::ByteSpan, u64)>,
+    reads: &[(AllocId, crate::arena::ByteSpan)],
+) {
+    let (epoch, pc) = (ctx.warp.epoch, ctx.warp.pc);
+    // Reuse the warp's record (its buffers) when there is one.
+    let mut b = ctx.warp.blocked_wait.take().unwrap_or_else(|| Box::new(BlockedWait { epoch, pc, res, state: None, reads: Vec::new(), bytes: Vec::new() }));
+    b.epoch = epoch;
+    b.pc = pc;
+    b.res = res;
+    b.state = None;
+    b.reads.clear();
+    b.bytes.clear();
+    for (a, sp, v) in words {
+        b.reads.push((a, sp));
+        b.bytes.extend_from_slice(&v.to_le_bytes()[..sp.len as usize]);
+    }
+    for &(a, sp) in reads {
+        let v = support::whole(ctx.arena, a);
+        let at = b.bytes.len();
+        b.bytes.resize(at + sp.len as usize, 0);
+        if ctx.arena.read(v, &[sp], &mut b.bytes[at..]).is_err() {
+            return;
+        }
+        b.reads.push((a, sp));
+    }
+    ctx.warp.blocked_wait = Some(b);
 }
 
 /// Incremental state of [`WarpState::spin_hash`] (W13): the hash of every
@@ -413,12 +468,36 @@ impl WarpState {
     }
 
     /// Would retrying this blocked warp only re-block ([`BlockedWait`])?
-    pub fn blocked_wait_repeats(&self, sync: &crate::sync::SyncTable) -> bool {
+    pub fn blocked_wait_repeats(&self, sync: &crate::sync::SyncTable, arena: &Arena) -> bool {
         let Some(b) = self.blocked_wait.as_deref() else { return false };
         if b.epoch != self.epoch || b.pc != self.pc || self.status != WarpStatus::Blocked(b.res) || !self.suspended.is_empty() {
             return false;
         }
-        sync.get(b.res) == Some(&b.state)
+        if let Some(st) = &b.state {
+            if sync.get(b.res) != Some(st) {
+                return false;
+            }
+        }
+        // Re-read in the retry's order (see `BlockedWait`).
+        let mut small = [0u8; 64];
+        let mut big = Vec::new();
+        let mut at = 0usize;
+        for &(a, sp) in &b.reads {
+            let v = support::whole(arena, a);
+            let n = sp.len as usize;
+            let buf: &mut [u8] = if n <= small.len() {
+                &mut small[..n]
+            } else {
+                big.resize(n, 0);
+                &mut big[..]
+            };
+            // Value first (the common change), then validity.
+            if arena.read(v, &[sp], buf).is_err() || buf[..] != b.bytes[at..at + n] || arena.first_invalid(v, sp).is_some() {
+                return false;
+            }
+            at += n;
+        }
+        true
     }
 
     /// Apply the effects of a retry for which [`WarpState::blocked_wait_repeats`]

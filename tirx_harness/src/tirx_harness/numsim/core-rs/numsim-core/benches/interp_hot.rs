@@ -28,6 +28,11 @@
 //! * `local_array` — per-lane local-array stores and scalar/vector loads
 //!   in a kernel with declared sync words: `mem::store` / `mem::load` on a
 //!   per-lane binding.
+//! * `blocked_wait_until` — warps blocked in `wait_until` on a declared
+//!   flag a producer warp publishes late, and a 128-CTA `wait_until` chain
+//!   (each CTA waits for its predecessor's publish; the polled word changes
+//!   every round): the repeated-block check on the polled word
+//!   (`interp::BlockedWait`).
 //! * `blocked_wait` — warps blocked on a blocking `mbarrier.try_wait` (all
 //!   lanes, one barrier) while a producer warp computes, retried every round
 //!   (the Mega MoE pipeline wait): `sync::mbar_wait` and the scheduler's
@@ -462,6 +467,73 @@ pub fn convert_chain(iters: u32) -> Scenario {
     s
 }
 
+/// `ctas` CTAs of `waiters + 1` warps: warp 0 runs `iters` iterations of
+/// register work, then lane 0 release-stores `flag = 1` (a declared sync
+/// word); the other warps block in `wait_until(flag == 1)`, retried every
+/// round: `sync::wait_until` and the repeated-block check
+/// (`interp::BlockedWait` on the polled word).
+pub fn blocked_wait_until(ctas: u32, waiters: u32, iters: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("blocked_wait_until", 32 * (waiters + 1));
+    b.grid(ctas, 1, 1);
+    let flag = b.global("flag", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    b.declare_sync_words(flag);
+    let w = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let cta = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let producer = b.reg(Ty::PRED);
+    let more = b.reg(Ty::PRED);
+    let k = b.reg(Ty::U32);
+    let acc = b.reg(Ty::U32);
+    let fa = b.reg(Ty::U64);
+    let got = b.reg(Ty::U32);
+    let arg = b.reg(Ty::U32);
+    let res = b.reg(Ty::PRED);
+    b.warp_id(w);
+    b.lane_id(lane);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k3 = b.k_u32(3);
+    let kn = b.k_u32(iters);
+    b.addr_of(fa, flag, cta);
+    b.compare(CmpOp::Eq, Ty::U32, producer, w, k0);
+    b.if_(producer);
+    b.mov(k, k0);
+    b.mov(acc, lane);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, more, k, kn);
+    b.loop_if(more);
+    b.mul(Ty::U32, acc, acc, k3);
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.push(Instr::StoreAddr { ty: Ty::U32, addr: fa.into(), space: AddrSpace::Generic, value: k1, sem: Sem::Release, scope: Scope::Gpu, mods: MemMods::default() });
+    b.end_if();
+    b.else_();
+    let placeholder = b.push(Instr::Nop);
+    b.st_u32(out, lane, got);
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    let start = Pc(prog.code.len() as u32);
+    prog.code.push(Instr::Compare { op: CmpOp::Eq, ty: Ty::U32, dst: res, a: arg.into(), b: k1 });
+    prog.code_sites.push(numsim_core::site::SiteId::NONE);
+    prog.preds.push(PredProgram { arg, start, end: Pc(start.0 + 1), result: res, reads_memory: false });
+    prog.code[placeholder.0 as usize] = Instr::WaitUntil { dst: got, addr: fa.into(), ty: Ty::U32, space: AddrSpace::Generic, sem: Sem::Acquire, scope: Scope::Gpu, pred: PredId(0), captures: vec![] };
+    prog.validate().expect("valid");
+    let mut s = Scenario {
+        name: "blocked_wait_until",
+        module: Module::new(vec![prog]),
+        inputs: inputs(vec![("flag", u32_buf(vec![0; ctas as usize])), ("out", u32_buf([0; 32]))]),
+        config: Default::default(),
+    };
+    s.config.completions = CompletionPolicy::Eager;
+    s
+}
+
 /// A per-lane local array (`Space::Local`, lane-major) written and read
 /// back every iteration, scalar and 16-byte vector, in a kernel that also
 /// declares sync words (the Mega MoE epilogue's spilled locals):
@@ -577,6 +649,11 @@ fn bench(c: &mut Criterion) {
     group(c, "reg_indexed", "iters2048", &reg_indexed(2048));
     group(c, "store_v4", "iters2048", &store_v4(2048));
     group(c, "blocked_wait", "ctas8_waiters15_iters1024", &blocked_wait(8, 15, 1024));
+    // `wait_until` chain: CTA k waits for `flag == k`, then publishes k + 1;
+    // every waiting CTA re-blocks each round (`interp::BlockedWait` on the
+    // polled word's bytes).
+    group(c, "blocked_wait_until", "chain_ctas128", &numsim_core::testutil::scenarios::wait_until_chain(128));
+    group(c, "blocked_wait_until", "ctas8_waiters15_iters1024", &blocked_wait_until(8, 15, 1024));
     group(c, "local_array", "iters512", &local_array(512));
     group(c, "alu_chain", "iters2048", &alu_chain(2048));
     group(c, "convert_chain", "iters2048", &convert_chain(2048));

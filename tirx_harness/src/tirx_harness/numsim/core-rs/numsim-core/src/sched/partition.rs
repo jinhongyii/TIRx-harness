@@ -377,7 +377,7 @@ impl Partition {
             // W13: a retry that would only re-block at the same
             // `mbarrier.try_wait` (`interp::BlockedWait`) applies its
             // counters without re-executing; same state either way.
-            let repeats = self.ctas[ci].warps[w].blocked_wait_repeats(&self.sync);
+            let repeats = self.ctas[ci].warps[w].blocked_wait_repeats(&self.sync, arena);
             if repeats && !cfg!(debug_assertions) {
                 self.ctas[ci].warps[w].repeat_blocked_wait();
                 self.counters.instrs += 1;
@@ -388,7 +388,7 @@ impl Partition {
             // Debug builds execute the retry and check the prediction.
             let before = repeats.then(|| {
                 let wp = &self.ctas[ci].warps[w];
-                (wp.status, wp.epoch, wp.steps, self.counters.instrs, wp.blocked_wait.as_ref().and_then(|b| self.sync.get(b.res).cloned()))
+                (wp.status, wp.epoch, wp.steps, self.counters.instrs, wp.blocked_wait.as_ref().and_then(|b| b.state.as_ref().and(self.sync.get(b.res)).cloned()))
             });
             let (r, progressed) = self.slice(ci, w, env, arena, env.config.quantum);
             if let Some((status, epoch, steps, instrs, res_state)) = before {
@@ -401,7 +401,8 @@ impl Partition {
                         && wp.epoch == epoch + 1
                         && wp.steps == steps + 1
                         && self.counters.instrs == instrs + 1
-                        && res.and_then(|x| self.sync.get(x).cloned()) == res_state,
+                        && wp.blocked_wait.as_ref().and_then(|b| b.state.as_ref().and(self.sync.get(b.res)).cloned()) == res_state
+                        && res.is_some(),
                     "blocked_wait_repeats predicted a re-block the retry did not reproduce: {r:?}"
                 );
             }
