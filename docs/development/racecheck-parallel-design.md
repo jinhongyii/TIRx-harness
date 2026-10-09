@@ -993,3 +993,56 @@ as above). In the bench, the slot walk with n=16384 other-warp slots
 dropped from 983 to 751 ms (1.3x). A commit legitimately tracks all of its
 own warp's in-flight pipelined ops (T15), and that per-commit cost is
 semantic, not the walk.
+
+**Negative: re-attribution v1 (not landed).** Built on d719a9d to W6's
+F1–F6 review.
+
+- **Mechanism.**
+  - Completed copies are watched from their first completion.
+  - Every rise of a watched component in a warp's hb or a2g[Global] view is
+    recorded, lane-precise. Rises already implied by an existing observer
+    are skipped.
+  - At GC, an eligible copy's witnesses are rewritten to a virtual actor
+    whose record holds a decode snapshot and the observers. Eligible means:
+    `Copy`, `done == 2`, every kept witness global, async-proxy and in the
+    Global (or no) domain, and no retained phase record carrying the raw
+    completion.
+  - The slot is then reclaimed. Ordering against a virtual witness is
+    answered from the observers' stamps: hb stamps in hb, a2g observers via
+    cur's hb or a2g, hb observers only inside cur's a2g (bridged).
+- **Correctness.** Exact.
+  - Findings byte-identical on the 7 fixtures at 1/8/16/32 workers.
+  - `racecheck_reattribution` 7/7 and `racecheck_retirement` 11/11.
+  - The fresh-source slot guard improved from 128 to 26 but missed its bar
+    (same-source 21 + 2).
+- **It does not pay.**
+  - On e24 it re-attributed nothing: every candidate still had shared-memory
+    witnesses at each collection. Wall was 19.0 s against 16.6 s.
+  - On medium, by round 1100: 82.9K of about 90K candidates were blocked
+    because a retained phase record still held the raw completion. A record
+    keeps 4 phases per object and per-expert barriers advance rarely.
+    Another 7.3K still had non-global witnesses.
+  - Only 5–39 copies were re-attributed per collection.
+  - The observation hook (a pre/post clock diff around every warp sync event
+    against about 90K watched actors) made medium about 5x slower: 931 s
+    against 186 s at round 1100.
+- **Files (scratch).**
+  - `scratchpad/w5_reattr_v1.patch` (racecheck/{cell,checker,clock,tuning}.rs
+    and checker/partition.rs);
+  - `scratchpad/w5_reattr_v1_reattr.rs` (the new `checker/reattr.rs`).
+  - Both are in session 6ce3d6ba's scratchpad,
+    `~/.cache/claude-code-tmp/claude-2792/-localhome-local-hongyij-TIRx-harness/6ce3d6ba-272f-405d-861d-e0b86a77dccc/scratchpad/`.
+
+**The only known path, not pursued (B).** Free carrier-pinned slots by
+making each phase record that carries a re-attributed completion an observer
+in its own right.
+
+- A per-record token component is raised in the record's completion clock,
+  so "knows the token" stands for "acquired the raw completion".
+- Observation then happens only where a raw completion enters a warp: phase
+  waits and warp-target completions. Everything after that is covered by
+  stamps, which removes the per-event diff.
+- Tokens are new actor ids, one per carrying phase record rather than one
+  per op. They need their own soundness case, in particular waits on a phase
+  after it has been pruned from the record list. W6 should review before any
+  code.
