@@ -73,7 +73,10 @@ fn proxy_of(c: u64) -> Proxy {
 #[derive(Clone, Debug, Default)]
 pub struct WideSpans {
     pub spans: Vec<(u64, u64)>,
-    index: std::collections::HashMap<(u64, u64), u64>,
+    /// Fx-hashed: the table is taken out of its allocation (`mem::take`)
+    /// on every access, and a `RandomState` default costs a thread-local
+    /// key per take (W16).
+    index: std::collections::HashMap<(u64, u64), u64, crate::sync::FxBuild>,
 }
 
 impl WideSpans {

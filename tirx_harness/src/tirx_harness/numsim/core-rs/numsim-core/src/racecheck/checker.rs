@@ -529,7 +529,7 @@ impl Slots {
 struct Pool {
     free: Vec<usize>,
     slots: Vec<usize>,
-    index: HashMap<AsyncId, usize>,
+    index: HashMap<AsyncId, usize, crate::sync::FxBuild>,
     /// Slots taken from `free` since the last fork; the most ever taken in
     /// one phase sizes the next reservation (deterministic).
     taken: usize,
@@ -755,8 +755,8 @@ pub struct Checker {
     /// Async slot pools, one per partition key (`pool_key`): the free
     /// slots and the live ops of the ops a partition issues, so a checker
     /// partition can own them (D3: keyed by the partition's first cluster).
-    pools: HashMap<u32, Pool>,
-    allocs: HashMap<AllocId, Alloc>,
+    pools: HashMap<u32, Pool, crate::sync::FxBuild>,
+    allocs: AllocMap,
     /// Per sync object, its most recent phases (older ones can no longer be
     /// waited on: mbarrier parity / barrier generations).
     phases: HashMap<SyncObjId, std::collections::BTreeMap<u64, Phase>>,
@@ -764,14 +764,21 @@ pub struct Checker {
     scope_dedup: HashMap<(SiteId, SiteId, Scope, Scope), usize>,
     /// Latest `fence.sc` per `(warp, lane, scope)`.
     sc: HashMap<(WarpId, u8, Scope), Arc<Knowledge>>,
-    words: HashMap<AllocId, Words>,
+    words: WordsMap,
     /// Read-froms of possible `wait_until` polls, per warp, held back until
     /// the warp's next event.
     poll_stash: HashMap<WarpId, Vec<PollStash>>,
     advisory_dedup: HashMap<(AdvisoryKind, AllocId, SiteId), usize>,
     /// `alias_stale_read` (legacy alias tracker): per allocation, the last
     /// named warp-lane writer of every byte, keyed by segment start.
-    alias_writers: HashMap<AllocId, std::collections::BTreeMap<u64, AliasSeg>>,
+    alias_writers: HashMap<AllocId, std::collections::BTreeMap<u64, AliasSeg>, crate::sync::FxBuild>,
+    /// `alias_access`'s logical name per (site, operand, allocation space),
+    /// resolved once from `operand_buffer` / `site_buffer` /
+    /// `site_buffer_space` (W16: three SipHash lookups and two `Arc`
+    /// clones per shared/TMEM lane access before). Rebuilt whenever one of
+    /// those tables changes size (they are set at launch start).
+    alias_names: AliasNames,
+    alias_names_of: (usize, usize, usize),
     /// The tensormap view of the current warp-lane `Proxy::TensorMap`
     /// access (set per access).
     lane_g2t: Option<Clock>,
@@ -807,6 +814,15 @@ pub struct Checker {
     /// shadow cells after each collection so a pass (linear in the cells)
     /// stays amortised O(1) per access while memory stays within 2x live.
     gc_period: u64,
+    /// Multiplier on `gc_period` (`tuning::GC_BACKOFF`): doubled after a
+    /// collection that retired almost nothing (fewer than 1/64 of the cells
+    /// it walked) and reclaimed under a quarter of the async slots in use,
+    /// up to `GC_BACKOFF_MAX`; reset by a productive one. A
+    /// launch whose witnesses all stay live (no actor ever observes another,
+    /// e.g. a persistent GEMM's producer and consumer warps until the end)
+    /// otherwise re-walks every cell each time `since_gc` reaches half the
+    /// live cells. Cost only: collecting later never changes a result.
+    gc_backoff: u64,
     pub stats: Stats,
     /// A checker partition's context (`None`: the main / serial checker).
     part: Option<Box<partition::PartCtx>>,
@@ -910,16 +926,18 @@ impl Checker {
             memo: JoinMemo::default(),
             warps: Warps(Held::Dense((0..n).map(|i| Some(Box::new(Warp::new(i)))).collect())),
             asyncs: Slots(Held::Dense(Vec::new())),
-            pools: HashMap::new(),
-            allocs: HashMap::new(),
+            pools: HashMap::default(),
+            allocs: AllocMap::default(),
             phases: HashMap::new(),
             incomplete_index: HashMap::new(),
             scope_dedup: HashMap::new(),
             sc: HashMap::new(),
-            words: HashMap::new(),
+            words: WordsMap::default(),
             poll_stash: HashMap::new(),
             advisory_dedup: HashMap::new(),
-            alias_writers: HashMap::new(),
+            alias_writers: HashMap::default(),
+            alias_names: HashMap::default(),
+            alias_names_of: (0, 0, 0),
             lane_g2t: None,
             alias_dedup: HashMap::new(),
             site_buffer: HashMap::new(),
@@ -936,6 +954,7 @@ impl Checker {
             dropped_findings: 0,
             since_gc: 0,
             gc_period: 0,
+            gc_backoff: 1,
             stats: Stats::default(),
             part: None,
             site_reg: HashMap::new(),
@@ -1370,24 +1389,41 @@ impl Checker {
     /// bytes (adjacent bytes of one writer coalesce). Unnamed accesses
     /// neither report nor overwrite; async copies carry no name. No
     /// ordering requirement: the advisory is about logical identity.
-    fn alias_access(&mut self, alloc: AllocId, r: Range<u64>, site: SiteId, operand: u8, warp: WarpId, cw: &Witness) {
+    /// The logical buffer name `alias_access` attributes an access of
+    /// `site`'s pointer operand `operand` in `space` to (cached).
+    fn alias_name(&mut self, site: SiteId, operand: u8, space: Option<Space>) -> Option<Arc<str>> {
+        let of = (self.site_buffer.len(), self.operand_buffer.len(), self.site_buffer_space.len());
+        if self.alias_names_of != of {
+            self.alias_names.clear();
+            self.alias_names_of = of;
+        }
+        if let Some(x) = self.alias_names.get(&(site, operand, space)) {
+            return x.clone();
+        }
         // W5-15: the access's own operand names it when lowering provides
         // per-operand buffers; otherwise the site's single name, guarded by
         // the space rule below (deltas P7 interim).
         let exact = self.operand_buffer.get(&(site, operand)).cloned();
-        if exact.is_none() && operand != 0 {
-            return;
-        }
-        let Some(buf) = exact.clone().or_else(|| self.site_buffer.get(&site).cloned()).filter(|b| !b.is_empty()) else {
+        let name = if exact.is_none() && operand != 0 {
+            None
+        } else {
+            exact.clone().or_else(|| self.site_buffer.get(&site).cloned()).filter(|b| !b.is_empty()).filter(|_| {
+                // A site names one operand's buffer; an access in another
+                // space (e.g. tensormap.cp_fenceproxy's shared-memory source,
+                // named after its global destination) has no known logical
+                // name (deltas P7).
+                exact.is_some() || !self.site_buffer_space.get(&site).is_some_and(|s| Some(*s) != space)
+            })
+        };
+        self.alias_names.insert((site, operand, space), name.clone());
+        name
+    }
+
+    fn alias_access(&mut self, alloc: AllocId, r: Range<u64>, site: SiteId, operand: u8, warp: WarpId, cw: &Witness) {
+        let space = self.allocs.get(&alloc).map(|a| a.space);
+        let Some(buf) = self.alias_name(site, operand, space) else {
             return;
         };
-        // A site names one operand's buffer; an access in another space
-        // (e.g. tensormap.cp_fenceproxy's shared-memory source, named after
-        // its global destination) has no known logical name (deltas P7).
-        let space = self.allocs.get(&alloc).map(|a| a.space);
-        if exact.is_none() && self.site_buffer_space.get(&site).is_some_and(|s| Some(*s) != space) {
-            return;
-        }
         if cw.kind() != AccessKind::Write {
             let mut hits: Vec<(Range<u64>, AliasSeg)> = Vec::new();
             if let Some(segs) = self.alias_writers.get(&alloc) {
@@ -2881,6 +2917,7 @@ impl Checker {
         let mut live_actors: HashSet<ActorId> = HashSet::new();
         let mut min_epoch: HashMap<ActorId, Epoch> = HashMap::new();
         let mut allocs = std::mem::take(&mut self.allocs);
+        let total_cells: usize = allocs.values().map(|a| a.shadow.len()).sum();
         for alloc in allocs.values_mut() {
             let (space, seen) = (alloc.space, alloc.seen);
             let (meet, live) = match space {
@@ -2982,7 +3019,10 @@ impl Checker {
         }
         // Async-slot reclaim: completed ops with no witness left.
         let held: Vec<usize> = self.asyncs.iter_indexed().map(|(i, _)| i).collect();
+        let reclaimed_before = self.stats.async_slots_reclaimed;
+        let mut in_use = 0u64;
         for i in held {
+            in_use += self.asyncs[i].in_use as u64;
             let a = &self.asyncs[i];
             if a.in_use && a.done >= 2 && !live_actors.contains(&a.actor) {
                 let op = a.op;
@@ -3000,6 +3040,20 @@ impl Checker {
                 self.stats.async_slots_reclaimed += 1;
             }
         }
+        // Back-off (`gc_backoff`): this collection was productive if it
+        // retired at least 1/64 of the cells it walked or reclaimed at least
+        // a quarter of the slots in use (a pipeline whose copies replace
+        // each other's witnesses frees slots without retiring any).
+        let reclaimed = self.stats.async_slots_reclaimed - reclaimed_before;
+        let productive = retired.saturating_mul(64) >= total_cells as u64 || reclaimed.saturating_mul(4) > in_use;
+        if super::tuning::on(&super::tuning::GC_BACKOFF) && !productive {
+            self.gc_backoff = (self.gc_backoff * 2).min(GC_BACKOFF_MAX);
+            if super::tuning::on(&super::tuning::ADAPTIVE_GC) {
+                self.gc_period = 2 * cells * self.gc_backoff;
+            }
+        } else {
+            self.gc_backoff = 1;
+        }
         // Site tables: keep only epochs a witness may still name.
         for w in self.warps.iter_mut() {
             let keep_from = min_epoch.get(&w.actor).copied().unwrap_or(w.epoch);
@@ -3010,6 +3064,19 @@ impl Checker {
         }
     }
 }
+
+/// Cap of `Checker::gc_backoff`: an unproductive launch still collects at
+/// least every `2 * GC_BACKOFF_MAX` live cells' worth of events (async-slot
+/// reclaim keeps the slot table bounded).
+pub const GC_BACKOFF_MAX: u64 = 16;
+
+/// Allocation state by id: looked up several times per access (W16: SipHash
+/// on these maps cost ~0.1 us per access on cudnn gemm_proj_rope). Nothing
+/// depends on their iteration order (it was `RandomState`-random before).
+type AllocMap = HashMap<AllocId, Alloc, crate::sync::FxBuild>;
+type WordsMap = HashMap<AllocId, Words, crate::sync::FxBuild>;
+/// `Checker::alias_names`: logical buffer name per (site, operand, space).
+type AliasNames = HashMap<(SiteId, u8, Option<Space>), Option<Arc<str>>, crate::sync::FxBuild>;
 
 #[cfg(test)]
 mod tests {

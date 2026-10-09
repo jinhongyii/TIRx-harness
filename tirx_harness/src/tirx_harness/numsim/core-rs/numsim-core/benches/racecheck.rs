@@ -362,5 +362,106 @@ fn declared_words(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words);
+/// GC back-off (`tuning::GC_BACKOFF`): a live shadow of 8192 cells with a
+/// 64-witness read frontier each (all 32 lanes of two unsynchronised warps
+/// read every cell; built untimed), then 65536 timed exact-hit rewrites by
+/// one lane with a scheduler phase end every 256 events. No witness ever
+/// dies, so every collection walks all 0.5M witnesses and retires nothing;
+/// without the back-off one runs every 4096 events.
+/// The guard is the on/off ratio (>= 1.5x; W16).
+fn gc_backoff(c: &mut Criterion) {
+    use numsim_core::racecheck::tuning::GC_BACKOFF;
+    use std::sync::atomic::Ordering::Relaxed;
+    let topo = Topology { warps_per_cta: 3, ctas_per_cluster: 1, num_ctas: 1 };
+    let cells = 8192u64;
+    let mut setup = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: (cells + 64) * 16, cta: 0 })];
+    for i in 0..cells {
+        for w in 0..2u32 {
+            for l in 0..32u8 {
+                setup.push(acc(w, l, 1 + i as u32, AccessKind::Read, i * 16..i * 16 + 16, w));
+            }
+        }
+    }
+    let timed: Vec<Event> = (0..65536u64).map(|k| {
+        let off = (cells + k % 64) * 16;
+        acc(2, 0, 1 + k as u32, AccessKind::Write, off..off + 16, 2)
+    }).collect();
+    let build = || {
+        let mut ck = Checker::new(topo);
+        ck.set_collect_at_phase_end(true);
+        for e in setup.iter().cloned() {
+            ck.event(e);
+        }
+        ck
+    };
+    let mut g = c.benchmark_group("gc_backoff");
+    g.sample_size(10);
+    for on in [false, true] {
+        g.bench_function(BenchmarkId::from_parameter(if on { "on" } else { "off" }), |b| {
+            GC_BACKOFF.store(on, Relaxed);
+            b.iter_batched(
+                build,
+                |mut ck| {
+                    for (i, e) in timed.iter().cloned().enumerate() {
+                        ck.event(e);
+                        if i % 256 == 255 {
+                            ck.phase_end();
+                        }
+                    }
+                    ck
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+    GC_BACKOFF.store(true, Relaxed);
+    g.finish();
+}
+
+/// Interval-shadow slow path on a large map of racecheck-sized cells (80
+/// bytes, like `cell::Cell`): a 256K-segment shadow with a 16-byte hole
+/// after every segment (built untimed), then every hole is first-touched
+/// (`first_touch`), or every other segment is overwritten by a range
+/// straddling two segments (`straddle`: split + merge path). cudnn
+/// gemm_proj_rope's global shadow has ~0.3M segments and 63% of its slow
+/// updates are first touches (W16). Guard: >= 1.5x vs the inline-cell
+/// BTreeMap layout it replaced (W16, 2026-10-08, same host back to back:
+/// first_touch 161 -> 78 ms, straddle 214 -> 130 ms).
+fn shadow_slow_path(c: &mut Criterion) {
+    type Fat = [u64; 10];
+    let n = 1u64 << 18;
+    let mut base: IntervalShadow<Fat> = IntervalShadow::new();
+    for i in 0..n {
+        base.update(i * 32..i * 32 + 16, |_, c| c[0] = i + 1);
+    }
+    let mut g = c.benchmark_group("interval_shadow_slow");
+    g.sample_size(10);
+    g.bench_function("first_touch", |b| {
+        b.iter_batched(
+            || base.clone(),
+            |mut s| {
+                for i in 0..n {
+                    s.update(i * 32 + 16..i * 32 + 32, |_, c| c[1] = black_box(i));
+                }
+                s
+            },
+            criterion::BatchSize::LargeInput,
+        )
+    });
+    g.bench_function("straddle", |b| {
+        b.iter_batched(
+            || base.clone(),
+            |mut s| {
+                for i in (0..n - 1).step_by(2) {
+                    s.update(i * 32 + 8..i * 32 + 40, |_, c| c[2] = black_box(i));
+                }
+                s
+            },
+            criterion::BatchSize::LargeInput,
+        )
+    });
+    g.finish();
+}
+
+criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words, gc_backoff, shadow_slow_path);
 criterion_main!(benches);

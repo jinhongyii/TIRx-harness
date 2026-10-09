@@ -31,8 +31,8 @@ pub(crate) struct AllocMeta {
 /// exact because a partition reads only round-start values plus its own
 /// writes (I11/I12), and own writes this phase make the child suspend.
 pub(super) struct Globals {
-    pub(super) allocs: HashMap<AllocId, Alloc>,
-    pub(super) words: HashMap<AllocId, Words>,
+    pub(super) allocs: super::AllocMap,
+    pub(super) words: super::WordsMap,
     pub meta: Arc<HashMap<AllocId, AllocMeta>>,
 }
 
@@ -850,8 +850,8 @@ impl Checker {
         }
         self.phase_index = index;
         let ids: Vec<AllocId> = self.allocs.iter().filter(|(_, a)| a.space == Space::Global).map(|(id, _)| *id).collect();
-        let mut allocs = HashMap::with_capacity(ids.len());
-        let mut words = HashMap::new();
+        let mut allocs = super::AllocMap::with_capacity_and_hasher(ids.len(), Default::default());
+        let mut words = super::WordsMap::default();
         for id in ids {
             allocs.insert(id, self.allocs.remove(&id).unwrap());
             if let Some(w) = self.words.remove(&id) {
