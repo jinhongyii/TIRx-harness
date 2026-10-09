@@ -386,6 +386,24 @@ Wall / process CPU / voluntary switches, landed tree against e06f874, interleave
 
 Small kernels (sched/interp part, min of 3): flat or faster (recurrent_kda w16 0.123 -> 0.106 s, fp16_bf16_gemm w8 0.0425 -> 0.0394 s, kda_backward_packed w8 0.112 -> 0.107 s; radix_topk, rmsnorm, selective_state, gdn_decode within noise). Digests identical to e06f874 at 1/8/32 on the usual set plus medium.
 
+**Remaining sites: recorded, not pursued (e24 cannot clear 2x by buffer reuse).** Byte-weighted backtrace sampling (one sample per MiB allocated) on b36e44e, 16 workers:
+
+| Site | e24 (3.39 GB sampled) | medium (31.3 GB sampled) |
+|---|---|---|
+| `zeroed_regs` (register files, ~910 KiB per warp) | 2.26 GB | 2.34 GB |
+| oplib `gather_f8_rows` + `per_cta` (block-scaled gathers) | 0.21 GB | 7.71 GB |
+| oplib `mxf8_scale_locations` | 0.06 GB | 2.07 GB |
+| oplib TMA `push_span` + `ByteRun::to_vec` | 0.09 GB | 3.29 GB |
+| oplib `Window::read` | 0.06 GB | 1.85 GB |
+| oplib `mma_f32_abt_increasing_k` output | 0.05 GB | 1.85 GB |
+| interp TMA payload, `tcgen_cp` src/dst and plan pairs | 0.17 GB | 5.67 GB |
+
+- The 2x bar for e24 (4.66 GB at e06f874) means at most 2.33 GB. Register files alone are 2.26 GB, so 93% of everything else would have to go. Buffer reuse cannot get there.
+- The register files cannot be reused. Mega MoE launches a persistent grid, so every warp's file is live at once, and no CTA retires while another is waiting to be admitted.
+  - A process-wide pool of retired files (≥ 128 KiB, re-zeroed on reuse) changed neither e24 (3.31 GB) nor medium (30.65 GB).
+  - Most of those bytes are `calloc`'d zero pages a warp never touches, so they cost address space rather than CPU.
+- What would reduce them is compact register storage (narrower lanes for 32-bit registers). That is the `RegFile` encoding in `value.rs`, a design change, not a buffer fix.
+- The medium-only oplib sites (about 17 GB) remain open if medium CPU matters. They would not move the e24 criterion.
 **Declined (negative result): sticky partition assignment.** Do not re-try without new data.
 - Design: pool participants get stable ids; `par_for_sticky` first claims the partitions the participant ran last round (`Partition::last_worker`), then steals the rest from a per-participant offset. Only the running thread changes; merge and serial-phase order stay in partition order, so digests were identical at 1/8/32 and `every_scenario_is_observer_and_worker_independent` passed.
 - Bar: voluntary switches (the cross-thread-free signal) down 5x and no wall regression. Measured on top of the buffers (interleaved, min of 5; wall / CPU / switches):
