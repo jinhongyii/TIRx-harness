@@ -977,6 +977,34 @@ Reading:
 - **Open:** what selects the slow mode per run. It is not cross-group stealing. Candidates are run-to-run memory placement (NUMA node of first touch, transparent huge pages) and co-tenant load on the pinned cores. Both need hardware counters (`perf_event_paranoid` ≤ 2) or a dedicated host to separate.
 - **Not landed:** `pin_workers` keeps the global-steal sticky handout of 5d98955.
 
+**The pinned slow mode is not NUMA placement (W13, 2026-10-09).** Recorded; the investigation stops here.
+
+Setup: `pin_workers=on`, medium and large at 32 workers, 6 interleaved rounds of three placements of the whole driver process. Build: 5d98955 behaviour (scratch `w13/hgl/`, variant switches unset). Every run was `clean` and matched the reference. Load was 1.7-14.8.
+- (a) As is.
+- (b) `numactl --cpunodebind=0 --membind=0`.
+- (c) `numactl --cpunodebind=0`.
+
+Background:
+- This host has 2 sockets, 1 NUMA node each. Node 0 is CPUs 0-63 and 128-191; node 1 is 64-127 and 192-255.
+- Pinned placement fills physical cores in order, so the 32 participants already sit on CPUs 0-31 of node 0 in (a).
+- What (a) does not control is memory. One `numastat` sample of an (a) medium run showed 3.0 GB on node 0 and 1.65 GB on node 1.
+
+Wall s (process CPU s) per sample, in run order:
+
+| case | (a) as is | (b) CPUs + memory on node 0 | (c) CPUs on node 0 |
+|---|---|---|---|
+| medium | 2.43 (27.7), 2.74 (29.9), 3.73 (43.9), 2.89 (31.7), 3.67 (42.8), 3.70 (43.2) | 3.42 (38.5), 3.75 (44.0), 3.76 (44.3), 3.85 (45.1), 2.38 (26.8), 3.76 (44.0) | 2.38 (26.9), 3.78 (44.3), 3.67 (42.8), 3.77 (44.1), 3.12 (34.9), 3.16 (35.4) |
+| medium min / median | 2.43 / 3.67 | 2.38 / 3.76 | 2.38 / 3.67 |
+| large | 5.75 (64.1), 6.60 (79.5), 6.57 (79.4), 6.68 (80.5), 5.74 (62.8), 6.37 (76.0) | 4.85 (54.2), 6.62 (79.2), 6.76 (81.4), 6.71 (81.0), 6.00 (70.9), 6.30 (75.4) | 6.72 (80.5), 6.12 (73.0), 5.52 (63.1), 6.87 (83.0), 6.72 (80.5), 4.05 (46.6) |
+| large min / median | 5.74 / 6.57 | 4.85 / 6.62 | 4.05 / 6.72 |
+
+Reading:
+- Neither (b) nor (c) removes the slow mode. With CPUs and memory both on node 0, medium still has 5 of 6 samples at 3.4-3.9 s.
+- So the selector is neither cross-node memory or first-touch placement nor CPU placement across sockets. The NUMA-first placement fix is not implemented.
+- Competing load does not explain it either: the 1-minute load average at each sample does not track the mode. Medium slow samples ran at load 1.8-2.9, and fast samples at load up to 9.1.
+- Process CPU tracks wall in every sample: 26-35 s fast, 38-45 s slow. Each run inflates or it does not.
+- The selector stays unidentified. Separating it needs hardware counters (`perf_event_paranoid` ≤ 2) or a dedicated host. `pin_workers` is unchanged.
+
 ## Parked spin-loop replay: validated prototype, not landed (W13, 2026-10-09)
 
 **Why not landed.** The design below was implemented in scratch and validated. No corpus case parks on a spin loop in a way that matters: medium spends 0.1–0.3 s in re-polls, and the max config has 0 replays. The max config's re-polls are blocked retries at `mbar_wait` (107 M checks, most already applied by `BlockedWait`), `wait_until` (29.5 M) and `barrier` (19.1 M), with no parked loops. Landing would add a recorder and replayer to the interpreter for no corpus gain. It can be revived if a spinning kernel shows up.
