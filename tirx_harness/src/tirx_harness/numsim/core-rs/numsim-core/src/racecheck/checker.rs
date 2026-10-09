@@ -864,9 +864,9 @@ pub struct Checker {
     /// stays amortised O(1) per access while memory stays within 2x live.
     gc_period: u64,
     /// Multiplier on `gc_period` (`tuning::GC_BACKOFF`): doubled after a
-    /// collection that retired almost nothing (fewer than 1/64 of the cells
-    /// it walked) and reclaimed under a quarter of the async slots in use,
-    /// up to `GC_BACKOFF_MAX`; reset by a productive one. A
+    /// collection that freed little for the cells it walked (retired under
+    /// 1/64 of them and reclaimed under 1/`GC_SLOT_CELLS` of them in async
+    /// slots), up to `GC_BACKOFF_MAX`; reset by a productive one. A
     /// launch whose witnesses all stay live (no actor ever observes another,
     /// e.g. a persistent GEMM's producer and consumer warps until the end)
     /// otherwise re-walks every cell each time `since_gc` reaches half the
@@ -3232,9 +3232,7 @@ impl Checker {
         // Async-slot reclaim: completed ops with no witness left.
         let held: Vec<usize> = self.asyncs.iter_indexed().map(|(i, _)| i).collect();
         let reclaimed_before = self.stats.async_slots_reclaimed;
-        let mut in_use = 0u64;
         for i in held {
-            in_use += self.asyncs[i].in_use as u64;
             let a = &self.asyncs[i];
             if a.in_use && a.done >= 2 && !live_actors.contains(&a.actor) {
                 let op = a.op;
@@ -3252,12 +3250,21 @@ impl Checker {
                 self.stats.async_slots_reclaimed += 1;
             }
         }
-        // Back-off (`gc_backoff`): this collection was productive if it
-        // retired at least 1/64 of the cells it walked or reclaimed at least
-        // a quarter of the slots in use (a pipeline whose copies replace
-        // each other's witnesses frees slots without retiring any).
+        // Back-off (`gc_backoff`): productivity is measured against the
+        // walk's cost, the cells it visited. A collection was productive if
+        // it retired at least 1/64 of them, or reclaimed async slots
+        // worth at least as much, a slot counting as `GC_SLOT_CELLS` cells
+        // (it carries its knowledge clocks and is scanned by commits and
+        // allocation ends). A pipeline whose copies replace each other's
+        // witnesses frees slots without retiring any (racecheck_retirement
+        // stage reuse: ~1 slot per 45-224 cells walked, productive); with
+        // token re-attribution almost every collection of a large launch
+        // reclaims a few slots, which must not reset the back-off (mega_moe
+        // medium: ~1 slot per 300-1700 cells; 92 collections in 2000
+        // rounds under the earlier share-of-slots-in-use rule; W16).
         let reclaimed = self.stats.async_slots_reclaimed - reclaimed_before;
-        let productive = retired.saturating_mul(64) >= total_cells as u64 || reclaimed.saturating_mul(4) > in_use;
+        let walked = total_cells as u64;
+        let productive = retired.saturating_mul(64) >= walked || reclaimed.saturating_mul(GC_SLOT_CELLS) >= walked;
         if super::tuning::on(&super::tuning::GC_BACKOFF) && !productive {
             self.gc_backoff = (self.gc_backoff * 2).min(GC_BACKOFF_MAX);
             if super::tuning::on(&super::tuning::ADAPTIVE_GC) {
@@ -3383,6 +3390,10 @@ fn gc_walk(alloc: &mut Alloc, meet: &Option<Knowledge>, live: bool, re: &Reattr<
 /// least every `2 * GC_BACKOFF_MAX` live cells' worth of events (async-slot
 /// reclaim keeps the slot table bounded).
 pub const GC_BACKOFF_MAX: u64 = 16;
+
+/// Cells one reclaimed async slot is worth in the back-off's productivity
+/// test (`Checker::gc_backoff`).
+pub const GC_SLOT_CELLS: u64 = 256;
 
 /// Allocation state by id: looked up several times per access (W16: SipHash
 /// on these maps cost ~0.1 us per access on cudnn gemm_proj_rope). Nothing

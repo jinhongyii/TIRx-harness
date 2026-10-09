@@ -364,17 +364,30 @@ fn declared_words(c: &mut Criterion) {
 
 /// GC back-off (`tuning::GC_BACKOFF`): a live shadow of 8192 cells with a
 /// 64-witness read frontier each (all 32 lanes of two unsynchronised warps
-/// read every cell; built untimed), then 65536 timed exact-hit rewrites by
-/// one lane with a scheduler phase end every 256 events. No witness ever
-/// dies, so every collection walks all 0.5M witnesses and retires nothing;
-/// without the back-off one runs every 4096 events.
-/// The guard is the on/off ratio (>= 1.5x; W16).
+/// read every cell; built untimed), then 65536 timed events with a
+/// scheduler phase end every 256. No setup witness ever dies, so every
+/// collection walks all 0.5M of them; without the back-off one runs every
+/// 4096 events. Two timed shapes:
+/// - `witnesses`: exact-hit rewrites by one lane (nothing to free);
+/// - `slots`: the same rewrites with a TMA-style copy pipeline interleaved
+///   (one fresh-source copy per ~500 events, completed on an mbarrier the
+///   consumer waits): every collection reclaims a few copy slots, about one
+///   per 1000 cells walked, like mega_moe medium under token re-attribution.
+///   The productivity test weighs them against the walk, so the back-off
+///   still engages (W16).
+///
+/// The guard is the on/off ratio of each shape (>= 1.5x; W16).
 fn gc_backoff(c: &mut Criterion) {
     use numsim_core::racecheck::tuning::GC_BACKOFF;
     use std::sync::atomic::Ordering::Relaxed;
-    let topo = Topology { warps_per_cta: 3, ctas_per_cluster: 1, num_ctas: 1 };
+    let topo = Topology { warps_per_cta: 5, ctas_per_cluster: 1, num_ctas: 1 };
     let cells = 8192u64;
-    let mut setup = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: (cells + 64) * 16, cta: 0 })];
+    let (shadow, stage, src) = (AllocId(1), AllocId(2), AllocId(3));
+    let mut setup = vec![
+        Event::Sync(SyncEvent::AllocBegin { alloc: shadow, space: Space::Shared, size: (cells + 64) * 16, cta: 0 }),
+        Event::Sync(SyncEvent::AllocBegin { alloc: stage, space: Space::Shared, size: 128, cta: 0 }),
+        Event::Sync(SyncEvent::AllocBegin { alloc: src, space: Space::Global, size: 256 * 128, cta: 0 }),
+    ];
     for i in 0..cells {
         for w in 0..2u32 {
             for l in 0..32u8 {
@@ -382,10 +395,38 @@ fn gc_backoff(c: &mut Criterion) {
             }
         }
     }
-    let timed: Vec<Event> = (0..65536u64).map(|k| {
+    let rewrite = |k: u64| {
         let off = (cells + k % 64) * 16;
         acc(2, 0, 1 + k as u32, AccessKind::Write, off..off + 16, 2)
-    }).collect();
+    };
+    let witnesses: Vec<Event> = (0..65536u64).map(rewrite).collect();
+    let mut slots: Vec<Event> = Vec::new();
+    let full = SyncObjId::Mbarrier { cta: CtaId(0), alloc: AllocId(4), offset: 0 };
+    let empty = SyncObjId::Mbarrier { cta: CtaId(0), alloc: AllocId(4), offset: 8 };
+    let mut k = 0u64;
+    for i in 0..128u64 {
+        // Producer: warp 3 lane 0; consumer: warp 4; rewriter: warp 2.
+        let (p, c) = (4 * i as u32 + 1, 4 * i as u32 + 1);
+        let op = AsyncId(1 + i);
+        if i > 0 {
+            slots.push(Event::Sync(SyncEvent::Wait { warp: 3, lanes: LaneMask::lane(0), obj: empty, phase: i - 1, acquire: Some(true), scope: Some(Scope::Cta), site: SiteId(4), epoch: p }));
+        }
+        slots.push(Event::Sync(SyncEvent::AsyncIssue { op, warp: 3, lanes: LaneMask::lane(0), kind: AsyncKind::Copy, proxy: Proxy::Async, preds: vec![], footprint: vec![(stage, 0..128)], restricted: false, site: SiteId(5), epoch: p + 1 }));
+        let a = |who, alloc, range: std::ops::Range<u64>, kind, proxy, domain| Event::Access(Access { seq: 0, who, alloc, range, kind, order: MemOrder::Weak, scope: None, atomic: false, proxy, domain: Some(domain), site: SiteId(6), returns_value: false, operand: 0 });
+        slots.push(a(Who::Async { op, side: Milestone::Read }, src, (i % 256) * 128..(i % 256) * 128 + 128, AccessKind::Read, Proxy::Async, Domain::Global));
+        slots.push(a(Who::Async { op, side: Milestone::Write }, stage, 0..128, AccessKind::Write, Proxy::Async, Domain::SharedCta));
+        for m in [Milestone::Read, Milestone::Write] {
+            slots.push(Event::Sync(SyncEvent::AsyncComplete { op, milestone: m, target: CompletionTarget::Phase { obj: full, phase: i } }));
+        }
+        slots.push(Event::Sync(SyncEvent::Wait { warp: 4, lanes: LaneMask::ALL, obj: full, phase: i, acquire: Some(true), scope: Some(Scope::Cta), site: SiteId(7), epoch: c }));
+        slots.push(a(Who::Lane { warp: 4, lane: 0, epoch: c + 1 }, stage, 0..128, AccessKind::Read, Proxy::Generic, Domain::SharedCta));
+        slots.push(Event::Sync(SyncEvent::Fence { warp: 4, lanes: LaneMask::ALL, kind: FenceKind::ProxyAsync(None), site: SiteId(8), epoch: c + 2 }));
+        slots.push(Event::Sync(SyncEvent::Arrive { warp: 4, lanes: LaneMask::ALL, obj: empty, phase: i, release: Some(true), scope: Some(Scope::Cta), site: SiteId(9), epoch: c + 3 }));
+        for _ in 0..500 {
+            slots.push(rewrite(k));
+            k += 1;
+        }
+    }
     let build = || {
         let mut ck = Checker::new(topo);
         ck.set_collect_at_phase_end(true);
@@ -396,23 +437,25 @@ fn gc_backoff(c: &mut Criterion) {
     };
     let mut g = c.benchmark_group("gc_backoff");
     g.sample_size(10);
-    for on in [false, true] {
-        g.bench_function(BenchmarkId::from_parameter(if on { "on" } else { "off" }), |b| {
-            GC_BACKOFF.store(on, Relaxed);
-            b.iter_batched(
-                build,
-                |mut ck| {
-                    for (i, e) in timed.iter().cloned().enumerate() {
-                        ck.event(e);
-                        if i % 256 == 255 {
-                            ck.phase_end();
+    for (shape, timed) in [("witnesses", &witnesses), ("slots", &slots)] {
+        for on in [false, true] {
+            g.bench_function(BenchmarkId::new(shape, if on { "on" } else { "off" }), |b| {
+                GC_BACKOFF.store(on, Relaxed);
+                b.iter_batched(
+                    build,
+                    |mut ck| {
+                        for (i, e) in timed.iter().cloned().enumerate() {
+                            ck.event(e);
+                            if i % 256 == 255 {
+                                ck.phase_end();
+                            }
                         }
-                    }
-                    ck
-                },
-                criterion::BatchSize::LargeInput,
-            );
-        });
+                        ck
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            });
+        }
     }
     GC_BACKOFF.store(true, Relaxed);
     g.finish();
