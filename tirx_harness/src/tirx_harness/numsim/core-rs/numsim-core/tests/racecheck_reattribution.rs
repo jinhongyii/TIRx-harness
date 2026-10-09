@@ -165,3 +165,31 @@ fn c3_bridge_verdicts_do_not_depend_on_collection() {
         assert!(clean(&r), "fence={fence}: {r:#?}");
     }
 }
+
+/// v1 rule (a)3 (an a2g observer's stamp counts when found in cur's `hb`):
+/// exact only if every path that delivers Q's `hb` also delivers Q's a2g
+/// bridge rows. Barrier payloads do (C3). This pins the other path: Q
+/// observes A (async write of GMEM[0..4]) on its phase, then publishes with
+/// `st.release.gpu` on GMEM2; R `ld.acquire`s it (read-from: a release
+/// head, not a barrier payload) and then reads A's bytes generically.
+/// Today's verdict must hold under any collection schedule, and under any
+/// future re-attribution.
+fn read_from_bridge() -> K {
+    let mut k = K::new(3, 1, 1);
+    async_write(&mut k);
+    k.wait(1, u32::MAX, 0, 0, true);
+    filler(&mut k, 1, 64);
+    k.a(1, 0, st(MemOrder::Release, Scope::Gpu), GMEM2, 0..4);
+    k.a(2, 0, ld(MemOrder::Acquire, Scope::Gpu), GMEM2, 0..4);
+    filler(&mut k, 2, 64);
+    k.ld(2, 0, GMEM, 0..4);
+    k
+}
+
+#[test]
+fn a3_read_from_release_carries_the_observation() {
+    let r = both(read_from_bridge());
+    // Today: the release head carries Q's bridge rows with its hb, so R's
+    // generic read of A's bytes is ordered.
+    assert!(clean(&r), "{r:#?}");
+}
