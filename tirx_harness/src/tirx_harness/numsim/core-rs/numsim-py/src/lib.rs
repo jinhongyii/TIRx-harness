@@ -23,7 +23,7 @@ use numsim_core::report::Report;
 use numsim_core::sched::{self, ArgValue, Inputs, RunConfig, RunError, RunOutcome, RunStatus};
 use numsim_core::synccheck::{self, SynccheckConfig};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{self, AssertUnwindSafe};
 
 /// Decode a serialized module: JSON when the first non-blank byte is `{`,
@@ -75,6 +75,10 @@ pub struct RunRequest {
     pub max_findings: usize,
     /// Scheduler worker threads (also copied into `RunConfig::workers`).
     pub workers: u32,
+    /// Output buffers to return; `None` = every buffer argument. Readback of
+    /// a large module's weights is the dominant host cost when only a few
+    /// outputs are wanted (Mega MoE medium: 680 MB copied to Python per run).
+    pub outputs: Option<BTreeSet<String>>,
 }
 
 impl RunRequest {
@@ -87,6 +91,7 @@ impl RunRequest {
             synccheck_limits: BTreeMap::new(),
             max_findings: 0,
             workers: 1,
+            outputs: None,
         }
     }
 }
@@ -456,12 +461,18 @@ fn invalid_mask(valid: &BitSet) -> Option<Vec<u8>> {
     Some((0..valid.len()).map(|i| u8::from(valid.get(i))).collect())
 }
 
-fn outcome_result(outcome: RunOutcome, reports: Vec<String>, payloads: Vec<Value>) -> ExecuteResult {
+fn outcome_result(
+    outcome: RunOutcome,
+    wanted: Option<&BTreeSet<String>>,
+    reports: Vec<String>,
+    payloads: Vec<Value>,
+) -> ExecuteResult {
     let diagnostics = diagnostics_of(&outcome);
     let outputs = outcome
         .outputs
         .buffers
         .into_iter()
+        .filter(|(name, _)| wanted.is_none_or(|w| w.contains(name)))
         .map(|(name, (bytes, valid))| {
             let invalid_mask = invalid_mask(&valid);
             (name, OutputBuffer { bytes, invalid_mask })
@@ -530,30 +541,51 @@ impl Observer for PerLaunchRecorder {
 
 /// Run `module` in one mode. Never panics: engine panics become errors.
 pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result<ExecuteResult, ExecuteError> {
-    guarded(|| {
+    execute_inputs(module, std::borrow::Cow::Borrowed(inputs), request)
+}
+
+/// [`execute`] taking `inputs` by value: buffer arguments move into the
+/// engine instead of being copied (`sched::run_with_config_owned`,
+/// CONTRACT_REQUESTS W15-1).
+pub fn execute_owned(module: &Module, inputs: Inputs, request: &RunRequest) -> Result<ExecuteResult, ExecuteError> {
+    execute_inputs(module, std::borrow::Cow::Owned(inputs), request)
+}
+
+/// `sched::run_with_config`, or its owned form for owned inputs.
+fn run_inputs(module: &Module, inputs: std::borrow::Cow<'_, Inputs>, observer: &mut dyn Observer, config: &RunConfig) -> Result<RunOutcome, RunError> {
+    match inputs {
+        std::borrow::Cow::Borrowed(i) => sched::run_with_config(module, i, observer, config),
+        std::borrow::Cow::Owned(i) => sched::run_with_config_owned(module, i, observer, config),
+    }
+}
+
+fn execute_inputs(module: &Module, inputs: std::borrow::Cow<'_, Inputs>, request: &RunRequest) -> Result<ExecuteResult, ExecuteError> {
+    guarded(move || {
         let config = &request.config;
         let run_started = std::time::Instant::now();
         let run_ms;
         let result: Result<(ExecuteResult, std::time::Instant), ExecuteError> = match request.mode {
             Mode::Numsim => {
                 let mut observer = NoopObserver;
-                let outcome = sched::run_with_config(module, inputs, &mut observer, config).map_err(run_error)?;
+                let outcome = run_inputs(module, inputs, &mut observer, config).map_err(run_error)?;
                 run_ms = ms(run_started);
-                Ok((outcome_result(outcome, Vec::new(), Vec::new()), std::time::Instant::now()))
+                Ok((outcome_result(outcome, request.outputs.as_ref(), Vec::new(), Vec::new()), std::time::Instant::now()))
             }
             Mode::Racecheck => {
                 let mut observer = RaceObserver::new(RacecheckConfig { max_findings: request.max_findings });
-                let outcome = sched::run_with_config(module, inputs, &mut observer, config).map_err(run_error)?;
+                // The collector's walk uses the engine's workers (§15).
+                observer.gc_threads = config.workers.max(1);
+                let outcome = run_inputs(module, inputs, &mut observer, config).map_err(run_error)?;
                 run_ms = ms(run_started);
                 let check_started = std::time::Instant::now();
                 observer.finish_launch(); // no-op when end_launch already finalized it
                 let reports: Vec<Report> = racecheck::payload::reports(&observer);
                 let payloads = reports.iter().map(racecheck::serialize).collect();
-                Ok((outcome_result(outcome, reports.iter().map(Report::to_json).collect(), payloads), check_started))
+                Ok((outcome_result(outcome, request.outputs.as_ref(), reports.iter().map(Report::to_json).collect(), payloads), check_started))
             }
             Mode::Synccheck => {
                 let mut recorder = PerLaunchRecorder::default();
-                let outcome = sched::run_with_config(module, inputs, &mut recorder, config).map_err(run_error)?;
+                let outcome = run_inputs(module, inputs, &mut recorder, config).map_err(run_error)?;
                 run_ms = ms(run_started);
                 let check_started = std::time::Instant::now();
                 let mut reports = Vec::new();
@@ -588,7 +620,7 @@ pub fn execute(module: &Module, inputs: &Inputs, request: &RunRequest) -> Result
                     reports.push(report);
                 }
                 let payloads = reports.iter().map(synccheck::serialize).collect();
-                Ok((outcome_result(outcome, reports.iter().map(Report::to_json).collect(), payloads), check_started))
+                Ok((outcome_result(outcome, request.outputs.as_ref(), reports.iter().map(Report::to_json).collect(), payloads), check_started))
             }
         };
         let (mut result, check_started) = result?;
@@ -695,6 +727,13 @@ mod py {
         if let Ok(b) = obj.cast::<PyBytes>() {
             return Ok(b.as_bytes().to_vec());
         }
+        // A C-contiguous byte buffer (the binder passes a `memoryview` of the
+        // host array): one copy, straight from the caller's memory.
+        if let Ok(buffer) = pyo3::buffer::PyBuffer::<u8>::get(obj) {
+            if buffer.is_c_contiguous() {
+                return buffer.to_vec(obj.py());
+            }
+        }
         if obj.hasattr("tobytes")? {
             return Ok(obj.call_method0("tobytes")?.cast::<PyBytes>()?.as_bytes().to_vec());
         }
@@ -774,12 +813,13 @@ mod py {
     /// `invalid` (name -> per-byte validity bytes, only for buffers with
     /// invalid bytes), `stats`, `diagnostics`, and for checker modes
     /// `reports` (one `report::Report` JSON str per launch) and `payloads`
-    /// (the checker's legacy-shaped payload dict per launch).
+    /// (the checker's legacy-shaped payload dict per launch). `outputs`
+    /// names the buffers to return in `outputs`/`invalid` (default: all).
     #[pyfunction]
     #[pyo3(signature = (module, inputs, *, mode="numsim", workers=1, seed=0,
                         loop_budget=None, quantum=None, max_rounds=None,
                         validity=None, state_budget=None, transition_budget=None, max_findings=0,
-                        subset=None, synccheck_limits=None, host_addrs=None))]
+                        subset=None, synccheck_limits=None, host_addrs=None, outputs=None))]
     fn run<'py>(
         py: Python<'py>,
         module: &PyModuleHandle,
@@ -797,6 +837,7 @@ mod py {
         subset: Option<Vec<u32>>,
         synccheck_limits: Option<BTreeMap<String, u64>>,
         host_addrs: Option<BTreeMap<String, u64>>,
+        outputs: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let mode = Mode::parse(mode).ok_or_else(|| PyValueError::new_err(format!("unknown mode {mode:?}")))?;
         let mut args = BTreeMap::new();
@@ -816,6 +857,7 @@ mod py {
         request.max_findings = max_findings;
         request.config.seed = seed;
         request.config.subset = subset;
+        request.outputs = outputs.map(|names| names.into_iter().collect());
         if let Some(limits) = synccheck_limits {
             for key in limits.keys() {
                 if !["max_schedules", "max_events_per_run", "max_total_events", "max_wall_time_ms", "max_diagnostic_bytes"].contains(&key.as_str()) {
@@ -836,7 +878,7 @@ mod py {
             request.config.max_rounds = v;
         }
         let module = Arc::clone(&module.inner);
-        let result = py.detach(move || execute(&module, &inputs, &request)).map_err(to_py_err)?;
+        let result = py.detach(move || execute_owned(&module, inputs, &request)).map_err(to_py_err)?;
 
         let out = PyDict::new(py);
         out.set_item("status", json_to_py(py, &result.status)?)?;

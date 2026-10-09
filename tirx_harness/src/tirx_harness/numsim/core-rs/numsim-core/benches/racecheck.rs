@@ -463,5 +463,58 @@ fn shadow_slow_path(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words, gc_backoff, shadow_slow_path);
+/// Parallel collector (racecheck-parallel-design.md §15): one `gc()` over
+/// 296 CTA-private shared allocations (the e24 shape: 148 2-CTA clusters,
+/// ~0.9M cells, about one e24 phase-end collection) whose witnesses all stay live (no synchronisation), so every run walks
+/// every cell. Rows: inline (`gc_threads` 1) vs 16 threads; the guard is
+/// the ratio (>= 1.5x; measured 3.5-4.5x on e24's phase-end GC).
+fn gc_parallel(c: &mut Criterion) {
+    let ctas = 296u32;
+    let wpc = 4u32;
+    let topo = Topology { warps_per_cta: wpc, ctas_per_cluster: 2, num_ctas: ctas };
+    let mut ev: Vec<Event> = Vec::new();
+    for cta in 0..ctas {
+        ev.push(Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(cta + 1), space: Space::Shared, size: 1 << 16, cta }));
+    }
+    for cta in 0..ctas {
+        for w in 0..wpc {
+            let warp = cta * wpc + w;
+            for it in 0..24u32 {
+                for l in 0..32u8 {
+                    let off = ((w * 24 + it) as u64 * 32 + l as u64) * 16;
+                    if let Event::Access(mut a) = acc(warp, l, 1 + it, AccessKind::Write, off..off + 16, 6) {
+                        a.alloc = AllocId(cta + 1);
+                        ev.push(Event::Access(a));
+                    }
+                }
+            }
+        }
+    }
+    let build = |threads: usize| {
+        let mut ck = Checker::new(topo);
+        ck.set_collect_at_phase_end(true);
+        ck.gc_threads = threads;
+        for e in ev.iter().cloned() {
+            ck.event(e);
+        }
+        ck
+    };
+    let mut g = c.benchmark_group("gc_parallel");
+    g.sample_size(10);
+    for threads in [1usize, 16] {
+        g.bench_function(BenchmarkId::from_parameter(threads), |b| {
+            b.iter_batched(
+                || build(threads),
+                |mut ck| {
+                    ck.gc();
+                    ck
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words, gc_backoff, shadow_slow_path, gc_parallel);
 criterion_main!(benches);

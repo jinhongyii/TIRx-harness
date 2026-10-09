@@ -90,6 +90,12 @@ pub struct RaceObserver {
     pending: Vec<(Checker, Vec<Stashed>)>,
     /// Global state is lent to children (`Checker::lend_globals`).
     lent: bool,
+    /// Threads for the collector (racecheck-parallel-design.md §15;
+    /// `numsim-py` passes the engine's worker count). Never changes a result.
+    pub gc_threads: usize,
+    /// See `Checker::gc_par_min_cells` (tests set 0 to force the parallel
+    /// path).
+    pub gc_par_min_cells: usize,
 }
 
 impl RaceObserver {
@@ -110,6 +116,8 @@ impl RaceObserver {
             phase_gc: true,
             pending: Vec::new(),
             lent: false,
+            gc_threads: 1,
+            gc_par_min_cells: super::checker::GC_PAR_MIN_CELLS,
         }
     }
 
@@ -122,6 +130,8 @@ impl RaceObserver {
         }
         let mut c = Checker::new(topo);
         c.gc_every = self.gc_every;
+        c.gc_threads = self.gc_threads;
+        c.gc_par_min_cells = self.gc_par_min_cells;
         c.set_collect_at_phase_end(self.phase_gc || self.fork_join);
         c.set_fork_join(self.fork_join);
         c.max_findings = self.config.max_findings;

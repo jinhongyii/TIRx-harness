@@ -69,6 +69,27 @@ def test_native_run_rejects_unknown_mode(module):
         numsim_core_py.run(module.handle, {}, backend="interp")
 
 
+def test_native_run_reads_back_only_requested_outputs(module):
+    """``outputs=`` limits readback (Engine.run asks only for the selected
+    buffers; checker phases ask for none) without changing the bytes."""
+
+    bound = v2.canonicalize_inputs(module, _inputs())
+    natives = {name: b.native for name, b in bound.items()}
+    full = _skip_if_unimplemented(lambda: numsim_core_py.run(module.handle, natives))
+    assert set(full["outputs"]) == {"a", "b", "c"}
+    only_c = numsim_core_py.run(module.handle, natives, outputs=["c"])
+    assert set(only_c["outputs"]) == {"c"}
+    assert only_c["outputs"]["c"] == full["outputs"]["c"]
+    assert numsim_core_py.run(module.handle, natives, outputs=[])["outputs"] == {}
+    # Buffers bind from any C-contiguous byte buffer, e.g. the binder's
+    # zero-copy memoryview, with the same result as bytes.
+    as_bytes = {
+        k: (v[0], bytes(v[1]), *v[2:]) if v[0] == "buffer" else v for k, v in natives.items()
+    }
+    again = numsim_core_py.run(module.handle, as_bytes, outputs=["c"])
+    assert again["outputs"]["c"] == full["outputs"]["c"]
+
+
 # -- inputs ----------------------------------------------------------------
 
 

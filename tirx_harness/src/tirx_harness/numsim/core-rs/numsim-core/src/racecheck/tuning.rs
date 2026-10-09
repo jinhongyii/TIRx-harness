@@ -29,10 +29,13 @@ switches! {
 }
 
 /// Decision 17: `RaceObserver`s fork a child checker per scheduling
-/// partition (default for new observers: on since milestone 2, 1.7-2.1x on
-/// mega_moe e24 at 16 workers; findings identical either way. Not a pruning
-/// switch).
-pub static FORK_JOIN: AtomicBool = AtomicBool::new(false);
+/// partition (default on; findings identical either way, not a pruning
+/// switch). Decision run on e5d1582, min of 3 interleaved, 16 workers:
+/// mega_moe e24 serial 16.60 s, fork/join 7.68 s (2.16x), with the parallel
+/// phase-end collector 6.50 s (2.55x); mega_moe medium (2000 rounds) 908 s
+/// vs 555 s (1.64x). At 1 worker no fork is offered (W5-17a): 0.98-1.03x on
+/// the 7 recorded fixtures.
+pub static FORK_JOIN: AtomicBool = AtomicBool::new(true);
 
 /// Decision 17 / W5-17a: a partition with fewer accesses than this is
 /// buffered and replayed by the main checker at the merge instead of being

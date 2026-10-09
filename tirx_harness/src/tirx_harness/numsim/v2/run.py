@@ -325,6 +325,14 @@ def _reject_unpacked_sub_byte(name: str, array: np.ndarray, slot: Mapping[str, A
         )
 
 
+def _byte_view(array: np.ndarray) -> memoryview:
+    """The bytes of a C-contiguous array as a flat ``memoryview``, without a
+    copy: the extension copies them once, straight into the engine's buffer
+    (a ``tobytes`` here would be a second full copy of every weight)."""
+
+    return memoryview(array.view(np.uint8).reshape(-1))
+
+
 def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> dict[str, BoundInput]:
     """Bind user inputs to the module's host ABI (all kernels, by name).
 
@@ -378,7 +386,7 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
                 bound[base_name] = BoundInput(
                     base_name,
                     "buffer",
-                    ("buffer", contiguous.view(np.uint8).reshape(-1).tobytes(), None),
+                    ("buffer", _byte_view(contiguous), None),
                     dtype=contiguous.dtype,
                     shape=tuple(contiguous.shape),
                     host_addr=int(base.__array_interface__["data"][0]),
@@ -469,7 +477,7 @@ def canonicalize_inputs(module: CompiledModule, inputs: Mapping[str, Any]) -> di
             bound[canonical] = BoundInput(
                 canonical,
                 "buffer",
-                ("buffer", array.view(np.uint8).reshape(-1).tobytes(), None),
+                ("buffer", _byte_view(array), None),
                 dtype=array.dtype,
                 shape=tuple(array.shape),
                 host_addr=int(host.__array_interface__["data"][0]) if host.size else None,
@@ -817,7 +825,7 @@ def _input_digest(bound: Mapping[str, BoundInput]) -> str:
         digest.update(name.encode())
         digest.update(repr(bound[name].native[:1]).encode())
         for part in bound[name].native[1:]:
-            digest.update(part if isinstance(part, bytes) else repr(part).encode())
+            digest.update(part if isinstance(part, (bytes, memoryview)) else repr(part).encode())
     return digest.hexdigest()
 
 
@@ -888,10 +896,22 @@ class Engine:
 
     # -- core call ---------------------------------------------------------
     def _native_run(
-        self, module: CompiledModule, bound: Mapping[str, BoundInput], mode: str, **extra: Any
+        self,
+        module: CompiledModule,
+        bound: Mapping[str, BoundInput],
+        mode: str,
+        *,
+        outputs: Iterable[str] | None = None,
+        **extra: Any,
     ) -> dict[str, Any]:
+        """``outputs``: the buffers to read back (``None`` = all). Reading
+        back only what the caller selected avoids copying every weight of a
+        large module to Python."""
+
         if "synccheck_limits" in extra:
             extra = {**extra, "synccheck_limits": dict(extra["synccheck_limits"])}
+        if outputs is not None:
+            extra = {**extra, "outputs": sorted(set(outputs))}
         return self._native_call(module, bound, mode, extra)
 
     def _native_call(
@@ -1014,7 +1034,9 @@ class Engine:
         bound = canonicalize_inputs(module, inputs)
         selected = _select_outputs(bound, outputs, module)
         bind_ms = (time.perf_counter() - started) * 1e3
-        raw = self._native_run(module, bound, "numsim", **extra)
+        wanted = {canonical for canonical, _, _ in selected}
+        wanted |= {bound[c].base for c in wanted if bound[c].kind == "view" and bound[c].base}
+        raw = self._native_run(module, bound, "numsim", outputs=wanted, **extra)
         report_started = time.perf_counter()
         result_outputs = {}
         for canonical, external, selector in selected:
@@ -1072,7 +1094,8 @@ class Engine:
         key = (mode, module.cache_key, _input_digest(bound), tuple(sorted(extra.items())))
         if key not in self._phase_memo:
             self._phase_memo.clear()  # keep at most one run alive
-            self._phase_memo[key] = self._native_run(module, bound, mode, **extra)
+            # Checker phases read no output buffers.
+            self._phase_memo[key] = self._native_run(module, bound, mode, outputs=(), **extra)
         return self._phase_memo[key]
 
     def _checker_phase(

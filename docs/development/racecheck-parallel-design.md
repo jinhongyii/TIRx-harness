@@ -1105,3 +1105,27 @@ samples:
 
 Even removing all of it caps the gain at about 1.13x on the medium window,
 below the 1.5x case criterion, so it was not built.
+
+**FORK_JOIN decision run (W5, 2026-10-09): default flipped on, together with
+W14's parallel phase-end collector.**
+
+Setup: HEAD e5d1582, prof harness on the recorded fixtures, interleaved
+runs, min of 3 (e24 at 16 workers: min of 6), host load average 6–11. The
+"+ parallel GC" arm is W14's patch with `gc_threads = workers`.
+
+| Case | serial | fork/join | fork/join + parallel GC |
+| --- | --- | --- | --- |
+| e24, 16 workers | 16.60 s | 7.68 s (2.16x) | 6.50 s (2.55x) |
+| e24, 1 worker | 17.68 s | 17.46 s | — |
+| medium (2000 rounds), 16 workers | 907.97 s | 555.28 s (1.64x) | 555.88 s (1.63x) |
+
+The serial checker with the parallel collector takes 16.38 s on e24 (1.01x).
+
+1-worker cost on the other fixtures, serial vs fork/join: fp16_bf16_gemm
+1.00, deepgemm_1d1d 1.00, gdn 1.03, kda 1.02, stp 1.00, radix_topk 0.98.
+Since W5-17a no fork is offered without a replay pool, so the milestone-2
+1-worker slowdowns are gone. Their `perf_regressions.tsv` rows are retired
+with a note line.
+
+The rule was: at least 1.5x over serial on e24 at 16 workers, and no 1-worker
+regression beyond noise. It is met.

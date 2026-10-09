@@ -24,7 +24,7 @@ Medium at 1 worker is now 1.61x faster than legacy (22.2 s against 35.7 s).
 
 | | Max config, 16 workers | W2-era | Medium, 1 worker | Medium, 16 workers | Medium, 32 workers |
 |---|---|---|---|---|---|
-| Rust setup and input binding | 26.0 s | 9.2 s (binding) | 0.85 s | 0.76 s | 0.78 s |
+| Rust work outside the round loop | 26.0 s, of which input allocation 8.8–9.3 s, output copies 14.5 s and drops 1.7 s | 9.2 s (input allocation only) | 0.85 s | 0.76 s | 0.78 s |
 | Round loop wall | 211.9 s | — | 21.3 s | 3.04 s | 4.20 s |
 | Parallel phase wall | 207.9 s | — | 21.1 s | 2.89 s | 3.98 s |
 | Critical path (sum over rounds of the slowest partition) | 122.7 s | 203 s | 1.42 s | 1.72 s | 3.01 s |
@@ -43,20 +43,26 @@ Medium at 1 worker is now 1.61x faster than legacy (22.2 s against 35.7 s).
 Medium's `Engine.run` wall is 1.8–1.9 s above `run_with_config` at every worker count: Python-side binding and report. At 16 workers that is a third of the 5.7 s.
 
 **What the remaining gaps are.**
-1. **Round-wall overhead and imbalance.**
-   - The max config's parallel-phase wall (208 s) exceeds both the critical path (123 s) and CPU/16 (134 s).
-   - The 74 partitions are handed to 16 workers dynamically in index order, so a round ends when the worker that drew the most work finishes.
-   - Lever: longest-first assignment. Hand out partitions in descending order of their previous round's cost. Results do not depend on it, because only the thread changes, and its benefit is bounded by the wall-vs-max(crit, CPU/16) gap.
-   - Medium at 16 workers shows the same overhead: 2.89 s wall against a critical path of 1.72 s and 28.6/16 = 1.79 s.
+1. **Per-round overhead.**
+   - The max config's parallel-phase wall exceeds the critical path and CPU/16. A better lower bound is the per-round sum of max(slowest partition, partition CPU / workers), measured at 125 s against a 170 s wall in the same run (174 s in a second run, 208 s at load 7–9).
+   - The remaining 45 s (26%) is about 0.6 ms per round over 74,478 rounds:
+     - 12 s is the main thread's merge and replay;
+     - the rest is the pool's park/wake and the dynamic handout.
+   - **Longest-first handout: measured, declined (negative).** Partitions were handed out in descending order of their previous round's wall time.
+     - Max config parallel-phase wall: 187.2 → 187.8 s (same load).
+     - Medium at 16 workers: 2.92–3.21 → 2.81–2.99 s.
+     - Medium at 32 workers: 3.91–4.09 → 3.84 s.
+     - At most about 5%, far below the 1.5x bar, so the gap is not ordering imbalance.
+   - Lever if it matters: a cheaper round handoff, e.g. spin-before-park, measured 1.40x at 32 workers on 2026-10-08 (below the bar then), or fewer rounds.
    - Owner: W13 / W2 (sched).
 2. **Per-partition CPU inflation with worker count.**
    - Medium partition CPU is 20.8 s at 1 worker, 28.6 s at 16 (1.37x) and 50.1 s at 32 (2.4x). At 32 workers the critical path itself grows to 3.0 s.
    - This is user-mode CPU in the partitions' own code, and its cause is not attributed (below).
 3. **MMA landing** (700 s on the max config, 33% of partition CPU). Oplib, W4.
 4. **Fixed costs outside the round loop.**
-   - Max config: 26 s of Rust setup and binding, up from 9.2 s at the W2 split; not yet attributed.
-   - Medium: about 1.9 s of Python-side binding and report per run.
-   - Owner: W8 (numsim-py) and sched for the Rust part.
+   - Max config: the 26 s was not growth since the W2 split. W2's 9.2 s counted input allocation only, which is still 8.8–9.3 s. The rest was the Rust output step copying every argument buffer out of the arena (14.5 s), plus drops (1.7 s).
+   - Output buffers now move out of the arena instead (W13, `sched/mod.rs` `run_with_config`). Output copies drop from 14.5 to 1.25 s on the max config and from 0.43 to 0.08 s on medium.
+   - Medium also has about 1.9 s of Python-side binding and report per run. Owner: W8 (numsim-py).
 5. **Parked spin-loop re-polls** (203 s on the max config). These polls emit Access events. A skip would therefore be observer-selected, which the one-execution-path rule forbids; see the 2026-10-08 decision below. Blocked `mbarrier.try_wait` / `bar.sync` retries are already applied without re-execution (`BlockedWait`).
 
 **Proven not to be the cause** (see "Mega MoE medium: per-worker CPU inflation" and the allocation sections):
@@ -280,6 +286,39 @@ A run is `incomplete` when coverage cannot be established. This is never `clean`
 | `run` | `numsim-py::execute` | engine execution. **Includes online racecheck**: `RaceObserver` consumes events during the run |
 | `check` | `numsim-py::execute` | post-run checker work: synccheck exploration, racecheck `finish` |
 | `report` | `v2.run` | Python report assembly |
+
+### Host-side binding and readback on Mega MoE medium (W15, 2026-10-09)
+
+Test case: Mega MoE medium (`t64_h2048_i1536_e96_k4_g1`, 148 SMs), numsim mode, `Engine(max_workers=16,
+native_loop_iteration_budget=10_000_000).run` with the case's `outputs` (`y`,
+`cumulative_local_expert_recv_stats`). It binds 95 arguments: 13 buffers, 680 MB. The figures below
+are the time outside `run_with_config`: `bind` plus the wall-clock time of the native call minus
+`run`. No `timing` key covers the native-call boundary, so it was split with temporary timers in
+`numsim-py`.
+
+| piece | before | after |
+| --- | --- | --- |
+| `bind`: `ndarray.tobytes()` of every buffer (`canonicalize_inputs`) | 470-630 ms | 60-65 ms (now a `memoryview`; the rest is the host-alias region copy and checks) |
+| `numsim_core_py.run` argument conversion (`object_bytes`, copy into `ArgValue::Buffer`) | 240-290 ms | same: one copy, now read through the buffer protocol |
+| readback: all 13 buffers to `PyBytes` (680 MB), plus drop | 460-580 ms | about 0: only the selected outputs (and the regions behind selected views) are returned |
+| `outcome_result` / dropping the inputs | 70-100 ms | about 70 ms |
+| **bind + outside `run` (min / max of 4 runs)** | **1295 / 1640 ms** | **423 / 482 ms (3.1x)** |
+| wall (min of 4) | 4911 ms | 4007 ms |
+
+The runs were interleaved: before = HEAD bf0e9c6, after = HEAD plus this change, both private builds.
+The 1-minute load average was 12-14 on 256 CPUs. The output digests are identical (`y` 8a39d2ab...,
+stats fd587ef8...). Conformance passes (304) and so do `tests/numsim/v2`.
+
+How it works:
+- `v2/run.py` binds buffers as a `memoryview` of the C-contiguous host array.
+- `numsim-py` copies that view once, through the buffer protocol.
+- `Engine.run` passes `outputs=` with the selected names to `numsim_core_py.run`.
+- Checker phases pass `outputs=()`.
+
+What remains:
+- The single copy into `ArgValue::Buffer { bytes: Vec<u8> }`. A borrowed variant would remove it, and that is a contract change in `sched/mod.rs`.
+- The arena binding copy inside `run`.
+- In checker modes, the phase memo key `_input_digest` still SHA-256-hashes every input byte.
 
 ## Partitioning and the single-partition fallback (2026-10-08)
 

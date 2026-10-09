@@ -34,10 +34,5 @@ kda_backward_packed	synccheck	1	1.2527	1.3123	1.05	numsim/W2	yes	6ba4190
 deepgemm_sm100_m_grouped_fp8_gemm_contiguous	racecheck	8	2.1200	2.2093	1.04	scheduler/W2	yes	6ba4190
 kda_backward_packed	numsim	8	0.9051	0.9168	1.01	numsim/W2	yes	6ba4190
 mega_moe:medium	numsim	1	35.7297	36.0048	1.01	numsim/W2	no	6ba4190
-recurrent_kda_decode_one_warp (fork/join vs serial checker; legacy_s = serial)	racecheck	1	2.0700	2.4600	1.19	racecheck/W5	no	6cfabec
-recurrent_kda_decode_one_warp (fork/join vs serial checker; legacy_s = serial)	racecheck	32	1.5300	1.8200	1.19	racecheck/W5	no	6cfabec
-selective_state_update_stp_simple (fork/join vs serial checker; legacy_s = serial)	racecheck	1	0.2800	0.3300	1.18	racecheck/W5	no	6cfabec
-selective_state_update_stp_simple (fork/join vs serial checker; legacy_s = serial)	racecheck	32	0.1400	0.1600	1.14	racecheck/W5	no	6cfabec
-radix_topk_multi_cta (fork/join vs serial checker; legacy_s = serial; prof harness)	racecheck	1	20.3700	23.2300	1.14	racecheck/W5	no	6cfabec
-mega_moe:twenty_four_experts (fork/join vs serial checker; legacy_s = serial; prof harness)	racecheck	1	20.7100	23.2500	1.12	racecheck/W5	no	6cfabec
-gdn_decode_bf16_wide_vec_mtp (fork/join vs serial checker; legacy_s = serial)	racecheck	1	1.5400	1.6900	1.10	racecheck/W5	no	6cfabec
+recurrent_kda_decode_one_warp (fork/join vs serial checker; legacy_s = serial; prof harness, min of 3)	racecheck	32	1.1200	1.4200	1.27	racecheck/W5	no	bf0e9c6
+# retired at the FORK_JOIN default-on commit (HEAD bf0e9c6 + W5/W14 batch): the 6cfabec fork/join 1-worker rows (recurrent_kda_decode_one_warp, selective_state_update_stp_simple, radix_topk_multi_cta, mega_moe:twenty_four_experts, gdn_decode_bf16_wide_vec_mtp); since W5-17a (df280f3) no fork is offered at 1 worker, measured serial vs fork/join 0.98-1.03x (min of 3); stp w32 retired too (0.02 vs 0.01 s); kda w32 re-measured at bf0e9c6 and kept (1.27x)

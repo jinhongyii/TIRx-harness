@@ -801,6 +801,13 @@ pub struct Checker {
     dedup: HashMap<(AllocId, RaceClass, SiteId, SiteId, bool), usize>,
     /// Run the collectors every this many events (0 = never).
     pub gc_every: u64,
+    /// Threads for the collector's per-allocation shadow walk and
+    /// declared-word scan (racecheck-parallel-design.md §15; 1 = inline).
+    /// A run-time parameter only: it never changes a result.
+    pub gc_threads: usize,
+    /// Live shadow cells below which the walk stays inline (0 = always
+    /// parallel when `gc_threads > 1`; tests force it).
+    pub gc_par_min_cells: usize,
     /// Stop recording new findings after this many (0 = unlimited).
     pub max_findings: usize,
     /// The mbarrier arrive/wait scope is assumed (`.cta`, the PTX default)
@@ -949,6 +956,8 @@ impl Checker {
             report: Report::default(),
             dedup: HashMap::new(),
             gc_every: 1 << 14,
+            gc_threads: 1,
+            gc_par_min_cells: GC_PAR_MIN_CELLS,
             max_findings: 0,
             mbarrier_scope_assumed: false,
             dropped_findings: 0,
@@ -1058,7 +1067,13 @@ impl Checker {
     pub fn finish(mut self) -> Report {
         self.finalize();
         self.stats.wide_spans = self.wide_span_count();
-        self.report
+        let report = std::mem::take(&mut self.report);
+        // The launch's shadow and clocks are freed off the critical path
+        // (0.3-0.4 s on mega_moe e24, §15); nothing reads them any more.
+        if self.gc_threads > 1 {
+            std::thread::spawn(move || drop(self));
+        }
+        report
     }
 
     pub fn warp_done(&mut self, w: WarpId) {
@@ -2908,67 +2923,67 @@ impl Checker {
         let any_global = global_meet.is_some();
         let cluster_meet: Vec<Option<Knowledge>> = cluster_meet.iter().map(|m| meet2(m, &async_meet)).collect();
         let ctas_per_cluster = self.topo.ctas_per_cluster.max(1);
-        // `None` meet with nobody live: nothing can access it any more.
-        let dead_in = |meet: &Option<Knowledge>, live: bool, w: &Witness, pcs: &[Proxy]| match meet {
-            None => !live,
-            Some(m) => pcs.iter().all(|pc| m.view(select_view(w.proxy(), *pc, w.domain())).observes(w.stamp, w.lane())),
+        // The shadow walk is per allocation and reads only the meets, so it
+        // runs on `gc_threads` threads (§15). The merge (retired count,
+        // per-actor min epoch, live actors) is order-free; the folds into
+        // the retired summary decode witnesses through `self` (whose memo is
+        // not `Sync`), so they run afterwards, per allocation, in the
+        // allocation map's order as before.
+        let mut allocs = std::mem::take(&mut self.allocs);
+        let total_cells: usize = allocs.values().map(|a| a.shadow.len()).sum();
+        let async_live = async_meet.is_some();
+        let jobs: Vec<(&mut Alloc, &Option<Knowledge>, bool)> = allocs
+            .values_mut()
+            .map(|alloc| match alloc.space {
+                Space::Shared | Space::Tmem => {
+                    let cl = ((alloc.cta / ctas_per_cluster) as usize).min(ncl - 1);
+                    (alloc, &cluster_meet[cl], any_live[cl] || async_live)
+                }
+                _ => (alloc, &global_meet, any_global),
+            })
+            .collect();
+        let threads = if total_cells >= self.gc_par_min_cells { self.gc_threads.min(jobs.len()).max(1) } else { 1 };
+        let outs: Vec<(&mut Alloc, GcWalk)> = if threads <= 1 {
+            jobs.into_iter().map(|(al, m, l)| {
+                let o = gc_walk(al, m, l);
+                (al, o)
+            }).collect()
+        } else {
+            let n = jobs.len();
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(jobs[i].0.shadow.len()));
+            let slots: Vec<std::sync::Mutex<Option<(&mut Alloc, &Option<Knowledge>, bool)>>> = jobs.into_iter().map(|j| std::sync::Mutex::new(Some(j))).collect();
+            let res: Vec<std::sync::Mutex<Option<(&mut Alloc, GcWalk)>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|sc| {
+                let work = || loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= n {
+                        break;
+                    }
+                    let i = order[k];
+                    let (al, m, l) = slots[i].lock().unwrap().take().unwrap();
+                    let o = gc_walk(al, m, l);
+                    *res[i].lock().unwrap() = Some((al, o));
+                };
+                for _ in 1..threads {
+                    sc.spawn(work);
+                }
+                work();
+            });
+            res.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
         };
         let mut retired = 0u64;
         let mut live_actors: HashSet<ActorId> = HashSet::new();
         let mut min_epoch: HashMap<ActorId, Epoch> = HashMap::new();
-        let mut allocs = std::mem::take(&mut self.allocs);
-        let total_cells: usize = allocs.values().map(|a| a.shadow.len()).sum();
-        for alloc in allocs.values_mut() {
-            let (space, seen) = (alloc.space, alloc.seen);
-            let (meet, live) = match space {
-                Space::Shared | Space::Tmem => {
-                    let cl = ((alloc.cta / ctas_per_cluster) as usize).min(ncl - 1);
-                    (&cluster_meet[cl], any_live[cl] || async_meet.is_some())
-                }
-                _ => (&global_meet, any_global),
-            };
-            let seen_proxies: Vec<Proxy> =
-                [Proxy::Async, Proxy::TensorMap, Proxy::ReadOnly, Proxy::Tcgen].into_iter().filter(|p| seen & proxy_bit(*p) != 0).collect();
-            let fully_dead = |w: &Witness| dead_in(meet, live, w, future_proxies(space));
-            let same_proxy_dead = |w: &Witness| dead_in(meet, live, w, &[w.proxy()]);
-            let dead_in_seen = |w: &Witness| dead_in(meet, live, w, &seen_proxies);
-            let mut folded: Vec<Witness> = Vec::new();
-            alloc.shadow.retain_mut(|cell| {
-                let last = cell.writes.last().map(|e| e.w);
-                // Decide per witness: drop (dead in every view), fold into the
-                // retired-generic summary (dead in every view of a proxy that
-                // already accessed the allocation; the summary answers for the
-                // others), or keep.
-                let mut decide = |w: &Witness, pinned: bool| -> bool {
-                    if pinned {
-                        return true;
-                    }
-                    if fully_dead(w) {
-                        retired += 1;
-                        return false;
-                    }
-                    // Async-actor stamps may be summarised too: once every
-                    // live actor's hb observes them, any view carrying a
-                    // later generation of the slot was snapshotted after
-                    // that, so it observes the old stamp as well.
-                    if w.proxy() == Proxy::Generic && space != Space::Tmem && same_proxy_dead(w) && dead_in_seen(w) {
-                        folded.push(*w);
-                        retired += 1;
-                        return false;
-                    }
-                    true
-                };
-                // Keep the latest write while it carries release heads: a
-                // future reader that reads from it needs them.
-                cell.writes.retain(|e| decide(&e.w, Some(e.w) == last && e.rel.is_some()));
-                cell.reads.retain(|e| decide(&e.w, false));
-                for e in cell.writes.as_slice().iter().chain(cell.reads.as_slice()) {
-                    live_actors.insert(e.w.stamp.actor());
-                    let m = min_epoch.entry(e.w.stamp.actor()).or_insert(u32::MAX);
-                    *m = (*m).min(e.w.stamp.epoch());
-                }
-                !cell.is_empty()
-            });
+        for (alloc, out) in outs {
+            let GcWalk { retired: r, folded, min_epoch: me } = out;
+            retired += r;
+            for (actor, e) in me {
+                live_actors.insert(actor);
+                let m = min_epoch.entry(actor).or_insert(u32::MAX);
+                *m = (*m).min(e);
+            }
             for w in folded {
                 let info = self.info(&w, &alloc.wide);
                 let (lo, hi) = w.span(&alloc.wide);
@@ -2998,23 +3013,29 @@ impl Checker {
         // already holds adds nothing when acquired; drop the payload, keep
         // the index (verdict bitsets index absolute positions).
         if let Some(m) = &global_meet {
-            for words in self.words.values_mut() {
-                for word in words.list.iter_mut() {
-                    for e in word.history.iter_mut() {
-                        let useless = e.rel.as_ref().is_some_and(|h| {
-                            h.iter().all(|r| {
-                                r.k.hb.leq(&m.hb, &self.memo)
-                                    && (0..NDOM).all(|d| r.k.g2a[d].leq(&m.g2a[d], &self.memo) && r.k.a2g[d].leq(&m.a2g[d], &self.memo))
-                                    && r.k.tcgen_rel.is_empty()
-                                    && r.k.tmap_rel.is_none()
-                            })
-                        });
-                        if useless {
-                            e.rel = None;
-                            e.consumed = true;
-                        }
-                    }
+            // Per history entry, independent (§15); `leq` never touches the
+            // memo. Only entries still carrying a payload are tested.
+            let mut list: Vec<&mut HistEntry> =
+                self.words.values_mut().flat_map(|ws| ws.list.iter_mut()).flat_map(|w| w.history.iter_mut()).filter(|e| e.rel.is_some()).collect();
+            let threads = if list.len() >= self.gc_par_min_cells.min(GC_PAR_MIN_ENTRIES) { self.gc_threads.min(list.len()).max(1) } else { 1 };
+            if threads <= 1 {
+                for e in list.iter_mut() {
+                    gc_hist(e, m);
                 }
+            } else {
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let cells: Vec<std::sync::Mutex<&mut &mut HistEntry>> = list.iter_mut().map(std::sync::Mutex::new).collect();
+                std::thread::scope(|sc| {
+                    let work = || loop {
+                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(c) = cells.get(k) else { break };
+                        gc_hist(&mut c.lock().unwrap(), m);
+                    };
+                    for _ in 1..threads {
+                        sc.spawn(work);
+                    }
+                    work();
+                });
             }
         }
         // Async-slot reclaim: completed ops with no witness left.
@@ -3063,6 +3084,81 @@ impl Checker {
             }
         }
     }
+}
+
+/// Below this many live cells the GC walk stays on the calling thread.
+pub const GC_PAR_MIN_CELLS: usize = 1 << 14;
+/// Below this many payload-carrying history entries the word scan stays
+/// on the calling thread.
+const GC_PAR_MIN_ENTRIES: usize = 32;
+
+/// Drop a declared-word history entry's release payload when every live actor
+/// already holds (the declared-word part of `gc`).
+fn gc_hist(e: &mut HistEntry, m: &Knowledge) {
+    let memo = JoinMemo::default(); // unused by `leq`
+    let useless = e.rel.as_ref().is_some_and(|h| {
+        h.iter().all(|r| {
+            r.k.hb.leq(&m.hb, &memo)
+                && (0..NDOM).all(|d| r.k.g2a[d].leq(&m.g2a[d], &memo) && r.k.a2g[d].leq(&m.a2g[d], &memo))
+                && r.k.tcgen_rel.is_empty()
+                && r.k.tmap_rel.is_none()
+        })
+    });
+    if useless {
+        e.rel = None;
+        e.consumed = true;
+    }
+}
+
+/// One allocation's GC walk result (§15).
+struct GcWalk {
+    retired: u64,
+    folded: Vec<Witness>,
+    /// Every actor a kept witness names, with its least kept epoch.
+    min_epoch: HashMap<ActorId, Epoch>,
+}
+
+/// The shadow walk of `gc` for one allocation: retire dead witnesses and
+/// collect the generic ones to fold into the retired summary. Reads only
+/// the meet, so allocations walk in parallel.
+fn gc_walk(alloc: &mut Alloc, meet: &Option<Knowledge>, live: bool) -> GcWalk {
+    // `None` meet with nobody live: nothing can access it any more.
+    let dead_in = |w: &Witness, pcs: &[Proxy]| match meet {
+        None => !live,
+        Some(m) => pcs.iter().all(|pc| m.view(select_view(w.proxy(), *pc, w.domain())).observes(w.stamp, w.lane())),
+    };
+    let (space, seen) = (alloc.space, alloc.seen);
+    let seen_proxies: Vec<Proxy> =
+        [Proxy::Async, Proxy::TensorMap, Proxy::ReadOnly, Proxy::Tcgen].into_iter().filter(|p| seen & proxy_bit(*p) != 0).collect();
+    let mut retired = 0u64;
+    let mut folded: Vec<Witness> = Vec::new();
+    let mut min_epoch: HashMap<ActorId, Epoch> = HashMap::new();
+    alloc.shadow.retain_mut(|cell| {
+        let last = cell.writes.last().map(|e| e.w);
+        let mut decide = |w: &Witness, pinned: bool| -> bool {
+            if pinned {
+                return true;
+            }
+            if dead_in(w, future_proxies(space)) {
+                retired += 1;
+                return false;
+            }
+            if w.proxy() == Proxy::Generic && space != Space::Tmem && dead_in(w, &[w.proxy()]) && dead_in(w, &seen_proxies) {
+                folded.push(*w);
+                retired += 1;
+                return false;
+            }
+            true
+        };
+        cell.writes.retain(|e| decide(&e.w, Some(e.w) == last && e.rel.is_some()));
+        cell.reads.retain(|e| decide(&e.w, false));
+        for e in cell.writes.as_slice().iter().chain(cell.reads.as_slice()) {
+            let m = min_epoch.entry(e.w.stamp.actor()).or_insert(u32::MAX);
+            *m = (*m).min(e.w.stamp.epoch());
+        }
+        !cell.is_empty()
+    });
+    GcWalk { retired, folded, min_epoch }
 }
 
 /// Cap of `Checker::gc_backoff`: an unproductive launch still collects at
