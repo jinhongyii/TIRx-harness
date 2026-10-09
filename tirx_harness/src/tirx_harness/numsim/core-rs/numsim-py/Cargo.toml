@@ -12,12 +12,22 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = []
+default = ["mimalloc"]
 python = ["dep:pyo3"]
 # Link mode for a loadable extension (no libpython link); only for the cdylib.
 extension-module = ["python", "pyo3/extension-module", "pyo3/abi3-py312"]
+# mimalloc as the global allocator of this crate's builds (default on; a build
+# without a C compiler uses `--no-default-features --features
+# extension-module` and keeps the system allocator). Per-thread heaps with
+# lock-free remote frees. Racecheck's checker partitions allocate and free
+# clock storage on every pool thread (and free what other threads
+# allocated); under glibc malloc that contended on arena locks (mega_moe e24
+# at 16 workers: children 16.6 s CPU with mimalloc vs 20.5 s with glibc
+# before the lane-entry change, 12.6 s vs 18.5 s after).
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 numsim-core = { path = "../numsim-core" }
 serde_json.workspace = true
 pyo3 = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }

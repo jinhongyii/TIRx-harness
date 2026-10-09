@@ -22,7 +22,7 @@ use std::sync::Arc;
 use super::cell::{effective_heads, overlap, Cell, Entry, WideSpans, Witness};
 use super::clock::{ActorId, Clock, Epoch, JoinMemo, LaneVec, Stamp};
 use super::input::*;
-use super::knowledge::{fence_domains, join_tmap, select_view, Heads, Knowledge, Rel, View, NDOM};
+use super::knowledge::{fence_domains, join_tmap, select_view, HeadList, Heads, Knowledge, Rel, View, NDOM};
 use super::shadow::IntervalShadow;
 
 mod partition;
@@ -1858,11 +1858,7 @@ impl Checker {
                     let rel = match (&base, &own_rel) {
                         (None, None) => None,
                         (Some(b), None) => Some(b.clone()),
-                        (b, Some(own)) => {
-                            let mut v: Vec<Arc<Rel>> = b.as_ref().map(|b| b.to_vec()).unwrap_or_default();
-                            v.push(own.clone());
-                            Some(Arc::new(v))
-                        }
+                        (b, Some(own)) => Some(HeadList::extend(b.as_ref(), own, &this.memo)),
                     };
                     for (i, pt, exact) in &word_points {
                         if seg.start <= *pt && *pt < seg.end {
@@ -1954,9 +1950,26 @@ impl Checker {
             // `red` never forms an acquire pattern (PTX §8.8).
             let can_acquire = kind != AccessKind::Rmw || returns_value;
             for heads in acquired {
+                // An acquire at `.gpu` or wider takes the joined `.gpu`
+                // heads at once (`HeadList`); the rest one by one.
+                let joined = can_acquire
+                    && super::tuning::on(&super::tuning::JOINED_HEADS)
+                    && matches!(order, MemOrder::Acquire | MemOrder::AcqRel)
+                    && scope.is_some_and(|s| s >= Scope::Gpu);
+                if joined {
+                    if let Some(k) = heads.gpu() {
+                        let memo = &self.memo;
+                        let w = &mut self.warps[wi];
+                        w.tcgen_in[lane as usize].join(&k.tcgen_rel, memo);
+                        w.acquire(one_lane(lane), k, memo);
+                    }
+                }
                 for rel in heads.iter() {
                     if !can_acquire {
                         continue; // `red` observes nothing, tcgen included
+                    }
+                    if joined && HeadList::wide(rel) {
+                        continue;
                     }
                     self.warps[wi].tcgen_in[lane as usize].join(&rel.k.tcgen_rel, &self.memo);
                     match order {
@@ -2911,8 +2924,24 @@ impl Checker {
             }
             return;
         };
+        self.acquire_heads(warp, lanes, scope, &heads, site);
+    }
+
+    /// Acquire every head of `heads` (each scope-checked), the joined
+    /// `.gpu`-or-wider heads at once when `my_scope` is `.gpu` or wider.
+    fn acquire_heads(&mut self, me: WarpId, lanes: LaneMask, my_scope: Scope, heads: &Heads, acq_site: SiteId) {
+        let joined = my_scope >= Scope::Gpu && super::tuning::on(&super::tuning::JOINED_HEADS);
+        if joined {
+            if let Some(k) = heads.gpu() {
+                let memo = &self.memo;
+                self.warps[me as usize].acquire(lanes, k, memo);
+            }
+        }
         for rel in heads.iter() {
-            self.acquire_rel(warp, lanes, scope, rel, site);
+            if joined && HeadList::wide(rel) {
+                continue;
+            }
+            self.acquire_rel(me, lanes, my_scope, rel, acq_site);
         }
     }
 

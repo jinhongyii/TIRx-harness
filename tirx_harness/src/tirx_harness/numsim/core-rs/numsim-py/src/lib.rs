@@ -14,6 +14,12 @@
 
 pub use numsim_core;
 
+/// The extension's global allocator (feature `mimalloc`, default on; see
+/// numsim-py/Cargo.toml). `numsim-core` itself stays allocator-agnostic.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use numsim_core::arena::{BitSet, ValidityPolicy};
 use numsim_core::interp::ExecError;
 use numsim_core::observe::{Access, CtaId, LaunchInfo, NoopObserver, Observer, RecordingObserver, SyncEvent, WarpEnd, WarpId};

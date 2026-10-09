@@ -76,7 +76,82 @@ pub fn join_tmap(a: &mut TmapHeads, b: &TmapHeads, memo: &JoinMemo) {
 /// The release heads a write carries: its own head plus the heads it
 /// inherits through an observation-order chain of morally strong atomics
 /// (PTX §8.9.2). Each head is scope-checked against the acquirer on its own.
-pub type Heads = std::sync::Arc<Vec<std::sync::Arc<Rel>>>;
+pub type Heads = std::sync::Arc<HeadList>;
+
+/// A head list plus the join of its `.gpu`-or-wider heads.
+///
+/// An RMW chain on a counter (a grid-wide arrival count) inherits every
+/// earlier RMW's head, so a list grows by one head per RMW, and an acquirer
+/// joined each head on its own: on mega_moe e24, 2.8K waits joined ~88 heads
+/// each, 59% of the checker's time. A head released at `.gpu` or wider
+/// passes the scope check of every acquirer whose own scope is `.gpu` or
+/// wider (`required_scope` never exceeds `.gpu` within a launch), so for
+/// such an acquirer those heads act as one payload: `gpu` is their join,
+/// built incrementally as the chain grows (one join per RMW). The join is a
+/// lattice join, so acquiring `gpu` gives the same clock values as acquiring
+/// each of those heads in turn.
+#[derive(Debug)]
+pub struct HeadList {
+    rels: Vec<std::sync::Arc<Rel>>,
+    /// Join of the acquire-relevant parts (`hb`, bridges, `tcgen_rel`,
+    /// `tmap_rel`) of every head with `scope >= Gpu`; `None` if there is none.
+    gpu: Option<std::sync::Arc<Knowledge>>,
+}
+
+impl std::ops::Deref for HeadList {
+    type Target = [std::sync::Arc<Rel>];
+    fn deref(&self) -> &Self::Target {
+        &self.rels
+    }
+}
+
+impl HeadList {
+    /// Does `rel` belong to the joined `.gpu`-or-wider class?
+    #[inline]
+    pub fn wide(rel: &Rel) -> bool {
+        rel.scope.is_some_and(|s| s >= Scope::Gpu)
+    }
+
+    /// `base`'s heads followed by `own`.
+    pub fn extend(base: Option<&Heads>, own: &std::sync::Arc<Rel>, memo: &JoinMemo) -> Heads {
+        let mut rels: Vec<std::sync::Arc<Rel>> = base.map(|b| b.rels.clone()).unwrap_or_default();
+        rels.push(own.clone());
+        let prior = base.and_then(|b| b.gpu.clone());
+        let gpu = if Self::wide(own) {
+            Some(std::sync::Arc::new(match prior {
+                None => acquire_part(&own.k),
+                Some(p) => {
+                    let mut k = (*p).clone();
+                    join_acquire_part(&mut k, &own.k, memo);
+                    k
+                }
+            }))
+        } else {
+            prior
+        };
+        std::sync::Arc::new(HeadList { rels, gpu })
+    }
+
+    /// The joined `.gpu`-or-wider heads (see the type doc).
+    pub fn gpu(&self) -> Option<&Knowledge> {
+        self.gpu.as_deref()
+    }
+}
+
+/// The parts of a payload an acquire reads (`Warp::acquire`).
+fn acquire_part(k: &Knowledge) -> Knowledge {
+    Knowledge { hb: k.hb.clone(), g2a: k.g2a.clone(), a2g: k.a2g.clone(), tcgen_rel: k.tcgen_rel.clone(), tmap_rel: k.tmap_rel.clone(), ..Default::default() }
+}
+
+fn join_acquire_part(x: &mut Knowledge, k: &Knowledge, memo: &JoinMemo) {
+    x.hb.join(&k.hb, memo);
+    for d in 0..NDOM {
+        x.g2a[d].join(&k.g2a[d], memo);
+        x.a2g[d].join(&k.a2g[d], memo);
+    }
+    x.tcgen_rel.join(&k.tcgen_rel, memo);
+    join_tmap(&mut x.tmap_rel, &k.tmap_rel, memo);
+}
 
 /// A release payload stored with a write (or a fence-release head).
 #[derive(Clone, Debug)]

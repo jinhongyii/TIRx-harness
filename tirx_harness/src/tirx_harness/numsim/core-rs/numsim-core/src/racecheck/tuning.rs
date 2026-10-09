@@ -25,6 +25,7 @@ switches! {
     FRONTIER_EVICTION: "Single witness per actor: a recent frontier entry (newest EVICT_WINDOW) the new witness subsumes and observes is evicted.",
     ASYNC_SPAN_MERGE: "Coalesce touching weak spans of one async lane before the checker.",
     ADAPTIVE_GC: "GC period scaled to twice the live shadow cells.",
+    JOINED_HEADS: "An acquire at .gpu or wider takes the joined .gpu-or-wider release heads of an RMW chain at once (knowledge::HeadList) instead of one join per head.",
     GC_BACKOFF: "GC period doubled (up to 16x) after a collection that retired under 1/64 of the cells it walked and reclaimed under a quarter of the live async slots.",
 }
 

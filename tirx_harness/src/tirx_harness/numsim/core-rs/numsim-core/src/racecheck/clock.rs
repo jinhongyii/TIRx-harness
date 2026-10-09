@@ -436,65 +436,119 @@ impl Epochs {
 /// An entry dominated by the scalar component is dropped.
 pub type LaneVec = [Epoch; 32];
 
-/// log2 of the actors per lane block.
+/// log2 of the actors per lane block. A block covers exactly the actors of
+/// one scalar chunk, so a block's entries can only become dominated when that
+/// chunk changes.
 const LBLK_SHIFT: u32 = 5;
+const _: () = assert!(1 << LBLK_SHIFT == CHUNK);
 
-/// One block's entries, sorted by actor. Each lane vector is shared (`Arc`):
-/// clocks that learned a warp's lanes from the same release share it, so
-/// joins compare pointers and a rebuild copies 16 bytes per entry.
-type LaneBlock = Vec<(ActorId, Arc<LaneVec>)>;
+/// Lane blocks per lane group: the second level of [`Lanes`].
+const LGROUP: usize = 16;
 
-/// Lane entries in shared blocks of `1 << LBLK_SHIFT` actors. With hundreds
-/// of lane-precise warps (elected-lane arrives and releases in persistent
-/// kernels) a flat list made every acquire that learned one new lane vector
-/// rebuild the whole list; with blocks a join skips pointer-equal blocks and
-/// rebuilds only the blocks it changes plus the top slice.
+/// One warp's lane-precise components, stored inline with their maximum.
+///
+/// The vector is a plain value: a block rebuild copies entries instead of
+/// bumping a shared reference count. Lane entries are learned from release
+/// payloads that every checker partition of a phase reads, so a shared
+/// count turned each rebuild into cross-core cache-line traffic (mega_moe
+/// e24: 59% of the children's time at 16 workers was lane code, against 36%
+/// at one worker). `max` makes the "dominated by the scalar" test O(1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LaneEntry {
+    actor: ActorId,
+    max: Epoch,
+    v: LaneVec,
+}
+
+impl LaneEntry {
+    #[inline]
+    fn new(actor: ActorId, v: LaneVec) -> LaneEntry {
+        LaneEntry { actor, max: *v.iter().max().unwrap(), v }
+    }
+}
+
+/// One block's entries (actors `bi << LBLK_SHIFT ..`), sorted by actor.
+type LaneBlock = Vec<LaneEntry>;
+
+/// `LGROUP` block slots (`None` = no entries), shared between clocks.
+type LaneGroup = [Option<Arc<LaneBlock>>; LGROUP];
+
+const EMPTY_LANE_GROUP: LaneGroup = [const { None }; LGROUP];
+
+/// Lane entries in shared blocks of `1 << LBLK_SHIFT` actors, two levels deep
+/// like [`Epochs`]. With hundreds of lane-precise warps (elected-lane arrives
+/// and releases in persistent kernels) a join that changes one block copies
+/// one group and the top slice, never every block; a join skips
+/// pointer-equal groups and blocks.
 #[derive(Clone, Debug)]
 pub struct Lanes {
-    blocks: Arc<[Option<Arc<LaneBlock>>]>,
+    groups: Arc<[Option<Arc<LaneGroup>>]>,
 }
 
 impl Lanes {
     #[inline]
     fn block(&self, bi: usize) -> Option<&Arc<LaneBlock>> {
-        self.blocks.get(bi).and_then(|b| b.as_ref())
+        self.groups.get(bi / LGROUP)?.as_ref()?[bi % LGROUP].as_ref()
+    }
+
+    #[inline]
+    fn entry(&self, actor: ActorId) -> Option<&LaneEntry> {
+        let b = self.block((actor >> LBLK_SHIFT) as usize)?;
+        b.iter().find(|e| e.actor == actor)
     }
 
     #[inline]
     pub fn get(&self, actor: ActorId) -> Option<&LaneVec> {
-        let b = self.block((actor >> LBLK_SHIFT) as usize)?;
-        b.iter().find(|(a, _)| *a == actor).map(|(_, v)| &**v)
+        self.entry(actor).map(|e| &e.v)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &(ActorId, Arc<LaneVec>)> + '_ {
-        self.blocks.iter().flatten().flat_map(|b| b.iter())
+    pub fn iter(&self) -> impl Iterator<Item = (ActorId, &LaneVec)> + '_ {
+        self.blocks().flat_map(|(_, b)| b.iter().map(|e| (e.actor, &e.v)))
+    }
+
+    /// Every non-empty block: `(block index, block)`.
+    fn blocks(&self) -> impl Iterator<Item = (usize, &Arc<LaneBlock>)> + '_ {
+        self.groups
+            .iter()
+            .enumerate()
+            .filter_map(|(gi, g)| g.as_ref().map(|g| (gi, g)))
+            .flat_map(|(gi, g)| g.iter().enumerate().filter_map(move |(s, b)| b.as_ref().map(|b| (gi * LGROUP + s, b))))
     }
 
     pub fn len(&self) -> usize {
-        self.blocks.iter().flatten().map(|b| b.len()).sum()
+        self.blocks().map(|(_, b)| b.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.blocks.iter().all(|b| b.is_none())
+        self.blocks().next().is_none()
     }
 
     fn ptr_eq(&self, o: &Lanes) -> bool {
-        Arc::ptr_eq(&self.blocks, &o.blocks)
+        Arc::ptr_eq(&self.groups, &o.groups)
     }
 
-    /// Replace blocks; `None` result = no entries left.
+    /// Replace blocks (`repl` sorted by block index, each at most once);
+    /// `None` result = no entries left.
     fn with_blocks(cur: Option<&Lanes>, repl: Vec<(usize, Option<Arc<LaneBlock>>)>) -> Option<Lanes> {
-        let mut top: Vec<Option<Arc<LaneBlock>>> = cur.map(|l| l.blocks.to_vec()).unwrap_or_default();
-        for (bi, b) in repl {
-            if top.len() <= bi {
-                top.resize(bi + 1, None);
+        let mut top: Vec<Option<Arc<LaneGroup>>> = cur.map(|l| l.groups.to_vec()).unwrap_or_default();
+        let mut i = 0;
+        while i < repl.len() {
+            let gi = repl[i].0 / LGROUP;
+            if top.len() <= gi {
+                top.resize(gi + 1, None);
             }
-            top[bi] = b.filter(|b| !b.is_empty());
+            let mut g: LaneGroup = top[gi].as_deref().cloned().unwrap_or(EMPTY_LANE_GROUP);
+            while i < repl.len() && repl[i].0 / LGROUP == gi {
+                let (bi, b) = &repl[i];
+                g[bi % LGROUP] = b.clone().filter(|b| !b.is_empty());
+                i += 1;
+            }
+            top[gi] = g.iter().any(Option::is_some).then(|| Arc::new(g));
         }
         while matches!(top.last(), Some(None)) {
             top.pop();
         }
-        (!top.is_empty()).then(|| Lanes { blocks: top.into() })
+        (!top.is_empty()).then(|| Lanes { groups: top.into() })
     }
 }
 
@@ -559,16 +613,18 @@ impl Clock {
         }
         let bi = (actor >> LBLK_SHIFT) as usize;
         let mut b: LaneBlock = self.lanes.as_ref().and_then(|l| l.block(bi)).map(|b| (**b).clone()).unwrap_or_default();
-        match b.binary_search_by_key(&actor, |(x, _)| *x) {
+        match b.binary_search_by_key(&actor, |e| e.actor) {
             Ok(i) => {
-                for (s, n) in Arc::make_mut(&mut b[i].1).iter_mut().zip(v.iter()) {
+                let mut m = b[i].v;
+                for (s, n) in m.iter_mut().zip(v.iter()) {
                     *s = (*s).max(*n);
                 }
-                if b[i].1.iter().all(|e| *e <= scalar) {
+                b[i] = LaneEntry::new(actor, m);
+                if b[i].max <= scalar {
                     b.remove(i);
                 }
             }
-            Err(i) => b.insert(i, (actor, Arc::new(*v))),
+            Err(i) => b.insert(i, LaneEntry::new(actor, *v)),
         }
         self.lanes = Lanes::with_blocks(self.lanes.as_ref(), vec![(bi, Some(Arc::new(b)))]);
     }
@@ -579,8 +635,8 @@ impl Clock {
         let Some(l) = &self.lanes else { return };
         let bi = (actor >> LBLK_SHIFT) as usize;
         let Some(b) = l.block(bi) else { return };
-        if let Ok(i) = b.binary_search_by_key(&actor, |(x, _)| *x) {
-            if b[i].1.iter().all(|e| *e <= scalar) {
+        if let Ok(i) = b.binary_search_by_key(&actor, |e| e.actor) {
+            if b[i].max <= scalar {
                 let mut nb = (**b).clone();
                 nb.remove(i);
                 self.lanes = Lanes::with_blocks(Some(l), vec![(bi, Some(Arc::new(nb)))]);
@@ -588,93 +644,103 @@ impl Clock {
         }
     }
 
+    /// Does this clock already cover incoming entry `n` (given its own entry
+    /// for the actor, if any)?
+    #[inline]
+    fn covers_entry(&self, n: &LaneEntry, own: Option<&LaneEntry>) -> bool {
+        let scalar = self.epochs.get(n.actor);
+        if n.max <= scalar {
+            return true;
+        }
+        match own {
+            Some(o) if o.v == n.v => true,
+            Some(o) => n.v.iter().zip(o.v.iter()).all(|(e, m)| *e <= scalar || *e <= *m),
+            None => false,
+        }
+    }
+
     pub fn join(&mut self, other: &Clock, memo: &JoinMemo) -> bool {
+        // The scalar slice before the join (one reference), so the
+        // normalisation below revisits only blocks whose chunk changed.
+        let before = if self.lanes.is_some() { self.epochs.groups.clone() } else { None };
         let scalar_changed = self.epochs.join(&other.epochs, memo);
         let mut changed = scalar_changed;
         if let Some(ol) = &other.lanes {
             let same = matches!(&self.lanes, Some(sl) if sl.ptr_eq(ol));
             if !same {
                 let mut repl: Vec<(usize, Option<Arc<LaneBlock>>)> = Vec::new();
-                for (bi, ob) in ol.blocks.iter().enumerate() {
-                    let Some(ob) = ob else { continue };
-                    let mb = self.lanes.as_ref().and_then(|l| l.block(bi));
-                    if mb.is_some_and(|mb| Arc::ptr_eq(mb, ob)) {
+                for (gi, og) in ol.groups.iter().enumerate() {
+                    let Some(og) = og else { continue };
+                    let mg = self.lanes.as_ref().and_then(|l| l.groups.get(gi)).and_then(|g| g.as_ref());
+                    if mg.is_some_and(|mg| Arc::ptr_eq(mg, og)) {
                         continue;
                     }
-                    let mine: &[(ActorId, Arc<LaneVec>)] = mb.map_or(&[], |b| b.as_slice());
-                    // Which incoming entries this clock does not cover yet:
-                    // one merge walk, one scalar lookup per actor.
-                    let mut j = 0;
-                    let mut any = false;
-                    for (a, v) in ob.iter() {
-                        while j < mine.len() && mine[j].0 < *a {
-                            j += 1;
-                        }
-                        let scalar = self.epochs.get(*a);
-                        let known = match (j < mine.len() && mine[j].0 == *a).then(|| &mine[j].1) {
-                            Some(o) if Arc::ptr_eq(o, v) => true,
-                            Some(o) => v.iter().zip(o.iter()).all(|(e, m)| *e <= scalar || *e <= *m),
-                            None => v.iter().all(|e| *e <= scalar),
-                        };
-                        if !known {
-                            any = true;
-                            break;
-                        }
-                    }
-                    if !any {
-                        continue;
-                    }
-                    // Rebuild this block: merge, raise scalars to each new
-                    // vector's minimum (as `raise_lanes`), drop dominated.
-                    let mut out: LaneBlock = Vec::with_capacity(mine.len() + ob.len());
-                    let mut j = 0;
-                    for (a, v) in ob.iter() {
-                        while j < mine.len() && mine[j].0 < *a {
-                            out.push(mine[j].clone());
-                            j += 1;
-                        }
-                        let own = (j < mine.len() && mine[j].0 == *a).then(|| mine[j].1.clone());
-                        if own.is_some() {
-                            j += 1;
-                        }
-                        let scalar0 = self.epochs.get(*a);
-                        let known = match &own {
-                            Some(o) if Arc::ptr_eq(o, v) => true,
-                            Some(o) => v.iter().zip(o.iter()).all(|(e, m)| *e <= scalar0 || *e <= *m),
-                            None => v.iter().all(|e| *e <= scalar0),
-                        };
-                        if known {
-                            if let Some(o) = own {
-                                out.push((*a, o));
-                            }
+                    for (s, ob) in og.iter().enumerate() {
+                        let Some(ob) = ob else { continue };
+                        let bi = gi * LGROUP + s;
+                        let mb = mg.and_then(|g| g[s].as_ref());
+                        if mb.is_some_and(|mb| Arc::ptr_eq(mb, ob)) {
                             continue;
                         }
-                        let mut merged = v.clone();
-                        if let Some(o) = &own {
-                            if !v.iter().zip(o.iter()).all(|(n, p)| n >= p) {
-                                let m = Arc::make_mut(&mut merged);
-                                for (m, p) in m.iter_mut().zip(o.iter()) {
+                        let mine: &[LaneEntry] = mb.map_or(&[], |b| b.as_slice());
+                        // Which incoming entries this clock does not cover
+                        // yet: one merge walk, one scalar lookup per actor.
+                        let mut j = 0;
+                        let mut any = false;
+                        for n in ob.iter() {
+                            while j < mine.len() && mine[j].actor < n.actor {
+                                j += 1;
+                            }
+                            let own = (j < mine.len() && mine[j].actor == n.actor).then(|| &mine[j]);
+                            if !self.covers_entry(n, own) {
+                                any = true;
+                                break;
+                            }
+                        }
+                        if !any {
+                            continue;
+                        }
+                        // Rebuild this block: merge, raise scalars to each
+                        // new vector's minimum (as `raise_lanes`), drop
+                        // dominated entries.
+                        let mut out: LaneBlock = Vec::with_capacity(mine.len() + ob.len());
+                        let mut j = 0;
+                        for n in ob.iter() {
+                            while j < mine.len() && mine[j].actor < n.actor {
+                                out.push(mine[j]);
+                                j += 1;
+                            }
+                            let own = (j < mine.len() && mine[j].actor == n.actor).then(|| mine[j]);
+                            if own.is_some() {
+                                j += 1;
+                            }
+                            if self.covers_entry(n, own.as_ref()) {
+                                if let Some(o) = own {
+                                    out.push(o);
+                                }
+                                continue;
+                            }
+                            let mut merged = n.v;
+                            if let Some(o) = &own {
+                                for (m, p) in merged.iter_mut().zip(o.v.iter()) {
                                     *m = (*m).max(*p);
                                 }
                             }
+                            let min = *n.v.iter().min().unwrap();
+                            if min > 0 {
+                                self.epochs.raise(n.actor, min);
+                            }
+                            let scalar = self.epochs.get(n.actor);
+                            let e = LaneEntry::new(n.actor, merged);
+                            if e.max > scalar {
+                                out.push(e);
+                            }
                         }
-                        let min = *v.iter().min().unwrap();
-                        if min > 0 {
-                            self.epochs.raise(*a, min);
-                        }
-                        let scalar = self.epochs.get(*a);
-                        if !merged.iter().all(|e| *e <= scalar) {
-                            out.push((*a, merged));
-                        }
+                        out.extend_from_slice(&mine[j..]);
+                        changed = true;
+                        let nb = if out.as_slice() == ob.as_slice() { ob.clone() } else { Arc::new(out) };
+                        repl.push((bi, Some(nb)));
                     }
-                    out.extend_from_slice(&mine[j..]);
-                    changed = true;
-                    let nb = if out.len() == ob.len() && out.iter().zip(ob.iter()).all(|(x, y)| x.0 == y.0 && Arc::ptr_eq(&x.1, &y.1)) {
-                        ob.clone()
-                    } else {
-                        Arc::new(out)
-                    };
-                    repl.push((bi, Some(nb)));
                 }
                 if !repl.is_empty() {
                     self.lanes = Lanes::with_blocks(self.lanes.as_ref(), repl);
@@ -686,11 +752,22 @@ impl Clock {
             // was normalised by the rebuild itself).
             if let Some(l) = &self.lanes {
                 let epochs = &self.epochs;
+                let old = Epochs { groups: before };
                 let mut repl = Vec::new();
-                for (bi, b) in l.blocks.iter().enumerate() {
-                    let Some(b) = b else { continue };
-                    if b.iter().any(|(a, v)| v.iter().all(|e| *e <= epochs.get(*a))) {
-                        let nb: LaneBlock = b.iter().filter(|(a, v)| !v.iter().all(|e| *e <= epochs.get(*a))).cloned().collect();
+                for (bi, b) in l.blocks() {
+                    // Entries are normalised against the scalar before the
+                    // join; a block whose chunk (the same 32 actors) is
+                    // unchanged cannot have become dominated.
+                    let unchanged = match (old.chunk(bi), epochs.chunk(bi)) {
+                        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if unchanged {
+                        continue;
+                    }
+                    if b.iter().any(|e| e.max <= epochs.get(e.actor)) {
+                        let nb: LaneBlock = b.iter().filter(|e| e.max > epochs.get(e.actor)).copied().collect();
                         repl.push((bi, Some(Arc::new(nb))));
                     }
                 }
@@ -707,8 +784,8 @@ impl Clock {
         let mut out = Clock { epochs: self.epochs.map_chunks(|base, e| if keep(base) { e } else { 0 }), lanes: None };
         if let Some(l) = &self.lanes {
             for (a, v) in l.iter() {
-                if keep(*a) {
-                    out.raise_lanes(*a, v);
+                if keep(a) {
+                    out.raise_lanes(a, v);
                 }
             }
         }
@@ -731,10 +808,103 @@ impl Clock {
         match &self.lanes {
             None => true,
             Some(l) => l.iter().all(|(a, v)| {
-                v.iter().enumerate().all(|(lane, e)| other.observes(Stamp::new(*a, *e), lane as u8) || *e == 0)
+                v.iter().enumerate().all(|(lane, e)| other.observes(Stamp::new(a, *e), lane as u8) || *e == 0)
             }),
         }
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    /// Reference model: a clock is `K(actor, lane)`, joins are pointwise max.
+    #[derive(Clone)]
+    struct Model(Vec<[Epoch; 32]>);
+
+    impl Model {
+        fn k(&self, a: usize, l: usize) -> Epoch {
+            self.0[a][l]
+        }
+    }
+
+    fn agrees(c: &Clock, m: &Model) {
+        for a in 0..m.0.len() {
+            for l in 0..32 {
+                let k = m.k(a, l);
+                let s = |e: Epoch| Stamp::new(a as ActorId, e);
+                if k > 0 {
+                    assert!(c.observes(s(k), l as u8), "actor {a} lane {l}: misses {k}");
+                }
+                assert!(!c.observes(s(k + 1), l as u8), "actor {a} lane {l}: claims {}", k + 1);
+            }
+        }
+    }
+
+    /// Random raises, lane raises and joins over actors spanning several
+    /// chunks, lane blocks and lane groups, against the pointwise model.
+    #[test]
+    fn lanes_and_joins_match_the_pointwise_model() {
+        const ACTORS: usize = 1100; // > 2 lane groups of 512 actors
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let memo = JoinMemo::default();
+        let mut clocks: Vec<(Clock, Model)> = (0..6).map(|_| (Clock::default(), Model(vec![[0; 32]; ACTORS]))).collect();
+        for step in 0..4000 {
+            let i = rnd(clocks.len() as u64) as usize;
+            // A few hot actors so entries collide, plus the whole range.
+            let a = if rnd(2) == 0 { rnd(40) as usize * 29 % ACTORS } else { rnd(ACTORS as u64) as usize };
+            match rnd(4) {
+                0 => {
+                    let e = rnd(50) as Epoch + 1;
+                    let (c, m) = &mut clocks[i];
+                    c.raise(a as ActorId, e);
+                    for l in 0..32 {
+                        m.0[a][l] = m.0[a][l].max(e);
+                    }
+                }
+                1 | 2 => {
+                    let mut v = [0; 32];
+                    for x in v.iter_mut() {
+                        *x = rnd(50) as Epoch;
+                    }
+                    let (c, m) = &mut clocks[i];
+                    c.raise_lanes(a as ActorId, &v);
+                    for l in 0..32 {
+                        m.0[a][l] = m.0[a][l].max(v[l]);
+                    }
+                }
+                _ => {
+                    let j = rnd(clocks.len() as u64) as usize;
+                    let (oc, om) = clocks[j].clone();
+                    let (c, m) = &mut clocks[i];
+                    c.join(&oc, &memo);
+                    for (x, y) in m.0.iter_mut().zip(om.0.iter()) {
+                        for l in 0..32 {
+                            x[l] = x[l].max(y[l]);
+                        }
+                    }
+                }
+            }
+            if step % 500 == 499 {
+                for (c, m) in &clocks {
+                    agrees(c, m);
+                }
+            }
+        }
+        for (c, m) in &clocks {
+            agrees(c, m);
+            // No entry the scalar already covers is kept.
+            if let Some(l) = &c.lanes {
+                for (a, v) in l.iter() {
+                    assert!(v.iter().any(|e| *e > c.get(a)), "dominated entry kept for actor {a}");
+                }
+            }
+        }
+    }
+}

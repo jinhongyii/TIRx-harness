@@ -584,5 +584,56 @@ fn reattribution_tokens(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words, gc_backoff, shadow_slow_path, gc_parallel, reattribution_tokens);
+/// Joined release heads (`knowledge::HeadList`, `tuning::JOINED_HEADS`): `n`
+/// warps of different CTAs extend one RMW chain (`atom.acq_rel.gpu` on a
+/// global counter, so each write inherits every earlier head), then one warp
+/// acquires the chain head `READS` times (`ld.acquire.gpu`). Per head, every
+/// acquire joins `n` payloads; joined, one. The guard is the on/off ratio
+/// (mega_moe e24: 2.8K waits joined ~88 heads each, 4.2 ms per wait).
+fn joined_heads(c: &mut Criterion) {
+    use numsim_core::racecheck::tuning::JOINED_HEADS;
+    use std::sync::atomic::Ordering::Relaxed;
+    const READS: u32 = 256;
+    let mut g = c.benchmark_group("joined_heads");
+    g.sample_size(10);
+    for n in [64u32, 256] {
+        let topo = Topology { warps_per_cta: 1, ctas_per_cluster: 1, num_ctas: n + 1 };
+        let mut ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Global, size: 1 << 12, cta: 0 })];
+        let mut seq = 0u64;
+        let mut strong = |w: u32, e: u32, kind: AccessKind, order: MemOrder, atomic: bool| {
+            seq += 1;
+            Event::Access(Access {
+                seq,
+                who: Who::Lane { warp: w, lane: 0, epoch: e },
+                alloc: AllocId(1),
+                range: 0..4,
+                kind,
+                order,
+                scope: Some(Scope::Gpu),
+                atomic,
+                proxy: Proxy::Generic,
+                domain: Some(Domain::Global),
+                site: SiteId(7),
+                returns_value: true,
+                operand: 0,
+            })
+        };
+        for w in 0..n {
+            ev.push(strong(w, 1, AccessKind::Rmw, MemOrder::AcqRel, true));
+        }
+        for r in 0..READS {
+            ev.push(strong(n, 1 + r, AccessKind::Read, MemOrder::Acquire, false));
+        }
+        for on in [true, false] {
+            g.bench_function(BenchmarkId::new(format!("chain_{n}"), if on { "on" } else { "off" }), |b| {
+                JOINED_HEADS.store(on, Relaxed);
+                b.iter(|| black_box(Checker::run(topo, ev.iter().cloned())));
+                JOINED_HEADS.store(true, Relaxed);
+            });
+        }
+    }
+    g.finish();
+}
+
+criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words, gc_backoff, shadow_slow_path, gc_parallel, reattribution_tokens, joined_heads);
 criterion_main!(benches);
