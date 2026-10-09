@@ -933,6 +933,50 @@ The trade-off:
   - By min: 1.28x at 16 workers, 1.03x at 32. Large was 1.32x and 1.36x.
 - **Shared host:** pinned threads cannot leave busy cores. It therefore stays off by default, and CI never sets it (`dev-loop.md`).
 
+**Declined (final negative): L3-group-local stealing under `pin_workers` (W13, 2026-10-09).** Do not re-try without new data.
+
+The variant (scratch tree `w13/hgl/`, on 5d98955):
+- Each pinned participant knows its dense L3 group.
+- A partition's home is the group of the participant that ran it last round.
+- An idle participant takes, in order: its own sticky partitions, then partitions homed in its group, then anything else.
+- New partitions are homed either in blocks of partition index ("fill") or round-robin over the groups in use ("rr").
+
+Results do not change:
+- `every_scenario_is_pin_independent` passes under both homing variants.
+- Digests at 8 and 32 workers, with and without an observer, over every scenario and the 10 fixtures (including medium and e24), are identical to unpinned.
+
+Setup: `bench_backends.py mega`, wall and process CPU of the run call. 6 interleaved rounds of {unpinned, pinned global steal (5d98955), group-local fill, group-local rr} at 32 workers, 3 at 16 workers. Load was 3-12. Every run was `clean` and matched the reference. Min / median, with all 32-worker samples as wall s (process CPU s):
+
+| case | unpinned | pinned, global steal | group-local fill | group-local rr |
+|---|---|---|---|---|
+| medium 16 | 3.26 | 2.53 | 2.48 | 2.49 |
+| medium 32 | 3.58 / 3.94: 4.23 (50.0), 3.87 (48.7), 4.01 (47.7), 3.93 (44.5), 3.94 (46.4), 3.58 (40.4) | 2.40 / 3.75: 3.21 (34.1), 3.75 (44.1), 3.75 (43.9), 2.40 (27.3), 3.76 (44.1), 2.74 (30.2) | 2.41 / 3.47: 2.88 (31.1), 2.41 (27.2), 3.70 (43.3), 3.47 (39.7), 3.75 (44.1), 3.20 (33.8) | 2.32 / 3.50: 2.32 (26.2), 3.71 (43.5), 3.50 (38.5), 3.12 (34.2), 3.28 (35.3), 3.77 (43.9) |
+| large 16 | 5.84 | 4.43 | 4.27 | 4.34 |
+| large 32 | 7.44 / 8.46: 9.07 (114.1), 8.46 (105.0), 7.44 (90.5), 7.71 (93.9), 7.49 (91.9), 9.23 (122.8) | 4.21 / 5.89: 4.67 (53.9), 6.57 (77.9), 4.21 (48.9), 5.00 (57.1), 5.89 (67.0), 6.64 (79.8) | 5.67 / 6.56: 6.57 (78.6), 6.55 (79.3), 6.61 (79.8), 6.56 (79.4), 5.71 (65.3), 5.67 (61.2) | 4.24 / 6.41: 6.60 (79.7), 6.08 (70.8), 6.70 (80.3), 6.41 (75.6), 4.24 (48.7), 6.37 (75.7) |
+
+Max config (16-worker perf test, worker count overridden in scratch), one run each, load 4-15:
+
+| variant | 16 workers | 32 workers |
+|---|---|---|
+| Group-local rr | 129.3 s | 191.6 s |
+| Global steal | 132.8 s | 193.9 s |
+
+The 16-worker reference is 154.3 s unpinned at a4c7157.
+
+Reading:
+- **The bar is met only through the pinning that already landed.**
+  - Group-local rr over unpinned, by min at 32 workers: 1.54x on medium and 1.75x on large.
+  - Pinned global steal alone already gives 1.49x and 1.77x.
+  - Group-local over global steal: 1.03x on medium by min, 0.99x on large by min. By median it is slower on large: 6.41-6.56 s against 5.89 s.
+  - On the max config the gain is 1.03x at 16 workers and 1.01x at 32.
+- **The hypothesis fails.**
+  - All pinned variants are still bimodal at 32 workers: a fast mode (medium 2.3-2.9 s / 26-31 s CPU, large 4.2-5.0 s / 49-57 s) and a slow mode (medium 3.5-3.8 s / 39-44 s CPU, large 6.4-6.7 s / 76-80 s).
+  - Process CPU tracks wall in both modes, so the slow mode is CPU inflation that keeping partitions inside one L3 does not remove.
+  - Large at 32 does not beat large at 16 in any variant.
+- **Max config:** 32 workers is ~1.45x slower than 16 whether pinned or not.
+- **Open:** what selects the slow mode per run. It is not cross-group stealing. Candidates are run-to-run memory placement (NUMA node of first touch, transparent huge pages) and co-tenant load on the pinned cores. Both need hardware counters (`perf_event_paranoid` ≤ 2) or a dedicated host to separate.
+- **Not landed:** `pin_workers` keeps the global-steal sticky handout of 5d98955.
+
 ## Parked spin-loop replay: validated prototype, not landed (W13, 2026-10-09)
 
 **Why not landed.** The design below was implemented in scratch and validated. No corpus case parks on a spin loop in a way that matters: medium spends 0.1–0.3 s in re-polls, and the max config has 0 replays. The max config's re-polls are blocked retries at `mbar_wait` (107 M checks, most already applied by `BlockedWait`), `wait_until` (29.5 M) and `barrier` (19.1 M), with no parked loops. Landing would add a recorder and replayer to the interpreter for no corpus gain. It can be revived if a spinning kernel shows up.
