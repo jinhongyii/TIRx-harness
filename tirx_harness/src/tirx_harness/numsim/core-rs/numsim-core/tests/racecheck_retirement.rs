@@ -569,6 +569,7 @@ fn successor_scenario_reclaims_slots() {
 /// - Without `chain`, the producer waits only for its own TMA to land
 ///   (`full`), so the next TMA write is unordered with the consumer's reads
 ///   of the previous one: a real race.
+///
 /// The consumer fences `proxy.async` before arriving on `empty` (its stage
 /// reads are generic; the next write is async-proxy).
 fn tma_stage_pipeline(iters: u32, chain: bool) -> Scenario {
@@ -715,13 +716,12 @@ fn tma_stage_pipeline_src(iters: u32, chain: bool, fresh_src: bool) -> Scenario 
         mark_elect(&mut prog, e2);
     }
     let words = (iters * W_WORDS) as usize;
-    let s = Scenario {
+    Scenario {
         name: "tma_stage_pipeline",
         module: Module::new(vec![prog]),
         inputs: inputs(vec![("w", u32_buf(0..words as u32)), ("out", u32_buf(vec![0; words]))]),
         config: RunConfig { loop_budget: 1 << 40, ..RunConfig::default() },
-    };
-    s
+    }
 }
 
 fn site_named(s: &Scenario, op: &str) -> SiteId {
