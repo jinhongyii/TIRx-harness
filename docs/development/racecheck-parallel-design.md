@@ -1,8 +1,44 @@
-# Racecheck: parallel checker (planned project)
+# Racecheck: parallel checker
 
-Status: design only, not implemented. Owner: racecheck (W5). The current
-serial checker and the measurements that motivate this work are in
+Status: implemented and on by default since 5ca4877. Owner: racecheck (W5).
+The serial checker and the measurements that motivated this work are in
 `racecheck-semantics.md` § "Merge design and the serial-checker limit".
+
+**Racecheck performance status (2026-10-09, fe737cb).** The fork/join
+checker (§13–§14, `FORK_JOIN` on) and W14's parallel phase-end collector
+(§15.9) are on by default; the decision run is in §16. Findings are
+identical to the serial checker by construction and by test
+(`racecheck_parallel_review`, payload hashes on 7 fixtures at 1/8/16/32
+workers).
+
+`perf-same-verdict.md` listed three verdict-identical racecheck rows that
+were still more than 10% slower than legacy with the serial checker. They
+were re-measured on fe737cb with the default on, against the same build with
+`FORK_JOIN` off. Each value is the sum of the phases' `timing.run`
+(engine plus checker), min of 3 interleaved runs, at 1-minute load 5–13. The
+legacy column is copied from `perf-same-verdict.md`, since legacy can no
+longer be re-run.
+
+| case | workers | legacy | serial checker | fork/join (default) | fork/join vs legacy |
+| --- | --- | --- | --- | --- | --- |
+| `kda_decode_multishape` | 8 | 123 ms | 186 ms | 123 ms | 1.00x |
+| `kda_decode_multishape` | 32 | 129 ms | 188 ms | 123 ms | 1.05x faster |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 8 | 9.07 s | 10.05 s | 7.31 s | 1.24x faster |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 32 | 6.71 s | 8.93 s | 6.18 s | 1.09x faster |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 8 | 110 ms | 150 ms | 134 ms | 1.22x slower |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 32 | 108 ms | 151 ms | 143 ms | 1.32x slower |
+
+At 1 worker the two arms are equal (no fork is offered): kda 199 vs 201 ms,
+gemm_proj_rope 14.79 vs 14.85 s, swiglu quant 130 vs 130 ms. Every verdict is
+clean in both arms.
+
+What remains:
+- The swiglu-quant case is still 22–32% slower than legacy, about 25–35 ms in
+  absolute terms. Fork/join gains only 1.05–1.12x there.
+- mega_moe racecheck: e24 7.68 s (6.50 s with the parallel collector)
+  against legacy 2.7 s, and medium 1433 s end to end. The verdicts differ
+  from legacy (racecheck B7), and the remaining growth term is clock width
+  (§16).
 
 ## 1. Problem
 
