@@ -12,6 +12,7 @@
 //! only, with the generic path's messages.
 
 use super::super::{OpError, OpResult};
+use numsim_oplib::scalar::det;
 use crate::dtype::{Dtype, Ty};
 use crate::program::{BinOp, CmpOp, Rounding, TerOp, UnOp};
 use crate::value::{WarpMask, WarpValue};
@@ -323,10 +324,10 @@ pub(super) fn unary(op: UnOp, ty: Ty, a: &[W], out: &mut [W], mask: WarpMask) ->
         (Dtype::F32, UnOp::Neg) => map1::<u32, u32>(a, out, mask, |x| x ^ 0x8000_0000),
         (Dtype::F32, UnOp::Abs) => map1::<u32, u32>(a, out, mask, |x| x & 0x7fff_ffff),
         (Dtype::F32, UnOp::Sqrt) => map1::<f32, f32>(a, out, mask, f32::sqrt),
-        (Dtype::F32, UnOp::Exp) => map1::<f32, f32>(a, out, mask, f32::exp),
-        (Dtype::F32, UnOp::Exp2) => map1::<f32, f32>(a, out, mask, f32::exp2),
-        (Dtype::F32, UnOp::Log) => map1::<f32, f32>(a, out, mask, f32::ln),
-        (Dtype::F32, UnOp::Log2) => map1::<f32, f32>(a, out, mask, f32::log2),
+        (Dtype::F32, UnOp::Exp) => map1::<f32, f32>(a, out, mask, det::exp_f32),
+        (Dtype::F32, UnOp::Exp2) => map1::<f32, f32>(a, out, mask, det::exp2_f32),
+        (Dtype::F32, UnOp::Log) => map1::<f32, f32>(a, out, mask, det::ln_f32),
+        (Dtype::F32, UnOp::Log2) => map1::<f32, f32>(a, out, mask, det::log2_f32),
         (Dtype::F32, UnOp::Rsqrt) => map1::<f32, f32>(a, out, mask, |x| 1.0_f32 / x.sqrt()),
         (Dtype::F64, UnOp::Neg) => map1::<u64, u64>(a, out, mask, |x| x ^ (1 << 63)),
         (Dtype::F64, UnOp::Abs) => map1::<u64, u64>(a, out, mask, |x| x & !(1 << 63)),

@@ -5,6 +5,7 @@
 //! `round` (directed-rounding f32/f64 arithmetic, sqrt, div, fma).
 //! Conversions (`cvt`) and packed lane helpers live in `crate::cvt`.
 
+pub mod det;
 mod exact;
 mod low;
 mod math;

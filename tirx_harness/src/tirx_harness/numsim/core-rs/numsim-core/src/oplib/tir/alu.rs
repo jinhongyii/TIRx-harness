@@ -9,8 +9,10 @@
 //!   widening then wrapped back, unsigned `checked_*`); shifts are Rust
 //!   `wrapping_shl/shr` (count taken modulo the width), `Shr` arithmetic for
 //!   signed; `Min/Max` ordered by signedness.
-//! * f32/f64: host IEEE round-to-nearest operators and std math methods
-//!   (`.exp() .ln() .log2()`, `rsqrt = 1/sqrt`, `Round` = C `roundf`,
+//! * f32/f64: host IEEE round-to-nearest operators; `exp exp2 ln log2 sin
+//!   cos tanh pow atan2` from the pure-Rust `libm` crate
+//!   (`numsim_oplib::scalar::det`, delta D14: std would call the host's C
+//!   library); `rsqrt = 1/sqrt`, `Round` = C `roundf`,
 //!   ties away). `Min/Max` = `cuda_f32_min/max` / `cuda_f64_min/max`
 //!   (NaN-ignoring, -0 < +0: device `min.f32/.f64`, which is also what the
 //!   legacy tile reductions used; legacy scalar TIR f64 used Rust
@@ -25,6 +27,7 @@
 use super::super::{OpError, OpResult};
 use super::convert::decode_f64;
 use super::elem::{int_value, mask128};
+use numsim_oplib::scalar::det;
 use crate::dtype::Dtype;
 use crate::program::{BinOp, CmpOp, TerOp, UnOp};
 use numsim_oplib::cvt;
@@ -77,13 +80,13 @@ fn f32_unary(op: UnOp, x: f32) -> Option<f32> {
         UnOp::Abs => x.abs(),
         UnOp::Sqrt => x.sqrt(),
         UnOp::Rsqrt => 1.0_f32 / x.sqrt(),
-        UnOp::Exp => x.exp(),
-        UnOp::Exp2 => x.exp2(),
-        UnOp::Log => x.ln(),
-        UnOp::Log2 => x.log2(),
-        UnOp::Sin => x.sin(),
-        UnOp::Cos => x.cos(),
-        UnOp::Tanh => x.tanh(),
+        UnOp::Exp => det::exp_f32(x),
+        UnOp::Exp2 => det::exp2_f32(x),
+        UnOp::Log => det::ln_f32(x),
+        UnOp::Log2 => det::log2_f32(x),
+        UnOp::Sin => det::sin_f32(x),
+        UnOp::Cos => det::cos_f32(x),
+        UnOp::Tanh => det::tanh_f32(x),
         UnOp::Floor => x.floor(),
         UnOp::Ceil => x.ceil(),
         UnOp::Round => x.round(),
@@ -99,13 +102,13 @@ fn f64_unary(op: UnOp, x: f64) -> Option<f64> {
         UnOp::Abs => x.abs(),
         UnOp::Sqrt => x.sqrt(),
         UnOp::Rsqrt => 1.0_f64 / x.sqrt(),
-        UnOp::Exp => x.exp(),
-        UnOp::Exp2 => x.exp2(),
-        UnOp::Log => x.ln(),
-        UnOp::Log2 => x.log2(),
-        UnOp::Sin => x.sin(),
-        UnOp::Cos => x.cos(),
-        UnOp::Tanh => x.tanh(),
+        UnOp::Exp => det::exp_f64(x),
+        UnOp::Exp2 => det::exp2_f64(x),
+        UnOp::Log => det::ln_f64(x),
+        UnOp::Log2 => det::log2_f64(x),
+        UnOp::Sin => det::sin_f64(x),
+        UnOp::Cos => det::cos_f64(x),
+        UnOp::Tanh => det::tanh_f64(x),
         UnOp::Floor => x.floor(),
         UnOp::Ceil => x.ceil(),
         UnOp::Round => x.round(),
@@ -189,8 +192,8 @@ fn f32_binary(op: BinOp, a: f32, b: f32) -> Option<f32> {
         BinOp::Div => sc::pin_nan2_f32(a, b, a / b),
         BinOp::Min => sc::cuda_f32_min(a, b),
         BinOp::Max => sc::cuda_f32_max(a, b),
-        BinOp::Pow => a.powf(b),
-        BinOp::Atan2 => a.atan2(b),
+        BinOp::Pow => det::pow_f32(a, b),
+        BinOp::Atan2 => det::atan2_f32(a, b),
         BinOp::Copysign => a.copysign(b),
         _ => return None,
     })
@@ -205,8 +208,8 @@ fn f64_binary(op: BinOp, a: f64, b: f64) -> Option<f64> {
         BinOp::Div => sc::pin_nan2_f64(a, b, a / b),
         BinOp::Min => sc::cuda_f64_min(a, b),
         BinOp::Max => sc::cuda_f64_max(a, b),
-        BinOp::Pow => a.powf(b),
-        BinOp::Atan2 => a.atan2(b),
+        BinOp::Pow => det::pow_f64(a, b),
+        BinOp::Atan2 => det::atan2_f64(a, b),
         BinOp::Copysign => a.copysign(b),
         _ => return None,
     })

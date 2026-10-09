@@ -32,6 +32,11 @@ fn tir(c: &mut Criterion) {
         ("binary_floordiv_s32", Box::new(|o| oplib::binary(BinOp::FloorDiv, Ty::S32, &au, &bu, o, mask).unwrap())),
         ("ternary_fma_f32", Box::new(|o| oplib::ternary(TerOp::Fma, Ty::F32, &af, &bf, &cf, o, mask).unwrap())),
         ("unary_neg_f32", Box::new(|o| oplib::unary(UnOp::Neg, Ty::F32, &af, o, mask).unwrap())),
+        // Transcendentals (pure-Rust `libm` since delta D14; were the host C library).
+        ("unary_exp_f32", Box::new(|o| oplib::unary(UnOp::Exp, Ty::F32, &af, o, mask).unwrap())),
+        ("unary_log_f32", Box::new(|o| oplib::unary(UnOp::Log, Ty::F32, &cf, o, mask).unwrap())),
+        ("unary_log2_f32", Box::new(|o| oplib::unary(UnOp::Log2, Ty::F32, &cf, o, mask).unwrap())),
+        ("unary_tanh_f32", Box::new(|o| oplib::unary(UnOp::Tanh, Ty::F32, &bf, o, mask).unwrap())),
         ("cast_f32_s32", Box::new(|o| oplib::cast(Ty::F32, Ty::S32, Rounding::Default, false, &af, o, mask).unwrap())),
         ("cast_f32_f16", Box::new(|o| oplib::cast(Ty::F32, Ty::F16, Rounding::Default, false, &af, o, mask).unwrap())),
         ("cast_s32_f32", Box::new(|o| oplib::cast(Ty::S32, Ty::F32, Rounding::Default, false, &au, o, mask).unwrap())),

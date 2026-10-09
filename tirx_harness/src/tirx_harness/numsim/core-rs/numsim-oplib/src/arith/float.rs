@@ -115,13 +115,13 @@ pub fn lg2_approx_f32(value: f32, ftz: bool) -> f32 {
     if ftz {
         scalar::ptx_lg2_approx_ftz_f32(value)
     } else {
-        value.log2()
+        scalar::det::log2_f32(value)
     }
 }
 
 /// `lg2.f64` representative (host `log2`).
 pub fn lg2_f64(value: f64) -> f64 {
-    value.log2()
+    scalar::det::log2_f64(value)
 }
 
 /// `rsqrt.approx{.ftz}.f32`.

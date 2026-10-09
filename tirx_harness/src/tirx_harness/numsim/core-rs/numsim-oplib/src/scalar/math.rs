@@ -3,15 +3,17 @@
 //! Legacy (`frontend-rs/src/emit/pure.rs` `log1p` / `sigmoid`) accepted only
 //! `float32 -> float32` and computed with host Rust: `x.ln_1p()` (the C
 //! library's `log1pf`) and `1.0 / (1.0 + (-x).exp())`. These kernels keep that
-//! value path and pin what host code leaves to the C library or the code
+//! value path, except that `log1p`/`exp` come from the pure-Rust `libm` crate
+//! ([`super::det`], delta D14) so the bits do not depend on the host's C
+//! library, and pin what host code leaves to the library or the code
 //! generator:
 //!
 //! * `log1p`: NaN in -> the same NaN, quieted; `x < -1` (incl. `-inf`) -> the
 //!   x86 default NaN; `x == -1` -> `-inf`; `±0` -> `±0`; `+inf` -> `+inf`;
-//!   otherwise the C library's `log1pf` / `log1p` (glibc: < 1 ulp).
+//!   otherwise `libm::log1pf` / `libm::log1p` (< 1 ulp).
 //! * `sigmoid`: NaN in -> that NaN with its sign flipped (the `-x` of the
 //!   formula), quieted; otherwise the formula in binary32 with round to
-//!   nearest at each step (`exp` from the C library).
+//!   nearest at each step (`exp` from `libm`, see [`super::det`]).
 //! * f16 / bf16 (an extension: legacy rejected them) decode to f32, use the
 //!   f32 kernel, and round back to the half format with RNE (the TIR half
 //!   rule: `cvt::f32_to_fp16_bits` / `f32_to_bf16_bits`).
@@ -35,7 +37,7 @@ pub fn log1p_f32(x: f32) -> f32 {
     if x == 0.0 || x == f32::INFINITY {
         return x;
     }
-    x.ln_1p()
+    super::det::ln_1p_f32(x)
 }
 
 /// `tirx.log1p` on binary64.
@@ -52,7 +54,7 @@ pub fn log1p_f64(x: f64) -> f64 {
     if x == 0.0 || x == f64::INFINITY {
         return x;
     }
-    x.ln_1p()
+    super::det::ln_1p_f64(x)
 }
 
 /// `tirx.sigmoid` on binary32: `1 / (1 + exp(-x))` (see the module docs).
@@ -60,7 +62,7 @@ pub fn sigmoid_f32(x: f32) -> f32 {
     if x.is_nan() {
         return f32::from_bits((x.to_bits() ^ 0x8000_0000) | 0x0040_0000);
     }
-    1.0_f32 / (1.0_f32 + (-x).exp())
+    1.0_f32 / (1.0_f32 + super::det::exp_f32(-x))
 }
 
 /// `tirx.sigmoid` on binary64.
@@ -68,7 +70,7 @@ pub fn sigmoid_f64(x: f64) -> f64 {
     if x.is_nan() {
         return f64::from_bits((x.to_bits() ^ (1 << 63)) | 0x0008_0000_0000_0000);
     }
-    1.0_f64 / (1.0_f64 + (-x).exp())
+    1.0_f64 / (1.0_f64 + super::det::exp_f64(-x))
 }
 
 /// A binary32 kernel applied to a half (`bf16 = false`: f16) bit pattern.

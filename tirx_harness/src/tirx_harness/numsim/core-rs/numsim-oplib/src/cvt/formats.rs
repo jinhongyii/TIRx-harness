@@ -497,7 +497,7 @@ pub fn f32_to_float8_e8m0fnu_bits(value: f32) -> u8 {
     if value <= 0.0_f32 {
         return 0;
     }
-    let exponent = value.log2().round_ties_even().clamp(-127.0, 127.0) as i32;
+    let exponent = crate::scalar::det::log2_f32(value).round_ties_even().clamp(-127.0, 127.0) as i32;
     (exponent + 127) as u8
 }
 
