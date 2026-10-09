@@ -879,6 +879,40 @@ Only placement changes: digests and streams are unaffected by construction. Inte
 
 Pinning and stickiness only help together, and both are below the 1.5x rule, so nothing landed. Pinning also gives up the kernel's freedom to move threads off busy cores on a shared host. The bounded remaining lever is static or near-static assignment with work stealing only when idle, but its imbalance cost showed in the static test (wall 6.4 s against 4.5–5.4 s).
 
+**Cost-balanced static assignment, and pin + sticky re-measured: both declined (W13, 2026-10-09).**
+
+The static variant (scratch tree `w13/st2/` on 76d45e1):
+- Partitions get fixed owners by LPT over their running-average round wall time.
+- New partitions go to the least-loaded participant.
+- A full rebalance runs only after max/mean load stays above 1.25 for 8 consecutive rounds.
+- Participants are pinned one per core, filling one CCD at a time, with no stealing.
+
+Medium, host load about 3, min of 3 interleaved runs (wall / process CPU):
+
+| Workers | HEAD (dynamic, unpinned) | LPT static + pin | LPT static, unpinned |
+|---|---|---|---|
+| 8 | 4.94 s / 28.3 s | 4.31 s / 19.5 s | 5.36 s / 24.0 s |
+| 16 | 3.92 s / 32.9 s | 5.46 s / 35.4 s | 7.12 s / 48.6 s |
+| 32 | 4.94 s / 54.4 s | 5.13 s / 46.0 s | 6.68 s / 63.4 s |
+
+Rebalancing churn is not the cause. At 16 workers, 194 rebalances took 6.3 s, 4 rebalances 6.0 s, and none 5.9 s.
+
+Pin + sticky (`w13/st/`) against HEAD, 5 interleaved rounds, load 4–8. Min, with all samples in parentheses:
+
+| Variant | 16 workers | 32 workers |
+|---|---|---|
+| HEAD | 3.93 s (3.93–4.10) | 5.20 s (5.20, 6.43, 6.55, 7.35, 7.77) |
+| Pin + dynamic | 3.27 s (3.27–3.67) | 4.61 s (4.61–4.66) |
+| Pin + sticky | 3.07 s (3.07–3.53) | 4.30 s (4.30–4.41) |
+
+By the project's statistic (min of interleaved runs), pin + sticky is 1.25x at 16 workers and 1.21x at 32. On the max config's parallel-phase wall it is 1.10x. Pinning also costs something on shared hosts, including the CI runners, because threads cannot move off busy cores. Not landed.
+
+Two facts to keep:
+- **Unpinned 32-worker runs on this host are bimodal:** 5.2–8.0 s for the same binary, while pinned runs stay within 4.30–4.41 s. Medium 32-worker measurements must report every sample, not a single min.
+- **Static assignment keeps partition CPU at the 1-worker level at 8 workers** (19.5 s against 28.3 s for HEAD), confirming cross-CCD migration as the source of the inflation. Round costs swing too much from round to round for any fixed assignment to hold wall time; dynamic handout balances each round.
+
+**Status of the medium 16/32-worker gap:** closed out as bounded by cross-CCD migration. Further attribution needs hardware counters, which require `perf_event_paranoid` at 2 or lower.
+
 ## Parked spin-loop replay: validated prototype, not landed (W13, 2026-10-09)
 
 **Why not landed.** The design below was implemented in scratch and validated. No corpus case parks on a spin loop in a way that matters: medium spends 0.1–0.3 s in re-polls, and the max config has 0 replays. The max config's re-polls are blocked retries at `mbar_wait` (107 M checks, most already applied by `BlockedWait`), `wait_until` (29.5 M) and `barrier` (19.1 M), with no parked loops. Landing would add a recorder and replayer to the interpreter for no corpus gain. It can be revived if a spinning kernel shows up.
