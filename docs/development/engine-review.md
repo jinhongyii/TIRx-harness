@@ -861,6 +861,24 @@ Bisect, on the one-per-CCD placement:
 - **NUMA correction:** spreading over both NUMA nodes adds another 1.2x on top. The earlier "NUMA ruled out" was measured unpinned and is withdrawn.
 - **Lever:** CCD-aware sticky handout with pool threads pinned one per core.
 
+**CCD-aware sticky handout with pinned pool threads: measured, declined (W13, 2026-10-09).**
+
+The prototype, in scratch tree `w13/st/`:
+- Pool participants are pinned one per CPU, filling an L3 (CCD) with physical cores before moving to the next. SMT siblings are used only after every core is taken. The calling thread is pinned for the launch and its affinity restored afterwards.
+- Each partition is first offered to the participant that ran it last round; idle participants steal the rest.
+
+Only placement changes: digests and streams are unaffected by construction. Interleaved measurements:
+
+| Case | Base (94eccc4) | Pin + sticky | Pin only | Sticky only |
+|---|---|---|---|---|
+| Medium wall, 16 workers | 3.39 s | 3.19 s | 3.19 s | 3.59 s |
+| Medium wall, 32 workers | 3.75 s | 3.11 s (1.21x) | 4.36 s | 4.28 s |
+| Max config parallel-phase wall, 16 workers | 155.3 / 156.2 s | 142.2 / 140.6 s (1.10x) | — | — |
+| Max config partition CPU | 1,514 / 1,519 s | 1,369 / 1,363 s | — | — |
+| Max config perf metric | 173.5 / 174.0 s | 162.5 / 160.7 s | — | — |
+
+Pinning and stickiness only help together, and both are below the 1.5x rule, so nothing landed. Pinning also gives up the kernel's freedom to move threads off busy cores on a shared host. The bounded remaining lever is static or near-static assignment with work stealing only when idle, but its imbalance cost showed in the static test (wall 6.4 s against 4.5–5.4 s).
+
 ## Parked spin-loop replay: validated prototype, not landed (W13, 2026-10-09)
 
 **Why not landed.** The design below was implemented in scratch and validated. No corpus case parks on a spin loop in a way that matters: medium spends 0.1–0.3 s in re-polls, and the max config has 0 replays. The max config's re-polls are blocked retries at `mbar_wait` (107 M checks, most already applied by `BlockedWait`), `wait_until` (29.5 M) and `barrier` (19.1 M), with no parked loops. Landing would add a recorder and replayer to the interpreter for no corpus gain. It can be revived if a spinning kernel shows up.
@@ -963,3 +981,59 @@ This is the same pattern as `BlockedWait`'s debug check. Equivalence also needs 
 **Open questions for W6.**
 - Whether replayed `Access` events need any marker. Proposed: none, since the stream is identical.
 - Whether the racecheck checker relies on per-iteration `round_boundary` interleaving that replay preserves. Replay happens at the same point in `run_cta` as execution, so it should.
+
+## Racecheck checker-partition CPU: release-head joins, lane storage and the allocator (W14, 2026-10-09)
+
+**Setup.** e24 recorded stream, fork/join on. A forked child's CPU is thread CPU (`/proc/thread-self/schedstat`) summed over its replay. The "forked 1-worker" figure offers forks with no pool, so the same child work runs on one thread. Profiles are stack samples taken by attaching gdb (the driver calls `prctl(PR_SET_PTRACER)`; `perf` is blocked by `perf_event_paranoid=4`), plus per-event-kind timers in a scratch copy.
+
+**Where the child time went (at 75e9dda's predecessor 8ab6a62).**
+
+1. **WaitVerdicts: 11.5 s of the 18 s of child CPU at 1 worker.**
+   - Each RMW on a counter inherits every earlier head, so 2,772 waits acquired about 88 release heads each, at 4.2 ms per wait.
+   - Fix: `knowledge::HeadList` keeps the join of its `.gpu`-or-wider heads and grows it by one join per RMW. An acquirer at `.gpu` or wider takes that join once.
+   - This is exact (racecheck-semantics row 25). The guard is `tuning::JOINED_HEADS` with bench `joined_heads`: chains of 64 and 256 heads cost 3.7 vs 1.2 ms (3.1x) and 30.8 vs 5.4 ms (5.8x).
+2. **Lane-entry code in `Clock::join`: 59% of child samples at 16 workers, 36% at 1.**
+   - Each block rebuild cloned the `Arc` of every lane vector and copied a ~470-entry top slice of `Arc`s. The lane vectors were shared by every partition, so the refcount writes bounced between CCDs.
+   - Joins that touched lane entries: 642 K, carrying 181 entries in 74 blocks on average.
+   - Fix (`clock.rs`):
+     - lane vectors stored inline with their maximum;
+     - two-level lane groups;
+     - normalisation after a scalar change that visits only blocks whose 32-actor chunk changed;
+     - a randomized model test (`clock::tests`).
+3. **glibc arena locks** (`futex_wait` in `_int_free` on `main_arena`): threads free clock storage that other threads allocated.
+
+**The inflation is cross-CCD sharing of written lines, not migration.** 8 workers on 8 cores of one CCD:
+- one CCD: child CPU 20.1 s, wall 5.6 s;
+- spread over 8 CCDs: 31.0 s, 8.1 s;
+- spread over 8 CCDs with fixed partition→thread assignment, pinned: 28.0 s;
+- 1 worker: 17–21 s.
+
+Aligning `Chunk` to a cache line changed nothing measurable.
+
+**A/B** on 75e9dda (a39756d, the current base, changes no racecheck code). "Heads + lanes" is this change.
+- Instrumented scratch builds, min of 3 interleaved runs for e24 and one run each for medium.
+- Load average was 5.8–12.7 for e24 and 5.9–13.9 for medium.
+- Payload hash identical across all builds, modes and worker counts.
+
+| | e24 wall, 1 worker | e24 wall, 16 workers | e24 child CPU, 16 workers / forked 1-worker | medium, 2000 rounds, 16 workers: wall / child CPU |
+| --- | --- | --- | --- | --- |
+| HEAD, glibc | 18.03 s | 8.21 s | 43.3 / 15.6 s (2.8x) | 380 s / 610 s |
+| HEAD, mimalloc | 14.24 s | 5.89 s | 29.8 / 13.6 s (2.2x) | 291 s / 510 s |
+| heads + lanes, glibc | 9.75 s | 6.06 s | 21.2 / 6.3 s (3.4x) | 200 s / 441 s |
+| heads + lanes, mimalloc | **7.88 s** | **4.02 s** | 12.9 / 5.5 s (2.4x) | **135 s** / 303 s |
+
+- With heads + lanes, mimalloc is worth 1.5x on e24 at 16 workers and on medium; on HEAD it was worth 1.3–1.4x.
+- The engine alone gains about 10% CPU from mimalloc ("allocator and huge-page experiments" above).
+- Overall, e24 at 16 workers goes from 8.21 s to 4.02 s (2.04x); against the 8ab6a62 figure of 6.5 s it is 1.6x. Medium goes from 380 s to 135 s (2.8x).
+
+**Child-CPU bar not met.** The bar was child CPU at 16 workers within 1.5x of the 1-worker figure. The result is 2.4x (12.9 vs 5.5 s), against 2.8x at HEAD. The ratio barely moved because the heads fix removed mostly work that does not inflate.
+- The remaining inflation is the lane storage, still shared between partitions through `Arc` groups and blocks, together with clock-group adoption on joins.
+- The landing criterion is the wall time.
+
+**mimalloc dependency.**
+- `numsim-py` feature `mimalloc`, default on. `numsim-core` stays allocator-agnostic, so its tests and benches use the system allocator.
+- To build without a C compiler: `cargo build -p numsim-py --no-default-features --features extension-module`.
+- The wheel (`setup.py`: `cargo build --release --locked -p numsim-py --features extension-module`) gets it by default. It needs the `cc` crate and a C compiler, which manylinux_2_28 has.
+- `--locked` passes with the new lock entries: mimalloc 0.1.52, libmimalloc-sys 0.1.49, cc 1.6.0, find-msvc-tools 0.1.14, shlex 2.0.1.
+- The extension still links only libc, libm and libgcc_s (mimalloc is static).
+- Not verified here: the CI toolchain 1.89.0 and the aarch64 image (W8).
