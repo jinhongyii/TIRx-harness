@@ -40,6 +40,17 @@ python -m pytest -q -n 16 --dist=worksteal -m "not numsim_gpu"
 The legacy tests these replaced, and the retirement ledger and tools, were
 deleted in `79f04eb`; `docs/development/test-migration.md` records the history.
 
+## Corpus Inputs Must Be Host-Independent
+
+Snapshots hash outputs bit for bit, so a corpus case's **inputs** must not
+depend on the host's BLAS kernel or ISA dispatch. Never feed a float result of
+`np.matmul`/`@`/`np.dot`/`einsum` (OpenBLAS picks its kernel per CPU) into a
+kernel argument. Compute such inputs with float64 elementwise products and
+`np.sum`, and round to the input dtype once; BLAS is fine for references,
+which are compared within tolerance.
+`tests/numsim/corpus/test_input_host_independence.py` checks
+`flash_attention_backward_sm100` under `OPENBLAS_CORETYPE=Sandybridge`.
+
 ## Judging a Full-Suite Run
 
 Wiki cases can fail on a clean checkout. A failure count proves nothing on its

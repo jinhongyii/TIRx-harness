@@ -313,6 +313,42 @@ def prepare_flash_attention4_case(
     )
 
 
+def _flash_attention_backward_lse_dpsum(
+    qh: np.ndarray,
+    kh: np.ndarray,
+    vh: np.ndarray,
+    doh: np.ndarray,
+    scale: np.float32,
+    is_causal: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The kernel's `LSE_g` (log2 domain) and `dpsum_g` inputs, computed
+    without BLAS.
+
+    Kernel inputs must not depend on the host's BLAS kernel or ISA dispatch.
+    `np.matmul` in float32 goes to OpenBLAS, whose per-CPU kernels round
+    differently, so `LSE_g`/`dpsum_g` and every output hash differed between
+    hosts (CI runner vs dev host). Here every product is a float64 elementwise
+    multiply and every reduction is `np.sum` (pairwise summation; the same bits
+    for numpy's SIMD variants), and the results are rounded to float32 once.
+    """
+    q64, k64, v64, do64 = (x.astype(np.float64) for x in (qh, kh, vh, doh))
+    scores = (q64[..., :, None, :] * k64[..., None, :, :]).sum(axis=-1) * float(scale)
+    if is_causal:
+        seq_len = scores.shape[-1]
+        scores = np.where(np.triu(np.ones((seq_len, seq_len), dtype=np.bool_), 1), -np.inf, scores)
+    row_max = np.max(scores, axis=-1, keepdims=True)
+    exponentials = np.exp(scores - row_max)
+    denominator = np.sum(exponentials, axis=-1, keepdims=True)
+    probabilities = exponentials / denominator
+    lse = np.log(denominator[..., 0]) + row_max[..., 0]
+    output = (probabilities[..., :, :, None] * v64[..., None, :, :]).sum(axis=-2)
+    dpsum = (do64 * output).sum(axis=-1)
+    return (
+        (lse * math.log2(math.e)).astype(np.float32).reshape(-1),
+        dpsum.astype(np.float32).reshape(-1),
+    )
+
+
 def prepare_flash_attention_backward_case(*, is_causal: bool, seed: int = 0) -> NumSimCase:
     batch_size, seq_len, num_heads, head_dim = 1, 256, 1, 128
     shape = (batch_size, seq_len, num_heads, head_dim)
@@ -334,7 +370,6 @@ def prepare_flash_attention_backward_case(*, is_causal: bool, seed: int = 0) -> 
     exponentials = np.exp(scores - row_max)
     denominator = np.sum(exponentials, axis=-1, keepdims=True)
     probabilities = exponentials / denominator
-    lse = np.log(denominator[..., 0]) + row_max[..., 0]
     output = np.matmul(probabilities, vh)
     dpsum = np.sum(doh * output, axis=-1)
     dp = np.matmul(doh, np.swapaxes(vh, -1, -2))
@@ -366,13 +401,14 @@ def prepare_flash_attention_backward_case(*, is_causal: bool, seed: int = 0) -> 
     dk_binding = np.zeros(math.prod(shape), dtype=np.float16)
     dv_binding = np.zeros(math.prod(shape), dtype=np.float16)
     dq_acc_binding = np.zeros(batch_size * num_heads * seq_len * head_dim, dtype=np.float32)
+    lse_input, dpsum_input = _flash_attention_backward_lse_dpsum(qh, kh, vh, doh, scale, is_causal)
     args = {
         "Q_g": q_binding,
         "K_g": k_binding,
         "V_g": v_binding,
         "dO_g": dout_binding,
-        "LSE_g": (lse * np.float32(math.log2(math.e))).astype(np.float32).reshape(-1),
-        "dpsum_g": dpsum.astype(np.float32).reshape(-1),
+        "LSE_g": lse_input,
+        "dpsum_g": dpsum_input,
         "dK_g": dk_binding,
         "dV_g": dv_binding,
         "dQ_acc_g": dq_acc_binding,
