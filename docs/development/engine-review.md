@@ -808,3 +808,110 @@ So the cost is the oplib call plus the fixed per-handler work over 256-byte `[u6
 | `alu_chain/iters2048` | — | — | flat (within noise) |
 
 Digests at 1/8/32 are identical with and without an observer.
+
+## Per-partition CPU inflation: allocator and huge-page experiments (W13, 2026-10-09)
+
+**Setup.**
+- Scratch build of HEAD 8ab6a62 with the CPU-split counters; medium fixture, NoopObserver, `run_with_config`.
+- Partition CPU is thread CPU summed over `run_round`. Each cell below is the minimum of 3 interleaved runs.
+- The host was loaded: 1-minute load 6–40 (one outlier at 57), so treat differences under about 10% as noise.
+- `/sys/kernel/mm/transparent_hugepage/enabled` is `[madvise]`, so neither threads nor processes get THP unless the allocator calls madvise. The process-vs-thread difference therefore cannot come from THP.
+
+**Partition CPU (s) at 1 / 16 / 32 workers, and inflation relative to 1 worker:**
+
+| Allocator | 1 | 16 | 32 | Inflation at 16 | Inflation at 32 | AnonHugePages | Minor faults (16 workers) |
+|---|---|---|---|---|---|---|---|
+| glibc | 19.3 | 32.8 | 42.6 | 1.69x | 2.20x | 0 | 1.16 M |
+| glibc, `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` | 18.9 | 27.5 | 44.6 | 1.46x | 2.36x | 1.4–3.5 GB | 0.19–0.26 M |
+| mimalloc | 17.3 | 25.6 | 41.5 | 1.48x | 2.40x | 3.8–3.9 GB | 8–10 k |
+| mimalloc, large OS pages | 17.2 | 26.5 | 42.9 | 1.54x | 2.50x | 3.7–3.9 GB | 8–11 k |
+| jemalloc | 18.7 | 28.9 | 43.7 | 1.54x | 2.33x | 0 | 1.07 M |
+| jemalloc, `thp:always` | 18.6 | 28.6 | 44.0 | 1.53x | 2.36x | 1.5–2.3 GB | 13–15 k |
+
+Medium wall at 32 workers, minimum: glibc 4.06 s, mimalloc 3.62 s (1.12x), glibc with hugetlb 3.78 s.
+
+**Reading.**
+- Huge pages and per-thread heaps cut minor faults by 100x and absolute partition CPU by up to about 10% at 1 worker and up to about 20% at 16 workers.
+- They do not change the inflation: about 1.5x at 16 workers and 2.2–2.5x at 32, with or without huge pages. With mimalloc nearly all anonymous memory is on 2 MB pages, including the warp register files. Experiment (c), a pre-faulted huge-page pool for the register files, is therefore already covered, and TLB misses or page-table walks are not the cause.
+- No variant closes half the inflation, and none reaches 1.5x on medium wall at 32 workers. Nothing lands.
+- mimalloc is a standalone candidate worth roughly 10% CPU. That would be a separate decision: a new dependency, and the allocator choice of the Python extension.
+
+**Still unexplained.** The working set moves between cores: partitions are handed out dynamically each round, while independent processes stay put. That is consistent with the earlier pinned, static-assignment result (about 1.2x at 16 workers on a quiet host). Confirming it needs cache-miss counters (`perf_event_paranoid`).
+
+## Parked spin-loop replay: design for W6 review (W13, 2026-10-09; no code)
+
+**Problem.** A warp parks at a spin loop's `LoopEnd` (`control::loop_end`). It parks when the iteration made only failed polls, completed no progress instruction, and left `WarpState::spin_hash` (registers plus active/live masks) equal to the previous parked iteration's.
+- Every retry re-interprets one whole iteration: `LoopEnd` with `resume == PARKED` → `Jump(head)` → body → `LoopEnd` → fixed point → `Blocked` again.
+- On the max config that is 32.2 M slices and 203 CPU-s of `run_cta` (df585e9 split).
+- `BlockedWait` already applies blocked `try_wait` / `bar.sync` retries without re-execution. It cannot cover these loops, because their bodies emit observer events: weak or acquire loads emit `Access` events, and acquire loads also call `note_load_poll`.
+- The rejected 2026-10-08 skip would have dropped those events only when no observer is attached.
+
+**Proposal.** When the retried iteration is provably identical to the recorded one, apply its recorded effects instead of interpreting it, in every mode:
+- the counter and frame updates;
+- the read and poll bookkeeping;
+- when observing, the recorded events, re-stamped.
+
+The decision depends only on engine state, so the execution path does not depend on the observer. With an observer the stream is byte-identical; without one, nothing is emitted, as today.
+
+**What a recording captures.** It is taken while interpreting the iteration that parks, from the `Jump(head)` after the previous `LoopEnd` to the parking `LoopEnd`. It is kept on the `WarpState`, like `BlockedWait`.
+1. **Identity.** `epoch` at the end of the iteration, `pc` (the `LoopEnd`), the loop frame's depth, and `spin_hash`.
+2. **Counter deltas.**
+   - `steps`, `epoch` and `LaunchCounters::instrs` each advance by n, the number of instructions in the iteration.
+   - `progress` advances by 0 (a parked iteration has none).
+   - The loop frame's `iteration` advances by 1. Replay re-checks the loop budget and raises the same `Budget` error at the same iteration.
+3. **Poll state.** The iteration's `PollState` (`failed_on`, `also`, `overflow`, `progressed = false`). It is merged into the frame's `outer` exactly as `loop_end` does, and the returned `Blocked(failed_on)` must be the same.
+4. **Reads.** Every `(alloc, span)` the iteration read, through the existing `aux.capture_reads` hook, which loads already feed, with the bytes and validity bits seen. These serve two purposes:
+   - the unchanged-inputs check;
+   - re-applying the reads' side records on replay: the shard read set (`track_shard_reads`, which feeds `shard_replay_order`) and the readonly-proxy read notes (`note_readonly_read`).
+   - Uninitialized-read findings are deduplicated per (site, alloc, span) and were already recorded by the original iteration, so replay adds none. The debug check below asserts this.
+5. **Sync queries.** For each `try_wait` / `test_wait` / named-barrier query in the body: (resource, command, the resource's state). Like `BlockedWait`, the queries are pure functions of the state.
+6. **Events, only when observing.**
+   - The `Access` events: everything except `seq`, with `actor.epoch` stored as an offset from the iteration's first epoch.
+   - Any sync events the iteration emitted. A failed poll emits none; one that did emit would be a successful operation, i.e. progress, so the iteration would not have parked.
+   - The `round_boundary` events are not part of the iteration.
+7. **Register writes: none.** `spin_hash` equality before and after the recorded iteration means the iteration leaves registers and masks as it found them. The unchanged-inputs condition then implies the replayed iteration does the same. Replay writes no registers and leaves the spin memo untouched.
+
+**Unchanged-inputs condition.** Replay applies only if all of the following hold:
+- `warp.epoch == recording.epoch` (the warp ran nothing since), `warp.pc` is the recorded `LoopEnd`, and `resume == PARKED`;
+- `warp.suspended` is empty, and the frame stack depth and the loop frame's identity (`begin`) are unchanged;
+- every recorded read span's current bytes and validity equal the recorded ones, read through the same arena or shard view execution would use;
+- every recorded sync query's resource state equals the recorded state.
+- **Why this is sufficient.**
+  - The iteration is a deterministic function of: warp state (registers, masks and frames, all unchanged since the warp has not run); program constants; the bytes it reads (checked); sync states it queries (checked); and launch-constant context (CTA id and shape).
+  - Instructions that read anything else make the iteration non-repeatable. Examples are `%clock` / `%globaltimer`, which change registers, so `spin_hash` differs and the loop never parks, and async-group queries, which are recorded as sync queries.
+  - Any instruction not covered by the recorder sets "not replayable" for that iteration, so it is executed normally.
+- **Cost.** The checks are a few word compares plus one state compare per query, against interpreting the whole body.
+
+**Applying a replay.**
+- Bump `steps`, `epoch` and `instrs` by n.
+- Bump the frame's `iteration` and check the budget.
+- Merge the recorded poll state into `outer`.
+- Re-record the reads in the shard read set and the readonly tracking.
+- When observing, emit the recorded events in order: each `Access` with a fresh `counters.next_access_seq()` and its epoch rebased onto the warp's current epoch; each sync event with the warp's current `sync_seq` handling.
+- Return `Blocked(failed_on)` through the normal `settle`.
+
+**Debug assertion.** In debug builds, never replay. Execute the iteration and assert that:
+- the result is `Blocked(recorded failed_on)`;
+- the counter deltas match;
+- the poll state matches;
+- `spin_hash` is unchanged;
+- the shard read set gained exactly the recorded spans;
+- the emitted events equal the recording modulo `seq` and the epoch base (captured with a tee into the partition `EventBuffer`).
+
+This is the same pattern as `BlockedWait`'s debug check. Equivalence also needs digests at 1/8/32 with and without an observer, the W16 racecheck hashes, and `every_scenario_is_observer_and_worker_independent`.
+
+**Expected saving.** The max config's 203 CPU-s of re-polls becomes the check plus the replay. The check is a handful of word compares. Replaying events costs a few hundred ns per `Access` when observing, and nothing otherwise.
+- NumSim mode: estimated 150–190 CPU-s saved (7–9% of the 2,136 partition CPU-s). The wall effect is smaller, because re-polls are spread across partitions.
+- Racecheck mode: proportionally less, since the checker still consumes the replayed events.
+- Medium spends only 0.13–0.34 s in re-polls, so the max config is the target.
+
+**Files, if approved.**
+- `interp/mod.rs`: the recording on `WarpState`, the condition and the apply.
+- `interp/handlers/control.rs`: start, finish and invalidate the recording at `LoopEnd`.
+- `interp/handlers/mem.rs` and `interp/support.rs`: feed reads and events to the recorder.
+- `interp/handlers/sync.rs`: record sync queries.
+- `sched/partition.rs`: the apply in `run_cta`, beside `BlockedWait`.
+
+**Open questions for W6.**
+- Whether replayed `Access` events need any marker. Proposed: none, since the stream is identical.
+- Whether the racecheck checker relies on per-iteration `round_boundary` interleaving that replay preserves. Replay happens at the same point in `run_cta` as execution, so it should.
