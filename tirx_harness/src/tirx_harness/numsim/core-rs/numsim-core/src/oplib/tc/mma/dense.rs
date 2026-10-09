@@ -176,7 +176,7 @@ pub(super) fn float_mma(
     };
     let cell = instruction.cell_dtype;
     let input_d = if payload.enable_input_d {
-        Some(window.read(io, |bytes| cell.decode(bytes), f32::NAN)?)
+        Some(if cell == CellDtype::F32 { window.read_f32(io)? } else { window.read(io, |bytes| cell.decode(bytes), f32::NAN)? })
     } else {
         None
     };
@@ -209,7 +209,7 @@ pub(super) fn float_mma(
             layout,
         ))?,
     };
-    window.write(io, tmem_write, |value| cell.encode(value), &output)?;
+    if cell == CellDtype::F32 { window.write_f32(io, tmem_write, &output)? } else { window.write(io, tmem_write, |value| cell.encode(value), &output)? };
     if payload.args.ashift {
         let columns = if kind.tmem_a_columns(idesc) == 16 {
             16
@@ -334,7 +334,7 @@ pub(super) fn f8f6f4_mma(
         cta_group: cg,
     };
     let input_d = if payload.enable_input_d {
-        Some(window.read(io, |bytes| cell.decode(bytes), f32::NAN)?)
+        Some(if cell == CellDtype::F32 { window.read_f32(io)? } else { window.read(io, |bytes| cell.decode(bytes), f32::NAN)? })
     } else {
         None
     };
@@ -346,7 +346,7 @@ pub(super) fn f8f6f4_mma(
         form.a_in_tmem,
         layout,
     ))?;
-    window.write(io, tmem_write, |value| cell.encode(value), &output)?;
+    if cell == CellDtype::F32 { window.write_f32(io, tmem_write, &output)? } else { window.write(io, tmem_write, |value| cell.encode(value), &output)? };
     if payload.args.ashift {
         let address = io.lib(f8_tmem_a_address(payload.a, false))?;
         shift_a(io, tmem_write, address, if k == 64 { 16 } else { 8 }, cg)?;

@@ -54,7 +54,7 @@ use numsim_oplib::tcgen05::narrow::{
     decode_b16, decode_b16_word, decode_e2m1_word, tf32_payload_to_f32, CellDtype, NarrowFormat,
 };
 use numsim_oplib::tcgen05::scale::{
-    apply_row_scales, check_joint_scales, decode_ue8m0_scale, mxf8_scale_values, read_block_scale,
+    apply_row_scales, check_joint_scales, decode_ue8m0_scale, read_block_scale,
 };
 use numsim_oplib::tcgen05::smem_desc::{
     decode_matrix_descriptor, decode_matrix_descriptor_for_layout, decode_packed_matrix_descriptor,
@@ -316,6 +316,64 @@ fn write_run<T: Copy>(
     tmem_write(cta as u32, lane, column, buf).map_err(|error| io.fail(error))
 }
 
+/// Little-endian byte view of f32 values: TMEM F32 cells are the values'
+/// little-endian bytes (`CellDtype::F32`: `f32::from_le_bytes` /
+/// `to_le_bytes`), so a contiguous run is read and written in place.
+#[cfg(target_endian = "little")]
+fn f32_bytes_mut(values: &mut [f32]) -> &mut [u8] {
+    // SAFETY: f32 has no invalid bit patterns and alignment 4 >= 1; the slice
+    // covers exactly `values`' storage.
+    unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), values.len() * 4) }
+}
+
+#[cfg(target_endian = "little")]
+fn f32_bytes(values: &[f32]) -> &[u8] {
+    // SAFETY: as `f32_bytes_mut`, read-only.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) }
+}
+
+/// [`read_run`] for F32 cells: a contiguous run is read straight into the
+/// values (same checks, same single callback call, same bytes); any other
+/// run takes the generic path.
+fn read_run_f32(
+    io: &Io<'_>,
+    buf: &mut Vec<u8>,
+    at: (usize, usize, usize),
+    indices: &[usize],
+    values: &mut [f32],
+) -> LibResult<()> {
+    #[cfg(target_endian = "little")]
+    if let Some(range) = contiguous(indices).filter(|r| r.end <= values.len()) {
+        let (cta, lane, column) = at;
+        check_cell(io, lane, column + indices.len() - 1)?;
+        let (lane, column) = check_cell(io, lane, column)?;
+        return (io.tmem_read)(cta as u32, lane, column, f32_bytes_mut(&mut values[range]))
+            .map_err(|error| io.fail(error));
+    }
+    read_run(io, buf, at, indices, values, &f32::from_le_bytes)
+}
+
+/// [`write_run`] for F32 cells: a contiguous run is written straight from
+/// the values' bytes.
+fn write_run_f32(
+    io: &Io<'_>,
+    tmem_write: TcTmemWrite<'_>,
+    buf: &mut Vec<u8>,
+    at: (usize, usize, usize),
+    indices: &[usize],
+    values: &[f32],
+) -> LibResult<()> {
+    #[cfg(target_endian = "little")]
+    if let Some(range) = contiguous(indices).filter(|r| r.end <= values.len()) {
+        let (cta, lane, column) = at;
+        check_cell(io, lane, column + indices.len() - 1)?;
+        let (lane, column) = check_cell(io, lane, column)?;
+        return tmem_write(cta as u32, lane, column, f32_bytes(&values[range]))
+            .map_err(|error| io.fail(error));
+    }
+    write_run(io, tmem_write, buf, at, indices, values, &f32::to_le_bytes)
+}
+
 /// Runs of a `(cta, lane, column, index)` cell list (CTA pairs).
 fn list_runs(
     cells: &[(usize, usize, usize, usize)],
@@ -561,6 +619,36 @@ impl Window {
             }))?;
         }
         Ok(values)
+    }
+
+    /// [`Self::read`] of F32 cells (bit-exact `f32::from_le_bytes`), read in place.
+    fn read_f32(&self, io: &Io<'_>) -> OpResult<Vec<f32>> {
+        let mut values = vec![f32::NAN; self.m * self.n];
+        let mut buf = Vec::new();
+        if self.cta_group == 1 {
+            io.lib(cta1_runs(self.taddr, self.m, self.n, self.layout, None, |lane, column, indices| {
+                read_run_f32(io, &mut buf, (0, lane, column), indices, &mut values)
+            }))?;
+        } else {
+            io.lib(cta2_runs(self.taddr, self.m, self.n, self.layout, None, |at, indices| {
+                read_run_f32(io, &mut buf, at, indices, &mut values)
+            }))?;
+        }
+        Ok(values)
+    }
+
+    /// [`Self::write`] of F32 cells (bit-exact `f32::to_le_bytes`), written in place.
+    fn write_f32(&self, io: &Io<'_>, tmem_write: TmemWrite<'_>, values: &[f32]) -> OpResult {
+        let mut buf = Vec::new();
+        if self.cta_group == 1 {
+            io.lib(cta1_runs(self.taddr, self.m, self.n, self.layout, Some(self.mask4()), |lane, column, indices| {
+                write_run_f32(io, tmem_write, &mut buf, (0, lane, column), indices, values)
+            }))
+        } else {
+            io.lib(cta2_runs(self.taddr, self.m, self.n, self.layout, Some(self.mask), |at, indices| {
+                write_run_f32(io, tmem_write, &mut buf, at, indices, values)
+            }))
+        }
     }
 
     fn write<T: Copy>(

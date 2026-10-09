@@ -73,7 +73,7 @@ fn sparse_mxf4_mma(
         cta_group: 1,
     };
     let input_d = if payload.enable_input_d {
-        Some(window.read(io, |bytes| CellDtype::F32.decode(bytes), f32::NAN)?)
+        Some(window.read_f32(io)?)
     } else {
         None
     };
@@ -85,7 +85,7 @@ fn sparse_mxf4_mma(
         &b,
         input_d.as_deref().map(|values| (values, 1.0)),
     ))?;
-    window.write(io, tmem_write, |value: f32| value.to_le_bytes(), &output)
+    window.write_f32(io, tmem_write, &output)
 }
 
 pub(super) fn mxf4_mma(
@@ -221,7 +221,7 @@ pub(super) fn mxf4_mma(
         cta_group: cg,
     };
     let input_d = if payload.enable_input_d {
-        Some(window.read(io, |bytes| CellDtype::F32.decode(bytes), f32::NAN)?)
+        Some(window.read_f32(io)?)
     } else {
         None
     };
@@ -234,7 +234,7 @@ pub(super) fn mxf4_mma(
         &b,
         input_d.as_deref().map(|values| (values, 1.0)),
     ))?;
-    window.write(io, tmem_write, |value: f32| value.to_le_bytes(), &output)
+    window.write_f32(io, tmem_write, &output)
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +245,51 @@ pub(super) fn mxf4_mma(
 /// every CTA, then one UE8M0 scale per row (replicated SM100 layout, or the
 /// SM107 128-lane SFA layout), SFB copies checked equal across the pair.
 #[allow(clippy::too_many_arguments)]
+/// `numsim_oplib::tcgen05::scale::mxf8_scale_values` over the MMA's TMEM
+/// reads, without its per-call location and byte vectors (perf): the same
+/// location checks first (every row and replica, before any read), the same
+/// one-cell reads in the same (row, replica) order, then the same replica
+/// agreement check and UE8M0 decode per row. Same values and errors.
+fn read_mxf8_scales(
+    io: &Io<'_>,
+    cta: usize,
+    address: u32,
+    scale_id: usize,
+    rows: usize,
+    layout: ScaleLayout,
+) -> OpResult<Vec<f32>> {
+    thread_local! {
+        static BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if scale_id >= 4 {
+        return Err(io.lift(LibError::message("raw TCGEN scale byte is outside TMEM")));
+    }
+    let replicas = layout.replicas();
+    for row in 0..rows {
+        for replica in 0..replicas {
+            io.lib(layout.location(address, row, replica))?;
+        }
+    }
+    BYTES.with(|bytes| {
+        let mut bytes = bytes.borrow_mut();
+        bytes.clear();
+        for row in 0..rows {
+            for replica in 0..replicas {
+                let (lane, column) = io.lib(layout.location(address, row, replica))?;
+                bytes.push(io.lib(io.cell(cta, lane, column))?[scale_id]);
+            }
+        }
+        let mut values = Vec::with_capacity(rows);
+        for copies in bytes.chunks_exact(replicas) {
+            if copies.iter().any(|&bits| bits != copies[0]) {
+                return Err(io.lift(LibError::message("raw TCGEN block-scale replicas disagree")));
+            }
+            values.push(io.lib(decode_ue8m0_scale(copies[0]))?);
+        }
+        Ok(values)
+    })
+}
+
 fn gather_mxf8f6f4(
     io: &Io<'_>,
     cg: usize,
@@ -297,13 +342,7 @@ fn gather_mxf8f6f4(
     for (cta, chunk) in values.chunks_exact_mut(rows_per_cta * k).enumerate() {
         let rows = rows_per_cta * if joint { cg } else { 1 };
         let scales = if lanes_per_column == 32 {
-            io.lib(mxf8_scale_values(
-                &mut io.bytes(cta),
-                scale_address,
-                scale_id,
-                rows,
-                scale_layout,
-            ))?
+            read_mxf8_scales(io, cta, scale_address, scale_id, rows, scale_layout)?
         } else {
             (0..rows)
                 .map(|row| {
@@ -477,7 +516,7 @@ pub(super) fn mxf8f6f4_mma(
         cta_group: cg,
     };
     let input_d = if payload.enable_input_d {
-        Some(window.read(io, |bytes| CellDtype::F32.decode(bytes), f32::NAN)?)
+        Some(window.read_f32(io)?)
     } else {
         None
     };
@@ -512,5 +551,5 @@ pub(super) fn mxf8f6f4_mma(
             layout,
         ))?,
     };
-    window.write(io, tmem_write, |value: f32| value.to_le_bytes(), &output)
+    window.write_f32(io, tmem_write, &output)
 }

@@ -191,3 +191,37 @@ increasing-K FMA chain, accumulator encode), so the API was removed (W4/W2,
 2026-10-08). Further gains need fewer per-element operations, not a cheaper I/O
 boundary.
 
+## Mega MoE block-scaled MMA: where `tc_mma_ctas` spends its time (W4, 2026-10-09)
+
+Mega MoE medium (`t64_h2048_i1536_e96_k4_g1`, 110,592 `tcgen05.mma.kind::mxf8f6f4.block_scale`
+MMAs), private builds with scratch-only phase counters (`Instant` per phase, callback
+call counts), host load 8-16. "Before" is d86beb5; "after" adds the in-place F32 D
+window read/write, the vector-free scale reads (`read_mxf8_scales`) and the bit-built
+E8M0 decode. All three give bit-identical results.
+
+| phase (CPU-s) | before, 1 worker | after, 1 worker | before, 16 workers | after, 16 workers |
+| --- | --- | --- | --- | --- |
+| `run_mma` (engine wrapper + `tc_mma_ctas`) | 14.59 | 12.45 | 19.97 | 16.17 |
+| `tc_mma_ctas` | 11.71 | 9.66 | 16.76 | 13.05 |
+| A/B operand gather (`gather_f8_rows`) | 3.74 | 2.87 | 4.85 | 3.90 |
+| scale reads (`mxf8_scale_values` / `read_mxf8_scales`) | 3.89 | 3.75 | 5.72 | 4.83 |
+| D window read | 2.06 | 1.34 | 3.21 | 1.85 |
+| D window write | 1.27 | 1.00 | 1.68 | 1.33 |
+| increasing-K FMA chain (`mma_dense_tail`) | 0.53 | 0.49 | 0.73 | 0.69 |
+| scale application | 0.10 | 0.10 | 0.14 | 0.12 |
+
+Per MMA the engine callbacks are called about 2,200 times: 544 shared-memory reads,
+1,404 TMEM reads (about 1,150 of them single-cell scale reads, every row's scale in
+every replica) and 256 TMEM writes. A scale cell read costs about 25 ns, nearly all
+inside the engine callback (arena borrow, allocation and overlay lookup, validity
+check, copy, read note).
+
+**Finding: about 95% of `tc_mma_ctas` is per-piece operand and accumulator I/O through
+the engine callbacks, not arithmetic** (the FMA chain is 4-5%). Medium end to end
+moved about 6-8% at 1 worker and within noise at 16. Reading each scale lane as one
+run (4x fewer calls; scales 3.70 -> 2.07 s in a prototype) was declined: it changes
+the first-error offset order and the uninitialized-span granularity for invalid scale
+cells. The next lever is the engine's per-callback cost (resolve the window's
+allocation and overlay once per MMA, keep per-cell validity and notes); see the
+contract request draft routed by the coordinator.
+

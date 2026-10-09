@@ -462,12 +462,17 @@ pub fn narrow_float_bits_to_f32_checked(bits: u8, format: NarrowFloatFormat) -> 
     ))
 }
 
-/// Decode one unsigned E8M0 exponent payload into `f32`.
+/// Decode one unsigned E8M0 exponent payload into `f32`: `2^(bits - 127)`
+/// exactly (code 0 is the binary32 subnormal `2^-127`), code `0xff` is
+/// `f32::NAN`. Built from the bit pattern (perf: the block-scale reads decode
+/// one scale per row per MMA); equal to `2.0f32.powi(bits - 127)` for every
+/// code (exhaustive test).
+#[inline]
 pub fn float8_e8m0fnu_bits_to_f32(bits: u8) -> f32 {
-    if bits == 0xff {
-        f32::NAN
-    } else {
-        2.0_f32.powi(bits as i32 - 127)
+    match bits {
+        0xff => f32::NAN,
+        0 => f32::from_bits(0x0040_0000),
+        _ => f32::from_bits(u32::from(bits) << 23),
     }
 }
 
@@ -545,6 +550,24 @@ fn round_shift_right_even(value: u32, shift: u32) -> u32 {
 
 #[cfg(test)]
 mod codec_tests {
+
+    /// The bit-built E8M0 decode equals the old `powi` form for all 256 codes.
+    #[test]
+    fn e8m0_decode_matches_powi_exhaustively() {
+        for bits in 0..=255_u8 {
+            let reference = if bits == 0xff {
+                f32::NAN
+            } else {
+                2.0_f32.powi(i32::from(bits) - 127)
+            };
+            assert_eq!(
+                float8_e8m0fnu_bits_to_f32(bits).to_bits(),
+                reference.to_bits(),
+                "{bits:#04x}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
