@@ -274,8 +274,8 @@ fn tma(c: &mut Criterion) {
     g.bench_function("load_bf16_64x128_sw128_oob_uncached", |b| {
         b.iter(|| black_box(oplib::tma_plan_dir(&map, oplib::TmaPlanDir::Load, TmaMode::Tile, &[4064, 256], &[], 0x400).unwrap()))
     });
-    // FP4 (e2m1) interior box, the Mega MoE weight loads: bypasses the plan
-    // cache (sub-byte elements), so it measures the layout cache.
+    // FP4 (e2m1) interior box at 128-aligned inner origins: served by the
+    // plan cache (sub-byte loads, W4).
     let fp4 = oplib::TensorMapDesc { elem: Some(Dtype::E2M1), box_dim: [128, 64, 1, 1, 1], global_stride: [2048, 0, 0, 0, 0], ..map.clone() };
     let mut fp4_k = 0i64;
     g.bench_function("load_e2m1_128x64_sw128", |b| {
@@ -283,6 +283,26 @@ fn tma(c: &mut Criterion) {
             fp4_k = (fp4_k + 128) % 4096;
             black_box(oplib::tma_plan_dir(&fp4, oplib::TmaPlanDir::Load, TmaMode::Tile, &[fp4_k, 256], &[], 0x400).unwrap())
         })
+    });
+    // The Mega MoE medium FP4 weight load (128 x 128 box of a 2048 x 294912
+    // packed e2m1 tensor, 128B swizzle), and the same box at an inner origin
+    // that is not 128-aligned (planned directly).
+    let moe = oplib::TensorMapDesc {
+        elem: Some(Dtype::E2M1),
+        global_dim: [2048, 294_912, 1, 1, 1],
+        global_stride: [1024, 0, 0, 0, 0],
+        box_dim: [128, 128, 1, 1, 1],
+        ..map.clone()
+    };
+    let mut moe_row = 0i64;
+    g.bench_function("load_e2m1_128x128_sw128_mega_moe", |b| {
+        b.iter(|| {
+            moe_row = (moe_row + 128) % 294_784;
+            black_box(oplib::tma_plan_dir(&moe, oplib::TmaPlanDir::Load, TmaMode::Tile, &[(moe_row / 128 % 16) * 128, moe_row], &[], 0x400).unwrap())
+        })
+    });
+    g.bench_function("load_e2m1_128x128_sw128_unaligned_uncached", |b| {
+        b.iter(|| black_box(oplib::tma_plan_dir(&moe, oplib::TmaPlanDir::Load, TmaMode::Tile, &[64, 256], &[], 0x400).unwrap()))
     });
     let bytes = map.encode();
     g.bench_function("descriptor_decode", |b| b.iter(|| oplib::TensorMapDesc::decode(black_box(&bytes)).unwrap()));

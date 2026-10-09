@@ -97,6 +97,12 @@ impl NarrowFormat {
         f32::from_bits(narrow_decode_table()[self as usize][usize::from(bits)])
     }
 
+    /// The 256-entry decode table [`decode_value`](Self::decode_value) reads
+    /// (f32 bits per code).
+    pub fn decode_table(self) -> &'static [u32; 256] {
+        &narrow_decode_table()[self as usize]
+    }
+
     /// The direct (table-free) decode [`decode_value`](Self::decode_value) is built from.
     pub fn decode_value_direct(self, bits: u8) -> f32 {
         narrow_float_bits_to_f32_checked(bits, self.format()).unwrap_or(f32::NAN)

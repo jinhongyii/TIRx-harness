@@ -264,3 +264,61 @@ experiments on this bench (code temporarily removed, not kept):
 
 In the Mega MoE run, gather moved only 4%. The per-atom reader dispatch and the offset
 finish dominate there, not the decode.
+
+## Sub-byte TMA plan caching and the K-major F8/F6/F4 gather (W4, 2026-10-09)
+
+Both changes are exact. Fixture: Mega MoE medium (`t64_h2048_i1536_e96_k4_g1`), 1 worker,
+scratch-only phase counters, median of 3 interleaved runs against c257bfe. Conformance 304
+passed. Output digests of 14 cases are identical to c257bfe at 1/8/32 workers. The cases
+cover both Mega MoE fixtures, `nvfp4_gemm`, `fastcu_nvfp4_gemm_gb300`, `flash_attention4(_fp4)`,
+sm107 block-scaled, `mxfp4_quantize` and the grouped GEMMs.
+
+**TMA plans.** The translation cache (`oplib/tma/cache.rs`) now also serves sub-byte (FP4, U6)
+loads whose inner origin is a multiple of 128 elements:
+- every origin-dependent check passes there exactly as at coordinate 0: packed FP4 needs
+  a multiple of 2, padded FP4 and U6 a multiple of 128;
+- `c_0 * bits / 8` is exact, so the plan is the coordinate-0 plan shifted.
+
+Sub-byte stores and other origins are still planned directly. The guard is
+`cached_sub_byte_plans_equal_direct_plans`: plan or error equal to the direct planner for FP4
+packed/padded and U6, every swizzle, ranks 1-3, loads and stores, aligned and unaligned
+origins, at least 150 cache-served plans. A wrong shift or 2-element alignment fails it.
+
+| bench | before | after |
+| --- | --- | --- |
+| `tma_plan/load_e2m1_128x128_sw128_mega_moe` (new) | 7.90 us | 0.48 us (16.6x) |
+| `tma_plan/load_e2m1_128x64_sw128` | 4.00 us | 0.33 us (12x) |
+| `tma_plan/load_e2m1_128x128_sw128_unaligned_uncached` (new) | 7.95 us | 7.87 us (direct planner) |
+
+On medium, `tma_plan_dir` falls from 1.36 s to 0.11 s over 168,192 calls. The 55,296 FP4
+weight loads were 22 us each.
+
+**Operand gather.** `gather_f8_rows`, K-major with whole 16-value atoms, now does:
+- the same shared reads in the same order;
+- each offset from `SharedOffsets`, which hoists the descriptor and window constants and
+  returns a value only when `shared_byte_offset` would return `Ok` with it; otherwise
+  `shared_byte_offset` itself is called and produces the error;
+- decode through a per-call `AtomDecoder`: the FP8 table, or a 16-entry E2M1 table built
+  from `float4_e2m1fn_bits_to_f32`, with negation as a sign-bit flip;
+- writes straight into the output.
+
+Guards:
+- `k_major_f8_gather_equals_the_reference_loop`: the pre-change loop is kept as the oracle;
+  values are compared as bits, plus error text and the read log, over every format, K,
+  padding, negation, swizzle, column masks, short windows and failing reads;
+- `atom_decoder_matches_decode_shared_atom`: every byte in every position;
+- `shared_offsets_agree_with_shared_byte_offset`: random descriptors and windows.
+
+Mutations (no view check, a wrong E2M1 mask, a wrong row offset) fail them.
+
+| bench | before | after |
+| --- | --- | --- |
+| `tcgen05_gather/f8_rows_256x32_sw128` | 19.06 us | 9.56 us (2.0x) |
+| `tcgen05_gather/f4_rows_256x32_sw128` (new) | 20.92 us | 8.97 us (2.3x) |
+
+| medium phase (CPU-s, 1 worker) | c257bfe | after |
+| --- | --- | --- |
+| `run_mma` | 8.01 | 5.96 |
+| A/B operand gather | 3.38 | 1.81 |
+| `tma_plan_dir` | 1.36 | 0.11 |
+| process wall | 26.9 s | 22.4 s |

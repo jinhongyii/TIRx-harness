@@ -196,7 +196,7 @@ pub fn f8_b_descriptor(
 /// power-of-two atom sizes descriptors decode to (16 or 32 bytes), the
 /// division otherwise (perf: this runs per operand piece). Same results.
 #[inline]
-fn div_rem_atom(value: usize, atom_bytes: usize) -> (usize, usize) {
+pub(crate) fn div_rem_atom(value: usize, atom_bytes: usize) -> (usize, usize) {
     if atom_bytes.is_power_of_two() {
         (value >> atom_bytes.trailing_zeros(), value & (atom_bytes - 1))
     } else {
@@ -260,6 +260,100 @@ pub fn shared_byte_offset(
         .and_then(|value| value.checked_add(column_offset))
         .ok_or_else(|| OpError::message("raw TCGEN source address overflow"))?;
     finish_shared_byte_offset(source, descriptor, unswizzled, access_bytes)
+}
+
+/// [`shared_byte_offset`] with the descriptor- and window-derived constants
+/// computed once per operand (perf, W4: the K-major gathers call it per
+/// 16-byte atom). [`offset`](Self::offset) returns `Some` only when
+/// `shared_byte_offset` returns `Ok` with that same value; every other case
+/// (any error, any overflow, the absolute-LDO and non-power-of-two-atom
+/// layouts) is `None`, and callers then call `shared_byte_offset` itself, so
+/// errors and their order are unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedOffsets {
+    source: SharedWindow,
+    descriptor: MatrixDescriptor,
+    fast: bool,
+    row_stride: usize,
+    column_stride: usize,
+    atom_shift: u32,
+    swizzle_mask: usize,
+    view_end: usize,
+}
+
+impl SharedOffsets {
+    pub fn new(source: SharedWindow, descriptor: MatrixDescriptor) -> Self {
+        let atom = descriptor.swizzle_atom_bytes;
+        let row_stride = u32::try_from(descriptor.swizzle_bits)
+            .ok()
+            .and_then(|bits| atom.checked_shl(bits));
+        let view_end = source.view_offset.checked_add(source.view_len);
+        let fast = !descriptor.absolute_leading_address
+            && atom.is_power_of_two()
+            && descriptor.swizzle_bits < 16
+            && descriptor.swizzle_xor_shift < usize::BITS as usize
+            && row_stride.is_some()
+            && view_end.is_some();
+        let column_stride = if descriptor.swizzle_bits == 0 {
+            descriptor.leading_byte_offset.max(atom)
+        } else {
+            atom
+        };
+        Self {
+            source,
+            descriptor,
+            fast,
+            row_stride: row_stride.unwrap_or(0),
+            column_stride,
+            atom_shift: atom.trailing_zeros(),
+            swizzle_mask: if descriptor.swizzle_bits < 16 { (1_usize << descriptor.swizzle_bits) - 1 } else { 0 },
+            view_end: view_end.unwrap_or(0),
+        }
+    }
+
+    /// `shared_byte_offset(source, descriptor, row, byte_in_row, access_bytes)`
+    /// when that is `Ok`, computed without re-deriving the constants;
+    /// `None` when the caller must call `shared_byte_offset`.
+    #[inline]
+    pub fn offset(&self, row: usize, byte_in_row: usize, access_bytes: usize) -> Option<usize> {
+        if !self.fast {
+            return None;
+        }
+        let descriptor = &self.descriptor;
+        let atom_bytes = descriptor.swizzle_atom_bytes;
+        let atom = byte_in_row >> self.atom_shift;
+        let byte_in_atom = byte_in_row & (atom_bytes - 1);
+        if byte_in_atom.checked_add(access_bytes)? > atom_bytes {
+            return None;
+        }
+        if descriptor.swizzle_bits == 0 && atom != 0 && descriptor.leading_byte_offset == 0 {
+            return None;
+        }
+        let column_offset = atom.checked_mul(self.column_stride)?.checked_add(byte_in_atom)?;
+        let unswizzled = descriptor
+            .start_address
+            .checked_add((row % 8).checked_mul(self.row_stride)?)?
+            .checked_add((row / 8).checked_mul(descriptor.stride_byte_offset)?)?
+            .checked_add(column_offset)?;
+        let swizzled = if descriptor.swizzle_bits == 0 {
+            unswizzled
+        } else {
+            let byte_in_atom = unswizzled & (atom_bytes - 1);
+            let atom_index = unswizzled >> self.atom_shift;
+            let shift = descriptor.swizzle_xor_shift;
+            let swizzled_atom = atom_index ^ ((atom_index & (self.swizzle_mask << shift)) >> shift);
+            (swizzled_atom << self.atom_shift) | byte_in_atom
+        };
+        let source = &self.source;
+        let relative = swizzled.checked_add(source.view_offset)?.checked_sub(source.virtual_base)?;
+        let end = relative.checked_add(access_bytes)?;
+        if end > source.backing_byte_len
+            || (source.access_view && (relative < source.view_offset || end > self.view_end))
+        {
+            return None;
+        }
+        relative.checked_sub(source.view_offset)
+    }
 }
 
 /// Swizzle an absolute virtual address and make it window-relative

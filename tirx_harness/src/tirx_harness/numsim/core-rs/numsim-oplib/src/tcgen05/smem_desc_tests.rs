@@ -388,3 +388,55 @@ fn unaligned_swizzled_base_differs_from_buffer_relative_swizzle() {
     // Row bit 1 flips K chunk 0 <-> 1 (the observed "k ^ 8 when (i//2)%2 differs").
     assert_eq!(differing_rows, [2, 3, 6, 7]);
 }
+
+/// `SharedOffsets::offset` is `Some` only where `shared_byte_offset` is `Ok`
+/// with the same value, over random descriptors (every swizzle, LDO 0 and
+/// not, absolute LDO), windows (access views, short backings, bases above
+/// and below the descriptor address), rows, columns and access sizes; and it
+/// serves the ordinary in-bounds case.
+#[test]
+fn shared_offsets_agree_with_shared_byte_offset() {
+    let mut seed = 0x2545_f491_u64;
+    let mut next = move |bound: usize| {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 33) as usize) % bound
+    };
+    let (mut served, mut ok_total, mut checked) = (0, 0, 0);
+    for _ in 0..4000 {
+        let swizzle_bits = next(4);
+        let descriptor = MatrixDescriptor {
+            start_address: next(1 << 16) & !15,
+            leading_byte_offset: [0, 16, 128, 4096][next(4)] + 16 * next(2),
+            absolute_leading_address: next(8) == 0,
+            stride_byte_offset: [0, 256, 1024, 8192][next(4)],
+            swizzle_bits,
+            swizzle_atom_bytes: [16, 16, 32, 48][next(4)],
+            swizzle_xor_shift: [3, 4, 7][next(3)],
+        };
+        let backing = 1 << (12 + next(6));
+        let view_offset = if next(2) == 0 { 0 } else { next(backing) };
+        let source = SharedWindow {
+            virtual_base: next(1 << 16),
+            view_offset,
+            view_len: next(backing - view_offset + 1),
+            backing_byte_len: backing,
+            access_view: next(2) == 0,
+        };
+        let offsets = SharedOffsets::new(source, descriptor);
+        for _ in 0..32 {
+            let row = next(300);
+            let column = next(160);
+            let access = 1 + next(16);
+            let direct = shared_byte_offset(source, descriptor, row, column, access);
+            let fast = offsets.offset(row, column, access);
+            if let Some(value) = fast {
+                assert_eq!(direct.as_ref().ok(), Some(&value), "{descriptor:?} {source:?} row {row} column {column} access {access}");
+                served += 1;
+            }
+            ok_total += usize::from(direct.is_ok());
+            checked += 1;
+        }
+    }
+    assert!(checked > 0 && ok_total > 1000, "{ok_total} Ok of {checked}");
+    assert!(served * 2 > ok_total, "served {served} of {ok_total} Ok offsets");
+}

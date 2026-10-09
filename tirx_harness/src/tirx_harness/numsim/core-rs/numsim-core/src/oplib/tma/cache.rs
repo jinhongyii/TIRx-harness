@@ -10,7 +10,16 @@
 //! all. Plans are cached per (map, direction, shared offset), planned at
 //! coordinates 0 with the map's own address (so every address check sees the
 //! real map), and shifted on use. Everything else (OOB boxes, gather/scatter,
-//! im2col, interleaved and sub-byte maps) is planned directly.
+//! im2col and interleaved maps) is planned directly.
+//!
+//! Sub-byte (FP4, U6) loads are cached too when the inner origin is a
+//! multiple of 128 elements (perf, W4: the Mega MoE FP4 weight loads were
+//! ~22 us per uncached plan). Then every origin-dependent check passes at the
+//! origin exactly as at coordinate 0 (FP4 packed origins must be multiples of
+//! 2, FP4 padded and U6 of 128), and the inner byte offset
+//! `(c_0 + e_0) * bits / 8` equals `c_0 * bits / 8 + e_0 * bits / 8` because
+//! `c_0 * bits` is a multiple of 8. Sub-byte stores (masked fragments) and
+//! other origins are planned directly.
 
 use super::super::{OpResult, TensorMapDesc, TmaPlan, TmaPlanDir};
 use crate::arena::ByteSpan;
@@ -30,7 +39,13 @@ thread_local! {
 
 /// Byte offset of `coords` from the tensor base, when the box at `coords`
 /// is interior and the map qualifies; `None` otherwise.
-fn interior_shift(map: &TensorMapDesc, mode: TmaMode, coords: &[i64], im2col_offsets: &[i64]) -> Option<u64> {
+fn interior_shift(
+    map: &TensorMapDesc,
+    dir: TmaPlanDir,
+    mode: TmaMode,
+    coords: &[i64],
+    im2col_offsets: &[i64],
+) -> Option<u64> {
     let rank = usize::from(map.rank);
     if mode != TmaMode::Tile
         || !im2col_offsets.is_empty()
@@ -42,8 +57,12 @@ fn interior_shift(map: &TensorMapDesc, mode: TmaMode, coords: &[i64], im2col_off
         return None;
     }
     let elem = map.elem?;
-    let bits = elem.bits();
-    if bits < 8 || bits % 8 != 0 {
+    let bits = u64::from(elem.bits());
+    if bits >= 8 {
+        if bits % 8 != 0 {
+            return None;
+        }
+    } else if dir != TmaPlanDir::Load || coords[0].rem_euclid(128) != 0 {
         return None;
     }
     let mut shift: u64 = 0;
@@ -53,10 +72,21 @@ fn interior_shift(map: &TensorMapDesc, mode: TmaMode, coords: &[i64], im2col_off
         if extent == 0 || c.checked_add(extent)? > map.global_dim[i] {
             return None;
         }
-        let stride = if i == 0 { u64::from(bits / 8) } else { map.global_stride[i - 1] };
-        shift = shift.checked_add(c.checked_mul(stride)?)?;
+        let bytes = if i == 0 {
+            // Exact: `c` is a multiple of 128 for sub-byte elements.
+            c.checked_mul(bits)? / 8
+        } else {
+            c.checked_mul(map.global_stride[i - 1])?
+        };
+        shift = shift.checked_add(bytes)?;
     }
     Some(shift)
+}
+
+/// Test hook: does the cache serve this request (before its own fallbacks)?
+#[cfg(test)]
+pub(super) fn eligible(map: &TensorMapDesc, dir: TmaPlanDir, mode: TmaMode, coords: &[i64], im2col_offsets: &[i64]) -> bool {
+    interior_shift(map, dir, mode, coords, im2col_offsets).is_some()
 }
 
 pub(super) fn plan(
@@ -67,7 +97,7 @@ pub(super) fn plan(
     im2col_offsets: &[i64],
     smem_offset: u64,
 ) -> OpResult<TmaPlan> {
-    let Some(shift) = interior_shift(map, mode, coords, im2col_offsets) else {
+    let Some(shift) = interior_shift(map, dir, mode, coords, im2col_offsets) else {
         return super::plan_uncached(map, dir, mode, coords, im2col_offsets, smem_offset);
     };
     let delta = shift;

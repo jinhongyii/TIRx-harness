@@ -24,8 +24,8 @@ use super::narrow::{tf32_payload_to_f32, NarrowFormat};
 use super::scale::{decode_ue8m0_scale, read_block_scale, ScaleDecoder};
 use super::smem_desc::{
     b16_matrix_byte_offset, byte8_matrix_byte_offset, lut_b_row_accesses, masked_row,
-    matrix_byte_offset, narrow_shared_atom_accesses, shared_byte_offset, ColumnMask,
-    MatrixDescriptor, SharedWindow,
+    div_rem_atom, matrix_byte_offset, narrow_shared_atom_accesses, shared_byte_offset, ColumnMask,
+    MatrixDescriptor, SharedOffsets, SharedWindow,
 };
 use crate::cvt::float4_e2m1fn_bits_to_f32;
 use crate::types::{OpError, OpResult};
@@ -287,6 +287,19 @@ pub fn gather_f8_rows(
     mask: Option<ColumnMask>,
     padded_atoms: bool,
 ) -> OpResult<Vec<f32>> {
+    if !transpose && k_extent != 0 && k_extent.is_multiple_of(16) {
+        return gather_f8_rows_k_major(
+            read_shared,
+            source,
+            descriptor,
+            rows,
+            k_extent,
+            format,
+            negate,
+            mask,
+            padded_atoms,
+        );
+    }
     let mut values = Vec::with_capacity(rows * k_extent);
     for row in 0..rows {
         let Some(row) = masked_row(mask, row) else {
@@ -331,6 +344,101 @@ pub fn gather_f8_rows(
         }
     }
     Ok(values)
+}
+
+/// The K-major (`!transpose`, whole 16-value atoms) case of
+/// [`gather_f8_rows`] (perf, W4: the Mega MoE operand gathers). The same
+/// shared reads in the same order with the same offsets (each from
+/// [`SharedOffsets`], or [`shared_byte_offset`] when that declines), the same
+/// per-value decode (one table per call instead of per atom), written in
+/// place: results and errors are identical.
+#[allow(clippy::too_many_arguments)]
+fn gather_f8_rows_k_major(
+    read_shared: &mut impl SharedRead,
+    source: SharedWindow,
+    descriptor: MatrixDescriptor,
+    rows: usize,
+    k_extent: usize,
+    format: NarrowFormat,
+    negate: bool,
+    mask: Option<ColumnMask>,
+    padded_atoms: bool,
+) -> OpResult<Vec<f32>> {
+    let mut values = vec![0.0_f32; rows * k_extent];
+    let offsets = SharedOffsets::new(source, descriptor);
+    let decoder = AtomDecoder::new(format);
+    let bytes = format.payload_bytes_per_k16();
+    let atom_stride = if padded_atoms { 16 } else { format.shared_atom_stride(k_extent) };
+    let atom_bytes = descriptor.swizzle_atom_bytes;
+    for (row, out_row) in values.chunks_exact_mut(k_extent).enumerate() {
+        let Some(row) = masked_row(mask, row) else {
+            continue;
+        };
+        for (atom, out) in out_row.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            // `narrow_shared_atom_accesses`, inlined.
+            let mut bits = [0_u8; 16];
+            let start = atom * atom_stride;
+            let mut done = 0;
+            while done < bytes {
+                let column = start + done;
+                let count = (bytes - done).min(atom_bytes - div_rem_atom(column, atom_bytes).1);
+                let offset = match offsets.offset(row, column, count) {
+                    Some(offset) => offset,
+                    None => shared_byte_offset(source, descriptor, row, column, count)?,
+                };
+                read_shared(offset, &mut bits[done..done + count])?;
+                done += count;
+            }
+            decoder.decode_into(&bits, out, negate);
+        }
+    }
+    Ok(values)
+}
+
+/// Per-call decoder of 16-value shared atoms, bit-identical to
+/// [`NarrowFormat::decode_shared_atom`] (exhaustively tested).
+pub struct AtomDecoder {
+    format: NarrowFormat,
+    table: &'static [u32; 256],
+    e2m1: [f32; 16],
+}
+
+impl AtomDecoder {
+    pub fn new(format: NarrowFormat) -> Self {
+        Self {
+            format,
+            table: format.decode_table(),
+            e2m1: std::array::from_fn(|code| float4_e2m1fn_bits_to_f32(code as u8)),
+        }
+    }
+
+    /// `out[i] = decode_shared_atom(bits)[i]`, negated when `negate`.
+    #[inline]
+    pub fn decode_into(&self, bits: &[u8; 16], out: &mut [f32; 16], negate: bool) {
+        let sign = if negate { 0x8000_0000_u32 } else { 0 };
+        match self.format {
+            NarrowFormat::E2M1 => {
+                for (pair, &byte) in out.as_chunks_mut::<2>().0.iter_mut().zip(bits) {
+                    pair[0] = f32::from_bits(self.e2m1[usize::from(byte & 0x0f)].to_bits() ^ sign);
+                    pair[1] = f32::from_bits(self.e2m1[usize::from(byte >> 4)].to_bits() ^ sign);
+                }
+            }
+            _ if self.format.format().width_bits == 8 => {
+                for (value, &code) in out.iter_mut().zip(bits) {
+                    *value = f32::from_bits(self.table[usize::from(code)] ^ sign);
+                }
+            }
+            _ => {
+                let width = self.format.format().width_bits;
+                let packed = u128::from_le_bytes(*bits);
+                let mask = (1_u128 << width) - 1;
+                for (i, value) in out.iter_mut().enumerate() {
+                    let code = ((packed >> (i as u32 * width)) & mask) as usize;
+                    *value = f32::from_bits(self.table[code] ^ sign);
+                }
+            }
+        }
+    }
 }
 
 /// TF32 rows of one CTA (storage bits, truncated mantissa).
@@ -625,6 +733,143 @@ pub fn cta2_window_cells(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-W4 `gather_f8_rows` loop, verbatim: the oracle for the
+    /// K-major fast path.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_f8_rows_reference(
+        read_shared: &mut impl SharedRead,
+        source: SharedWindow,
+        descriptor: MatrixDescriptor,
+        rows: usize,
+        k_extent: usize,
+        format: NarrowFormat,
+        negate: bool,
+        mask: Option<ColumnMask>,
+        padded_atoms: bool,
+    ) -> OpResult<Vec<f32>> {
+        let mut values = Vec::with_capacity(rows * k_extent);
+        for row in 0..rows {
+            let Some(row) = masked_row(mask, row) else {
+                values.resize(values.len() + k_extent, 0.0);
+                continue;
+            };
+            for atom in 0..k_extent / 16 {
+                let mut bits = [0_u8; 16];
+                let mut done = 0;
+                narrow_shared_atom_accesses(
+                    source,
+                    descriptor,
+                    row,
+                    k_extent,
+                    format,
+                    atom,
+                    |offset, count| {
+                        read_shared(offset, &mut bits[done..done + count])?;
+                        done += count;
+                        Ok(())
+                    },
+                    padded_atoms,
+                )?;
+                let decoded = format.decode_shared_atom(bits);
+                if negate {
+                    values.extend(decoded.into_iter().map(|v| -v));
+                } else {
+                    values.extend_from_slice(&decoded);
+                }
+            }
+        }
+        Ok(values)
+    }
+
+    /// The K-major gather equals the reference loop: same values (bits,
+    /// NaN payloads included), same error text, and the same shared reads
+    /// in the same order, for every format, K, padding, negation, swizzle,
+    /// zero-column masks, short windows (offset errors) and failing reads.
+    #[test]
+    fn k_major_f8_gather_equals_the_reference_loop() {
+        use super::super::encode::encode_matrix_descriptor;
+        use super::super::smem_desc::decode_matrix_descriptor;
+        let mut seed = 0x0bad_5eed_u64;
+        let mut next = move |bound: usize| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) as usize) % bound
+        };
+        let smem: Vec<u8> = (0..1 << 15).map(|i| (i * 131 + (i >> 7) * 17 + 5) as u8).collect();
+        let formats = [NarrowFormat::E4M3, NarrowFormat::E5M2, NarrowFormat::E2M3, NarrowFormat::E3M2, NarrowFormat::E2M1];
+        let (mut ok_cases, mut err_cases) = (0, 0);
+        for case in 0..3000 {
+            let swizzle = next(5) as i64;
+            let start = (next(1 << 12) & !127) as u32;
+            let bits = encode_matrix_descriptor(start, [0, 1, 8, 64][next(4)], [8, 64, 128][next(3)], swizzle);
+            let Ok(descriptor) = decode_matrix_descriptor(bits) else { continue };
+            let format = formats[next(5)];
+            let k = [16, 32, 64, 128][next(4)];
+            let rows = 1 + next(160);
+            let backing = if next(4) == 0 { 1 << (8 + next(6)) } else { smem.len() };
+            let source = SharedWindow {
+                virtual_base: if next(6) == 0 { 64 } else { 0 },
+                view_offset: 0,
+                view_len: backing,
+                backing_byte_len: backing,
+                access_view: next(2) == 0,
+            };
+            let mask = if next(4) == 0 { ColumnMask::new(((next(1 << 20) as u64) << 8) | ((next(9) as u64) << 56), 128, 256, 3 << 30).ok() } else { None };
+            let poison = if next(5) == 0 { Some(next(1 << 14)) } else { None };
+            let negate = next(2) == 0;
+            let padded = next(2) == 0;
+            let run = |fast: bool| {
+                let mut log = Vec::new();
+                let mut read = |offset: usize, out: &mut [u8]| {
+                    log.push((offset, out.len()));
+                    if poison.is_some_and(|p| (offset..offset + out.len()).contains(&p)) {
+                        return Err(OpError::message(format!("poisoned read at {offset}")));
+                    }
+                    let bytes = smem.get(offset..offset + out.len()).ok_or_else(|| OpError::message("read past smem"))?;
+                    out.copy_from_slice(bytes);
+                    Ok(())
+                };
+                let result = if fast {
+                    gather_f8_rows(&mut read, source, descriptor, rows, k, format, negate, false, mask, padded)
+                } else {
+                    gather_f8_rows_reference(&mut read, source, descriptor, rows, k, format, negate, mask, padded)
+                };
+                let result = result
+                    .map(|values| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+                    .map_err(|e| e.to_string());
+                (result, log)
+            };
+            let (fast, reference) = (run(true), run(false));
+            assert_eq!(fast, reference, "case {case}: {descriptor:?} {format:?} k {k} rows {rows} padded {padded} negate {negate} mask {mask:?}");
+            if reference.0.is_ok() { ok_cases += 1 } else { err_cases += 1 }
+        }
+        assert!(ok_cases > 500 && err_cases > 100, "ok {ok_cases} err {err_cases}");
+    }
+
+    /// `AtomDecoder` equals `decode_shared_atom` (negated by `-v` when
+    /// asked) for every format on every byte value in every position.
+    #[test]
+    fn atom_decoder_matches_decode_shared_atom() {
+        for format in [NarrowFormat::E4M3, NarrowFormat::E5M2, NarrowFormat::E2M3, NarrowFormat::E3M2, NarrowFormat::E2M1] {
+            let decoder = AtomDecoder::new(format);
+            for byte in 0..=255_u8 {
+                for position in 0..16 {
+                    let mut bits = [0x5a_u8; 16];
+                    bits[position] = byte;
+                    bits[(position + 7) % 16] = byte.rotate_left(3);
+                    let expected = format.decode_shared_atom(bits);
+                    for negate in [false, true] {
+                        let mut out = [0.0_f32; 16];
+                        decoder.decode_into(&bits, &mut out, negate);
+                        for i in 0..16 {
+                            let want = if negate { -expected[i] } else { expected[i] };
+                            assert_eq!(out[i].to_bits(), want.to_bits(), "{format:?} byte {byte:#x} position {position} value {i} negate {negate}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn lut_b_row_decode_reads_three_bit_indices_across_bytes() {

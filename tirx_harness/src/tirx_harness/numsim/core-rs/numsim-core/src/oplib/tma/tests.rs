@@ -709,6 +709,73 @@ fn cached_tiled_plans_equal_direct_plans() {
     assert!(checked > 0);
 }
 
+/// Sub-byte maps (FP4 packed and padded, U6): the translation cache serves
+/// loads whose inner origin is a multiple of 128 and returns exactly the
+/// direct planner's plan or error for every origin, direction, swizzle,
+/// rank and shared offset (W4: FP4 weight loads).
+#[test]
+fn cached_sub_byte_plans_equal_direct_plans() {
+    use super::super::{TensorMapDesc, TmaPlanDir};
+    let mut seed = 0x51ed_270b_u64;
+    let mut next = move |bound: u64| {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % bound
+    };
+    let (mut checked, mut served_ok) = (0, 0);
+    for (elem, padded, bits) in [(Dtype::E2M1, false, 4_u64), (Dtype::E2M1, true, 4), (Dtype::U6, false, 6)] {
+        for swizzle in 0..=3_u8 {
+            for inner_box in [64_u32, 128, 256] {
+                for rank in 1..=3_u8 {
+                    let row_bytes = 1024 * bits / 8 + 128;
+                    let mut map = TensorMapDesc {
+                        global_address: 0x1_0000_0000 + 0x100 * next(16),
+                        rank,
+                        elem: Some(elem),
+                        global_dim: [1024, 48, 6, 1, 1],
+                        global_stride: [row_bytes, row_bytes * 48, 0, 0, 0],
+                        box_dim: [inner_box, 8, 2, 1, 1],
+                        element_stride: [1, 1, 1, 1, 1],
+                        swizzle,
+                        fp4_padded: padded,
+                        ..Default::default()
+                    };
+                    for i in usize::from(rank)..5 {
+                        map.global_dim[i] = 1;
+                        map.box_dim[i] = 1;
+                    }
+                    for dir in [TmaPlanDir::Load, TmaPlanDir::Store] {
+                        for round in 0..16 {
+                            let mut coords: Vec<i64> = (0..usize::from(rank))
+                                .map(|i| next(map.global_dim[i] + 8) as i64 - 4)
+                                .collect();
+                            coords[0] = match round % 4 {
+                                // Aligned (cache-eligible when interior).
+                                0 | 1 => 128 * next(9) as i64,
+                                // Packed-aligned but not 128-aligned.
+                                2 => 2 * next(512) as i64,
+                                _ => next(1032) as i64 - 4,
+                            };
+                            let smem = 0x400 * next(4) + 0x80 * next(2);
+                            let direct = super::plan_uncached(&map, dir, TmaMode::Tile, &coords, &[], smem);
+                            let cached = super::plan(&map, dir, TmaMode::Tile, &coords, &[], smem);
+                            let eligible = super::cache::eligible(&map, dir, TmaMode::Tile, &coords, &[]);
+                            served_ok += usize::from(eligible && direct.is_ok());
+                            assert_eq!(
+                                cached.map_err(|e| e.to_string()),
+                                direct.map_err(|e| e.to_string()),
+                                "{elem:?} padded {padded} swizzle {swizzle} box {inner_box} rank {rank} {dir:?} {coords:?} smem {smem:#x}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 0);
+    assert!(served_ok >= 150, "only {served_ok} cache-served successful plans");
+}
+
 /// `tensormap.replace .elemtype` 8 / 12 (f32.ftz / tf32.ftz) are
 /// representable (`elem_ftz`), round-trip through the image, and plan like
 /// their non-FTZ types (TF32 maps keep the landing tf32 rounding).

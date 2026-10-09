@@ -257,6 +257,19 @@ fn operand_gather(c: &mut Criterion) {
             )
         })
     });
+    // The Mega MoE FP4 (e2m1) weight operand: 16 values per padded 16-byte atom.
+    g.bench_function("f4_rows_256x32_sw128", |b| {
+        b.iter(|| {
+            let mut read = |offset: usize, out: &mut [u8]| {
+                out.copy_from_slice(&smem[offset..offset + out.len()]);
+                Ok(())
+            };
+            black_box(
+                gather_f8_rows(&mut read, window, descriptor, 256, 32, NarrowFormat::E2M1, false, false, None, true)
+                    .unwrap(),
+            )
+        })
+    });
     g.finish();
 }
 
