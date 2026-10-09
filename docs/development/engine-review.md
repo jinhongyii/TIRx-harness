@@ -4,6 +4,77 @@ orphan: true
 
 # NumSim engine review: interpreter and scheduler (HEAD fff0479)
 
+## Status (W13, 2026-10-09, engine df585e9)
+
+**v2 vs legacy today.** See `perf-same-verdict.md`, "v2 now (243f9f4)" columns. NumSim is 7.5x / 6.7x / 6.7x faster than legacy at 1 / 8 / 32 workers (geometric mean over 30 rows), and no row is >10% slower. Racecheck is 5.9x / 3.6x / 3.6x and synccheck 6.7x / 5.9x / 6.1x. What remains are two multi-worker Mega MoE gaps:
+
+| Workload | Legacy | v2 now |
+|---|---|---|
+| medium, 16 workers | 5.0 s | 5.75 s (1.15x slower) |
+| medium, 32 workers | 3.7 s | 6.92 s (1.87x slower) |
+| max config | 185 s (at load 40–50) | 271.6 s (1.47x slower) |
+
+Medium at 1 worker is now 1.61x faster than legacy (22.2 s against 35.7 s).
+
+**CPU split now.** Measured on a private instrumented build of df585e9:
+- Per-partition and main-thread phases use thread CPU time; `run_cta`, `land` by kind and slices use rdtsc.
+- One run each, at host load 7–9.
+- The max config is `test_mega_moe_numsim_max_config` (16 workers).
+- The W2-era column is from the "Mega MoE max config" section below.
+
+| | Max config, 16 workers | W2-era | Medium, 1 worker | Medium, 16 workers | Medium, 32 workers |
+|---|---|---|---|---|---|
+| Rust setup and input binding | 26.0 s | 9.2 s (binding) | 0.85 s | 0.76 s | 0.78 s |
+| Round loop wall | 211.9 s | — | 21.3 s | 3.04 s | 4.20 s |
+| Parallel phase wall | 207.9 s | — | 21.1 s | 2.89 s | 3.98 s |
+| Critical path (sum over rounds of the slowest partition) | 122.7 s | 203 s | 1.42 s | 1.72 s | 3.01 s |
+| Partition CPU, total | 2,136 s | 3,460–3,712 s | 20.8 s | 28.6 s | 50.1 s |
+| `run_cta` | 1,001 s | 1,326 s | 7.6 s | 11.6 s | 19.9 s |
+| of which blocked warps re-polled | 203 s (32.2 M slices; 118 M repeats applied without re-running) | 288 s (151 M slices) | 0.13 s | 0.20 s | 0.34 s |
+| `land` | 1,136 s | 2,074 s | 13.1 s | 17.0 s | 30.1 s |
+| of which MMA | 700 s | 1,309–1,356 s | 6.7 s | 8.5 s | 15.1 s |
+| of which TcgenCp | 174 s | 131 s | 2.7 s | 3.4 s | 6.1 s |
+| of which Copy | 177 s | 114 s | 2.1 s | 2.8 s | 4.7 s |
+| of which landing scan | 79 s | 75 s | 1.6 s | 2.2 s | 4.0 s |
+| Merge and replay (main thread) | 12.5 s | — | 0.09 s | 0.16 s | 0.23 s |
+| Serial phase | 3.1 s | 0.5 s | 0.12 s | 0.09 s | 0.15 s |
+| Turnover | 0.7 s | 0.9 s | 0.02 s | 0.03 s | 0.04 s |
+
+Medium's `Engine.run` wall is 1.8–1.9 s above `run_with_config` at every worker count: Python-side binding and report. At 16 workers that is a third of the 5.7 s.
+
+**What the remaining gaps are.**
+1. **Round-wall overhead and imbalance.**
+   - The max config's parallel-phase wall (208 s) exceeds both the critical path (123 s) and CPU/16 (134 s).
+   - The 74 partitions are handed to 16 workers dynamically in index order, so a round ends when the worker that drew the most work finishes.
+   - Lever: longest-first assignment. Hand out partitions in descending order of their previous round's cost. Results do not depend on it, because only the thread changes, and its benefit is bounded by the wall-vs-max(crit, CPU/16) gap.
+   - Medium at 16 workers shows the same overhead: 2.89 s wall against a critical path of 1.72 s and 28.6/16 = 1.79 s.
+   - Owner: W13 / W2 (sched).
+2. **Per-partition CPU inflation with worker count.**
+   - Medium partition CPU is 20.8 s at 1 worker, 28.6 s at 16 (1.37x) and 50.1 s at 32 (2.4x). At 32 workers the critical path itself grows to 3.0 s.
+   - This is user-mode CPU in the partitions' own code, and its cause is not attributed (below).
+3. **MMA landing** (700 s on the max config, 33% of partition CPU). Oplib, W4.
+4. **Fixed costs outside the round loop.**
+   - Max config: 26 s of Rust setup and binding, up from 9.2 s at the W2 split; not yet attributed.
+   - Medium: about 1.9 s of Python-side binding and report per run.
+   - Owner: W8 (numsim-py) and sched for the Rust part.
+5. **Parked spin-loop re-polls** (203 s on the max config). These polls emit Access events. A skip would therefore be observer-selected, which the one-execution-path rule forbids; see the 2026-10-08 decision below. Blocked `mbarrier.try_wait` / `bar.sync` retries are already applied without re-execution (`BlockedWait`).
+
+**Proven not to be the cause** (see "Mega MoE medium: per-worker CPU inflation" and the allocation sections):
+- locks and atomics on the partition path;
+- page faults, TLB shootdowns and system calls;
+- NUMA placement and L3 capacity at 16 workers;
+- false sharing of engine structs;
+- data hand-off between the main thread and workers;
+- register-file footprint;
+- shared mutable arena state (code audit);
+- allocator volume, cut 79 → 31 GB per medium run without closing the gap;
+- glibc tcache;
+- partition-to-thread migration: sticky assignment was measured and declined, and static assignment with pinned threads was also tried.
+
+16 or 32 independent single-worker processes do not inflate.
+
+**Missing diagnostic.** Hardware counters (cache and TLB misses, frequency, IPC per partition thread) are unavailable: `perf_event_paranoid=4` on this host, and `/usr/bin/perf` is installed but blocked. Attributing the multi-worker CPU inflation (item 2) needs them. That requires `perf_event_paranoid ≤ 2`, or a host where perf is allowed, and is the one measurement still outstanding.
+
 Scope: `numsim-core/src/{interp,sched,arena.rs}`, tests, and benches. Line numbers refer to HEAD. Programs use `testutil::ProgramBuilder` (`b.`).
 
 Each finding is labelled as follows:
