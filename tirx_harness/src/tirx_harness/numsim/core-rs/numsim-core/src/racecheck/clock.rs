@@ -131,8 +131,11 @@ impl JoinMemo {
         let mut map = self.map.borrow_mut();
         map.insert(key, Arc::downgrade(&chunk));
         let n = self.inserts.get() + 1;
-        if n >= MEMO_PRUNE_EVERY {
-            // A dead Weak still pins the chunk allocation; prune on a cadence.
+        // A dead Weak still pins the chunk allocation; prune on a cadence
+        // proportional to the map (amortised O(1) per insert: a fixed
+        // cadence made every prune O(map) and the run quadratic once the
+        // live map outgrew it — mega_moe medium).
+        if n >= MEMO_PRUNE_EVERY.max((map.len() / 2) as u32) {
             map.retain(|_, w| w.strong_count() != 0);
             self.inserts.set(0);
         } else {
