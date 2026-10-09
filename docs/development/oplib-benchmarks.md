@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # OpLib benchmarks
 
 These are the baselines for the criterion benches that guard OpLib

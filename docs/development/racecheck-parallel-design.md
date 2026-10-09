@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Racecheck: parallel checker
 
 Status: implemented and on by default since 5ca4877. Owner: racecheck (W5).

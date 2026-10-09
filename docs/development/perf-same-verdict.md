@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Legacy vs v2 per tool, verdict-identical cases only (engine 6ba4190)
 
 Source: `backend-comparison.json` (`head.cases`, engine wall, min of the samples per cell, same host/session for both columns). A (case, mode) is excluded when a `<mode>.delta.json` existed before step 5 (`git ls-tree 79f04eb^`): legacy and v2 disagreed on verdict or finding set there (racecheck B1/B7/R3/R4/T18/T19/X4, numsim H5, sync S1). The Mega-MoE perf configs are in `backend-comparison.md` (racecheck verdicts differ there; numsim verdicts agree).
