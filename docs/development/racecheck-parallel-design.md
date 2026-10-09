@@ -855,3 +855,141 @@ those are sub-second cases).
 - On disk: 3.6 GiB written and read back for medium (encoded), plus
   encoding. Only worth it for re-analysis without re-running the engine
   (e.g. trying checker versions on a fixed trace), not for speed.
+
+### 15.9 Parallel collector: prototype, landing tied to the `FORK_JOIN` default
+
+The §15.3 prototype is a complete, gated patch. It is rebased onto d719a9d
+(W16's GC back-off) and kept outside the tree:
+`w14-parallel-gc-rebased-d719a9d.patch`. It lands only together with turning
+`FORK_JOIN` on. Under the default serial checker it gains nothing (table
+below). If the re-measurement after W5's re-attribution keeps fork/join off,
+it stays a recorded prototype.
+
+**What it changes**
+- Files: `racecheck/checker.rs` (`gc`, `gc_walk`, `gc_hist`,
+  `Checker::finish`), `racecheck/observer.rs`, and `numsim-py`.
+- The route is the interim one: `numsim-py` sets `RaceObserver::gc_threads`
+  from `RunConfig::workers`. There is no Observer-contract change.
+- The collector runs the per-allocation shadow walk and the declared-word
+  scan with `std::thread::scope`.
+- `Checker::finish` frees the launch state on a detached thread.
+- Thresholds are run-time fields. `gc_par_min_cells` defaults to 16K live
+  cells, and the word scan to 32 payload-carrying entries; below them the
+  walk stays inline.
+- The payload is the same at any `gc_threads` (§15.3 I1–I5). With the
+  back-off, the walk's total cells feed both the thread threshold and the
+  productivity rule.
+
+**Gates** (on d719a9d)
+- `cargo test --workspace` (debug): all binaries pass.
+- `racecheck_parallel_review` 27/27, `racecheck_retirement` 11/11 (one
+  ignore, pre-existing) and `racecheck_reattribution` 7/7, release, both at
+  default settings and with 16 threads and threshold 0 forced.
+- New `tests/racecheck_parallel_gc.rs` (2/2): `gc_threads` 2 and 16 against
+  the inline collector, over every scenario at 1/8/32 workers (serial and
+  fork/join) and the recorded corpus at 1 and 32 workers.
+- e24 payload hash `c804e3c3622da394` is identical with and without the
+  patch at 1 and 16 workers, serial and fork/join.
+- Criterion guard `gc_parallel/{1,16}`: one `gc()` over 296 shared
+  allocations, about 0.9M live cells (one e24 collection).
+  - 32.0 ms vs 10.4 ms (3.1x) at load average 3.8–4.6.
+  - 40.8 vs 11.0 ms (3.7x) before the rebase.
+  - The bar is ≥ 1.5x.
+- Not run yet: racecheck conformance and the v2 Python tests (pending the
+  user's decision on the private extension build).
+
+**e24 wall**: recorded stream, d719a9d vs d719a9d + patch, interleaved, min
+of 3 (range), load average 3.9–9.0.
+
+| mode | workers | d719a9d | patched | ratio |
+| --- | --- | --- | --- | --- |
+| fork/join | 16 | 8.77 s (8.77–10.26) | 7.33 s (7.33–8.85) | 1.20x |
+| fork/join | 1 | 17.38 s (17.38–18.36) | 17.44 s (17.44–18.21) | 1.00 (same inline path) |
+| serial (`FORK_JOIN` default off since 784e2df) | 16 | 16.86 s (16.86–18.41) | 16.65 s (16.65–19.12) | 1.01x |
+| serial | 1 | 17.88 s (17.88–18.29) | 17.76 s (17.76–18.97) | 1.01x |
+
+On a23dc03, before the back-off and at load average 9.8–15.3, fork/join at
+16 workers went from 10.56 s to 7.47 s (1.41x). The back-off removes part of
+the same collector time, so the two gains overlap.
+
+`gc_threads` follows the configured worker count, not the scheduler's pool
+capped at the resident partition count (e06f874). It stays within the
+configured budget:
+- the walk runs after `par_for` returns, while pool threads are parked;
+- it is capped by the number of allocations.
+
+## 16. Serial checker growth on mega_moe medium (W5, 2026-10-09)
+
+Measured with the prof harness on the recorded
+`mega_moe_t64_h2048_i1536_e96_k4_g1` fixture, serial checker, 16 workers,
+private builds. Times are wall seconds from the per-phase progress line.
+
+**JoinMemo prune cadence (landed, 54d0f94).** Up to round 1400, 31% of the
+run was in `JoinMemo::join`'s prune (`map.retain(strong_count)`). The prune
+ran every 1024 inserts but scanned the whole memo map, so once the live map
+was large the run went quadratic. The prune now runs when
+`inserts >= max(1024, map.len()/2)`, which is amortised O(1). The memo only
+affects which chunk object a join returns, so findings cannot change; they
+are byte-identical on 7 fixtures at 1/8/16/32 workers and conformance passes
+101/101.
+
+| Round | Before | After |
+| --- | --- | --- |
+| 999 | 160 s | 136 s |
+| 1599 | 809 s | 374 s |
+| end | no finish within 1500 s | 1433 s |
+
+**Medium end to end** (after the memo fix): about 2300 rounds, wall
+1432.6 s, of which the checker took 1416.6 s and the engine plus replay
+16.0 s. Peak RSS was 11.2 GB. Verdict Error, 1508 findings:
+
+| Kind | Findings | Occurrences |
+| --- | --- | --- |
+| data_race (Error) | 1184 | 7,330,048 |
+| scope_mismatch (Error) | 16 | 37,530 |
+| alias_stale_read (Review) | 3 | 17,920 |
+| cross_cta_async_order (Review) | 305 | 28,648,724 |
+
+Legacy's verdict on medium is Review (alias_stale_read), at 21.1 s on 16
+workers. v2 reports Error from the B7 pattern (remote mbarrier.arrive
+scope_mismatch, then data_race), as on e24, so the legacy time is not a
+like-for-like target.
+
+**What still grows.** After the memo fix the curve stays superlinear. The
+growth is clock width.
+
+- Async slots are never reclaimed mid-run: about 140K by the end. Per live
+  warp, the base hb clock holds 31 chunks at GC run 10 and 2752 at run 110.
+  Lane entries grow from 60 to 507 and the memo map from 2K to 5.9M entries.
+- What pins the slots is completed copies' global-memory witnesses: weight
+  TMA reads, and workspace TMA loads and stores. The global meet over every
+  live warp never dominates them.
+- Shared-memory witnesses stay bounded. A stage's next TMA write replaces
+  the previous one through the empty/full chain (W6's
+  `tma_stage_reuse_same_source_*` guards).
+- A ceiling experiment (unsound, scratch only) dropped completed copies'
+  global-only witnesses and reclaimed their slots. Slots stayed at about
+  18K, per-warp chunks saturated near 556, and the window 1800→2000
+  (access + sync) fell from about 232 s to 99 s, roughly 2.3x. That is the
+  case for re-attribution (W6 review F1–F6).
+
+**Negative: in-place group join (not landed).** When a warp's clock owns its
+group slice, `Epochs::join` was changed to join touched groups slot by slot
+in place instead of copying the slice and each 16-chunk group. The memo calls
+were unchanged and findings byte-identical (28/28). The criterion bench
+`clock_join_in_place` (16 groups, k changed chunks per group) came out at
+13.1 µs owned against 17.0 µs before for k=1, and 19.7 against 23.7 µs for
+k=4: 1.2–1.3x, below the 1.5x bar. Medium did not improve: the window
+1800→2000 took 228 s against 202 s side by side, and round 2000 was reached
+at 857 s against 818 s. Per join the cost is chunk dominance tests and memo
+work, and what grows is the number of changed groups per join (clock width),
+not the copy.
+
+**Negative: per-warp index for unrestricted tcgen05.commit (not landed).**
+The commit's walk over every async slot was replaced by a per-warp ordered
+set of in-use pipelined slots, kept at issue and reclaim and moved in
+split/absorb. Findings were byte-identical. Medium was unchanged (same run
+as above). In the bench, the slot walk with n=16384 other-warp slots
+dropped from 983 to 751 ms (1.3x). A commit legitimately tracks all of its
+own warp's in-flight pipelined ops (T15), and that per-commit cost is
+semantic, not the walk.
