@@ -341,8 +341,9 @@ impl TcgenCpPlan {
     /// with [`tcgen_cp_decode`] into destination cell `dst[k] = (lane,
     /// column)` (4 bytes). Multicast repeats a source span per lane.
     pub fn pairs(&self) -> (Vec<ByteSpan>, Vec<(u32, u32)>) {
-        let mut src = Vec::new();
-        let mut dst = Vec::new();
+        let cells = self.words.iter().map(|word| usize::from(word.lane_count)).sum();
+        let mut src = Vec::with_capacity(cells);
+        let mut dst = Vec::with_capacity(cells);
         for word in &self.words {
             for &lane in word.lanes() {
                 src.push(word.src);
@@ -386,7 +387,45 @@ fn decompress_code(bits: u8) -> OpResult<u8> {
 /// 0 none, 1 = `warpx2::02_13`, 2 = `warpx2::01_23`, 3 = `warpx4`);
 /// `sdesc` is the shared matrix descriptor (source spans are shared-window
 /// byte addresses, swizzled per the descriptor); `taddr` the destination.
+///
+/// Plans are a pure function of the arguments, so successful plans are
+/// memoized per thread (perf, W4: on the Mega MoE medium every issue of the
+/// 32x128b warpx4 scale copy replanned 128 swizzled source words, ~3 us).
+/// Errors are not cached; a failing request recomputes and fails the same way.
+#[allow(clippy::too_many_arguments)]
 pub fn tcgen_cp_plan(
+    rows: u16,
+    bits: u16,
+    multicast: u8,
+    decompress_bits: u8,
+    sdesc: u64,
+    taddr: u32,
+    cta_group: u8,
+    arch: TcArch,
+) -> OpResult<TcgenCpPlan> {
+    type Key = (u16, u16, u8, u8, u64, u32, u8, TcArch);
+    thread_local! {
+        static PLANS: std::cell::RefCell<std::collections::HashMap<Key, std::rc::Rc<TcgenCpPlan>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key: Key = (rows, bits, multicast, decompress_bits, sdesc, taddr, cta_group, arch);
+    if let Some(hit) = PLANS.with(|plans| plans.borrow().get(&key).cloned()) {
+        return Ok((*hit).clone());
+    }
+    let plan = tcgen_cp_plan_uncached(rows, bits, multicast, decompress_bits, sdesc, taddr, cta_group, arch)?;
+    PLANS.with(|plans| {
+        let mut plans = plans.borrow_mut();
+        if plans.len() >= 4096 {
+            plans.clear();
+        }
+        plans.insert(key, std::rc::Rc::new(plan.clone()));
+    });
+    Ok(plan)
+}
+
+/// [`tcgen_cp_plan`] without the per-thread memo.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tcgen_cp_plan_uncached(
     rows: u16,
     bits: u16,
     multicast: u8,
@@ -461,6 +500,86 @@ pub fn tcgen_cp_decode(src: &[u8], decompress_bits: u8) -> OpResult<[u8; 4]> {
     let mut packed = [0_u8; 4];
     packed[..src.len()].copy_from_slice(src);
     Ok(cp_decode_word(&packed, src.len(), decompress)?)
+}
+
+#[cfg(test)]
+mod cp_plan_cache_tests {
+    use super::*;
+
+    /// The memoized `tcgen_cp_plan` returns exactly the direct planner's
+    /// plan or error, first call and repeats alike, over every shape,
+    /// multicast, decompression, arch, CTA group and random descriptors and
+    /// TMEM addresses (including invalid ones), and `pairs()` is the
+    /// word-major, lane-minor expansion of the plan.
+    #[test]
+    fn memoized_cp_plans_equal_direct_plans() {
+        let mut seed = 0x7c0f_fee1_u64;
+        let mut next = move |bound: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let shapes = [(32_u16, 128_u16, 3_u8), (64, 128, 1), (64, 128, 2), (128, 128, 0), (128, 256, 0), (4, 256, 0), (64, 256, 1)];
+        let (mut ok, mut err) = (0, 0);
+        for _ in 0..3000 {
+            let (rows, bits, multicast) = shapes[next(shapes.len() as u64) as usize];
+            let decompress = [0_u8, 0, 4, 6, 5][next(5) as usize];
+            let sdesc = numsim_oplib::tcgen05::encode::encode_matrix_descriptor(
+                (next(1 << 10) as u32) << 4,
+                next(64) as i64,
+                next(128) as i64,
+                next(5) as i64,
+            );
+            let sdesc = if next(10) == 0 { sdesc ^ (1 << (49 + next(3))) } else { sdesc };
+            // Bit 14: accepted by the SM107 descriptor layout only.
+            let sdesc = if next(4) == 0 { sdesc | (1 << 14) } else { sdesc };
+            let lane = [0_u32, 0, 32, 64, 96, 100][next(6) as usize];
+            let taddr = (lane << 16) | (next(520) as u32);
+            let group = [1_u8, 2, 1, 3][next(4) as usize];
+            let arch = [TcArch::Sm100, TcArch::Sm103, TcArch::Sm107][next(3) as usize];
+            let direct = tcgen_cp_plan_uncached(rows, bits, multicast, decompress, sdesc, taddr, group, arch).map_err(|e| e.to_string());
+            for _ in 0..2 {
+                let memo = tcgen_cp_plan(rows, bits, multicast, decompress, sdesc, taddr, group, arch).map_err(|e| e.to_string());
+                assert_eq!(memo, direct, "{rows}x{bits} mc{multicast} dc{decompress} sdesc {sdesc:#x} taddr {taddr:#x} group {group} {arch:?}");
+            }
+            // Neighbours differing in one key field each (a key missing a
+            // field would serve the first plan for the second request).
+            let neighbours = [
+                (rows, bits, multicast ^ 1, decompress, sdesc, taddr, group, arch),
+                (rows, bits, multicast, decompress ^ 4, sdesc, taddr, group, arch),
+                (rows, bits, multicast, decompress, sdesc + 0x10, taddr, group, arch),
+                (rows, bits, multicast, decompress, sdesc, taddr ^ 4, group, arch),
+                (rows, bits, multicast, decompress, sdesc, taddr ^ (32 << 16), group, arch),
+                (rows, bits, multicast, decompress, sdesc, taddr, 3 - group.min(2), arch),
+                (rows, bits, multicast, decompress, sdesc | (1 << 46), taddr, group, TcArch::Sm103),
+                (rows, bits ^ 384, multicast, decompress, sdesc, taddr, group, arch),
+                (rows ^ 96, bits, multicast, decompress, sdesc, taddr, group, arch),
+                (rows, bits, multicast, decompress, sdesc, taddr, group, TcArch::Sm100),
+                (rows, bits, multicast, decompress, sdesc, taddr, group, TcArch::Sm103),
+                (rows, bits, multicast, decompress, sdesc, taddr, group, TcArch::Sm107),
+            ];
+            for (r, b, m, d, sd, t, g, a) in neighbours {
+                let want = tcgen_cp_plan_uncached(r, b, m, d, sd, t, g, a).map_err(|e| e.to_string());
+                let memo = tcgen_cp_plan(r, b, m, d, sd, t, g, a).map_err(|e| e.to_string());
+                assert_eq!(memo, want, "{r}x{b} mc{m} dc{d} sdesc {sd:#x} taddr {t:#x} group {g} {a:?}");
+            }
+            match &direct {
+                Ok(plan) => {
+                    ok += 1;
+                    let (src, dst) = plan.pairs();
+                    let mut k = 0;
+                    for word in &plan.words {
+                        for &lane in word.lanes() {
+                            assert_eq!((src[k], dst[k]), (word.src, (lane, word.column)));
+                            k += 1;
+                        }
+                    }
+                    assert_eq!((src.len(), dst.len()), (k, k));
+                }
+                Err(_) => err += 1,
+            }
+        }
+        assert!(ok > 300 && err > 100, "ok {ok} err {err}");
+    }
 }
 
 #[cfg(test)]

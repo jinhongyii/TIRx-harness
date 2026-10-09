@@ -462,3 +462,86 @@ fn fast_paths_match_the_generic_path() {
         }
     }
 }
+
+/// W4 fast forms against the generic path on their edge cases: floor
+/// div/mod with divisors that are never zero on active lanes (fast), zero
+/// only on inactive lanes (fast), zero on an active lane (checked path:
+/// same first error and partial writes), the S64 `MIN / -1` overflow;
+/// predicate logic and predicate casts on registers with junk upper bits.
+#[test]
+fn w4_fast_forms_match_the_generic_path_on_edges() {
+    use super::{binary_generic, cast_generic};
+    let mut state = 0x1234_5678_9abc_def1_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let edges: [u64; 8] = [0, 1, u64::MAX, 0x8000_0000, 0x7fff_ffff, 0x8000_0000_0000_0000, 0x7fff_ffff_ffff_ffff, 0xffff_fffe];
+    let mask = WarpMask(0x7bad_f00d);
+    let mut fast_seen = 0;
+    for round in 0..400 {
+        for d in [Dtype::U8, Dtype::U16, Dtype::U32, Dtype::U64, Dtype::S8, Dtype::S16, Dtype::S32, Dtype::S64] {
+            let ty = Ty::scalar(d);
+            let m = if d.bits() >= 64 { u64::MAX } else { (1u64 << d.bits()) - 1 };
+            let a: Vec<WarpValue<u64>> = vec![std::array::from_fn(|l| (if l % 3 == 0 { edges[(next() % 8) as usize] } else { next() }) & m)];
+            let mut b: Vec<WarpValue<u64>> = vec![std::array::from_fn(|l| {
+                let v = (if l % 5 == 0 { edges[(next() % 8) as usize] } else { next() }) & m;
+                if v == 0 { 1 } else { v }
+            })];
+            match round % 4 {
+                // Zero divisors on inactive lanes only.
+                1 => (0..32).filter(|l| (mask.bits() >> l) & 1 == 0).for_each(|l| b[0][l] = 0),
+                // One zero divisor on an active lane.
+                2 => b[0][(next() % 32) as usize] = 0,
+                // All-ones divisors (-1 for signed) with MIN dividends.
+                3 => {
+                    b[0] = [m; 32];
+                    a.clone().iter().for_each(|_| ());
+                }
+                _ => {}
+            }
+            let a = if round % 4 == 3 { vec![std::array::from_fn(|l| if l % 2 == 0 { (m >> 1) + 1 } else { a[0][l] })] } else { a };
+            for op in [BinOp::FloorDiv, BinOp::FloorMod] {
+                let init: Vec<WarpValue<u64>> = vec![std::array::from_fn(|_| next())];
+                let (mut fo, mut go) = (init.clone(), init.clone());
+                let f = fast::binary(op, ty, &a, &b, &mut fo, mask).expect("fast form");
+                let g = binary_generic(op, ty, &a, &b, &mut go, mask);
+                assert_eq!(f.as_ref().map_err(|e| e.to_string()), g.as_ref().map_err(|e| e.to_string()), "{op:?} {d} round {round}");
+                assert_eq!(fo, go, "{op:?} {d} round {round}");
+                fast_seen += usize::from(f.is_ok());
+            }
+        }
+        // Predicates with junk upper bits.
+        let p = |next: &mut dyn FnMut() -> u64| -> Vec<WarpValue<u64>> { vec![std::array::from_fn(|_| next())] };
+        let (pa, pb) = (p(&mut next), p(&mut next));
+        for op in [BinOp::And, BinOp::Or, BinOp::Xor] {
+            let init = p(&mut next);
+            let (mut fo, mut go) = (init.clone(), init.clone());
+            let f = fast::binary(op, Ty::PRED, &pa, &pb, &mut fo, mask).expect("fast form");
+            assert_eq!(f, binary_generic(op, Ty::PRED, &pa, &pb, &mut go, mask));
+            assert_eq!(fo, go, "pred {op:?}");
+        }
+        for d in [Dtype::U8, Dtype::U16, Dtype::U32, Dtype::U64, Dtype::S8, Dtype::S16, Dtype::S32, Dtype::S64, Dtype::F32, Dtype::F64] {
+            for (from, to) in [(Ty::PRED, Ty::scalar(d)), (Ty::scalar(d), Ty::PRED)] {
+                let src = if from == Ty::PRED || round % 2 == 0 {
+                    p(&mut next)
+                } else {
+                    let m = if d.bits() >= 64 { u64::MAX } else { (1u64 << d.bits()) - 1 };
+                    vec![std::array::from_fn(|l| if l % 4 == 0 { edges[(next() % 8) as usize] & m } else { next() & m })]
+                };
+                let init = p(&mut next);
+                let (mut fo, mut go) = (init.clone(), init.clone());
+                let Some(f) = fast::cast(from, to, Rounding::Default, false, &src, &mut fo, mask) else {
+                    assert!(d.is_float(), "{from} -> {to} has no fast form");
+                    continue;
+                };
+                let g = cast_generic(from, to, Rounding::Default, false, &src, &mut go, mask);
+                assert_eq!(f, g, "{from} -> {to}");
+                assert_eq!(fo, go, "{from} -> {to}");
+            }
+        }
+    }
+    assert!(fast_seen > 1000, "{fast_seen}");
+}

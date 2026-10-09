@@ -322,3 +322,54 @@ Mutations (no view check, a wrong E2M1 mask, a wrong row offset) fail them.
 | A/B operand gather | 3.38 | 1.81 |
 | `tma_plan_dir` | 1.36 | 0.11 |
 | process wall | 26.9 s | 22.4 s |
+
+## `tcgen05.cp` plan memo and predicate ALU fast forms (W4, 2026-10-09)
+
+Both changes are exact. Fixture: Mega MoE medium, 1 worker. Conformance 304 passed. Output
+digests of 16 cases are identical to 01754cd at 1/8/32 workers (both Mega MoE fixtures, the
+MMA-heavy set, `radix_topk_multi_cta`, `filtered_topk`, `gdn_prefill_sm100`,
+`kda_decode_multishape`, `flashinfer_rmsnorm_quant`).
+
+**`tcgen_cp_plan`.** It is a pure function of its arguments, so successful plans are memoized
+per thread. Errors are not cached. `TcgenCpPlan::pairs` pre-sizes its two vectors.
+
+The guard is `memoized_cp_plans_equal_direct_plans`:
+- plan or error equal to the direct planner over every shape, multicast, decompression, arch,
+  CTA group, and random descriptors and TMEM addresses;
+- every sampled request also runs with each key field varied, so dropping any field from the
+  key (8 mutations, one per field) fails it;
+- `pairs()` is checked as the word-major, lane-minor expansion of the plan.
+
+| | before | after |
+| --- | --- | --- |
+| bench `tcgen_cp/plan_pairs_32x128b_warpx4` (new) | 4.54 us | 1.29 us (3.5x) |
+| medium handler, per issue (55,296 issues) | 10.8 us | 7.65 us |
+| of which oplib plan + pairs | 5.3 us | 2.1 us |
+
+The remaining handler cost is the interp's per-cell span construction (about 4 us per issue).
+
+**ALU (`oplib::binary`/`cast`/`compare` bodies).** The `Pred` And/Or/Xor and `Pred`<->integer
+(and F32/F64 -> `Pred`) casts took the generic `u128` path. They now have fast forms with the
+generic results: `(x op y) & 1`, `x & 1` and `x != 0`.
+
+| bench (`tir_32_lanes/`, partial mask) | before | after |
+| --- | --- | --- |
+| `binary_or_pred` | 455 ns | 20.6 ns (22x) |
+| `binary_and_pred` | 428 ns | 19.6 ns |
+| `cast_pred_u32` | 539 ns | 23.6 ns (23x) |
+| `cast_u32_pred` | 473 ns | 22.6 ns (21x) |
+
+The guards are the existing `fast_paths_match_the_generic_path`, which iterates `Pred`, and
+the new `w4_fast_forms_match_the_generic_path_on_edges`, which uses junk upper bits.
+
+The medium mix is about 0.54 M such calls per run, so the saving is about 0.24 s at 1 worker.
+Whole-run CPU A/B at this size is within host noise (about +/-1 s).
+
+**Measured negatives, not kept:**
+- *The integer forms are already at the floor.* S32 add/mul, the S32/U32/U64 casts and the
+  S32 compare cost 17-27 ns per 32-lane call, with one `(op, dtype)` match per call.
+  The rest of the 200-350 cycles per issue that W13 measured is on the interp side.
+- *Branchless blend.* A branchless partial-mask blend made partial-mask ops slower
+  (22 -> 34 ns).
+- *Floor-division fast path.* A pre-checked check-free floor div/mod was slower than the
+  per-active-lane checked loop (75 -> 119 ns).

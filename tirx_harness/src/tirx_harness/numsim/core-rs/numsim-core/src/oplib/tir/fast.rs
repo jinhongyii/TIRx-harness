@@ -259,6 +259,13 @@ pub(super) fn binary(op: BinOp, ty: Ty, a: &[W], b: &[W], out: &mut [W], mask: W
             BinOp::Max => map2::<f64>(a, b, out, mask, sc::cuda_f64_max),
             _ => return None,
         },
+        // Generic: `(x op y) & 1` on the low byte (W4).
+        Dtype::Pred => match op {
+            BinOp::And => map2::<u64>(a, b, out, mask, |x, y| x & y & 1),
+            BinOp::Or => map2::<u64>(a, b, out, mask, |x, y| (x | y) & 1),
+            BinOp::Xor => map2::<u64>(a, b, out, mask, |x, y| (x ^ y) & 1),
+            _ => return None,
+        },
         Dtype::F16 | Dtype::BF16 => match op {
             BinOp::Add => half2(a, b, out, mask, d, |x, y| sc::pin_nan2_f32(x, y, x + y)),
             BinOp::Sub => half2(a, b, out, mask, d, |x, y| sc::pin_nan2_f32(x, y, x - y)),
@@ -417,6 +424,8 @@ pub(super) fn cast(from: Ty, to: Ty, rnd: Rounding, sat: bool, src: &[W], out: &
                 Dtype::S16 => map1::<u64, i16>(a, out, mask, |x| get(x) as i16),
                 Dtype::S32 => map1::<u64, i32>(a, out, mask, |x| get(x) as i32),
                 Dtype::S64 => map1::<u64, i64>(a, out, mask, |x| get(x) as i64),
+                // Generic: `x != 0` (NaN != 0) as 0/1 (W4).
+                Dtype::Pred => map1::<u64, u64>(a, out, mask, |x| u64::from(get(x) != <$s>::default())),
                 _ => return None,
             }
         }};
@@ -432,6 +441,13 @@ pub(super) fn cast(from: Ty, to: Ty, rnd: Rounding, sat: bool, src: &[W], out: &
         Dtype::S64 => to_dst!(i64, |v| v as f32, |v| v as f64),
         Dtype::F32 => to_dst!(f32, |v| v, |v: f32| v as f64),
         Dtype::F64 => to_dst!(f64, |v: f64| v as f32, |v| v),
+        // Generic: the low bit as an integer (W4); float destinations stay generic.
+        Dtype::Pred => {
+            if !to.elem.is_int() {
+                return None;
+            }
+            map1::<u64, u64>(a, out, mask, |x| x & 1)
+        }
         Dtype::F16 => {
             if !matches!(to.elem, Dtype::F32 | Dtype::F64) {
                 return None;

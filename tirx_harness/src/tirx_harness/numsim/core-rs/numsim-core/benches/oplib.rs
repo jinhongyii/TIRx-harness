@@ -39,6 +39,31 @@ fn tir(c: &mut Criterion) {
     for (name, f) in &ops {
         g.bench_function(*name, |b| b.iter(|| f(black_box(&mut out))));
     }
+    // The Mega MoE medium mix (W4 profile: S32 add/mul ~9.5 M calls, int
+    // casts ~2.7 M, predicate casts/logic ~0.5 M), at a partial and a full mask.
+    let pa = lanes(|l| (l as u64 * 5) & 1);
+    let pb = lanes(|l| (l as u64 / 3) & 1);
+    let neg = lanes(|l| (l as u64).wrapping_mul(0x9e37_79b9) & 0xffff_ffff);
+    for (suffix, m) in [("", mask), ("_full", WarpMask::ALL)] {
+        let medium: Vec<Case> = vec![
+            ("binary_add_s32", Box::new(|o| oplib::binary(BinOp::Add, Ty::S32, &au, &bu, o, m).unwrap())),
+            ("binary_mul_s32", Box::new(|o| oplib::binary(BinOp::Mul, Ty::S32, &au, &bu, o, m).unwrap())),
+            ("binary_floordiv_s32_b", Box::new(|o| oplib::binary(BinOp::FloorDiv, Ty::S32, &au, &bu, o, m).unwrap())),
+            ("binary_or_pred", Box::new(|o| oplib::binary(BinOp::Or, Ty::PRED, &pa, &pb, o, m).unwrap())),
+            ("binary_and_pred", Box::new(|o| oplib::binary(BinOp::And, Ty::PRED, &pa, &pb, o, m).unwrap())),
+            ("cast_s32_u32", Box::new(|o| oplib::cast(Ty::S32, Ty::U32, Rounding::Default, false, &neg, o, m).unwrap())),
+            ("cast_u32_s32", Box::new(|o| oplib::cast(Ty::U32, Ty::S32, Rounding::Default, false, &neg, o, m).unwrap())),
+            ("cast_u32_u64", Box::new(|o| oplib::cast(Ty::U32, Ty::U64, Rounding::Default, false, &neg, o, m).unwrap())),
+            ("cast_pred_u32", Box::new(|o| oplib::cast(Ty::PRED, Ty::U32, Rounding::Default, false, &pa, o, m).unwrap())),
+            ("cast_u32_pred", Box::new(|o| oplib::cast(Ty::U32, Ty::PRED, Rounding::Default, false, &neg, o, m).unwrap())),
+        ];
+        for (name, f) in &medium {
+            g.bench_function(format!("{name}{suffix}"), |b| b.iter(|| f(black_box(&mut out))));
+        }
+        g.bench_function(format!("compare_lt_s32{suffix}"), |b| {
+            b.iter(|| oplib::compare(CmpOp::Lt, Ty::S32, black_box(&au), black_box(&bu), m).unwrap())
+        });
+    }
     g.bench_function("compare_lt_u32", |b| {
         b.iter(|| oplib::compare(CmpOp::Lt, Ty::U32, black_box(&au), black_box(&bu), mask).unwrap())
     });
@@ -307,6 +332,19 @@ fn tma(c: &mut Criterion) {
     let bytes = map.encode();
     g.bench_function("descriptor_decode", |b| b.iter(|| oplib::TensorMapDesc::decode(black_box(&bytes)).unwrap()));
     g.bench_function("descriptor_encode", |b| b.iter(|| black_box(&map).try_encode().unwrap()));
+    g.finish();
+    // `tcgen05.cp.32x128b.warpx4` (the Mega MoE scale copy): plan + pairs
+    // over 8 rotating stage buffers (a memo hit per issue after warm-up).
+    let mut g = c.benchmark_group("tcgen_cp");
+    let mut stage = 0u64;
+    g.bench_function("plan_pairs_32x128b_warpx4", |b| {
+        b.iter(|| {
+            stage = (stage + 1) % 8;
+            let sdesc = numsim_oplib::tcgen05::encode::encode_matrix_descriptor((0x2000 + stage * 0x800) as u32, 8, 64, 0);
+            let plan = oplib::tcgen_cp_plan(32, 128, 3, 0, sdesc, 0x40 + 4 * stage as u32, 1, oplib::TcArch::Sm100).unwrap();
+            black_box(plan.pairs())
+        })
+    });
     g.finish();
     let mut g = c.benchmark_group("tcgen_ldst");
     g.bench_function("map_32x32b_x64", |b| {
