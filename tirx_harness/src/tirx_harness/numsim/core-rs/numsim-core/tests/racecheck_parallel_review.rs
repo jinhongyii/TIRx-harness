@@ -845,11 +845,22 @@ fn w16_first_wait_declare_numbering_follows_the_delivery() {
 /// release heads of the latest write to those bytes. W2's serial-point fix
 /// for part 1 reduces the multi-partition case to this one.
 #[test]
-#[ignore = "xfail: CONTRACT_REQUESTS W6-P2 part 2 (W5) -- first-use declaration value owes the latest write's edge"]
 fn w6_p2_first_use_declaration_value_carries_the_release() {
     let mut s = first_wait_declare(true);
     s.config.single_partition = true;
     let (status, report) = serial_payload(&s, 1, &RacecheckConfig::default());
     assert_eq!(status, format!("{:?}", RunStatus::Completed));
     assert!(!report.contains("DataRace"), "{report}");
+}
+
+/// W6-P2 part 2, negative: a plain store that precedes the first-use
+/// declaration seeds index 0 with no release heads, so the wait still owes
+/// an edge it cannot get (delta W9; as for plain publications, W2).
+#[test]
+fn w6_p2_first_use_declaration_plain_value_gives_no_edge() {
+    let mut s = first_wait_declare(false);
+    s.config.single_partition = true;
+    let (status, report) = serial_payload(&s, 1, &RacecheckConfig::default());
+    assert_eq!(status, format!("{:?}", RunStatus::Completed));
+    assert!(report.contains("SignalProtocolError"), "{report}");
 }

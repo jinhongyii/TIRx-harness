@@ -875,8 +875,8 @@ mod tests {
                     }
                     let (c, m) = &mut clocks[i];
                     c.raise_lanes(a as ActorId, &v);
-                    for l in 0..32 {
-                        m.0[a][l] = m.0[a][l].max(v[l]);
+                    for (x, y) in m.0[a].iter_mut().zip(v) {
+                        *x = (*x).max(y);
                     }
                 }
                 _ => {

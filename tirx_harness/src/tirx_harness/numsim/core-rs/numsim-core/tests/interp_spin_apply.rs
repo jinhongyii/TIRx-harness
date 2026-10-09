@@ -102,6 +102,7 @@ fn observe(s: &Scenario, workers: usize) -> Observed {
 ///   read for the replay order, and see the write from the next round on.
 /// - `cross_cluster_sb()`: store buffering across partitions (replay cycle);
 ///   no spin, but a guard on the shard-read tracking the apply must keep.
+///
 /// Two single-CTA clusters (two partitions). CTA 0 lane 0 busy-loops for
 /// `delay` iterations (several rounds), then stores `data = 5` and
 /// `st.release.gpu flag = 1`. CTA 1 lane 0 spins on `ld.acquire.gpu flag`

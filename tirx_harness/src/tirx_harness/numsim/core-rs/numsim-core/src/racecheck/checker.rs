@@ -696,6 +696,12 @@ struct Word {
     /// Coherence (CoWR): a later read of that thread cannot read from an
     /// earlier entry, so a wait's accepted entry is at least this one.
     own: HashMap<(WarpId, u8), u32>,
+    /// Index 0 of a word declared mid-run (first-use `DeclareWord`): the
+    /// latest write to the word's bytes at declaration, whose release heads
+    /// an accepted index 0 acquires (W6-P2). `None` for a word with no
+    /// write since launch (or one GC already retired): the launch value,
+    /// which owes no edge.
+    seed: Option<HistEntry>,
 }
 
 /// An allocation's declared words in declaration order, indexed by range
@@ -709,11 +715,14 @@ struct Words {
 }
 
 impl Words {
-    fn declare(&mut self, range: Range<u64>) {
+    /// Declare `range`; `seed` (called only for a new word) gives its
+    /// index-0 entry.
+    fn declare(&mut self, range: Range<u64>, seed: impl FnOnce() -> Option<HistEntry>) {
         if let std::collections::btree_map::Entry::Vacant(v) = self.index.entry((range.start, range.end)) {
             v.insert(self.list.len());
             self.max_len = self.max_len.max(range.end - range.start);
-            self.list.push(Word { range, history: Vec::new(), last: None, own: HashMap::new() });
+            let seed = seed();
+            self.list.push(Word { range, history: Vec::new(), last: None, own: HashMap::new(), seed });
         }
     }
 
@@ -2149,7 +2158,9 @@ impl Checker {
                 self.words.remove(&alloc);
             }
             SyncEvent::DeclareWord { alloc, range } => {
-                self.words.entry(alloc).or_default().declare(range);
+                let known = self.words.get(&alloc).is_some_and(|ws| ws.exact(&range).is_some());
+                let seed = if known { None } else { self.declaration_seed(alloc, &range) };
+                self.words.entry(alloc).or_default().declare(range, || seed);
             }
             SyncEvent::WarpSync { warp, mask, epoch } => {
                 if !self.tick(warp, epoch) {
@@ -2891,7 +2902,10 @@ impl Checker {
             return;
         };
         if idx == 0 {
-            return; // the launch value satisfied the predicate: no edge owed
+            // The launch value owes no edge; a mid-run declaration's index 0
+            // owes its seed's (W6-P2).
+            self.acquire_seed(warp, lanes, alloc, wi, scope, site);
+            return;
         }
         let word = &self.words_ref(alloc).unwrap().list[wi];
         let Some(e) = word.history.get(idx as usize - 1) else {
@@ -2908,6 +2922,7 @@ impl Checker {
             // schedule-dependent fallback, async publications only).
             idx = observed;
             if idx == 0 {
+                self.acquire_seed(warp, lanes, alloc, wi, scope, site);
                 return;
             }
         }
@@ -2943,6 +2958,56 @@ impl Checker {
             }
             self.acquire_rel(me, lanes, my_scope, rel, acq_site);
         }
+    }
+
+    /// Index 0 of a word declared now: the latest write to its bytes, as a
+    /// strong read of the word would read from it (W6-P2). Every byte must
+    /// name the same latest write (else the value is a mix: `mixed_size`);
+    /// its effective release heads are the entry's payload, so a plain
+    /// write gives no edge (`WaitExitUnproven`, delta W2) and an async one
+    /// keeps the observed-version fallback. No write left in the shadow
+    /// (none since launch, or retired by GC as known to every live actor):
+    /// no entry, no edge owed.
+    fn declaration_seed(&self, alloc: AllocId, range: &Range<u64>) -> Option<HistEntry> {
+        let al = self.alloc_ref(alloc)?;
+        let nw = self.topo.num_warps();
+        let mut latest: Option<(Witness, Option<Heads>)> = None;
+        let (mut mixed, mut covered) = (false, 0u64);
+        al.shadow.visit(range.clone(), |seg, cell| {
+            let Some(e) = cell.writes.last() else {
+                mixed = true;
+                return;
+            };
+            covered += seg.end - seg.start;
+            match &latest {
+                None => latest = Some((e.w, effective_heads(&cell.writes, e))),
+                Some((w, _)) if *w == e.w => {}
+                Some(_) => mixed = true,
+            }
+        });
+        let (w, rel) = latest?;
+        let exact = w.span(&al.wide) == (range.start, range.end);
+        let mixed_size = mixed || covered != range.end - range.start || !exact;
+        Some(HistEntry { rel, is_async: w.stamp.actor() >= nw, consumed: false, mixed_size })
+    }
+
+    /// An accepted index 0: acquire the declaration seed's release heads.
+    fn acquire_seed(&mut self, warp: WarpId, lanes: LaneMask, alloc: AllocId, wi: usize, scope: Scope, site: SiteId) {
+        let Some(e) = self.words_ref(alloc).and_then(|ws| ws.list[wi].seed.as_ref()) else { return };
+        if e.is_async {
+            return; // the observed-version fallback had nothing older
+        }
+        if e.mixed_size {
+            self.note_incomplete(Incomplete::SignalWriteNotRecorded { warp });
+            return;
+        }
+        let Some(heads) = e.rel.clone() else {
+            if !e.consumed {
+                self.note_incomplete(Incomplete::WaitExitUnproven { warp });
+            }
+            return;
+        };
+        self.acquire_heads(warp, lanes, scope, &heads, site);
     }
 
     // ------------------------------------------------------------- GC --
@@ -3042,7 +3107,7 @@ impl Checker {
             let n = jobs.len();
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by_key(|&i| std::cmp::Reverse(jobs[i].0.shadow.len()));
-            let slots: Vec<std::sync::Mutex<Option<(&mut Alloc, &Option<Knowledge>, bool)>>> = jobs.into_iter().map(|j| std::sync::Mutex::new(Some(j))).collect();
+            let slots: Vec<std::sync::Mutex<Option<GcJob>>> = jobs.into_iter().map(|j| std::sync::Mutex::new(Some(j))).collect();
             let res: Vec<std::sync::Mutex<Option<(&mut Alloc, GcWalk)>>> = (0..n).map(|_| std::sync::Mutex::new(None)).collect();
             let next = std::sync::atomic::AtomicUsize::new(0);
             std::thread::scope(|sc| {
@@ -3106,7 +3171,7 @@ impl Checker {
             // Per history entry, independent (§15); `leq` never touches the
             // memo. Only entries still carrying a payload are tested.
             let mut list: Vec<&mut HistEntry> =
-                self.words.values_mut().flat_map(|ws| ws.list.iter_mut()).flat_map(|w| w.history.iter_mut()).filter(|e| e.rel.is_some()).collect();
+                self.words.values_mut().flat_map(|ws| ws.list.iter_mut()).flat_map(|w| w.seed.iter_mut().chain(w.history.iter_mut())).filter(|e| e.rel.is_some()).collect();
             let threads = if list.len() >= self.gc_par_min_cells.min(GC_PAR_MIN_ENTRIES) { self.gc_threads.min(list.len()).max(1) } else { 1 };
             if threads <= 1 {
                 for e in list.iter_mut() {
@@ -3201,6 +3266,10 @@ fn gc_hist(e: &mut HistEntry, m: &Knowledge) {
         e.consumed = true;
     }
 }
+
+/// One allocation's GC walk job: the allocation, the meet that judges it,
+/// and whether it is global (reach: every live actor).
+type GcJob<'a> = (&'a mut Alloc, &'a Option<Knowledge>, bool);
 
 /// One allocation's GC walk result (§15).
 struct GcWalk {
