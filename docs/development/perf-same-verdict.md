@@ -47,6 +47,8 @@ Separate configuration set (148 SMs, `native_loop_iteration_budget=10_000_000`, 
 
 v2 now: `bench_backends.py mega --impls interp` on the 243f9f4 build (148 SMs, `native_loop_iteration_budget=10_000_000`), min of 2 runs per cell (load 4.6-15). The max config is one run of the perf test (its `perf_metrics` engine time). Mega-MoE numsim at 16 and 32 workers stays slower than legacy on medium: the remaining gap is per-partition CPU inflation at 16+ workers and the MMA landing (see engine-review.md).
 
+v2 racecheck on medium, absolute (not a comparison row: the racecheck verdict still differs from legacy): **163.4 s** at 16 workers on 8e3ff95. This uses the default configuration (fork/join, phase-end GC on 16 threads, mimalloc) on the prof harness over the recorded fixture, one run at host load 4.4-8.4. The verdict is Error with 1508 findings, peak RSS is 12.3 GB, and `phase_end` is 41% of wall. The earlier serial run took 1433 s (54d0f94), so this is 8.8x faster. Details are in racecheck-parallel-design.md §16.
+
 ## numsim
 
 | case | workers | legacy | v2 (6ba4190) | v2 vs legacy (6ba4190) | v2 now (243f9f4) | now vs legacy |

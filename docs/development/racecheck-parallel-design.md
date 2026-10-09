@@ -1168,6 +1168,37 @@ regression beyond noise. It is met.
 
 **Status: W6-P2 part 1 (a39756d).** The first-use serial points change the schedule instance: on mega_moe medium (16 workers) rounds go 2,391 → 2,400 with identical outputs, and racecheck still reports 1,508 findings with an identical (kind, anchor) multiset. 916 findings differ only in representative witness or occurrence counts, so no behaviour-delta row is needed, and payload-hash baselines for e24 and medium are refreshed at ≥ a39756d.
 
+**Child suspensions on medium (W5, 2026-10-09).** Each child's first stashed event, stash length and replay time were logged in `absorb` on the main thread. Setup: prof harness, medium, MAX_ROUNDS=2000, fork/join, 16 workers, system allocator, `gc_threads` = 1, the same in both arms.
+
+| Build | Suspensions | Stash events | Stash replay | Wall to round 2000 |
+| --- | --- | --- | --- | --- |
+| 75e9dda + W16's series | 377 | 654,457 | 35.6 s | 428 s |
+| 8e3ff95 | 37 (all `AsyncIssue`) | 67,778 | 0.03 s | 192 s |
+
+- At 75e9dda, 348 of the 377 suspensions were `wait_until` polls: `ld.acquire` (.gpu or .sys) of exact declared global words that the polling partition had itself written earlier in the phase. These trip the `own_written` guard in `child_read_from`.
+- The poll sites were kernel.py:93 (sites 311, 312, 616), kernel.py:1750 (441) and kernel.py:1982 (540). Site 312 alone accounted for 33.6 s of the replay.
+- The other 29 suspensions were `AsyncIssue` with the reserved slot pool exhausted.
+- None of the 377 was an atom or red. A global RMW in an arena shard is an engine serial point, so it reaches the main checker in the serial phase and never a child.
+- W16's earlier count of 26 access + 4 `AsyncIssue` came from thread-local counters, which miss the worker threads.
+- At 8e3ff95 the access suspensions are gone. Candidates are the engine's first-use `wait_until` serial point (a39756d) and parking of failed `wait_until` polls (94eccc4); not bisected.
+- No racecheck lever is taken. If own-written polls come back, the exact fix is W1-style: take the poll's edge at its `WaitVerdicts` (earliest accepted entry), not at the read, so the child would not have to decide the read-from at all.
+
+**Medium end to end at 8e3ff95 (W5, 2026-10-09).** Default configuration: fork/join, phase-end GC with `gc_threads` = 16, mimalloc (`=0.1.52`, `local_dynamic_tls`, as numsim-py). Prof harness, 16 workers, one run, host load average 4.4-8.4 on 256 CPUs.
+
+- Wall 163.4 s for 2,400 rounds (165.6 s including fixture load). That is **8.8x** faster than the 1433 s serial baseline at 54d0f94.
+- Main-checker time was 74.4 s; `phase_end` took 67.0 s of it (41% of wall). Children used 423.9 s of CPU; the engine plus parallel replay took 89.0 s.
+- Peak RSS was 12.3 GB (baseline 11.2 GB). There were 98 GC runs; 26,616 async slots were live at the end, with 499,770 reclaimed.
+- Verdict Error, 1508 findings, with the same kinds and finding counts as the baseline:
+
+| Kind | Findings | Occurrences |
+| --- | --- | --- |
+| data_race (Error) | 1184 | 7,335,296 |
+| scope_mismatch (Error) | 16 | 37,530 |
+| alias_stale_read (Review) | 3 | 17,920 |
+| cross_cta_async_order (Review) | 305 | 28,648,724 |
+
+The data_race occurrence count moves from 7,330,048 because of the a39756d schedule instance (see the status line above).
+
 ## 17. Token re-attribution of completed copies (W5; reviewed and signed off by W6, 2026-10-09)
 
 Goal: free the async slot of a completed copy as soon as its completion has
