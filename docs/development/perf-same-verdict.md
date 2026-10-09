@@ -4,17 +4,19 @@ Source: `backend-comparison.json` (`head.cases`, engine wall, min of the samples
 
 ## Summary (geometric mean over verdict-identical rows)
 
-| mode | workers | rows | v2 vs legacy (geomean) | rows where v2 is >10% slower |
-| --- | --- | --- | --- | --- |
-| numsim | 1 | 30 | 4.12x faster | 1 |
-| numsim | 8 | 30 | 3.44x faster | 0 |
-| numsim | 32 | 30 | 2.95x faster | 0 |
-| racecheck | 1 | 24 | 2.96x faster | 0 |
-| racecheck | 8 | 23 | 1.87x faster | 5 |
-| racecheck | 32 | 23 | 1.77x faster | 7 |
-| synccheck | 1 | 29 | 3.43x faster | 0 |
-| synccheck | 8 | 29 | 3.00x faster | 0 |
-| synccheck | 32 | 29 | 2.82x faster | 3 |
+| mode | workers | rows | v2 vs legacy (geomean, 6ba4190) | rows where v2 is >10% slower (6ba4190) | v2 now (243f9f4) vs legacy | rows >10% slower now |
+| --- | --- | --- | --- | --- | --- | --- |
+| numsim | 1 | 30 | 4.12x faster | 1 | (W13) | (W13) |
+| numsim | 8 | 30 | 3.44x faster | 0 | (W13) | (W13) |
+| numsim | 32 | 30 | 2.95x faster | 0 | (W13) | (W13) |
+| racecheck | 1 | 24 | 2.96x faster | 0 | 5.94x faster | 0 |
+| racecheck | 8 | 23 | 1.87x faster | 5 | 3.61x faster | 3 |
+| racecheck | 32 | 23 | 1.77x faster | 7 | 3.58x faster | 3 |
+| synccheck | 1 | 29 | 3.43x faster | 0 | 6.67x faster | 0 |
+| synccheck | 8 | 29 | 3.00x faster | 0 | 5.87x faster | 0 |
+| synccheck | 32 | 29 | 2.82x faster | 3 | 6.11x faster | 0 |
+
+**v2 now (243f9f4), racecheck and synccheck** (W16, 2026-10-09): private release build of a `git archive 243f9f4` copy; `Engine(max_workers=w, native_loop_iteration_budget=10_000_000)`, fresh engine per sample, every phase via `run_racecheck_phase` / `run_synccheck_phase` (synccheck with the conformance coverage bounds and resource limits), engine wall, min of 3 samples interleaved over 1/8/32 workers; serial racecheck checker (`FORK_JOIN` off), default collector threads (W14's parallel GC not in HEAD). Host: 256 CPUs, 1-minute load 4.3-12.7 during the run. The legacy and 6ba4190 columns are unchanged (legacy is not re-measurable: deleted in 79f04eb). Rows still >10% slower than legacy now: `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` racecheck 8 (1.25x); `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` racecheck 8 (1.23x); `kda_decode_multishape` racecheck 8 (1.66x); `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` racecheck 32 (1.26x); `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` racecheck 32 (1.45x); `kda_decode_multishape` racecheck 32 (1.58x).
 
 ## Excluded (verdict/finding delta vs legacy)
 
@@ -132,168 +134,168 @@ Separate configuration set (148 SMs, `native_loop_iteration_budget=10_000_000`, 
 
 ## racecheck
 
-| case | workers | legacy | v2 | v2 vs legacy |
-| --- | --- | --- | --- | --- |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 1 | 275 ms | 302 ms | 1.10x slower |
-| `cudnn_sm100_dense_gemm_persistent_swiglu` | 1 | 495 ms | 288 ms | **1.72x faster** |
-| `cudnn_sm100_flex_attention_backward` | 1 | 340 ms | 96 ms | **3.54x faster** |
-| `cudnn_sm100_gdn2_bprop_f16` | 1 | 1.13 s | 229 ms | **4.92x faster** |
-| `cudnn_sm100_gdn2_recompute_f16` | 1 | 1.72 s | 268 ms | **6.42x faster** |
-| `cudnn_sm100_gdn_bprop_f16` | 1 | 5.13 s | 956 ms | **5.37x faster** |
-| `cudnn_sm100_gdn_prefill_f16` | 1 | 2.87 s | 304 ms | **9.44x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in` | 1 | 121.14 s | 40.30 s | **3.01x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 1 | 45.73 s | 35.19 s | **1.30x faster** |
-| `cudnn_sm100_kda_bprop_f16` | 1 | 1.17 s | 198 ms | **5.92x faster** |
-| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 1 | 1.89 s | 1.22 s | **1.55x faster** |
-| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 1 | 1.57 s | 587 ms | **2.67x faster** |
-| `deepgemm_sm100_fp4_mqa_logits` | 1 | 1.60 s | 734 ms | **2.18x faster** |
-| `deepgemm_sm100_fp8_mqa_logits` | 1 | 1.56 s | 432 ms | **3.62x faster** |
-| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 1 | 182 ms | 85 ms | **2.14x faster** |
-| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 1 | 3.98 s | 2.39 s | **1.67x faster** |
-| `filtered_topk` | 1 | 123 ms | 40 ms | **3.07x faster** |
-| `flash_attention4` | 1 | 16.44 s | 3.45 s | **4.76x faster** |
-| `gdn_decode_bf16_ilp4` | 1 | 352 ms | 97 ms | **3.62x faster** |
-| `gdn_decode_bf16_wide_vec_mtp` | 1 | 2.13 s | 1.36 s | **1.57x faster** |
-| `kda_decode_multishape` | 1 | 494 ms | 344 ms | **1.44x faster** |
-| `msa_sparse_atten_fwd_sm100` | 1 | 241 ms | 45 ms | **5.34x faster** |
-| `recurrent_kda_decode_one_warp` | 1 | 8.94 s | 1.94 s | **4.62x faster** |
-| `selective_state_update_stp_simple` | 1 | 57 ms | 20 ms | **2.80x faster** |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 8 | 110 ms | 275 ms | 2.50x slower |
-| `cudnn_sm100_dense_gemm_persistent_swiglu` | 8 | 204 ms | 293 ms | 1.43x slower |
-| `cudnn_sm100_flex_attention_backward` | 8 | 350 ms | 102 ms | **3.45x faster** |
-| `cudnn_sm100_gdn2_bprop_f16` | 8 | 1.14 s | 234 ms | **4.86x faster** |
-| `cudnn_sm100_gdn2_recompute_f16` | 8 | 1.80 s | 251 ms | **7.17x faster** |
-| `cudnn_sm100_gdn_bprop_f16` | 8 | 4.89 s | 795 ms | **6.15x faster** |
-| `cudnn_sm100_gdn_prefill_f16` | 8 | 2.79 s | 308 ms | **9.07x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 8 | 9.07 s | 20.05 s | 2.21x slower |
-| `cudnn_sm100_kda_bprop_f16` | 8 | 1.17 s | 194 ms | **6.03x faster** |
-| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 8 | 950 ms | 1.02 s | 1.07x slower |
-| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 8 | 739 ms | 507 ms | **1.46x faster** |
-| `deepgemm_sm100_fp4_mqa_logits` | 8 | 871 ms | 737 ms | **1.18x faster** |
-| `deepgemm_sm100_fp8_mqa_logits` | 8 | 872 ms | 448 ms | **1.95x faster** |
-| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 8 | 146 ms | 95 ms | **1.53x faster** |
-| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 8 | 2.12 s | 2.21 s | 1.04x slower |
-| `filtered_topk` | 8 | 115 ms | 40 ms | **2.88x faster** |
-| `flash_attention4` | 8 | 3.15 s | 2.52 s | **1.25x faster** |
-| `gdn_decode_bf16_ilp4` | 8 | 198 ms | 71 ms | **2.79x faster** |
-| `gdn_decode_bf16_wide_vec_mtp` | 8 | 784 ms | 1.09 s | 1.38x slower |
-| `kda_decode_multishape` | 8 | 123 ms | 312 ms | 2.54x slower |
-| `msa_sparse_atten_fwd_sm100` | 8 | 230 ms | 46 ms | **4.98x faster** |
-| `recurrent_kda_decode_one_warp` | 8 | 3.89 s | 1.49 s | **2.61x faster** |
-| `selective_state_update_stp_simple` | 8 | 33 ms | 15 ms | **2.15x faster** |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 32 | 108 ms | 297 ms | 2.74x slower |
-| `cudnn_sm100_dense_gemm_persistent_swiglu` | 32 | 169 ms | 305 ms | 1.80x slower |
-| `cudnn_sm100_flex_attention_backward` | 32 | 372 ms | 98 ms | **3.79x faster** |
-| `cudnn_sm100_gdn2_bprop_f16` | 32 | 1.22 s | 241 ms | **5.06x faster** |
-| `cudnn_sm100_gdn2_recompute_f16` | 32 | 1.91 s | 252 ms | **7.57x faster** |
-| `cudnn_sm100_gdn_bprop_f16` | 32 | 4.96 s | 831 ms | **5.96x faster** |
-| `cudnn_sm100_gdn_prefill_f16` | 32 | 2.84 s | 317 ms | **8.95x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 32 | 6.71 s | 18.98 s | 2.83x slower |
-| `cudnn_sm100_kda_bprop_f16` | 32 | 1.16 s | 200 ms | **5.81x faster** |
-| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 32 | 968 ms | 893 ms | **1.08x faster** |
-| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 32 | 795 ms | 526 ms | **1.51x faster** |
-| `deepgemm_sm100_fp4_mqa_logits` | 32 | 837 ms | 809 ms | **1.03x faster** |
-| `deepgemm_sm100_fp8_mqa_logits` | 32 | 925 ms | 531 ms | **1.74x faster** |
-| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 32 | 143 ms | 108 ms | **1.32x faster** |
-| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 32 | 2.15 s | 2.64 s | 1.23x slower |
-| `filtered_topk` | 32 | 123 ms | 43 ms | **2.90x faster** |
-| `flash_attention4` | 32 | 1.64 s | 2.33 s | 1.43x slower |
-| `gdn_decode_bf16_ilp4` | 32 | 171 ms | 69 ms | **2.47x faster** |
-| `gdn_decode_bf16_wide_vec_mtp` | 32 | 673 ms | 1.04 s | 1.54x slower |
-| `kda_decode_multishape` | 32 | 129 ms | 325 ms | 2.52x slower |
-| `msa_sparse_atten_fwd_sm100` | 32 | 252 ms | 48 ms | **5.24x faster** |
-| `recurrent_kda_decode_one_warp` | 32 | 4.98 s | 1.38 s | **3.60x faster** |
-| `selective_state_update_stp_simple` | 32 | 32 ms | 17 ms | **1.94x faster** |
+| case | workers | legacy | v2 (6ba4190) | v2 vs legacy (6ba4190) | v2 now (243f9f4) | now vs legacy |
+| --- | --- | --- | --- | --- | --- | --- |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 1 | 275 ms | 302 ms | 1.10x slower | 127 ms | **2.16x faster** |
+| `cudnn_sm100_dense_gemm_persistent_swiglu` | 1 | 495 ms | 288 ms | **1.72x faster** | 131 ms | **3.78x faster** |
+| `cudnn_sm100_flex_attention_backward` | 1 | 340 ms | 96 ms | **3.54x faster** | 53 ms | **6.36x faster** |
+| `cudnn_sm100_gdn2_bprop_f16` | 1 | 1.13 s | 229 ms | **4.92x faster** | 79 ms | **14.22x faster** |
+| `cudnn_sm100_gdn2_recompute_f16` | 1 | 1.72 s | 268 ms | **6.42x faster** | 143 ms | **12.04x faster** |
+| `cudnn_sm100_gdn_bprop_f16` | 1 | 5.13 s | 956 ms | **5.37x faster** | 285 ms | **18.03x faster** |
+| `cudnn_sm100_gdn_prefill_f16` | 1 | 2.87 s | 304 ms | **9.44x faster** | 140 ms | **20.56x faster** |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in` | 1 | 121.14 s | 40.30 s | **3.01x faster** | 13.88 s | **8.73x faster** |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 1 | 45.73 s | 35.19 s | **1.30x faster** | 13.79 s | **3.32x faster** |
+| `cudnn_sm100_kda_bprop_f16` | 1 | 1.17 s | 198 ms | **5.92x faster** | 57 ms | **20.70x faster** |
+| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 1 | 1.89 s | 1.22 s | **1.55x faster** | 474 ms | **3.99x faster** |
+| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 1 | 1.57 s | 587 ms | **2.67x faster** | 259 ms | **6.07x faster** |
+| `deepgemm_sm100_fp4_mqa_logits` | 1 | 1.60 s | 734 ms | **2.18x faster** | 362 ms | **4.42x faster** |
+| `deepgemm_sm100_fp8_mqa_logits` | 1 | 1.56 s | 432 ms | **3.62x faster** | 183 ms | **8.51x faster** |
+| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 1 | 182 ms | 85 ms | **2.14x faster** | 47 ms | **3.91x faster** |
+| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 1 | 3.98 s | 2.39 s | **1.67x faster** | 1.07 s | **3.71x faster** |
+| `filtered_topk` | 1 | 123 ms | 40 ms | **3.07x faster** | 33 ms | **3.77x faster** |
+| `flash_attention4` | 1 | 16.44 s | 3.45 s | **4.76x faster** | 2.13 s | **7.71x faster** |
+| `gdn_decode_bf16_ilp4` | 1 | 352 ms | 97 ms | **3.62x faster** | 71 ms | **4.93x faster** |
+| `gdn_decode_bf16_wide_vec_mtp` | 1 | 2.13 s | 1.36 s | **1.57x faster** | 854 ms | **2.50x faster** |
+| `kda_decode_multishape` | 1 | 494 ms | 344 ms | **1.44x faster** | 216 ms | **2.29x faster** |
+| `msa_sparse_atten_fwd_sm100` | 1 | 241 ms | 45 ms | **5.34x faster** | 30 ms | **8.12x faster** |
+| `recurrent_kda_decode_one_warp` | 1 | 8.94 s | 1.94 s | **4.62x faster** | 1.51 s | **5.90x faster** |
+| `selective_state_update_stp_simple` | 1 | 57 ms | 20 ms | **2.80x faster** | 16 ms | **3.61x faster** |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 8 | 110 ms | 275 ms | 2.50x slower | 137 ms | 1.25x slower |
+| `cudnn_sm100_dense_gemm_persistent_swiglu` | 8 | 204 ms | 293 ms | 1.43x slower | 137 ms | **1.49x faster** |
+| `cudnn_sm100_flex_attention_backward` | 8 | 350 ms | 102 ms | **3.45x faster** | 50 ms | **7.05x faster** |
+| `cudnn_sm100_gdn2_bprop_f16` | 8 | 1.14 s | 234 ms | **4.86x faster** | 78 ms | **14.54x faster** |
+| `cudnn_sm100_gdn2_recompute_f16` | 8 | 1.80 s | 251 ms | **7.17x faster** | 142 ms | **12.68x faster** |
+| `cudnn_sm100_gdn_bprop_f16` | 8 | 4.89 s | 795 ms | **6.15x faster** | 286 ms | **17.07x faster** |
+| `cudnn_sm100_gdn_prefill_f16` | 8 | 2.79 s | 308 ms | **9.07x faster** | 138 ms | **20.15x faster** |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 8 | 9.07 s | 20.05 s | 2.21x slower | 11.20 s | 1.23x slower |
+| `cudnn_sm100_kda_bprop_f16` | 8 | 1.17 s | 194 ms | **6.03x faster** | 56 ms | **20.85x faster** |
+| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 8 | 950 ms | 1.02 s | 1.07x slower | 383 ms | **2.48x faster** |
+| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 8 | 739 ms | 507 ms | **1.46x faster** | 198 ms | **3.72x faster** |
+| `deepgemm_sm100_fp4_mqa_logits` | 8 | 871 ms | 737 ms | **1.18x faster** | 413 ms | **2.11x faster** |
+| `deepgemm_sm100_fp8_mqa_logits` | 8 | 872 ms | 448 ms | **1.95x faster** | 219 ms | **3.98x faster** |
+| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 8 | 146 ms | 95 ms | **1.53x faster** | 53 ms | **2.74x faster** |
+| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 8 | 2.12 s | 2.21 s | 1.04x slower | 1.17 s | **1.82x faster** |
+| `filtered_topk` | 8 | 115 ms | 40 ms | **2.88x faster** | 33 ms | **3.54x faster** |
+| `flash_attention4` | 8 | 3.15 s | 2.52 s | **1.25x faster** | 1.52 s | **2.07x faster** |
+| `gdn_decode_bf16_ilp4` | 8 | 198 ms | 71 ms | **2.79x faster** | 42 ms | **4.73x faster** |
+| `gdn_decode_bf16_wide_vec_mtp` | 8 | 784 ms | 1.09 s | 1.38x slower | 654 ms | **1.20x faster** |
+| `kda_decode_multishape` | 8 | 123 ms | 312 ms | 2.54x slower | 204 ms | 1.66x slower |
+| `msa_sparse_atten_fwd_sm100` | 8 | 230 ms | 46 ms | **4.98x faster** | 30 ms | **7.75x faster** |
+| `recurrent_kda_decode_one_warp` | 8 | 3.89 s | 1.49 s | **2.61x faster** | 1.11 s | **3.51x faster** |
+| `selective_state_update_stp_simple` | 8 | 33 ms | 15 ms | **2.15x faster** | 11 ms | **2.87x faster** |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 32 | 108 ms | 297 ms | 2.74x slower | 136 ms | 1.26x slower |
+| `cudnn_sm100_dense_gemm_persistent_swiglu` | 32 | 169 ms | 305 ms | 1.80x slower | 144 ms | **1.17x faster** |
+| `cudnn_sm100_flex_attention_backward` | 32 | 372 ms | 98 ms | **3.79x faster** | 48 ms | **7.81x faster** |
+| `cudnn_sm100_gdn2_bprop_f16` | 32 | 1.22 s | 241 ms | **5.06x faster** | 78 ms | **15.63x faster** |
+| `cudnn_sm100_gdn2_recompute_f16` | 32 | 1.91 s | 252 ms | **7.57x faster** | 142 ms | **13.47x faster** |
+| `cudnn_sm100_gdn_bprop_f16` | 32 | 4.96 s | 831 ms | **5.96x faster** | 285 ms | **17.42x faster** |
+| `cudnn_sm100_gdn_prefill_f16` | 32 | 2.84 s | 317 ms | **8.95x faster** | 139 ms | **20.49x faster** |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 32 | 6.71 s | 18.98 s | 2.83x slower | 9.74 s | 1.45x slower |
+| `cudnn_sm100_kda_bprop_f16` | 32 | 1.16 s | 200 ms | **5.81x faster** | 56 ms | **20.73x faster** |
+| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 32 | 968 ms | 893 ms | **1.08x faster** | 401 ms | **2.41x faster** |
+| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 32 | 795 ms | 526 ms | **1.51x faster** | 199 ms | **4.00x faster** |
+| `deepgemm_sm100_fp4_mqa_logits` | 32 | 837 ms | 809 ms | **1.03x faster** | 411 ms | **2.04x faster** |
+| `deepgemm_sm100_fp8_mqa_logits` | 32 | 925 ms | 531 ms | **1.74x faster** | 215 ms | **4.31x faster** |
+| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 32 | 143 ms | 108 ms | **1.32x faster** | 53 ms | **2.70x faster** |
+| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 32 | 2.15 s | 2.64 s | 1.23x slower | 1.15 s | **1.87x faster** |
+| `filtered_topk` | 32 | 123 ms | 43 ms | **2.90x faster** | 32 ms | **3.79x faster** |
+| `flash_attention4` | 32 | 1.64 s | 2.33 s | 1.43x slower | 1.43 s | **1.15x faster** |
+| `gdn_decode_bf16_ilp4` | 32 | 171 ms | 69 ms | **2.47x faster** | 37 ms | **4.60x faster** |
+| `gdn_decode_bf16_wide_vec_mtp` | 32 | 673 ms | 1.04 s | 1.54x slower | 625 ms | **1.08x faster** |
+| `kda_decode_multishape` | 32 | 129 ms | 325 ms | 2.52x slower | 204 ms | 1.58x slower |
+| `msa_sparse_atten_fwd_sm100` | 32 | 252 ms | 48 ms | **5.24x faster** | 30 ms | **8.53x faster** |
+| `recurrent_kda_decode_one_warp` | 32 | 4.98 s | 1.38 s | **3.60x faster** | 987 ms | **5.04x faster** |
+| `selective_state_update_stp_simple` | 32 | 32 ms | 17 ms | **1.94x faster** | 12 ms | **2.74x faster** |
 
 ## synccheck
 
-| case | workers | legacy | v2 | v2 vs legacy |
-| --- | --- | --- | --- | --- |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` | 1 | 222 ms | 132 ms | **1.68x faster** |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 1 | 152 ms | 90 ms | **1.69x faster** |
-| `cudnn_sm100_dense_gemm_persistent_swiglu` | 1 | 227 ms | 100 ms | **2.28x faster** |
-| `cudnn_sm100_flex_attention_backward` | 1 | 228 ms | 55 ms | **4.18x faster** |
-| `cudnn_sm100_gdn2_bprop_f16` | 1 | 1.10 s | 154 ms | **7.12x faster** |
-| `cudnn_sm100_gdn2_recompute_f16` | 1 | 1.64 s | 119 ms | **13.74x faster** |
-| `cudnn_sm100_gdn_bprop_f16` | 1 | 4.77 s | 531 ms | **8.98x faster** |
-| `cudnn_sm100_gdn_prefill_f16` | 1 | 3.08 s | 189 ms | **16.33x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 1 | 30.57 s | 21.45 s | **1.42x faster** |
-| `cudnn_sm100_kda_bprop_f16` | 1 | 1.03 s | 116 ms | **8.93x faster** |
-| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 1 | 1.88 s | 607 ms | **3.09x faster** |
-| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 1 | 1.79 s | 584 ms | **3.07x faster** |
-| `deepgemm_sm100_fp4_mqa_logits` | 1 | 827 ms | 415 ms | **1.99x faster** |
-| `deepgemm_sm100_fp8_gemm_1d1d` | 1 | 41 ms | 29 ms | **1.40x faster** |
-| `deepgemm_sm100_fp8_mqa_logits` | 1 | 642 ms | 187 ms | **3.44x faster** |
-| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 1 | 86 ms | 31 ms | **2.76x faster** |
-| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 1 | 1.30 s | 668 ms | **1.95x faster** |
-| `filtered_topk` | 1 | 112 ms | 22 ms | **5.14x faster** |
-| `flash_attention4` | 1 | 9.46 s | 2.31 s | **4.09x faster** |
-| `gdn_cp_prefill_sm100` | 1 | 15.24 s | 2.73 s | **5.59x faster** |
-| `gdn_decode_bf16_ilp4` | 1 | 235 ms | 44 ms | **5.32x faster** |
-| `gdn_decode_bf16_wide_vec_mtp` | 1 | 1.45 s | 317 ms | **4.57x faster** |
-| `gdn_prefill_sm100` | 1 | 1.68 s | 1.65 s | **1.01x faster** |
-| `kda_backward_packed` | 1 | 1.25 s | 1.31 s | 1.05x slower |
-| `kda_decode_multishape` | 1 | 256 ms | 89 ms | **2.87x faster** |
-| `msa_sparse_atten_fwd_sm100` | 1 | 195 ms | 30 ms | **6.48x faster** |
-| `recurrent_kda_decode_one_warp` | 1 | 5.40 s | 1.03 s | **5.24x faster** |
-| `selective_state_update_stp_simple` | 1 | 38 ms | 9 ms | **4.38x faster** |
-| `sparse_flashmla_prefill_head128_phase1` | 1 | 181 ms | 157 ms | **1.16x faster** |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` | 8 | 148 ms | 135 ms | **1.10x faster** |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 8 | 78 ms | 75 ms | **1.04x faster** |
-| `cudnn_sm100_dense_gemm_persistent_swiglu` | 8 | 97 ms | 79 ms | **1.22x faster** |
-| `cudnn_sm100_flex_attention_backward` | 8 | 246 ms | 56 ms | **4.42x faster** |
-| `cudnn_sm100_gdn2_bprop_f16` | 8 | 1.24 s | 169 ms | **7.35x faster** |
-| `cudnn_sm100_gdn2_recompute_f16` | 8 | 1.53 s | 126 ms | **12.15x faster** |
-| `cudnn_sm100_gdn_bprop_f16` | 8 | 4.82 s | 577 ms | **8.36x faster** |
-| `cudnn_sm100_gdn_prefill_f16` | 8 | 2.83 s | 171 ms | **16.62x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 8 | 9.60 s | 5.40 s | **1.78x faster** |
-| `cudnn_sm100_kda_bprop_f16` | 8 | 1.03 s | 123 ms | **8.39x faster** |
-| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 8 | 1.46 s | 530 ms | **2.76x faster** |
-| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 8 | 1.21 s | 480 ms | **2.52x faster** |
-| `deepgemm_sm100_fp4_mqa_logits` | 8 | 503 ms | 372 ms | **1.35x faster** |
-| `deepgemm_sm100_fp8_gemm_1d1d` | 8 | 42 ms | 32 ms | **1.33x faster** |
-| `deepgemm_sm100_fp8_mqa_logits` | 8 | 377 ms | 199 ms | **1.89x faster** |
-| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 8 | 62 ms | 46 ms | **1.35x faster** |
-| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 8 | 728 ms | 697 ms | **1.05x faster** |
-| `filtered_topk` | 8 | 113 ms | 23 ms | **4.93x faster** |
-| `flash_attention4` | 8 | 2.77 s | 851 ms | **3.26x faster** |
-| `gdn_cp_prefill_sm100` | 8 | 7.41 s | 728 ms | **10.19x faster** |
-| `gdn_decode_bf16_ilp4` | 8 | 96 ms | 13 ms | **7.60x faster** |
-| `gdn_decode_bf16_wide_vec_mtp` | 8 | 506 ms | 91 ms | **5.57x faster** |
-| `gdn_prefill_sm100` | 8 | 1.69 s | 1.62 s | **1.04x faster** |
-| `kda_backward_packed` | 8 | 1.16 s | 956 ms | **1.21x faster** |
-| `kda_decode_multishape` | 8 | 133 ms | 70 ms | **1.89x faster** |
-| `msa_sparse_atten_fwd_sm100` | 8 | 190 ms | 31 ms | **6.12x faster** |
-| `recurrent_kda_decode_one_warp` | 8 | 2.08 s | 655 ms | **3.17x faster** |
-| `selective_state_update_stp_simple` | 8 | 25 ms | 5 ms | **4.79x faster** |
-| `sparse_flashmla_prefill_head128_phase1` | 8 | 181 ms | 151 ms | **1.20x faster** |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` | 32 | 145 ms | 155 ms | 1.07x slower |
-| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 32 | 79 ms | 88 ms | 1.13x slower |
-| `cudnn_sm100_dense_gemm_persistent_swiglu` | 32 | 98 ms | 86 ms | **1.14x faster** |
-| `cudnn_sm100_flex_attention_backward` | 32 | 231 ms | 55 ms | **4.20x faster** |
-| `cudnn_sm100_gdn2_bprop_f16` | 32 | 1.23 s | 177 ms | **6.94x faster** |
-| `cudnn_sm100_gdn2_recompute_f16` | 32 | 1.65 s | 133 ms | **12.44x faster** |
-| `cudnn_sm100_gdn_bprop_f16` | 32 | 5.31 s | 597 ms | **8.88x faster** |
-| `cudnn_sm100_gdn_prefill_f16` | 32 | 2.83 s | 174 ms | **16.24x faster** |
-| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 32 | 7.37 s | 4.46 s | **1.65x faster** |
-| `cudnn_sm100_kda_bprop_f16` | 32 | 1.02 s | 126 ms | **8.07x faster** |
-| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 32 | 1.45 s | 550 ms | **2.63x faster** |
-| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 32 | 1.66 s | 490 ms | **3.39x faster** |
-| `deepgemm_sm100_fp4_mqa_logits` | 32 | 536 ms | 592 ms | 1.11x slower |
-| `deepgemm_sm100_fp8_gemm_1d1d` | 32 | 43 ms | 33 ms | **1.29x faster** |
-| `deepgemm_sm100_fp8_mqa_logits` | 32 | 372 ms | 264 ms | **1.41x faster** |
-| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 32 | 64 ms | 56 ms | **1.16x faster** |
-| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 32 | 719 ms | 968 ms | 1.35x slower |
-| `filtered_topk` | 32 | 120 ms | 24 ms | **4.94x faster** |
-| `flash_attention4` | 32 | 2.13 s | 954 ms | **2.23x faster** |
-| `gdn_cp_prefill_sm100` | 32 | 6.42 s | 607 ms | **10.57x faster** |
-| `gdn_decode_bf16_ilp4` | 32 | 81 ms | 11 ms | **7.22x faster** |
-| `gdn_decode_bf16_wide_vec_mtp` | 32 | 445 ms | 62 ms | **7.15x faster** |
-| `gdn_prefill_sm100` | 32 | 1.67 s | 1.62 s | **1.03x faster** |
-| `kda_backward_packed` | 32 | 1.27 s | 1.15 s | **1.11x faster** |
-| `kda_decode_multishape` | 32 | 131 ms | 67 ms | **1.95x faster** |
-| `msa_sparse_atten_fwd_sm100` | 32 | 200 ms | 32 ms | **6.27x faster** |
-| `recurrent_kda_decode_one_warp` | 32 | 1.97 s | 548 ms | **3.59x faster** |
-| `selective_state_update_stp_simple` | 32 | 24 ms | 6 ms | **3.83x faster** |
-| `sparse_flashmla_prefill_head128_phase1` | 32 | 179 ms | 148 ms | **1.21x faster** |
+| case | workers | legacy | v2 (6ba4190) | v2 vs legacy (6ba4190) | v2 now (243f9f4) | now vs legacy |
+| --- | --- | --- | --- | --- | --- | --- |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` | 1 | 222 ms | 132 ms | **1.68x faster** | 80 ms | **2.76x faster** |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 1 | 152 ms | 90 ms | **1.69x faster** | 41 ms | **3.71x faster** |
+| `cudnn_sm100_dense_gemm_persistent_swiglu` | 1 | 227 ms | 100 ms | **2.28x faster** | 40 ms | **5.69x faster** |
+| `cudnn_sm100_flex_attention_backward` | 1 | 228 ms | 55 ms | **4.18x faster** | 35 ms | **6.60x faster** |
+| `cudnn_sm100_gdn2_bprop_f16` | 1 | 1.10 s | 154 ms | **7.12x faster** | 41 ms | **26.72x faster** |
+| `cudnn_sm100_gdn2_recompute_f16` | 1 | 1.64 s | 119 ms | **13.74x faster** | 42 ms | **38.66x faster** |
+| `cudnn_sm100_gdn_bprop_f16` | 1 | 4.77 s | 531 ms | **8.98x faster** | 168 ms | **28.33x faster** |
+| `cudnn_sm100_gdn_prefill_f16` | 1 | 3.08 s | 189 ms | **16.33x faster** | 35 ms | **88.69x faster** |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 1 | 30.57 s | 21.45 s | **1.42x faster** | 5.96 s | **5.13x faster** |
+| `cudnn_sm100_kda_bprop_f16` | 1 | 1.03 s | 116 ms | **8.93x faster** | 32 ms | **31.97x faster** |
+| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 1 | 1.88 s | 607 ms | **3.09x faster** | 394 ms | **4.77x faster** |
+| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 1 | 1.79 s | 584 ms | **3.07x faster** | 412 ms | **4.34x faster** |
+| `deepgemm_sm100_fp4_mqa_logits` | 1 | 827 ms | 415 ms | **1.99x faster** | 188 ms | **4.40x faster** |
+| `deepgemm_sm100_fp8_gemm_1d1d` | 1 | 41 ms | 29 ms | **1.40x faster** | 18 ms | **2.33x faster** |
+| `deepgemm_sm100_fp8_mqa_logits` | 1 | 642 ms | 187 ms | **3.44x faster** | 70 ms | **9.13x faster** |
+| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 1 | 86 ms | 31 ms | **2.76x faster** | 20 ms | **4.27x faster** |
+| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 1 | 1.30 s | 668 ms | **1.95x faster** | 279 ms | **4.65x faster** |
+| `filtered_topk` | 1 | 112 ms | 22 ms | **5.14x faster** | 17 ms | **6.72x faster** |
+| `flash_attention4` | 1 | 9.46 s | 2.31 s | **4.09x faster** | 1.37 s | **6.93x faster** |
+| `gdn_cp_prefill_sm100` | 1 | 15.24 s | 2.73 s | **5.59x faster** | 2.30 s | **6.63x faster** |
+| `gdn_decode_bf16_ilp4` | 1 | 235 ms | 44 ms | **5.32x faster** | 41 ms | **5.70x faster** |
+| `gdn_decode_bf16_wide_vec_mtp` | 1 | 1.45 s | 317 ms | **4.57x faster** | 280 ms | **5.18x faster** |
+| `gdn_prefill_sm100` | 1 | 1.68 s | 1.65 s | **1.01x faster** | 1.50 s | **1.12x faster** |
+| `kda_backward_packed` | 1 | 1.25 s | 1.31 s | 1.05x slower | 213 ms | **5.88x faster** |
+| `kda_decode_multishape` | 1 | 256 ms | 89 ms | **2.87x faster** | 70 ms | **3.65x faster** |
+| `msa_sparse_atten_fwd_sm100` | 1 | 195 ms | 30 ms | **6.48x faster** | 15 ms | **13.04x faster** |
+| `recurrent_kda_decode_one_warp` | 1 | 5.40 s | 1.03 s | **5.24x faster** | 1.01 s | **5.33x faster** |
+| `selective_state_update_stp_simple` | 1 | 38 ms | 9 ms | **4.38x faster** | 8 ms | **4.48x faster** |
+| `sparse_flashmla_prefill_head128_phase1` | 1 | 181 ms | 157 ms | **1.16x faster** | 101 ms | **1.79x faster** |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` | 8 | 148 ms | 135 ms | **1.10x faster** | 84 ms | **1.77x faster** |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 8 | 78 ms | 75 ms | **1.04x faster** | 41 ms | **1.89x faster** |
+| `cudnn_sm100_dense_gemm_persistent_swiglu` | 8 | 97 ms | 79 ms | **1.22x faster** | 41 ms | **2.38x faster** |
+| `cudnn_sm100_flex_attention_backward` | 8 | 246 ms | 56 ms | **4.42x faster** | 35 ms | **7.12x faster** |
+| `cudnn_sm100_gdn2_bprop_f16` | 8 | 1.24 s | 169 ms | **7.35x faster** | 38 ms | **32.25x faster** |
+| `cudnn_sm100_gdn2_recompute_f16` | 8 | 1.53 s | 126 ms | **12.15x faster** | 46 ms | **33.62x faster** |
+| `cudnn_sm100_gdn_bprop_f16` | 8 | 4.82 s | 577 ms | **8.36x faster** | 167 ms | **28.78x faster** |
+| `cudnn_sm100_gdn_prefill_f16` | 8 | 2.83 s | 171 ms | **16.62x faster** | 35 ms | **79.87x faster** |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 8 | 9.60 s | 5.40 s | **1.78x faster** | 2.42 s | **3.97x faster** |
+| `cudnn_sm100_kda_bprop_f16` | 8 | 1.03 s | 123 ms | **8.39x faster** | 32 ms | **31.70x faster** |
+| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 8 | 1.46 s | 530 ms | **2.76x faster** | 328 ms | **4.45x faster** |
+| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 8 | 1.21 s | 480 ms | **2.52x faster** | 342 ms | **3.54x faster** |
+| `deepgemm_sm100_fp4_mqa_logits` | 8 | 503 ms | 372 ms | **1.35x faster** | 188 ms | **2.67x faster** |
+| `deepgemm_sm100_fp8_gemm_1d1d` | 8 | 42 ms | 32 ms | **1.33x faster** | 18 ms | **2.39x faster** |
+| `deepgemm_sm100_fp8_mqa_logits` | 8 | 377 ms | 199 ms | **1.89x faster** | 73 ms | **5.18x faster** |
+| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 8 | 62 ms | 46 ms | **1.35x faster** | 24 ms | **2.57x faster** |
+| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 8 | 728 ms | 697 ms | **1.05x faster** | 260 ms | **2.80x faster** |
+| `filtered_topk` | 8 | 113 ms | 23 ms | **4.93x faster** | 17 ms | **6.78x faster** |
+| `flash_attention4` | 8 | 2.77 s | 851 ms | **3.26x faster** | 581 ms | **4.77x faster** |
+| `gdn_cp_prefill_sm100` | 8 | 7.41 s | 728 ms | **10.19x faster** | 577 ms | **12.85x faster** |
+| `gdn_decode_bf16_ilp4` | 8 | 96 ms | 13 ms | **7.60x faster** | 11 ms | **9.12x faster** |
+| `gdn_decode_bf16_wide_vec_mtp` | 8 | 506 ms | 91 ms | **5.57x faster** | 73 ms | **6.94x faster** |
+| `gdn_prefill_sm100` | 8 | 1.69 s | 1.62 s | **1.04x faster** | 1.51 s | **1.12x faster** |
+| `kda_backward_packed` | 8 | 1.16 s | 956 ms | **1.21x faster** | 171 ms | **6.80x faster** |
+| `kda_decode_multishape` | 8 | 133 ms | 70 ms | **1.89x faster** | 41 ms | **3.23x faster** |
+| `msa_sparse_atten_fwd_sm100` | 8 | 190 ms | 31 ms | **6.12x faster** | 15 ms | **12.70x faster** |
+| `recurrent_kda_decode_one_warp` | 8 | 2.08 s | 655 ms | **3.17x faster** | 645 ms | **3.22x faster** |
+| `selective_state_update_stp_simple` | 8 | 25 ms | 5 ms | **4.79x faster** | 4 ms | **6.27x faster** |
+| `sparse_flashmla_prefill_head128_phase1` | 8 | 181 ms | 151 ms | **1.20x faster** | 101 ms | **1.80x faster** |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant` | 32 | 145 ms | 155 ms | 1.07x slower | 82 ms | **1.76x faster** |
+| `cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant` | 32 | 79 ms | 88 ms | 1.13x slower | 42 ms | **1.89x faster** |
+| `cudnn_sm100_dense_gemm_persistent_swiglu` | 32 | 98 ms | 86 ms | **1.14x faster** | 39 ms | **2.52x faster** |
+| `cudnn_sm100_flex_attention_backward` | 32 | 231 ms | 55 ms | **4.20x faster** | 32 ms | **7.28x faster** |
+| `cudnn_sm100_gdn2_bprop_f16` | 32 | 1.23 s | 177 ms | **6.94x faster** | 39 ms | **31.71x faster** |
+| `cudnn_sm100_gdn2_recompute_f16` | 32 | 1.65 s | 133 ms | **12.44x faster** | 42 ms | **39.00x faster** |
+| `cudnn_sm100_gdn_bprop_f16` | 32 | 5.31 s | 597 ms | **8.88x faster** | 168 ms | **31.61x faster** |
+| `cudnn_sm100_gdn_prefill_f16` | 32 | 2.83 s | 174 ms | **16.24x faster** | 35 ms | **81.49x faster** |
+| `cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in` | 32 | 7.37 s | 4.46 s | **1.65x faster** | 1.94 s | **3.80x faster** |
+| `cudnn_sm100_kda_bprop_f16` | 32 | 1.02 s | 126 ms | **8.07x faster** | 33 ms | **31.31x faster** |
+| `cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias` | 32 | 1.45 s | 550 ms | **2.63x faster** | 366 ms | **3.97x faster** |
+| `cudnn_sm100_moe_grouped_gemm_dglu_dbias` | 32 | 1.66 s | 490 ms | **3.39x faster** | 315 ms | **5.27x faster** |
+| `deepgemm_sm100_fp4_mqa_logits` | 32 | 536 ms | 592 ms | 1.11x slower | 191 ms | **2.81x faster** |
+| `deepgemm_sm100_fp8_gemm_1d1d` | 32 | 43 ms | 33 ms | **1.29x faster** | 18 ms | **2.44x faster** |
+| `deepgemm_sm100_fp8_mqa_logits` | 32 | 372 ms | 264 ms | **1.41x faster** | 73 ms | **5.07x faster** |
+| `deepgemm_sm100_k_grouped_fp8_gemm_contiguous` | 32 | 64 ms | 56 ms | **1.16x faster** | 25 ms | **2.61x faster** |
+| `deepgemm_sm100_m_grouped_fp8_gemm_contiguous` | 32 | 719 ms | 968 ms | 1.35x slower | 268 ms | **2.69x faster** |
+| `filtered_topk` | 32 | 120 ms | 24 ms | **4.94x faster** | 17 ms | **7.21x faster** |
+| `flash_attention4` | 32 | 2.13 s | 954 ms | **2.23x faster** | 684 ms | **3.12x faster** |
+| `gdn_cp_prefill_sm100` | 32 | 6.42 s | 607 ms | **10.57x faster** | 363 ms | **17.68x faster** |
+| `gdn_decode_bf16_ilp4` | 32 | 81 ms | 11 ms | **7.22x faster** | 7 ms | **12.01x faster** |
+| `gdn_decode_bf16_wide_vec_mtp` | 32 | 445 ms | 62 ms | **7.15x faster** | 45 ms | **9.83x faster** |
+| `gdn_prefill_sm100` | 32 | 1.67 s | 1.62 s | **1.03x faster** | 1.50 s | **1.11x faster** |
+| `kda_backward_packed` | 32 | 1.27 s | 1.15 s | **1.11x faster** | 173 ms | **7.35x faster** |
+| `kda_decode_multishape` | 32 | 131 ms | 67 ms | **1.95x faster** | 42 ms | **3.09x faster** |
+| `msa_sparse_atten_fwd_sm100` | 32 | 200 ms | 32 ms | **6.27x faster** | 15 ms | **13.38x faster** |
+| `recurrent_kda_decode_one_warp` | 32 | 1.97 s | 548 ms | **3.59x faster** | 563 ms | **3.50x faster** |
+| `selective_state_update_stp_simple` | 32 | 24 ms | 6 ms | **3.83x faster** | 5 ms | **5.32x faster** |
+| `sparse_flashmla_prefill_head128_phase1` | 32 | 179 ms | 148 ms | **1.21x faster** | 101 ms | **1.77x faster** |
 
