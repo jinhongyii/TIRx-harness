@@ -1005,6 +1005,37 @@ Reading:
 - Process CPU tracks wall in every sample: 26-35 s fast, 38-45 s slow. Each run inflates or it does not.
 - The selector stays unidentified. Separating it needs hardware counters (`perf_event_paranoid` ≤ 2) or a dedicated host. `pin_workers` is unchanged.
 
+**The pinned slow mode is not transparent huge pages either (W13, 2026-10-09).** Recorded; nothing landed.
+
+Setup: `pin_workers=on`, medium at 32 workers, 8 interleaved rounds of four mimalloc settings. Build: 5d98955 behaviour (scratch `w13/hgl/`). At the end of each run the driver read `Rss` and `AnonHugePages` from `/proc/self/smaps_rollup`. Every run was `clean` and matched the reference. Load was 0.4-8.0.
+- **default:** mimalloc v3 defaults.
+- **never:** `MIMALLOC_ALLOW_LARGE_OS_PAGES=0 MIMALLOC_ALLOW_THP=0`.
+- **always:** `MIMALLOC_ALLOW_LARGE_OS_PAGES=1`.
+- **reserve:** `always` plus `MIMALLOC_RESERVE_HUGE_OS_PAGES=4`. This has no effect here: the host's 1 GB hugetlb pool is empty (`nr_hugepages=0`, not changeable without root), so it equals `always`.
+
+Host THP policy:
+- `transparent_hugepage/enabled = madvise` and `defrag = madvise`.
+- `khugepaged/defrag = 1`, `pages_to_scan = 4096`, `max_ptes_none = 511`.
+
+Wall s (process CPU s, AnonHugePages MB), in run order:
+
+| setting | samples | min / median |
+|---|---|---|
+| default | 3.73 (43.7, 3778), 2.78 (30.7, 3774), 2.39 (27.3, 3774), 3.69 (42.8, 3768), 3.81 (44.9, 3776), 2.75 (31.2, 3756), 3.74 (44.0, 3768), 3.77 (44.2, 3748) | 2.39 / 3.73 |
+| never | 3.62 (34.4, 452), 3.43 (33.4, 454), 3.99 (39.6, 454), 3.70 (34.7, 452), 3.96 (40.6, 452), 4.10 (42.4, 452), 4.18 (44.3, 454), 2.76 (26.6, 452) | 2.76 / 3.96 |
+| always | 3.80 (44.5, 3760), 3.73 (43.8, 3764), 3.25 (37.5, 3672), 2.49 (27.8, 3764), 3.00 (33.2, 3772), 3.75 (44.1, 3772), 3.73 (43.7, 3758), 2.40 (27.0, 3762) | 2.40 / 3.73 |
+| reserve (= always) | 2.44 (27.5, 3770), 2.39 (26.8, 3772), 2.39 (27.0, 3758), 3.77 (44.0, 3742), 3.23 (34.6, 3408), 3.14 (34.9, 3770), 3.75 (44.0, 3766), 3.74 (43.8, 3760) | 2.39 / 3.23 |
+
+Rss was 4.4-4.6 GB, and 2.4-2.7 GB with `never`.
+
+Reading:
+- **Huge-page coverage does not separate the modes.** Under default, fast runs (2.39-2.78 s) and slow runs (3.69-3.81 s) both ended with 3.75-3.78 GB on 2 MB pages.
+- **Forcing the mode does not force the band.**
+  - With 2 MB pages forced off (`never`, 452 MB left, from the non-mimalloc heap), runs stay bimodal (2.76 s once, otherwise 3.43-4.18 s), and the median is ~6% worse.
+  - With large pages always requested, runs are as bimodal as default.
+- **Ruled out so far:** transparent huge pages, NUMA placement, cross-L3 stealing and the 1-minute load average.
+- **Still open:** the per-run selector. CPU tracks wall in every mode: fast runs take 26-31 s of CPU, slow ones 42-45 s. Hardware counters (`perf_event_paranoid` ≤ 2) are the next step.
+
 ## Parked spin-loop replay: validated prototype, not landed (W13, 2026-10-09)
 
 **Why not landed.** The design below was implemented in scratch and validated. No corpus case parks on a spin loop in a way that matters: medium spends 0.1–0.3 s in re-polls, and the max config has 0 replays. The max config's re-polls are blocked retries at `mbar_wait` (107 M checks, most already applied by `BlockedWait`), `wait_until` (29.5 M) and `barrier` (19.1 M), with no parked loops. Landing would add a recorder and replayer to the interpreter for no corpus gain. It can be revived if a spinning kernel shows up.
