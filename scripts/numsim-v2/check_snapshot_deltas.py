@@ -18,7 +18,9 @@ present in several tables fails until it is qualified (``delta_rows.py``).
 
 A whole-corpus regeneration that changes no verdict or finding (a snapshot
 schema bump, a normalization change) instead carries the trailer
-``Snapshot-Regen: schema <reason>``.
+``Snapshot-Regen: schema <reason>`` or ``Snapshot-Regen: harness <reason>``
+(a test-harness change, e.g. host-independent input generation, that moves
+output bits but no verdict, finding or coverage).
 
 Changed cases the message does not name are reported as warnings (not
 failures). Exit status 1 lists the offending commits.
@@ -57,7 +59,7 @@ def judge(message: str, changed: list[str], ids: dict[str, set[str]]) -> tuple[s
     """``(failure, warning)`` for one commit that changes ``changed`` snapshot
     paths (relative to the repository root) with commit message ``message``."""
 
-    if re.search(r"^Snapshot-Regen: schema \S", message, re.M):
+    if re.search(r"^Snapshot-Regen: (schema|harness) \S", message, re.M):
         return None, None
     citations = delta_rows.parse(message, ids)
     cited = sorted(citations.qualified)

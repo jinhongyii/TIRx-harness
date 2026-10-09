@@ -39,6 +39,8 @@ def test_judge_rules(check):
     failure, _ = check.judge("refresh bmm_fp8_rubin", changed, IDS)
     assert "cites no delta row id" in failure
     assert check.judge("regen\n\nSnapshot-Regen: schema projection", changed, IDS) == (None, None)
+    assert check.judge("regen\n\nSnapshot-Regen: harness inputs without BLAS", changed, IDS) == (None, None)
+    assert check.judge("regen\n\nSnapshot-Regen: numerics libm", changed, IDS) != (None, None)
     failure, warning = check.judge("racecheck B7 for the gemm", changed, IDS)
     assert failure is None and "bmm_fp8_rubin" in warning
 

@@ -223,7 +223,7 @@ git diff --stat tests/conformance/snapshots
 Review the diff. The commit message explains each changed case and cites the
 behaviour-delta row that justifies it, file-qualified (`racecheck B7`,
 `numsim H5`, `sync S1`); a regeneration that changes no verdict or finding
-carries `Snapshot-Regen: schema <reason>` instead. CI checks this
+carries `Snapshot-Regen: schema <reason>` instead (`Snapshot-Regen: harness <reason>` for a harness change that moves output bits but no verdict). CI checks this
 (`scripts/numsim-v2/check_snapshot_deltas.py`). A changed snapshot without a
 row is a regression.
 
