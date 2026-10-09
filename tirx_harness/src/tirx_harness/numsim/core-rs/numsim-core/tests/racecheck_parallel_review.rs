@@ -825,7 +825,6 @@ fn w16_first_wait_declare_fork_join_matches_serial() {
 /// a false DataRace on `data`. This is an engine bug, the same on base and
 /// on W16's series (CONTRACT_REQUESTS W6-P2).
 #[test]
-#[ignore = "xfail: CONTRACT_REQUESTS W6-P2 (W2) -- first-wait declaration misses other partitions' same-round writes"]
 fn w16_first_wait_declare_numbering_follows_the_delivery() {
     for hb in [true, false] {
         for w in [1usize, 8] {
@@ -836,3 +835,21 @@ fn w16_first_wait_declare_numbering_follows_the_delivery() {
     }
 }
 
+
+
+/// W6-P2 part 2 (racecheck, W5): with one partition the engine numbering is
+/// consistent (CTA 0's `st.release w = 7` precedes the first-use
+/// declaration, so 7 is history index 0). Racecheck still owes no edge for
+/// an accepted index 0 (the "launch value" rule, delta W8), so the data read
+/// is a false DataRace. A mid-run `DeclareWord` must seed entry 0 with the
+/// release heads of the latest write to those bytes. W2's serial-point fix
+/// for part 1 reduces the multi-partition case to this one.
+#[test]
+#[ignore = "xfail: CONTRACT_REQUESTS W6-P2 part 2 (W5) -- first-use declaration value owes the latest write's edge"]
+fn w6_p2_first_use_declaration_value_carries_the_release() {
+    let mut s = first_wait_declare(true);
+    s.config.single_partition = true;
+    let (status, report) = serial_payload(&s, 1, &RacecheckConfig::default());
+    assert_eq!(status, format!("{:?}", RunStatus::Completed));
+    assert!(!report.contains("DataRace"), "{report}");
+}

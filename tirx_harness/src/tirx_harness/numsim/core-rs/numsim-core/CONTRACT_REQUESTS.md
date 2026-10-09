@@ -3382,3 +3382,14 @@ Found while reviewing W16's child-side `DeclareWord` (patch 02). The bug is in t
   - (b) Log writes to *any* global 4/8-byte location into a per-partition pending log while word history is wanted, and fold the entries for regions declared this phase at merge. This costs memory.
   - (c) Make a first-use declaration of a global word end the round's partition parallelism for that word: mark it so that other partitions' writes that phase go through the serial phase.
   - (d) Declare at first use with history starting at the *end* of the declaring phase, so writes in the declaring round count as pre-declaration. Racecheck then also has to start the word's history at the merge point, not at the `DeclareWord` event; that is a contract change.
+
+### W6-P2 part 2 (for W5): the first-use declaration value owes the latest write's edge
+
+- **The engine fix alone is not enough.** W2's proposal (part 1) makes a first-use declaration a serial point, so other partitions' same-round writes precede the `DeclareWord`.
+- **Single-partition repro.** With one partition (`single_partition = true`), the numbering is already consistent: CTA 0's `st.release w = 7` precedes the first-use declaration, so 7 is history index 0.
+  - Racecheck applies "an accepted index 0 owes no edge" (the launch-value rule, delta W8), so the read of `data` after the wait is a false DataRace.
+  - Index 0 of a word declared mid-run is not a launch value: it was written, here by a release.
+- **Fix (racecheck).** At a mid-run `DeclareWord`, seed history entry 0 with the effective release heads of the latest morally-strong write to those bytes in the shadow, what a strong read's read-from would acquire. Bit 0 then acquires that `Rel`.
+  - A plain latest write gives no `Rel`, so `WaitExitUnproven` / `SignalProtocolError`, as today for plain publications.
+  - A word that has had no write since launch keeps "no edge".
+- **Guard.** `tests/racecheck_parallel_review.rs::w6_p2_first_use_declaration_value_carries_the_release` (`#[ignore]`, xfail). Un-ignore it together with `w16_first_wait_declare_numbering_follows_the_delivery` once both parts land.
