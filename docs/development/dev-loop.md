@@ -20,6 +20,8 @@ source scripts/dev-env.sh   # repo root; clears the TVM variables, sets $PY
                             # and NUMSIM_CACHE_DIR
 ```
 
+The same applies to a wheel smoke test in a fresh venv (`scripts/smoke_wheel.py`): run it with `env -u TVM_HOME -u TVM_LIBRARY_PATH -u LD_LIBRARY_PATH -u PYTHONPATH`, or `import tvm.script` fails with "Cannot find object type index for ir.StringType".
+
 and use `$PY` (the project `.venv`, Python 3.12) for every Python command.
 
 Create or refresh the environment with
