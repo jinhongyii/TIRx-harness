@@ -1778,6 +1778,65 @@ pub fn tcgen_mma_sparse() -> Scenario {
     s
 }
 
+/// W6-P2: a global word declared at its first `wait_until` (not a
+/// `sync_words` buffer) while another cluster writes it. Two single-CTA
+/// clusters: CTA 1 lane 0 `wait_until(w == 7)` then reads `data`; CTA 0
+/// lane 0 stores `data = 5`, then `w = 7` (`st.release.gpu` when `hb`).
+/// Not in [`all`]: racecheck's first-use declaration value (W6-P2 part 2)
+/// is pending.
+pub fn first_use_wait(hb: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("first_use_wait", 32);
+    b.grid(2, 1, 1);
+    let w = b.global("w", Dtype::U32);
+    let data = b.global("data", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let cta = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let wa = b.reg(Ty::U64);
+    let got = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    let arg = b.reg(Ty::U32);
+    let res = b.reg(Ty::PRED);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k5 = b.k_u32(5);
+    let k7 = b.k_u32(7);
+    b.addr_of(wa, w, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.compare(CmpOp::Eq, Ty::U32, p, cta, k0);
+    b.if_(p);
+    b.site("data_store", 1);
+    b.st_u32(data, k0, k5);
+    b.site("w_publish", 2);
+    b.push(Instr::Store { ty: Ty::U32, buf: w, offset: k0, value: k7, sem: if hb { Sem::Release } else { Sem::Weak }, scope: Scope::Gpu, mods: MemMods::default() });
+    b.no_site();
+    b.else_();
+    b.site("wait_until", 3);
+    let placeholder = b.push(Instr::Nop);
+    b.site("data_load", 4);
+    b.ld_u32(v, data, k0);
+    b.no_site();
+    b.add_u32(v, v, got);
+    b.st_u32(out, k0, v);
+    b.end_if();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    let start = Pc(prog.code.len() as u32);
+    prog.code.push(Instr::Compare { op: CmpOp::Eq, ty: Ty::U32, dst: res, a: arg.into(), b: k7 });
+    prog.code_sites.push(crate::site::SiteId::NONE);
+    prog.preds.push(PredProgram { arg, start, end: Pc(start.0 + 1), result: res, reads_memory: false });
+    prog.code[placeholder.0 as usize] =
+        Instr::WaitUntil { dst: got, addr: wa.into(), ty: Ty::U32, space: AddrSpace::Generic, sem: Sem::Acquire, scope: Scope::Gpu, pred: PredId(0), captures: vec![] };
+    prog.validate().expect("valid");
+    let mut s = scenario("first_use_wait", Module::new(vec![prog]), inputs(vec![("w", u32_buf([0])), ("data", u32_buf([0])), ("out", u32_buf([0]))]));
+    s.config.loop_budget = 1 << 40;
+    s
+}
+
 /// W12-gaps 6: CLC task stealing under a cluster subset. Grid of 4
 /// one-CTA clusters, subset {0, 1} (two resident partitions, tasks 2 and 3
 /// non-resident). Each CTA's lane 0 marks `out[ctaid]`, then loops:

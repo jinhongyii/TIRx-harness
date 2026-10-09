@@ -1062,6 +1062,25 @@ pub fn wait_until(
         _ => WarpMask::NONE,
     };
     let todo = active.and_not(latched);
+    // W6-P2: a word shared across partitions (a shard-overlaid allocation)
+    // that is not yet declared is declared at a serial point: inside an
+    // arena shard the wait re-runs in the serial phase on the main arena,
+    // after the round's merge, so the declaration snapshot includes every
+    // partition's same-round writes and `DeclareWord` follows their events
+    // (history numbering = delivery order). This pre-pass has no side
+    // effects beyond materializing lazy words (idempotent).
+    if ctx.arena.is_shard() {
+        for l in todo.lanes() {
+            let loc = support::resolve(ctx, space, lane_val(ctx, a, l), l, n)?;
+            if ctx.arena.is_overlaid(loc.alloc) {
+                ctx.aux.words.materialize(loc.alloc, loc.span(n));
+                if ctx.aux.words.region(loc.alloc, loc.span(n)).is_none() {
+                    ctx.aux.serial_request = true;
+                    return Ok(Flow::Yield(ctx.pc()));
+                }
+            }
+        }
+    }
     let mut vals = [0u64; 32];
     let mut locs: Vec<(usize, support::Loc)> = Vec::with_capacity(todo.count() as usize);
     for l in todo.lanes() {

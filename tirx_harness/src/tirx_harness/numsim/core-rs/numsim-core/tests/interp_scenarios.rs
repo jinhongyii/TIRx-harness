@@ -1957,3 +1957,76 @@ fn forked_replay_equals_serial_replay() {
         }
     }
 }
+
+/// Counts, per declared word, the write accesses delivered after its
+/// `DeclareWord`, and checks every `WaitVerdicts.observed` against it.
+#[derive(Default)]
+struct Numbering {
+    words: Vec<(numsim_core::arena::AllocId, numsim_core::arena::ByteSpan, u32)>,
+    verdicts: usize,
+    first_use: usize,
+    bad: Vec<String>,
+}
+impl Observer for Numbering {
+    fn wants_word_history(&self) -> bool {
+        true
+    }
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        use numsim_core::observe::AccessKind;
+        if !matches!(a.kind, AccessKind::Write | AccessKind::Rmw) {
+            return;
+        }
+        for w in self.words.iter_mut().filter(|w| w.0 == a.alloc) {
+            if a.spans.iter().any(|s| s.span.overlaps(w.1)) {
+                w.2 += 1;
+            }
+        }
+    }
+    fn sync(&mut self, e: &SyncEvent) {
+        match &e.kind {
+            SyncKind::DeclareWord { alloc, span } => {
+                if matches!(e.actor, numsim_core::observe::Actor::Warp { .. }) {
+                    self.first_use += 1;
+                }
+                if !self.words.iter().any(|w| w.0 == *alloc && w.1 == *span) {
+                    self.words.push((*alloc, *span, 0));
+                }
+            }
+            SyncKind::WaitVerdicts { alloc, span, verdicts, .. } => {
+                self.verdicts += 1;
+                let n = self.words.iter().find(|w| w.0 == *alloc && w.1 == *span).map(|w| w.2);
+                for v in verdicts {
+                    if Some(v.observed) != n {
+                        self.bad.push(format!("{alloc:?} {span:?}: observed {} vs {n:?} writes delivered", v.observed));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// W6-P2: a global word declared at its first `wait_until` (no
+/// `sync_words`) while another cluster writes it in the same round: the
+/// declaration is a serial point, so the history numbering equals the
+/// delivered writes at 1/8/32 workers (and status/outputs are worker- and
+/// observer-independent).
+#[test]
+fn first_use_word_numbering_follows_the_delivery() {
+    let s = scenarios::first_use_wait(true);
+    let mut first = None;
+    for workers in [1usize, 8, 32] {
+        let cfg = RunConfig { workers, ..s.config.clone() };
+        let mut obs = Numbering::default();
+        let o = sched::run_with_config(&s.module, &s.inputs, &mut obs, &cfg).unwrap();
+        completed(&o);
+        assert!(obs.first_use > 0 && obs.verdicts > 0, "first-use declaration not exercised");
+        assert!(obs.bad.is_empty(), "{workers} workers: {:?}", obs.bad);
+        let plain = sched::run_with_config(&s.module, &s.inputs, &mut numsim_core::observe::NoopObserver, &cfg).unwrap();
+        assert_eq!(format!("{:?}{:?}", plain.status, plain.outputs), format!("{:?}{:?}", o.status, o.outputs));
+        match &first {
+            None => first = Some(u32s(&o, "out")),
+            Some(f) => assert_eq!(&u32s(&o, "out"), f),
+        }
+    }
+}
