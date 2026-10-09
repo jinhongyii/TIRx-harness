@@ -28,12 +28,12 @@ fn run(per_operand: bool, read_operand: u8) -> usize {
     c.event(Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: 64, cta: 0 }));
     // site 1 writes `image`; site 2 (a copy: operand 0 = `dst`, operand 1 =
     // `image`) reads the same bytes through operand 1.
-    c.site_buffer.insert(SiteId(1), Arc::from("image"));
-    c.site_buffer.insert(SiteId(2), Arc::from("dst"));
+    Arc::make_mut(&mut c.site_buffer).insert(SiteId(1), Arc::from("image"));
+    Arc::make_mut(&mut c.site_buffer).insert(SiteId(2), Arc::from("dst"));
     if per_operand {
-        c.operand_buffer.insert((SiteId(1), 0), Arc::from("image"));
-        c.operand_buffer.insert((SiteId(2), 0), Arc::from("dst"));
-        c.operand_buffer.insert((SiteId(2), 1), Arc::from("image"));
+        Arc::make_mut(&mut c.operand_buffer).insert((SiteId(1), 0), Arc::from("image"));
+        Arc::make_mut(&mut c.operand_buffer).insert((SiteId(2), 0), Arc::from("dst"));
+        Arc::make_mut(&mut c.operand_buffer).insert((SiteId(2), 1), Arc::from("image"));
     }
     c.event(acc(1, AccessKind::Write, 1, 0));
     c.event(acc(2, AccessKind::Read, 2, read_operand));

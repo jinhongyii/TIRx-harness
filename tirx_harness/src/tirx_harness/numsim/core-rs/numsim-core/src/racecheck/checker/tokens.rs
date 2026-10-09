@@ -111,7 +111,7 @@ impl Checker {
     /// op `i` to it.
     pub(super) fn token_fold(&mut self, i: usize, obj: SyncObjId, phase: u64, c: &mut Knowledge) {
         let cluster = self.token_cluster(obj);
-        let cur = self.phases.get(&obj).and_then(|m| m.get(&phase)).and_then(|p| p.tok);
+        let cur = self.phases_of(obj).and_then(|m| m.get(&phase)).and_then(|p| p.tok);
         let (id, last) = match cur {
             Some(t) => t,
             None => {
@@ -128,7 +128,7 @@ impl Checker {
             }
         };
         let v = last + 1;
-        if let Some(p) = self.phases.get_mut(&obj).and_then(|m| m.get_mut(&phase)) {
+        if let Some(p) = self.phases_of_mut(obj).and_then(|m| m.get_mut(&phase)) {
             p.tok = Some((id, v));
         }
         c.join_propagating(&tok_knowledge(id, v), &self.memo);

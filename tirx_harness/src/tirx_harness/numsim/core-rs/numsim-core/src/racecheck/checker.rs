@@ -439,10 +439,15 @@ impl AsyncActor {
 
 /// Per-id state, held either densely (the main checker: every id) or
 /// sparsely (a checker partition: only its own ids; iteration is in id
-/// order either way). `None`/absent: held by another partition.
+/// order either way). `None`/absent: held by another partition. The sparse
+/// form is a vector sorted by id: a fork fills it in id order (a pool's
+/// slots and a CTA's warps are allocated in increasing order, so every put
+/// appends) and the join drains it whole (W16: a BTreeMap insert per slot
+/// and a remove per slot at the join were ~0.2 s of mega_moe e24's serial
+/// segment).
 enum Held<T> {
     Dense(Vec<Option<Box<T>>>),
-    Sparse(BTreeMap<usize, Box<T>>),
+    Sparse(Vec<(usize, Box<T>)>),
 }
 
 impl<T> Held<T> {
@@ -450,20 +455,20 @@ impl<T> Held<T> {
     fn get(&self, i: usize) -> Option<&T> {
         match self {
             Held::Dense(v) => v.get(i).and_then(|x| x.as_deref()),
-            Held::Sparse(m) => m.get(&i).map(|x| &**x),
+            Held::Sparse(m) => m.binary_search_by_key(&i, |e| e.0).ok().map(|k| &*m[k].1),
         }
     }
     #[inline(always)]
     fn get_mut(&mut self, i: usize) -> Option<&mut T> {
         match self {
             Held::Dense(v) => v.get_mut(i).and_then(|x| x.as_deref_mut()),
-            Held::Sparse(m) => m.get_mut(&i).map(|x| &mut **x),
+            Held::Sparse(m) => m.binary_search_by_key(&i, |e| e.0).ok().map(|k| &mut *m[k].1),
         }
     }
     fn take(&mut self, i: usize) -> Option<Box<T>> {
         match self {
             Held::Dense(v) => v.get_mut(i).and_then(|x| x.take()),
-            Held::Sparse(m) => m.remove(&i),
+            Held::Sparse(m) => m.binary_search_by_key(&i, |e| e.0).ok().map(|k| m.remove(k).1),
         }
     }
     fn put(&mut self, i: usize, x: Box<T>) {
@@ -475,7 +480,14 @@ impl<T> Held<T> {
                 v[i] = Some(x);
             }
             Held::Sparse(m) => {
-                m.insert(i, x);
+                if m.last().is_none_or(|e| e.0 < i) {
+                    m.push((i, x));
+                } else {
+                    match m.binary_search_by_key(&i, |e| e.0) {
+                        Ok(k) => m[k].1 = x,
+                        Err(k) => m.insert(k, (i, x)),
+                    }
+                }
             }
         }
     }
@@ -488,14 +500,21 @@ impl<T> Held<T> {
     fn iter_mut(&mut self) -> Box<dyn Iterator<Item = &mut T> + '_> {
         match self {
             Held::Dense(v) => Box::new(v.iter_mut().filter_map(|x| x.as_deref_mut())),
-            Held::Sparse(m) => Box::new(m.values_mut().map(|x| &mut **x)),
+            Held::Sparse(m) => Box::new(m.iter_mut().map(|(_, x)| &mut **x)),
+        }
+    }
+    /// Room for `n` more entries (a sparse map filled by a fork).
+    fn reserve(&mut self, n: usize) {
+        match self {
+            Held::Dense(v) => v.reserve(n),
+            Held::Sparse(m) => m.reserve(n),
         }
     }
     /// Move every held entry out (id order).
     fn drain_all(&mut self) -> Vec<(usize, Box<T>)> {
         match self {
             Held::Dense(v) => v.iter_mut().enumerate().filter_map(|(i, x)| x.take().map(|x| (i, x))).collect(),
-            Held::Sparse(m) => std::mem::take(m).into_iter().collect(),
+            Held::Sparse(m) => std::mem::take(m),
         }
     }
 }
@@ -780,7 +799,9 @@ pub struct Checker {
     allocs: AllocMap,
     /// Per sync object, its most recent phases (older ones can no longer be
     /// waited on: mbarrier parity / barrier generations).
-    phases: HashMap<SyncObjId, std::collections::BTreeMap<u64, Phase>>,
+    /// Barrier phases, boxed per owning cluster (`u32::MAX`: objects with
+    /// no cluster): a fork / join moves a cluster's phases by pointer.
+    phases: HashMap<u32, Box<PhaseMap>, crate::sync::FxBuild>,
     incomplete_index: HashMap<Incomplete, usize>,
     scope_dedup: HashMap<(SiteId, SiteId, Scope, Scope), usize>,
     /// Latest `fence.sc` per `(warp, lane, scope)`.
@@ -808,13 +829,13 @@ pub struct Checker {
     alias_dedup: HashMap<AliasKey, usize>,
     /// Logical buffer name per site (`SiteInfo::buffer`), for
     /// `AliasStaleRead`. Empty = advisory off.
-    pub site_buffer: HashMap<SiteId, Arc<str>>,
+    pub site_buffer: Arc<HashMap<SiteId, Arc<str>>>,
     /// W5-15: logical buffer of each (site, pointer operand).
-    pub operand_buffer: HashMap<(SiteId, u8), Arc<str>>,
+    pub operand_buffer: Arc<HashMap<(SiteId, u8), Arc<str>>>,
     /// Declared space of each site's named buffer (see `alias_access`).
-    pub site_buffer_space: HashMap<SiteId, Space>,
+    pub site_buffer_space: Arc<HashMap<SiteId, Space>>,
     /// Sites of `wait_until` polls (lowering's `tirx.cuda.wait_until`).
-    pub poll_sites: HashSet<SiteId>,
+    pub poll_sites: Arc<HashSet<SiteId>>,
     /// Wide spans of allocations already ended (statistics).
     wide_retired: u64,
     empty_wide: WideSpans,
@@ -856,8 +877,11 @@ pub struct Checker {
     part: Option<Box<partition::PartCtx>>,
     /// Main checker: decode evidence of witnesses whose warp / async slot a
     /// checker partition holds (filled when their deferred accesses run).
-    site_reg: HashMap<(WarpId, Epoch), SiteId>,
-    op_reg: HashMap<(ActorId, Epoch), Arc<AsyncActor>>,
+    site_reg: HashMap<(WarpId, Epoch), SiteId, crate::sync::FxBuild>,
+    op_reg: HashMap<(ActorId, Epoch), Arc<AsyncActor>, crate::sync::FxBuild>,
+    /// Joined children's emptied shells (their memo, report and map
+    /// allocations), dropped off the scheduler thread after the merge.
+    pub(crate) graveyard: Vec<Checker>,
     /// Seq of the latest access processed.
     last_seq: u64,
     /// Next fresh async slot index (main checker).
@@ -883,9 +907,6 @@ pub struct Checker {
     /// Debug safety net (milestone 2): global ranges written by the
     /// partitions already joined in this batch.
     batch_writes: HashMap<AllocId, Vec<Range<u64>>>,
-    /// Main checker, during a parallel phase: barrier objects per cluster
-    /// (built once per phase; what each fork moves).
-    phase_index: HashMap<u32, Vec<SyncObjId>>,
     /// Token re-attribution state (checker/tokens.rs).
     tk: tokens::Tokens,
 }
@@ -958,7 +979,7 @@ impl Checker {
             asyncs: Slots(Held::Dense(Vec::new())),
             pools: HashMap::default(),
             allocs: AllocMap::default(),
-            phases: HashMap::new(),
+            phases: HashMap::default(),
             incomplete_index: HashMap::new(),
             scope_dedup: HashMap::new(),
             sc: HashMap::new(),
@@ -970,10 +991,10 @@ impl Checker {
             alias_names_of: (0, 0, 0),
             lane_g2t: None,
             alias_dedup: HashMap::new(),
-            site_buffer: HashMap::new(),
-            poll_sites: HashSet::new(),
-            site_buffer_space: HashMap::new(),
-            operand_buffer: HashMap::new(),
+            site_buffer: Arc::default(),
+            poll_sites: Arc::default(),
+            site_buffer_space: Arc::default(),
+            operand_buffer: Arc::default(),
             wide_retired: 0,
             empty_wide: WideSpans::default(),
             report: Report::default(),
@@ -989,8 +1010,9 @@ impl Checker {
             gc_backoff: 1,
             stats: Stats::default(),
             part: None,
-            site_reg: HashMap::new(),
-            op_reg: HashMap::new(),
+            site_reg: HashMap::default(),
+            op_reg: HashMap::default(),
+            graveyard: Vec::new(),
             last_seq: 0,
             next_slot: 0,
             allocs_by_cluster: HashMap::new(),
@@ -1001,7 +1023,6 @@ impl Checker {
             skip_read_from: false,
             lent: None,
             batch_writes: HashMap::new(),
-            phase_index: HashMap::new(),
             tk: Default::default(),
         }
     }
@@ -1010,8 +1031,8 @@ impl Checker {
     fn new_shell(topo: Topology) -> Self {
         let mut c = Checker::new(Topology { num_ctas: 0, ..topo });
         c.topo = topo;
-        c.warps = Warps(Held::Sparse(BTreeMap::new()));
-        c.asyncs = Slots(Held::Sparse(BTreeMap::new()));
+        c.warps = Warps(Held::Sparse(Vec::new()));
+        c.asyncs = Slots(Held::Sparse(Vec::new()));
         c
     }
 
@@ -2218,7 +2239,8 @@ impl Checker {
                         if tokenised {
                             self.token_fold(i, obj, phase, &mut c);
                         }
-                        let ph = self.phases.get_mut(&obj).and_then(|m| m.get_mut(&phase)).unwrap();
+                        let key = self.phase_key(obj);
+                        let ph = self.phases.get_mut(&key).and_then(|b| b.get_mut(&obj)).and_then(|m| m.get_mut(&phase)).unwrap();
                         ph.completion.join_propagating(&c, &self.memo);
                     }
                     CompletionTarget::Warp { warp, lanes } => {
@@ -2277,7 +2299,8 @@ impl Checker {
 
     /// The phase record, keeping only the most recent phases per object.
     fn phase_mut(&mut self, obj: SyncObjId, phase: u64) -> &mut Phase {
-        let m = self.phases.entry(obj).or_default();
+        let key = self.phase_key(obj);
+        let m = self.phases.entry(key).or_default().entry(obj).or_default();
         if let std::collections::btree_map::Entry::Vacant(v) = m.entry(phase) {
             v.insert(Phase::default());
             let mut gone = Vec::new();
@@ -2292,7 +2315,17 @@ impl Checker {
                 self.token_retire(obj, t);
             }
         }
-        self.phases.get_mut(&obj).unwrap().entry(phase).or_default()
+        self.phases_of_mut(obj).unwrap().entry(phase).or_default()
+    }
+
+    /// An object's recent phases (in its cluster's box).
+    fn phases_of(&self, obj: SyncObjId) -> Option<&std::collections::BTreeMap<u64, Phase>> {
+        self.phases.get(&self.phase_key(obj)).and_then(|b| b.get(&obj))
+    }
+
+    fn phases_of_mut(&mut self, obj: SyncObjId) -> Option<&mut std::collections::BTreeMap<u64, Phase>> {
+        let key = self.phase_key(obj);
+        self.phases.get_mut(&key).and_then(|b| b.get_mut(&obj))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2307,7 +2340,8 @@ impl Checker {
         let topo = self.topo;
         let cta = topo.cta_of(warp);
         self.phase_mut(obj, phase);
-        let ph = self.phases.get_mut(&obj).and_then(|m| m.get_mut(&phase)).unwrap();
+        let key = self.phase_key(obj);
+        let ph = self.phases.get_mut(&key).and_then(|b| b.get_mut(&obj)).and_then(|m| m.get_mut(&phase)).unwrap();
         ph.tcgen_rel.join(&tc, &self.memo);
         if let Some(k) = pubk {
             match ph.arrivals.iter_mut().find(|x| x.scope == scope && topo.cta_of(x.warp) == cta) {
@@ -2326,7 +2360,7 @@ impl Checker {
         let named = matches!(obj, SyncObjId::Named { .. });
         self.phase_mut(obj, phase);
         let topo = self.topo;
-        let ph = &self.phases[&obj][&phase];
+        let ph = &self.phases[&self.phase_key(obj)][&obj][&phase];
         let mut lost = false;
         let mut mismatches = Vec::new();
         let mut acquires: Vec<Arc<Knowledge>> = Vec::new();
@@ -3355,6 +3389,8 @@ pub const GC_BACKOFF_MAX: u64 = 16;
 /// depends on their iteration order (it was `RandomState`-random before).
 type AllocMap = HashMap<AllocId, Alloc, crate::sync::FxBuild>;
 type WordsMap = HashMap<AllocId, Words, crate::sync::FxBuild>;
+/// One cluster's barrier objects and their recent phases.
+type PhaseMap = HashMap<SyncObjId, std::collections::BTreeMap<u64, Phase>>;
 /// `Checker::alias_names`: logical buffer name per (site, operand, space).
 type AliasNames = HashMap<(SiteId, u8, Option<Space>), Option<Arc<str>>, crate::sync::FxBuild>;
 

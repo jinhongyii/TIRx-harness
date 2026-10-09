@@ -14,6 +14,21 @@
 //! processes the stash in the main checker. Every event that touches global
 //! state is therefore handled by the main checker in replay order, which is
 //! the serial order (review H1/H2/H4/W3/W4 by construction).
+//!
+//! A child also begins its own clusters' shared / TMEM allocations and
+//! declares words of allocations it holds (W16). Soundness: the state these
+//! events write (`allocs[id]`, `allocs_by_cluster[cluster]`, `words[id]`) is
+//! keyed by an allocation only this partition's CTAs can address (shared
+//! memory is visible within its cluster, TMEM within its CTA, and a
+//! partition owns whole clusters); the main checker processes no event
+//! while the children of a phase run and absorbs them in partition order
+//! before any stash, and no other child holds or creates an entry under
+//! that id or cluster. So the inserts commute with every other partition's
+//! events of the round and land in the same maps the serial checker writes
+//! (the cluster's index appended in replay order at the join). The events
+//! carry no ordering effect (no clock, no finding). `AllocEnd` stays with
+//! the main checker: it scans every live async slot, including other
+//! partitions'.
 
 use super::*;
 
@@ -73,6 +88,8 @@ pub(crate) struct PartCtx {
     pub clusters: HashSet<u32>,
     pub pool: u32,
     pub deferred: Vec<Deferred>,
+    /// Global word declarations, for the main checker at the join.
+    pub declares: Vec<(Tag, AllocId, Range<u64>)>,
     pub suspended: bool,
     /// Tag of the event being processed.
     pub tag: Tag,
@@ -123,6 +140,11 @@ impl Warp {
 }
 
 impl Checker {
+    /// Key of a barrier object's phase box: its cluster (`u32::MAX`: none).
+    pub(super) fn phase_key(&self, obj: SyncObjId) -> u32 {
+        self.obj_cluster(obj).unwrap_or(u32::MAX)
+    }
+
     /// Cluster owning a barrier object, if any.
     pub(super) fn obj_cluster(&self, obj: SyncObjId) -> Option<u32> {
         let cpc = self.topo.ctas_per_cluster.max(1);
@@ -303,7 +325,23 @@ impl Checker {
                 }
             }
             Event::Sync(s) => match s {
-                SyncEvent::AllocBegin { .. } | SyncEvent::AllocEnd { .. } | SyncEvent::DeclareWord { .. } | SyncEvent::WaitVerdicts { .. } => true,
+                // A shared / TMEM allocation of one of this partition's
+                // clusters begins here, and words of an allocation this
+                // child holds are declared here (W16): that state is
+                // cluster-private (no other partition can address it in
+                // this round, and the main checker processes no event while
+                // the children run), so the child's insert is the serial
+                // one, merged back at the join in replay order. Global
+                // allocations, allocation ends (which scan every async
+                // slot) and global words stay with the main checker.
+                SyncEvent::AllocBegin { space, cta, .. } => {
+                    !(matches!(space, Space::Shared | Space::Tmem) && p.clusters.contains(&(cta / self.topo.ctas_per_cluster.max(1))))
+                }
+                // A word of a lent global allocation is declared at the
+                // join instead (`PartCtx::declares`), in replay order with
+                // the deferred accesses.
+                SyncEvent::DeclareWord { alloc, .. } => !self.allocs.contains_key(alloc) && !self.is_lent_global(*alloc),
+                SyncEvent::AllocEnd { .. } | SyncEvent::WaitVerdicts { .. } => true,
                 SyncEvent::WarpSync { warp, .. } => !self.warp_held(*warp),
                 SyncEvent::Arrive { warp, obj, .. } | SyncEvent::Wait { warp, obj, .. } => {
                     !self.warp_held(*warp) || !self.obj_cluster(*obj).is_some_and(|c| p.clusters.contains(&c))
@@ -324,7 +362,7 @@ impl Checker {
                                     // A tokenised fold needs a record token: from the
                                     // reserved pool only (tokens.rs).
                                     || (self.op_slot(*op).is_some_and(|i| self.tokenised(i))
-                                        && self.phases.get(obj).and_then(|m| m.get(phase)).and_then(|ph| ph.tok).is_none()
+                                        && self.phases_of(*obj).and_then(|m| m.get(phase)).and_then(|ph| ph.tok).is_none()
                                         && !self.token_available(*obj))
                             }
                             CompletionTarget::Warp { warp, .. } => !self.warp_held(*warp),
@@ -373,6 +411,16 @@ impl Checker {
             return Err(e);
         }
         match e {
+            Event::Sync(SyncEvent::DeclareWord { alloc, range }) if !self.allocs.contains_key(&alloc) => {
+                // A global word declared by this partition (wait_until's
+                // first use): applied by the main checker at the join, in
+                // tag order. Its range counts as written by this partition:
+                // a later strong read or wait of it here suspends instead of
+                // judging against the round-start words.
+                let p = self.part.as_mut().unwrap();
+                add_span(p.dwrites.entry(alloc).or_default(), range.clone());
+                p.declares.push((p.tag, alloc, range));
+            }
             Event::Access(a) if !self.allocs.contains_key(&a.alloc) => self.defer_access(&a),
             Event::Access(a) => {
                 if let Who::Lane { warp, .. } = a.who {
@@ -586,6 +634,7 @@ impl Checker {
         let clusters: HashSet<u32> = ctas.iter().map(|c| c / cpc).collect();
         let mut child = Checker::new_empty(self);
         let wpc = self.topo.warps_per_cta;
+        child.warps.0.reserve(ctas.len() * wpc as usize);
         for &c in ctas {
             for w in c * wpc..(c + 1) * wpc {
                 if let Some(x) = self.warps.0.take(w as usize) {
@@ -597,6 +646,7 @@ impl Checker {
             }
         }
         if let Some(p) = self.pools.remove(&pool) {
+            child.asyncs.0.reserve(p.slots.len());
             for &i in &p.slots {
                 if let Some(x) = self.asyncs.0.take(i) {
                     child.asyncs.0.put(i, x);
@@ -617,9 +667,10 @@ impl Checker {
                 child.alias_writers.insert(id, w);
             }
         }
-        let objs: Vec<SyncObjId> = clusters.iter().flat_map(|c| self.phase_index.remove(c).unwrap_or_default()).collect();
-        for o in objs {
-            child.phases.insert(o, self.phases.remove(&o).unwrap());
+        for c in &clusters {
+            if let Some(b) = self.phases.remove(c) {
+                child.phases.insert(*c, b);
+            }
         }
         // Token re-attribution: records (read-only), and each cluster's
         // record-token pool topped up to the reservation.
@@ -643,6 +694,7 @@ impl Checker {
             clusters,
             pool,
             deferred: Vec::new(),
+            declares: Vec::new(),
             suspended: false,
             tag: (0, 0),
             finding_tags: Vec::new(),
@@ -656,6 +708,7 @@ impl Checker {
     /// A child shell: same configuration, no state.
     fn new_empty(main: &Checker) -> Checker {
         let mut c = Checker::new_shell(main.topo);
+        // Shared, read-only for the launch: a pointer copy per fork.
         c.site_buffer = main.site_buffer.clone();
         c.operand_buffer = main.operand_buffer.clone();
         c.site_buffer_space = main.site_buffer_space.clone();
@@ -693,16 +746,19 @@ impl Checker {
         for (w, v) in child.poll_stash.drain() {
             self.poll_stash.insert(w, v);
         }
+        // A child holds only its pool's slots: they all go back.
+        for (i, x) in child.asyncs.0.drain_all() {
+            self.asyncs.0.put(i, x);
+        }
         for (k, p) in child.pools.drain() {
-            for &i in &p.slots {
-                if let Some(x) = child.asyncs.0.take(i) {
-                    self.asyncs.0.put(i, x);
-                }
-            }
             self.pools.insert(k, p);
         }
         for (id, a) in child.allocs.drain() {
             self.allocs.insert(id, a);
+        }
+        // Allocations the child began (its own clusters' only).
+        for (cl, v) in child.allocs_by_cluster.drain() {
+            self.allocs_by_cluster.entry(cl).or_default().extend(v);
         }
         for (id, w) in child.words.drain() {
             self.words.insert(id, w);
@@ -710,8 +766,13 @@ impl Checker {
         for (id, w) in child.alias_writers.drain() {
             self.alias_writers.insert(id, w);
         }
-        for (o, ph) in child.phases.drain() {
-            self.phases.insert(o, ph);
+        for (k, b) in child.phases.drain() {
+            match self.phases.entry(k) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(b);
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().extend(*b),
+            }
         }
         for (cl, pool) in child.tk.pools.drain() {
             self.tk.pools.insert(cl, pool);
@@ -738,6 +799,7 @@ impl Checker {
             Finding(usize),
             Incomplete(usize),
             Deferred(Deferred),
+            Declare(AllocId, Range<u64>),
         }
         let mut items: Vec<(Tag, u8, usize, Item)> = Vec::new();
         for (i, t) in part.finding_tags.iter().enumerate() {
@@ -749,11 +811,17 @@ impl Checker {
         for (i, d) in part.deferred.into_iter().enumerate() {
             items.push((d.tag, 1, i, Item::Deferred(d)));
         }
+        // A declaration is a sync event: its tag sorts before the next
+        // access and after the previous one; same-tag declarations keep
+        // their order.
+        for (i, (t, al, r)) in part.declares.into_iter().enumerate() {
+            items.push((t, 1, i, Item::Declare(al, r)));
+        }
         // Same tag: a child-side entry comes from the child event itself;
         // a deferred access has no report entry of its own in the child,
         // so the order within one tag is entries first, by push order.
         items.sort_by_key(|(t, r, i, _)| (*t, *r, *i));
-        let mut findings: Vec<Option<Finding>> = child.report.findings.into_iter().map(Some).collect();
+        let mut findings: Vec<Option<Finding>> = std::mem::take(&mut child.report.findings).into_iter().map(Some).collect();
         for (_, _, _, it) in items {
             match it {
                 Item::Finding(i) => {
@@ -774,8 +842,10 @@ impl Checker {
                     }
                 }
                 Item::Deferred(d) => self.apply_deferred(d),
+                Item::Declare(alloc, range) => self.sync(SyncEvent::DeclareWord { alloc, range }),
             }
         }
+        self.graveyard.push(child);
         for s in stash {
             match s {
                 Stashed::Event(e) => self.event(e),
@@ -878,13 +948,6 @@ impl Checker {
         if let Some(g) = &self.lent {
             return g.clone();
         }
-        let mut index: HashMap<u32, Vec<SyncObjId>> = HashMap::new();
-        for o in self.phases.keys() {
-            if let Some(c) = self.obj_cluster(*o) {
-                index.entry(c).or_default().push(*o);
-            }
-        }
-        self.phase_index = index;
         let ids: Vec<AllocId> = self.allocs.iter().filter(|(_, a)| a.space == Space::Global).map(|(id, _)| *id).collect();
         let mut allocs = super::AllocMap::with_capacity_and_hasher(ids.len(), Default::default());
         let mut words = super::WordsMap::default();
@@ -902,7 +965,6 @@ impl Checker {
 
     /// Take the lent globals back (every child has dropped its handle).
     pub(crate) fn reclaim_globals(&mut self) {
-        self.phase_index.clear();
         let Some(g) = self.lent.take() else { return };
         let g = Arc::try_unwrap(g).unwrap_or_else(|_| panic!("a checker partition still holds the lent global state"));
         self.allocs.extend(g.allocs);

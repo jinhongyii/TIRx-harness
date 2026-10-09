@@ -143,7 +143,7 @@ impl RaceObserver {
     /// the `alias_stale_read` advisory.
     pub fn set_site_buffers(&mut self, names: Vec<(crate::site::SiteId, String)>) {
         if let Some(c) = &mut self.checker {
-            c.site_buffer = names.iter().map(|(s, b)| (*s, std::sync::Arc::<str>::from(b.as_str()))).collect();
+            c.site_buffer = std::sync::Arc::new(names.iter().map(|(s, b)| (*s, std::sync::Arc::<str>::from(b.as_str()))).collect());
         }
         self.buffer_of_site = names.into_iter().collect();
     }
@@ -151,7 +151,7 @@ impl RaceObserver {
     /// Sites of `wait_until` polls (normally from the program's site table).
     pub fn set_poll_sites(&mut self, sites: impl IntoIterator<Item = crate::site::SiteId>) {
         if let Some(c) = &mut self.checker {
-            c.poll_sites = sites.into_iter().collect();
+            c.poll_sites = std::sync::Arc::new(sites.into_iter().collect());
         }
     }
 
@@ -210,6 +210,13 @@ impl RaceObserver {
         c.reclaim_globals();
         for (child, stash) in pending {
             c.absorb(child, stash);
+        }
+        // The emptied child shells are freed off the scheduler thread when
+        // the collector has threads (0.07 s of mega_moe e24's serial
+        // segment inline; W16). Nothing reads them any more.
+        let shells = std::mem::take(&mut c.graveyard);
+        if c.gc_threads > 1 && !shells.is_empty() {
+            std::thread::spawn(move || drop(shells));
         }
     }
 
@@ -548,7 +555,8 @@ impl Observer for RaceObserver {
                         b.as_deref().filter(|b| !b.is_empty()).map(|b| ((crate::site::SiteId(i as u32), o as u8), std::sync::Arc::<str>::from(b)))
                     })
                 })
-                .collect();
+                .collect::<HashMap<_, _>>()
+                .into();
             // The site's buffer names ONE operand (the first pointer of a
             // multi-operand op such as tensormap.cp_fenceproxy): record its
             // space so an access in another space is not given that name.
@@ -559,7 +567,8 @@ impl Observer for RaceObserver {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, s)| s.buffer().and_then(|b| space_of.get(b)).map(|sp| (crate::site::SiteId(i as u32), *sp)))
-                .collect();
+                .collect::<HashMap<_, _>>()
+                .into();
             c.poll_sites = info
                 .program
                 .sites
@@ -567,7 +576,8 @@ impl Observer for RaceObserver {
                 .enumerate()
                 .filter(|(_, s)| s.op_name == "tirx.cuda.wait_until")
                 .map(|(i, _)| crate::site::SiteId(i as u32))
-                .collect();
+                .collect::<std::collections::HashSet<_>>()
+                .into();
         }
         for (id, a) in info.arena.iter() {
             if matches!(a.space, Space::Global | Space::Shared | Space::Tmem) {
