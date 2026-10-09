@@ -5,7 +5,7 @@
  "outputs": {
   "k1:lse": {
    "dtype": "float32",
-   "sha256": "9f548a06ffc39d61fad0e1c517202866268da3687affa0ac026622ab314094fd",
+   "sha256": "bb239ad2ad24de9350ec1de684143d140b731e0f205d39b81ff2c617c183c808",
    "shape": [
     64
    ]
