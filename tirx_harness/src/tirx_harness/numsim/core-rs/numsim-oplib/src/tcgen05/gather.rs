@@ -323,7 +323,11 @@ pub fn gather_f8_rows(
                 )?;
                 format.decode_shared_atom(bits)
             };
-            values.extend(decoded.into_iter().map(|v| if negate { -v } else { v }));
+            if negate {
+                values.extend(decoded.into_iter().map(|v| -v));
+            } else {
+                values.extend_from_slice(&decoded);
+            }
         }
     }
     Ok(values)

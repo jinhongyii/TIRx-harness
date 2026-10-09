@@ -225,3 +225,42 @@ cells. The next lever is the engine's per-callback cost (resolve the window's
 allocation and overlay once per MMA, keep per-cell validity and notes); see the
 contract request draft routed by the coordinator.
 
+
+## Mega MoE block-scaled MMA: TMEM/shared windows plus the `note_all` fix (W4 + W13, 2026-10-09)
+
+Same counters and fixture as above. "Before" is d719a9d. "After" is one batch:
+- `TcMmaIo` windows: each piece is read from a borrowed arena window when the piece is in
+  bounds and fully valid, or else through that piece's callback. Windows exist only for
+  non-overlaid, non-metadata allocations and are dropped before the first TMEM write.
+- W13's `note_all` read-note fix: read notes are taken only when observing.
+- Window lane-run scale reads, with diagnostics unchanged because any invalid or
+  out-of-window cell falls back to the per-cell callback in the original order.
+- A shift/mask atom split in `smem_desc` (`div_rem_atom`).
+- An FP8 byte-decode fast path and a hoisted negate in `gather_f8_rows`.
+
+Each figure is the median of 3 interleaved runs at 1 worker (host load 7-15). Results are
+bit-identical: conformance 304 passed, and output digests of 11 MMA-heavy cases (both Mega MoE
+fixtures included) are identical at 1/8/32 workers.
+
+| phase (CPU-s, 1 worker) | before (d719a9d) | after |
+| --- | --- | --- |
+| `run_mma` (engine wrapper + `tc_mma_ctas`) | 12.66 | 7.42 (1.71x) |
+| `tc_mma_ctas` | 9.97 | 7.23 |
+| A/B operand gather (`gather_f8_rows`) | 3.26 | 3.12 |
+| scale reads (`read_mxf8_scales`) | 3.71 | 1.16 |
+| D window read | 1.32 | 1.22 |
+| D window write | 1.01 | 1.07 |
+| increasing-K FMA chain (`mma_dense_tail`) | 0.48 | 0.48 |
+| scale application | 0.11 | 0.10 |
+
+The engine wrapper's share of `run_mma` falls from 2.69 s to 0.19 s, which is the
+`note_all` fix. Scale reads drop 3.2x. Gather is now the largest phase.
+
+New bench, `tcgen05_gather/f8_rows_256x32_sw128` (256 rows, K=32, 128B swizzle, slice
+reader): 25.5 us before the FP8 decode and negate changes, 19.6 us after. Attribution
+experiments on this bench (code temporarily removed, not kept):
+- dropping the decode gives 11.9 us, so decode costs about 40%;
+- dropping `finish_shared_byte_offset` gives 15.4 us, so the offset finish costs about 20%.
+
+In the Mega MoE run, gather moved only 4%. The per-atom reader dispatch and the offset
+finish dominate there, not the decode.

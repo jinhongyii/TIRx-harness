@@ -840,8 +840,85 @@ pub fn tc_mma_ctas(
     smem: TcSmemRead<'_>,
     tmem_read: TcTmemRead<'_>,
     tmem_write: TcTmemWrite<'_>,
+    io: Option<&TcMmaIo<'_>>,
 ) -> OpResult {
-    tc::tc_mma_ctas(payload, options, smem, tmem_read, tmem_write)
+    tc::tc_mma_ctas(payload, options, smem, tmem_read, tmem_write, io)
+}
+
+/// Which memory a [`TcWindow`] or a recorded window read is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TcSpace {
+    Shared,
+    Tmem,
+}
+
+/// One CTA's operand allocation, resolved once per MMA by the engine
+/// (contract W4-mma-window): its bytes and per-byte validity, borrowed from
+/// the arena for the MMA's reads. Built only for allocations that are neither
+/// overlaid nor metadata-only.
+pub struct TcWindow<'b> {
+    pub bytes: std::cell::Ref<'b, [u8]>,
+    pub valid: std::cell::Ref<'b, crate::arena::BitSet>,
+}
+
+impl TcWindow<'_> {
+    /// Serve `out` from `[offset, offset + out.len())` when it is in bounds and
+    /// every byte is valid; `false` = this piece goes to the callback.
+    #[inline]
+    pub fn try_read(&self, offset: u64, out: &mut [u8]) -> bool {
+        let len = out.len() as u64;
+        let Some(end) = offset.checked_add(len) else { return false };
+        if end > self.bytes.len() as u64 || self.valid.first_clear(offset, len).is_some() {
+            return false;
+        }
+        out.copy_from_slice(&self.bytes[offset as usize..end as usize]);
+        true
+    }
+}
+
+/// Window-served reads `(space, cta, offset, len)` in request order.
+pub type TcWindowReads = Vec<(TcSpace, u32, u64, u64)>;
+
+/// Per-MMA resolved operand windows for [`tc_mma_ctas`] (W4/W13, 2026-10-09).
+///
+/// Each shared or TMEM piece the MMA reads is served from the CTA's window
+/// when it is in bounds and fully valid ([`TcWindow::try_read`]); any other
+/// piece goes to the copying callback for exactly that piece, so validity
+/// policy, uninitialized-read notes and errors stay the callbacks'. oplib
+/// drops every window before its first TMEM write in the call (releasing the
+/// arena borrows for `tmem_write`); later reads use the callbacks.
+pub struct TcMmaIo<'b> {
+    /// `[TcSpace::Shared as usize | TcSpace::Tmem as usize][cta]`; `None` =
+    /// callbacks for that CTA and space.
+    pub windows: std::cell::RefCell<Option<[[Option<TcWindow<'b>>; 2]; 2]>>,
+    /// Window-served reads `(space, cta, offset, len)` in request order, when
+    /// the engine records them (callback-served pieces record themselves).
+    pub reads: Option<&'b std::cell::RefCell<TcWindowReads>>,
+}
+
+impl TcMmaIo<'_> {
+    /// Read one piece from a live window; `false` = use the callback.
+    #[inline]
+    pub(crate) fn try_read(&self, space: TcSpace, cta: u32, offset: u64, out: &mut [u8]) -> bool {
+        let windows = self.windows.borrow();
+        let Some(windows) = windows.as_ref() else { return false };
+        let Some(Some(window)) = windows[space as usize].get(cta as usize) else { return false };
+        if !window.try_read(offset, out) {
+            return false;
+        }
+        if let Some(reads) = self.reads {
+            reads.borrow_mut().push((space, cta, offset, out.len() as u64));
+        }
+        true
+    }
+
+    /// Drop every window (before a TMEM write).
+    #[inline]
+    pub(crate) fn release(&self) {
+        if self.windows.borrow().is_some() {
+            self.windows.borrow_mut().take();
+        }
+    }
 }
 
 /// Single-CTA wrapper of [`tc_mma_ctas`] (default options; `cta_group::2`

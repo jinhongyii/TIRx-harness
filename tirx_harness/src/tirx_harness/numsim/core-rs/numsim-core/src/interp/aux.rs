@@ -200,6 +200,14 @@ impl WordTable {
         self.regions.is_empty() && self.arrays.is_empty()
     }
 
+    /// Does `alloc` have declared words (regions or lazy arrays)? When not,
+    /// [`Self::log_lane`] does nothing for it (W13: checked once per
+    /// instruction instead of per lane).
+    #[inline]
+    pub fn tracks(&self, alloc: AllocId) -> bool {
+        !self.is_empty() && (self.regions.contains_key(&alloc) || self.arrays.contains_key(&alloc))
+    }
+
     /// Declare `spans` of `alloc` (a buffer's sync words). With images the
     /// regions are created now (index 0 = current bytes); without, a run of
     /// equal-width adjacent words is recorded as one lazy array.

@@ -3319,3 +3319,18 @@ worker, so its payload equals the serial checker's by construction.
 
 **Racecheck side.** The debug assert at join stays. With this change it
 checks the `shard_replay_order` guarantee and should never fire.
+
+## W4-mma-window (approved by the coordinator, 2026-10-09): resolved operand windows for `tc_mma_ctas`
+
+`tc_mma_ctas` gains `io: Option<&TcMmaIo<'_>>`. `TcMmaIo` holds, per space (shared, TMEM) and per CTA of the group, a `TcWindow` that the engine resolves once per MMA. A window is a `Ref` borrow of an allocation's bytes and per-byte validity, built only for allocations that are neither overlaid nor metadata-only.
+
+**Behaviour.**
+- For every piece the MMA reads, oplib first tries the window: shared at `decode_shared(addr).1`, TMEM at `tmem_byte_offset(lane, col)` after the lane/column range check.
+- A piece in bounds with every byte valid is copied from the window. When the engine passes a `reads` list (it records only when observing), the piece's `(space, cta, offset, len)` is pushed onto it.
+- Any other piece goes to today's callback for exactly that piece. Pieces, their order and size, validity policy, uninitialized-read notes and errors therefore stay the callbacks'.
+- oplib drops all windows before its first TMEM write in a call. That releases the arena borrows for `tmem_write`. Later reads (`.ashift`) use the callbacks and see the written bytes.
+- No `unsafe`.
+
+**Guards.**
+- The oplib tc harness runs every MMA test on the callback path and on the window path under four validity/overlay mixes: all valid, sparse invalid, overlaid, none valid. It requires the same result or error, the same final TMEM and the same multiset of pieces.
+- The engine half and its observer-equality guards are W13's. W13's read-note fix ("notes taken only when observing") lands in the same batch.

@@ -20,6 +20,13 @@
 //!   `alu::load_reg_indexed` / `store_reg_indexed`.
 //! * `store_v4` — 16-byte vector stores into shared memory (a GEMM
 //!   epilogue's staging): `mem::store`.
+//! * `local_array` — per-lane local-array stores and scalar/vector loads
+//!   in a kernel with declared sync words: `mem::store` / `mem::load` on a
+//!   per-lane binding.
+//! * `blocked_wait` — warps blocked on a blocking `mbarrier.try_wait` (all
+//!   lanes, one barrier) while a producer warp computes, retried every round
+//!   (the Mega MoE pipeline wait): `sync::mbar_wait` and the scheduler's
+//!   repeated-block check (`interp::BlockedWait`).
 //! * `observed_overhead` — the cost of being observed: whole corpus runs
 //!   with no observer and with a counting observer (events built and
 //!   delivered, no word history, no checker), from the recorded fixtures
@@ -360,6 +367,111 @@ pub fn store_v4(iters: u32) -> Scenario {
     s
 }
 
+/// A per-lane local array (`Space::Local`, lane-major) written and read
+/// back every iteration, scalar and 16-byte vector, in a kernel that also
+/// declares sync words (the Mega MoE epilogue's spilled locals):
+/// `mem::store` / `mem::load` on a per-lane binding.
+pub fn local_array(iters: u32) -> Scenario {
+    let v4 = Ty::vector(Dtype::U32, 4);
+    let mut b = ProgramBuilder::new("local_array", 128);
+    let out = b.global("out", Dtype::U32);
+    let flag = b.global("flag", Dtype::U32);
+    b.declare_sync_words(flag);
+    let arr = b.per_lane("arr", numsim_core::arena::Space::Local, Dtype::U32, 16);
+    let tid = b.reg(Ty::U32);
+    let k = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let x = b.reg(Ty::U32);
+    let v = b.reg(v4);
+    b.thread_rank(tid);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k3 = b.k_u32(3);
+    let k4 = b.k_u32(4);
+    let k8 = b.k_u32(8);
+    let kn = b.k_u32(iters);
+    b.mov(x, tid);
+    b.st_u32(arr, k0, x);
+    b.st_u32(arr, k1, x);
+    b.st_u32(arr, k3, x);
+    b.st(v4, arr, k8, v);
+    b.mov(k, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, kn);
+    b.loop_if(p);
+    b.st_u32(arr, k3, x);
+    b.ld_u32(x, arr, k3);
+    b.ld(v4, v, arr, k0);
+    b.st(v4, arr, k4, v);
+    b.add_u32(x, x, k1);
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.st_u32(out, tid, x);
+    b.exit();
+    let mut s = Scenario {
+        name: "local_array",
+        module: b.build_module(),
+        inputs: inputs(vec![("out", u32_buf([0; 128])), ("flag", u32_buf([0; 1]))]),
+        config: Default::default(),
+    };
+    s.config.completions = CompletionPolicy::Eager;
+    s
+}
+
+/// `ctas` CTAs of `waiters + 1` warps: warp 0 runs `iters` iterations of
+/// register work, then lane 0 arrives on an mbarrier; the other warps block
+/// on it with a blocking `mbarrier.try_wait` (all 32 lanes, one barrier),
+/// retried every round (the Mega MoE pipeline-stage wait): `sync::mbar_wait`.
+pub fn blocked_wait(ctas: u32, waiters: u32, iters: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("blocked_wait", 32 * (waiters + 1));
+    b.grid(ctas, 1, 1);
+    let out = b.global("out", Dtype::U32);
+    let bar = b.shared("bar", Dtype::U64, 1);
+    let w = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let barr = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let producer = b.reg(Ty::PRED);
+    let more = b.reg(Ty::PRED);
+    let k = b.reg(Ty::U32);
+    let acc = b.reg(Ty::U32);
+    b.warp_id(w);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k3 = b.k_u32(3);
+    let kn = b.k_u32(iters);
+    b.smem_addr(barr, bar, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.compare(CmpOp::Eq, Ty::U32, producer, w, k0);
+    b.if_(producer);
+    b.if_(p);
+    b.mbar_init(barr, 1);
+    b.end_if();
+    b.end_if();
+    b.bar_sync(0);
+    b.if_(producer);
+    b.mov(k, k0);
+    b.mov(acc, lane);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, more, k, kn);
+    b.loop_if(more);
+    b.mul(Ty::U32, acc, acc, k3);
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.if_(p);
+    b.mbar_arrive(barr, None);
+    b.end_if();
+    b.else_();
+    b.push(Instr::MbarWait { mbar: barr.into(), space: AddrSpace::Shared, phase: PhaseArg::Parity(k0), sem: Sem::Acquire, scope: Scope::Cta });
+    b.st_u32(out, lane, lane);
+    b.end_if();
+    b.exit();
+    let mut s = Scenario { name: "blocked_wait", module: b.build_module(), inputs: inputs(vec![("out", u32_buf([0; 32]))]), config: Default::default() };
+    s.config.completions = CompletionPolicy::Eager;
+    s
+}
+
 fn bench(c: &mut Criterion) {
     group(c, "spin_wait_regs", "pad768_iters4096", &spin_wait(768, 4096));
     // A kda_backward_packed-sized register file (~8 MiB per warp).
@@ -369,6 +481,8 @@ fn bench(c: &mut Criterion) {
     group(c, "tcgen_ld", "x64_iters64", &tcgen_ld(64));
     group(c, "reg_indexed", "iters2048", &reg_indexed(2048));
     group(c, "store_v4", "iters2048", &store_v4(2048));
+    group(c, "blocked_wait", "ctas8_waiters15_iters1024", &blocked_wait(8, 15, 1024));
+    group(c, "local_array", "iters512", &local_array(512));
 }
 
 /// Events on, history off, no checker: only the cost of building and

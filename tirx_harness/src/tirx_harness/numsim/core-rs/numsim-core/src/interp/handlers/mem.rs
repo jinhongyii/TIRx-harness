@@ -66,20 +66,46 @@ fn load_proxy(mods: &MemMods) -> Proxy {
     }
 }
 
-/// Fast-path target of a buffer access: the allocation, the buffer's byte
-/// base in it, its byte length, and the window. `None` = use the general
-/// path (local/tmem/unbound buffers, overlaid allocations, sub-byte dtypes).
+/// Fast-path target of a buffer access.
+#[derive(Clone, Copy)]
+struct FastTarget {
+    alloc: crate::arena::AllocId,
+    /// The buffer's byte base in the allocation (lane 0's, for per-lane arrays).
+    base: u64,
+    /// Byte length of the buffer (per lane for per-lane arrays).
+    len: u64,
+    window: Option<crate::observe::Window>,
+    /// Bytes between consecutive lanes' copies (per-lane local/register
+    /// arrays, lane-major); 0 for a buffer shared by the lanes.
+    stride: u64,
+}
+
+impl FastTarget {
+    /// Lane `l`'s byte base.
+    #[inline(always)]
+    fn base_of(&self, l: usize) -> u64 {
+        self.base + l as u64 * self.stride
+    }
+}
+
+/// Fast-path target of a buffer access, or `None` = use the general path
+/// (tmem/unbound buffers, overlaid allocations, sub-byte dtypes). Per-lane
+/// local and register arrays (W13) resolve exactly as `support::resolve_buf`
+/// does (lane `l` at `l * per_lane_stride + offset`); their allocations are
+/// the warp's own, never overlaid.
 #[inline]
-fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<(crate::arena::AllocId, u64, u64, Option<crate::observe::Window>)> {
+fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<FastTarget> {
     use crate::interp::BufBinding;
     // Sub-byte elements take the general path (element size rule:
     // `BufferDecl::bit_offset`, the scalar element of the dtype).
     if !ctx.program.buffers[buf.0 as usize].dtype.elem.bits().is_multiple_of(8) {
         return None;
     }
-    let (alloc, base, len) = match ctx.buffers[buf.0 as usize] {
-        BufBinding::View(v) => (v.alloc, v.offset, v.len),
-        BufBinding::SharedWindow { offset, len } => (ctx.cta.smem, offset as u64, len),
+    let (alloc, base, len, stride) = match ctx.buffers[buf.0 as usize] {
+        BufBinding::View(v) => (v.alloc, v.offset, v.len, 0),
+        BufBinding::SharedWindow { offset, len } => (ctx.cta.smem, offset as u64, len, 0),
+        BufBinding::Local { offset, per_lane } => (ctx.warp.local?, offset, per_lane, ctx.loaded.local_per_lane),
+        BufBinding::Reg { offset, per_lane } => (ctx.warp.regbuf?, offset, per_lane, ctx.loaded.reg_per_lane),
         _ => return None,
     };
     // Overlaid allocations take the general path. (A wait_until predicate's
@@ -89,7 +115,11 @@ fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<(crate::arena::AllocId, u6
         return None;
     }
     let a = ctx.arena.get(alloc);
-    if a.metadata_only || a.space == crate::arena::Space::Param || base.checked_add(len).is_none_or(|e| e > a.size) {
+    // The last lane's copy must lie in the allocation, and alignment is
+    // checked on the in-allocation offset (`check_align` checks the
+    // address: equal when the base is 32-byte aligned).
+    let last = base.checked_add(stride.checked_mul(31)?)?.checked_add(len)?;
+    if a.metadata_only || a.space == crate::arena::Space::Param || last > a.size || (stride != 0 && !a.base.is_multiple_of(32)) {
         return None;
     }
     let window = match a.space {
@@ -97,7 +127,7 @@ fn fast_target(ctx: &ExecCtx<'_>, buf: Buf) -> Option<(crate::arena::AllocId, u6
         crate::arena::Space::Shared => Some(crate::observe::Window::SharedCta),
         _ => None,
     };
-    Some((alloc, base, len, window))
+    Some(FastTarget { alloc, base, len, window, stride })
 }
 
 /// Byte offset of `buf[idx]` for an `n`-byte access within `len`, or
@@ -120,7 +150,8 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
     active_or_next!(ctx);
     let n = ty.mem_bytes() as u64;
     if n <= 8 && ty.slots() == 1 && !mods.uniform && !(mods.nc && ctx.arena.readonly_tracking()) {
-        if let Some((alloc, base, len, window)) = fast_target(ctx, buf) {
+        if let Some(t) = fast_target(ctx, buf) {
+            let FastTarget { alloc, len, window, .. } = t;
             let active = ctx.warp.active;
             let mut vals = [0u64; 32];
             let mut ok = true;
@@ -129,7 +160,7 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
                 let allow = ctx.arena.policy() == crate::arena::ValidityPolicy::Allow;
                 for l in active.lanes() {
                     let idx = lane_int(ctx, offset, l);
-                    match fast_offset(ctx, buf, idx, n, len, base) {
+                    match fast_offset(ctx, buf, idx, n, len, t.base_of(l)) {
                         Some(off) if allow || a.valid.first_clear(off, n).is_none() => {
                             let mut b = [0u8; 8];
                             b[..n as usize].copy_from_slice(&a.bytes[off as usize..(off + n) as usize]);
@@ -147,7 +178,7 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
                 support::write_masked(ctx.warp.reg_mut(s), &vals, active);
                 if ctx.aux.capture_reads.is_some() {
                     for l in active.lanes() {
-                        let off = fast_offset(ctx, buf, lane_int(ctx, offset, l), n, len, base).expect("checked");
+                        let off = fast_offset(ctx, buf, lane_int(ctx, offset, l), n, len, t.base_of(l)).expect("checked");
                         if let Some(c) = ctx.aux.capture_reads.as_mut() {
                             c.push((alloc, crate::arena::ByteSpan::new(off, n)));
                         }
@@ -155,14 +186,14 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
                 }
                 if sem != Sem::Weak {
                     let l0 = active.lanes().next().expect("active");
-                    let off = fast_offset(ctx, buf, lane_int(ctx, offset, l0), n, len, base).expect("checked");
+                    let off = fast_offset(ctx, buf, lane_int(ctx, offset, l0), n, len, t.base_of(l0)).expect("checked");
                     note_load_poll(ctx, sem, alloc, off);
                 }
                 if ctx.observing {
                     let mut acc = Accesses::default();
                     for l in active.lanes() {
                         let idx = lane_int(ctx, offset, l);
-                        let off = fast_offset(ctx, buf, idx, n, len, base).expect("checked");
+                        let off = fast_offset(ctx, buf, idx, n, len, t.base_of(l)).expect("checked");
                         acc.push(Loc { alloc, offset: off, window, remote: None }, l as u8, n);
                     }
                     let sp = support::spec(ctx, AccessKind::Read, sem, scope, load_proxy(&mods));
@@ -171,6 +202,57 @@ pub fn load(ctx: &mut ExecCtx<'_>, ty: Ty, dst: Reg, buf: Buf, offset: Operand, 
                 return Ok(Flow::Next);
             }
             // Some lane needs the general path (error / uninit report).
+        }
+    }
+    // Vector loads up to 32 bytes (W13), same conditions and effects as the
+    // scalar fast path above; register slots are filled as
+    // `write_lane_bytes` fills them.
+    if n > 8 && n <= 32 && !mods.uniform && !(mods.nc && ctx.arena.readonly_tracking()) && sub_byte(ctx, ty, buf).is_none() {
+        if let Some(t) = fast_target(ctx, buf) {
+            let active = ctx.warp.active;
+            let nb = n as usize;
+            let mut offs = [0u64; 32];
+            let mut rows = [0u8; 32 * 32];
+            let mut ok = true;
+            {
+                let a = ctx.arena.get(t.alloc);
+                let allow = ctx.arena.policy() == crate::arena::ValidityPolicy::Allow;
+                for l in active.lanes() {
+                    let idx = lane_int(ctx, offset, l);
+                    match fast_offset(ctx, buf, idx, n, t.len, t.base_of(l)) {
+                        Some(off) if allow || a.valid.first_clear(off, n).is_none() => {
+                            offs[l] = off;
+                            rows[l * 32..l * 32 + nb].copy_from_slice(&a.bytes[off as usize..off as usize + nb]);
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok {
+                let row: [usize; 32] = std::array::from_fn(|l| l);
+                support::write_lanes_bytes(ctx, dst, active, &rows, 32, &row, 0, nb);
+                if let Some(c) = ctx.aux.capture_reads.as_mut() {
+                    for l in active.lanes() {
+                        c.push((t.alloc, crate::arena::ByteSpan::new(offs[l], n)));
+                    }
+                }
+                if sem != Sem::Weak {
+                    let l0 = active.first().expect("active");
+                    note_load_poll(ctx, sem, t.alloc, offs[l0]);
+                }
+                if ctx.observing {
+                    let mut acc = Accesses::default();
+                    for l in active.lanes() {
+                        acc.push(Loc { alloc: t.alloc, offset: offs[l], window: t.window, remote: None }, l as u8, n);
+                    }
+                    let sp = support::spec(ctx, AccessKind::Read, sem, scope, load_proxy(&mods));
+                    support::emit(ctx, sp, &mut acc);
+                }
+                return Ok(Flow::Next);
+            }
         }
     }
     if let Some(eb) = sub_byte(ctx, ty, buf) {
@@ -212,13 +294,14 @@ pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Op
     if n <= 32 && (n <= 8 || sub_byte(ctx, ty, buf).is_none()) && !ctx.arena.readonly_tracking() {
         // Declared-word history is logged per lane in lane order, as
         // `mem_write` does, so the path does not depend on the observer.
-        if let Some((alloc, base, len, window)) = fast_target(ctx, buf) {
+        if let Some(t) = fast_target(ctx, buf) {
+            let FastTarget { alloc, len, window, .. } = t;
             let active = ctx.warp.active;
             let mut offs = [0u64; 32];
             let mut ok = true;
             for l in active.lanes() {
                 let idx = lane_int(ctx, offset, l);
-                match fast_offset(ctx, buf, idx, n, len, base) {
+                match fast_offset(ctx, buf, idx, n, len, t.base_of(l)) {
                     Some(off) => offs[l] = off,
                     None => {
                         ok = false;
@@ -249,7 +332,7 @@ pub fn store(ctx: &mut ExecCtx<'_>, ty: Ty, buf: Buf, offset: Operand, value: Op
                         a.valid.set_range(offs[l], n, true);
                     }
                 }
-                if !ctx.aux.words.is_empty() {
+                if ctx.aux.words.tracks(alloc) {
                     for l in active.lanes() {
                         let span = crate::arena::ByteSpan::new(offs[l], n);
                         ctx.aux.words.log_lane(alloc, span, &lane(l)[..n as usize]);

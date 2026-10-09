@@ -8,11 +8,11 @@
 //! re-register. Events follow racecheck-semantics §3 (rows 7-11, 26-33)
 //! and the W6 `Protocol` shape.
 
-use super::async_copy::{issue_async, mbar_in_rank, mbar_issue, mbar_res, ranks_of, Issue};
+use super::async_copy::{issue_async, mbar_in_rank, mbar_issue, mbar_res, mbar_res_memo, ranks_of, Issue};
 use super::HResult;
 use crate::arena::ByteSpan;
 use crate::dtype::Ty;
-use crate::interp::support::{self, lane_val, uniform_over, write_lane, Accesses, ProtoExtra};
+use crate::interp::support::{self, lane_val, same_val, uniform_over, write_lane, Accesses, ProtoExtra};
 use crate::interp::{ExecCtx, ExecError, ExecErrorKind, Flow};
 use crate::observe::{AccessKind, AsyncClass, AsyncTarget, Collective, Counts, FenceEvent, LaneVerdict, SyncKind, WarpId, Window};
 use crate::program::*;
@@ -108,7 +108,12 @@ pub fn barrier(ctx: &mut ExecCtx<'_>, kind: BarKind, id: Operand, count: Option<
         // event (its contribution) is logged when it completes.
         let resume = SyncCmd::Named(named::Cmd::Resume { gen });
         return match support::step(ctx, res, resume)? {
-            Step::Blocked(r) => Ok(Flow::Blocked(r)),
+            Step::Blocked(r) => {
+                // A blocked `Resume` repeats while the barrier is unchanged
+                // (`crate::interp::BlockedWait`).
+                crate::interp::note_repeatable_block(ctx, res);
+                Ok(Flow::Blocked(r))
+            }
             Step::Done(_) => {
                 ctx.warp.resume = None;
                 ctx.aux.named_registered.remove(&ctx.warp.id);
@@ -489,8 +494,9 @@ fn aggregate<T: Copy>(v: &mut Vec<(ResourceId, T)>, res: ResourceId, x: T, f: im
 
 fn mbar_collapse(ctx: &mut ExecCtx<'_>, mbar: Operand, space: AddrSpace, val: Option<Operand>) -> Result<Vec<(ResourceId, u64)>, ExecError> {
     let mut v: Vec<(ResourceId, u64)> = Vec::new();
+    let mut memo = None;
     for l in ctx.warp.active.lanes() {
-        let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
+        let res = mbar_res_memo(ctx, space, lane_val(ctx, mbar, l), l, &mut memo)?;
         let x = val.map(|o| lane_val(ctx, o, l)).unwrap_or(0);
         match v.iter().find(|(r, _)| *r == res) {
             Some((_, y)) if *y != x => {
@@ -724,8 +730,9 @@ pub fn mbar_test_wait(
     let active = ctx.warp.active;
     // One query per distinct (target, command), in lane order.
     let mut seen: Vec<(ResourceId, SyncCmd, Option<Option<u64>>, WarpMask)> = Vec::new();
+    let mut memo = None;
     for l in active.lanes() {
-        let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
+        let res = mbar_res_memo(ctx, space, lane_val(ctx, mbar, l), l, &mut memo)?;
         let cmd = phase_cmd(ctx, phase, l, false);
         let i = match seen.iter().position(|(r, c, _, _)| *r == res && *c == cmd) {
             Some(i) => i,
@@ -785,12 +792,29 @@ pub fn mbar_wait(ctx: &mut ExecCtx<'_>, mbar: Operand, space: AddrSpace, phase: 
     let latched = earlier.iter().fold(WarpMask::NONE, |m, d| m.or(d.2));
     let mut done = Vec::new();
     let mut seen: Vec<(ResourceId, SyncCmd, WarpMask)> = Vec::new();
-    for l in active.and_not(latched).lanes() {
-        let res = mbar_res(ctx, space, lane_val(ctx, mbar, l), l)?;
-        let cmd = phase_cmd(ctx, phase, l, true);
-        match seen.iter_mut().find(|(r, c, _)| *r == res && *c == cmd) {
-            Some((_, _, m)) => *m = m.or(WarpMask::lane(l)),
-            None => seen.push((res, cmd, WarpMask::lane(l))),
+    let retry = active.and_not(latched);
+    let phase_op = match phase {
+        PhaseArg::Parity(p) => p,
+        PhaseArg::State(s) => s,
+    };
+    match (retry.first(), same_val(ctx, mbar, retry).is_some() && same_val(ctx, phase_op, retry).is_some()) {
+        // W13: every retried lane names the same mbarrier and phase (the
+        // common case): one resolution and one (target, command) entry for
+        // all of them, exactly what the per-lane loop below builds.
+        (Some(first), true) => {
+            let res = mbar_res(ctx, space, lane_val(ctx, mbar, first), first)?;
+            seen.push((res, phase_cmd(ctx, phase, first, true), retry));
+        }
+        _ => {
+            let mut memo = None;
+            for l in retry.lanes() {
+                let res = mbar_res_memo(ctx, space, lane_val(ctx, mbar, l), l, &mut memo)?;
+                let cmd = phase_cmd(ctx, phase, l, true);
+                match seen.iter_mut().find(|(r, c, _)| *r == res && *c == cmd) {
+                    Some((_, _, m)) => *m = m.or(WarpMask::lane(l)),
+                    None => seen.push((res, cmd, WarpMask::lane(l))),
+                }
+            }
         }
     }
     let mut blocked = None;
@@ -814,6 +838,10 @@ pub fn mbar_wait(ctx: &mut ExecCtx<'_>, mbar: Operand, space: AddrSpace, phase: 
         all.extend(done);
         if !all.is_empty() {
             ctx.aux.mbar_latch.insert(key, all);
+        } else if let [(res, _, _)] = seen[..] {
+            // One mbarrier, nothing latched: a retry repeats this attempt
+            // while its state is unchanged (`crate::interp::BlockedWait`).
+            crate::interp::note_repeatable_block(ctx, res);
         }
         return Ok(Flow::Blocked(r));
     }

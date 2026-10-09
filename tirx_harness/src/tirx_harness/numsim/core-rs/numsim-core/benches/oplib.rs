@@ -209,7 +209,7 @@ fn tc(c: &mut Criterion) {
                     mem.note(off as u64 | 1 << 41, data.len() as u64);
                     Ok(())
                 };
-                oplib::tc_mma_ctas(black_box(&payload), &options, &smem_read, &tmem_read, &mut tmem_write)
+                oplib::tc_mma_ctas(black_box(&payload), &options, &smem_read, &tmem_read, &mut tmem_write, None)
                     .unwrap_or_else(|e| panic!("{}: {e}", case.name));
             })
         });

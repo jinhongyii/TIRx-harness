@@ -111,10 +111,15 @@ impl NarrowFormat {
             });
         }
         let width = self.format().width_bits;
-        let packed = u128::from_le_bytes(bytes);
-        let mask = (1_u128 << width) - 1;
         // One table fetch per atom (the `OnceLock` load showed in the profile).
         let table = &narrow_decode_table()[self as usize];
+        if width == 8 {
+            // FP8: one code per byte (the packed-field extraction below with
+            // width 8 is exactly byte `i`).
+            return bytes.map(|code| f32::from_bits(table[usize::from(code)]));
+        }
+        let packed = u128::from_le_bytes(bytes);
+        let mask = (1_u128 << width) - 1;
         std::array::from_fn(|i| {
             f32::from_bits(table[((packed >> (i as u32 * width)) & mask) as usize])
         })

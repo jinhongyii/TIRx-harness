@@ -586,3 +586,75 @@ Observer-gated fast paths were made observer-independent, so each path is select
 Engine-side, mega_moe is bounded by MMA arithmetic (previous section). The per-poll register-file scan of `spin_hash` is gone: polls now cost O(written slots).
 
 **Noted, not started: compact register storage.** Mega MoE medium loses per-partition CPU as workers increase: 1.5x at 16 workers and 2.3x at 32 (W2's phase split). The likely cause is cache pressure from ~910 KB per-warp register files: one 64-bit × 32-lane slot per SSA register, with no reuse. Compact register storage (paged or sparse `RegFile`) or slot reuse in lowering would address it. Either needs a `RegFile`/lowering contract change.
+
+## Warp execution (`run_cta`) per handler, and the run_mma read notes (W13, 2026-10-09)
+
+**How it was measured.**
+- Case: Mega MoE medium (`mega_moe_t64_h2048_i1536_e96_k4_g1`), 1 worker, NoopObserver.
+- Each instruction is timed with rdtsc around dispatch plus the epilogue; slices, `run_cta`, `land` and `run_mma` are timed the same way.
+- The probe costs about 40–50 cycles per instruction. That is why `mov` shows about 100 and `endif` about 50.
+- Builds were private scratch copies. The tree was not instrumented.
+
+**Handler table, before (e06f874 + b36e44e) and after this batch.** Cycles are per executed instruction. Retries the scheduler applies without re-executing (below) are not timed.
+
+| Handler | Executions before | Cycles before | Executions after | Cycles after | Owner of the remaining cost |
+|---|---|---|---|---|---|
+| mbar_wait | 3.61 M | 2,224 | 0.32 M (+3.29 M applied) | 1,471 | sync |
+| tma | 168 k | 22,598 | 168 k | 22,724 | 82% `tma_plan_dir` (oplib) |
+| binary | 17.0 M | 212 | 17.0 M | 209 | `oplib::binary` |
+| store | 380 k | 6,027 | 380 k | 1,218 | interp |
+| load | 465 k | 4,524 | 465 k | 1,158 | interp |
+| tcgen_cp | 55 k | 23,751 | 55 k | 24,143 | plan + per-cell spans (oplib) |
+| cast | 3.0 M | 347 | 3.0 M | 358 | oplib |
+| barrier | 1.68 M | 410 | 0.17 M (+1.5 M applied) | 1,131 | sync |
+| compare | 2.3 M | 249 | 2.3 M | 257 | oplib |
+| wait_until / async_wait / stmatrix / tcgen_ld | 41 k / 33 k / 15 k / 31 k | 13.7 k / 16.1 k / 34.4 k / 14.4 k | unchanged | unchanged | — |
+
+Instruction cycles fell from 3.06e10 to 1.91e10, and `run_cta` from 3.52e10 to 2.28e10 (1.55x in the instrumented build).
+
+**Fixes (interp/, sched/).**
+1. **`mbar_wait` resolves the mbarrier once.** It used to resolve the address in every lane: about 62 cycles per lane, 75% of a failed retry.
+   - Now, when every retried lane names one address and phase (`support::same_val`), one resolution and one (target, command) entry cover all lanes. Otherwise a per-lane memo (`mbar_res_memo`) is used. `mbar_collapse` and `test_wait` use the memo as well.
+   - This is exact: an address that resolves for one lane resolves to the same mbarrier for every lane. Only local addresses depend on the lane, and a local mbarrier is always an error.
+2. **Repeated blocked retries are applied, not executed** (`interp::BlockedWait`).
+   - A blocked `mbarrier.try_wait` on one mbarrier with no lane latched, or a named-barrier `Resume`, records the resource's state right after the attempt.
+   - A blocked step is deterministic and idempotent: it commits nothing, or only `armed`. The warp cannot change while it does not run (same epoch), and with no suspended arm `divergent_switch` decides from the warp alone. So while the resource still equals the recorded state, the retry would re-block with no effect besides `steps`, `epoch` and `instrs`, and it emits no event, because blocked attempts are not delivered.
+   - The scheduler applies exactly those counters. The decision depends only on engine state, not on the observer.
+   - Debug builds execute the retry anyway and assert the prediction: same status, counters and resource state. This held on all scenarios, e24, kda_backward_packed, fp16_bf16_gemm and the other corpus fixtures.
+   - Medium: 3.29 M mbarrier retries and 1.5 M barrier retries are applied rather than executed.
+3. **Per-lane local and register arrays take the buffer fast path.** `fast_target` now covers `Local`/`Reg` bindings with a per-lane stride; they are the warp's own allocations and never overlaid. Vector loads up to 32 bytes now have a fast path too.
+4. **Declared-word logging is checked once per instruction per allocation** (`WordTable::tracks`), instead of three hash lookups per lane. On medium every store paid them, because the kernel declares sync words, even though the stored arrays carry none.
+5. **`run_mma` read notes.**
+   - Every NumSim MMA tracked its reads (ZeroAndReport): about 1,940 unmerged spans per MMA, 214 M pushes per run, and `coalesce` alone was about 25% of `run_mma`.
+   - Without an observer the notes only feed `report_async_uninit`. A piece every byte of which was valid when read contributes nothing there: a landing only makes bytes valid, and the maximal invalid runs over the merged spans are the same with or without such pieces.
+   - So fast-path and window-served pieces are noted only when observing; pieces read through the general path are always noted.
+   - Guarded by `mma_uninit_findings_do_not_depend_on_the_observer`. Without the general-path notes the test fails.
+   - This was combined with the oplib window path (contract W4-mma-window), which built the windows in `run_mma`.
+
+**Measured.**
+- `benches/interp_hot.rs`:
+
+  | Row | Before | After | Speed-up |
+  |---|---|---|---|
+  | `blocked_wait/ctas8_waiters15_iters1024` | 5.60 ms | 2.48 ms | 2.26x |
+  | `local_array/iters512` | 18.35 ms | 9.48 ms | 1.94x |
+
+  `spin_wait_regs` and `store_v4` are flat.
+- Medium, interp fixes 1–4 only, interleaved min of 3–5, wall / CPU:
+
+  | Workers | Before | After |
+  |---|---|---|
+  | 1 | 35.0 s | 29.5 s |
+  | 16 | 5.71 s / 51.3 s | 4.91 s / 41.8 s |
+  | 32 | 5.80 s / 70.9 s | 5.07 s / 58.1 s |
+
+  e24 at 32 workers went from 0.479 s / 4.63 s to 0.394 s / 3.29 s.
+- Medium `run_mma` CPU, 1 worker, this batch with W4's window types before W4's later oplib additions: 12.71 to 8.85 s (1.44x). Wall went from 34.5 to 24.7 s.
+- Max config, private ext with this batch, one run at load 7.5–13.5: metric 279.3 s (test call 284.2 s), against 337.5 s for b36e44e.
+
+**Checked and not changed.**
+- **Register-file layout.** Each slot is `[u64; 32]`, lane-contiguous and 256 bytes. Handlers read and write whole slot rows, so access is not strided per lane. A 910 KB file is mostly SSA temporaries, and a slice touches a few slots. Cache effects could not be measured: perf is blocked on this host.
+- **Dispatch and predicates.** `mov`, `if`, `loop_if` and `endif` cost 50–130 cycles including the probe. Neither is a lever.
+- **Address computation.** `addr_of` is 1%. The address cost was in load and store resolution (fixed above).
+- **Spin-parked loops.** Medium has none; its blocked retries were `mbarrier.try_wait` and `bar.sync` (fixed above). The max config's 151 M parked re-polls are loops whose polls emit Access events, so they still cannot be skipped observer-independently.
+- **Open, outside interp/sched.** TMA plan building (`tma_plan_dir`, about 82% of a TMA issue) and `tcgen_cp` payload construction (per-cell spans) are oplib's. Elementwise ALU (`binary`, `cast`, `compare`, ptx ops, about 30% of instruction cycles) is `oplib::binary` and its relatives.

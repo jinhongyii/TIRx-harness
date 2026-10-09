@@ -259,24 +259,110 @@ fn read_mxf8_scales(
     layout: ScaleLayout,
 ) -> OpResult<Vec<f32>> {
     thread_local! {
-        static BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        static SCRATCH: std::cell::RefCell<ScaleScratch> = std::cell::RefCell::new(ScaleScratch::default());
     }
     if scale_id >= 4 {
         return Err(io.lift(LibError::message("raw TCGEN scale byte is outside TMEM")));
     }
     let replicas = layout.replicas();
-    for row in 0..rows {
-        for replica in 0..replicas {
-            io.lib(layout.location(address, row, replica))?;
-        }
+    if let Some(values) = replicated_scales_fast(io, cta, address, scale_id, rows, layout)? {
+        return Ok(values);
     }
-    BYTES.with(|bytes| {
-        let mut bytes = bytes.borrow_mut();
-        bytes.clear();
+    SCRATCH.with(|scratch| {
+        let scratch = &mut *scratch.borrow_mut();
+        // Every location first, before any read (as `mxf8_scale_locations`).
+        scratch.locations.clear();
         for row in 0..rows {
             for replica in 0..replicas {
-                let (lane, column) = io.lib(layout.location(address, row, replica))?;
-                bytes.push(io.lib(io.cell(cta, lane, column))?[scale_id]);
+                scratch.locations.push(io.lib(layout.location(address, row, replica))?);
+            }
+        }
+        scratch.bytes.clear();
+        scratch.bytes.resize(scratch.locations.len(), 0);
+        scratch.served.clear();
+        scratch.served.resize(scratch.locations.len(), false);
+        // Window pass (no observable effect besides order-free read notes):
+        // when a lane's cells form one contiguous column range, read it in one
+        // piece from the window; every other cell keeps its own read below.
+        if io.windows.is_some() {
+            window_lane_runs(io, cta, scale_id, scratch);
+        }
+        // The remaining cells, one read each, in (row, replica) order.
+        for (index, &(lane, column)) in scratch.locations.iter().enumerate() {
+            if !scratch.served[index] {
+                scratch.bytes[index] = io.lib(io.cell(cta, lane, column))?[scale_id];
+            }
+        }
+        let mut values = Vec::with_capacity(rows);
+        for copies in scratch.bytes.chunks_exact(replicas) {
+            if copies.iter().any(|&bits| bits != copies[0]) {
+                return Err(io.lift(LibError::message("raw TCGEN block-scale replicas disagree")));
+            }
+            values.push(io.lib(decode_ue8m0_scale(copies[0]))?);
+        }
+        Ok(values)
+    })
+}
+
+/// [`read_mxf8_scales`] for the replicated layout when no location can fail:
+/// `ScaleLayout::location` puts `(row, replica)` at lane `base_lane + 32 *
+/// replica + row % 32`, column `base_column + row / 32`, and fails only past
+/// lane 127 or column 0xffff, so checking the largest lane and column up front
+/// is the same as checking every location. Each lane's cells (rows `l`,
+/// `l + 32`, ...) are consecutive columns: read once from the window when it
+/// serves the run, else per cell in (row, replica) order as the general path.
+/// `None` = take the general path (another layout, a failing location, or
+/// no windows).
+fn replicated_scales_fast(
+    io: &Io<'_>,
+    cta: usize,
+    address: u32,
+    scale_id: usize,
+    rows: usize,
+    layout: ScaleLayout,
+) -> OpResult<Option<Vec<f32>>> {
+    thread_local! {
+        static FAST: std::cell::RefCell<(Vec<u8>, Vec<bool>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    if !matches!(layout, ScaleLayout::Replicated) || rows == 0 || io.windows.is_none() {
+        return Ok(None);
+    }
+    let replicas = layout.replicas();
+    let Ok((base_lane, base_column)) = block_scale_address(address) else { return Ok(None) };
+    let lanes_used = rows.min(32);
+    if base_lane + (replicas - 1) * 32 + lanes_used > 128 || base_column + (rows - 1) / 32 > 0xffff {
+        return Ok(None);
+    }
+    FAST.with(|fast| {
+        let (bytes, served) = &mut *fast.borrow_mut();
+        bytes.clear();
+        bytes.resize(rows * replicas, 0);
+        served.clear();
+        served.resize(rows * replicas, false);
+        let mut run = [0_u8; 4 * 64];
+        for l in 0..lanes_used {
+            let count = (rows - l).div_ceil(32);
+            if count > 64 {
+                continue;
+            }
+            for replica in 0..replicas {
+                let lane = base_lane + 32 * replica + l;
+                if io.try_window_tmem(cta as u32, lane as u32, base_column as u32, &mut run[..4 * count]) {
+                    for t in 0..count {
+                        let index = (l + 32 * t) * replicas + replica;
+                        bytes[index] = run[4 * t + scale_id];
+                        served[index] = true;
+                    }
+                }
+            }
+        }
+        for row in 0..rows {
+            for replica in 0..replicas {
+                let index = row * replicas + replica;
+                if !served[index] {
+                    let (lane, column) = (base_lane + 32 * replica + row % 32, base_column + row / 32);
+                    bytes[index] = io.lib(io.cell(cta, lane, column))?[scale_id];
+                }
             }
         }
         let mut values = Vec::with_capacity(rows);
@@ -286,8 +372,56 @@ fn read_mxf8_scales(
             }
             values.push(io.lib(decode_ue8m0_scale(copies[0]))?);
         }
-        Ok(values)
+        Ok(Some(values))
     })
+}
+
+/// Reusable buffers of [`read_mxf8_scales`].
+#[derive(Default)]
+struct ScaleScratch {
+    locations: Vec<(usize, usize)>,
+    bytes: Vec<u8>,
+    served: Vec<bool>,
+    /// Per TMEM lane: (first column, last column, cell count, start of the
+    /// lane's cells in `run`, or `usize::MAX` when the window did not serve it).
+    lanes: Vec<(usize, usize, usize, usize)>,
+    run: Vec<u8>,
+}
+
+/// Serve scale cells from the TMEM window one lane at a time: a lane whose
+/// requested cells are exactly the columns `first..=last` (no gaps, no
+/// repeats) is one window read of those cells, the same bytes the per-cell
+/// reads would take. A lane the window cannot serve (out of range, invalid
+/// bytes, no window) is left to the per-cell reads.
+fn window_lane_runs(io: &Io<'_>, cta: usize, scale_id: usize, scratch: &mut ScaleScratch) {
+    const UNUSED: (usize, usize, usize, usize) = (usize::MAX, 0, 0, usize::MAX);
+    scratch.lanes.clear();
+    scratch.lanes.resize(addr::TMEM_LANES as usize, UNUSED);
+    for &(lane, column) in &scratch.locations {
+        let Some(entry) = scratch.lanes.get_mut(lane) else { return };
+        *entry = (entry.0.min(column), entry.1.max(column), entry.2 + 1, usize::MAX);
+    }
+    scratch.run.clear();
+    for lane in 0..scratch.lanes.len() {
+        let (first, last, count, _) = scratch.lanes[lane];
+        if count == 0 || last - first + 1 != count {
+            continue;
+        }
+        let start = scratch.run.len();
+        scratch.run.resize(start + count * 4, 0);
+        if io.try_window_tmem(cta as u32, lane as u32, first as u32, &mut scratch.run[start..]) {
+            scratch.lanes[lane].3 = start;
+        } else {
+            scratch.run.truncate(start);
+        }
+    }
+    for (index, &(lane, column)) in scratch.locations.iter().enumerate() {
+        let (first, _, _, start) = scratch.lanes[lane];
+        if start != usize::MAX {
+            scratch.bytes[index] = scratch.run[start + (column - first) * 4 + scale_id];
+            scratch.served[index] = true;
+        }
+    }
 }
 
 fn gather_mxf8f6f4(

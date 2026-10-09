@@ -508,3 +508,64 @@ fn deferred_register_files() {
         }
     }
 }
+
+/// An observer that receives (and counts) every event: the engine builds
+/// the full access lists for it.
+#[derive(Default)]
+struct Counting(u64);
+impl numsim_core::observe::Observer for Counting {
+    fn access(&mut self, _: &numsim_core::observe::Access<'_>) {
+        self.0 += 1;
+    }
+    fn sync(&mut self, _: &numsim_core::observe::SyncEvent) {
+        self.0 += 1;
+    }
+}
+
+/// `run_mma` notes only the pieces read through the general path when no
+/// observer is attached (W13): the uninitialized-read findings, outputs and
+/// status equal those of an observed run, with uninitialized accumulator D,
+/// uninitialized A bytes in a scattered pattern, and both.
+#[test]
+fn mma_uninit_findings_do_not_depend_on_the_observer() {
+    use numsim_core::arena::BitSet;
+    use numsim_core::sched::ArgValue;
+    use numsim_core::testutil::scenarios::{tcgen_mma_f16, MmaSpec, MMA_K, MMA_M};
+    let f16 = numsim_oplib::arith::half::encode_f16;
+    let a: Vec<u16> = (0..MMA_M * MMA_K).map(|i| f16((i % 7) as f32 - 3.0)).collect();
+    let b: Vec<u16> = (0..16 * MMA_K).map(|i| f16((i % 3) as f32 - 1.0)).collect();
+    let mut checked = 0;
+    for (uninit_d, holes, short_a) in [(true, false, false), (false, true, false), (false, false, true), (true, true, true)] {
+        let spec = MmaSpec { accumulate: true, init_d: if uninit_d { None } else { Some(1.0) }, two_issuers: false, collectors: &[], sparse: false };
+        let mut s = tcgen_mma_f16(spec, &a, &b);
+        if holes {
+            // Every 5th 4-byte word of A invalid.
+            if let Some(ArgValue::Buffer { bytes, valid }) = s.inputs.args.get_mut("a") {
+                let mut v = BitSet::new(bytes.len() as u64, true);
+                for w in (0..bytes.len() as u64 / 4).step_by(5) {
+                    v.set_range(w * 4, 4, false);
+                }
+                *valid = Some(v);
+            }
+        }
+        if short_a {
+            // The kernel copies only the first 1000 of A's 1024 words into
+            // shared memory: the MMA reads never-written shared bytes.
+            let k = &mut s.module.kernels[0];
+            let n = k.consts.iter_mut().filter(|c| c.bits == 1024).map(|c| c.bits = 1000).count();
+            assert_eq!(n, 1);
+        }
+        for workers in [1, 8] {
+            s.config.workers = workers;
+            let plain = sched::run_with_config(&s.module, &s.inputs, &mut NoopObserver, &s.config).unwrap();
+            let mut c = Counting::default();
+            let seen = sched::run_with_config(&s.module, &s.inputs, &mut c, &s.config).unwrap();
+            assert!(c.0 > 0);
+            assert!(!plain.diagnostics.is_empty(), "uninit_d {uninit_d} holes {holes} short_a {short_a}: expected findings");
+            assert_eq!(format!("{:?}", plain.diagnostics), format!("{:?}", seen.diagnostics), "uninit_d {uninit_d} holes {holes} short_a {short_a} w{workers}");
+            assert_eq!(format!("{:?}{:?}", plain.status, plain.outputs), format!("{:?}{:?}", seen.status, seen.outputs));
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 8);
+}

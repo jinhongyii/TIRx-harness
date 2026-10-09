@@ -23,7 +23,8 @@ mod dense;
 
 use std::cell::RefCell;
 
-use super::super::{OpError, OpResult, TcArch, TcMmaOptions, TcSmemRead, TcTmemRead, TcTmemWrite};
+use super::super::{OpError, OpResult, TcArch, TcMmaIo, TcMmaOptions, TcSmemRead, TcSpace, TcTmemRead, TcTmemWrite};
+use crate::arena::addr;
 use super::mxf4_spellings;
 use crate::program::{TcA, TcMmaKind};
 use crate::sync::completion::TcgenMmaPayload;
@@ -43,7 +44,7 @@ use numsim_oplib::tcgen05::integer::{
     gather_integer_rows, integer_mma_accumulate, integer_shape, IntegerKind,
 };
 use numsim_oplib::tcgen05::layouts::{
-    cta1_dense_tmem_layout, lane_disabled, metadata_nibble, tmem_address, mxf8_scale_layout, sparse_metadata_location,
+    block_scale_address, cta1_dense_tmem_layout, lane_disabled, metadata_nibble, tmem_address, mxf8_scale_layout, sparse_metadata_location,
     validate_sparse_metadata_address, DenseTmemLayout, ScaleLayout, SparseMetadataLayout,
     CTA1_PACKED_A_COLUMNS,
 };
@@ -90,6 +91,26 @@ struct Io<'a> {
     smem: TcSmemRead<'a>,
     tmem_read: TcTmemRead<'a>,
     stash: RefCell<Option<OpError>>,
+    /// Resolved operand windows (`None` = callbacks only).
+    windows: Option<&'a dyn Windows>,
+}
+
+/// [`TcMmaIo`] with its arena lifetime erased (it is invariant in it), so
+/// `Io` keeps one lifetime.
+trait Windows {
+    fn try_read(&self, space: TcSpace, cta: u32, offset: u64, out: &mut [u8]) -> bool;
+    fn release(&self);
+}
+
+impl Windows for TcMmaIo<'_> {
+    #[inline]
+    fn try_read(&self, space: TcSpace, cta: u32, offset: u64, out: &mut [u8]) -> bool {
+        TcMmaIo::try_read(self, space, cta, offset, out)
+    }
+    #[inline]
+    fn release(&self) {
+        TcMmaIo::release(self)
+    }
 }
 
 impl Io<'_> {
@@ -122,20 +143,57 @@ impl Io<'_> {
     fn shared(&self, cta: usize) -> impl FnMut(usize, &mut [u8]) -> LibResult<()> + '_ {
         move |offset, buf| {
             let address = self.index(offset, "shared address")?;
+            if self.windows.is_some_and(|w| {
+                w.try_read(TcSpace::Shared, cta as u32, u64::from(addr::decode_shared(address).1), buf)
+            }) {
+                return Ok(());
+            }
             (self.smem)(cta as u32, address, buf).map_err(|error| self.fail(error))
         }
     }
 
     fn cell(&self, cta: usize, lane: usize, column: usize) -> LibResult<[u8; 4]> {
         let mut bytes = [0_u8; 4];
-        (self.tmem_read)(
-            cta as u32,
-            self.index(lane, "TMEM lane")?,
-            self.index(column, "TMEM column")?,
-            &mut bytes,
-        )
-        .map_err(|error| self.fail(error))?;
+        let lane = self.index(lane, "TMEM lane")?;
+        let column = self.index(column, "TMEM column")?;
+        self.read_tmem(cta as u32, lane, column, &mut bytes)?;
         Ok(bytes)
+    }
+
+    /// Read `buf.len()` bytes of TMEM from cell `(lane, column)`: from the
+    /// CTA's window when the piece is inside its lane, in bounds and valid,
+    /// else through the callback (the callback's own range check and errors).
+    fn read_tmem(&self, cta: u32, lane: u32, column: u32, buf: &mut [u8]) -> LibResult<()> {
+        if let Some(windows) = self.windows {
+            let in_lane = lane < addr::TMEM_LANES
+                && column < addr::TMEM_COLS
+                && u64::from(column) * 4 + buf.len() as u64 <= u64::from(addr::TMEM_COLS) * 4;
+            if in_lane && windows.try_read(TcSpace::Tmem, cta, addr::tmem_byte_offset(lane, column), buf) {
+                return Ok(());
+            }
+        }
+        (self.tmem_read)(cta, lane, column, buf).map_err(|error| self.fail(error))
+    }
+
+    /// Window-only TMEM read (no callback, no effect when it fails): `true`
+    /// when the CTA's window served the piece.
+    fn try_window_tmem(&self, cta: u32, lane: u32, column: u32, buf: &mut [u8]) -> bool {
+        let in_lane = lane < addr::TMEM_LANES
+            && column < addr::TMEM_COLS
+            && u64::from(column) * 4 + buf.len() as u64 <= u64::from(addr::TMEM_COLS) * 4;
+        in_lane
+            && self
+                .windows
+                .is_some_and(|windows| windows.try_read(TcSpace::Tmem, cta, addr::tmem_byte_offset(lane, column), buf))
+    }
+
+    /// Write a TMEM piece through the callback, first dropping every window
+    /// (their arena borrows) so the engine can write.
+    fn write_tmem(&self, tmem_write: TcTmemWrite<'_>, cta: u32, lane: u32, column: u32, bytes: &[u8]) -> LibResult<()> {
+        if let Some(windows) = self.windows {
+            windows.release();
+        }
+        tmem_write(cta, lane, column, bytes).map_err(|error| self.fail(error))
     }
 
     fn words(&self, cta: usize) -> impl FnMut(usize, usize) -> LibResult<u32> + '_ {
@@ -274,7 +332,7 @@ fn read_run<T>(
     let (lane, column) = check_cell(io, lane, column)?;
     buf.clear();
     buf.resize(indices.len() * 4, 0);
-    (io.tmem_read)(cta as u32, lane, column, buf).map_err(|error| io.fail(error))?;
+    io.read_tmem(cta as u32, lane, column, buf)?;
     let cells = buf.as_chunks::<4>().0;
     if let Some(slots) = contiguous(indices).and_then(|r| values.get_mut(r)) {
         // Every streamed run is a contiguous index range: no per-cell indirection.
@@ -313,7 +371,7 @@ fn write_run<T: Copy>(
             *cell = encode(values[index]);
         }
     }
-    tmem_write(cta as u32, lane, column, buf).map_err(|error| io.fail(error))
+    io.write_tmem(tmem_write, cta as u32, lane, column, buf)
 }
 
 /// Little-endian byte view of f32 values: TMEM F32 cells are the values'
@@ -347,8 +405,7 @@ fn read_run_f32(
         let (cta, lane, column) = at;
         check_cell(io, lane, column + indices.len() - 1)?;
         let (lane, column) = check_cell(io, lane, column)?;
-        return (io.tmem_read)(cta as u32, lane, column, f32_bytes_mut(&mut values[range]))
-            .map_err(|error| io.fail(error));
+        return io.read_tmem(cta as u32, lane, column, f32_bytes_mut(&mut values[range]));
     }
     read_run(io, buf, at, indices, values, &f32::from_le_bytes)
 }
@@ -368,8 +425,7 @@ fn write_run_f32(
         let (cta, lane, column) = at;
         check_cell(io, lane, column + indices.len() - 1)?;
         let (lane, column) = check_cell(io, lane, column)?;
-        return tmem_write(cta as u32, lane, column, f32_bytes(&values[range]))
-            .map_err(|error| io.fail(error));
+        return io.write_tmem(tmem_write, cta as u32, lane, column, f32_bytes(&values[range]));
     }
     write_run(io, tmem_write, buf, at, indices, values, &f32::to_le_bytes)
 }
@@ -574,7 +630,7 @@ fn write_cell(
 ) -> LibResult<()> {
     let lane = io.index(lane, "TMEM lane")?;
     let column = io.index(column, "TMEM column")?;
-    tmem_write(cta as u32, lane, column, bytes).map_err(|error| io.fail(error))
+    io.write_tmem(tmem_write, cta as u32, lane, column, bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -853,12 +909,14 @@ pub(super) fn run(
     smem: TcSmemRead<'_>,
     tmem_read: TcTmemRead<'_>,
     tmem_write: TcTmemWrite<'_>,
+    windows: Option<&TcMmaIo<'_>>,
 ) -> OpResult {
     let form = check_form(payload, options)?;
     let io = Io {
         smem,
         tmem_read,
         stash: RefCell::new(None),
+        windows: windows.map(|w| w as &dyn Windows),
     };
     match payload.args.kind {
         TcMmaKind::F16 | TcMmaKind::Tf32 => float_mma(&io, payload, options, &form, tmem_write),

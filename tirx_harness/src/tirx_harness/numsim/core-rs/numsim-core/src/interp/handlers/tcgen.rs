@@ -1246,7 +1246,7 @@ pub(crate) fn mma_a_footprint_probe(p: &TcgenMmaPayload, options: &oplib::TcMmaO
             Ok(())
         };
         let mut tw = |_: u32, _: u32, _: u32, _: &[u8]| -> oplib::OpResult { Ok(()) };
-        let _ = oplib::tc_mma_ctas(payload, options, &smem, &tr, &mut tw);
+        let _ = oplib::tc_mma_ctas(payload, options, &smem, &tr, &mut tw, None);
         reads.into_inner()
     };
     let first = probe(p);

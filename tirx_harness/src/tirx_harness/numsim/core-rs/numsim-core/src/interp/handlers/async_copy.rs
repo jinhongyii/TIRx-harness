@@ -152,6 +152,26 @@ pub fn mbar_res(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize) -> Res
     Ok(ResourceId::Mbarrier { cta, alloc: loc.alloc, offset: loc.offset as u32 })
 }
 
+/// [`mbar_res`] over the lanes of one instruction, reusing the previous
+/// lane's result for a repeated address (W13): lanes almost always name one
+/// mbarrier, and resolving it per lane dominated a failed `mbarrier.try_wait`
+/// retry. Exact: an address that resolves Ok for one lane resolves to the
+/// same mbarrier for every lane (only a local address depends on the lane,
+/// and a local mbarrier is always an error), so only the first lane of a
+/// run of equal addresses resolves (and reports any error).
+#[inline]
+pub fn mbar_res_memo(ctx: &ExecCtx<'_>, space: AddrSpace, a: u64, lane: usize, memo: &mut Option<(u64, ResourceId)>) -> Result<ResourceId, ExecError> {
+    if let Some((ma, r)) = *memo {
+        if ma == a {
+            debug_assert_eq!(mbar_res(ctx, space, a, lane).ok(), Some(r), "lane-dependent mbarrier resolution");
+            return Ok(r);
+        }
+    }
+    let r = mbar_res(ctx, space, a, lane)?;
+    *memo = Some((a, r));
+    Ok(r)
+}
+
 /// Same mbarrier offset in CTA `rank` of the cluster.
 pub fn mbar_in_rank(ctx: &ExecCtx<'_>, res: ResourceId, rank: u32) -> Option<ResourceId> {
     let ResourceId::Mbarrier { offset, .. } = res else { return None };

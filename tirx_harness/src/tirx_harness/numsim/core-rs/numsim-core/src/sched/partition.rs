@@ -374,7 +374,37 @@ impl Partition {
             if self.serial.iter().any(|&(c, x)| c == ci && x == w) {
                 continue;
             }
+            // W13: a retry that would only re-block at the same
+            // `mbarrier.try_wait` (`interp::BlockedWait`) applies its
+            // counters without re-executing; same state either way.
+            let repeats = self.ctas[ci].warps[w].blocked_wait_repeats(&self.sync);
+            if repeats && !cfg!(debug_assertions) {
+                self.ctas[ci].warps[w].repeat_blocked_wait();
+                self.counters.instrs += 1;
+                let WarpStatus::Blocked(res) = self.ctas[ci].warps[w].status else { unreachable!("checked by blocked_wait_repeats") };
+                progress |= self.settle(ci, w, StepResult::Blocked(res), false)?;
+                continue;
+            }
+            // Debug builds execute the retry and check the prediction.
+            let before = repeats.then(|| {
+                let wp = &self.ctas[ci].warps[w];
+                (wp.status, wp.epoch, wp.steps, self.counters.instrs, wp.blocked_wait.as_ref().and_then(|b| self.sync.get(b.res).cloned()))
+            });
             let (r, progressed) = self.slice(ci, w, env, arena, env.config.quantum);
+            if let Some((status, epoch, steps, instrs, res_state)) = before {
+                let wp = &self.ctas[ci].warps[w];
+                let res = wp.blocked_wait.as_ref().map(|b| b.res);
+                debug_assert!(
+                    matches!(r, StepResult::Blocked(x) if Some(x) == res)
+                        && !progressed
+                        && wp.status == status
+                        && wp.epoch == epoch + 1
+                        && wp.steps == steps + 1
+                        && self.counters.instrs == instrs + 1
+                        && res.and_then(|x| self.sync.get(x).cloned()) == res_state,
+                    "blocked_wait_repeats predicted a re-block the retry did not reproduce: {r:?}"
+                );
+            }
             progress |= self.settle(ci, w, r, progressed)?;
         }
         Ok(progress)
@@ -653,9 +683,16 @@ impl Partition {
             }
             Payload::TcgenMma(p) => {
                 // Read spans feed only access events and the ZeroAndReport
-                // uninit reports.
+                // uninit reports. Without an observer only the reports need
+                // them, and a piece every byte of which was valid when read
+                // contributes nothing to those (W13): a landing only makes
+                // bytes valid (D writes), so every byte invalid at report
+                // time lies in a piece read through the general path, and
+                // the maximal invalid runs `report_async_uninit` finds in
+                // the merged spans are the same with or without the valid
+                // pieces. So only those pieces are noted then.
                 let track_reads = env.observing || arena.policy() == crate::arena::ValidityPolicy::ZeroAndReport;
-                let (r, w, u) = run_mma(arena, p, tc_arch(env.program.arch.as_deref()), meta.as_ref().and_then(|m| m.lut_b), track_reads)
+                let (r, w, u) = run_mma(arena, p, tc_arch(env.program.arch.as_deref()), meta.as_ref().and_then(|m| m.lut_b), track_reads, env.observing)
                     .map_err(|e| sched_error(ExecErrorKind::Op(e.kind), kernel, op.source.warp, op.source.site, e.message))?;
                 // Take the lists over (no copy); they go back to the pool
                 // at the end of the landing.
@@ -1340,6 +1377,7 @@ fn run_mma(
     arch: crate::oplib::TcArch,
     lut_b: Option<u32>,
     track_reads: bool,
+    note_all: bool,
 ) -> crate::oplib::OpResult<(Spans, Spans, Spans)> {
     use crate::oplib::OpError;
     use std::cell::RefCell;
@@ -1377,10 +1415,11 @@ fn run_mma(
         let off = addr::decode_shared(a).1 as u64;
         let ar = cell.borrow();
         let span = ByteSpan::new(off, out.len() as u64);
-        if !fast_read(&ar, al, span, out) {
+        let fast = fast_read(&ar, al, span, out);
+        if !fast {
             ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
         }
-        if track_reads {
+        if track_reads && (note_all || !fast) {
             note(&mut reads.borrow_mut(), al, span);
         }
         Ok(())
@@ -1398,13 +1437,14 @@ fn run_mma(
         let (al, off) = tmem_of(cta, lane, col, out.len())?;
         let ar = cell.borrow();
         let span = ByteSpan::new(off, out.len() as u64);
-        if !fast_read(&ar, al, span, out) {
+        let fast = fast_read(&ar, al, span, out);
+        if !fast {
             if ar.first_invalid(support::whole(&ar, al), span).is_some() {
                 note(&mut uninit.borrow_mut(), al, span);
             }
             ar.read(support::whole(&ar, al), &[span], out).map_err(|e| OpError::invalid(e.to_string()))?;
         }
-        if track_reads {
+        if track_reads && (note_all || !fast) {
             note(&mut reads.borrow_mut(), al, span);
         }
         Ok(())
@@ -1424,8 +1464,39 @@ fn run_mma(
         note(&mut writes, al, span);
         Ok(())
     };
-    crate::oplib::tc_mma_ctas(p, &options, &smem, &tmem_read, &mut tmem_write)?;
+    // Resolved operand windows (contract W4-mma-window): every piece that
+    // is in bounds and fully valid is served from the allocation directly;
+    // the rest go to the callbacks above. Window-served pieces are fully
+    // valid, so they are recorded only when observing (`note_all`), like the
+    // callbacks' fast path.
+    let window_reads: RefCell<Vec<(crate::oplib::TcSpace, u32, u64, u64)>> = RefCell::new(Vec::new());
+    let window = |al: AllocId| -> Option<crate::oplib::TcWindow<'_>> {
+        let ar = cell.borrow();
+        if ar.is_overlaid(al) || ar.get(al).metadata_only {
+            return None;
+        }
+        let bytes = std::cell::Ref::map(cell.borrow(), |ar| &ar.get(al).bytes[..]);
+        let valid = std::cell::Ref::map(cell.borrow(), |ar| &ar.get(al).valid);
+        Some(crate::oplib::TcWindow { bytes, valid })
+    };
+    let per_cta = |v: &[AllocId]| -> [Option<crate::oplib::TcWindow<'_>>; 2] { [v.first().and_then(|&a| window(a)), v.get(1).and_then(|&a| window(a))] };
+    let io = crate::oplib::TcMmaIo {
+        windows: RefCell::new(Some([per_cta(&p.smem), per_cta(&p.tmem)])),
+        reads: (track_reads && note_all).then_some(&window_reads),
+    };
+    crate::oplib::tc_mma_ctas(p, &options, &smem, &tmem_read, &mut tmem_write, Some(&io))?;
+    drop(io);
     let mut r = reads.into_inner();
+    // Merged with the callbacks' notes; `coalesce` makes the order moot.
+    for (space, cta, off, len) in window_reads.into_inner() {
+        let v = match space {
+            crate::oplib::TcSpace::Shared => &p.smem,
+            crate::oplib::TcSpace::Tmem => &p.tmem,
+        };
+        if let Some(&al) = v.get(cta as usize) {
+            r.push((al, ByteSpan::new(off, len)));
+        }
+    }
     coalesce(&mut r);
     coalesce(&mut writes);
     let mut u = uninit.into_inner();

@@ -99,6 +99,23 @@ pub fn lane_slot(ctx: &ExecCtx<'_>, o: Operand, i: u32, lane: usize) -> u64 {
     }
 }
 
+/// The common low 64 bits of operand `o` over the lanes of `mask`, or
+/// `None` when they differ or `mask` is empty (W13: one pass over the
+/// register's lane array, for handlers whose per-lane work is the same for
+/// equal values).
+#[inline]
+pub fn same_val(ctx: &ExecCtx<'_>, o: Operand, mask: WarpMask) -> Option<u64> {
+    let first = mask.first()?;
+    match o {
+        Operand::Reg(r) => {
+            let v = ctx.warp.regs.get(ctx.slot(r));
+            let x = v[first];
+            mask.lanes().all(|l| v[l] == x).then_some(x)
+        }
+        Operand::Const(_) => Some(lane_val(ctx, o, first)),
+    }
+}
+
 /// Low 64 bits of an operand in one lane.
 #[inline]
 pub fn lane_val(ctx: &ExecCtx<'_>, o: Operand, lane: usize) -> u64 {
@@ -731,7 +748,7 @@ pub fn mem_write(ctx: &mut ExecCtx<'_>, loc: Loc, lane: usize, src: &[u8]) -> Re
     if let Err(e) = ctx.arena.write(v, &[span], src) {
         return Err(arena_err(ctx, e, WarpMask::lane(lane)));
     }
-    if !ctx.aux.words.is_empty() {
+    if ctx.aux.words.tracks(loc.alloc) {
         ctx.aux.words.log_lane(loc.alloc, span, src);
     }
     Ok(())

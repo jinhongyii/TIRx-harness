@@ -155,6 +155,53 @@ pub struct WarpState {
     /// Register slots still to allocate (zeroed) before the warp's first
     /// instruction ([`WarpState::new_deferred`]); 0 once allocated.
     pub pending_slots: usize,
+    /// The warp's last instruction blocked in a way a retry repeats exactly
+    /// while the resource it waits on is unchanged (W13); see [`BlockedWait`].
+    pub blocked_wait: Option<Box<BlockedWait>>,
+}
+
+/// A blocked wait whose retry is known to block again (W13).
+///
+/// Recorded by a handler whose retry is one `SyncTable::step` of a fixed
+/// command on one resource, with no other effect when it blocks:
+/// `mbar_wait` when every retried lane waits on one mbarrier with one phase
+/// command and no lane is latched, and a named-barrier `Resume`. `state` is
+/// that resource's state right after the blocked attempt. A blocked step is
+/// deterministic and idempotent (it commits nothing, or only the mbarrier
+/// `armed` flag, see `crate::sync`); the warp's registers, masks and frames
+/// cannot change while it does not run (`epoch` unchanged); and with no
+/// suspended arm `divergent_switch` decides from those alone. So while the
+/// warp is still at `epoch`, has no suspended arm and the resource still
+/// equals `state`, re-executing would block again with no effect besides
+/// the per-instruction counters (`steps`, `epoch`, `LaunchCounters::instrs`)
+/// and no observer event (blocked attempts are not delivered). The
+/// scheduler then applies exactly those counters instead of re-executing
+/// ([`WarpState::repeat_blocked_wait`]); the decision depends only on engine
+/// state, never on the observer. Debug builds execute the retry anyway and
+/// check the prediction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockedWait {
+    pub epoch: u64,
+    pub pc: Pc,
+    pub res: crate::sync::ResourceId,
+    pub state: crate::sync::Resource,
+}
+
+/// Record that the current instruction blocked on `res` in a way its retry
+/// repeats exactly while `res` is unchanged ([`BlockedWait`]). Call only
+/// from the handlers listed there, after the blocked step.
+pub fn note_repeatable_block(ctx: &mut ExecCtx<'_>, res: crate::sync::ResourceId) {
+    let Some(st) = ctx.sync.get(res) else { return };
+    let (epoch, pc) = (ctx.warp.epoch, ctx.warp.pc);
+    match ctx.warp.blocked_wait.as_deref_mut() {
+        Some(b) => {
+            b.epoch = epoch;
+            b.pc = pc;
+            b.res = res;
+            b.state.clone_from(st);
+        }
+        None => ctx.warp.blocked_wait = Some(Box::new(BlockedWait { epoch, pc, res, state: st.clone() })),
+    }
 }
 
 /// Incremental state of [`WarpState::spin_hash`] (W13): the hash of every
@@ -361,6 +408,27 @@ impl WarpState {
             suspended: Vec::new(),
             spin_memo: None,
             pending_slots: 0,
+            blocked_wait: None,
+        }
+    }
+
+    /// Would retrying this blocked warp only re-block ([`BlockedWait`])?
+    pub fn blocked_wait_repeats(&self, sync: &crate::sync::SyncTable) -> bool {
+        let Some(b) = self.blocked_wait.as_deref() else { return false };
+        if b.epoch != self.epoch || b.pc != self.pc || self.status != WarpStatus::Blocked(b.res) || !self.suspended.is_empty() {
+            return false;
+        }
+        sync.get(b.res) == Some(&b.state)
+    }
+
+    /// Apply the effects of a retry for which [`WarpState::blocked_wait_repeats`]
+    /// holds: one instruction's `steps` and `epoch` (the caller counts the
+    /// instruction); the warp stays `Blocked` on the same resource.
+    pub fn repeat_blocked_wait(&mut self) {
+        self.steps += 1;
+        self.epoch += 1;
+        if let Some(b) = self.blocked_wait.as_deref_mut() {
+            b.epoch = self.epoch;
         }
     }
 

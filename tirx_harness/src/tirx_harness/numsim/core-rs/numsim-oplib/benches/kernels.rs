@@ -233,8 +233,36 @@ fn narrow_decode(c: &mut Criterion) {
     g.finish();
 }
 
+/// Block-scaled MMA operand gather: 256 K-major e4m3 rows of K=32 from a
+/// 128B-swizzled shared tile through a plain slice reader (the per-piece oplib
+/// work of `gather_f8_rows`: offsets, reads, decode; W4 Mega MoE profile).
+fn operand_gather(c: &mut Criterion) {
+    use tcgen05::gather::gather_f8_rows;
+    use tcgen05::narrow::NarrowFormat;
+    use tcgen05::smem_desc::{decode_matrix_descriptor, SharedWindow};
+    let smem: Vec<u8> = (0..1 << 16).map(|i| (i * 7 + 3) as u8).collect();
+    let bits = tcgen05::encode::encode_matrix_descriptor(0x1000, 1, 64, 3);
+    let descriptor = decode_matrix_descriptor(bits).unwrap();
+    let window = SharedWindow::resolved(0, smem.len());
+    let mut g = c.benchmark_group("tcgen05_gather");
+    g.bench_function("f8_rows_256x32_sw128", |b| {
+        b.iter(|| {
+            let mut read = |offset: usize, out: &mut [u8]| {
+                out.copy_from_slice(&smem[offset..offset + out.len()]);
+                Ok(())
+            };
+            black_box(
+                gather_f8_rows(&mut read, window, descriptor, 256, 32, NarrowFormat::E4M3, false, false, None, true)
+                    .unwrap(),
+            )
+        })
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
+    operand_gather,
     narrow_decode,
     conversions,
     host_nan_rule,

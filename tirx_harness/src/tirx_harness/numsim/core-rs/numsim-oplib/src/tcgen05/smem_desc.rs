@@ -192,6 +192,18 @@ pub fn f8_b_descriptor(
     }
 }
 
+/// `(value / atom_bytes, value % atom_bytes)`; a shift and mask for the
+/// power-of-two atom sizes descriptors decode to (16 or 32 bytes), the
+/// division otherwise (perf: this runs per operand piece). Same results.
+#[inline]
+fn div_rem_atom(value: usize, atom_bytes: usize) -> (usize, usize) {
+    if atom_bytes.is_power_of_two() {
+        (value >> atom_bytes.trailing_zeros(), value & (atom_bytes - 1))
+    } else {
+        (value / atom_bytes, value % atom_bytes)
+    }
+}
+
 /// Byte offset of `byte_in_row` of K-major `row` (legacy `raw_tcgen05_shared_byte_offset`).
 pub fn shared_byte_offset(
     source: SharedWindow,
@@ -207,8 +219,7 @@ pub fn shared_byte_offset(
                 OpError::message("matrix descriptor swizzle length conversion failed")
             })?)
             .ok_or_else(|| OpError::message("matrix descriptor row stride overflow"))?;
-    let atom = byte_in_row / descriptor.swizzle_atom_bytes;
-    let byte_in_atom = byte_in_row % descriptor.swizzle_atom_bytes;
+    let (atom, byte_in_atom) = div_rem_atom(byte_in_row, descriptor.swizzle_atom_bytes);
     if byte_in_atom
         .checked_add(access_bytes)
         .ok_or_else(|| OpError::message("raw TCGEN access size overflow"))?
@@ -456,7 +467,7 @@ pub fn narrow_shared_atom_accesses(
     while done < bytes {
         let column = start + done;
         let count = (bytes - done)
-            .min(descriptor.swizzle_atom_bytes - column % descriptor.swizzle_atom_bytes);
+            .min(descriptor.swizzle_atom_bytes - div_rem_atom(column, descriptor.swizzle_atom_bytes).1);
         let offset = shared_byte_offset(source, descriptor, row, column, count)?;
         visit(offset, count)?;
         done += count;
