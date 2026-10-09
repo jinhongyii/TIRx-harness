@@ -495,9 +495,17 @@ pub fn fma_f32_abt_increasing_k(
     output: &mut [f32],
 ) -> Result<(), FmaShapeError> {
     validate_abt_shapes(m, n, k, a_values, b_transposed, output)?;
-    let initial = output.to_vec();
+    // The pre-MMA accumulator, kept only for the NaN re-pin; one reusable
+    // per-thread buffer instead of a copy per call.
+    thread_local! {
+        static INITIAL: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut initial = INITIAL.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    initial.clear();
+    initial.extend_from_slice(output);
     fma_f32_abt_increasing_k_dispatch(m, n, k, a_values, b_transposed, output);
     repin_nan_outputs(n, k, a_values, b_transposed, &initial, output);
+    INITIAL.with(|b| *b.borrow_mut() = initial);
     Ok(())
 }
 

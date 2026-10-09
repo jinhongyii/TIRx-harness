@@ -547,8 +547,8 @@ impl Partition {
         let proxy = if strong.is_some() { Proxy::Generic } else { meta.as_ref().map(|m| m.proxy).unwrap_or_default() };
         let lane = meta.as_ref().map(|m| m.lane).unwrap_or(ALL_LANES);
         let src_err = |e: String| sched_error(ExecErrorKind::OutOfBounds, kernel, op.source.warp, op.source.site, e);
-        let mut reads: Vec<(AllocId, ByteSpan)> = Vec::new();
-        let mut writes: Vec<(AllocId, ByteSpan)> = Vec::new();
+        let mut reads: Vec<(AllocId, ByteSpan)> = take_spans();
+        let mut writes: Vec<(AllocId, ByteSpan)> = take_spans();
         let mut rmw = false;
         // Reads whose bytes were invalid when read but are written by the same
         // op (MMA accumulator D): reported from the read-time check.
@@ -657,9 +657,21 @@ impl Partition {
                 let track_reads = env.observing || arena.policy() == crate::arena::ValidityPolicy::ZeroAndReport;
                 let (r, w, u) = run_mma(arena, p, tc_arch(env.program.arch.as_deref()), meta.as_ref().and_then(|m| m.lut_b), track_reads)
                     .map_err(|e| sched_error(ExecErrorKind::Op(e.kind), kernel, op.source.warp, op.source.site, e.message))?;
-                reads.extend(r);
+                // Take the lists over (no copy); they go back to the pool
+                // at the end of the landing.
+                if reads.is_empty() {
+                    give_spans(std::mem::replace(&mut reads, r));
+                } else {
+                    reads.extend_from_slice(&r);
+                    give_spans(r);
+                }
                 read_time_uninit = u;
-                writes.extend(w);
+                if writes.is_empty() {
+                    give_spans(std::mem::replace(&mut writes, w));
+                } else {
+                    writes.extend_from_slice(&w);
+                    give_spans(w);
+                }
                 rmw = true;
             }
         }
@@ -727,19 +739,24 @@ impl Partition {
                 Payload::Reduce { dtype, .. } | Payload::ReduceData { dtype, .. } => Some(dtype.mem_bytes() as u64),
                 _ => None,
             };
+            // Only allocations holding declared words are logged (the rest
+            // log nothing); filtering keeps the logged order (W13).
+            let words = &self.aux.words;
             let mut items: Vec<(AllocId, Option<Window>, LaneSpan)> = match elem {
                 Some(eb) => writes
                     .iter()
+                    .filter(|(a, _)| words.has(*a))
                     .flat_map(|&(a, s)| {
                         let w = window(arena, a);
                         (0..s.len / eb.max(1)).map(move |k| (a, w, LaneSpan { lane, span: ByteSpan::new(s.start + k * eb, eb) }))
                     })
                     .collect(),
-                None => writes.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect(),
+                None => writes.iter().filter(|(a, _)| words.has(*a)).map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect(),
             };
             support::log_async_writes(&mut self.aux, arena, &mut items);
+            let words = &self.aux.words;
             let mut items: Vec<(AllocId, Option<Window>, LaneSpan)> =
-                frag_writes.iter().map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
+                frag_writes.iter().filter(|(a, _)| words.has(*a)).map(|&(a, s)| (a, window(arena, a), LaneSpan { lane, span: s })).collect();
             support::log_async_writes(&mut self.aux, arena, &mut items);
         }
         if env.observing {
@@ -887,6 +904,9 @@ impl Partition {
         let open = self.aux.groups.is_open(op.id);
         let due = self.aux.groups.landed(op.id, open);
         self.sync.completions.extend(due);
+        give_spans(reads);
+        give_spans(writes);
+        give_spans(read_time_uninit);
         Ok(())
     }
 }
@@ -1092,9 +1112,17 @@ fn copy_spans(arena: &mut Arena, src: &[(AllocId, ByteSpan)], dst: &[(AllocId, B
     // contiguous runs, then store each merged destination run with one
     // memcpy + one validity range (direct when the allocation is not a
     // shard overlay).
-    let src_runs = merge_runs(src);
+    let mut src_runs = take_spans();
+    merge_runs_into(src, &mut src_runs);
     if src_runs.iter().all(|&(a, s)| !arena.get(a).metadata_only && arena.first_invalid(support::whole(arena, a), s).is_none()) {
-        let mut bytes = vec![0u8; total(src) as usize];
+        thread_local! {
+            /// Reusable gather buffer (W13: a fresh one per landing was
+            /// GBs of allocation per Mega MoE run).
+            static COPY_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut bytes = COPY_BUF.with(|b| std::mem::take(&mut *b.borrow_mut()));
+        bytes.clear();
+        bytes.resize(total(src) as usize, 0);
         let mut at = 0usize;
         for &(a, s) in &src_runs {
             let out = &mut bytes[at..at + s.len as usize];
@@ -1105,8 +1133,10 @@ fn copy_spans(arena: &mut Arena, src: &[(AllocId, ByteSpan)], dst: &[(AllocId, B
             }
             at += s.len as usize;
         }
+        let mut dst_runs = take_spans();
+        merge_runs_into(dst, &mut dst_runs);
         let mut pos = 0usize;
-        for (a, s) in merge_runs(dst) {
+        for &(a, s) in &dst_runs {
             let n = s.len as usize;
             let direct = !arena.is_overlaid(a) && !arena.get(a).metadata_only && s.end() <= arena.get(a).size;
             if direct {
@@ -1118,8 +1148,14 @@ fn copy_spans(arena: &mut Arena, src: &[(AllocId, ByteSpan)], dst: &[(AllocId, B
             }
             pos += n;
         }
+        give_spans(src_runs);
+        give_spans(dst_runs);
+        if bytes.capacity() <= 1 << 24 {
+            COPY_BUF.with(|b| *b.borrow_mut() = bytes);
+        }
         return Ok(());
     }
+    give_spans(src_runs);
     let (mut si, mut so, mut di, mut doff) = (0usize, 0u64, 0usize, 0u64);
     while si < src.len() && di < dst.len() {
         let (sa, ss) = src[si];
@@ -1145,15 +1181,14 @@ fn copy_spans(arena: &mut Arena, src: &[(AllocId, ByteSpan)], dst: &[(AllocId, B
 }
 
 /// Consecutive same-allocation spans that touch, merged (order kept).
-fn merge_runs(v: &[(AllocId, ByteSpan)]) -> Vec<(AllocId, ByteSpan)> {
-    let mut out: Vec<(AllocId, ByteSpan)> = Vec::with_capacity(v.len());
+fn merge_runs_into(v: &[(AllocId, ByteSpan)], out: &mut Vec<(AllocId, ByteSpan)>) {
+    out.clear();
     for &(a, s) in v {
         match out.last_mut() {
             Some((la, ls)) if *la == a && ls.end() == s.start => ls.len += s.len,
             _ => out.push((a, s)),
         }
     }
-    out
 }
 
 fn gather_bytes(arena: &Arena, spans: &[(AllocId, ByteSpan)]) -> Result<Vec<u8>, String> {
@@ -1273,6 +1308,32 @@ fn split_tmem_reads(reads: &[(AllocId, ByteSpan)], bases: &[(u8, u32, u32)]) -> 
     out
 }
 
+thread_local! {
+    /// Reusable span lists for MMA landings (W13: their growth was ~10 GB of
+    /// allocation per Mega MoE medium run). Per thread; contents never
+    /// outlive a landing.
+    static SPAN_POOL: std::cell::RefCell<Vec<Spans>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An empty span list, reusing a returned one's capacity when available.
+fn take_spans() -> Spans {
+    SPAN_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default()
+}
+
+/// Return a span list for reuse (bounded count and capacity).
+fn give_spans(mut v: Spans) {
+    v.clear();
+    if v.capacity() == 0 || v.capacity() > 1 << 20 {
+        return;
+    }
+    SPAN_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < 16 {
+            p.push(v);
+        }
+    });
+}
+
 fn run_mma(
     arena: &mut Arena,
     p: &crate::sync::completion::TcgenMmaPayload,
@@ -1283,9 +1344,9 @@ fn run_mma(
     use crate::oplib::OpError;
     use std::cell::RefCell;
     let cell = RefCell::new(arena);
-    let reads: RefCell<Spans> = RefCell::new(Vec::new());
-    let uninit: RefCell<Spans> = RefCell::new(Vec::new());
-    let mut writes: Spans = Vec::new();
+    let reads: RefCell<Spans> = RefCell::new(take_spans());
+    let uninit: RefCell<Spans> = RefCell::new(take_spans());
+    let mut writes: Spans = take_spans();
     let options = crate::oplib::TcMmaOptions { arch, ti16: p.args.kind == crate::program::TcMmaKind::Ti16, lut_b, ..Default::default() };
     // oplib reads/writes one small piece at a time: record them merged with
     // the previous piece when contiguous (most are; only when a consumer
@@ -1385,17 +1446,22 @@ fn coalesce_sorted(v: &mut Spans) {
     // indistinguishable (W13: the stable sort's buffer moves were ~10% of
     // an fp8 GEMM run).
     v.sort_unstable();
-    let mut out: Spans = Vec::with_capacity(v.len());
-    for (a, s) in v.drain(..) {
-        match out.last_mut() {
-            Some((la, ls)) if *la == a && s.start <= ls.end() => {
+    // Merge in place (W13: no second list).
+    let mut n = 0usize;
+    for i in 0..v.len() {
+        let (a, s) = v[i];
+        if n > 0 {
+            let (la, ls) = &mut v[n - 1];
+            if *la == a && s.start <= ls.end() {
                 let end = ls.end().max(s.end());
                 ls.len = end - ls.start;
+                continue;
             }
-            _ => out.push((a, s)),
         }
+        v[n] = (a, s);
+        n += 1;
     }
-    *v = out;
+    v.truncate(n);
 }
 
 /// [`coalesce_sorted`] through one bitmap per allocation (W13): an MMA
@@ -1429,7 +1495,27 @@ fn coalesce_dense(v: &mut Spans) -> bool {
         return false;
     }
     ranges.sort_unstable_by_key(|r| r.0);
-    let mut bits: Vec<Vec<u64>> = ranges.iter().map(|r| vec![0u64; (r.2 - r.1).div_ceil(64) as usize]).collect();
+    thread_local! {
+        /// One reusable word buffer for every range's bitmap (W13: a fresh
+        /// bitmap per call was ~10 GB of allocation per Mega MoE medium run).
+        static BITS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut buf = BITS.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    buf.clear();
+    buf.resize(words as usize, 0);
+    let mut starts: [usize; 9] = [0; 9];
+    for (k, r) in ranges.iter().enumerate() {
+        starts[k + 1] = starts[k] + (r.2 - r.1).div_ceil(64) as usize;
+    }
+    let mut bits: Vec<&mut [u64]> = Vec::with_capacity(ranges.len());
+    {
+        let mut rest: &mut [u64] = &mut buf;
+        for k in 0..ranges.len() {
+            let (head, tail) = rest.split_at_mut(starts[k + 1] - starts[k]);
+            bits.push(head);
+            rest = tail;
+        }
+    }
     for &(a, s) in v.iter() {
         let k = ranges.iter().position(|r| r.0 == a).expect("range");
         let (b, lo) = (&mut bits[k], ranges[k].1);
@@ -1473,6 +1559,8 @@ fn coalesce_dense(v: &mut Spans) -> bool {
             v.push((r.0, ByteSpan::new(r.1 + st, end - st)));
         }
     }
+    drop(bits);
+    BITS.with(|b| *b.borrow_mut() = buf);
     true
 }
 

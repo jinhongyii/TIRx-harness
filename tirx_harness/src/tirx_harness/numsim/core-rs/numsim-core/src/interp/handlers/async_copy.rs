@@ -732,9 +732,9 @@ pub fn tma(ctx: &mut ExecCtx<'_>, args: &TmaArgs) -> HResult {
         };
         let (kind, payload) = match args.dir {
             TmaDir::Load => {
-                let mut src = Vec::new();
-                let mut dst = Vec::new();
-                let mut zf = Vec::new();
+                let mut src = Vec::with_capacity(ranks.len() * global.len());
+                let mut dst = Vec::with_capacity(ranks.len() * plan.smem.len());
+                let mut zf = Vec::with_capacity(ranks.len() * plan.smem_oob_fill.len());
                 for &r in &ranks {
                     let a = smem_in(ctx, r);
                     src.extend(global.iter().copied());

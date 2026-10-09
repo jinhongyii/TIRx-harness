@@ -337,6 +337,70 @@ Conclusions:
 - The loaded-host check (another 16-worker job running alongside) was not run, because the change does not land.
 - **Lever, if 32-worker Mega MoE matters:** a per-round handoff that avoids the condvar park/wake. For example, workers that stay on a partition across rounds until the serial phase. That is a scheduler design question, not a spin budget.
 
+### Mega MoE medium: allocation volume (landed) and sticky partition assignment (declined) (W13, 2026-10-08)
+
+**Allocation sites.** A counting global allocator with sampled backtraces (allocations of 8 KB or more) puts medium at 26.5 M allocations and 79 GB per run at e06f874, the same at 1 and 16 workers:
+
+| GB per run | Site | Owner |
+|---|---|---|
+| 11.5 | `Partition::fire_op` landing buffers | sched |
+| 9.6 | `coalesce_dense` bitmap, allocated on every call | sched |
+| 8.7 + 1.4 | `run_mma::note` span Vec growth | sched |
+| 5.6 + 3.6 + 1.9 + 1.7 | oplib block-scaled MMA gathers (`per_cta`, `gather_f8_rows`, `mxf8_scale_locations`, `Window::read`) | oplib |
+| 5.5 | interp (unresolved frames) | interp |
+| 4.2 | `log_async_writes` sort scratch | interp |
+| 3.6 | oplib `fma_f32_abt_increasing_k` buffers | oplib |
+| 2.3 | `zeroed_regs` | interp |
+| 2 x 2.1 | `tcgen_cp` src/dst Vec growth | interp |
+| 1.4 | TMA `push_span` Vec growth | interp |
+| 1.4 | `merge_runs` (`copy_spans`) | sched |
+
+**Allocator tcache test: no effect.** Raising glibc's per-thread cache (`tcache_max=65536`, `tcache_count=1024`) first looked like a win (medium, 16 workers, fixed assignment and pinned threads: 75.9 -> 50.1 s round CPU). On repeat the baseline itself measured 49.8-50.0 s, the same as with the larger cache, and at 32 workers or with dynamic assignment it never helped. What reproduces: with fixed assignment, round CPU is ~1.2x the 1-worker figure at 16 workers and 1.75-2x at 32; dynamic assignment adds ~20% CPU from frees of another thread's allocations.
+
+**Landed: reusable buffers** (`sched/partition.rs`, `interp/support.rs`, `interp/handlers/tcgen.rs`, `interp/handlers/async_copy.rs`, plus oplib scratch buffers in `numsim-oplib/src/fpenv.rs`, `numsim-oplib/src/mma/backend.rs`, `numsim-core/src/oplib/tc/mma/mod.rs`):
+- a thread-local span-list pool (`take_spans` / `give_spans`) for `run_mma`'s read/uninit/write lists and `fire_op`'s landing lists;
+- `coalesce_sorted` in place; `coalesce_dense` with one thread-local bitmap sliced per range;
+- `copy_spans` with pooled run lists (`merge_runs_into`) and a thread-local byte buffer;
+- `log_async_writes` skips the sort when already ordered;
+- `tcgen_cp` and the TMA load payload pre-size their Vecs;
+- oplib: `per_cta` starts from its first gather; thread-local scratch for the fma pre-MMA accumulator copy and for the transposed B. No numerics change.
+- Not changed: `zeroed_regs`, TMA `push_span`, `gather_f8_rows`, `mxf8_scale_locations`, `Window::read` (the remaining levers, mostly what keeps e24 at 1.41x).
+
+Allocated bytes per run (counting allocator, 16 workers; deterministic):
+
+| Case | e06f874 | sched/interp only | Landed (sched/interp + oplib) |
+|---|---|---|---|
+| medium | 79.29 GB, 26.5 M allocs | 34.61 GB, 21.4 M (2.29x) | 30.65 GB, 21.0 M (2.59x) |
+| e24 | 4.66 GB, 1.29 M allocs | 3.42 GB (1.36x) | 3.31 GB, 1.14 M (1.41x) |
+
+Wall / process CPU / voluntary switches, landed tree against e06f874, interleaved A/B, min of 5 (e24) or 4 (medium; 2 at 1 worker):
+
+| Case | Workers | e06f874 | Landed |
+|---|---|---|---|
+| e24 | 1 | 1.849 s | 1.701 s |
+| e24 | 16 | 0.402 s / 3.02 s / 10.7 k | 0.405 s / 2.98 s / 5.9 k |
+| e24 | 32 | 0.549 s / 5.77 s / 18.1 k | 0.488 s / 5.00 s / 12.7 k |
+| medium | 1 | 39.69 s | 34.39 s |
+| medium | 16 | 7.04 s / 66.7 s / 305 k | 6.10 s / 55.5 s / 141 k |
+| medium | 32 | 9.13 s / 125.1 s / 343 k | 7.19 s / 90.4 s / 180 k |
+
+Small kernels (sched/interp part, min of 3): flat or faster (recurrent_kda w16 0.123 -> 0.106 s, fp16_bf16_gemm w8 0.0425 -> 0.0394 s, kda_backward_packed w8 0.112 -> 0.107 s; radix_topk, rmsnorm, selective_state, gdn_decode within noise). Digests identical to e06f874 at 1/8/32 on the usual set plus medium.
+
+**Declined (negative result): sticky partition assignment.** Do not re-try without new data.
+- Design: pool participants get stable ids; `par_for_sticky` first claims the partitions the participant ran last round (`Partition::last_worker`), then steals the rest from a per-participant offset. Only the running thread changes; merge and serial-phase order stay in partition order, so digests were identical at 1/8/32 and `every_scenario_is_observer_and_worker_independent` passed.
+- Bar: voluntary switches (the cross-thread-free signal) down 5x and no wall regression. Measured on top of the buffers (interleaved, min of 5; wall / CPU / switches):
+
+| Case | Workers | Buffers only | Buffers + sticky |
+|---|---|---|---|
+| e24 | 16 | 0.391 s / 2.85 s / 6.8 k | 0.372 s / 2.58 s / 5.5 k |
+| e24 | 32 | 0.501 s / 4.97 s / 11.8 k | 0.454 s / 4.21 s / 10.2 k |
+| medium | 16 | 5.729 s / 51.4 s / 132 k | 5.481 s / 47.4 s / 126 k |
+| medium | 32 | 7.401 s / 90.5 s / 178 k | 5.917 s / 69.5 s / 167 k |
+
+- Switches fell only 5% more than with the buffers alone (which already halve them); the remaining switches are probably the per-round condvar park/wake, not cross-thread frees.
+- Its best criterion is medium at 32 workers, 1.25x wall (1.3x CPU), under the 1.5x rule. gdn_decode at 16 workers measured min 0.0278 s against 0.0261 s (spread overlapping, 1.7 ms kernel).
+- The prototype is kept as a patch in W13's scratchpad (`sticky_saved/sticky.patch`, plus the `last_worker` field).
+
 ### Partition lookahead (workers keep partitions across rounds): design and verdict (W13, 2026-10-08)
 
 **Question.** Mega MoE at 32 workers is slower than at 16 (medium: 8.15 s against 7.12 s). Would a scheduler where each worker keeps its partitions and runs them through several rounds help? That means no park/wake and no barrier between rounds, until a partition needs merged state.

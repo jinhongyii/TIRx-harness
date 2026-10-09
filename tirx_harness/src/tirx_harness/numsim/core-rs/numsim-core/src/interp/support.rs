@@ -871,7 +871,11 @@ pub fn log_async_writes(aux: &mut LaunchAux, arena: &Arena, items: &mut [(AllocI
     if aux.words.is_empty() {
         return;
     }
-    items.sort_by_key(|a| (a.0, window_key(a.1), a.2));
+    // The key determines the whole item (`window_key` is injective): an
+    // unstable sort gives the stable order without its scratch buffer (W13).
+    if !items.is_sorted_by_key(|a| (a.0, window_key(a.1), a.2)) {
+        items.sort_unstable_by_key(|a| (a.0, window_key(a.1), a.2));
+    }
     for &(alloc, _, ls) in items.iter() {
         aux.words.log_from_arena(arena, alloc, ls.span);
     }

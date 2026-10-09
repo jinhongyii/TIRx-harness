@@ -173,8 +173,9 @@ impl Io<'_> {
         cta_group: usize,
         mut gather: impl FnMut(usize) -> LibResult<Vec<T>>,
     ) -> OpResult<Vec<T>> {
-        let mut values = Vec::new();
-        for cta in 0..cta_group {
+        // One CTA: its gather is the result (no second copy).
+        let mut values = self.lib(gather(0))?;
+        for cta in 1..cta_group {
             values.extend(self.lib(gather(cta))?);
         }
         Ok(values)

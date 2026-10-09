@@ -86,7 +86,12 @@ pub fn mma_f32_abt_increasing_k(
     // contiguous. Advancing all columns together for each increasing K keeps
     // every element's exact FMA chain unchanged while allowing LLVM to
     // vectorize those independent chains.
-    let mut b_transposed = vec![0.0; b_len];
+    thread_local! {
+        static BT: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut b_transposed = BT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    b_transposed.clear();
+    b_transposed.resize(b_len, 0.0);
     for col in 0..n {
         for inner in 0..k {
             b_transposed[inner * n + col] = b_values[col * k + inner];
@@ -95,8 +100,9 @@ pub fn mma_f32_abt_increasing_k(
     let mut output = input_d
         .map(|(values, scale)| values.iter().map(|&value| value * scale).collect())
         .unwrap_or_else(|| vec![0.0_f32; output_len]);
-    fpenv::fma_f32_abt_increasing_k(m, n, k, a_values, &b_transposed, &mut output)
-        .map_err(|error| OpError::message(format!("raw TCGEN MMA SIMD shape error: {error}")))?;
+    let r = fpenv::fma_f32_abt_increasing_k(m, n, k, a_values, &b_transposed, &mut output);
+    BT.with(|b| *b.borrow_mut() = b_transposed);
+    r.map_err(|error| OpError::message(format!("raw TCGEN MMA SIMD shape error: {error}")))?;
     Ok(output)
 }
 

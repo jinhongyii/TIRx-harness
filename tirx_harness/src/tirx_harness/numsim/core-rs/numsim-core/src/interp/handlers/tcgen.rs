@@ -912,8 +912,9 @@ pub fn tcgen_cp(ctx: &mut ExecCtx<'_>, args: TcgenCpArgs) -> HResult {
         } else {
             vec![ctx.cta.rank_in_cluster as usize]
         };
-        let mut src = Vec::new();
-        let mut dst = Vec::new();
+        let n = ranks.len() * srcs.len().min(cells.len());
+        let mut src = Vec::with_capacity(n);
+        let mut dst = Vec::with_capacity(n);
         for r in ranks {
             let (Some(&sm), Some(&tm)) = (ctx.cta.cluster_smem.get(r), ctx.cta.cluster_tmem.get(r)) else {
                 return Err(ctx.error(ExecErrorKind::BadAddress, "tcgen05.cp peer CTA outside the cluster"));
