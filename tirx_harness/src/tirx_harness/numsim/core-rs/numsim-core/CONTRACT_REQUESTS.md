@@ -3383,6 +3383,8 @@ Found while reviewing W16's child-side `DeclareWord` (patch 02). The bug is in t
   - (c) Make a first-use declaration of a global word end the round's partition parallelism for that word: mark it so that other partitions' writes that phase go through the serial phase.
   - (d) Declare at first use with history starting at the *end* of the declaring phase, so writes in the declaring round count as pre-declaration. Racecheck then also has to start the word's history at the merge point, not at the `DeclareWord` event; that is a contract change.
 
+**Status (W6, 2026-10-09): part 1 landed in a39756d.** The first-use serial points change the schedule instance: on mega_moe medium (16 workers) rounds go 2,391 → 2,400 with identical outputs, and racecheck still reports 1,508 findings with an identical (kind, anchor) multiset. 916 findings differ only in representative witness or occurrence counts, so no behaviour-delta row is needed, and payload-hash baselines for e24 and medium are refreshed at ≥ a39756d.
+
 ### W6-P2 part 2 (for W5): the first-use declaration value owes the latest write's edge
 
 - **The engine fix alone is not enough.** W2's proposal (part 1) makes a first-use declaration a serial point, so other partitions' same-round writes precede the `DeclareWord`.

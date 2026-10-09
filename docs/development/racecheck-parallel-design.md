@@ -1166,6 +1166,8 @@ with a note line.
 The rule was: at least 1.5x over serial on e24 at 16 workers, and no 1-worker
 regression beyond noise. It is met.
 
+**Status: W6-P2 part 1 (a39756d).** The first-use serial points change the schedule instance: on mega_moe medium (16 workers) rounds go 2,391 → 2,400 with identical outputs, and racecheck still reports 1,508 findings with an identical (kind, anchor) multiset. 916 findings differ only in representative witness or occurrence counts, so no behaviour-delta row is needed, and payload-hash baselines for e24 and medium are refreshed at ≥ a39756d.
+
 ## 17. Token re-attribution of completed copies (W5; reviewed and signed off by W6, 2026-10-09)
 
 Goal: free the async slot of a completed copy as soon as its completion has
