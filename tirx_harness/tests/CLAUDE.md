@@ -2,18 +2,12 @@
 
 ## Running the Test Suites
 
-A fresh worktree first needs the Rust frontend dependency:
-
-```bash
-git submodule update --init thirdparty/tvm-rust-ext  # repo root
-```
-
 Tests load canonical kernels from the environment's installed `tirx-kernels`
-package. Then from `tirx_harness/`:
+package. From `tirx_harness/`:
 
 ```bash
 python -m pip install --no-deps --no-build-isolation ..
-(cd src/tirx_harness/numsim/engine-rs && cargo build --all-features)  # engine changes
+bash src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh  # core-rs changes; see dev-loop.md for a private build
 python -m pytest -q -n 16 --dist=worksteal
 ```
 
@@ -27,6 +21,35 @@ argument. To drop them from a full run, deselect by marker instead:
 ```bash
 python -m pytest -q -n 16 --dist=worksteal -m "not numsim_gpu"
 ```
+
+## Where Tests Live
+
+- `src/tirx_harness/numsim/core-rs/numsim-core/tests/` (Rust): scenarios from hand-built `Program`s
+  and contract events, including the Racecheck/Synccheck legacy ports.
+- `tests/numsim/v2/`: lowering tests that assert `Program` contents
+  (`test_lowering_*.py`), plus
+  - `checkers/`: kernel-level Racecheck/Synccheck tests that contract events
+    cannot express;
+  - `ports/`: v2 copies of legacy public-API tests, each docstring citing its
+    legacy test and any delta row;
+  - `tile_forms/`: tile-op kernels that TVM's dispatch rejects.
+- `tests/conformance/`: every canonical corpus case in three modes against
+  `snapshots/`, the v2 oracle (a change cites its delta row).
+- `tests/perf/`: relative performance baselines (`performance` marker).
+
+The legacy tests these replaced, and the retirement ledger and tools, were
+deleted in `79f04eb`; `docs/development/test-migration.md` records the history.
+
+## Corpus Inputs Must Be Host-Independent
+
+Snapshots hash outputs bit for bit, so a corpus case's **inputs** must not
+depend on the host's BLAS kernel or ISA dispatch. Never feed a float result of
+`np.matmul`/`@`/`np.dot`/`einsum` (OpenBLAS picks its kernel per CPU) into a
+kernel argument. Compute such inputs with float64 elementwise products and
+`np.sum`, and round to the input dtype once; BLAS is fine for references,
+which are compared within tolerance.
+`tests/numsim/corpus/test_input_host_independence.py` checks
+`flash_attention_backward_sm100` under `OPENBLAS_CORETYPE=Sandybridge`.
 
 ## Judging a Full-Suite Run
 

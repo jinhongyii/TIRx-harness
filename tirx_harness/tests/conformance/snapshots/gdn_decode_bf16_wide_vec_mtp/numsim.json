@@ -1,0 +1,24 @@
+{
+ "case": "gdn_decode_bf16_wide_vec_mtp",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "97c943c24b4aa77b6637247269d4889885d6e19d8a4b373eda2b7e9162797c5d",
+   "shape": [
+    8192
+   ]
+  },
+  "state": {
+   "dtype": "uint16",
+   "sha256": "3323602943b72622809b3a61023c801bbf5b68b027dcddb559aad0906b073b67",
+   "shape": [
+    524288
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

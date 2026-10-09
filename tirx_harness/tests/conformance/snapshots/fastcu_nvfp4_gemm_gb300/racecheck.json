@@ -1,0 +1,34 @@
+{
+ "case": "fastcu_nvfp4_gemm_gb300",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/fastcu/nvfp4_gemm_gb300.py:102:1-102:53",
+      "tirx_kernels/ported/fastcu/nvfp4_gemm_gb300.py:846:1-846:84"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/fastcu/nvfp4_gemm_gb300.py:110:1-110:70",
+      "tirx_kernels/ported/fastcu/nvfp4_gemm_gb300.py:907:1-907:76"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    }
+   ],
+   "verdict": "error"
+  }
+ ],
+ "schema": 4
+}

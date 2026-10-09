@@ -1,0 +1,24 @@
+{
+ "case": "msa_sparse_atten_fwd_nvfp4_kv_sm100",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "lse_partial": {
+   "dtype": "float32",
+   "sha256": "c3557e0354b6b60ccd73997c6ef780c8ba12ad7bac883c7f129fee553e24eb78",
+   "shape": [
+    1
+   ]
+  },
+  "o_partial": {
+   "dtype": "float32",
+   "sha256": "7790808cbb6a8edb971e3e6445933fbbd35b4e7a144175ebd3a5e278df2b0506",
+   "shape": [
+    128
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

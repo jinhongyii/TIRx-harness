@@ -1,0 +1,24 @@
+{
+ "case": "kda_decode_multishape",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "final_state": {
+   "dtype": "uint16",
+   "sha256": "d28cced757422bc5797f8bd188115a4559c43ae80c2a6411cfe28c25286adcbe",
+   "shape": [
+    262144
+   ]
+  },
+  "output": {
+   "dtype": "uint16",
+   "sha256": "d5fbb74ebc50cd92c121842b457a4e88691915fe970e94fa22966549adf16bb7",
+   "shape": [
+    2048
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

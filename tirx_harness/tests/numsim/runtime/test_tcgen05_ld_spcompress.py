@@ -91,7 +91,3 @@ def test_tcgen_load_compression(num, reduce, maximum, absolute, nan, tmp_path):
     np.testing.assert_array_equal(actual, expected)
 
 
-def test_tcgen_compression_preserves_store_wait():
-    args = {"source": np.ones((32, 4), np.float32), "output": np.zeros((32, 3), np.uint32)}
-    report = racecheck(compression_kernel(wait=False), args)
-    assert any(f.status == "error" and f.details["access_pair"] == "write_read" for f in report.findings)

@@ -1,0 +1,24 @@
+{
+ "case": "sm100_fp8_fp4_mega_moe",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "cumulative_local_expert_recv_stats": {
+   "dtype": "int32",
+   "sha256": "69dde876033dc61cfac1922b6b25ddad782c52034041eb39335b4dd56ac1ee77",
+   "shape": [
+    2
+   ]
+  },
+  "y": {
+   "dtype": "uint16",
+   "sha256": "8e3844bb4409b108a34a4f054dc63a254b9bb58b70a61e9c872c9352e869cd2b",
+   "shape": [
+    512
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

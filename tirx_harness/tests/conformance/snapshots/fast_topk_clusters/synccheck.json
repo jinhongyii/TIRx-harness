@@ -1,0 +1,11 @@
+{
+ "case": "fast_topk_clusters",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

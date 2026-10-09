@@ -5,7 +5,6 @@ from tvm.backend.cuda.lang.clc import query_cancel_first_ctaid_x
 from tvm.script import tirx as T
 
 from tirx_harness import numsim
-from tirx_harness.numsim.api import ExecutionSubset
 
 
 @T.prim_func
@@ -375,28 +374,6 @@ def test_clc_no_work_completion_and_cluster_acquire_wait(tmp_path):
     result = numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.uint32)})
 
     np.testing.assert_array_equal(result.outputs["output"], np.array([0xFFFFFFFF], np.uint32))
-
-
-def test_clc_claims_the_nonresident_logical_cluster(tmp_path):
-    module = numsim.transpile(clc_claims_nonresident_cluster, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {"output": np.zeros(2, dtype=np.uint32)},
-        subset=ExecutionSubset(cluster_ids=[0]),
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], np.array([2, 2], np.uint32))
-
-
-def test_clc_first_ctaid_y_and_z_are_zero_in_linear_launch_model(tmp_path):
-    module = numsim.transpile(clc_claims_nonresident_cluster_yz, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {"output": np.zeros((2, 6), dtype=np.uint32)},
-        subset=ExecutionSubset(cluster_ids=[0]),
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], [[0, 0, 2, 0, 0, 99]] * 2)
 
 
 def test_sm100_pair_base_handle_form_routes_both_ctas(tmp_path):

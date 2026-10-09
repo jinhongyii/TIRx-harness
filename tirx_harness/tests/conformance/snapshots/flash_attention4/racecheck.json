@@ -1,0 +1,38 @@
+{
+ "case": "flash_attention4",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention4.py:473:1-473:83",
+      "tirx_kernels/ported/flashattention/flash_attention4.py:476:1-476:85"
+     ],
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/flashattention/flash_attention4.py:473:1-473:83",
+      "tirx_kernels/ported/flashattention/flash_attention4.py:851:1-851:50"
+     ],
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

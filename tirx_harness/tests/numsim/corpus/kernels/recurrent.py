@@ -197,7 +197,13 @@ def _tensor_map(
 
 
 def _agent_kda_tensor_map(
-    base: np.ndarray, seq_len: int, num_heads: int, *, beta: bool = False, rows: int = 64
+    base: np.ndarray,
+    seq_len: int,
+    num_heads: int,
+    *,
+    beta: bool = False,
+    rows: int = 64,
+    slabs: int = 2,
 ) -> np.ndarray:
     import torch
 
@@ -231,7 +237,7 @@ def _agent_kda_tensor_map(
         if beta:
             encoder(torch.from_numpy(base), seq_len, num_heads)
         else:
-            encoder(torch.from_numpy(base), seq_len, num_heads, rows=rows)
+            encoder(torch.from_numpy(base), seq_len, num_heads, rows=rows, slabs=slabs)
     [descriptor] = descriptors
     return descriptor
 
@@ -283,11 +289,15 @@ def prepare_native_kda_forward_case() -> NumSimCase:
     # snapshots reverse its innermost-first (64, T, 2H) dimensions.
     expected_output = np.zeros((2 * active_heads, seq_len, 64), dtype=np.float32)
     expected_output[0, :, 0] = expected_scalar
+    schedule = native_kda_forward.packed_schedule(
+        (0, seq_lens[0], seq_len), num_heads, num_heads, False
+    )
     output_map = _agent_kda_tensor_map(output_binding, seq_len, num_heads, rows=32)
     beta_map = _agent_kda_tensor_map(beta.reshape(-1), seq_len, num_heads, beta=True)
     args = {
-        "q_map": _agent_kda_tensor_map(qkvg_binding, seq_len, num_heads),
-        "k_map": _agent_kda_tensor_map(qkvg_binding, seq_len, num_heads),
+        # Box shapes as the production fused_setup encodes them: q/k (64, 32, 1).
+        "q_map": _agent_kda_tensor_map(qkvg_binding, seq_len, num_heads, rows=32, slabs=1),
+        "k_map": _agent_kda_tensor_map(qkvg_binding, seq_len, num_heads, rows=32, slabs=1),
         "v_map": _agent_kda_tensor_map(qkvg_binding, seq_len, num_heads),
         "g_map": _agent_kda_tensor_map(qkvg_binding, seq_len, num_heads),
         "beta_map": beta_map,
@@ -299,15 +309,21 @@ def prepare_native_kda_forward_case() -> NumSimCase:
         "final_state": final_state.reshape(-1),
         "hand": np.zeros(num_heads * _HEAD_DIM * _HEAD_DIM, dtype=np.float32),
         "flags": np.zeros(num_heads + 1, dtype=np.int32),
-        "cu": np.array([0, seq_lens[0], seq_len], dtype=np.int64),
-        "nseq": np.int32(len(seq_lens)),
+        # The kernel walks a host-built per-CTA item table (``packed_schedule``
+        # in tirx_kernels.kda); one CTA per head, as the schedule below runs.
+        "items": np.frombuffer(schedule.words, dtype=np.uint32).copy(),
+        "item_counts": np.asarray(schedule.counts, dtype=np.int32),
         "scale": np.float32(1.0 / math.sqrt(_HEAD_DIM)),
     }
     return NumSimCase(
         # The public packed dispatch returns one PrimFunc. Run its full 64-CTA
         # schedule so each CTA owns one complete head across both sequences.
+        # Same configuration get_kernel(num_heads=64, seq_lens=(64, 64)) picks,
+        # with the item-table width of this 64-CTA schedule.
         kernel=_specialize_runtime_scalars(
-            native_kda_forward.get_kernel(num_heads=num_heads, seq_lens=seq_lens),
+            native_kda_forward.build_kernel(
+                num_heads, intra_unroll=False, bf16_handoff=False, max_items=schedule.max_items
+            ).func,
             {"num_ctas": num_heads},
         ),
         args=args,

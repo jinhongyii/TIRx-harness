@@ -17,7 +17,7 @@ listed field names as keyword arguments.
 including output storage. `outputs` selects the result buffers. `reference`
 is a zero-argument callable returning a dictionary of expected outputs;
 `comparisons` maps output names to comparison specifications. Pass the case to
-{py:func}`~tirx_harness.numsim.run_case`.
+{py:func}`~tirx_harness.numsim.v2.api.run_case`.
 
 ```{eval-rst}
 .. autoapiclass:: tirx_harness.numsim.ComparisonSpec
@@ -45,7 +45,8 @@ be nonempty and have matching shapes.
 A tensor map describes the storage and tile shape for a tensor-memory transfer.
 Use `TensorMap(...).numpy()` to create a simulator descriptor, then bind that
 array under the kernel's tensor-map parameter name. This descriptor is for
-CPU simulation.
+CPU simulation. The descriptor addresses its base array; select the tensor
+map as an output to receive that array back in the map's logical layout.
 
 ```{eval-rst}
 .. autoapiclass:: tirx_harness.numsim.TensorMap
@@ -70,26 +71,38 @@ coordinates use width, height, and depth order (W/H/D).
 
 ## Launch selection
 
-Most callers execute the full launch. To select complete clusters or thread
-blocks, import `ExecutionSubset` from `tirx_harness.numsim.api` and pass it as
-`subset` to `Engine.run`. A cooperative thread array (CTA) is a thread block.
-For a multi-kernel launch, use a mapping from phase indices to selections.
+Most callers execute the full launch. To select complete clusters, import
+`ExecutionSubset` from `tirx_harness.numsim.v2.api` and pass it as `subset` to
+`Engine.run` or a checker phase; only the selected clusters run. A cooperative
+thread array (CTA) is a thread block. `cluster_ids` are linear cluster ids
+(x fastest). `cta_ids` are flattened global CTA ids and must cover whole
+clusters; they need a static grid, and a partial cluster raises `InputError`.
+With both, the run uses their intersection. A run that skips part of the
+launch cannot certify it, so checker verdicts on a subset are at least
+`incomplete`: the payload's `analysis_scope` is `{"kind": "subset", ...}` with
+the selected and total warp counts.
 
 ```{eval-rst}
-.. autoapiclass:: tirx_harness.numsim.api.ExecutionSubset
+.. autoapiclass:: tirx_harness.numsim.v2.api.ExecutionSubset
    :members: cluster_ids, cta_ids
    :undoc-members:
 ```
 
 ```{eval-rst}
-.. autoapidata:: tirx_harness.numsim.api.ExecutionSubsetSelection
+.. autoapidata:: tirx_harness.numsim.v2.api.ExecutionSubsetSelection
 ```
 
 This type alias accepts an `ExecutionSubset` or a mapping from integer phase
-indices to `ExecutionSubset` objects.
+indices to `ExecutionSubset` objects. One engine run serves every launch of a
+module, so the mapping must name every launch with the same subset
+(numsim-behaviour-deltas H6); `Engine.run` on a multi-kernel module needs the
+mapping form, since a bare subset is not broadcast.
 
 ```{eval-rst}
 .. autoapiclass:: tirx_harness.numsim.ExecutionAssumptions
    :members: external_grid_dependencies_satisfied
    :undoc-members:
 ```
+
+The redesigned engine accepts `ExecutionAssumptions` and ignores it: grid
+dependencies on an earlier launch are satisfied at the launch boundary.

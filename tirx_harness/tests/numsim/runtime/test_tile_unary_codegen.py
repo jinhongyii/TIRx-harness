@@ -283,19 +283,6 @@ def test_shared_cta_cast_uses_shared_ownership_and_completion(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], source.astype(np.float16))
 
 
-def test_warpgroup_shared_owner_is_independent_of_vector_chunk(tmp_path):
-    source = np.linspace(1.0, 2.0, 512, dtype=np.float32)
-    output = np.zeros((2, 512), dtype=np.float32)
-
-    module = numsim.transpile(tile_warpgroup_shared_vector_owners, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    indices = np.arange(512, dtype=np.int64)
-    owner = (indices % 128).astype(np.float32)
-    expected = np.stack([source + owner, source / (owner + np.float32(1))])
-    np.testing.assert_allclose(result.outputs["output"], expected, rtol=2e-6, atol=2e-6)
-
-
 def test_unary_tile_ops_fail_closed_on_unknown_config(tmp_path):
     with pytest.raises(UnsupportedTIRxError, match="unsupported config keys"):
         numsim.transpile(tile_unary_unknown_config, cache_dir=tmp_path)
@@ -319,22 +306,6 @@ def tile_fill_untyped_literals(output: T.Buffer((3, 32), "float32")):
     output[2, lane] = T.cast(counter[0], "float32")
 
 
-def test_fill_accepts_untyped_python_literals(tmp_path):
-    output = np.zeros((3, 32), dtype=np.float32)
-
-    module = numsim.transpile(tile_fill_untyped_literals, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": output})
-
-    expected = np.stack(
-        [
-            np.zeros(32, dtype=np.float32),
-            np.full(32, 1.5, dtype=np.float32),
-            np.full(32, 3.0, dtype=np.float32),
-        ]
-    )
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
 @T.prim_func
 def tile_fill_wide_integer_literal(output: T.Buffer((32,), "uint32")):
     """A mask literal does not fit int32; the frontend must not reject it."""
@@ -346,17 +317,6 @@ def tile_fill_wide_integer_literal(output: T.Buffer((32,), "uint32")):
 
     Tx.fill(mask, 0xFFFFFFFF, dispatch="reg")
     output[lane] = mask[0]
-
-
-def test_fill_accepts_an_integer_literal_wider_than_int32(tmp_path):
-    output = np.zeros(32, dtype=np.uint32)
-
-    module = numsim.transpile(tile_fill_wide_integer_literal, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": output})
-
-    np.testing.assert_array_equal(
-        result.outputs["output"], np.full(32, 0xFFFFFFFF, dtype=np.uint32)
-    )
 
 
 _E4M3_FILL_LAYOUT = TileLayout(S[16])

@@ -1,0 +1,11 @@
+{
+ "case": "radix_topk_single_cta",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

@@ -1,0 +1,24 @@
+{
+ "case": "msa_sparse_atten_fwd_sm100",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "lse_partial": {
+   "dtype": "float32",
+   "sha256": "f270e3e8d466bfbe2ed16fa6cdf86dd835551619fff62cd6b77c9449b2770e65",
+   "shape": [
+    16
+   ]
+  },
+  "o_partial": {
+   "dtype": "float32",
+   "sha256": "9ac6b7bf041f8dcd0888ba8adc5519f926c9faa289b7ce6bdb788bae204a9021",
+   "shape": [
+    2048
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

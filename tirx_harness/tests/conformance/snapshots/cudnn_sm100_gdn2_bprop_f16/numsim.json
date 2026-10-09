@@ -1,0 +1,52 @@
+{
+ "case": "cudnn_sm100_gdn2_bprop_f16",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "dbeta": {
+   "dtype": "uint8",
+   "sha256": "3e62521bbd0e5a7b224c13b996478934c13ca9e642ac317fa777eda1cbedfea5",
+   "shape": [
+    256
+   ]
+  },
+  "dgate": {
+   "dtype": "float32",
+   "sha256": "d43f5f7f0ff194f078096ca537ac9d5cec4283257549f7942fcfb5cbc797e3fe",
+   "shape": [
+    128
+   ]
+  },
+  "dk": {
+   "dtype": "uint8",
+   "sha256": "f79e323fa3064222d09e0161af521272d5aedf361bf01eae1d47cda5718b24cf",
+   "shape": [
+    256
+   ]
+  },
+  "dq": {
+   "dtype": "uint8",
+   "sha256": "f79e323fa3064222d09e0161af521272d5aedf361bf01eae1d47cda5718b24cf",
+   "shape": [
+    256
+   ]
+  },
+  "dv": {
+   "dtype": "uint8",
+   "sha256": "a2e7574e4c750d197443b78220c9addbdaa48e2f3423d7a52700639dd8c3a80f",
+   "shape": [
+    256
+   ]
+  },
+  "dw": {
+   "dtype": "uint8",
+   "sha256": "7a50d53b2eee6557ebcda45f783cec8827cb641a5b8c27cffca2ac0a8aa51af9",
+   "shape": [
+    256
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

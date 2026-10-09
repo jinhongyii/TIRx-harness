@@ -1,0 +1,24 @@
+{
+ "case": "cudnn_sm100_bsa_forward_combine_blk64",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/cudnn/bsa/block_sparse_attention_forward_combine_sm100_blk64.py:446:1-446:41"
+     ],
+     "bytes": {
+      "shared": "2688-2944,6784-7040"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

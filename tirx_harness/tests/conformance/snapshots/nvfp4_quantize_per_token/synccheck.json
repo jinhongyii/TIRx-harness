@@ -1,0 +1,11 @@
+{
+ "case": "nvfp4_quantize_per_token",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

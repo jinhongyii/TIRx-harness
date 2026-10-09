@@ -1,0 +1,31 @@
+{
+ "case": "cudnn_sm100_flex_attention_backward",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "dk_output": {
+   "dtype": "uint16",
+   "sha256": "668510e053a2ec60afa8d188bd4ffe4bfe79f3712836959f4fcb0380499f8723",
+   "shape": [
+    8192
+   ]
+  },
+  "dv_output": {
+   "dtype": "uint16",
+   "sha256": "42f399a857f27015337a27e3943f1e7efb3931cd9704a67347eae8354c53bbc3",
+   "shape": [
+    8192
+   ]
+  },
+  "workspace": {
+   "dtype": "float32",
+   "sha256": "a8bf4c1cf2fac3fac379945520c93aeea4efd0f5b88721f19caa58d3910967d0",
+   "shape": [
+    24832
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

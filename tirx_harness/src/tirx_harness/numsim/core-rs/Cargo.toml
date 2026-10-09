@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["numsim-types", "numsim-core", "numsim-py", "numsim-oplib", "numsim-sync-ref"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
+pyo3 = { version = "=0.29.0" }
+# Per-thread heaps for the Python extension (numsim-py `mimalloc`).
+# `local_dynamic_tls`: the extension is dlopen'ed, and mimalloc's default initial-exec
+# TLS marks it STATIC_TLS, which can fail to load on older glibc or after many
+# libraries (W8, build_wheels check at 1581dfe).
+mimalloc = { version = "=0.1.52", default-features = false, features = ["local_dynamic_tls"] }
+
+[profile.release]
+debug = 1
+# Thin cross-crate LTO (W4, 2026-10-08; numbers in docs/development/dev-loop.md):
+# rmsnorm ~13% faster end to end, no measurable build-time cost. codegen-units = 1
+# was rejected: 3x the incremental release build for no further gain.
+lto = "thin"
+
+# Criterion benches keep the pre-LTO codegen (bench inherits release), so their
+# recorded baselines stay comparable.
+[profile.bench]
+lto = false

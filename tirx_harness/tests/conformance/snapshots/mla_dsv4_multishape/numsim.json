@@ -1,0 +1,17 @@
+{
+ "case": "mla_dsv4_multishape",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "b66e573c3d6e9c831547e3850a952dbb473ce3acae06719d868ca5fa44504179",
+   "shape": [
+    32768
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

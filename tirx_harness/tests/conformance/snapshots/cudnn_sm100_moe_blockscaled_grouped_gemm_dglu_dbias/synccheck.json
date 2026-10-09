@@ -1,0 +1,11 @@
+{
+ "case": "cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

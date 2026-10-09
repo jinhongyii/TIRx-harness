@@ -1,0 +1,77 @@
+{
+ "case": "sparse_flashmla_prefill_head128_phase1",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:109:1-109:30",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:808:1-808:46"
+     ],
+     "bytes": {
+      "shared": "163840-180224"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_proxy_bridge",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:1108:1-1108:64",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:1157:1-1157:55"
+     ],
+     "bytes": {
+      "shared": "25088-25104,32768-32784"
+     },
+     "category": "advisories",
+     "kind": "cross_cta_async_order",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:1393:1-1393:70"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:1473:1-1473:50",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:720:1-720:39"
+     ],
+     "bytes": {
+      "shared": "180224-180228"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:1473:1-1473:50",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_phase1.py:724:1-724:39"
+     ],
+     "bytes": {
+      "shared": "180228-180232"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "error"
+  }
+ ],
+ "schema": 4
+}

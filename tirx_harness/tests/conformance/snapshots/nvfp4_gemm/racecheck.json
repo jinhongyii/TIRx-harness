@@ -1,0 +1,23 @@
+{
+ "case": "nvfp4_gemm",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/gemm/nvfp4_gemm.py:841:1-841:85",
+      "tirx_kernels/gemm/nvfp4_gemm.py:842:1-842:81"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    }
+   ],
+   "verdict": "error"
+  }
+ ],
+ "schema": 4
+}

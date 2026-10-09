@@ -1,0 +1,115 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUST_TOOLCHAIN: '1.89.0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust core (core-rs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: tirx_harness/src/tirx_harness/numsim/core-rs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # numsim-py's dev-dependencies embed CPython through pyo3.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+      # A hung test fails fast instead of eating the 60-minute job.
+      - name: Test the workspace
+        run: timeout 1800 cargo test --workspace
+      # Every criterion bench guards a kept optimization: build them, do not run them.
+      - name: Build the benches
+        run: cargo bench --workspace --no-run
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+  snapshot-deltas:
+    name: Snapshot changes cite a delta row
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Check conformance snapshot commits
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE=HEAD~1
+          fi
+          python scripts/numsim-v2/check_snapshot_deltas.py --base "$BASE" --head HEAD
+
+  python:
+    name: Python suite (v2 oracle)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      NUMSIM_CACHE_DIR: ${{ github.workspace }}/.local/numsim-cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      # Canonical tirx-kernels modules import torch at module scope.
+      - name: Install the locked environment
+        run: uv sync --locked --python 3.12 --extra test --group benchmark
+      # Until the package build compiles numsim_core_py itself, install the
+      # extension the dev way (path follows wherever step 5 puts numsim-py).
+      - name: Build the numsim_core_py extension
+        env:
+          PY: ${{ github.workspace }}/.venv/bin/python
+        run: bash tirx_harness/src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh
+      # Host fingerprint for cross-host conformance diffs (CPU ISA, numpy's
+      # dispatched SIMD targets, prepared-input digests of a sensitive case);
+      # compare with a dev host's output of the same commands.
+      - name: Host and input fingerprint
+        working-directory: tirx_harness
+        run: |
+          lscpu | grep -E '^(Model name|Flags):'
+          ../.venv/bin/python -c "import numpy; numpy.show_runtime()"
+          ../.venv/bin/python ../scripts/numsim-v2/case_input_digest.py
+      # No NUMSIM_IMPL: v2 is the only implementation and the conformance oracle.
+      # GPU microtests need a device; performance markers run on dedicated hosts.
+      - name: Run the test suite
+        working-directory: tirx_harness
+        run: |
+          ../.venv/bin/python -m pytest -q -n auto --dist=worksteal \
+            -m "not numsim_gpu and not performance"

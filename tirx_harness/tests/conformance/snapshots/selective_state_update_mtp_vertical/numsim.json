@@ -1,0 +1,32 @@
+{
+ "case": "selective_state_update_mtp_vertical",
+ "diagnostics": [
+  {
+   "anchors": [],
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "register",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "99a72dce5570fedd5c6d540374d5849e0e4ebc767b14e2785c3bc5376f4d3203",
+   "shape": [
+    128
+   ]
+  },
+  "state": {
+   "dtype": "uint16",
+   "sha256": "3e703309d83b54e5a2a6529d9a30051334650c33f8fe4eb69b3be9a392db7098",
+   "shape": [
+    4096
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "review"
+}

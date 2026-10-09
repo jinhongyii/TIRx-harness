@@ -14,7 +14,9 @@ integrating checks, simulation, or generated-code inspection into your own loop.
 | Extract generated code and compiler resource information | [Generated-code inspection](inspection.md) |
 
 The reference focuses on callable tools and the objects their callers supply
-or receive.
+or receive. NumSim and the checkers are documented for the redesigned engine,
+whose implementation lives in `tirx_harness.numsim.v2` until the migration
+completes. Generated pages link to that module path.
 
 ```{toctree}
 :maxdepth: 1

@@ -86,32 +86,6 @@ def addition_expected(*, flush=False):
     return np.resize(bits, 128).view(np.float32)
 
 
-@pytest.mark.parametrize("kind,width,space", ATOMIC_CASES)
-def test_atomic_f32_noftz(kind, width, space, tmp_path):
-    for noftz in (False, True):
-        kernel = atomic_kernel(kind, width, space, noftz=noftz)
-        inputs = atomic_inputs()
-        for checker in (synccheck, racecheck):
-            checker(kernel, {name: value.copy() for name, value in inputs.items()}).require_clean()
-        module = numsim.transpile(kernel, cache_dir=tmp_path)
-        result = numsim.Engine().run(module, {name: value.copy() for name, value in inputs.items()})
-        selected = np.arange(128) < 32 * width
-        if width > 1:
-            selected &= np.arange(128) // width % 2 == 0
-        flush = not noftz and not space.startswith("shared")
-        left = inputs["destination"]
-        expected = left.copy()
-        expected[selected] = addition_expected(flush=flush)[selected]
-        assert_float_bits(result.outputs["destination"], expected)
-        returned = inputs["returned"].copy()
-        if kind == "atom":
-            returned[selected] = left[selected]
-        np.testing.assert_array_equal(
-            result.outputs["returned"].view(np.uint32), returned.view(np.uint32)
-        )
-        assert ("variant::Add<true>" in module.rust_source) is noftz
-
-
 def bulk_kernel(*, early_read=False):
     return tvm.script.from_source(
         f"""

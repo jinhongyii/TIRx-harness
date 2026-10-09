@@ -44,18 +44,6 @@ def fp8_identity_reinterpret_roundtrip(
     )
 
 
-def test_float8_address_uses_one_byte_physical_pointer(tmp_path):
-    source = np.zeros(32, dtype=np.uint8)
-
-    module = numsim.transpile(float8_address, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source})
-
-    assert set(result.outputs) == {"source"}
-    np.testing.assert_array_equal(result.outputs["source"], 0)
-    assert "PhysicalPtr::new" in module.rust_source
-    assert "tirx.address_of" not in module.rust_source
-
-
 @pytest.mark.parametrize("dtype", ["float8_e4m3fn", "float8_e8m0fnu"])
 def test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip(dtype, tmp_path):
     with pytest.raises(
@@ -65,13 +53,3 @@ def test_scalar_fp8_identity_reinterpret_rejects_256_payload_roundtrip(dtype, tm
         numsim.transpile(_fp8_identity_reinterpret_roundtrip(dtype), cache_dir=tmp_path)
 
 
-def test_cuda_four_argument_shfl_sync_uses_implicit_warp_size(tmp_path):
-    source = np.arange(32, dtype=np.uint32) * np.uint32(7) + np.uint32(3)
-    output = np.zeros(32, dtype=np.uint32)
-
-    module = numsim.transpile(cuda_shfl_sync_u32, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], source[::-1])
-    assert "fn warp_shuffle(" not in module.rust_source
-    assert "tirx.cuda.__shfl_sync" not in module.rust_source

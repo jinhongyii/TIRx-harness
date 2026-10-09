@@ -1,0 +1,11 @@
+{
+ "case": "cudnn_sm100_flex_attention_backward",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

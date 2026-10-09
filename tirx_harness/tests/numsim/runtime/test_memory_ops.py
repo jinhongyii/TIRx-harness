@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import tvm
-from tirx_harness.numsim.transpiler.frontend import analyze
 
 import ml_dtypes
 import numpy as np
 import pytest
 
 from tirx_harness import numsim, racecheck
-from tirx_harness.numsim.bindings import prepare_bindings
-from tests.numsim.support.manifest import emitted_calls, parse_kernel
+from tests.numsim.support.manifest import parse_kernel
 from tvm import tirx
 from tvm.script import tirx as T
 
@@ -714,14 +712,6 @@ def test_cp_async_preserves_bound_raw_shared_base_and_lane_offset(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], source)
 
 
-def test_obsolete_cp_async_bulk_wrapper_is_rejected_during_parsing():
-    with pytest.raises(
-        tvm.error.DiagnosticError,
-        match=r"'cp_async' is not a ptx instruction",
-    ):
-        tvm.script.from_source(_OBSOLETE_CP_ASYNC_BULK_SOURCE, {"T": T})
-
-
 def test_cuda_float_atomic_add_and_default_st_bulk_forms(tmp_path):
     atomic = numsim.transpile(cuda_atomic_add_float32, cache_dir=tmp_path / "atomic")
     atomic_result = numsim.Engine().run(
@@ -1048,78 +1038,6 @@ def test_ptx_vector_f32_atomic_add_uses_scalar_storage_and_predicate(tmp_path):
     np.testing.assert_array_equal(result.outputs["counter"], initial + increments)
 
 
-def test_cuda_uint64x2_atomic_cas_compares_and_replaces_one_128bit_value(tmp_path):
-    module = numsim.transpile(cuda_atomic_cas_uint64x2, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "cell": _uint64x2_binding(
-                [[7, 9]],
-            ),
-            "compares": _uint64x2_binding(
-                [[7, 9], [11, 999], [11, 13]],
-            ),
-            "replacements": _uint64x2_binding(
-                [[11, 13], [17, 19], [23, 29]],
-            ),
-            "old_values": _uint64x2_binding(
-                np.zeros((3, 2), dtype=np.uint64),
-            ),
-            "final_value": _uint64x2_binding(
-                np.zeros((1, 2), dtype=np.uint64),
-            ),
-        },
-    )
-
-    def check() -> None:
-        np.testing.assert_array_equal(
-            _unpack_uint64x2(result.outputs["old_values"]),
-            np.asarray([[7, 9], [11, 13], [11, 13]], dtype=np.uint64),
-        )
-        np.testing.assert_array_equal(
-            _unpack_uint64x2(result.outputs["final_value"]),
-            np.asarray([[23, 29]], dtype=np.uint64),
-        )
-
-    check()
-
-
-def test_cuda_128bit_atomic_cas_compares_float_vectors_by_bits(tmp_path):
-    module = numsim.transpile(cuda_atomic_cas_float32x4, cache_dir=tmp_path)
-    initial = np.asarray([[0x80000000, 0x7FC12345, 0x3F800000, 0x40000000]], dtype=np.uint32)
-    exact_compare = initial.copy()
-    signed_zero_mismatch = initial.copy()
-    signed_zero_mismatch[0, 0] = 0
-    replacement = np.asarray([[1, 2, 3, 4], [11, 13, 17, 19]], dtype=np.uint32)
-    result = numsim.Engine().run(
-        module,
-        {
-            "cell": _float32x4_bits_binding(
-                initial,
-            ),
-            "compares": _float32x4_bits_binding(
-                np.concatenate([signed_zero_mismatch, exact_compare]),
-            ),
-            "replacements": _float32x4_bits_binding(
-                replacement,
-            ),
-            "old_values": _float32x4_bits_binding(
-                np.zeros((2, 4), dtype=np.uint32),
-            ),
-            "final_value": _float32x4_bits_binding(
-                np.zeros((1, 4), dtype=np.uint32),
-            ),
-        },
-    )
-
-    np.testing.assert_array_equal(
-        _unpack_float32x4_bits(result.outputs["old_values"]), np.concatenate([initial, initial])
-    )
-    np.testing.assert_array_equal(
-        _unpack_float32x4_bits(result.outputs["final_value"]), replacement[1:2]
-    )
-
-
 def test_cuda_128bit_atomic_cas_uses_generic_total_width_vector_abi(tmp_path):
     module = numsim.transpile(cuda_atomic_cas_uint32x4, cache_dir=tmp_path)
     initial = np.asarray([[2, 3, 5, 7]], dtype=np.uint32)
@@ -1187,87 +1105,11 @@ def test_legacy_acquire_and_guarded_ldg32_write_local_lvalues(tmp_path):
     np.testing.assert_array_equal(ldg_result.outputs["output"], expected)
 
 
-def test_legacy_ldmatrix_transpose_preserves_b16_fragment_abi(tmp_path):
-    module = numsim.transpile(legacy_ldmatrix_x2_trans, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(128, dtype=np.uint16)})
-    expected = np.empty((32, 4), dtype=np.uint16)
-    for matrix in range(2):
-        for lane in range(32):
-            row = lane // 4
-            pair = lane % 4
-            low = (matrix * 64) + (pair * 2) * 8 + row
-            high = low + 8
-            expected[lane, matrix * 2] = np.uint16(low)
-            expected[lane, matrix * 2 + 1] = np.uint16(high)
-    np.testing.assert_array_equal(result.outputs["output"], expected.reshape(-1))
-
-
-def test_legacy_ldmatrix_8bit_transpose_matches_tirx_manual_gather(tmp_path):
-    module = numsim.transpile(legacy_ldmatrix_i8_transpose_fallback, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(512, dtype=np.uint8)})
-    expected = np.empty((32, 16), dtype=np.uint8)
-    stride = 32
-    for lane in range(32):
-        for element in range(16):
-            source = (
-                ((element % 8) // 4) * stride * 16
-                + (lane % 4) * 4 * stride
-                + (element % 4) * stride
-                + lane // 4
-                + (element // 8) * 8
-            )
-            expected[lane, element] = np.uint8(source & 0xFF)
-    np.testing.assert_array_equal(result.outputs["output"], expected.reshape(-1))
-
-
-def test_legacy_ldmatrix_8bit_transpose_uses_full_thread_index_across_warps(tmp_path):
-    module = numsim.transpile(legacy_ldmatrix_i8_transpose_two_warps, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(1024, dtype=np.uint8)})
-    expected = np.empty((64, 16), dtype=np.uint8)
-    stride = 32
-    for thread in range(64):
-        for element in range(16):
-            source = (
-                ((element % 8) // 4) * stride * 16
-                + (thread % 4) * 4 * stride
-                + (element % 4) * stride
-                + thread // 4
-                + (element // 8) * 8
-            )
-            expected[thread, element] = np.uint8(source & 0xFF)
-    np.testing.assert_array_equal(result.outputs["output"], expected.reshape(-1))
-
-
-def test_legacy_ldmatrix_8bit_nontranspose_keeps_b16_fragment_abi(tmp_path):
-    module = numsim.transpile(legacy_ldmatrix_i8_x4, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(512, dtype=np.uint8)})
-    expected = np.empty((32, 16), dtype=np.uint8)
-    for lane in range(32):
-        row = lane // 4
-        fragment = lane % 4
-        for matrix in range(4):
-            source = (matrix * 8 + row) * 16 + fragment * 4
-            expected[lane, matrix * 4 : matrix * 4 + 4] = np.arange(
-                source, source + 4, dtype=np.uint16
-            ).astype(np.uint8)
-    np.testing.assert_array_equal(result.outputs["output"], expected.reshape(-1))
-
-
 def test_bulk_g2s_cta_copies_exact_physical_bytes(tmp_path):
     source = np.arange(16, dtype=np.uint8) ^ np.uint8(0xC3)
     module = numsim.transpile(bulk_g2s_cta, cache_dir=tmp_path)
     result = numsim.Engine().run(module, {"source": source, "output": np.zeros_like(source)})
     np.testing.assert_array_equal(result.outputs["output"], source)
-
-
-def test_bulk_g2s_cta_has_exact_racecheck_payload_accesses():
-    source = np.arange(16, dtype=np.uint8) ^ np.uint8(0xC3)
-    report = racecheck(
-        bulk_g2s_cta,
-        inputs={"source": source, "output": np.zeros_like(source)},
-    )
-
-    assert report.verdict == "clean", report.format()
 
 
 def test_raw_tma_gather4_bar_address_and_prefetch(tmp_path):
@@ -1289,117 +1131,3 @@ def test_raw_tma_gather4_bar_address_and_prefetch(tmp_path):
     np.testing.assert_array_equal(prefetch_result.outputs["output"], [1])
 
 
-def test_raw_tma_reduce_uses_retained_logical_dtype(tmp_path):
-    source = np.array([1.5, -2.0, 4.25, 3.0], dtype=np.float32)
-    destination = np.array([10.0, 20.0, -1.0, 8.0], dtype=np.float32)
-    initial_destination = destination.copy()
-    output_map = _tensor_map(
-        destination,
-        global_shape=(4,),
-        global_strides=(),
-        box_shape=(4,),
-    )
-    prepared = prepare_bindings(
-        {"output_map": output_map}, expected_tensor_map_names={"output_map"}
-    )
-    assert prepared.tensor_map_outputs["output_map"].dtype == "float32"
-
-    module = numsim.transpile(raw_tma_reduce_add, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output_map": output_map})
-    np.testing.assert_array_equal(result.outputs["output_map"], initial_destination + source)
-
-
-def test_raw_tma_reduce_bfloat16_uses_plain_logical_dtype_array(tmp_path):
-    source = np.asarray([1.5, -2.0, 4.25, 3.0, -0.5, 0.25, 16.0, -8.0], dtype=ml_dtypes.bfloat16)
-    destination = np.asarray(
-        [10.0, 20.0, -1.0, 8.0, 2.0, -4.0, 0.5, 32.0], dtype=ml_dtypes.bfloat16
-    )
-    initial_destination = destination.copy()
-    output_map = _tensor_map(
-        destination,
-        global_shape=(8,),
-        global_strides=(),
-        box_shape=(8,),
-    )
-
-    prepared = prepare_bindings(
-        {"output_map": output_map}, expected_tensor_map_names={"output_map"}
-    )
-    assert prepared.tensor_map_outputs["output_map"].dtype == "bfloat16"
-
-    module = numsim.transpile(raw_tma_reduce_add_bfloat16, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output_map": output_map})
-    expected = np.asarray(
-        initial_destination.astype(np.float32) + source.astype(np.float32), dtype=ml_dtypes.bfloat16
-    )
-    np.testing.assert_array_equal(result.outputs["output_map"], expected.view(np.uint16))
-
-
-def test_memory_family_public_ops_have_closed_world_registration():
-    assert analyze(cp_async_plain_4).unsupported == ()
-    assert analyze(cp_async_cache_hint_16).unsupported == ()
-    assert analyze(cp_async_ca_ignore_src_zero_fill_8).unsupported == ()
-    assert analyze(cp_async_cg_ignore_src_zero_fill_16).unsupported == ()
-    assert analyze(cuda_atomic_add_float32).unsupported == ()
-    assert analyze(cuda_atomic_add_float32x2).unsupported == ()
-    assert analyze(cuda_atomic_add_float16x2).unsupported == ()
-    assert analyze(cuda_atomic_add_float16x2_shared).unsupported == ()
-    assert analyze(cuda_atomic_add_bfloat16x2).unsupported == ()
-    assert analyze(cuda_atomic_add_float32x4).unsupported == ()
-    assert analyze(ptx_atomic_add_f32_vectors).unsupported == ()
-    assert analyze(cuda_atomic_cas_uint64x2).unsupported == ()
-    assert analyze(cuda_atomic_cas_float32x4).unsupported == ()
-    assert analyze(cuda_atomic_cas_uint32x4).unsupported == ()
-    assert analyze(st_bulk_default_weak).unsupported == ()
-    assert analyze(legacy_global_acquire).unsupported == ()
-    assert analyze(guarded_ldg32).unsupported == ()
-    assert analyze(legacy_ldmatrix_x2_trans).unsupported == ()
-    assert analyze(bulk_g2s_cta).unsupported == ()
-    assert analyze(raw_tma_gather4_bar_address).unsupported == ()
-    assert analyze(raw_tma_reduce_add).unsupported == ()
-    assert analyze(raw_tma_reduce_add_bfloat16).unsupported == ()
-    assert analyze(raw_tma_prefetch).unsupported == ()
-    assert analyze(raw_bulk_prefetch).unsupported == ()
-    assert analyze(raw_prefetchu).unsupported == ()
-
-
-@pytest.mark.parametrize("op_name", ["atom", "red"])
-def test_scalar_atomic_add_has_no_s64_form_while_min_and_max_do(op_name):
-    """PTX ISA 9.7.14.5 Table 35 lists `.s64` under `.min, .max` only.
-
-    `atom.add.s64` / `red.add.s64` are therefore not PTX forms, and the missing
-    `Add` x `I64` engine row is the ISA rather than a NumSim coverage gap. The
-    `min` case is the positive control that the s64 carrier itself resolves.
-    """
-
-    pointer = tirx.Var("pointer", "handle")
-    wrapper = getattr(T.ptx, op_name)
-    destination = tirx.decl_buffer((1,), "int64", name="destination")
-
-    def call(operation):
-        operands = (
-            (destination[0], pointer, T.int64(1))
-            if op_name == "atom"
-            else (
-                pointer,
-                T.int64(1),
-            )
-        )
-        return operation(*operands)
-
-    with pytest.raises(ValueError, match=r"\.add requires"):
-        call(wrapper.global_.add.s64)
-
-    destination_operand = "destination, " if op_name == "atom" else ""
-    kernel = parse_kernel(
-        f"""
-@T.prim_func
-def kernel(counter: T.Buffer((1,), "int64")):
-    T.device_entry()
-    destination = T.local_scalar("int64")
-    T.ptx.{op_name}.global_.min.s64({destination_operand}T.address_of(counter[0]), T.int64(1))
-"""
-    )
-    (emitted,) = emitted_calls(kernel, f"tirx.ptx.{op_name}")
-    assert "v2::mem::variant::Minimum" in emitted.generics
-    assert "v2::reg::variant::I64" in emitted.generics

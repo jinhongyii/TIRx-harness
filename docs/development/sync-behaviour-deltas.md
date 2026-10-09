@@ -1,0 +1,90 @@
+---
+orphan: true
+---
+
+# Sync behaviour deltas vs. legacy
+
+Use this list to review conformance-snapshot diffs. The new `SyncTable::step` behaviour is defined by `core-rs/numsim-sync-ref/`, with the full specification in `sync-semantics.md`. Each row says which legacy model changes: E is the engine checker path, N is the engine NumSim path, S is strict synccheck. A snapshot diff that matches no row here is a regression.
+
+ISA cites use PTX 9.4 section numbers. Quotes are in `sync-isa-answers.md`.
+
+## mbarrier
+
+| ID | Change | Legacy | New | ISA basis |
+| --- | --- | --- | --- | --- |
+| M1 | Re-init without `inval` | N allowed it on an inactive slot. E and S rejected it. | Error in every mode. The most specific kind wins: `ReinitBeforeConsumption`, then `ReinitActive`, then `ReinitWithoutInval`. | §9.7.15.16.12, §9.7.15.16.4 |
+| M2 | Arrive-on into the next phase before any successful wait on the completed phase. Covers `arrive`, `arrive.expect_tx`, the non-`.noinc` `cp.async.mbarrier.arrive` increment, and deferred arrive-ons from `cp.async.mbarrier.arrive` / `tcgen05.commit`. | N and E: silent roll-over. S: error, except for the pending increment (F1). | `ReuseBeforeConsumption` in every mode | §9.7.15.16.5.1 |
+| M3 | Standalone `expect_tx` before consumption | N and E: roll. S: error. | Unchanged: roll in Numeric, error in Strict only (policy extension) | §9.7.15.16.5.1 names arrive-on only |
+| M4 | tx-count range | E and N: each operand ≤ 2^20-1; the phase total is checked for `expect_tx` only. S: u64 overflow only. | The signed state `expected − completed` must stay in ±(2^20−1) after every op, including bytes buffered for the next phase (`TxCountOutOfRange`). Operands are not range-checked. | §9.7.15.16.3 Table 43, §9.7.15.16.14 |
+| M5 | `arrive_drop` that brings the expected count to 0 | Allowed in all models | `DropUnderflow` | §9.7.15.16.17 |
+| M6 | `.noComplete` arrive that would complete the phase | E and N: untyped `EngineError`. S: no check. | Typed `NoCompleteWouldComplete`. The rule is still "pending > count". | §9.7.15.16.16, §9.7.15.16.17 |
+| M7 | Init count limit with `.layout::v1` | E and N: 511. S: 2^20−1. | 511 (v1), 2^20−1 (v0) | §9.7.15.16.12, Table 43 |
+| M8 | Pending-count increment beyond the limit | E and N: error. S: u64 overflow only. | `PendingOverflow` | §9.7.15.16.18 |
+| M9 | Deferred arrive-on bound to a phase that other arrivals already completed (D1) | E: lands silently on the next phase; only a `debug_assert` catches it. S: error. | `CompletionAfterComplete` | Over-delivery to a completed phase |
+| M10 | Stale completion, bound to an older phase (D2) | E: stays queued and surfaces as non-quiescent at exit. S: error at landing. | `StaleCompletion` at landing | Fail closed earlier |
+| M11 | `cp.async.mbarrier.arrive` increment on a completed, unobserved phase (F1) | S: raises the old phase, and the increment is then lost | Covered by M2 | §9.7.15.16.5.1, §9.7.15.16.18 |
+| M12 | `arrive_drop` atomicity (D5) | E and N: the drop is committed even if the arrival fails | Transactional | — |
+| M13 | Waiter registry (D7) | E and S: `DuplicateWaiter` | Impossible by construction. A parked waiter still consumes at completion. | — |
+| M14 | `mbarrier.pending_count` on a state token that was not produced by `mbarrier.arrive{.drop}.noComplete` (`test_pending_count_instruction_predicates`, invalid form) | Error whose text names `noComplete` | Same verdict (`error`). The finding is `sync_protocol_error` with the message `pending_count: NotNoComplete` (`sync::query::TokenError::NotNoComplete`); the lowercase PTX spelling `noComplete` no longer appears | §9.7.15.16.20 "The state operand … must be the result of a prior mbarrier.arrive.noComplete or mbarrier.arrive_drop.noComplete instruction. Otherwise, the behavior is undefined." (UB, so error) |
+| M15 | Blocking `mbarrier` wait (`T.cuda.mbarrier_wait`) whose lanes are in one wait instruction but on different barriers/phases with different readiness (`test_blocking_wait_fails_closed_for_mixed_lane_readiness`) | E and N: error "cannot suspend lanes with different readiness or barrier/phase" | `incomplete`, `analysis_incomplete` with reason `divergent_block` (no progress while the warp is blocked with a divergent mask). Fail closed in both. | Under independent thread scheduling the ready lane may run on and release the other, so the kernel can be valid: neither model can prove a fault. W2-20 table ruling "divergent blocking wait": delta. Port: `test_p6c_mbarrier_lane_semantics.py`. |
+| M16 | Multicast `ctaMask` bit naming a rank outside the cluster (mbarrier `.multicast::cluster::32b`, bulk/tensor TMA `.multicast::cluster`, `tcgen05.commit` multicast) | Error text "outside the cluster" | Error `bad_address` "multicast CTA mask {mask:#x} names ranks outside the {n}-CTA cluster", raised before any target is touched (sync-isa-answers Q9) | ctaMask bits correspond to `%cluster_ctarank` of a destination CTA; a bit with no such CTA fails closed |
+| M17 | A blocking wait reached by only some lanes of a warp, that no possible event can complete: a TMA whose landed bytes fall short of its `expect_tx` (`test_tma_transaction_under_delivery_is_an_error`, `test_raw_tensor_map_under_delivery_reports_exact_bytes`), or a `wait_until` whose word nobody writes (`test_wait_without_any_possible_publisher_is_a_sync_deadlock`) | E and N: error (`deadlock`, `transactions=48/52`) | `incomplete`, `analysis_incomplete` with reason `divergent_block`, in NumSim, Racecheck and Synccheck. The run stops; nothing is reported clean. | The same structured-SIMT limitation as M15/B8 (W2-20 table ruling "divergent blocking wait"). The engine runs the waiting arm first, and the other lanes only run after the `If`, so engine state cannot prove they never complete the wait. A static proof (no remaining transaction or writer anywhere in the program) is not attempted. Rows added by W12 when flipping the copies. |
+
+## Named barriers
+
+| ID | Change | Legacy | New | ISA basis |
+| --- | --- | --- | --- | --- |
+| B1 | Barrier executed by a strict subset of the warp's non-exited lanes, including an elected single lane | E: error for arrive and aligned sync, but waived under `elect.sync`; unaligned sync was accumulated. S: error only if the mask differed from the elect entry mask. | `.aligned` forms (and `bar.arrive`/`bar.red` executed by a lane subset): `PartialWarp`. Non-aligned `barrier.sync` executed by a lane subset: the lanes of each warp are gathered and the warp arrives once when all its non-exited lanes have arrived (e75fbb0, 5241a22; Q3 ruling) | §9.7.15.1, §9.7.15.15 |
+| B2 | Lanes of one warp reaching different barrier instructions (unaligned recombination) | E: full-CTA counts recombine and partial paths pass without waiting. S: partitioned resume for any count. | `.aligned` forms: `PartialWarp` (fail closed). Non-aligned `barrier.sync` on different instructions: gathered per warp like B1, the warp arrives once its non-exited lanes have all arrived (e75fbb0, 5241a22) | §9.7.15.1 is silent on recombination; Q3 ruling for the non-aligned forms |
+| B3 | Mixing aligned and unaligned syncs on one barrier, or different static sites | S: `AlignedSyncContractMismatch` | Allowed | §9.7.15.1 "Different warps may execute different forms" |
+| B4 | `bar.red` mixed with `sync`/`arrive` in one generation | Allowed in all models | `RedMixed` | §9.7.15.1 "unpredictable" |
+| B5 | Incomplete generation at exit (dangling `bar.arrive`) | E: `CompletionSourceNotQuiescent` error. S: only full-CTA all-aligned generations. | Review lint `DanglingAtExit` | §9.7.14.7 |
+| B6 | Arrival counting | E and S: per active lane | 32 per warp arrival, once all non-exited lanes have executed the instruction | §9.7.15.1 "marks warps' arrival" |
+| B7 | Exit of whole warps releasing a barrier | Not modeled | Modeled for count-less barriers. A warp whose lanes have all exited leaves the membership of its CTA's count-less named barriers, so later generations expect 32 fewer threads. An open generation it has not arrived at counts it as arrived: the exit commits and logs a `Named` `Arrive` (`Red` in a `.red` generation) with `mask = live` of the exiting lanes (`interp/handlers/control.rs` `release_named_on_exit`). Synccheck replays that logged arrive like any other in every order (`exit_arrival_releases_count_less_named_barrier`). A generation with an explicit thread count names no membership: a hang there is reported as `incomplete` (G8), never success | §9.7.14.7 "Barriers exclusively waiting on arrivals from exited threads are always released"; sync-isa-answers Q3 (exited lanes leave the expected set) and Q4 (exited threads count as arrived) |
+| B8 | Default full-mask `__syncwarp` / `bar.warp.sync` reached by only part of a warp (`if lane < 16: warp_sync()`) | E and N: error "participant mask names an inactive lane" | `incomplete`, `analysis_incomplete` with reason `divergent_block`. Fail closed. | The engine runs one arm of a divergent `If` first and cannot prove that the other lanes never reach a matching sync (documented divergent-switch limitation). W2-20 table ruling "divergent `__syncwarp`": delta. Port: `test_p6c_ordering_calls.py`. |
+
+## Cluster barrier
+
+| ID | Change | Legacy | New | ISA basis |
+| --- | --- | --- | --- | --- |
+| C1 | Membership | E: the selected warps, fixed at launch. S: the full cluster range. | The non-exited threads. `Exit` shrinks membership and may complete the generation, which releases waiters. | §9.7.15.3, §9.7.14.7 |
+| C2 | Incomplete generation at exit | E: error, or a deadlock with exit evidence. S: incomplete. | No finding: exits complete it | §9.7.15.3 |
+| C3 | Partial-warp arrive | E: unaligned lanes accumulate. S: always rejected. | `.aligned`: `PartialWarp` unless the mask is exactly the warp's non-exited lanes. Non-aligned: the lanes gather (`cluster::gather`) until the rest of the warp executes the same kind, then the warp arrives once, as E did. `PartialWarp` only when missing lanes exit or execute the other kind (ruling 2026-10-08, sync-isa-answers Q11) | §9.7.15.3 "wait for all non-exited threads from its warp"; `.aligned` "must execute the same barrier.cluster instruction" |
+| C4 | Partial-warp wait | E: `UnalignedWaitUnsupported`. S: `PartialWarpParticipation`. | `PartialWarp`, under the same rule as C3 | §9.7.15.3 |
+| C5 | Rearrival without an intervening wait | E: silent. S: unmodeled (incomplete). | A flag in `Outcome::Arrived`; checkers report it as unmodeled | §9.7.15.3 is silent |
+
+## Async groups
+
+| ID | Change | Legacy | New | ISA basis |
+| --- | --- | --- | --- | --- |
+| A1 | Wait visibility | Racecheck: one merged warp clock acquired by the whole wait mask | Per lane: a wait acquires only the executing lane's groups | §9.7.10.28.1.1, §9.7.10.28.3.3 |
+| A2 | `cp.async.bulk.wait_group.read` | Acquires the source-read milestone | `acquired: ReadsDone` only. Never publishes destination writes. A destination read after only `.read` is a race. | §9.7.10.28.6.2 |
+| A3 | Uncommitted `cp.async` issues at exit | E and N: `CompletionSourceNotQuiescent` error | Review lint `UncommittedAtExit` | The ISA does not require a commit |
+
+## tcgen05
+
+| ID | Change | Legacy | New | ISA basis |
+| --- | --- | --- | --- | --- |
+| T1 | `alloc` with no free columns | E, N and verifier: `AllocationUnavailable` | `Blocked` and retried. A deadlock is reported only when nothing can progress. | §9.7.18.7.1 |
+| T2 | `.exclusive` alloc while other allocations are live, or another CTA's alloc while an exclusive allocation is live | Placed first-fit | `Blocked` | §9.7.18.7.1 "An exclusive allocation operation blocks until there is no other live allocation … no other CTA may allocate" |
+| T8 | Any alloc by the CTA that holds a live `.exclusive` allocation (`test_exclusive_tmem_uses_cta_local_lifecycle_without_placement`, 96 columns) | Allowed ("the model deliberately permits ordinary allocation while exclusive is live") | Error `AllocWhileExclusive` (synccheck kind `tcgen_alloc_while_exclusive`), in every mode | §9.7.18.7.1 "This must be the only live allocation, until it is deallocated with a corresponding tcgen05.dealloc.exclusive operation"; "No other allocation may exist at the same time as an exclusive allocation" (sync-isa-answers Q6) |
+| T9 | TMEM access (`tcgen05.ld/st/mma/cp`) to columns outside every live allocation, e.g. after another warp's `tcgen05.dealloc` (`test_synccheck_requires_cross_warp_tmem_quiescence_before_dealloc`, unordered half) | S: `synchronization_collective_publication` ("not covered by any live allocation") | Error `bad_address` from the engine in every mode ("… is not in a live tcgen05 allocation"). Cross-warp dealloc itself is legal (sync-isa-answers Q8) | §9.7.18.7.1 "taddr must point to a previous Tensor Memory allocation"; §9.7.18.2 |
+| T10 | Restricted `tcgen05.commit` (`.sync_restrict::shared::read::mma::a`) in synccheck | S: treated as a full commit, so it was ordered after the warp's earlier commits | Its arrival is ordered after earlier restricted commits and before later unrestricted ones, but not after earlier unrestricted ones; it certifies only operand-A shared reads (sync-semantics §6.7, sync-isa-answers Q10) | §9.7.18.12.1 |
+| T3 | Dealloc exclusivity mismatch | Not checked | `DeallocationMismatch` | §9.7.18.7.1 "deallocated with .exclusive if and only if" |
+| T4 | Exclusive width limit | `min(cap, 512)` | `exclusive_max` parameter: 512 on sm_100f/103/110, 576 on sm_107f | Table 58 |
+| T5 | `cta_group` uniformity | E: across lifecycle ops only; commit silently ignored work of the other group | Kernel-wide across all tcgen05 ops; any mismatch is `CtaGroupMismatch` | §9.7.18.7.1 |
+| T6 | `cta_group::2` peer warp index | E: must equal `warp_id_in_cta` | Any warp of the peer CTA | §9.7.18.5 Table 55 |
+| T7 | `AllocationSizeIncrease`, sticky across deallocs | Same | Unchanged; now ISA-cited | §9.7.18.7.1 |
+
+## setmaxnreg
+
+| ID | Change | Legacy | New | ISA basis |
+| --- | --- | --- | --- | --- |
+| R1 | NumSim pool semantics (D6) | N: no pool, no direction check, `inc` never blocks | Checker-mode pool in every mode. NumSim can now report `InvalidDirection` or a pool deadlock. | setmaxnreg: `inc` blocks until registers are available |
+| R2 | Warpgroup-sync rule in the fixed verifier | Verifier: not modeled | `MissingWarpgroupSync` in every mode | setmaxnreg: "synchronize explicitly before a subsequent setmaxnreg" |
+
+## Synccheck explorer
+
+| ID | Change | Legacy | New | ISA basis |
+| --- | --- | --- | --- | --- |
+| S1 | Generations observed by waits are proved schedule-independent, not taken from the run (`msa_prefill_multishape`, V2C-28) | S: the fixed verifier took each wait's generation from the concrete run as a fact, so a wait that some schedule lets pass on an older generation of the same parity was clean | Gated per-resource searches compare every command's generations with the reference run. A schedule that assigns another generation is `incomplete` (`fixed_sync_program_model_incomplete`, source `generation_assignment_differs`), with the operation and a witness schedule (explorer rule S5, `synccheck-explorer.md` §5.5). In `msa_prefill_multishape` this is a genuine kernel race. Warpgroup 1's iteration-1 `o_smem_free.wait(0, (seq_x+1)&1)` (line 1280) is not ordered after the store warp's generation-1 arrival, so it can pass on stale generation 0. It then overwrites `o_smem` during the in-flight TMA store (`synccheck-explorer.md` §5.8, with the interleaving and fixes) | `mbarrier.try_wait.parity` waits for the completion of the phase with the given parity: the current or immediately preceding phase. A parity cannot tell generation g from g−2 |

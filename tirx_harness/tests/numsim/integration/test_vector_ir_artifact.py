@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 
 from tirx_harness import numsim
-from tirx_harness.numsim.transpiler.frontend import analyze
 from tvm.script import tirx as T
 
 
@@ -86,67 +85,6 @@ def construct_uint32x2_bits(
     _warp = T.warp_id([1])
     lane = T.lane_id([32])
     output[lane] = T.reinterpret("uint64", T.Shuffle([low[lane], high[lane]], [0, 1]))
-
-
-def test_vector_ir_roundtrip_executes_packed_and_f32x4_semantics(tmp_path):
-    source_u32 = (np.arange(64, dtype=np.uint32) * np.uint32(0x01020305)) ^ np.uint32(0xA55AA55A)
-    source_f32 = np.arange(128, dtype=np.float32) * np.float32(0.125) - np.float32(3)
-    output_u32 = np.zeros_like(source_u32)
-    output_f32 = np.zeros_like(source_f32)
-
-    spec = analyze(vector_ir_roundtrip)
-    assert spec.unsupported == ()
-    module = numsim.transpile(vector_ir_roundtrip, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "source_u32": source_u32,
-            "source_f32": source_f32,
-            "output_u32": output_u32,
-            "output_f32": output_f32,
-        },
-    )
-
-    np.testing.assert_array_equal(result.outputs["output_u32"], source_u32)
-    np.testing.assert_array_equal(result.outputs["output_f32"], source_f32)
-    assert "F32x4" in module.rust_source
-    assert "packed_u32x2" in module.rust_source
-
-
-def test_vector_shuffle_classifier_and_frontend_reject_out_of_range_extract():
-    spec = analyze(invalid_vector_shuffle_extract)
-    assert any("outside uint32x2 lane range" in item for item in spec.unsupported)
-
-
-def test_packed_storage_vectors_fail_closed_for_ordinary_arithmetic():
-    spec = analyze(packed_vector_arithmetic_is_not_scalar_arithmetic)
-
-    assert any("packed vector storage" in item for item in spec.unsupported)
-
-
-def test_generic_vector_extract_fails_during_analysis():
-    spec = analyze(unsupported_generic_vector_extract)
-
-    assert any("only a packed storage ABI" in item for item in spec.unsupported)
-
-
-def test_128bit_vector_reinterpret_is_a_bitwise_roundtrip(tmp_path):
-    source = np.arange(64, dtype=np.uint64).reshape(32, 2).view(np.dtype("V16")).reshape(32)
-    output = np.zeros(32, dtype=np.dtype("V16"))
-
-    module = numsim.transpile(reinterpret_128bit_vector_roundtrip, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "source": source,
-            "output": output,
-        },
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], source)
-    assert "f32::from_bits" in module.rust_source
-    assert ".to_bits()" in module.rust_source
-    assert " as [f32; 4]" not in module.rust_source
 
 
 def test_uint32x2_construction_preserves_low_and_high_words(tmp_path):

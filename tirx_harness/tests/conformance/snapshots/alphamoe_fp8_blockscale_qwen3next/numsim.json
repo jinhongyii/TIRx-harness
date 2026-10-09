@@ -1,0 +1,17 @@
+{
+ "case": "alphamoe_fp8_blockscale_qwen3next",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "final_out": {
+   "dtype": "uint16",
+   "sha256": "d4ffcf20705947d70bab328033f6a5f388d2dd20107e8a90deca60e1b992bb8c",
+   "shape": [
+    16384
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

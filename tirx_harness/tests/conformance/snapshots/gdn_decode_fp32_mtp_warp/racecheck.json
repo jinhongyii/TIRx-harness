@@ -1,0 +1,19 @@
+{
+ "case": "gdn_decode_fp32_mtp_warp",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [],
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "register",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

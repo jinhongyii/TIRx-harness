@@ -1,0 +1,11 @@
+{
+ "case": "rmsnorm",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

@@ -1,0 +1,24 @@
+{
+ "case": "cudnn_sm100_bsa_forward_blk128",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "lse": {
+   "dtype": "float32",
+   "sha256": "54638cd3ee2f6d4022fd217687826014cabcd471aac7ee39bd3ecb7b1b7608c4",
+   "shape": [
+    1
+   ]
+  },
+  "out": {
+   "dtype": "uint16",
+   "sha256": "f12a7f18f2c64fb6625604133521cd6fe7dde0eed60858e4dca7719db5dc9902",
+   "shape": [
+    128
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

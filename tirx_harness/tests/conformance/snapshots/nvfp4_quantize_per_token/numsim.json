@@ -1,0 +1,31 @@
+{
+ "case": "nvfp4_quantize_per_token",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out_global": {
+   "dtype": "uint8",
+   "sha256": "e2f2eddc5e0164c2fb7d09f99d82c1bcdaf128116b615399c1cbe0c7412e030a",
+   "shape": [
+    8
+   ]
+  },
+  "pts_out": {
+   "dtype": "float32",
+   "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+   "shape": [
+    1
+   ]
+  },
+  "sf_out": {
+   "dtype": "uint8",
+   "sha256": "2c624232cdd221771294dfbb310aca000a0df6ac8b66b696d90ef06fdefb64a3",
+   "shape": [
+    1
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

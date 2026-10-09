@@ -1,0 +1,408 @@
+{
+  "format_version": 3,
+  "kernels": [
+    {
+      "name": "vadd",
+      "code": [
+        {
+          "ReadSpecial": {
+            "dst": 0,
+            "sreg": "CtaLinear"
+          }
+        },
+        {
+          "ReadSpecial": {
+            "dst": 1,
+            "sreg": "ThreadInCta"
+          }
+        },
+        {
+          "Binary": {
+            "op": "Mul",
+            "ty": {
+              "elem": "U32",
+              "lanes": 1
+            },
+            "dst": 2,
+            "a": {
+              "Reg": 0
+            },
+            "b": {
+              "Const": 0
+            }
+          }
+        },
+        {
+          "Binary": {
+            "op": "Add",
+            "ty": {
+              "elem": "U32",
+              "lanes": 1
+            },
+            "dst": 2,
+            "a": {
+              "Reg": 2
+            },
+            "b": {
+              "Reg": 1
+            }
+          }
+        },
+        {
+          "Compare": {
+            "op": "Lt",
+            "ty": {
+              "elem": "U32",
+              "lanes": 1
+            },
+            "dst": 3,
+            "a": {
+              "Reg": 2
+            },
+            "b": {
+              "Const": 1
+            }
+          }
+        },
+        {
+          "If": {
+            "cond": {
+              "Reg": 3
+            },
+            "else_pc": 10,
+            "end_pc": 10,
+            "elect": false
+          }
+        },
+        {
+          "Load": {
+            "ty": {
+              "elem": "F32",
+              "lanes": 1
+            },
+            "dst": 4,
+            "buf": 0,
+            "offset": {
+              "Reg": 2
+            },
+            "sem": "Weak",
+            "scope": "Gpu",
+            "mods": {
+              "cache": "Default",
+              "evict": "Normal",
+              "l2_prefetch": 0,
+              "policy": null,
+              "nc": false,
+              "uniform": false
+            }
+          }
+        },
+        {
+          "Load": {
+            "ty": {
+              "elem": "F32",
+              "lanes": 1
+            },
+            "dst": 5,
+            "buf": 1,
+            "offset": {
+              "Reg": 2
+            },
+            "sem": "Weak",
+            "scope": "Gpu",
+            "mods": {
+              "cache": "Default",
+              "evict": "Normal",
+              "l2_prefetch": 0,
+              "policy": null,
+              "nc": false,
+              "uniform": false
+            }
+          }
+        },
+        {
+          "Binary": {
+            "op": "Add",
+            "ty": {
+              "elem": "F32",
+              "lanes": 1
+            },
+            "dst": 4,
+            "a": {
+              "Reg": 4
+            },
+            "b": {
+              "Reg": 5
+            }
+          }
+        },
+        {
+          "Store": {
+            "ty": {
+              "elem": "F32",
+              "lanes": 1
+            },
+            "buf": 2,
+            "offset": {
+              "Reg": 2
+            },
+            "value": {
+              "Reg": 4
+            },
+            "sem": "Weak",
+            "scope": "Gpu",
+            "mods": {
+              "cache": "Default",
+              "evict": "Normal",
+              "l2_prefetch": 0,
+              "policy": null,
+              "nc": false,
+              "uniform": false
+            }
+          }
+        },
+        "EndIf",
+        "Exit"
+      ],
+      "code_sites": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "consts": [
+        {
+          "ty": {
+            "elem": "U32",
+            "lanes": 1
+          },
+          "bits": 128
+        },
+        {
+          "ty": {
+            "elem": "U32",
+            "lanes": 1
+          },
+          "bits": 1024
+        }
+      ],
+      "strings": [],
+      "sites": [
+        {
+          "kind": "",
+          "spans": [
+            {
+              "file": null,
+              "line": 10,
+              "col": 0,
+              "end_line": 10,
+              "end_col": 0
+            }
+          ],
+          "op_name": "tirx.BufferStore",
+          "text": "",
+          "dtype": null,
+          "buffer": null,
+          "buffers": []
+        }
+      ],
+      "regs": [
+        {
+          "ty": {
+            "elem": "U32",
+            "lanes": 1
+          },
+          "name": null,
+          "uniform": false
+        },
+        {
+          "ty": {
+            "elem": "U32",
+            "lanes": 1
+          },
+          "name": null,
+          "uniform": false
+        },
+        {
+          "ty": {
+            "elem": "U32",
+            "lanes": 1
+          },
+          "name": null,
+          "uniform": false
+        },
+        {
+          "ty": {
+            "elem": "Pred",
+            "lanes": 1
+          },
+          "name": null,
+          "uniform": false
+        },
+        {
+          "ty": {
+            "elem": "F32",
+            "lanes": 1
+          },
+          "name": null,
+          "uniform": false
+        },
+        {
+          "ty": {
+            "elem": "F32",
+            "lanes": 1
+          },
+          "name": null,
+          "uniform": false
+        }
+      ],
+      "buffers": [
+        {
+          "name": "a",
+          "space": "global",
+          "dtype": {
+            "elem": "F32",
+            "lanes": 1
+          },
+          "shape": [],
+          "strides": [],
+          "param_slot": 0,
+          "base": 0,
+          "base_reg": null,
+          "byte_len": null,
+          "align": 16,
+          "view_of": null,
+          "sync_words": false
+        },
+        {
+          "name": "b",
+          "space": "global",
+          "dtype": {
+            "elem": "F32",
+            "lanes": 1
+          },
+          "shape": [],
+          "strides": [],
+          "param_slot": 1,
+          "base": 0,
+          "base_reg": null,
+          "byte_len": null,
+          "align": 16,
+          "view_of": null,
+          "sync_words": false
+        },
+        {
+          "name": "c",
+          "space": "global",
+          "dtype": {
+            "elem": "F32",
+            "lanes": 1
+          },
+          "shape": [],
+          "strides": [],
+          "param_slot": 2,
+          "base": 0,
+          "base_reg": null,
+          "byte_len": null,
+          "align": 16,
+          "view_of": null,
+          "sync_words": false
+        }
+      ],
+      "ops": [],
+      "preds": [],
+      "layouts": [],
+      "topology": {
+        "grid": [
+          {
+            "Const": 8
+          },
+          {
+            "Const": 1
+          },
+          {
+            "Const": 1
+          }
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "static_smem_bytes": 0,
+        "dyn_smem_bytes": {
+          "Const": 0
+        },
+        "min_blocks_per_sm": null,
+        "cooperative": false,
+        "regs_per_thread": 0
+      },
+      "host_abi": [
+        {
+          "name": "a",
+          "local_name": "a",
+          "aliases": [],
+          "kind": "Buffer",
+          "dtype": {
+            "elem": "F32",
+            "lanes": 1
+          },
+          "shape": [],
+          "tensor_map": null,
+          "implicit_base": null,
+          "buf": 0
+        },
+        {
+          "name": "b",
+          "local_name": "b",
+          "aliases": [],
+          "kind": "Buffer",
+          "dtype": {
+            "elem": "F32",
+            "lanes": 1
+          },
+          "shape": [],
+          "tensor_map": null,
+          "implicit_base": null,
+          "buf": 1
+        },
+        {
+          "name": "c",
+          "local_name": "c",
+          "aliases": [],
+          "kind": "Buffer",
+          "dtype": {
+            "elem": "F32",
+            "lanes": 1
+          },
+          "shape": [],
+          "tensor_map": null,
+          "implicit_base": null,
+          "buf": 2
+        }
+      ],
+      "arch": null,
+      "requirements": {
+        "implicit_tmem": false,
+        "dynamic_tmem_lifecycle": false,
+        "readonly_proxy": false,
+        "grid_dependency": false,
+        "raw_tensor_map_registry": false
+      },
+      "unsupported": []
+    }
+  ]
+}

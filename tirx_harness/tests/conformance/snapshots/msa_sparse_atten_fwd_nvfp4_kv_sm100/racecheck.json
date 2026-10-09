@@ -1,0 +1,25 @@
+{
+ "case": "msa_sparse_atten_fwd_nvfp4_kv_sm100",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/msa/sparse_atten_fwd_nvfp4_kv.py:2763:1-2763:46",
+      "tirx_kernels/ported/msa/sparse_atten_fwd_nvfp4_kv.py:2960:1-2960:43"
+     ],
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

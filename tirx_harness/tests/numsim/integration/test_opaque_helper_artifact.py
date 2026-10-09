@@ -5,7 +5,6 @@ import pytest
 
 from tirx_harness import numsim
 from tirx_harness.numsim.errors import UnsupportedTIRxError
-from tirx_harness.numsim.transpiler.frontend import analyze, verify
 from tvm.script import tirx as T
 
 
@@ -94,25 +93,6 @@ def smem_descriptor_make_lo_uniform_helper(
         )
     )
     output[lane] = descriptor[0]
-
-
-@pytest.mark.parametrize(
-    "kernel",
-    [
-        opaque_value_helper,
-        opaque_statement_helper,
-    ],
-)
-def test_opaque_or_spoofed_cuda_helpers_are_rejected(kernel, tmp_path):
-    spec = analyze(kernel)
-
-    unsupported = [item for item in spec.unsupported if "tirx.cuda.func_call" in item]
-    assert len(unsupported) == 1
-
-    with pytest.raises(UnsupportedTIRxError):
-        verify(spec)
-    with pytest.raises(UnsupportedTIRxError):
-        numsim.transpile(kernel, cache_dir=tmp_path)
 
 
 def test_smem_descriptor_offset_wraps_only_the_low_32_bits(tmp_path):

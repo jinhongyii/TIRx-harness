@@ -1,0 +1,24 @@
+{
+ "case": "flashinfer_rmsnorm_fp4quant",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/norm/rmsnorm_fp4quant.py:800:1-800:38"
+     ],
+     "bytes": {
+      "shared": "128-2048"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

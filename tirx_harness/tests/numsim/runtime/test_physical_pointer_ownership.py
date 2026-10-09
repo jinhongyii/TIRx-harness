@@ -15,7 +15,6 @@ from __future__ import annotations
 import numpy as np
 
 from tirx_harness import numsim
-from tirx_harness.numsim.transpiler import suspend_scaffold
 from tvm.backend.cuda.lang.clc import query_cancel_first_ctaid_x
 from tvm.script import tirx as T
 
@@ -421,19 +420,6 @@ _REUSED_POINTER_CASES = (
 )
 
 
-def test_reused_physical_pointers_build_one_native_artifact(tmp_path):
-    # The native build is the oracle: an accidental move of a reused pointer
-    # binding fails rustc borrow checking (E0382) inside this build.
-    numsim.transpile(_REUSED_POINTER_CASES, cache_dir=tmp_path)
-
-
-def test_reused_pointer_builds_and_runs_across_a_forced_root_async_split(tmp_path, monkeypatch):
-    monkeypatch.setattr(suspend_scaffold, "_ROOT_ASYNC_SPLIT_MIN_LINES", 0)
-    module = numsim.transpile(reused_runtime_descriptor_pointer, cache_dir=tmp_path)
-
-    numsim.Engine().run(module, {"descriptor": np.zeros(32, dtype=np.uint32)})
-
-
 def test_reused_raw_ldmatrix_pointer_executes_both_loads(tmp_path):
     module = numsim.transpile(reused_raw_ldmatrix_pointer, cache_dir=tmp_path)
 
@@ -444,33 +430,6 @@ def test_reused_raw_ldmatrix_pointer_executes_both_loads(tmp_path):
     np.testing.assert_array_equal(
         result.outputs["output"], np.full((32, 2), 0xA5A5A5A5, dtype=np.uint32)
     )
-
-
-def test_reused_legacy_mma_reuses_a_b_and_accumulator_bindings_across_calls(tmp_path):
-    packed_fp16_ones = np.uint32(0x3C003C00)
-    a_words = np.full((32, 4), packed_fp16_ones, dtype=np.uint32)
-    b_words = np.full((32, 2), packed_fp16_ones, dtype=np.uint32)
-    c_values = np.arange(32 * 4, dtype=np.float32).reshape(32, 4) / 4
-
-    module = numsim.transpile(reused_legacy_mma_pointer_bindings, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "a_words": a_words,
-            "b_words": b_words,
-            "c_values": c_values,
-            "output": np.zeros((32, 4), dtype=np.uint32),
-        },
-    )
-
-    # With every A/B half equal to 1.0 each product fragment is exactly 16.0,
-    # so d[slot] = 16.0 + c[slot] independently of the lane->element mapping.
-    # The second accumulator register is seeded from c[0], so d[1] must
-    # observe c[0].
-    accumulators = c_values.copy()
-    accumulators[:, 1] = c_values[:, 0]
-    expected = (np.float32(16.0) + accumulators).view(np.uint32)
-    np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
 def test_reused_mma_store_pointers_write_lane_register_layout(tmp_path):

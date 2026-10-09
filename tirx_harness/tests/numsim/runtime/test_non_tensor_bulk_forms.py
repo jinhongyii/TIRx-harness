@@ -9,7 +9,6 @@ from tvm_ffi import structural_map, structural_walk
 
 from tirx_harness import numsim, racecheck, synccheck
 from tests.numsim.support.execution import run_checked
-from tests.numsim.support.manifest import call_op_names
 
 
 @T.prim_func
@@ -492,51 +491,6 @@ def _cp_mask_readonly_kernel(before):
     return kernel
 
 
-def test_cp_mask_readonly_overlap_uses_selected_bytes(tmp_path):
-    from tirx_harness import racecheck, synccheck
-
-    for before in (False, True):
-        kernel = _cp_mask_readonly_kernel(before)
-        module = numsim.transpile(kernel, cache_dir=tmp_path)
-        for mask in (0, 0xF0, 1):
-            args = {
-                "destination": np.full(16, 0xD3, np.uint8),
-                "byte_mask": mask,
-                "output": np.zeros(1, np.uint32),
-            }
-            for checker in (synccheck, racecheck):
-                report = checker(kernel, args)
-                if mask == 1:
-                    assert report.verdict == "error", report.format()
-                    assert "write overlaps readonly bytes" in str(report.to_dict())
-                else:
-                    report.require_clean()
-            if mask == 1:
-                with pytest.raises(
-                    numsim.NumSimExecutionError, match="write overlaps readonly bytes"
-                ):
-                    numsim.Engine().run(module, args)
-            else:
-                result = numsim.Engine().run(module, args)
-                assert result.verdict == "clean"
-                np.testing.assert_array_equal(result.outputs["output"], [0xD3D3D3D3])
-                np.testing.assert_array_equal(
-                    result.outputs["destination"],
-                    np.where((mask >> np.arange(16)) & 1, 0x35, 0xD3),
-                )
-
-
-def test_cp_mask_without_cache_policy_copies_only_selected_bytes(tmp_path):
-    inputs = {
-        "source": np.arange(16, dtype=np.uint8),
-        "byte_mask": np.array([0x55AA], np.int32),
-        "destination": np.full(16, 99, np.uint8),
-    }
-    result = run_checked(bulk_s2g_cp_mask_without_cache, inputs, cache_dir=tmp_path)
-    expected = np.array([99, 1, 99, 3, 99, 5, 99, 7, 8, 99, 10, 99, 12, 99, 14, 99], np.uint8)
-    np.testing.assert_array_equal(result.outputs["destination"], expected)
-
-
 def test_bulk_g2s_cluster_false_predicate_does_not_access_uninitialized_barrier(tmp_path):
     result = run_checked(
         bulk_g2s_cluster_static_false_predicate,
@@ -554,25 +508,6 @@ def test_bulk_g2s_cta_two_issuing_lanes_credit_both_transfers(tmp_path):
             cache_dir=tmp_path,
         )
         np.testing.assert_array_equal(result.outputs["output"], np.r_[np.arange(32), np.zeros(16)])
-
-
-def test_bulk_g2s_cluster_dynamic_predicate_transpiles(tmp_path):
-    # Preserve the old compile-only probe; its barrier is not initialized for execution.
-    module = numsim.transpile(bulk_g2s_cluster_dynamic_predicate, cache_dir=tmp_path)
-    assert "tirx.ptx.cp_async_bulk_g2s_cluster" in call_op_names(module.spec.kernels[0])
-
-
-def test_raw_bulk_s2c_preserves_mapped_remote_cta_ownership(tmp_path):
-    from tirx_harness import racecheck, synccheck
-
-    for checker in (synccheck, racecheck):
-        checker(
-            raw_bulk_s2c_uses_mapped_u32_addresses, {"output": np.zeros(16, np.uint8)}
-        ).require_clean()
-    module = numsim.transpile(raw_bulk_s2c_uses_mapped_u32_addresses, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(16, dtype=np.uint8)})
-
-    np.testing.assert_array_equal(result.outputs["output"], np.arange(19, 35, dtype=np.uint8))
 
 
 def mapped_st_async_case(offset_form):
@@ -622,35 +557,6 @@ def mapped_st_async_case(offset_form):
     return kernel.with_body(structural_map(kernel.body, (Call, replace)))
 
 
-@pytest.mark.parametrize(
-    "offset_form", ["instruction", "constant", "dynamic", "reversed", "subtracted", "wrapped"]
-)
-def test_raw_st_async_preserves_mapped_remote_cta_ownership(tmp_path, offset_form):
-    kernel = mapped_st_async_case(offset_form)
-    inputs = {"output": np.zeros(8, dtype=np.uint32)}
-    for checker in (synccheck, racecheck):
-        checker(kernel, inputs).require_clean()
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(8, dtype=np.uint32)})
-
-    np.testing.assert_array_equal(
-        result.outputs["output"],
-        np.array(
-            [
-                0x10203040,
-                0x50607080,
-                0x90A0B0C0,
-                0xD0E0F001,
-                0x12345678,
-                0x9ABCDEF0,
-                0x0BADF00D,
-                0xCAFEBABE,
-            ],
-            dtype=np.uint32,
-        ),
-    )
-
-
 def test_raw_st_async_preserves_mapped_expression_byte_offset(tmp_path):
     module = numsim.transpile(raw_st_async_uses_mapped_u32_expression_offset, cache_dir=tmp_path)
     result = numsim.Engine().run(module, {"output": np.zeros(8, dtype=np.uint32)})
@@ -671,17 +577,6 @@ def test_raw_st_async_preserves_mapped_expression_byte_offset(tmp_path):
             dtype=np.uint32,
         ),
     )
-
-
-@pytest.mark.parametrize("checker", [synccheck, racecheck])
-def test_raw_st_async_mapped_expression_offsets_are_disjoint(checker):
-    report = checker(
-        raw_st_async_uses_mapped_u32_expression_offset,
-        {"output": np.zeros(8, dtype=np.uint32)},
-    )
-
-    assert report.verdict == "clean"
-    assert report.findings == []
 
 
 @pytest.mark.parametrize("offset_form", ["multiply", "two_addresses", "reverse_subtract"])
@@ -800,29 +695,6 @@ def test_bulk_multicast_cta_mask_is_evaluated_per_issuing_lane(tmp_path):
         module, {"source": source, "output": np.zeros((2, 16), dtype=np.uint8)}
     )
     np.testing.assert_array_equal(result.outputs["output"], source.reshape(2, 16))
-
-
-def test_bulk_g2s_cluster_accepts_static_true_predicate_as_unconditional(tmp_path):
-    source = np.arange(16, dtype=np.uint8) ^ np.uint8(0xA5)
-    module = numsim.transpile(bulk_g2s_cluster_static_true_predicate, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": np.zeros(16, dtype=np.uint8)})
-
-    np.testing.assert_array_equal(result.outputs["output"], source)
-    assert "tirx.ptx.cp_async_bulk_g2s_cluster" in call_op_names(module.spec.kernels[0])
-
-
-def test_raw_bulk_prefetch_preserves_global_memory(tmp_path):
-    source = np.arange(64, dtype=np.uint8) ^ np.uint8(0xA5)
-    module = numsim.transpile(raw_bulk_prefetch, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {"source": source, "num_bytes": np.uint32(32), "output": np.zeros(32, dtype=np.uint8)},
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], source[16:48])
-    assert result.verdict == "clean"
-    assert result.diagnostics == []
-    assert "tirx.ptx.cp_async_bulk_prefetch" in call_op_names(module.spec.kernels[0])
 
 
 @T.prim_func

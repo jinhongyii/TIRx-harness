@@ -31,7 +31,7 @@ from tests.numsim.corpus.kernels.gemm import (
     prepare_fp8_blockwise_case,
 )
 from tests.numsim.corpus.kernels.attention import prepare_flash_attention4_case
-from tirx_harness.numsim.bindings import _tensor_map_base_array
+from tests.numsim.support.host_bindings import tensor_map_base_array
 
 
 @dataclass(frozen=True)
@@ -118,7 +118,7 @@ def _prepared_numsim_case(case) -> PreparedWikiRacecheckCase:
     for tensor_map_name, buffer_name in tensor_map_buffers.items():
         tensor_map = args.pop(tensor_map_name, None)
         if tensor_map is not None:
-            array = _tensor_map_base_array(tensor_map)
+            array = tensor_map_base_array(tensor_map)
             if buffer_name == "q_gmem":
                 array = array.reshape(-1, array.shape[-1])
             expected = next(

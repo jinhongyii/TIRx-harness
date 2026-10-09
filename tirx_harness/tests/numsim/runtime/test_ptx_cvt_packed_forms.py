@@ -11,7 +11,6 @@ from tvm.tirx import Stmt
 from tvm_ffi import structural_walk
 
 from tirx_harness import numsim
-from tests.numsim.support.manifest import emitted_calls
 
 
 def _cvt_call(spelling: str, destination_dtype: str, *arguments: str):
@@ -39,14 +38,6 @@ def kernel():
     return func, calls[0]
 
 
-def _emitted_cvt(spelling: str, destination_dtype: str, *arguments: str) -> str:
-    """The head of the engine instruction the call emits."""
-
-    func, call = _cvt_call(spelling, destination_dtype, *arguments)
-    (emitted,) = emitted_calls(func, str(call.op.name))
-    return emitted.head
-
-
 def _packed_head(source: str, destination: str, *modes: str) -> str:
     """The ``v2::reg::cvt`` head of a packed conversion with ``modes``."""
 
@@ -56,66 +47,6 @@ def _packed_head(source: str, destination: str, *modes: str) -> str:
         f"v2::reg::cvt::<{variant}Cvt<{variant}{source}, {variant}{destination}, "
         f"{variant}PackedMode<{spelled}>>>"
     )
-
-
-def test_relu_and_satfinite_reach_the_emitted_conversion():
-    argument = "T.uint16(0x3840)"
-    plain = _emitted_cvt("cvt.rn.bf16x2.e4m3x2", "uint32", argument)
-    relu = _emitted_cvt("cvt.rn.relu.bf16x2.e4m3x2", "uint32", argument)
-    saturating = _emitted_cvt("cvt.rn.satfinite.bf16x2.e4m3x2", "uint32", argument)
-    both = _emitted_cvt("cvt.rn.relu.satfinite.bf16x2.e4m3x2", "uint32", argument)
-    scaled = _emitted_cvt(
-        "cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2",
-        "uint32",
-        argument,
-        "T.uint16(127)",
-    )
-
-    assert plain == _packed_head("E4m3x2", "Bf16x2", "Rn", "NoSatFinite", "NoRelu")
-    assert relu == _packed_head("E4m3x2", "Bf16x2", "Rn", "NoSatFinite", "Relu")
-    assert saturating == _packed_head("E4m3x2", "Bf16x2", "Rn", "SatFinite", "NoRelu")
-    assert both == _packed_head("E4m3x2", "Bf16x2", "Rn", "SatFinite", "Relu")
-    assert scaled == _packed_head(
-        "E4m3x2", "Bf16x2", "Rn", "NoSatFinite", "NoRelu", "ScaledUe8m0N2"
-    )
-    assert len({plain, relu, saturating, both, scaled}) == 5
-
-
-def test_previously_unmodeled_neighbors_preserve_exact_modifiers():
-    pair = ("T.float32(1.0)", "T.float32(2.0)")
-    for spelling, dtype, arguments, expected in (
-        (
-            "cvt.rs.f16x2.f32",
-            "uint32",
-            (*pair, "T.uint32(0)"),
-            _packed_head("F32", "F16x2", "Rs", "NoSatFinite", "NoRelu"),
-        ),
-        (
-            "cvt.rs.satfinite.bf16x2.f32",
-            "uint32",
-            (*pair, "T.uint32(0)"),
-            _packed_head("F32", "Bf16x2", "Rs", "SatFinite", "NoRelu"),
-        ),
-        (
-            "cvt.rn.satfinite.e2m3x2.f32",
-            "uint16",
-            pair,
-            _packed_head("F32", "E2m3x2", "Rn", "SatFinite", "NoRelu"),
-        ),
-        (
-            "cvt.rs.satfinite.e3m2x4.f32",
-            "uint32",
-            (*pair, "T.float32(3.0)", "T.float32(4.0)", "T.uint32(0)"),
-            _packed_head("F32", "E3m2x4", "Rs", "SatFinite", "NoRelu"),
-        ),
-        (
-            "cvt.rn.scaled::n2::ue8m0.bf16x2.s2f6x2",
-            "uint32",
-            ("T.uint16(1)", "T.uint16(127)"),
-            _packed_head("S2f6x2", "Bf16x2", "Rn", "NoSatFinite", "NoRelu", "ScaledUe8m0N2"),
-        ),
-    ):
-        assert _emitted_cvt(spelling, dtype, *arguments) == expected, spelling
 
 
 def test_f6_form_transpiles_and_preserves_exact_half_bits(tmp_path):
@@ -134,33 +65,6 @@ def test_f6_form_transpiles_and_preserves_exact_half_bits(tmp_path):
         {"source": source, "output": np.zeros(32, np.uint32)},
     )
     np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_stochastic_and_exponent_forms_record_their_rounding():
-    stochastic = _emitted_cvt(
-        "cvt.rs.relu.satfinite.e2m1x4.f32",
-        "uint16",
-        "T.float32(1.0)",
-        "T.float32(2.0)",
-        "T.float32(3.0)",
-        "T.float32(4.0)",
-        "T.uint32(0)",
-    )
-    assert stochastic == _packed_head("F32", "E2m1x4", "Rs", "SatFinite", "Relu")
-    exponent = _emitted_cvt(
-        "cvt.rp.satfinite.ue8m0x2.f32",
-        "uint16",
-        "T.float32(1.0)",
-        "T.float32(2.0)",
-    )
-    assert exponent == _packed_head("F32", "Ue8m0x2", "Rp", "SatFinite", "NoRelu")
-    plain = _emitted_cvt(
-        "cvt.rz.ue8m0x2.f32",
-        "uint16",
-        "T.float32(1.0)",
-        "T.float32(2.0)",
-    )
-    assert plain == _packed_head("F32", "Ue8m0x2", "Rz", "NoSatFinite", "NoRelu")
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,11 @@
+{
+ "case": "vsa_multishape",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

@@ -1,0 +1,17 @@
+{
+ "case": "recurrent_kda_decode_grouped",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out": {
+   "dtype": "uint16",
+   "sha256": "bcce95cbe701935a249f7e04b7c584f0aa97fabc486b188fb14ede506d66156d",
+   "shape": [
+    256
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

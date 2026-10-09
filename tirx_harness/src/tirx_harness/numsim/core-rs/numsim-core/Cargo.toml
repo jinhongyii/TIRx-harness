@@ -1,0 +1,60 @@
+[package]
+name = "numsim-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "numsim_core"
+path = "src/lib.rs"
+
+[dependencies]
+numsim-types = { path = "../numsim-types" }
+numsim-oplib = { path = "../numsim-oplib" }
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+
+[dev-dependencies]
+# W4: replay numsim-oplib cvt goldens through resolve_ptx.
+numsim-oplib = { path = "../numsim-oplib", features = ["goldens"] }
+# W3: differential tests of sync::* against numsim-sync-ref (tests/sync_differential.rs).
+numsim-sync-ref = { path = "../numsim-sync-ref" }
+proptest = { version = "=1.6.0", default-features = false, features = ["std"] }
+# Criterion microbenches (benches/).
+criterion = { version = "=0.5.1", default-features = false }
+
+# W2: interpreter dispatch / memory microbenches.
+[[bench]]
+name = "interp"
+harness = false
+
+# W4: oplib ALU / PTX hot-form microbenches.
+[[bench]]
+name = "oplib"
+harness = false
+
+# W6: synccheck reduction guards (one row per pruning technique).
+[[bench]]
+name = "synccheck"
+harness = false
+
+# W5: racecheck pruning-technique guards (packed stamps, exact-hit update,
+# join memo, frontier eviction window); corpus on/off table:
+# `cargo run --release --example racecheck_tuning_table`.
+[[bench]]
+name = "racecheck"
+harness = false
+
+# W13: interpreter hot-path guards (spin_hash memo, register-file
+# admission, special registers, arena spans).
+[[bench]]
+name = "interp_hot"
+harness = false
+
+# W6: SyncTable::step_all on the per-lane batch shapes of a cp.async GEMM
+# (fp16_bf16_gemm): 32-lane issue / commit / wait batches, plus a wait that
+# blocks on one lane and rolls the batch back.
+[[bench]]
+name = "sync"
+harness = false

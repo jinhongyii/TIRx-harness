@@ -1,0 +1,25 @@
+{
+ "case": "flashinfer_rmsnorm_quant",
+ "diagnostics": [
+  {
+   "anchors": [],
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "register",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "out": {
+   "dtype": "uint8",
+   "sha256": "7d11775cc5355dbca983c78c2aeb6abf86c5623c10092605a49ca0f096b21377",
+   "shape": [
+    65
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "review"
+}

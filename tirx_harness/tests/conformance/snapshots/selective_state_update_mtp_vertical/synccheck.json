@@ -1,0 +1,19 @@
+{
+ "case": "selective_state_update_mtp_vertical",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [],
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "register",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

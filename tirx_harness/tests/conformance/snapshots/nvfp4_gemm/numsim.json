@@ -1,0 +1,18 @@
+{
+ "case": "nvfp4_gemm",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "D": {
+   "dtype": "uint16",
+   "sha256": "9805450347185a4f17eb8ad6b67633b8efb1ad74700b60297f020f110e4001e7",
+   "shape": [
+    256,
+    256
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

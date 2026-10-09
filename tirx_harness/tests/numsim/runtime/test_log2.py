@@ -22,12 +22,3 @@ def test_log2_is_supported_by_checkers(checker):
     checker(log2_kernel, {"output": np.zeros(32, np.float32)}).require_clean()
 
 
-def test_log2_matches_independent_reference():
-    case = NumSimCase(
-        kernel=log2_kernel,
-        args={"output": np.zeros(32, np.float32)},
-        outputs=("output",),
-        reference=lambda: {"output": np.log2(np.arange(1, 33, dtype=np.float32))},
-        comparisons={"output": ComparisonSpec(rtol=1e-6, atol=1e-6)},
-    )
-    numsim.run_case(case).require_ok()

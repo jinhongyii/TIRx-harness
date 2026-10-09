@@ -1,0 +1,24 @@
+{
+ "case": "fastcu_nvfp4_gemm_gb300",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "C": {
+   "dtype": "float16",
+   "sha256": "0e2562c22541e6e9375a87ddedc5613cbfb4a997939478845fb997c06f1e5f49",
+   "shape": [
+    32768
+   ]
+  },
+  "placement_errors": {
+   "dtype": "uint32",
+   "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+   "shape": [
+    1
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

@@ -1,0 +1,34 @@
+{
+ "case": "cudnn_sm100_dense_blockscaled_gemm_persistent_dsrelu_quant",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/cudnn/dsrelu/dense_blockscaled_gemm_persistent_dsrelu_quant.py:122:1-122:53",
+      "tirx_kernels/ported/cudnn/dsrelu/dense_blockscaled_gemm_persistent_dsrelu_quant.py:1917:1-1917:73"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/cudnn/dsrelu/dense_blockscaled_gemm_persistent_dsrelu_quant.py:122:1-122:53",
+      "tirx_kernels/ported/cudnn/dsrelu/dense_blockscaled_gemm_persistent_dsrelu_quant.py:1945:1-1945:99"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    }
+   ],
+   "verdict": "error"
+  }
+ ],
+ "schema": 4
+}

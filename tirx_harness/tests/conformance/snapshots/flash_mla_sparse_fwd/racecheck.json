@@ -1,0 +1,25 @@
+{
+ "case": "flash_mla_sparse_fwd",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head64_phase1.py:1383:1-1383:42",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head64_phase1.py:714:1-714:39"
+     ],
+     "bytes": {
+      "shared": "229376-229380"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

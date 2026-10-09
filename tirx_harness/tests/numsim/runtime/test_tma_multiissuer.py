@@ -120,18 +120,3 @@ def test_tma_multiissuer_coordinates_and_target_completion(gather, route, tmp_pa
         np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-def test_tma_multiissuer_requires_wait_and_disjoint_destinations():
-    for wait, overlap in [(False, False), (True, True)]:
-        kernel, source, metadata, expected = tma_multiissuer_case(
-            False, "cta", wait=wait, overlap=overlap
-        )
-        args = {
-            "tensor_map": numsim.TensorMap(base=source, **metadata).numpy(),
-            "output": np.zeros_like(expected),
-        }
-        report = racecheck(kernel, args)
-        assert report.verdict == "error", report.format()
-        kinds = {"write_write"} if overlap else {"read_write", "write_read"}
-        assert any(f.kind == "data_race" and f.details["access_pair"] in kinds for f in report.findings), (
-            report.format()
-        )

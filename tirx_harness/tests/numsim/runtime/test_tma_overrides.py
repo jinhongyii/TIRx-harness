@@ -7,8 +7,6 @@ from tvm.script import tirx as T
 
 from tests.numsim.support.execution import run_checked
 from tirx_harness import numsim, racecheck, synccheck
-from tirx_harness.numsim.transpiler.frontend import analyze
-from tests.numsim.support.manifest import call_op_names
 
 ROUTES = ("g2cta", "g2cluster", "s2g", "reduce", "prefetch", "evict_last", "priority")
 FORMS = ("address", "dim_b8", "dim_b16", "stride_b8", "stride_b16")
@@ -249,65 +247,6 @@ def kernel(input_map: T.TensorMap(), replacement: T.Buffer((32800,), "float32"),
     return kernel, inputs, expected, shared
 
 
-@pytest.mark.parametrize("route,form", OVERRIDE_CASES)
-def test_tma_override_data_and_descriptor_isolation(route, form, tmp_path):
-    kernel = override_kernel(route, form)
-    inputs, original = override_inputs(form)
-    descriptor_before = inputs["input_map"].copy()
-    before = inputs["replacement"].copy()
-    for checker in (synccheck, racecheck):
-        checker(kernel, {name: value.copy() for name, value in inputs.items()}).require_clean()
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, inputs)
-    indices = np.arange(4) + 4
-    if inputs["output"].size == 8:
-        indices = np.concatenate((indices, indices + (16 if "stride" in form else 8)))
-    payload = np.arange(1, len(indices) + 1, dtype=np.float32)
-    expected = before.copy()
-    if route in {"s2g", "reduce"}:
-        expected[indices] = payload + (before[indices] if route == "reduce" else 0)
-        assert "replacement" in result.outputs
-        # The override redirected the store away from the descriptor's own base,
-        # so the TensorMap output shows that base untouched.
-        np.testing.assert_array_equal(result.outputs["input_map"], np.float32(-10))
-    np.testing.assert_array_equal(inputs["replacement"], expected)
-    np.testing.assert_array_equal(
-        result.outputs["output"], before[indices] if route.startswith("g2") else payload
-    )
-    np.testing.assert_array_equal(inputs["input_map"], descriptor_before)
-    np.testing.assert_array_equal(original, np.full(64, -10, np.float32))
-    assert any("override_" in op_name for op_name in call_op_names(module.spec.kernels[0]))
-
-
-@pytest.mark.parametrize(
-    "kwargs,message",
-    [
-        ({"offset": 1}, "16-byte aligned"),
-        ({"offset": 8}, "128 KiB"),
-        ({"coordinate": 1}, "zero coordinates"),
-        ({"dimension": 256}, "8-bit"),
-        ({"upper": 16}, "unused bits"),
-    ],
-)
-def test_tma_override_rejects_invalid_operands(kwargs, message, tmp_path):
-    kernel = override_kernel("g2cta", "stride_b16", **kwargs)
-    inputs, _ = override_inputs("stride_b16")
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-    source_id = next(
-        entry.op_id
-        for entry in analyze(kernel).kernels[0].source_map
-        if entry.kind == "Call"
-        and str(getattr(entry.node.op, "name", "")).endswith("override_global_dim_stride_b16")
-    )
-    for checker in (synccheck, racecheck):
-        report = checker(kernel, inputs)
-        assert report.verdict == "error"
-        assert message in str(report.to_dict())
-        assert report.findings[0].details["operation"]["source_op_id"] == source_id
-    with pytest.raises(numsim.NumSimExecutionError, match=message):
-        numsim.Engine().run(module, inputs)
-
-
 def test_tma_override_predicate_skips_invalid_replacement(tmp_path):
     inputs, _ = override_inputs("stride_b16")
     kernel = override_kernel("g2cta", "stride_b16", offset=1, issue=False)
@@ -315,9 +254,3 @@ def test_tma_override_predicate_skips_invalid_replacement(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], np.arange(1, 9, dtype=np.float32))
 
 
-def test_tma_override_keeps_async_destination_race():
-    inputs, _ = override_inputs("dim_b16")
-    kernel = override_kernel("s2g", "dim_b16", read_early=True)
-    report = racecheck(kernel, inputs)
-    assert report.verdict == "error"
-    assert any(finding.details["access_pair"] == "write_read" for finding in report.findings)

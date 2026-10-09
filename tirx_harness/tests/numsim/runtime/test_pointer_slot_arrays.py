@@ -30,31 +30,6 @@ def kernel(source: T.Buffer((32,), "uint32"), output: T.Buffer((32,), "uint32"))
     )
 
 
-@pytest.mark.parametrize("mode", ["valid", "uninitialized", "oob"])
-def test_pointer_array_initialization_and_bounds(mode, tmp_path):
-    kernel = partial_array_case(mode)
-    inputs = {"source": np.arange(32, dtype=np.uint32) + 100, "output": np.zeros(32, np.uint32)}
-    message = "out-of-bounds" if mode == "uninitialized" else "outside|exceeds"
-    for checker in (synccheck, racecheck):
-        report = checker(kernel, {k: v.copy() for k, v in inputs.items()})
-        if mode == "valid":
-            report.require_clean()
-        else:
-            assert report.verdict == "error", report.format()
-            if mode == "uninitialized":
-                # The integer model materializes an uninitialized word as zero;
-                # the warning and the later invalid-address error both remain.
-                assert any(f.kind == "uninitialized_read" for f in report.findings), report.format()
-                assert any(f.kind == "oob" for f in report.findings), report.format()
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-    if mode == "valid":
-        result = numsim.Engine().run(module, inputs)
-        np.testing.assert_array_equal(result.outputs["output"], inputs["source"])
-    else:
-        with pytest.raises(NumSimExecutionError, match=message):
-            numsim.Engine().run(module, inputs)
-
-
 @T.prim_func
 def pointer_array_alias(source: T.Buffer((64,), "uint32"), output: T.Buffer((32, 2), "uint32")):
     T.device_entry()

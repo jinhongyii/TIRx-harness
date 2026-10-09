@@ -1,0 +1,31 @@
+{
+ "case": "flash_attention_backward_sm100",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "dK_g": {
+   "dtype": "float16",
+   "sha256": "9260a8907102f8a44b1320adf85a7c6849edc08adaccb12a7fbc5cf537ff4b32",
+   "shape": [
+    32768
+   ]
+  },
+  "dQ_acc_g": {
+   "dtype": "float32",
+   "sha256": "5491c8a384c3dec7c3befb1f2bf86348e70ff6c300a6c716bfd198dfc2bc692e",
+   "shape": [
+    32768
+   ]
+  },
+  "dV_g": {
+   "dtype": "float16",
+   "sha256": "237615352061c5e3bcba9cb6ad48f0bdb3a9cc14b791adfbd5fcbb23ed4bc779",
+   "shape": [
+    32768
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

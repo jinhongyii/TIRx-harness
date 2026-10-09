@@ -1,0 +1,17 @@
+{
+ "case": "msa_decode_multishape",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "0ec23590895ccabcc97fef114e5713271e977f771b628e10c82ade57fe9106db",
+   "shape": [
+    2048
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

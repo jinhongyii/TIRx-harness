@@ -1,0 +1,40 @@
+{
+ "case": "cudnn_sm100_gdn_bprop_f16",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  },
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:1709:1-1709:50"
+     ],
+     "bytes": {
+      "shared": "150528-183296"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:1716:1-1716:50"
+     ],
+     "bytes": {
+      "shared": "68608-101376"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

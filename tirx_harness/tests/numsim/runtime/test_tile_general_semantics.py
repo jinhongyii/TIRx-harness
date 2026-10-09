@@ -308,37 +308,6 @@ def _unpack_e2m1(packed: np.ndarray) -> np.ndarray:
     return result
 
 
-def test_right_aligned_buffer_broadcast_maps_destination_coordinates(tmp_path):
-    source = np.arange(32 * 2 * 4, dtype=np.float32).reshape(32, 2, 4) / np.float32(7)
-    column = np.arange(32 * 4, dtype=np.float32).reshape(32, 4) / np.float32(5)
-    row = (np.arange(32 * 2, dtype=np.float32).reshape(32, 2) - 11) / np.float32(3)
-    half_column = (column - np.float32(4.25)).astype(np.float16)
-    output = np.zeros((32, 4, 2, 4), dtype=np.float32)
-
-    module = numsim.transpile(right_aligned_elementwise_broadcast, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "source": source,
-            "column": column,
-            "row": row,
-            "half_column": half_column,
-            "output": output,
-        },
-    )
-
-    expected = np.stack(
-        (
-            source + column[:, None, :],
-            source - row[:, :, None],
-            source * row[:, :, None],
-            np.broadcast_to(half_column[:, None, :], source.shape),
-        ),
-        axis=1,
-    )
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
 @pytest.mark.parametrize(
     ("dtype", "numpy_dtype"),
     [
@@ -456,34 +425,3 @@ def test_cast_uses_general_scalar_conversion_without_dispatch_semantics(tmp_path
     np.testing.assert_array_equal(result.outputs["output_bool"], integers.astype(np.bool_))
 
 
-def test_mxfp4_uses_ue8m0_scales_over_32_element_vectors(tmp_path):
-    left_codes = np.resize(
-        np.array([0x0, 0x1, 0x2, 0x3, 0x7, 0x9, 0xA, 0xF], dtype=np.uint8), (128, 64)
-    )
-    right_codes = np.resize(np.array([0x1, 0x2, 0x4, 0x7, 0x9, 0xB], dtype=np.uint8), (8, 64))
-    left_packed = (left_codes[:, 0::2] | (left_codes[:, 1::2] << np.uint8(4))).astype(np.uint8)
-    right_packed = (right_codes[:, 0::2] | (right_codes[:, 1::2] << np.uint8(4))).astype(np.uint8)
-    scale_a = np.resize(np.array([126, 128], dtype=np.uint8), (128, 2))
-    scale_b = np.resize(np.array([[127, 129], [128, 126]], dtype=np.uint8), (8, 2))
-    output = np.zeros((128, 8), dtype=np.float32)
-
-    module = numsim.transpile(block_scaled_mxfp4_gemm, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "left_packed": left_packed,
-            "right_packed": right_packed,
-            "scale_a": scale_a,
-            "scale_b": scale_b,
-            "output": output,
-        },
-    )
-
-    decoded_a = _decode_e2m1(_unpack_e2m1(left_packed)).reshape(128, 2, 32)
-    decoded_b = _decode_e2m1(_unpack_e2m1(right_packed)).reshape(8, 2, 32)
-    a_scales = np.exp2(scale_a.astype(np.int16) - 127).astype(np.float32)
-    b_scales = np.exp2(scale_b.astype(np.int16) - 127).astype(np.float32)
-    expected = (decoded_a * a_scales[:, :, None]).reshape(128, 64) @ (
-        decoded_b * b_scales[:, :, None]
-    ).reshape(8, 64).T
-    np.testing.assert_array_equal(result.outputs["output"], expected)

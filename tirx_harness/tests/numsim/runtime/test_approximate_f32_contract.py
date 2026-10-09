@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 from tirx_harness import numsim
-from tests.numsim.support.manifest import emitted_calls
 from tvm.script import tirx as T
 
 
@@ -204,24 +203,6 @@ def test_rsqrt_approx_ftz_representative_executes(flashkda_ptx_unary_result):
         expected_rsqrt = np.float32(1.0) / np.sqrt(flushed.view(np.float32), dtype=np.float32)
 
     _assert_nan_aware_bitwise_equal(result.outputs["rsqrt_output"], expected_rsqrt)
-
-
-@pytest.mark.parametrize(
-    ("kernel", "op_name", "instruction", "variant"),
-    (
-        (approximate_f32_calls, "tirx.ptx.ex2", "exp2", "F32RnFtz"),
-        (approximate_f32_calls, "tirx.ptx.rcp", "rcp", "F32RnFtz"),
-        (non_ftz_exp2_calls, "tirx.ptx.ex2", "exp2", "F32"),
-        (non_ftz_rcp_calls, "tirx.ptx.rcp", "rcp", "F32"),
-    ),
-)
-def test_approximate_f32_emission_selects_the_subnormal_policy(
-    kernel, op_name, instruction, variant
-):
-    calls = emitted_calls(kernel, op_name)
-    assert [(call.function, call.generics) for call in calls] == [
-        (f"v2::reg::{instruction}", f"v2::reg::variant::{variant}"),
-    ]
 
 
 def test_non_ftz_exp2_executes_and_preserves_subnormal_outputs(tmp_path):

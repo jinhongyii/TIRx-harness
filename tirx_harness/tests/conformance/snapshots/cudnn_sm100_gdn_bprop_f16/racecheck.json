@@ -1,0 +1,79 @@
+{
+ "case": "cudnn_sm100_gdn_bprop_f16",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  },
+  {
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:541:1-541:55",
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:932:1-932:27"
+     ],
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:541:1-541:55",
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:956:1-956:27"
+     ],
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:574:1-574:55",
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:581:1-581:55"
+     ],
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:1709:1-1709:50"
+     ],
+     "bytes": {
+      "shared": "150528-183296"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/cudnn/linear_attention/gdn_bprop_f16.py:1716:1-1716:50"
+     ],
+     "bytes": {
+      "shared": "68608-101376"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

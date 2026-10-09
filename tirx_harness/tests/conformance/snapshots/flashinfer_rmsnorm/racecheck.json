@@ -1,0 +1,24 @@
+{
+ "case": "flashinfer_rmsnorm",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/norm/rmsnorm.py:205:1-205:34"
+     ],
+     "bytes": {
+      "shared": "256-2048"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

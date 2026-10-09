@@ -16,8 +16,6 @@ from tirx_harness.numsim.cases import (
     NumSimCase,
     TensorMap,
 )
-from tirx_harness.numsim.host_abi import build_host_abi
-from tirx_harness.numsim.transpiler.frontend import analyze
 
 selective_state_update_stp_simple = load_tirx_kernel("selective_state_update_stp_simple")
 selective_state_update_stp_vertical = load_tirx_kernel("selective_state_update_stp_vertical")
@@ -309,13 +307,8 @@ def _prepare_selective_state_update_case(
             box_shape=(_DIM, 1, tokens, 1),
         )
 
-    module_spec = analyze(kernel)
-    host_abi = build_host_abi(module_spec)
-    binding_names = {
-        slot.canonical_name
-        for slot in host_abi.slots
-        if slot.canonical_name not in host_abi.implicit_tensor_map_names
-    }
+    # One PrimFunc: its host bindings are exactly its parameters.
+    binding_names = {parameter.name for parameter in kernel.params}
     missing = binding_names - candidates.keys()
     if missing:
         raise ValueError(f"missing selective-state-update bindings: {sorted(missing)}")

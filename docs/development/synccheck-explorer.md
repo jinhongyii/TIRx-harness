@@ -1,0 +1,902 @@
+---
+orphan: true
+---
+
+# Synccheck explorer: spec of today's algorithm and the plan for the rewrite
+
+Status: implemented, 2026-10-08, branch `refactor/clean-core`, worker W6.
+Contract: [`numsim-redesign.md`](numsim-redesign.md) §2.1 (Synccheck row), §2.6, §3, §6.
+Implementation: `tirx_harness/src/tirx_harness/numsim/core-rs/numsim-core/src/synccheck/`.
+Reduction benchmarks: `numsim-core/benches/synccheck.rs` (§5.9).
+Sections 1-4 specify the legacy algorithm that the rewrite preserves; §5 describes the rewrite.
+
+This document pins down how today's Synccheck works so the rewrite keeps the
+semantics and the pruning, and says what the new explorer needs from the
+`SyncEvent` contract. Unless stated otherwise, paths are relative to
+`tirx_harness/src/tirx_harness/numsim/engine-rs/src/`. Short names used below:
+
+| short | file |
+| --- | --- |
+| `check` | `native_analysis/synccheck/sync_check.rs` |
+| `unified` | `native_analysis/synccheck/sync_fixed_unified.rs` |
+| `verifier` | `native_analysis/synccheck/sync_fixed_verifier.rs` |
+| `po` | `native_analysis/synccheck/sync_partial_order.rs` |
+| `py` | `native_analysis/synccheck/sync_check_python.rs` |
+| `causal` | `native_analysis/sync_causality.rs` |
+| `log` | `resolved_transition.rs` |
+| `search` | `analysis_search.rs` |
+| `setmax` | `native_analysis/synccheck/setmaxnreg_verifier.rs` |
+| `strict` | `native_analysis/synccheck/strict_mbarrier.rs` |
+
+---
+
+## 1. Two phases
+
+Synccheck runs the kernel once on the CPU (Phase A, online) and then checks the
+synchronization program that run produced for every other interleaving
+(Phase B, offline). Driver: `run_native_sync_check_phase` (`py:103-196`).
+
+### 1.1 What is "fixed"
+
+For one invocation (inputs, launch shape), Phase B fixes everything the
+concrete run decided (`docs/components/tools.md` "Guarantee", and the
+`FixedSyncLogSnapshot` fields at `log:1456-1468`):
+
+* **Each warp's executed path.** Sync operations per warp are ordered by
+  `DynamicOpId::per_warp_sequence` (`unified:2196-2210`). Data-dependent
+  branches, loop trip counts, lane masks, `elect_sync` winners, and computed
+  barrier addresses are already resolved, so a command carries concrete
+  resource ids and counts.
+* **Values.** Arrival counts, transaction bytes, requested parities, named
+  barrier expected counts, setmaxnreg targets, and TCGEN columns come from the
+  run.
+* **Causal annotations.** Each operation has an `initial_clock`
+  (at issue/registration) and a committed `clock` (after acquire)
+  (`log:1448-1453`, `log:1482-1503`). Each operation has a
+  `canonical_generation` when it touches exactly one generation
+  (`unified:3143-3202`). Conditional (`try_wait` returned true) completions
+  are fixed per barrier and issuer (`log:1462-1463`, used at `unified:788-839`).
+  Setmax participants/resolutions and TCGEN allocation results are fixed too
+  (`log:1464-1467`).
+
+Free in Phase B: the interleaving of warps, the delivery time of async
+completions (`FixedSyncTransition::Complete`), and setmaxnreg pool grants
+(`SetmaxGrant`) (`unified:59-64`).
+
+Out of scope ("Limitations" in `tools.md`): other inputs, ordinary-memory
+values, atomic return orders, and control flow that depends on a protocol
+return value. The last one is enforced statically: the frontend marks a kernel
+`fixed_trace_statically_eligible` unless its sync slice has an unknown tile call
+(`tirx_harness/frontend-rs/src/emit/module.rs:435-442`,
+`frontend-rs/src/analyze/tile_forms/mod.rs:442-451`). An ineligible kernel whose
+Phase A is clean is reported as incomplete with
+`fixed_sync_state_ineligible` (`py:706-716`).
+
+### 1.2 Phase A (online) findings
+
+`SyncCheckMode` is an engine mode (`check:3444-3786`). Every sync effect is
+staged in `before_effect` against a clone of the strict protocol
+(`check:1364-1454`), then committed in `after_effect` (`check:1456`), with
+causal checks along the way: `apply_mbarrier_commit_causality`
+(`check:3155`), `apply_mbarrier_wait_causality` (`check:3285`),
+`apply_named_barrier_causality` (`check:3352`), and
+`apply_cluster_barrier_causality` (`check:3400`). On a rejection, the engine
+records a `SyncCheckFinding` (`check:491-511`) and returns an `EngineError`, so
+the offending warp operation fails. Racecheck continues after a finding;
+Phase A does not.
+
+Phase A finds:
+
+* Strict protocol errors, with `kind` from `mbarrier_error_kind`
+  (`py:2080-2117`), `named_barrier_error_kind` (`py:2119-2145`), and
+  `cluster_barrier_error_kind` (`py:2054-2078`). Examples:
+  `mbarrier_use_before_init`, `mbarrier_arrival_overflow`,
+  `mbarrier_arrive_before_consumption`, `mbarrier_transaction_over_delivery`,
+  `named_barrier_contract_mismatch`, and `full_cta_aligned_control`
+  (the terminal check at `check:1231-1247`).
+* Happens-before errors in the observed run, with `kind` from
+  `causality_error_kind` (`py:2000-2052`). The main ones are
+  `mbarrier_init_not_happens_before_use` (`causal:1143-1161`) and
+  `mbarrier_prior_generation_consumption_not_happens_before`
+  (`causal:1163-1235`). The tracker records only causal evidence. CPU order
+  alone is never accepted (`causal:1-6`, test `causal:1386-1406`).
+* Execution errors from the engine: the executor `deadlock` (with
+  `blocked_operations` and `stalled_operations`, `py:1730-1843`),
+  `synchronization_contract_mismatch`, `warp_collective_divergence`,
+  `setmaxnreg_missing_warpgroup_sync`, `setmaxnreg_pool_deadlock`, and similar.
+  `engine_error_kind` names them.
+* Incomplete reasons, listed in §2.8.
+
+Phase B runs only when Phase A is clean and the launch succeeded
+(`py:151-166`). `fixed_verification_required` (`py:257-258`) states the same
+condition.
+
+### 1.3 Phase B (offline) findings
+
+`verify_fixed_sync_programs` (`verifier:240-377`) produces:
+
+* `FixedSyncVerificationError::Protocol`: a strict step failed in some
+  schedule, or a certificate refuted the program (`verifier:72-79`). Payload
+  kind: `fixed_sync_protocol_error`.
+* `Deadlock`: no transition is enabled and the program is not complete
+  (`verifier:80-85`). Payload kind: `deadlock`, with `verification: "fixed_sync"`.
+* `NonConfluent`: more than one distinct terminal state (`verifier:86-91`).
+  Payload kind: `fixed_sync_nonconfluent`.
+* `FixedSyncVerificationIncomplete`, listed in §2.8.
+
+---
+
+## 2. Phase B algorithm
+
+### 2.1 Log to per-warp command sequences
+
+1. **Snapshot.** `with_fixed_sync_snapshot` (`log:1886-2108`) locks the log
+   and exposes `operations_with_clocks()` (`log:1482-1503`). Each operation
+   yields `(DynamicOpId, ResolvedTransitionSummary, initial_clock, clock)`. It
+   also exposes completion generations by action id and the side tables.
+2. **Collectives first.** `build_setmax_commands` (`unified:3579`) and
+   `build_tcgen_commands` (`unified:3818`) merge the per-warp records of one
+   collective (one setmaxnreg request, one TCGEN lifecycle op) into a single
+   `FixedSyncCommand` with several `participants`
+   (`unified:67-74`, `unified:697-712`). The command's clocks are the join of
+   the participants' clocks (`merge_command_clock`, `unified:3204-3218`).
+3. **Everything else.** `stage_noncollective_operations` (`unified:2723-2758`)
+   turns each summary into one `FixedSyncCommandKind` through
+   `command_from_summary` (`unified:3327`). The kinds are in `unified:118-179`:
+   init, init fence, inval, arrive, expect_tx, wait, wait batch, completion
+   issue, named arrive/sync, cluster arrive/wait, setmax, and TCGEN. This step
+   runs on up to 8 threads (`unified:29`, `unified:730-779`).
+4. **Per-warp programs.** In each projection, `build_projection` sorts every
+   participant's commands by `per_warp_sequence`. The result is
+   `warp_programs[warp] = [CommandId…]` and the reverse map
+   `warp_command_positions` (`unified:2196-2296`, `unified:2367-2383`).
+   `validate_collective_placement` (`unified:2304-2364`) checks that every
+   collective appears exactly once in each participant's program.
+
+### 2.2 Per-resource projection and the "unified" state
+
+**Keys.** `FixedSyncProjectionKey` (`unified:554-566`):
+
+| key | resources in one projection |
+| --- | --- |
+| `Mbarrier(anchor)` | one mbarrier, or every barrier joined by one multi-barrier wait (`mbarrier_component_anchors`, `unified:2638-2687`) |
+| `NamedBarrier(id)` | one named barrier of one CTA |
+| `ClusterBarrier(id)` | one cluster barrier |
+| `SetmaxnregPool{kernel, cta}` | one CTA register pool |
+| `TcgenCtaComponent{kernel, anchor}` | CTAs connected by 2-CTA TCGEN ops (`tcgen_component_anchors`, `unified:2595-2636`) |
+
+`stage_fixed_sync_command` (`unified:2769-2838`) splits a command that touches
+several anchors (for example a multi-barrier `mbarrier.init`) into one projected
+command per anchor (`for_each_projected_command_kind`, `unified:2880-3131`). A
+wait over several barriers is one atomic blocking command, so those barriers
+stay in one projection.
+
+**Happens-before gating.** Projection hides cross-resource ordering. Today's
+code puts it back as `causal_predecessors`. Command `d` gates command `c` when
+both are in the projection and `d.clock` (committed) strictly happens-before
+`c.initial_clock` (`build_causal_predecessors`, `unified:2696-2721`).
+`command_ready` requires every gating command to be completed: each
+participant's cursor must be past it (`unified:4019-4052`). Readiness uses
+the clock at issue, not the acquired clock, because a blocking wait's
+committed clock already includes the operation that woke it
+(`unified:2701-2704`).
+
+**The "unified" state.** `FixedSyncState` (`unified:239-335`) holds every
+protocol at once: mbarriers, named, cluster, setmax pools, pending
+completions, TCGEN CTAs, blocked warps, and cluster waits. The same
+`FixedSyncProgram` transition system can therefore explore one projection or
+a whole multi-protocol program. Tests build whole programs through
+`direct_program` (`unified:5499-5558`).
+`cross_protocol_cycle_is_a_deadlock_not_a_false_clean` (`unified:5883-5964`)
+pins that a named/cluster cycle is reported as a deadlock.
+
+**How cross-resource cycles are still caught when production only explores
+projections:**
+
+1. A cycle that exists in every schedule makes the concrete Phase A run
+   deadlock, so it is reported as an engine `deadlock` before Phase B.
+2. A cycle that depends on the schedule requires some resource whose
+   generation assignment depends on the schedule. That resource's own
+   projection reports it as a certificate refutation, a protocol error, or
+   non-confluence.
+3. The argument is assume-guarantee. Each projection assumes the other
+   resources behave as committed, which only adds HB gates, and each
+   projection proves its own resource behaves as committed. Phase B stops at
+   the first failing projection (`verifier:270-285`, `verifier:347-351`).
+4. Commands that change several resources atomically are never split across
+   projections: wait batches, multi-CTA TCGEN, and collectives.
+
+The equivalence tests check this argument directly. On random, structured,
+rich, lap, register-pool and TMA-issuer logs, the gated per-resource verdict
+equals the ungated whole-program verdict
+(`numsim-core/tests/synccheck_equivalence.rs`).
+
+**Projections that can only be certified.** For named and cluster projections,
+and for plain mbarrier projections (no transactions, completions, expect_tx,
+drop, wait batch, or inval), `build_projection` builds a skeleton with empty
+`warp_programs` (`uses_linear_causal_certificate`, `unified:2131-2187`). These
+projections must be decided by a certificate. A named-barrier projection is
+never state-searched (`unified:5145-5148`).
+
+### 2.3 Causal certificates
+
+`verify_program_causally` (`verifier:449-498`) tries the mbarrier certificate,
+then the named certificate, then the cluster certificate. `None` means not
+applicable. In that case the projection goes to fingerprinting and state
+search. When a certificate applies, its stats are fixed:
+`visited_states = 1`, `explored_transitions = command_count`
+(`verifier:454-460`). On success, the search is skipped. On failure, the
+certificate's error is reported directly with `transition = ValidateExit` and
+an empty witness. Incomplete details become `ProgramModel` incompletes.
+
+Every certificate uses the same counting and vector-clock argument:
+
+* **Counting.** Within one generation, contributions only add to counters, so
+  they commute. If every generation's totals are exact, every schedule with the
+  same generation assignment goes through the same protocol states.
+* **Assignment.** A schedule can only move a contribution to another
+  generation by overtaking. HB conditions between consecutive generations rule
+  that out for every schedule that respects HB.
+
+**Named barrier** (`verify_named_barrier_causally`, `unified:1043-1296`)
+applies to every `NamedBarrier` projection:
+
+* Every command has a `canonical_generation` and an `initial_causal_clock`.
+  If either is missing, the result is incomplete.
+* Generations are contiguous from 0. A gap is incomplete.
+* Within a generation, `expected_arrivals` is constant (else
+  `contract mismatch`). Lane masks are disjoint per
+  `(warp, Arrive|Sync)`, and the arrival total equals `expected_arrivals`
+  exactly.
+* If a generation has an aligned blocking sync, then every blocking sync in it
+  is aligned. Within one warp, all of them share one static instruction
+  (`same_static_instruction`). Different warps may use different inlined sites.
+* The release of generation `g` is the join of the initial clocks of all its
+  contributions. It must happen-before every contribution to `g + 1`
+  (`unified:1259-1279`).
+
+**Cluster barrier** (`verify_cluster_barrier_causally`, `unified:1298-1554`)
+applies to every `ClusterBarrier` projection:
+
+* Arrivals are full-warp (partial is incomplete), and the participant
+  contract is constant without duplicates.
+* Each generation has exactly one arrival from every participant. A missing
+  participant is incomplete
+  ("exit-aware membership is not modeled", `unified:1462-1480`).
+* A warp's wait in `g` is program-ordered after its arrival in `g`. Its
+  arrival in `g + 1` is program-ordered after its wait in `g`. Violations are
+  `CausalProtocol`. An arrival with no prior wait is incomplete.
+* Clocks are not needed here. A wait blocks until all arrivals exist, so
+  program order is enough (doc comment `unified:1289-1296`).
+
+**Mbarrier** (`verify_mbarrier_causally`, `unified:1556-2069`) returns `None`
+for `WaitBatch`, `Invalidate`, or an arrive with `drop`. Otherwise:
+
+* Exactly one `init`. Zero or several inits is incomplete.
+* Every init fence is HB-after the init.
+* Every other command is HB-after the init (`strict_happens_before`:
+  `≤` and not equal, `unified:2558-2560`).
+* Per generation, it accumulates arrivals, pending-arrival raises, expected
+  and completed transaction bytes, mutations, and waits. Non-conditional waits
+  must request parity `g & 1`.
+* Generations are contiguous. If a generation is waited on or followed by
+  another, it must be exact: `arrivals == expected + pending raises` and
+  `completed == expected tx`. Over-arrival is always an error.
+* A generation with a successor must have at least one consuming wait.
+* Every mutation of `g > 0` that requires consumption (all except
+  transaction-only completion issues, `unified:639-651`) must be HB-after some
+  wait of `g - 1`. This is the "arrive/expect_tx before consumption" check.
+* Every wait of `g` must be HB-before some mutation of `g + 1` (the "phase
+  lap" check: the wait cannot be overtaken by the next completion,
+  `unified:1997-2066`). For conditional waits, the successor generation comes
+  from `conditional_wait_successor` (`unified:4100-4132`).
+
+> **Found during implementation:** the overtaking check also fires when `g + 1` is
+> a terminal generation that never completes. In that case nothing can
+> overtake the wait, and the exhaustive search accepts the program. The
+> implementation applies the check only when `g + 1` completes
+> (`certificate.rs`, found by `tests/synccheck_equivalence.rs`).
+
+### 2.4 Fingerprint dedup
+
+The planning loop is `verifier:287-315`. It runs on projections that no
+certificate decided:
+
+* `mbarrier_state_search_fingerprint` (`unified:883-991`) is defined only for
+  `Mbarrier` projections with no setmax/TCGEN state. It hashes the command
+  count and, for each command, the witness warp, the participants, and the
+  kind with counts, parities, and conditional lifetimes. Warps are renamed to
+  their projection-local index. It also hashes `warp_programs` and
+  `causal_predecessors`.
+* A fingerprint match is confirmed by `has_equivalent_mbarrier_state_search`
+  (`unified:993-1041`, per command at `unified:2385-2556`), which guards
+  against hash collisions.
+* Only the first projection of each class is searched. The others report
+  `programs: 1, reused_clean_programs: 1` and no states (`verifier:331-345`).
+  Reuse is only valid after a clean primary, and the code asserts this
+  (`verifier:332-335`). Since search stops at the first failure, a failing
+  primary is never followed by a reuse.
+
+### 2.5 Explicit-state DFS
+
+**Trait** `SyncTransitionSystem` (`po:12-92`): `State: Clone + Eq + Hash`,
+`initial_state`, `enabled_transitions`, `step` (returns `Result`),
+`is_complete`, `describe_deadlock`, and three reduction hooks:
+`persistent_transition`, `strong_diamond`, `commutes`/`successors_commute`.
+
+**Concrete model** (`impl SyncTransitionSystem for FixedSyncProgram`,
+`unified:5133-5461`):
+
+* Transitions are `Issue(cmd)`, `Complete(completion_id)`, `SetmaxGrant`, and
+  `ValidateExit` (`unified:59-64`).
+* `Issue(cmd)` is enabled when the command is the head of every participant,
+  no participant is blocked, its causal predecessors are completed, and the
+  kind-specific readiness holds (`issue_ready`, `unified:4054-4089`):
+  * a conditional wait needs its committed completion to be visible;
+  * a setmax request needs no pending increase in its warpgroup;
+  * a TCGEN dealloc needs quiescence.
+* Every pending completion is enabled. Setmax grants come from
+  `pool.enabled_grants()`, gated by `command_ready`. `ValidateExit` is enabled
+  only when nothing else is, all warps are finished, there are no pending
+  completions, and the pools are quiescent (`unified:5157-5201`).
+* A blocking wait registers and blocks the warp
+  (`StrictMbarrierWaitOutcome::Registered`, `unified:4536-4569`). A later
+  arrive or completion wakes it (`wake_*_waiters`, `unified:4341-4460`).
+* `complete_mbarrier` applies a deferred transaction or arrival to the
+  generation captured at issue (`unified:4989-5044`).
+* `validate_exit` (`unified:5075-5131`):
+  * a cluster generation that is still incomplete is `Incomplete`;
+  * live TCGEN allocations are a `Protocol` error;
+  * otherwise it sets `exit_validated`.
+* `is_complete` returns `exit_validated` (`unified:5216-5218`).
+
+**Deadlock** means `enabled_transitions` is empty in a state that is not
+complete (`po:30-32`). The description lists the unfinished warps, the blocked
+warps, pending setmax increases, the projection domain and its semantic
+protocol state, and for each unfinished head its unmet causal predecessors
+(`unified:5220-5302`).
+
+**State hashing.** Equality and hashing (`unified:300-335`) cover cursors,
+blocked warps, cluster waits, setmax pools, and TCGEN CTAs. They also cover
+the semantic keys of pending completions and of each protocol
+(`StrictMbarrierSemanticState`, `strict:711-732`: counts, phase, the arrived
+warp set, waiters, and buffered transactions). Witnesses, provenance, and
+completion tokens are excluded, so equal protocol situations reached through
+different histories merge. A complete state is "the" terminal protocol state.
+
+**Search** (`explore_sync_states`, `po:234-364`, and the sleep-set variant
+`po:442-640`):
+
+* DFS with an explicit stack and a node arena with parent pointers for
+  witnesses (`po:197-229`).
+* Visited set, plain mode: `HashMap<Arc<State>, id>`.
+* Visited set, sleep-set mode: `HashMap<Arc<State>, Vec<sleep set>>`, an
+  antichain of subset-minimal sleep sets (`register_sleep_context`,
+  `po:390-418`). A state is re-entered only with a sleep set that is not a
+  superset of a recorded one. A stale node whose context was superseded is
+  skipped (`po:468-471`).
+* Enabled transitions are sorted and deduplicated. All one-step successors
+  are computed once per state (`po:534-540`).
+* **Persistent set** (`po:505-514`) is tried only when the inherited sleep
+  set is empty. If the model returns a persistent transition, it is the only
+  one explored. The model rule (`unified:5304-5380`) is that a pending
+  *transaction* completion is persistent when:
+  * its barrier has no conditional lifetimes;
+  * no other pending completion targets a different generation or kind; and
+  * no un-issued command can mutate the barrier or waits on another phase or
+    generation.
+* **Strong diamonds** (`po:515-533`): when every pair of enabled transitions
+  is a strong diamond, only the first non-sleeping transition is explored, and
+  `strong_diamond_pruned_transitions += active - 1`. The pair `(l, r)` is a
+  strong diamond when both steps succeed, each first step leaves exactly the
+  other enabled transitions enabled, and `l;r == r;l` (`unified:5382-5423`).
+* **Sleep sets** (`po:542-625`): after exploring `t`, it is added to the
+  branch sleep set. A child inherits the sleeping transitions that are still
+  enabled after `t` and commute with `t`. Commutation means both orders
+  succeed and reach equal states (`successors_commute`, `unified:5444-5460`).
+* Limits: if visited states would exceed `max_states`, the search stops with
+  `StateLimit`. If explored transitions would exceed `max_transitions`, it
+  stops with `TransitionLimit` (`po:554-593`).
+* A failure records `SyncStateFailure::{Error, Deadlock}` with its witness.
+  With `stop_on_first_failure` (always on in production), the termination
+  is `FirstFailure`.
+* Complete states go into a `HashSet`, keeping up to two witnesses.
+  **Non-confluence** means the search was exhausted with
+  `complete_states != 1` (`po:171-178`, `verifier:573-586`).
+
+Production options: `stop_on_first_failure`, `reduce_all_strong_diamonds`, and
+`reduce_sleep_sets`, all `true` (`verifier:504-512`).
+
+The verifier then maps the first failure (`verifier:523-605`):
+
+* an `Error` with `is_incomplete()` becomes a `ProgramModel` incomplete;
+* any other `Error` becomes `Protocol`, with a replayable witness;
+* a `Deadlock` becomes `Deadlock`.
+
+If there is no failure, termination maps to `NonConfluent`, `StateLimit`,
+`TransitionLimit`, `FirstFailureStop` (failure not retained), or clean.
+
+### 2.6 Budgets and coverage
+
+* `SyncStateSearchLimits { max_states, max_transitions }` defaults to
+  1,000,000 / 10,000,000 (`po:95-107`). Production sets
+  `max_states = ResourceLimits.max_backtrack_nodes` and
+  `max_transitions = ResourceLimits.max_loop_steps` (`py:71-95`).
+* `ResourceLimits` (`search:55-127`) has `max_schedules`,
+  `max_backtrack_nodes`, `max_events_per_run`, `max_total_events`,
+  `max_loop_steps`, `max_wall_time`, and `max_diagnostic_bytes`. Every limit
+  must be positive (`py:58-70`).
+* Usage is charged as follows (`py:198-221`):
+  * `schedules = 1`;
+  * `backtrack_nodes` = visited states;
+  * `events` = recorded effects plus fixed transitions;
+  * `loop_steps` = fixed transitions;
+  * `wall_time` counts only Phase B (Phase A is a completed prerequisite);
+  * `diagnostic_bytes` comes from the payload plan.
+* `first_exceeded_resource_limit` (`py:526-547`) checks the limits in the
+  order schedules, backtrack, events/run, total events, loop steps, wall time,
+  bytes. A state limit maps to `BacktrackNodes` and a transition limit maps to
+  `LoopSteps` (`py:304-319`). Any hit makes the result incomplete and sets
+  `termination = ResourceLimit`.
+* `CoverageBounds { max_warp_preemptions, max_completion_schedule_deviations }`
+  (`search:3-23`) is accepted and echoed. The fixed search does not use it:
+  `maximum_observed_usage` is always the default (`py:363`). It is left
+  over from the removed replay explorer, and so are `run_count = 1`,
+  `backtrack_count = 0`, `sleep_pruned_branch_count = 0`, and `runs[0]`
+  (`py:1061-1111`).
+* Verdict (`py:398-407`):
+  * `error` if Phase A has an error, an execution error is not incomplete, or
+    Phase B has an error;
+  * otherwise `incomplete` if only a subset of warps ran or anything is
+    incomplete;
+  * otherwise `clean`.
+
+### 2.7 setmaxnreg verifier
+
+`SetmaxnregVerifierCore` (`setmax:15-30`) is a pure pool per
+`(kernel, cta)`. It has a capacity, an available count, a current count per
+warpgroup, and pending increases. It has no waiters and no side effects.
+
+* `apply_request` (`setmax:320`): a decrease releases registers. An increase
+  is applied immediately if the pool has room. Otherwise it stays pending with
+  its `required_count`.
+* `enabled_grants` (`setmax:285`) lists pending increases that now fit.
+  `apply_grant` (`setmax:373`) applies one.
+* A pool is quiescent when nothing is pending (`setmax:308`).
+
+In the explorer:
+
+* the pool is in the state (`unified:246`);
+* `Setmax` commands are collectives over the warpgroup;
+* issue is blocked while the warpgroup has a pending increase
+  (`unified:4076-4080`);
+* grants are separate transitions (`grant_setmax`, `unified:5046-5073`);
+* exit requires quiescent pools.
+
+A stalled pool shows up as a deadlock that lists `pending_setmaxnreg`. Phase A
+also reports `setmaxnreg_pool_deadlock`. That deadlock is downgraded to
+incomplete when only part of the scheduling domain ran (`py:1953-1977`).
+
+### 2.8 `incomplete` reasons to preserve
+
+Every reason is serialized with `kind = "analysis_incomplete"` and a `reason`
+string.
+
+| source | reason string | payload extras | cite |
+| --- | --- | --- | --- |
+| `SyncCheckIncompleteReason::AnalysisGap` (TCGEN mma/shift) | `tcgen_protocol_unmodeled` | `operation`, `domain`, `effect` | `py:1384-1399` |
+| `AnalysisGap` (cluster) / `ClusterBarrierUnalignedUnmodeled` | `cluster_barrier_unaligned_unmodeled` | `operation`, `effect` | `py:1392`, `py:1436-1440` |
+| `AnalysisGap` (atomic) | `atomic_lane_serialization_unmodeled` | `operation`, `domain`, `effect` | `py:1393` |
+| `CompletionActionUnobserved` | `completion_action_unobserved` | `action_id`, `barrier`, `generation` | `py:1401-1410` |
+| `CompletionTransitionUnobserved` | `completion_transition_unobserved` | `operation`, `barrier`, `generation` | `py:1411-1420` |
+| `EffectCommitUnobserved` | `effect_commit_unobserved` | `operation`, `effect` | `py:1421-1425` |
+| `ClusterBarrierParticipantExitUnmodeled` | `cluster_barrier_warp_exit_unmodeled` | `kernel_index`, `cluster_id`, `generation`, `missing_warps` | `py:1426-1435` |
+| `ClusterBarrierRearrivalWithoutWaitUnmodeled` | `cluster_barrier_rearrival_without_wait_unmodeled` | `operation`, `kernel_index`, `cluster_id`, `generation`, `warp_id`, `verification: "[VERIFY]"` | `py:1441-1453` |
+| engine poll limit | `resource_limit`, `resource: "polls"` | `limit`, `pending_warps` | `py:1902-1910` |
+| engine native loop limit | `resource_limit`, `resource: "native_loop_iterations"` | `loop`, `limit` | `py:1894-1900` |
+| engine `AnalysisIncomplete{kind}` | `<kind>` | `effect`, `message`, `operation` | `py:1911-1920` |
+| subset launch | `subset_execution` | `selected_warp_count`, `total_warp_count` | `py:1356-1363` |
+| static ineligibility | `fixed_sync_state_ineligible` | `message` | `py:706-716` |
+| verification missing | `fixed_sync_state_verification_missing` | `message` | `py:717-727` |
+| `FixedSyncVerificationIncomplete::ProgramBuild` | `fixed_sync_program_build` | `source`, `message` | `py:861-864` |
+| `ProgramModel` | `fixed_sync_program_model_incomplete` | `operation`, `transition`, `source`, `witness` | `py:865-884` |
+| `StateLimit` | `resource_limit`, `resource: "fixed_sync_states"` | `operation`, `limit` | `py:885-893` |
+| `TransitionLimit` | `resource_limit`, `resource: "fixed_sync_transitions"` | `operation`, `limit` | `py:894-902` |
+| `FirstFailureStop` | `fixed_sync_first_failure_unretained` | `operation` | `py:903-909` |
+| generic coverage limit | `resource_limit`, `resource ∈ {schedules, backtrack_nodes, events_per_run, total_events, loop_steps, wall_time, diagnostic_bytes}` | `limit`/`usage` as `{kind: count \| milliseconds, value}` | `py:695-704`, `py:1232-1260` |
+
+After a terminal error, the three `*_unobserved` reasons are suppressed
+(`py:1367-1374`). `ProgramModel` sources include the model's own `Incomplete`
+errors, for example the cluster exit-membership incomplete at
+`unified:5093-5110` and the certificate incompletes in §2.3.
+
+---
+
+## 3. Operation-count arguments for each pruning
+
+The numbers come from `cargo bench -p numsim-core --bench synccheck` (§5.9 has the current table).
+The benchmark is a ring of 1 producer + 15 consumers, 4 stages, 32 iterations:
+1,020 events, budget 100k states. The TMA variant has 1,076 events.
+
+| pruning | what it saves | when it applies | count argument | measured (16x4x32) |
+| --- | --- | --- | --- | --- |
+| **Per-resource projection + HB gates** | The cross product of independent resources' states, and the interleavings of commands on other resources | Always. Commands that change several resources atomically are joined into one projection | Whole program: about the product of per-warp cursor offsets inside the K-stage window, exponential in the number of consumers. With projection, each resource keeps only its own commands. HB gates collapse rounds, so generation `g + 1` cannot start before `g` is consumed | whole + every reduction: >100k states (budget hit). Per-resource + diamonds: 1,062 states, clean |
+| **Warp/resource components** (plan §2.6) | Interleavings between disconnected subsystems | Only when warps and resources really partition | Sound without clocks, but a pipeline is one component, so this saves nothing here | Same as whole: >100k |
+| **Strong diamonds** | `n` independent ready transitions (consumer waits on a completed phase, arrivals before the last one) go from `2^n` states to `n + 1` | Every pair of enabled transitions commutes, and no first step exposes or disables another transition | A generation with C ready consumers takes C + 1 states instead of 2^C | per-resource: plain >100k, diamond-only 1,062 |
+| **Sleep sets** | Re-exploring commuting transitions: `n·2^(n-1)` transitions become `2^n − 1`. **States are not reduced** | Whenever two enabled transitions commute (the state-local check) | Each state is still visited (unit test: 1,024 states, 5,120 → 1,023 transitions) | per-resource sleep-only: >100k states. "16 warps may break sleep sets" (plan §6) holds |
+| **Persistent transition** | Orders of a terminal TMA completion against waiters and unrelated work | A pending transaction completion whose barrier has no conflicting future command (§2.5) | W waiters × completion: the completion moves to the front, so waiters see a ready phase and become a diamond chain | TMA-many-waiters test (16 warps): ≤ 32 + 18 states (`tests/scenarios.rs`) |
+| **Fingerprint dedup** | Searching K isomorphic stage projections | Single-resource projections with equal structure under warp renaming (today: mbarrier only) | full[s] and empty[s] are isomorphic for s ∈ 0..K. Only 2 of the 2K projections are searched, which saves (K − 1)/K | 1,062 → 279 states, 6 of 9 projections reused |
+| **Causal certificates** | All state search for a resource | named and cluster: always. mbarrier: one init, no wait batch, inval, or drop | One pass over the commands plus HB checks between adjacent generations: O(n·W) for named, O(Σ_g waits_g·mutations_{g+1}·W) for mbarrier. `visited_states = 1` per projection by definition | 9 projections → 9 states, 1.4 ms |
+
+Wall time on the build host for the same configurations, in the same order:
+>700 ms (budget), 13 ms, 4.4 ms, 1.4 ms. The TMA variant: 1,126 → 295 → 9
+states, with 1.5 ms using certificates.
+
+At 4 warps × 2 stages × 8 iterations (70 events) everything fits:
+
+| config | states | transitions |
+| --- | --- | --- |
+| whole plain | 1,113 | 2,943 |
+| whole sleep | 1,113 | 1,112 |
+| whole all | 1,102 | 1,101 |
+| per-resource plain | 155 | 247 |
+| per-resource diamond | 80 | 75 |
+| per-resource + fingerprint | 43 | 40 |
+| per-resource + certificates | 5 | 70 (= commands) |
+
+**Plan §6 risk.** A 16-warp K-stage pipeline does break sleep sets alone.
+Today's production code survives it only because strong diamonds, the
+fingerprint, and above all certificates decide those projections first. The
+rewrite must ship strong diamonds and certificates together with the DFS, not
+"later when the corpus needs it". Certificates are what make the realistic
+kernels O(n).
+
+---
+
+## 4. Report payload to preserve
+
+`build_native_sync_check_phase_dict` (`py:441-524`) and
+`build_native_sync_check_phase_result` (`py:223-439`) write these keys:
+
+* **Top level:**
+  * `schema_version: 3` (pinned by `test_native_synccheck_artifact.py:424`);
+  * `execution_model: "direct_fixed_sync_state"`;
+  * `phase: {index, name, topology: {clusters, ctas_per_cluster, warps_per_cta, warp_count}}`;
+  * `analysis_scope: {kind: "full_launch" | "subset", selected_warp_count, total_warp_count}`;
+  * `findings`, `incomplete`;
+  * `effects` (full journal) or `effect_summary` (bounded);
+  * `stats` (executor), `execution_error`, `resource_limits`
+    (`max_polls`, `max_transitions`, `native_loop_iteration_budget`,
+    `native_loop_reschedule_quantum`);
+  * `timing: {execution_wall_time_us, fixed_verification_wall_time_us, total_wall_time_us}`;
+  * `verdict: "clean" | "incomplete" | "error"`;
+  * `coverage`, `search`, `counterexample: None`, `replay_resource_limits`.
+* **`search`** (`py:1061-1111`):
+  * `algorithm: "fixed_sync_state"` (pinned in 11 places);
+  * `run_count: 1`, `backtrack_count: 0`, `sleep_pruned_branch_count: 0`;
+  * `program_count`, `reused_clean_program_count`, `visited_state_count`,
+    `explored_transition_count`, `strong_diamond_pruned_transition_count`;
+  * `incomplete_reason`;
+  * `runs: [{prefix: [], warp_preemption_bound: 0, trace_digest: None, trace_digest_hex: None, coverage_usage, status: "finding" | "complete" | "incomplete"}]`.
+* **`coverage`** (`py:1113-1151`):
+  * `status: "complete_within_bounds" | "finding" | "incomplete"`;
+  * `eligible_for_clean`;
+  * `bounds: {max_warp_preemptions, max_completion_schedule_deviations}`;
+  * `maximum_observed_usage: {warp_preemptions, completion_schedule_deviations}`;
+  * `resource_limits: {max_schedules, max_backtrack_nodes, max_events_per_run, max_total_events, max_loop_steps, max_wall_time_ms, max_diagnostic_bytes}`;
+  * `resource_usage: {schedules, backtrack_nodes, events_in_current_run, total_events, loop_steps, wall_time_ms, diagnostic_bytes}`;
+  * `pending_work_items`, `pending_backtracks`;
+  * `termination: {kind: "worklist_exhausted" | "finding" | "resource_limit" | "unsupported" | "cancelled", resource_limit: {resource, limit, usage} | None}`.
+* **Phase B findings** (`py:739-832`):
+  * `fixed_sync_protocol_error` with `message`, `operation`,
+    `protocol ∈ {"Mbarrier", "NamedBarrier", "ClusterBarrier", "Setmaxnreg", "TcgenLifecycle", "Internal"}`
+    (the Debug names of `FixedSyncProtocolKind`, `unified:337-344`; tests pin
+    `"TcgenLifecycle"`), `transition` (Debug), `source` (Display; tests match
+    on `"allocation result changed"`), `related_operations`, `witness`
+    (Debug strings), and `witness_evidence: [{transition, description, operation}]`;
+  * `deadlock` with `verification: "fixed_sync"`, `deadlock` (Debug of
+    `FixedSyncDeadlock`), `witness`, and `witness_evidence`;
+  * `fixed_sync_nonconfluent` with `complete_states`, `witness` (last),
+    `witnesses`, and `witnesses_evidence`.
+* **Phase A findings:** `{kind, effect, operation, message, related_operations?}`.
+  `kind` is one of the strict/causality kind strings (`py:1979-2145`). `effect`
+  is one of the `SyncCheckEffectKind::name()` strings (`check:109-135`:
+  `mbarrier.init`, `mbarrier.arrive`, `mbarrier.wait`, `mbarrier.complete_tx`,
+  `bar.sync.register`, …).
+* **Operation:** `{kernel_index, global_warp_id, per_warp_sequence, source_op_id, loop_frames: [{loop_site_id, iteration_ordinal}]}` (`py:2147-2165`).
+  **Barrier:** `{allocation_id, byte_offset, target_global_cta_id}`.
+
+Python tests also pin implementation counts. Plan §3 says these should go:
+
+* `program_count == 1|2|0`, `visited_state_count == 3`, and
+  `explored_transition_count == 6` (`test_native_synccheck_artifact.py:499-532`, `1085-1135`);
+* `visited_state_count <= 32` and `explored_transition_count <= 64`
+  (`test_native_kernel_contracts.py:554-555`).
+
+Keep the key names; drop the exact values from the tests.
+
+---
+
+## 5. The rewrite (W6)
+
+### 5.1 Shape
+
+```
+Vec<SyncEvent> ──► Program (per-warp sequences, collectives joined)
+               ──► reference run (one complete schedule; per-command clocks + generations)
+               ──► projections (per resource + atomic joins; HB gates from reference clocks)
+               ──► certificate? ── yes ──► visited 1
+               ──► fingerprint seen clean? ── yes ──► reused
+               ──► DFS (state hash, sleep sets, strong diamonds, persistent singletons §5.10)
+               ──► findings | incomplete (state/transition limit, model) | clean
+```
+
+### 5.2 What changes compared with legacy
+
+* **No clocks or generations in the log.** Synccheck recomputes them from
+  one complete schedule per connected component (`reference::run`). Any
+  complete schedule is acceptable, because the certificates and the per-resource
+  searches prove the annotations do not depend on the schedule. Phase A's
+  online causal tracker (`sync_causality.rs`, about 1.6K lines, plus the clock
+  plumbing in `resolved_transition.rs`, about 4K lines) leaves the engine.
+* **The reference run is Phase A's replacement.** If it errors or deadlocks,
+  that is a finding with a witness schedule. Errors that today come from
+  online HB checks (for example `mbarrier_init_not_happens_before_use`) come
+  from the certificate instead.
+* **Waits block by being disabled.** A blocking wait is enabled only when it
+  is ready. There is no waiter registry. This matches the contract's
+  `Step::Blocked` retry model (`numsim-core/src/sync/mod.rs`). Named syncs
+  still need a blocked flag, because their contribution and their release are
+  separate.
+* **The explorer owns the strong-diamond and commutation checks.** They only
+  need `step` and `enabled`, so the model implements only the state machine,
+  the `independent_of_future` proof obligation and the `singleton_persistent`
+  hook (§5.10).
+* **Fingerprint for every single-resource projection**, not only mbarrier. The
+  full encoding is the map key, so no second equivalence pass is needed.
+
+### 5.3 Contract inputs
+
+The `SyncEvent` fields the explorer relies on are now part of the contract
+(`numsim-core/src/observe.rs`). They are:
+- per-actor `seq` over committed commands;
+- explicit counts;
+- physical resource ids;
+- async targets bound to the issuing command;
+- multi-resource atomic events;
+- collective ids;
+- sites and loop frames;
+- the observed parity of conditional successes.
+
+The requests and their resolution are recorded in `numsim-core/CONTRACT_REQUESTS.md` (W6-1 to W6-5).
+
+### 5.4 Integration status (phase 2)
+
+The explorer now lives in `numsim-core/src/synccheck/` and runs on the
+production `crate::sync::*::step` functions (`backend.rs` is the only file
+that names them).
+
+* Entry points: `synccheck::check(&RecordingObserver, &SynccheckConfig) -> report::Report`
+  and `synccheck::serialize(&Report) -> serde_json::Value` (today's payload
+  keys, §4).
+* Phase A: `Protocol` events with `status: Failed` or `BlockedAtExit` are
+  reported as-is, with today's strict kinds and effect names (`kinds.rs`).
+  Phase B runs only after a clean Phase A.
+* Ported protocols: mbarrier (including inval/re-init, `.noinc`,
+  `IncPending`, deferred arrivals, multi-target waits, conditional
+  `try_wait` successes), named (lane-mask rule from the `step`), cluster,
+  setmaxnreg (collective `Set`, grants as transitions), TMEM lifecycle,
+  tcgen05 work/commit, and async groups (milestones as completions).
+* Arming change: a blocked parity wait that sets mbarrier `armed` is one
+  `Arm(resource)` transition, not one transition per waiting warp. Per-warp
+  arming broke strong diamonds and made the 16-warp ring exponential in
+  the number of consumers.
+* Contract gaps: `numsim-core/CONTRACT_REQUESTS.md` W6-1 (non-confluence
+  kind, structured payload, `.aligned`, kernel index, `TestState` success
+  flag).
+* Tests (2026-10-08):
+  * `numsim-core/tests/synccheck_scenarios.rs`: 67 tests.
+  * `synccheck_legacy_ports.rs`: 60 tests.
+  * `synccheck_equivalence.rs`: 7 generators (random, structured, rich, rich-structured, lap, register-pool, TMA-issuer) against the exhaustive oracle.
+  * `synccheck_payload.rs`: 3 tests.
+  * `synccheck_engine.rs`: 4 interpreter scenarios.
+  * The explorer unit tests in `synccheck/explore.rs`.
+
+Benchmarks: §5.9.
+
+### 5.5 Review fixes (2026-10-08, `checker-review.md`)
+
+Each item has a regression test built from contract events.
+
+| Item | Fix | Regression |
+| --- | --- | --- |
+| S1(a): a vacuous parity-1 wait was ignored by the mbarrier certificate | The certificate declines (falls back to the search) unless the wait is HB-before a prerequisite of generation 0's completion | `s1a_vacuous_parity_one_wait_is_not_certified` (deadlock found) |
+| S1(b): a wait of generation g could pass on g−2 | The certificate declines unless every wait of g ≥ 1 is HB-after a consuming wait of g−1 or a mutation of g. "Overtaken" waits also fall back instead of being reported, because the search decides whether they deadlock or pass later | `s1b_wait_that_can_pass_on_an_older_generation_is_not_certified` (never Clean; gated configurations fail closed) |
+| S5: gated DFS projections never checked the reference generations | `Ts` compares every issued command's generations (and captured issue generations) with the reference run. A mismatch is `incomplete`: `fixed_sync_program_model_incomplete`, with source `generation_assignment_differs` | `s5_generation_assignment_is_checked_against_the_reference` (clean, confluent program; the gated search fails closed) |
+| S8: strong diamonds checked one step only | New proof obligation `TransitionSystem::independent_of_future`; the default declines. `Ts` grants it only when, on the transition's single resource, every command that can still run first (un-issued commands not HB-gated behind it, pending completions, retries) is an observer or a contributor, and their arrivals cannot complete the open phase. Contributors that may complete it also require that no mbarrier observer of the last completed parity can still run | explorer unit test `one_step_diamonds_need_the_independence_proof` (discriminating) and `s8_strong_diamond_does_not_hide_a_two_step_lap` (end to end) |
+| F4: `tcgen05.commit` coupled empty[s], tmem_full and the MMA queue | `TcgenWork` commands are dropped from the explored program: they are total, never block, and carry no state the search needs. Each commit is then a single-resource deferred arrival, and its barrier is certified | `f4_umma_ring_is_certified_per_barrier`: 6 stages × 16 k-blocks × 16 tiles, 15 projections all certified, 15 states (was 320k). With certificates off: 3,994 states |
+| TMA events without `Mbarrier(Issue)` were never certified | The certificate reads the projection's commands, including the synthesized `Issue`. `build::issue` no longer injects `Issue` | `tma_event_without_issue_command_is_certified` |
+| `SyncEvent.kernel` (launches merged) | `check` on a mixed log is `incomplete` (`fixed_sync_program_build`). `check_launches` / `split_launches` return one `Report` per launch | `launches_are_checked_separately` |
+| Duplicate cluster waits were overwritten in the certificate | The certificate declines, and the state machine reports `DuplicateWait` | (covered by the state machine) |
+| W2 engine smoke: 32 per-lane cp.async groups were a product (20K states took 16 s; 1M did not finish) | Async-group milestones fire eagerly, in FIFO order, inside the transition that creates the group. Only the issuing thread's `wait_group` observes them. Deferred mbarrier arrivals stay separately schedulable `Complete` transitions gated on the group. Delaying a milestone is indistinguishable from not scheduling the warp | `synccheck_engine.rs`: cp.async scenario Clean in ≤16 states and under 2 s; every interpreter scenario stays within a 20K budget and 5 s |
+
+**Equivalence testing.** The tests now compare against an all-failures exhaustive oracle (`stop_on_first_failure: false`). Each search-based variant must reach the oracle's verdict and report a finding kind the oracle found. The only tolerated difference is a fail-closed `generation_assignment_differs`. There are five generators: random, structured, rich, rich-structured, and lap. The rich generators emit TMA issues without `Issue`, conditional waits, inval/re-init, multi-target waits, tcgen05 alloc/dealloc and commit, cluster barriers, parity-1 first waits and generation-skipping waits.
+
+Mutation checks:
+- Re-opening the S1 holes makes the rich generator fail (Clean against Error).
+- Disabling the S5 check makes the S5 scenario fail.
+- Reverting S8 makes the S8 unit test fail.
+
+**Bench after the fixes.** The sound independence rule keeps the earlier numbers: 16-warp ring 4,209 states with diamonds only, 1,180 with fingerprints, 9 with certificates. The UMMA row has been added (15 states certified).
+
+### 5.6 Test-migration follow-ups (2026-10-08)
+
+| Delta | Old behaviour (legacy) | New behaviour | Reason |
+| --- | --- | --- | --- |
+| tcgen05.alloc results are fixed by the run | Error `fixed_sync_protocol_error` (TcgenLifecycle, "allocation result changed") | Restored. The reference run records every `Allocated { base }`. Any explored schedule that returns another base for the same command is `fixed_sync_protocol_error`, with `protocol: "TcgenLifecycle"`, `source_kind: "tcgen_allocation_result_changed"`, and a source containing "allocation result changed". Both schedules are legal, so a differing base proves the program's addresses depend on the order, whichever of them the engine ran. | §1.1: allocation results are fixed facts of the run |
+| Stalled setmaxnreg pool | `setmaxnreg_pool_deadlock` | The same kind string. A deadlock where some warp is parked on a pool increase (`Poll` retry) keeps `kind: "setmaxnreg_pool_deadlock"`; `FindingKind::Deadlock` is unchanged | Legacy payload string |
+| Launch-bounds register budget | Applied by the engine | The scheduler logs `Configure { count }` as a host-side `Protocol` event. Synccheck applies every `Configure` (host or per-warp) to the initial pool state before any warp runs, so a per-warp copy cannot race with `Set`. `synccheck::resource_init(&LaunchShape)` derives `warps_per_cta` and the number of cluster participants | test-migration item 13 |
+| Uncommitted async work at exit | Error `CompletionSourceNotQuiescent` | Bulk (TMA / `cp.async.bulk`) issues are committed implicitly at warp exit and complete. Uncommitted `cp.async` issues are the Review lint `UncommittedAtExit` (W3 `exit_lint`). One rule for both checkers; `racecheck-semantics.md` / P6 now state the bulk case | sync-semantics §5 Exit, sync-isa-answers |
+
+### 5.7 Round-2 conformance (2026-10-08, `v2-conformance-status.md`)
+
+| Row | Cause | Fix | Regression |
+| --- | --- | --- | --- |
+| V2C-31: synccheck ran past the 900 s sweep timeout | `max_wall_time_ms` was only echoed into the payload, never enforced | A wall-clock deadline (`started + max_wall_time_ms`) is checked every 1024 reference-run steps, every 256 popped DFS states, and between projections. Passing it gives `incomplete`: `{"reason": "resource_limit", "resource": "wall_time", "limit": {"kind": "milliseconds", "value": N}}`. This cut is not deterministic (it depends on wall time), but it only ever yields `incomplete` | `wall_time_limit_is_incomplete` |
+| V2C-31: 128-CTA launches (49k commands, 1,792 warps) spent minutes in the reference run | Each step cloned the whole state (2,048 resources) and scanned every warp. The vector clocks had 1,792 components for each of the 49k commands | The reference run goes one connected component at a time (`ProjectionMode::Components`; warps and resources linked by commands). Clocks are indexed over the component's own warps plus its commit FIFOs. Components never synchronize, and every gated projection and certificate lies inside one component, so no comparison crosses a component. On failure, `ReferenceRun.spec` names the failing component, so the payload replays the schedule on the right system | `gemm_proj_rope_mxfp8_*`: reference run 0.5 s, check 2.6 s, Clean |
+| V2C-31: per-lane `cp.async.mbarrier.arrive.noinc` (32 deferred arrivals from one instruction) gave 2^32 landing orders | The pendings are interchangeable but were explored as distinct transitions | Symmetry reduction: once two pendings of the same command are both enabled and match on resource, FIFO, generation, count/bytes and the async-group condition, only the lowest ordinal is offered. The two must also be unnamed by any landing gate. Landing either one reaches the same state, up to renaming the ordinal | `per_lane_cp_async_arrivals_stay_small` (discriminating: 20k-state limit without the rule, Clean with it); `bsa_backward_blk64` 1.5 s and `dsa_sparse_attention_backward` 0.8 s, both Clean |
+| V2C-31: gated per-lane arrivals were `Other` in the independence proof | `independent_of_future` counted only ungated `Arrive` pendings as contributors | Every `Arrive` pending is `Contributor(count)` | `gdn_prefill_f16` Clean (46 ms) |
+| V2C-4: "collective … is missing participant records" | The engine lists only the recording warp in `Collective.participants` for cta_group::2 tcgen05 ops | A collective's members are the union, over all its records, of the declared participants and the recording warps. The missing-record error now names the warps | `collective_members_are_the_union_of_records`; `bmm_fp8_rubin` Clean |
+| V2C-28: `generation_assignment_differs` from a vacuous parity-1 conditional wait | tcgen05.commit landings were unordered across projections | Commits land in issue order for each issuing warp (`Pending.fifo`). The reference run gives each FIFO its own clock component, and a landing's clock joins the FIFO's previous landing. A command whose reference clock follows a landing gets a landing gate: that completion must have landed before the command issues | `tcgen_commits_land_in_issue_order`; `deepgemm_sm100_fp8_mqa_logits` Clean |
+| Delta rows: `flash_mla_sparse_fwd`, `cudnn_sm100_bsa_backward_blk128` and `sparse_flashmla_prefill_head64_phase1` / `head128_phase1` reported a `sync_exit_lint` review | The lint was `UncommittedAtExit` on a **Bulk** async group. The engine applies the implicit bulk commit at exit (`async_group::Cmd::Exit`) but does not log it, so the explorer's terminal state still had open bulk groups. This is not delta A3, which covers only `cp.async` | `backend::exit_lint` applies `Cmd::Exit` to bulk groups before linting. Only uncommitted `cp.async` remains the A3 review lint | `uncommitted_bulk_issue_at_exit_is_not_a_lint`; the four kernels replay Clean |
+| Delta row B1: `sparse_flashmla_decode_head64` reported an extra `fixed_sync_program_build` incomplete next to the `PartialWarp` error | The engine stopped at the error, so the truncated log had a collective without its other members' records, and `program::build` failed before Phase A ran | When the build fails, the protocol errors recorded in the log (`ProtocolStatus::Failed`) are the findings. The only diagnostic is the B1 `PartialWarp` error | `protocol_error_wins_over_unbuildable_truncated_log` |
+| V2C-28 `msa_prefill_multishape` (still `incomplete`, by design) | The mbarrier at offset 232112 is waited on with parity 0 by warps 4–7 in two iterations. In the reference run, the iteration-1 wait (warp 4, op 4310) observed generation 2. That wait is not happens-before ordered after the generation-1 arrival (warp 14), so a schedule exists where it passes on the stale generation 0 | Fail-closed S5: `fixed_sync_program_model_incomplete`, source `generation_assignment_differs` (reference gen 2, this schedule gen 0), plus a witness schedule. Legacy took the reference generation as a fact and said clean. Either the kernel orders it through memory (a flag the sync model does not see) or this is a real parity-aliasing hazard | none (kernel triage) |
+| W2-18: sm_107f `.exclusive` TMEM limit (576 columns) | The explorer built every TMEM lifecycle with 512 | The limit is `SynccheckConfig::tcgen_exclusive_max` (from the arch, `sched::exclusive_tmem_columns`) when given. Otherwise it is the largest `.exclusive` width the run committed, and at least 512: an alloc's width is a static fact of its command, which the engine already validated against the launch's arch (a rejection is a Phase A failure) | `tcgen_exclusive_576_follows_the_arch` |
+| V2C-14: `cudnn_sm100_dense_blockscaled_gemm_persistent_{amax,dsrelu_quant}` stopped with `RegPool(IncompleteWarpgroup{wg:1})` | No setmaxnreg ran in warps 4-5. The CTA-wide aligned `bar.sync` credited `WarpgroupSync{wg:1}` for the 2-warp tail, and the sync model rejected the credit | The rule is unchanged for `setmaxnreg` (PTX 9.7.21.5: UB unless all warps of the warpgroup execute it; the tail is no warpgroup; legacy rejects it too). Crediting a sync for the tail is a no-op (reference `numsim-sync-ref` first, then `sync::setmaxnreg`) | `trailing_partial_warpgroup_sync_is_not_an_error`, ref `setmaxnreg_trailing_partial_warpgroup`; both kernels: engine Completed, synccheck Clean |
+
+**Resolved limit (sweep 3).** Eight waiters that each park on two per-lane-arrival barriers used to exceed 20k states (`many_waiters_with_per_lane_arrivals_stay_small`). See §5.8.
+
+### 5.8 Sweep 3 (2026-10-08, at 3124cec)
+
+**V2C-31 cleared (both synccheck rows).** In the replay, `blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin` is Clean in 0.6 s (it was at the 100k-state limit). `sm100_fp8_fp4_mega_moe` is Clean in 0.5 s (it was at 2.1M states and still incomplete at the 4M-transition limit). The two `gemm_proj_rope` rows are racecheck rows. Three reductions, each with a regression test:
+
+| Reduction | Why it is sound | Test |
+| --- | --- | --- |
+| The pending symmetry (§5.7) now also applies across commands. Of the enabled deferred completions that match on resource, FIFO, generation and count/bytes, only the lowest `(cmd, ord)` is offered. This collapses four producer warps × 32 per-lane arrivals | The mbarrier state does not record which issuer a landing came from. Once both are enabled they stay enabled. Neither may be named by a landing gate | `per_lane_cp_async_arrivals_stay_small` |
+| New `TransitionSystem::singleton_persistent` hook, a strict persistent set that may be combined with sleep sets (Godefroid: explore persistent \ sleep). (1) A warp-private async-group `Issue`/`Commit`: one participant, no async targets, groups no other command touches | No other warp can run something that conflicts with it or disables it. HB gates only open. ArriveOn closes its group, so a later issue never delays an attached deferred arrival. Milestones are eager | `many_waiters_with_per_lane_arrivals_stay_small` (it fails with rule (2) switched off) |
+| (2) A ready mbarrier parity wait/test (`Issue` or `Resume`) when everything that can still run before it on that barrier is another observer: other warps' commands not HB-gated behind it, their retries, and no pending completion | A wait is **not** invisible. It consumes the completed phase, and an arrive of the next phase before that consumption is `ReuseBeforeConsumption`. The first version used the S8 `independent_of_future` proof (contributors that cannot complete the open phase), and the lap-log equivalence oracle caught exactly that (`case 5 whole+all: Clean != Error`). The rule now requires that no contributor at all can run first | `synccheck_equivalence` (lap and random generators) |
+
+**Sweep 5, no-oracle corpus cases.**
+- `fp16_bf16_gemm`: synccheck is Clean in 0.13 s.
+- `kda_forward_portfolio_multishape`: the case does not bind (`InputError`: input `cu` is unknown), so synccheck never runs. This is case preparation (W8/W1).
+- `mla_dsv4_multishape` was `incomplete` at the 100k-state limit: four producer warps × 32 per-lane arrivals on each of two barriers coupled in one projection. A fourth `singleton_persistent` rule now makes it Clean (4,070 states, 1.2 s). The rule: a deferred mbarrier completion (`Complete` of a transaction or arrive-on) that the S8 proof (`independent_of_future`) shows independent of everything that can run first. Without it, the others cannot complete the phase, and no observer it could disable exists. It stays enabled once enabled. Unlike waits, deferred completions do not consume a phase, so the S8 proof is enough here. The equivalence oracle (lap, rich and random generators) agrees. Test: `four_producers_per_lane_arrivals_on_two_barriers_stay_small`, which hits the 20k-state limit with the rule switched off.
+
+**V2C-28 `msa_prefill_multishape`: kernel bug (parity aliasing), not a model gap.** The `incomplete` is correct. Kernel: `tirx_kernels/msa/msa_prefill_multishape.py`, installed version.
+
+- The barrier is `o_smem_free = txl.MBarrier(smem, 1); o_smem_free.init(1)` (line 297), guarding the single shared `o_smem` output tile.
+- The store warp (warp 14, `r_store`, lines 936-973) handles tile `seq_s = it_s * N_TILES + i_q` (`N_TILES = 2`). For each tile it waits `o_staged` (parity `seq_s & 1`), issues the TMA store from `o_smem`, waits `cp.async.bulk.wait_group.read 0`, then `o_smem_free.arrive(0)`. So generation k of `o_smem_free` means "tile k has left `o_smem`".
+- Softmax warpgroup `wg_id` (warps 0-3 and 4-7) handles tile `seq_x = it_x * N_TILES + wg_id`. Its epilogue (lines 1279-1312) runs `o_smem_free.wait(0, (seq_x + 1) & 1)`, then writes `o_smem` and arrives `o_staged`. It means to wait for generation `seq_x - 1` (the previous tile left `o_smem`).
+- **Hazard.** Warpgroup 1, iteration 1 (`seq_x = 3`) waits with parity 0 for generation 2. Parity 0 is also satisfied while the barrier is still in phase 1, after generation 0 completed and generation 1 has not (the store warp is still storing tile 1, warpgroup 1's own iteration-0 tile). Nothing orders warpgroup 1's iteration-1 epilogue after generation 1:
+  - `o_ready` and `o_free` go through the MMA warp.
+  - `union_ready` and `union_free` need only the store warp to have *started* iteration 0 (`union_free.arrive(slot_s)` comes before its tile loop).
+  - `xu_turn` orders the softmax steps of the two warpgroups, not their epilogues.
+  - The metadata reads are data under `union_ready`; there is no spin on a memory flag.
+- **Interleaving.** The explorer's witness, on the `o_smem_free` projection:
+  1. Init; warpgroup 0's iteration-0 wait (vacuous parity 1).
+  2. The store warp frees tile 0 (generation 0).
+  3. Warpgroup 1's iteration-0 wait (parity 0, generation 0); it writes tile 1 and arrives `o_staged`.
+  4. Warpgroup 1 runs all of iteration 1 while the store warp's TMA read of tile 1 is still in flight.
+  5. Warpgroup 1's iteration-1 wait passes on the stale generation 0, and it overwrites `o_smem` while the bulk store still reads tile 1.
+  6. Its `o_staged` arrival also lands in the wrong `o_staged` phase.
+- The reference run happened to order it: there the wait observed generation 2. Legacy synccheck took that generation as fixed and reported clean. The race is real but needs the store warp to lag a whole softmax iteration.
+- **Fix options.**
+  - Make each epilogue wait on a generation that cannot alias: a turn barrier between the two warpgroups' epilogues (like `xu_turn`), so warpgroup 1 waits only after warpgroup 0 has consumed generation `seq_x - 2`.
+  - Or give each warpgroup its own `o_smem` tile and `o_smem_free` barrier, waiting on parity `it_x & 1`.
+- **Report.** It stays `incomplete` (`fixed_sync_program_model_incomplete` / `generation_assignment_differs`), with the operation (warp 4, op 4310, loop iteration 1) and the witness schedule. A proof that it is an error would need the race checker on the `o_smem` bytes; racecheck reports a new `data_race` on this case (V2C-37), and whether that is this race is unverified.
+
+### 5.9 Benchmarks: one guard per reduction (2026-10-08)
+
+The CLAUDE.md rule is to keep pruning techniques guarded by their criterion benchmarks.
+
+**Bench.** `cargo bench -p numsim-core --bench synccheck` (`numsim-core/benches/synccheck.rs`).
+- It prints the table below, then times the "on" configuration of every row with criterion. `SYNCCHECK_TABLE_ONLY=1` prints only the table.
+- Each row runs one scenario generator from `synccheck::build` (`pipeline`, `umma_ring`, `tma_many_waiters`, `per_lane_arrivals`) twice: everything on, then the same configuration with that one technique off. "Off" runs are capped at 200k states.
+- The bench asserts that every "on" run is Clean. A reduction that breaks therefore fails the bench, and one that stops pruning shows as a criterion regression.
+
+**Switches.** Individual techniques are switched by `explore::Options` (`sleep_sets`, `strong_diamonds`, `persistent`) and `Options::rules` (`Rules { private_issue, ready_observer, deferred_completion, twin_landings }`, default all on), plus `SynccheckConfig::hb_gates` (default on).
+
+Release build, one run (after the tx-terminal removal below):
+
+| Technique | Scenario | States on / off | Transitions on / off | Time on / off | Time ratio | Verdict on / off |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| per-resource projection (off = whole program) | pipeline(6,2,8) | 153 / 79,038 | 163 / 179,445 | 1.6 ms / 2.3 s | 1419x | Clean / Clean |
+| HB gates | pipeline(6,2,8) | 153 / 2 | 163 / 2 | — | (soundness) | Clean / **Error** (false alarm) |
+| strong diamonds (with sleep, persistent off) | tma_many_waiters(16) | 75 / 196,616 | 75 / 262,149 | 4.4 ms / 4.9 s | 1109x | Clean / Clean |
+| fingerprint dedup | pipeline(8,8,64,1024) | 220 / 1,585 | 233 / 1,689 | 9.8 ms / 21.9 ms | 2.2x | Clean / Clean |
+| causal certificates | umma_ring(6,16,16) | 15 / 3,872 | 1,453 / 4,394 | 21.5 ms / 37.2 ms | 1.7x (258x states) | Clean / Clean |
+| twin landings (deferred-completion singleton off) | per_lane_arrivals(1,2,2,1) | 2,334 / 200,000 (budget) | 2,368 / 200,032 | 129 ms / 21.1 s | 164x | Clean / Incomplete |
+| singleton: private async-group issue | per_lane_arrivals(4,1,1,4) | 546 / 10,898 | 545 / 10,897 | 103 ms / 1.7 s | 16.7x | Clean / Clean |
+| singleton: ready observer | per_lane_arrivals(1,8,2,1) | 118 / 7,171 | 117 / 7,170 | 9.0 ms / 518 ms | 58x | Clean / Clean |
+| sleep sets (in combination with the singletons) | per_lane_arrivals(4,2,2,1) | 2,805 / 14,275 | 2,804 / 14,626 | 740 ms / 2.1 s | 2.8x | Clean / Clean |
+| singleton: deferred completion | per_lane_arrivals(4,2,2,1) | 2,805 / 200,000 (budget) | 2,804 / 200,511 | 726 ms / 58.0 s | 80x | Clean / Incomplete |
+| singleton: setmaxnreg credit / `Poll` resume (`Rules::regpool_sync`) | regpool_credits(3,2) | 104 / 200,000 (budget) | 114 / 200,000 | 0.9 ms / 3.5 s | 3740x | Clean / Incomplete |
+| singleton: sole landing (`Rules::sole_landing`) | per_thread_tma(32, pair) | 72 / 200,000 (budget) | 71 / 200,000 | 6.7 ms / 15.0 s | 2248x | Clean / Incomplete |
+
+**Removed: tx-terminal persistent rule.** This was the terminal transaction-completion rule (`persistent_transition`). Measured with everything else on, it never mattered across eight scenarios, and it is subsumed by the observer and deferred-completion singletons:
+
+| Scenario | States with / without | Time ratio |
+| --- | --- | --- |
+| pipeline(6,2,8) | 153 / 153 | 1.0x |
+| pipeline(8,8,64,1024) | 1,569 / 1,585 | 1.0x |
+| umma_ring(6,16,16) | 3,860 / 3,872 | 1.0x |
+| tma_many_waiters(16) | 73 / 75 | 1.0x |
+| per_lane_arrivals, all four shapes | unchanged | 1.0x |
+
+Its trait hook `TransitionSystem::persistent_transition`, `Ts::persistent_transition` and `Rules::tx_terminal` are deleted. After removal, the "on" runs keep their verdicts and states up to +2 states (fingerprint row 218 → 220).
+
+**Kept: sleep sets (the removal decision was reverted).** The earlier "alone" measurement showed 0.5x time and no state reduction, and was the wrong context. Measured in combination with the persistent singletons (all other techniques on), removing them leaves verdicts unchanged but costs states and time on exactly the V2C-31 per-lane shapes:
+
+| Scenario | States with / without | Time ratio |
+| --- | --- | --- |
+| per_lane_arrivals(4,2,2,1) | 2,805 / 14,275 | 2.9x |
+| per_lane_arrivals(4,1,1,4) | 546 / 2,115 | 2.1x |
+| per_lane_arrivals(1,8,2,1) | 118 / 185 | 1.1x |
+| per_lane_arrivals(1,2,2,1) | 88 / 155 | 1.2x |
+
+On the other shapes they cost 0.8-0.9x. Their guard row is "sleep sets (in combination)". The scenario test `four_producers_per_lane_arrivals_on_two_barriers_stay_small` (< 5,000 states) fails without them (14,275).
+
+**Other findings.**
+- **HB gates** are not a performance technique. They make per-resource projection sound against false alarms, so their guard is the Clean assertion.
+- **`sync/` memoization:** there is none (no caches in `numsim-core/src/sync/`), so there is nothing to guard.
+- **Budget paths** have scenario tests: `budget_exhaustion_is_incomplete` (`fixed_sync_states`), `transition_budget_is_incomplete` (`fixed_sync_transitions`) and `wall_time_limit_is_incomplete` (`wall_time`).
+
+**`kda_forward_portfolio_multishape` (no-oracle corpus case, V2C-31).**
+- **Before:** the per-CTA setmaxnreg pool projection hit the 100k-state limit.
+- **Shape:** 5 warpgroups (20 warps). One `Set` per warpgroup; increases wait for another warpgroup's decrease. About 30 `WarpgroupSync` credits come from 20 warps; the engine logs one per completed aligned `bar.sync`, from a warp of the credited warpgroup.
+- **New rule, a fifth `singleton_persistent` rule (`Rules::regpool_sync`):**
+  - A credit `WarpgroupSync { wg }` that no `Set` of `wg` can precede is explored first, on its own. A credit only clears `needs_sync[wg]`, never blocks and never fails, so it commutes with everything except a `Set` of `wg`.
+  - An enabled `Poll` resume (a granted increase) is explored first, on its own. It mutates nothing, and only a `Set` of its own warpgroup could make it pending again; that `Set` is a collective it takes part in.
+- **Result:** Clean in 1.3 s (the projection is under 1,000 states).
+- **Checks:**
+  - New equivalence generator `regpool_log`: 2 warpgroups, 1-2 `Set`s each with valid and invalid directions and counts, 0-2 credits per warp around them. Over 400 cases the oracle agrees (47 Clean, 353 Error).
+  - Under the engine contract (a credit comes from a warp of its own warpgroup), every conflicting `Set` is a collective that includes the crediting warp. The conflict check is therefore defensive, and a mutation that removes it is not observable.
+  - Scenario `regpool_credits_stay_small`: 104 states; it fails with the rule off.
+
+**Per-thread TMA issuers: `test_tma_multiissuer` (7 items) and `test_tma_im2col_multiissuer` (3 items).**
+- **Before:** `incomplete` at the 1M-state limit.
+- **Shape:** one barrier per lane. Each barrier gets `arrive.expect_tx` and one transaction, or two for cta_group::2 pairs. The 32 independent landings were explored in every order.
+- **Why no existing rule fired:** the S8 contributor proof (deferred-completion singleton) declines a transaction landing that completes its phase, because `remaining` counts arrivals and is already 0.
+- **New rule, a sixth `singleton_persistent` rule (`Rules::sole_landing`):** a pending mbarrier completion is explored first, on its own, when it is the only possible mutation of its barrier. Conditions:
+  - No other pending completion is on the barrier, except transaction landings on the same phase. Those add up in any order, and over-delivery fails in every order.
+  - Every command or retry that can still run first on the barrier is a parity observer that the completion cannot disable.
+- **Result:** all 16 captured variants (the 7 + 3 test items, including the `sparse` sub-cases) replay Clean in at most 11 ms. The pair route went from 1M+ states to Clean.
+- **Checks:**
+  - New equivalence generator `tma_issuers_log`: 2 warps, 1-2 barriers each, 1-2 transactions per barrier with mostly exact and sometimes under- or over-delivery, waits and tests (some on the peer's barrier or with a wrong parity), and racing peer arrives and inval/re-init. Over 300 cases the oracle agrees (49 Clean, 251 Error).
+  - Scenarios: `per_thread_tma_issuers_stay_small` (72 states; it fails with the rule off) and `inval_racing_a_tma_landing_is_an_error`.
+  - Neither the generator nor the inval scenario catches a mutation that treats every command as harmless: the racing mutations here reach an error in both orders. Soundness rests on the conservative conditions above. Every non-observer command on the barrier blocks the rule, including the synthesized `Issue`.
+- **Bench note:** the fingerprint row's time ratio was noisy in this run (0.4x, 218 vs 1,569 states). Its state ratio (7x) is the guard.
+
+### 5.10 Persistent singleton rules
+
+`TransitionSystem::singleton_persistent` (`synccheck/ts.rs`) returns one enabled transition that forms a persistent set on its own: every transition that can run before it commutes with it and cannot disable it. Only that transition is explored from the state. The rule combines with sleep sets (Godefroid: explore persistent \ sleep). Each rule has a switch in `explore::Rules`, a guard row in `benches/synccheck.rs` (§5.9) and equivalence-oracle coverage. The guard is states with the rule on versus off.
+
+1. **Private async-group issue/commit** (`private_issue`). Bench: per_lane_arrivals(4,1,1,4), 546 vs 10,898 states.
+   The command has one participant and no async targets, and touches only groups that no other warp's command touches. Nothing else can conflict with it or disable it, and HB gates only open.
+   A later issue lands in a newer group than any deferred arrival already attached, because ArriveOn closes its group. Milestones are eager.
+2. **Ready mbarrier observer** (`ready_observer`). Bench: per_lane_arrivals(1,8,2,1), 118 vs 7,171 states.
+   The candidate is a wait or test (`Issue` or `Resume`) that is ready now. Everything that can still run first on its barrier is another observer: other warps' commands not HB-gated behind it, their retries, and no pending completion.
+   A wait is not invisible, because it consumes the completed phase. That is why no arrive may precede it; the S8 proof alone was refuted by the lap oracle.
+3. **Deferred completion, S8-independent** (`deferred_completion`). Bench: per_lane_arrivals(4,2,2,1), 2,805 vs the 200k budget.
+   The candidate is a pending mbarrier completion for which `independent_of_future` holds: the other contributions cannot complete the phase without it, and no observer it could disable exists.
+   It stays enabled once enabled, because async-group completion and FIFO order are monotone. Unlike waits, completions consume no phase.
+4. **Setmaxnreg warpgroup-sync credit** (`regpool_sync`). Bench: regpool_credits(3,2), 104 vs the 200k budget.
+   `WarpgroupSync { wg }` only clears `needs_sync[wg]`; it never blocks and never fails. It conflicts only with a `Set` of the same warpgroup, and no such `Set` can run first.
+   Under the contract, credits come from a warp of their own warpgroup, so a conflicting `Set` is a collective that includes the crediting warp.
+5. **Setmaxnreg `Poll` resume** (`regpool_sync`). Same bench row as rule 4.
+   A granted increase's `Poll` retry reads `pending[wg]` and mutates nothing. Only a `Set` of the same warpgroup could re-arm it, and that `Set` is a collective that includes the resuming warp.
+6. **Sole landing** (`sole_landing`). Bench: per_thread_tma(32, pair), 72 vs the 200k budget.
+   The candidate is a pending mbarrier completion that is the only possible mutation of its barrier. The only other pending completions allowed are transaction landings for the same phase: bytes add up in any order, and over-delivery fails in every order.
+   Every command or retry that can run first on the barrier is a parity observer the completion cannot disable. This also covers completions that finish the phase, which rule 3 declines.
+
+**Symmetry, not a singleton: twin landings** (`twin_landings`). Bench: per_lane_arrivals(1,2,2,1) with rule 3 off, 2,168 vs the 200k budget.
+Enabled pendings that differ only in issuing command and ordinal (same resource, FIFO, generation and count/bytes, and named by no landing gate) are interchangeable. Only the lowest is offered.

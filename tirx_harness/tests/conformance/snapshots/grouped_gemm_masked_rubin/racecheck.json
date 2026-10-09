@@ -1,0 +1,11 @@
+{
+ "case": "grouped_gemm_masked_rubin",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

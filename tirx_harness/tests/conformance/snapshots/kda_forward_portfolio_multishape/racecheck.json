@@ -1,0 +1,11 @@
+{
+ "case": "kda_forward_portfolio_multishape",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

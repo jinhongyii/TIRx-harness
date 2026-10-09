@@ -1,0 +1,11 @@
+{
+ "case": "selective_state_update_stp_horizontal",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

@@ -1,0 +1,11 @@
+{
+ "case": "cudnn_sm100_flex_attention_forward_hd256",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

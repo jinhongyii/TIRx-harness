@@ -1,0 +1,11 @@
+{
+ "case": "radix_topk_multi_cta",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

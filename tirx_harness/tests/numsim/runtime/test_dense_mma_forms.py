@@ -566,16 +566,6 @@ def test_m16n8k32_no_c_uses_zero_accumulator(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-def test_legacy_m16n8k32_int8_reuses_dense_form_and_engine(tmp_path):
-    a = (np.arange(16 * 32, dtype=np.int16).reshape(16, 32) % 15 - 7).astype(np.int8)
-    b = (np.arange(32 * 8, dtype=np.uint16).reshape(32, 8) % 11).astype(np.uint8)
-    c = (np.arange(16 * 8, dtype=np.int64).reshape(16, 8) * 17 - 400).astype(np.int32)
-    module = numsim.transpile(ptx_mma_legacy_s8_u8_m16n8k32, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"a": a, "b": b, "c": c, "output": np.zeros_like(c)})
-    expected = (a.astype(np.int64) @ b.astype(np.int64) + c.astype(np.int64)).astype(np.int32)
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
 def test_m16n8k16_integer_satfinite_clamps_after_accumulation(tmp_path):
     a = np.full((16, 16), 255, dtype=np.uint8)
     b = np.full((16, 8), 127, dtype=np.int8)

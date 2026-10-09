@@ -1,0 +1,142 @@
+{
+ "case": "deepgemm_sm100_fp8_gemm_1d1d",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1001:1-1001:68",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1215:1-1215:74"
+     ],
+     "bytes": {
+      "shared": "223232-223744"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "execution",
+     "ordering_failure": "missing_inter_actor_sync",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1193:1-1193:74",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1400:1-1400:66"
+     ],
+     "bytes": {
+      "shared": "217088-217600"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_proxy_bridge",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1193:1-1193:74",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:987:1-987:68"
+     ],
+     "bytes": {
+      "shared": "217088-217152"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "execution",
+     "ordering_failure": "missing_inter_actor_sync",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1215:1-1215:74",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1420:1-1420:66"
+     ],
+     "bytes": {
+      "shared": "223232-223744"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_proxy_bridge",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1285:1-1285:68",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:947:1-947:61"
+     ],
+     "bytes": {
+      "shared": "8192-12288"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "execution",
+     "ordering_failure": "missing_inter_actor_sync",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1285:1-1285:68",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:966:1-966:61"
+     ],
+     "bytes": {
+      "shared": "20480-86016"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "execution",
+     "ordering_failure": "missing_inter_actor_sync",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:137:1-137:70",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1434:1-1434:97"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:137:1-137:70",
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1606:1-1606:73"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1393:1-1393:67"
+     ],
+     "bytes": {
+      "shared": "217152-217600"
+     },
+     "category": "advisories",
+     "kind": "uninitialized_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "error"
+  }
+ ],
+ "schema": 4
+}

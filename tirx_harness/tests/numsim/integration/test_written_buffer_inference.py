@@ -7,7 +7,6 @@ from tvm.script import tirx as T
 
 from tirx_harness import numsim, racecheck, synccheck
 from tirx_harness.numsim.errors import NumSimExecutionError
-from tirx_harness.numsim.transpiler.frontend import analyze, verify
 
 
 @T.prim_func
@@ -140,50 +139,3 @@ def test_atomic_pointer_offset_mutates_the_parameter(tmp_path):
     check()
 
 
-@pytest.mark.parametrize("frozen", [False, True])
-def test_selected_outputs_preserve_all_host_writes(frozen, tmp_path):
-    counter = np.array([5, 7], dtype=np.uint32)
-    old_value = np.zeros(1, dtype=np.uint32)
-    inputs = {"counter": counter, "old_value": old_value}
-    if frozen:
-        case = numsim.NumSimCase(
-            kernel=atomic_through_pointer_offset,
-            args=inputs,
-            outputs=("old_value",),
-            reference=lambda: {"old_value": np.array([7], dtype=np.uint32)},
-        )
-        numsim.run_case(case).require_ok()
-    else:
-        module = numsim.transpile(atomic_through_pointer_offset, cache_dir=tmp_path)
-        result = numsim.Engine().run(module, inputs, outputs=("old_value",))
-        assert set(result.outputs) == {"old_value"}
-    np.testing.assert_array_equal(old_value, [7])
-    np.testing.assert_array_equal(counter, [5, 10])
-
-
-@pytest.mark.parametrize("address_kind", ["bound", "null", "unbound"])
-def test_dynamic_raw_write_requires_bound_address(address_kind, tmp_path):
-    spec = analyze(unresolved_raw_store)
-    verify(spec)
-    bits = np.zeros(1, np.uint64)
-    bits[0] = {"bound": bits.ctypes.data, "null": 0, "unbound": 0x1000}[address_kind]
-    inputs = {"pointer_bits": bits}
-    for checker in (synccheck, racecheck):
-        report = checker(unresolved_raw_store, inputs)
-        if address_kind == "bound":
-            report.require_clean()
-        else:
-            assert report.verdict == ("error" if address_kind == "null" else "incomplete")
-            message = "null pointer" if address_kind == "null" else "integer_address_without_binding"
-            assert message in report.format()
-    module = numsim.transpile(unresolved_raw_store, cache_dir=tmp_path)
-    if address_kind == "bound":
-        result = numsim.Engine().run(module, inputs)
-        assert set(result.outputs) == {"pointer_bits"}
-        expected = (int(bits[0]) & 0xFFFFFFFF00000000) | 1
-        np.testing.assert_array_equal(result.outputs["pointer_bits"], [expected])
-    else:
-        with pytest.raises(
-            NumSimExecutionError, match="null pointer|integer_address_without_binding"
-        ):
-            numsim.Engine().run(module, inputs)

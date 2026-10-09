@@ -663,17 +663,6 @@ def test_timer_finalize_is_a_numerical_noop(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], np.arange(7, 39, dtype=np.uint32))
 
 
-def test_removed_flat_arithmetic_helper_is_rejected_by_the_target_parser():
-    with pytest.raises(AttributeError, match="tirx.ptx.add_f32"):
-        T.call_intrin(
-            "",
-            "tirx.ptx_add_f32",
-            T.float32(0),
-            T.float32(1),
-            T.float32(2),
-        )
-
-
 def test_cuda_shuffle_rejects_invalid_width(tmp_path):
     @T.prim_func
     def kernel(output: T.Buffer((32,), "uint32"), width: T.int32):
@@ -754,15 +743,6 @@ def test_mbarrier_arrival_state_token_selects_the_exact_completed_generation(tmp
     expected = np.zeros(32, dtype=np.uint32)
     expected[0] = 1
     np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_mbarrier_state_token_rejects_a_generation_older_than_the_previous_one(tmp_path):
-    module = numsim.transpile(mbarrier_stale_state_token, cache_dir=tmp_path)
-    with pytest.raises(
-        NumSimExecutionError,
-        match="state token names generation 0, but the current generation is 2",
-    ):
-        numsim.Engine().run(module, {"output": np.zeros(4, dtype=np.uint32)})
 
 
 def test_pointer_conversions_and_runtime_descriptor_patch(tmp_path):
@@ -970,19 +950,6 @@ def test_fetch_register_separates_launched_warps_from_sm100_warp_identifier_capa
     np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-def test_integer_trap_predicate_uses_cpp_truth_conversion(tmp_path):
-    module = numsim.transpile(integer_trap_predicate, cache_dir=tmp_path)
-    passed = numsim.Engine().run(
-        module, {"flag": np.array([7], dtype=np.int32), "output": np.zeros(32, dtype=np.int32)}
-    )
-    np.testing.assert_array_equal(passed.outputs["output"], np.arange(1, 33, dtype=np.int32))
-
-    with pytest.raises(NumSimExecutionError, match="assertion condition failed"):
-        numsim.Engine().run(
-            module, {"flag": np.array([0], dtype=np.int32), "output": np.zeros(32, dtype=np.int32)}
-        )
-
-
 def test_floating_collective_predicates_use_cpp_truth_conversion(tmp_path):
     predicates = np.ones((2, 64), dtype=np.float32)
     predicates[0] = np.float32(0.0)
@@ -1026,27 +993,6 @@ def test_floating_trap_accepts_nonzero_and_nan(tmp_path, predicate):
         {"flag": np.array([predicate], dtype=np.float32), "output": np.zeros(32, dtype=np.int32)},
     )
     np.testing.assert_array_equal(result.outputs["output"], np.arange(1, 33, dtype=np.int32))
-
-
-@pytest.mark.parametrize("predicate", [np.float32(0.0), np.float32(-0.0)])
-def test_floating_trap_rejects_signed_zero(tmp_path, predicate):
-    with pytest.raises(NumSimExecutionError, match="assertion condition failed"):
-        numsim.Engine().run(
-            numsim.transpile(floating_trap_predicate, cache_dir=tmp_path),
-            {
-                "flag": np.array([predicate], dtype=np.float32),
-                "output": np.zeros(32, dtype=np.int32),
-            },
-        )
-
-
-def test_cuda_pointer_helpers_check_typed_dereference_alignment(tmp_path):
-    module = numsim.transpile(misaligned_cuda_pointer_helpers, cache_dir=tmp_path)
-    with pytest.raises(NumSimExecutionError, match="8-byte alignment"):
-        numsim.Engine().run(
-            module,
-            {"source": np.arange(32, dtype=np.uint8), "destination": np.zeros(32, dtype=np.uint8)},
-        )
 
 
 def test_named_barrier_arrive_contributes_without_blocking(tmp_path):

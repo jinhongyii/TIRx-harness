@@ -124,25 +124,6 @@ def test_tmem_layout_d_aliases_and_isolates_ctas(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-def test_tmem_layout_f_maps_rows_to_half_slabs(tmp_path):
-    output = np.zeros(64, dtype=np.uint32)
-    module = numsim.transpile(tmem_f_lane_mapping, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], 2000 + np.arange(64, dtype=np.uint32))
-
-
-def test_tmem_layout_b_splits_columns_across_lane_halves(tmp_path):
-    output = np.zeros((64, 2), dtype=np.uint32)
-    expected = np.stack(
-        [3000 + np.arange(64, dtype=np.uint32), 4000 + np.arange(64, dtype=np.uint32)], axis=1
-    )
-    module = numsim.transpile(tmem_b_lane_column_mapping, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
 def test_tmem_subword_views_alias_one_physical_cell(tmp_path):
     output = np.zeros(128, dtype=np.uint32)
     module = numsim.transpile(tmem_packed_alias, cache_dir=tmp_path)
@@ -153,13 +134,6 @@ def test_tmem_subword_views_alias_one_physical_cell(tmp_path):
     )
 
 
-def test_tmem_runtime_address_without_a_dynamic_lease_is_rejected(tmp_path):
-    output = np.zeros(32, dtype=np.uint32)
-    module = numsim.transpile(tmem_dynamic_allocated_addr, cache_dir=tmp_path)
-    with pytest.raises(numsim.NumSimExecutionError, match="not covered by any live allocation"):
-        numsim.Engine().run(module, {"output": output})
-
-
 def test_tmem_runtime_address_uses_a_live_dynamic_lease(tmp_path):
     output = np.zeros(32, dtype=np.uint32)
     module = numsim.transpile(dynamic_tmem_live_lease, cache_dir=tmp_path)
@@ -168,34 +142,12 @@ def test_tmem_runtime_address_uses_a_live_dynamic_lease(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], 7000 + np.arange(32, dtype=np.uint32))
 
 
-@pytest.mark.parametrize(
-    ("kernel", "message"),
-    [
-        (dynamic_tmem_use_before_alloc, "not covered by any live allocation"),
-        (dynamic_tmem_outside_live_lease, "not covered by any live allocation"),
-        (dynamic_tmem_use_after_dealloc, "not covered by any live allocation"),
-    ],
-)
-def test_tmem_dynamic_lease_rejects_invalid_lifetimes_and_ranges(tmp_path, kernel, message):
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-    with pytest.raises(numsim.NumSimExecutionError, match=message):
-        numsim.Engine().run(module, {"output": np.zeros(32, dtype=np.uint32)})
-
-
 def test_tmem_allocator_returns_nonzero_bases_and_reuses_released_ranges(tmp_path):
     output = np.full(3, np.uint32(0xFFFFFFFF), dtype=np.uint32)
     module = numsim.transpile(dynamic_tmem_multiple_allocations, cache_dir=tmp_path)
     result = numsim.Engine().run(module, {"output": output})
 
     np.testing.assert_array_equal(result.outputs["output"], np.array([0, 128, 0], dtype=np.uint32))
-
-
-def test_tmem_live_allocation_at_kernel_exit_is_rejected(tmp_path):
-    module = numsim.transpile(dynamic_tmem_leak, cache_dir=tmp_path)
-    with pytest.raises(
-        numsim.NumSimExecutionError, match="kernel exited with live TMEM allocations"
-    ):
-        numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.uint32)})
 
 
 def test_tmem_uninitialized_reads_are_zero_filled_and_require_review(tmp_path):

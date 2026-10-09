@@ -1,0 +1,31 @@
+{
+ "case": "cudnn_sm100_moe_grouped_gemm_dglu_dbias",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "d_row": {
+   "dtype": "uint8",
+   "sha256": "0f0de878e549f96166a529c7247b73b9cf6ec8157a8ab339e6b8fd843a4934ed",
+   "shape": [
+    32768
+   ]
+  },
+  "dbias": {
+   "dtype": "uint8",
+   "sha256": "519b60ea9d9d7c07970f34bda7561712aeb04df432219e32a99571d0b8af12ea",
+   "shape": [
+    128
+   ]
+  },
+  "dprob": {
+   "dtype": "float32",
+   "sha256": "5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+   "shape": [
+    256
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

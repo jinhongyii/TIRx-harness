@@ -1,0 +1,63 @@
+{
+ "case": "sparse_flashmla_prefill_head128_small_topk_phase1",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "access_pair": "write_read",
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:1333:1-1333:53",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:989:1-989:99"
+     ],
+     "bytes": {
+      "shared": "196608-204800"
+     },
+     "category": "findings",
+     "kind": "data_race",
+     "ordering_domain": "memory",
+     "ordering_failure": "missing_proxy_bridge",
+     "space": "shared",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:1092:1-1092:62",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:1191:1-1191:43"
+     ],
+     "bytes": {
+      "shared": "222208-222212,222216-222220"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:1180:1-1180:78",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:855:1-855:60"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:1369:1-1369:78",
+      "tirx_kernels/ported/flashmla/sparse_prefill_head128_small_topk_phase1.py:931:1-931:60"
+     ],
+     "category": "findings",
+     "kind": "scope_mismatch",
+     "ordering_domain": "memory",
+     "ordering_failure": "scope_mismatch",
+     "status": "error"
+    }
+   ],
+   "verdict": "error"
+  }
+ ],
+ "schema": 4
+}

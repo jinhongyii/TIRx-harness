@@ -1,0 +1,682 @@
+//! Micro-benchmarks for the pruning tricks the core depends on (plan §1
+//! "先量后改"). Each bench pairs the trick with the naive alternative so a
+//! regression shows up as a ratio, not an absolute time.
+
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use numsim_core::racecheck::clock::{Clock, JoinMemo, Stamp};
+use numsim_core::racecheck::input::*;
+use numsim_core::racecheck::shadow::IntervalShadow;
+use numsim_core::racecheck::Checker;
+use numsim_core::observe::CtaId;
+
+const BAR: SyncObjId = SyncObjId::Named { cta: CtaId(0), id: 0 };
+
+fn clock_with(actors: u32, base: u32) -> Clock {
+    let mut c = Clock::default();
+    for a in 0..actors {
+        c.raise(a, base + a % 7 + 1);
+    }
+    c
+}
+
+/// Packed (actor, epoch) stamp: one component read vs an O(actors) VC ≤.
+fn packed_stamp(c: &mut Criterion) {
+    let mut g = c.benchmark_group("packed_stamp_compare");
+    let memo = JoinMemo::default();
+    for actors in [64u32, 1024] {
+        let clock = clock_with(actors, 10);
+        let prior_vc = clock_with(actors, 9);
+        let stamps: Vec<Stamp> = (0..256).map(|i| Stamp::new(i % actors, 12)).collect();
+        g.bench_with_input(BenchmarkId::new("one_component", actors), &actors, |b, _| {
+            b.iter(|| stamps.iter().filter(|s| clock.observes(**s, 0)).count())
+        });
+        g.bench_with_input(BenchmarkId::new("full_vc_leq", actors), &actors, |b, _| {
+            b.iter(|| (0..256).filter(|_| black_box(&prior_vc).leq(&clock, &memo)).count())
+        });
+    }
+    g.finish();
+}
+
+/// Exact-hit in-place update vs the split/merge path on a fragmented map.
+fn exact_hit(c: &mut Criterion) {
+    let mut g = c.benchmark_group("interval_shadow_update");
+    let mut s: IntervalShadow<u64> = IntervalShadow::new();
+    for i in 0..1024u64 {
+        s.update(i * 16..i * 16 + 16, |_, c| *c = i);
+    }
+    g.bench_function("exact_hit", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            i = (i + 1) % 1024;
+            s.update(i * 16..i * 16 + 16, |_, c| *c = black_box(i));
+        })
+    });
+    g.bench_function("misaligned_split_merge", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            i = (i + 1) % 1023;
+            s.update(i * 16 + 8..i * 16 + 24, |_, c| *c = black_box(i));
+            // restore the original geometry so every iteration splits
+            s.update(i * 16..i * 16 + 16, |_, c| *c = i);
+            s.update(i * 16 + 16..i * 16 + 32, |_, c| *c = i + 1);
+        })
+    });
+    g.finish();
+}
+
+/// Barrier fan-in: N warps join the same payload. With Arc chunks the
+/// first join of an incomparable pair computes it, the rest hit the memo or
+/// the pointer-equality path.
+fn join_memo(c: &mut Criterion) {
+    let mut g = c.benchmark_group("clock_join");
+    for actors in [128u32, 4096] {
+        let payload = clock_with(actors, 100);
+        let warps: Vec<Clock> = (0..32).map(|w| {
+            let mut c = clock_with(actors, 50);
+            c.raise(w, 1000);
+            c
+        }).collect();
+        g.bench_with_input(BenchmarkId::new("chunked_fanin_disjoint_history", actors), &actors, |b, _| {
+            let memo = JoinMemo::default();
+            b.iter(|| {
+                for w in &warps {
+                    let mut x = w.clone();
+                    x.join(&payload, &memo);
+                    black_box(&x);
+                }
+            })
+        });
+        let flat_payload: Vec<u32> = (0..actors).map(|a| payload.get(a)).collect();
+        let flat_warps: Vec<Vec<u32>> = warps.iter().map(|w| (0..actors).map(|a| w.get(a)).collect()).collect();
+        g.bench_with_input(BenchmarkId::new("flat_fanin_disjoint_history", actors), &actors, |b, _| {
+            b.iter(|| {
+                for w in &flat_warps {
+                    let mut x = w.clone();
+                    for (s, p) in x.iter_mut().zip(flat_payload.iter()) {
+                        *s = (*s).max(*p);
+                    }
+                    black_box(&x);
+                }
+            })
+        });
+        g.bench_with_input(BenchmarkId::new("synchronized_ptr_eq", actors), &actors, |b, _| {
+            let memo = JoinMemo::default();
+            let mut synced = payload.clone();
+            synced.join(&payload, &memo);
+            b.iter(|| {
+                let mut x = synced.clone();
+                black_box(x.join(&payload, &memo));
+            })
+        });
+    }
+    // The realistic barrier case: warps synchronised before, so they share
+    // every chunk except the one holding their own component.
+    for actors in [128u32, 4096] {
+        let base = clock_with(actors, 50);
+        let warps: Vec<Clock> = (0..32).map(|w| {
+            let mut c = base.clone();
+            c.raise(w, 1000);
+            c
+        }).collect();
+        let memo = JoinMemo::default();
+        let mut payload = base.clone();
+        for w in &warps {
+            payload.join(w, &memo);
+        }
+        g.bench_with_input(BenchmarkId::new("chunked_fanin_shared_history", actors), &actors, |b, _| {
+            b.iter(|| {
+                for w in &warps {
+                    let mut x = w.clone();
+                    x.join(&payload, &memo);
+                    black_box(&x);
+                }
+            })
+        });
+        let flat_payload: Vec<u32> = (0..actors).map(|a| payload.get(a)).collect();
+        let flat_warps: Vec<Vec<u32>> = warps.iter().map(|w| (0..actors).map(|a| w.get(a)).collect()).collect();
+        g.bench_with_input(BenchmarkId::new("flat_fanin_shared_history", actors), &actors, |b, _| {
+            b.iter(|| {
+                for w in &flat_warps {
+                    let mut x = w.clone();
+                    for (s, p) in x.iter_mut().zip(flat_payload.iter()) {
+                        *s = (*s).max(*p);
+                    }
+                    black_box(&x);
+                }
+            })
+        });
+    }
+    g.finish();
+}
+
+/// End-to-end: a tiled producer/consumer loop through the whole checker.
+fn checker_loop(c: &mut Criterion) {
+    let topo = Topology { warps_per_cta: 4, ctas_per_cluster: 1, num_ctas: 1 };
+    let mut ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: 1 << 16, cta: 0 })];
+    let mut epoch = [0u32; 4];
+    let lanes: Vec<u8> = (0..32).collect();
+    for it in 0..64u32 {
+        for w in 0..4u32 {
+            epoch[w as usize] += 1;
+            for &l in &lanes {
+                let off = (w as u64 * 32 + l as u64) * 16;
+                ev.push(Event::Access(Access {
+                    seq: 0,
+                    who: Who::Lane { warp: w, lane: l, epoch: epoch[w as usize] },
+                    alloc: AllocId(1),
+                    range: off..off + 16,
+                    kind: if it % 2 == 0 { AccessKind::Write } else { AccessKind::Read },
+                    order: MemOrder::Weak,
+                    scope: None,
+                    atomic: false,
+                    proxy: Proxy::Generic,
+                    domain: Some(Domain::SharedCta),
+                    site: SiteId(w),
+                    returns_value: false,
+                    operand: 0,
+                }));
+            }
+        }
+        for w in 0..4u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: it as u64, release: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
+        }
+        for w in 0..4u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: it as u64, acquire: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
+        }
+    }
+    let n = ev.len();
+    c.bench_function(&format!("checker_tile_loop_{n}_events"), |b| {
+        b.iter(|| {
+            let r = Checker::run(topo, ev.iter().cloned());
+            assert!(r.is_clean());
+        })
+    });
+}
+
+/// Reader-heavy: 16 warps × 32 lanes read one tile concurrently, then a
+/// barrier and a write; stresses frontier size (witness footprint).
+fn checker_readers(c: &mut Criterion) {
+    let topo = Topology { warps_per_cta: 16, ctas_per_cluster: 1, num_ctas: 1 };
+    let mut ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: 1 << 16, cta: 0 })];
+    let mut epoch = [0u32; 16];
+    for it in 0..16u32 {
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            for l in 0..32u8 {
+                ev.push(Event::Access(Access {
+                    seq: 0,
+                    who: Who::Lane { warp: w, lane: l, epoch: epoch[w as usize] },
+                    alloc: AllocId(1),
+                    range: (l as u64 * 4)..(l as u64 * 4 + 4),
+                    kind: AccessKind::Read,
+                    order: MemOrder::Weak,
+                    scope: None,
+                    atomic: false,
+                    proxy: Proxy::Generic,
+                    domain: Some(Domain::SharedCta),
+                    site: SiteId(w),
+                    returns_value: false,
+                    operand: 0,
+                }));
+            }
+        }
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64, release: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
+        }
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64, acquire: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
+        }
+        epoch[0] += 1;
+        for l in 0..32u8 {
+            ev.push(Event::Access(Access {
+                    seq: 0,
+                who: Who::Lane { warp: 0, lane: l, epoch: epoch[0] },
+                alloc: AllocId(1),
+                range: (l as u64 * 4)..(l as u64 * 4 + 4),
+                kind: AccessKind::Write,
+                order: MemOrder::Weak,
+                scope: None,
+                atomic: false,
+                proxy: Proxy::Generic,
+                domain: Some(Domain::SharedCta),
+                site: SiteId(99),
+                returns_value: false,
+                    operand: 0,
+            }));
+        }
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64 + 1, release: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
+        }
+        for w in 0..16u32 {
+            epoch[w as usize] += 1;
+            ev.push(Event::Sync(SyncEvent::Wait { warp: w, lanes: LaneMask::ALL, obj: BAR, phase: 2 * it as u64 + 1, acquire: Some(true), scope: None, site: SiteId(0), epoch: epoch[w as usize] }));
+        }
+    }
+    let n = ev.len();
+    c.bench_function(&format!("checker_readers_{n}_events"), |b| {
+        b.iter(|| {
+            let r = Checker::run(topo, ev.iter().cloned());
+            assert!(r.is_clean());
+        })
+    });
+}
+
+fn acc(warp: u32, lane: u8, epoch: u32, kind: AccessKind, range: std::ops::Range<u64>, site: u32) -> Event {
+    Event::Access(Access {
+        seq: 0,
+        who: Who::Lane { warp, lane, epoch },
+        alloc: AllocId(1),
+        range,
+        kind,
+        order: MemOrder::Weak,
+        scope: None,
+        atomic: false,
+        proxy: Proxy::Generic,
+        domain: Some(Domain::SharedCta),
+        site: SiteId(site),
+        returns_value: false,
+        operand: 0,
+    })
+}
+
+/// Frontier eviction (`tuning::FRONTIER_EVICTION`, window `cell::EVICT_WINDOW`).
+/// `same_lane_loop`: one lane rewrites a cell that 32 lanes read each
+/// iteration (warp-synchronised); an idle second warp keeps GC from dropping
+/// anything, so without eviction the write frontier grows by one per
+/// iteration and every write rescans it. `read_shared`: 512 unordered
+/// warps x 32 lanes read one word repeatedly, the shape that made the old
+/// full-frontier eviction scan quadratic (recurrent_kda_decode_one_warp).
+fn frontier_eviction(c: &mut Criterion) {
+    use numsim_core::racecheck::tuning::FRONTIER_EVICTION;
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut loop_ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: 1 << 16, cta: 0 })];
+    let mut e = 0u32;
+    for _ in 0..4096 {
+        e += 1;
+        for l in 0..32u8 {
+            loop_ev.push(acc(0, l, e, AccessKind::Read, 0..4, 1));
+        }
+        e += 1;
+        loop_ev.push(Event::Sync(SyncEvent::WarpSync { warp: 0, mask: LaneMask::ALL, epoch: e }));
+        e += 1;
+        loop_ev.push(acc(0, 0, e, AccessKind::Write, 0..4, 2));
+        e += 1;
+        loop_ev.push(Event::Sync(SyncEvent::WarpSync { warp: 0, mask: LaneMask::ALL, epoch: e }));
+    }
+    let loop_topo = Topology { warps_per_cta: 2, ctas_per_cluster: 1, num_ctas: 1 };
+    let shared_topo = Topology { warps_per_cta: 1, ctas_per_cluster: 1, num_ctas: 512 };
+    let mut shared_ev: Vec<Event> = Vec::new();
+    for it in 1..=4u32 {
+        for w in 0..512u32 {
+            for l in 0..32u8 {
+                if it == 1 && w == 0 && l == 0 {
+                    shared_ev.push(Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Global, size: 1 << 16, cta: 0 }));
+                }
+                if let Event::Access(mut a) = acc(w, l, it, AccessKind::Read, 0..4, 3) {
+                    a.domain = Some(Domain::Global);
+                    shared_ev.push(Event::Access(a));
+                }
+            }
+        }
+    }
+    let mut g = c.benchmark_group("frontier_eviction");
+    g.sample_size(10);
+    for (name, topo, ev) in [("same_lane_loop", loop_topo, &loop_ev), ("read_shared", shared_topo, &shared_ev)] {
+        for on in [true, false] {
+            g.bench_function(BenchmarkId::new(name, if on { "on" } else { "off" }), |b| {
+                FRONTIER_EVICTION.store(on, Relaxed);
+                b.iter(|| black_box(Checker::run(topo, ev.iter().cloned())));
+                FRONTIER_EVICTION.store(true, Relaxed);
+            });
+        }
+    }
+    g.finish();
+}
+
+/// Declared-word index (`checker::Words`): radix_topk_multi_cta declares
+/// ~262K protocol words; a linear dedup / overlap scan per DeclareWord and
+/// per access made the checker quadratic (78 s in its first 3 rounds). Rows:
+/// 32K declarations then one access per word; the guard is the absolute
+/// time staying linear (compare `declared_words/8192` and `/32768`).
+fn declared_words(c: &mut Criterion) {
+    let topo = Topology { warps_per_cta: 1, ctas_per_cluster: 1, num_ctas: 1 };
+    let mut g = c.benchmark_group("declared_words");
+    g.sample_size(10);
+    for n in [8192u64, 32768] {
+        let mut ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Shared, size: n * 8, cta: 0 })];
+        for i in 0..n {
+            ev.push(Event::Sync(SyncEvent::DeclareWord { alloc: AllocId(1), range: i * 8..i * 8 + 4 }));
+        }
+        for i in 0..n {
+            ev.push(acc(0, 0, 1 + i as u32, AccessKind::Read, i * 8..i * 8 + 4, 5));
+        }
+        g.bench_function(BenchmarkId::from_parameter(n), |b| b.iter(|| black_box(Checker::run(topo, ev.iter().cloned()))));
+    }
+    g.finish();
+}
+
+/// GC back-off (`tuning::GC_BACKOFF`): a live shadow of 8192 cells with a
+/// 64-witness read frontier each (all 32 lanes of two unsynchronised warps
+/// read every cell; built untimed), then 65536 timed events with a
+/// scheduler phase end every 256. No setup witness ever dies, so every
+/// collection walks all 0.5M of them; without the back-off one runs every
+/// 4096 events. Two timed shapes:
+/// - `witnesses`: exact-hit rewrites by one lane (nothing to free);
+/// - `slots`: the same rewrites with a TMA-style copy pipeline interleaved
+///   (one fresh-source copy per ~500 events, completed on an mbarrier the
+///   consumer waits): every collection reclaims a few copy slots, about one
+///   per 1000 cells walked, like mega_moe medium under token re-attribution.
+///   The productivity test weighs them against the walk, so the back-off
+///   still engages (W16).
+///
+/// The guard is the on/off ratio of each shape (>= 1.5x; W16).
+fn gc_backoff(c: &mut Criterion) {
+    use numsim_core::racecheck::tuning::GC_BACKOFF;
+    use std::sync::atomic::Ordering::Relaxed;
+    let topo = Topology { warps_per_cta: 5, ctas_per_cluster: 1, num_ctas: 1 };
+    let cells = 8192u64;
+    let (shadow, stage, src) = (AllocId(1), AllocId(2), AllocId(3));
+    let mut setup = vec![
+        Event::Sync(SyncEvent::AllocBegin { alloc: shadow, space: Space::Shared, size: (cells + 64) * 16, cta: 0 }),
+        Event::Sync(SyncEvent::AllocBegin { alloc: stage, space: Space::Shared, size: 128, cta: 0 }),
+        Event::Sync(SyncEvent::AllocBegin { alloc: src, space: Space::Global, size: 256 * 128, cta: 0 }),
+    ];
+    for i in 0..cells {
+        for w in 0..2u32 {
+            for l in 0..32u8 {
+                setup.push(acc(w, l, 1 + i as u32, AccessKind::Read, i * 16..i * 16 + 16, w));
+            }
+        }
+    }
+    let rewrite = |k: u64| {
+        let off = (cells + k % 64) * 16;
+        acc(2, 0, 1 + k as u32, AccessKind::Write, off..off + 16, 2)
+    };
+    let witnesses: Vec<Event> = (0..65536u64).map(rewrite).collect();
+    let mut slots: Vec<Event> = Vec::new();
+    let full = SyncObjId::Mbarrier { cta: CtaId(0), alloc: AllocId(4), offset: 0 };
+    let empty = SyncObjId::Mbarrier { cta: CtaId(0), alloc: AllocId(4), offset: 8 };
+    let mut k = 0u64;
+    for i in 0..128u64 {
+        // Producer: warp 3 lane 0; consumer: warp 4; rewriter: warp 2.
+        let (p, c) = (4 * i as u32 + 1, 4 * i as u32 + 1);
+        let op = AsyncId(1 + i);
+        if i > 0 {
+            slots.push(Event::Sync(SyncEvent::Wait { warp: 3, lanes: LaneMask::lane(0), obj: empty, phase: i - 1, acquire: Some(true), scope: Some(Scope::Cta), site: SiteId(4), epoch: p }));
+        }
+        slots.push(Event::Sync(SyncEvent::AsyncIssue { op, warp: 3, lanes: LaneMask::lane(0), kind: AsyncKind::Copy, proxy: Proxy::Async, preds: vec![], footprint: vec![(stage, 0..128)], restricted: false, site: SiteId(5), epoch: p + 1 }));
+        let a = |who, alloc, range: std::ops::Range<u64>, kind, proxy, domain| Event::Access(Access { seq: 0, who, alloc, range, kind, order: MemOrder::Weak, scope: None, atomic: false, proxy, domain: Some(domain), site: SiteId(6), returns_value: false, operand: 0 });
+        slots.push(a(Who::Async { op, side: Milestone::Read }, src, (i % 256) * 128..(i % 256) * 128 + 128, AccessKind::Read, Proxy::Async, Domain::Global));
+        slots.push(a(Who::Async { op, side: Milestone::Write }, stage, 0..128, AccessKind::Write, Proxy::Async, Domain::SharedCta));
+        for m in [Milestone::Read, Milestone::Write] {
+            slots.push(Event::Sync(SyncEvent::AsyncComplete { op, milestone: m, target: CompletionTarget::Phase { obj: full, phase: i } }));
+        }
+        slots.push(Event::Sync(SyncEvent::Wait { warp: 4, lanes: LaneMask::ALL, obj: full, phase: i, acquire: Some(true), scope: Some(Scope::Cta), site: SiteId(7), epoch: c }));
+        slots.push(a(Who::Lane { warp: 4, lane: 0, epoch: c + 1 }, stage, 0..128, AccessKind::Read, Proxy::Generic, Domain::SharedCta));
+        slots.push(Event::Sync(SyncEvent::Fence { warp: 4, lanes: LaneMask::ALL, kind: FenceKind::ProxyAsync(None), site: SiteId(8), epoch: c + 2 }));
+        slots.push(Event::Sync(SyncEvent::Arrive { warp: 4, lanes: LaneMask::ALL, obj: empty, phase: i, release: Some(true), scope: Some(Scope::Cta), site: SiteId(9), epoch: c + 3 }));
+        for _ in 0..500 {
+            slots.push(rewrite(k));
+            k += 1;
+        }
+    }
+    let build = || {
+        let mut ck = Checker::new(topo);
+        ck.set_collect_at_phase_end(true);
+        for e in setup.iter().cloned() {
+            ck.event(e);
+        }
+        ck
+    };
+    let mut g = c.benchmark_group("gc_backoff");
+    g.sample_size(10);
+    for (shape, timed) in [("witnesses", &witnesses), ("slots", &slots)] {
+        for on in [false, true] {
+            g.bench_function(BenchmarkId::new(shape, if on { "on" } else { "off" }), |b| {
+                GC_BACKOFF.store(on, Relaxed);
+                b.iter_batched(
+                    build,
+                    |mut ck| {
+                        for (i, e) in timed.iter().cloned().enumerate() {
+                            ck.event(e);
+                            if i % 256 == 255 {
+                                ck.phase_end();
+                            }
+                        }
+                        ck
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    GC_BACKOFF.store(true, Relaxed);
+    g.finish();
+}
+
+/// Interval-shadow slow path on a large map of racecheck-sized cells (80
+/// bytes, like `cell::Cell`): a 256K-segment shadow with a 16-byte hole
+/// after every segment (built untimed), then every hole is first-touched
+/// (`first_touch`), or every other segment is overwritten by a range
+/// straddling two segments (`straddle`: split + merge path). cudnn
+/// gemm_proj_rope's global shadow has ~0.3M segments and 63% of its slow
+/// updates are first touches (W16). Guard: >= 1.5x vs the inline-cell
+/// BTreeMap layout it replaced (W16, 2026-10-08, same host back to back:
+/// first_touch 161 -> 78 ms, straddle 214 -> 130 ms).
+fn shadow_slow_path(c: &mut Criterion) {
+    type Fat = [u64; 10];
+    let n = 1u64 << 18;
+    let mut base: IntervalShadow<Fat> = IntervalShadow::new();
+    for i in 0..n {
+        base.update(i * 32..i * 32 + 16, |_, c| c[0] = i + 1);
+    }
+    let mut g = c.benchmark_group("interval_shadow_slow");
+    g.sample_size(10);
+    g.bench_function("first_touch", |b| {
+        b.iter_batched(
+            || base.clone(),
+            |mut s| {
+                for i in 0..n {
+                    s.update(i * 32 + 16..i * 32 + 32, |_, c| c[1] = black_box(i));
+                }
+                s
+            },
+            criterion::BatchSize::LargeInput,
+        )
+    });
+    g.bench_function("straddle", |b| {
+        b.iter_batched(
+            || base.clone(),
+            |mut s| {
+                for i in (0..n - 1).step_by(2) {
+                    s.update(i * 32 + 8..i * 32 + 40, |_, c| c[2] = black_box(i));
+                }
+                s
+            },
+            criterion::BatchSize::LargeInput,
+        )
+    });
+    g.finish();
+}
+
+/// Parallel collector (racecheck-parallel-design.md §15): one `gc()` over
+/// 296 CTA-private shared allocations (the e24 shape: 148 2-CTA clusters,
+/// ~0.9M cells, about one e24 phase-end collection) whose witnesses all stay live (no synchronisation), so every run walks
+/// every cell. Rows: inline (`gc_threads` 1) vs 16 threads; the guard is
+/// the ratio (>= 1.5x; measured 3.5-4.5x on e24's phase-end GC).
+fn gc_parallel(c: &mut Criterion) {
+    let ctas = 296u32;
+    let wpc = 4u32;
+    let topo = Topology { warps_per_cta: wpc, ctas_per_cluster: 2, num_ctas: ctas };
+    let mut ev: Vec<Event> = Vec::new();
+    for cta in 0..ctas {
+        ev.push(Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(cta + 1), space: Space::Shared, size: 1 << 16, cta }));
+    }
+    for cta in 0..ctas {
+        for w in 0..wpc {
+            let warp = cta * wpc + w;
+            for it in 0..24u32 {
+                for l in 0..32u8 {
+                    let off = ((w * 24 + it) as u64 * 32 + l as u64) * 16;
+                    if let Event::Access(mut a) = acc(warp, l, 1 + it, AccessKind::Write, off..off + 16, 6) {
+                        a.alloc = AllocId(cta + 1);
+                        ev.push(Event::Access(a));
+                    }
+                }
+            }
+        }
+    }
+    let build = |threads: usize| {
+        let mut ck = Checker::new(topo);
+        ck.set_collect_at_phase_end(true);
+        ck.gc_threads = threads;
+        for e in ev.iter().cloned() {
+            ck.event(e);
+        }
+        ck
+    };
+    let mut g = c.benchmark_group("gc_parallel");
+    g.sample_size(10);
+    for threads in [1usize, 16] {
+        g.bench_function(BenchmarkId::from_parameter(threads), |b| {
+            b.iter_batched(
+                || build(threads),
+                |mut ck| {
+                    ck.gc();
+                    ck
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
+    }
+    g.finish();
+}
+
+/// Token re-attribution (checker/tokens.rs, design §17): a TMA-style
+/// pipeline where every iteration copies a fresh global slice into one
+/// shared stage, the consumer warp waits the copy's mbarrier phase and reads
+/// the stage, fences proxy.async and releases the stage on a second
+/// mbarrier the producer waits. Without tokens each copy's global read
+/// witness pins its slot
+/// (and a clock component) for the whole run; with them the slot is
+/// reclaimed once the copy completes. The guard: `on` stays roughly linear
+/// in N (compare /1024 and /4096); `off` grows faster.
+fn reattribution_tokens(c: &mut Criterion) {
+    use numsim_core::racecheck::tuning;
+    use std::sync::atomic::Ordering::Relaxed;
+    let topo = Topology { warps_per_cta: 2, ctas_per_cluster: 1, num_ctas: 1 };
+    let mut g = c.benchmark_group("reattribution_tokens");
+    g.sample_size(10);
+    for n in [1024u64, 4096] {
+        let (glob, stage) = (AllocId(1), AllocId(2));
+        let bar = SyncObjId::Mbarrier { cta: CtaId(0), alloc: AllocId(3), offset: 0 };
+        let mut ev = vec![
+            Event::Sync(SyncEvent::AllocBegin { alloc: glob, space: Space::Global, size: n * 128, cta: 0 }),
+            Event::Sync(SyncEvent::AllocBegin { alloc: stage, space: Space::Shared, size: 128, cta: 0 }),
+        ];
+        let mut seq = 0u64;
+        let mut access = |who: Who, alloc: AllocId, range: std::ops::Range<u64>, kind: AccessKind, proxy: Proxy, domain: Domain| {
+            seq += 1;
+            Event::Access(Access { seq, who, alloc, range, kind, order: MemOrder::Weak, scope: None, atomic: false, proxy, domain: Some(domain), site: SiteId(1), returns_value: false, operand: 0 })
+        };
+        let empty = SyncObjId::Mbarrier { cta: CtaId(0), alloc: AllocId(3), offset: 8 };
+        for i in 0..n {
+            let op = AsyncId(1 + i);
+            let (p, c) = (3 * i as u32, 4 * i as u32);
+            if i > 0 {
+                // Producer waits the consumer's release of the stage.
+                ev.push(Event::Sync(SyncEvent::Wait { warp: 0, lanes: LaneMask::lane(0), obj: empty, phase: i - 1, acquire: Some(true), scope: Some(Scope::Cta), site: SiteId(4), epoch: p + 1 }));
+            }
+            ev.push(Event::Sync(SyncEvent::AsyncIssue {
+                op,
+                warp: 0,
+                lanes: LaneMask::lane(0),
+                kind: AsyncKind::Copy,
+                proxy: Proxy::Async,
+                preds: vec![],
+                footprint: vec![(stage, 0..128)],
+                restricted: false,
+                site: SiteId(2),
+                epoch: p + 2,
+            }));
+            ev.push(access(Who::Async { op, side: Milestone::Read }, glob, i * 128..i * 128 + 128, AccessKind::Read, Proxy::Async, Domain::Global));
+            ev.push(access(Who::Async { op, side: Milestone::Write }, stage, 0..128, AccessKind::Write, Proxy::Async, Domain::SharedCta));
+            for m in [Milestone::Read, Milestone::Write] {
+                ev.push(Event::Sync(SyncEvent::AsyncComplete { op, milestone: m, target: CompletionTarget::Phase { obj: bar, phase: i } }));
+            }
+            ev.push(Event::Sync(SyncEvent::Wait { warp: 1, lanes: LaneMask::ALL, obj: bar, phase: i, acquire: Some(true), scope: Some(Scope::Cta), site: SiteId(3), epoch: c + 1 }));
+            ev.push(access(Who::Lane { warp: 1, lane: 0, epoch: c + 2 }, stage, 0..128, AccessKind::Read, Proxy::Generic, Domain::SharedCta));
+            ev.push(Event::Sync(SyncEvent::Fence { warp: 1, lanes: LaneMask::ALL, kind: FenceKind::ProxyAsync(None), site: SiteId(5), epoch: c + 3 }));
+            ev.push(Event::Sync(SyncEvent::Arrive { warp: 1, lanes: LaneMask::ALL, obj: empty, phase: i, release: Some(true), scope: Some(Scope::Cta), site: SiteId(6), epoch: c + 4 }));
+        }
+        for on in [true, false] {
+            g.bench_function(BenchmarkId::new(if on { "on" } else { "off" }, n), |b| {
+                tuning::REATTRIBUTE_TOKENS.store(on, Relaxed);
+                b.iter(|| black_box(Checker::run(topo, ev.iter().cloned())));
+                tuning::REATTRIBUTE_TOKENS.store(true, Relaxed);
+            });
+        }
+    }
+    g.finish();
+}
+
+/// Joined release heads (`knowledge::HeadList`, `tuning::JOINED_HEADS`): `n`
+/// warps of different CTAs extend one RMW chain (`atom.acq_rel.gpu` on a
+/// global counter, so each write inherits every earlier head), then one warp
+/// acquires the chain head `READS` times (`ld.acquire.gpu`). Per head, every
+/// acquire joins `n` payloads; joined, one. The guard is the on/off ratio
+/// (mega_moe e24: 2.8K waits joined ~88 heads each, 4.2 ms per wait).
+fn joined_heads(c: &mut Criterion) {
+    use numsim_core::racecheck::tuning::JOINED_HEADS;
+    use std::sync::atomic::Ordering::Relaxed;
+    const READS: u32 = 256;
+    let mut g = c.benchmark_group("joined_heads");
+    g.sample_size(10);
+    for n in [64u32, 256] {
+        let topo = Topology { warps_per_cta: 1, ctas_per_cluster: 1, num_ctas: n + 1 };
+        let mut ev = vec![Event::Sync(SyncEvent::AllocBegin { alloc: AllocId(1), space: Space::Global, size: 1 << 12, cta: 0 })];
+        let mut seq = 0u64;
+        let mut strong = |w: u32, e: u32, kind: AccessKind, order: MemOrder, atomic: bool| {
+            seq += 1;
+            Event::Access(Access {
+                seq,
+                who: Who::Lane { warp: w, lane: 0, epoch: e },
+                alloc: AllocId(1),
+                range: 0..4,
+                kind,
+                order,
+                scope: Some(Scope::Gpu),
+                atomic,
+                proxy: Proxy::Generic,
+                domain: Some(Domain::Global),
+                site: SiteId(7),
+                returns_value: true,
+                operand: 0,
+            })
+        };
+        for w in 0..n {
+            ev.push(strong(w, 1, AccessKind::Rmw, MemOrder::AcqRel, true));
+        }
+        for r in 0..READS {
+            ev.push(strong(n, 1 + r, AccessKind::Read, MemOrder::Acquire, false));
+        }
+        for on in [true, false] {
+            g.bench_function(BenchmarkId::new(format!("chain_{n}"), if on { "on" } else { "off" }), |b| {
+                JOINED_HEADS.store(on, Relaxed);
+                b.iter(|| black_box(Checker::run(topo, ev.iter().cloned())));
+                JOINED_HEADS.store(true, Relaxed);
+            });
+        }
+    }
+    g.finish();
+}
+
+criterion_group!(benches, packed_stamp, exact_hit, join_memo, checker_loop, checker_readers, frontier_eviction, declared_words, gc_backoff, shadow_slow_path, gc_parallel, reattribution_tokens, joined_heads);
+criterion_main!(benches);

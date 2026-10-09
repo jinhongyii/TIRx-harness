@@ -85,6 +85,7 @@ Project website →
 | Optimize a kernel in your own project | [Quick Start](quick-start.md) |
 | Run a registered workload | [Optimization Runs](optimization-runs.md) |
 | Define a new optimization task | [Add a workload](development/add-workload.md) |
+| Run a generated kernel with only tvm-ffi | [Export a kernel](development/export-kernel.md) |
 | Publish a kernel produced by a run | [Contribute a kernel](development/contribute-kernel.md) |
 | Reproduce and resolve a defect | [Report and fix bugs](development/report-and-fix-bugs.md) |
 
@@ -120,8 +121,10 @@ Remote GPU execution <components/kcoral>
 :caption: Development
 
 development/add-workload
+development/export-kernel
 development/contribute-kernel
 development/report-and-fix-bugs
+development/architecture
 development/build-the-docs
 ```
 

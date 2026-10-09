@@ -1,0 +1,25 @@
+{
+ "case": "alphamoe_fp8_blockscale_qwen3next",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/moe/alphamoe_fp8_blockscale_qwen3next.py:1579:1-1579:149",
+      "tirx_kernels/moe/alphamoe_fp8_blockscale_qwen3next.py:474:1-474:148"
+     ],
+     "bytes": {
+      "global#5": "20480-20488,45056-45064"
+     },
+     "category": "advisories",
+     "kind": "undeclared_protocol_word",
+     "space": "global",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

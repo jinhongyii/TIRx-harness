@@ -1,0 +1,24 @@
+{
+ "case": "gdn_prefill_sm100",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "final_state": {
+   "dtype": "float32",
+   "sha256": "f2d98de8513af363609af678fc764123edafd9d2f677ac57789e8b28abc8dd62",
+   "shape": [
+    131072
+   ]
+  },
+  "o": {
+   "dtype": "float16",
+   "sha256": "452b3c8abddd4d29bca5da6e52b2d0c48b543b2688891fa8c1c820f62b51884a",
+   "shape": [
+    1024
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

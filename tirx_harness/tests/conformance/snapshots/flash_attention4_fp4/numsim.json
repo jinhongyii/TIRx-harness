@@ -1,0 +1,20 @@
+{
+ "case": "flash_attention4_fp4",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "b1e1e947e8978a8b7494203afe35fc08a199fa8ec66999769937b7658a186805",
+   "shape": [
+    1,
+    1,
+    256,
+    64
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

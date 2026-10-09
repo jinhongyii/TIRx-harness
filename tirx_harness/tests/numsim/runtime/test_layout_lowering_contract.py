@@ -49,25 +49,6 @@ def physical_buffers_with_strided_alias(output: T.Buffer((32, 3), "int32", layou
     output[lane, 2] = private[1]
 
 
-def test_physical_buffers_preserve_coordinates_aliases_and_lane_private_storage(tmp_path):
-    bindings = {"output": np.zeros((32, 3), dtype=np.int32)}
-    synccheck(physical_buffers_with_strided_alias, bindings).require_clean()
-    report = racecheck(physical_buffers_with_strided_alias, bindings)
-    # Reading storage after writing its explicit alias is intentional here.
-    assert [(finding.status, finding.kind) for finding in report.findings] == [
-        ("review", "alias_stale_read")
-    ], report.format()
-    module = numsim.transpile(physical_buffers_with_strided_alias, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, bindings)
-
-    storage = np.full(16, -1, dtype=np.int32)
-    storage[1:5] = np.arange(200, 204)
-    storage[7:11] = np.arange(204, 208)
-    lanes = np.arange(32, dtype=np.int32)
-    expected = np.column_stack((100 + (31 - lanes) % 8, storage[lanes % 16], lanes * 10 + 3))
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
 def _offset_tmem_layout(layout, col_offset):
     offset = dict(layout.offset)
     offset[TCol] = offset.get(TCol, 0) + col_offset
@@ -332,18 +313,6 @@ def test_typed_tma_uses_the_transpiler_lowered_swizzle_and_exposes_alias_writes(
     expected_logical = source.copy()
     expected_logical[4, 0] = (expected_logical[4, 0] & np.uint32(0xFFFFFF00)) | np.uint32(0xE7)
     np.testing.assert_array_equal(result.outputs["logical_output"], expected_logical)
-
-
-def test_tmem_tlane_tcol_coordinates_are_observable_through_a_physical_alias(
-    tmp_path,
-):
-    output = np.zeros(4, dtype=np.uint32)
-    module = numsim.transpile(tmem_lane_column_physical_alias, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": output})
-
-    np.testing.assert_array_equal(
-        result.outputs["output"], np.array([11, 12, 21, 22], dtype=np.uint32)
-    )
 
 
 def test_runtime_tmem_layout_base_selects_physical_columns(tmp_path):

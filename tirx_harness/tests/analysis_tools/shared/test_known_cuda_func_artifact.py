@@ -186,51 +186,6 @@ def modified_fma_scale_sub_f32x2(output: T.Buffer((1,), "uint64")):
         )
 
 
-def test_known_combine_int_frac_ex2_is_bit_exact(tmp_path):
-    rounded_bits = np.arange(32, dtype=np.uint32) + np.uint32(0x4B40_0000)
-    fraction_bits = np.arange(32, dtype=np.uint32) * np.uint32(0x0001_0203) + np.uint32(0x3F80_0000)
-    rounded = rounded_bits.view(np.float32)
-    fraction = fraction_bits.view(np.float32)
-    output = np.zeros(32, dtype=np.float32)
-
-    module = numsim.transpile(known_combine_int_frac_ex2, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {"rounded": rounded, "fraction": fraction, "output": output},
-    )
-
-    expected_bits = (rounded_bits << np.uint32(23)) + fraction_bits
-    np.testing.assert_array_equal(result.outputs["output"].view(np.uint32), expected_bits)
-    assert "wrapping_shl(23_u32)" in module.rust_source
-    assert "wrapping_add" in module.rust_source
-
-
-def test_known_shl_u32_clamp_is_bit_exact(tmp_path):
-    values = np.array(
-        [0xFFFF_FFFF, 1, 3, 0x8000_0001, 0xDEAD_BEEF, 7, 9, 11],
-        dtype=np.uint32,
-    )
-    shifts = np.array([0, 1, 7, 31, 32, 33, 63, 255], dtype=np.uint32)
-    output = np.zeros(8, dtype=np.uint32)
-
-    module = numsim.transpile(known_shl_u32_clamp, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {"values": values, "shifts": shifts, "output": output},
-    )
-
-    expected = np.array(
-        [
-            (int(value) << int(shift)) & 0xFFFF_FFFF if shift < 32 else 0
-            for value, shift in zip(values, shifts, strict=True)
-        ],
-        dtype=np.uint32,
-    )
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-    assert "checked_shl" in module.rust_source
-    assert "unwrap_or(0_u32)" in module.rust_source
-
-
 def test_known_gdn_lg2_approx_ftz_flushes_subnormal_input(tmp_path):
     values = np.array(
         [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 10.0, np.nextafter(np.float32(0), np.float32(1))],

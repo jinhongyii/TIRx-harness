@@ -1,0 +1,28 @@
+[package]
+name = "numsim-oplib"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Engine-independent numerical and addressing kernels for NumSim (cvt, fp8/fp4/bf16, MMA, TMA/im2col/swizzle, warp lane math)."
+
+[lib]
+name = "numsim_oplib"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Expose `cvt::goldens` (GPU-recorded cvt rows) for downstream replay tests.
+goldens = []
+
+[dev-dependencies]
+# W4: kernel microbenches (benches/kernels.rs).
+criterion = { version = "=0.5.1", default-features = false }
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[dependencies]
+numsim-types = { path = "../numsim-types" }
+libm = "=0.2.16"
+

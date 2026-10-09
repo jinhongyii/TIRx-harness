@@ -6,13 +6,19 @@ The frontend records every rejected call as an ``op#<id>:...`` entry of
 specialization is the engine instruction its site emits.  The helpers below
 expose exactly those facts, plus the complete native module text, so a test never
 needs a Python-side resolution object.
+
+The kernel builders (``parse_kernel``, ``device_kernel``, ``evaluated_kernel``,
+``replace_call``) are plain TIRx. The manifest and emission views read the
+legacy frontend and Rust artifact emitter, which redesign step 5 deletes; they
+import it on call, so a test module that only builds kernels (or whose other
+tests do not use these views) still imports without the legacy modules.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import tvm
 from tvm import tirx
@@ -21,9 +27,8 @@ from tvm.script import tirx as T
 from tvm.tirx import Stmt
 from tvm_ffi import structural_map
 
-from tirx_harness.numsim.transpiler.artifact_template import emit_rust_module
-from tirx_harness.numsim.transpiler.frontend import PrimFuncSpec, analyze, verify
-from tirx_harness.numsim.transpiler.host_prelude import normalize_host_tensor_map_prelude
+if TYPE_CHECKING:
+    pass
 
 DEVICE_ENTRY_ATTR = "tirx.device_entry"
 
@@ -63,28 +68,8 @@ def replace_call(func: tirx.PrimFunc, original: Any, replacement: Any) -> tirx.P
     return tirx.PrimFunc(func.params, body, func.ret_type, func.attrs)
 
 
-def kernel_manifest(func: Any) -> PrimFuncSpec:
-    """The kernel's manifest, rejected calls included in ``unsupported``."""
-
-    return analyze(func).kernels[0]
-
-
-def resolved_kernel(func: Any) -> PrimFuncSpec:
-    """The kernel's manifest, raising ``UnsupportedTIRxError`` for any rejected call."""
-
-    spec = analyze(func)
-    verify(spec)
-    return spec.kernels[0]
-
-
 def _op_name(entry: Any) -> str:
     return str(getattr(entry.node.op, "name", ""))
-
-
-def call_op_names(kernel: PrimFuncSpec) -> set[str]:
-    """The op names of the kernel's calls."""
-
-    return {_op_name(entry) for entry in kernel.source_map if entry.kind == "Call"}
 
 
 class EmittedCall(NamedTuple):
@@ -122,43 +107,6 @@ def _enclosing_call(text: str, index: int) -> EmittedCall:
     function = re.search(r"[A-Za-z_][A-Za-z0-9_:]*$", text[:name_end])
     assert function is not None, text[name_end - 80 : open_paren]
     return EmittedCall(function.group(0), generics)
-
-
-def emitted_calls(
-    func: tirx.PrimFunc, matches: str | Callable[[str], bool] | Any
-) -> list[EmittedCall]:
-    """The ``v2::`` instructions emitted at the calls ``matches`` selects.
-
-    ``matches`` is an op name, a predicate over op names, or one exact call node.
-    Calls follow their order in the complete emitted module.
-    """
-
-    func = normalize_host_tensor_map_prelude(func)
-    spec = analyze(func)
-    verify(spec)
-    kernel = spec.kernels[0]
-    if isinstance(matches, Expr):
-        selected = lambda entry: entry.node.same_as(matches)  # noqa: E731
-    else:
-        accept = _matcher(matches)
-        selected = lambda entry: accept(_op_name(entry))  # noqa: E731
-    sites = {entry.op_id for entry in kernel.source_map if entry.kind == "Call" and selected(entry)}
-    assert sites, "no call matches"
-    text = emit_rust_module(spec, func)
-    calls = []
-    for site in _SITE.finditer(text):
-        if int(site.group(1)) in sites:
-            call = _enclosing_call(text, site.start())
-            if call.function.startswith("v2::"):
-                calls.append(call)
-    return calls
-
-
-def emitted_module(func: tirx.PrimFunc) -> str:
-    """The complete native plain-mode module containing one kernel."""
-
-    func = normalize_host_tensor_map_prelude(func)
-    return emit_rust_module(analyze(func), func)
 
 
 __all__ = [

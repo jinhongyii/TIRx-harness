@@ -1,0 +1,11 @@
+{
+ "case": "mxfp8_quantize",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

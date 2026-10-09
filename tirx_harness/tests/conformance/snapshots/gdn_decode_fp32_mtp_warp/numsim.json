@@ -1,0 +1,32 @@
+{
+ "case": "gdn_decode_fp32_mtp_warp",
+ "diagnostics": [
+  {
+   "anchors": [],
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "register",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "output": {
+   "dtype": "uint16",
+   "sha256": "4d56ffe20e134156c80f77309a43de2c5d86f5f24b5ce8ef7904a01df48daedf",
+   "shape": [
+    52224
+   ]
+  },
+  "state": {
+   "dtype": "float32",
+   "sha256": "5f7a60d655b2919c9f020ff6de2b93b42934588ccd6be147ed433be4b369f100",
+   "shape": [
+    2228224
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "review"
+}

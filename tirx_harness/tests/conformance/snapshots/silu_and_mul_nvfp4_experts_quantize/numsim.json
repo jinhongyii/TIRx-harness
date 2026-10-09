@@ -1,0 +1,24 @@
+{
+ "case": "silu_and_mul_nvfp4_experts_quantize",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "out_global": {
+   "dtype": "uint64",
+   "sha256": "45e7ff2abd9205a46e26106d2707c6b35033083b3d1f63364915af8eda8ce170",
+   "shape": [
+    16
+   ]
+  },
+  "sf_out": {
+   "dtype": "uint8",
+   "sha256": "cbc1f2109a908a50e151801b68cbce31f50274aeebf916d8f571a1458aaaae4c",
+   "shape": [
+    2048
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

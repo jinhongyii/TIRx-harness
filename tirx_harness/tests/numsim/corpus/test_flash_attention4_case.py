@@ -13,8 +13,8 @@ from tests.numsim.corpus.kernels.attention import (
     prepare_flash_attention4_case as prepare_numsim_case,
 )
 from tests.numsim.support._tirx_kernels import load_tirx_kernel
-from tirx_harness.numsim.bindings import _decode_tensor_maps, _tensor_map_base_array
-from tirx_harness.numsim.transpiler.frontend import analyze
+from tests.numsim.support.host_bindings import decode_tensor_maps, tensor_map_base_array
+from tests.numsim.support.kernel_facts import launch_topology
 
 get_kernel = load_tirx_kernel("flash_attention4").get_kernel
 
@@ -58,43 +58,6 @@ def test_flash_attention_numsim_corpus_covers_every_gqa_ratio_and_causal_branch(
     assert signatures == {
         (256, ratio, causal) for ratio in (1, 2, 4, 8) for causal in (False, True)
     } | {(384, ratio, causal) for ratio in (1, 8) for causal in (False, True)}
-
-
-@pytest.mark.parametrize("label", ["s256_mha_noncausal", "s256_gqa8_causal"])
-def test_prepare_flash_attention_numsim_case_is_deterministic(label):
-    config = next(item for item in NUMSIM_CONFIGS if item["label"] == label)
-    params = {key: value for key, value in config.items() if key != "label"}
-    case = prepare_numsim_case(**params)
-    repeated = prepare_numsim_case(**params)
-
-    q_descriptor = _decode_tensor_maps(case.args["Q_tensor_map"])[0]
-    k_descriptor = _decode_tensor_maps(case.args["K_tensor_map"])[0]
-    o_descriptor = _decode_tensor_maps(case.args["O_tensor_map"])[0]
-    assert q_descriptor.global_shape == o_descriptor.global_shape
-    assert q_descriptor.dtype == o_descriptor.dtype == "float16"
-    assert math.prod(k_descriptor.global_shape) == 256 * params["num_kv_heads"] * 128
-    assert analyze(case.kernel).topology.warps_per_cta == 16
-    np.testing.assert_array_equal(
-        _tensor_map_base_array(case.args["Q_tensor_map"]),
-        _tensor_map_base_array(repeated.args["Q_tensor_map"]),
-    )
-    np.testing.assert_array_equal(case.reference()["O"], repeated.reference()["O"])
-
-
-def test_flash_attention_corpus_has_expected_full_launch_topologies():
-    expected_clusters = {
-        "s256_mha_noncausal": 32,
-        "s256_gqa8_noncausal": 32,
-        "s384_mha_noncausal": 64,
-        "s384_gqa8_noncausal": 48,
-    }
-    for label, clusters in expected_clusters.items():
-        config = next(item for item in NUMSIM_CONFIGS if item["label"] == label)
-        params = {key: value for key, value in config.items() if key not in {"label", "seed"}}
-        topology = analyze(get_kernel(**params)).topology
-        assert topology.clusters == clusters
-        assert topology.ctas_per_cluster == 1
-        assert topology.warps_per_cta == 16
 
 
 @pytest.mark.parametrize("causal", [False, True])

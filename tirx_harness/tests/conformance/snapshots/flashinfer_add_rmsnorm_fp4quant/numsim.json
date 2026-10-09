@@ -1,0 +1,56 @@
+{
+ "case": "flashinfer_add_rmsnorm_fp4quant",
+ "diagnostics": [
+  {
+   "anchors": [
+    "tirx_kernels/ported/flashinfer/norm/add_rmsnorm_fp4quant.py:912:1-912:38"
+   ],
+   "bytes": {
+    "shared": "128-2048"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "shared",
+   "status": "review"
+  },
+  {
+   "anchors": [
+    "tirx_kernels/ported/flashinfer/norm/add_rmsnorm_fp4quant.py:919:1-919:38"
+   ],
+   "bytes": {
+    "shared": "2176-4096"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "shared",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "residual": {
+   "dtype": "float16",
+   "sha256": "886b89d01dbb44b41e658c835065ae5847518a4db319eb740f986830be6960d4",
+   "shape": [
+    64
+   ]
+  },
+  "scales": {
+   "dtype": "uint8",
+   "sha256": "253ecbb6688313e3d743925cc6a6b31e2d72733bfa4a8d0b03f4a6e7326d0ce8",
+   "shape": [
+    4
+   ]
+  },
+  "y": {
+   "dtype": "uint8",
+   "sha256": "517c3ff9759d5c3c8e607e64f19262e978b36314a76d35a3af76e608161f9ca1",
+   "shape": [
+    32
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "review"
+}

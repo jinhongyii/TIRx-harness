@@ -1,0 +1,11 @@
+# NumSim v2 lints with the repository root rule set (E, F, I, UP, RUF and its
+# ignores, ../../../../../pyproject.toml) on top of tirx_harness/pyproject.toml.
+extend = "../../../../pyproject.toml"
+
+[lint]
+select = ["E", "F", "I", "UP", "RUF"]
+ignore = ["UP028", "UP030", "UP031", "RUF043", "RUF059"]
+
+[lint.isort]
+known-first-party = ["tvm", "tirx_kernels", "tirx_harness", "evolution"]
+split-on-trailing-comma = false

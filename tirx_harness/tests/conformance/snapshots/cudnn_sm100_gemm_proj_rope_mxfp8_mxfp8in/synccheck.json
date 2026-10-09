@@ -1,0 +1,11 @@
+{
+ "case": "cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

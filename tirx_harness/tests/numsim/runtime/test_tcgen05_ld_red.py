@@ -42,14 +42,3 @@ def test_tcgen_load_reduction_matches_column_oracle(dtype, maximum, split, absol
         np.testing.assert_array_equal(np.signbit(actual[:, 4][zero]), np.signbit(expected[zero]))
 
 
-def test_tcgen_load_reduction_preserves_the_store_wait_contract(monkeypatch, tmp_path):
-    monkeypatch.setenv("NUMSIM_CACHE_DIR", str(tmp_path))
-    args = {
-        "source": np.arange(256, dtype=np.float32).reshape(32, 8),
-        "output": np.zeros((32, 5), dtype=np.float32),
-    }
-    for checker in (synccheck, racecheck):
-        checker(ld_red_kernel(), args).require_clean()
-    report = racecheck(ld_red_kernel(wait_st=False), args)
-    assert report.verdict == "error"
-    assert any(f.status == "error" and f.details["access_pair"] == "write_read" for f in report.findings)

@@ -81,7 +81,7 @@ Internal analysis limits fail closed as `incomplete`.
 Current limitations:
 
 - Opaque CUDA bodies and unsupported executed TIRx effects are incomplete.
-- Exit-sensitive cluster-barrier participation that cannot be modeled is
-  `cluster_barrier_warp_exit_unmodeled` and incomplete.
+- Barrier participation after warp exit that the model cannot resolve is
+  incomplete.
 - An execution stopped by an internal limit cannot certify the full launch.
 - Barrier names may use physical pool offsets instead of source-level names.

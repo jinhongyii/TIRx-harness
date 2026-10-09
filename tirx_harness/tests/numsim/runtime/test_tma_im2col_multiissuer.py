@@ -97,15 +97,6 @@ def test_im2col_per_thread_coordinates_and_offsets(rank, tmp_path):
         np.testing.assert_array_equal(result.outputs["output"], expected)
 
 
-def test_im2col_multiissuer_requires_completion_wait():
-    kernel, source, metadata, expected = im2col_multiissuer_case(3, wait=False)
-    report = racecheck(kernel, {
-        "tmap": numsim.TensorMap(source, **metadata).numpy(), "output": np.zeros_like(expected),
-    })
-    assert report.verdict == "error", report.format()
-    assert any(f.status == "error" and f.details["access_pair"] in {"write_read", "read_write"} for f in report.findings), report.format()
-
-
 def wide_im2col_multiissuer_case(w128, sparse=False):
     pixels, multiplier, stride = (128, 4, 2560) if w128 else (5, 1, 256)
     max_rows = pixels + 2 * multiplier

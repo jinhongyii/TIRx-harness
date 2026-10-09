@@ -1,0 +1,11 @@
+{
+ "case": "recurrent_kda_decode_one_warp",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

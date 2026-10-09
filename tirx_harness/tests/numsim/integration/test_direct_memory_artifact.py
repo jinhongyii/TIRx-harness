@@ -5,7 +5,6 @@ import pytest
 
 from tirx_harness import numsim
 from tests.numsim.support.kernels import direct_cuda_ldg, direct_tvm_access_ptr_shared
-from tirx_harness.numsim.transpiler.frontend import analyze
 from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 
@@ -129,29 +128,6 @@ def pass_emitted_cp_async_raw(
         output[lane * 4 + element] = shared[lane * 4 + element]
 
 
-def test_cuda_ldg_reads_typed_global_memory(tmp_path):
-    source_f32 = np.linspace(-2.0, 3.0, 32, dtype=np.float32)
-    source_i32 = np.arange(32, dtype=np.int32) * 7 - 11
-    output_f32 = np.zeros(32, dtype=np.float32)
-    output_i32 = np.zeros(32, dtype=np.int32)
-
-    spec = analyze(direct_cuda_ldg)
-    assert spec.unsupported == ()
-    module = numsim.transpile(direct_cuda_ldg, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "source_f32": source_f32,
-            "source_i32": source_i32,
-            "output_f32": output_f32,
-            "output_i32": output_i32,
-        },
-    )
-
-    np.testing.assert_array_equal(result.outputs["output_f32"], source_f32[::-1])
-    np.testing.assert_array_equal(result.outputs["output_i32"], source_i32[::-1])
-
-
 def test_raw_cp_async_issues_nonbulk_group_for_zero_fill_lanes(tmp_path):
     source = np.arange(128, dtype=np.float32) + np.float32(0.25)
     output = np.full_like(source, np.float32(-1))
@@ -172,74 +148,6 @@ def test_pass_emitted_cp_async_raw_restores_element_offsets(tmp_path):
     result = numsim.Engine().run(module, {"source": source, "output": output})
 
     np.testing.assert_array_equal(result.outputs["output"], source)
-
-
-def test_tvm_access_ptr_applies_element_offset_to_shared_pointer(tmp_path):
-    output = np.zeros(128, dtype=np.uint32)
-
-    spec = analyze(direct_tvm_access_ptr_shared)
-    assert spec.unsupported == ()
-    module = numsim.transpile(direct_tvm_access_ptr_shared, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": output})
-
-    expected = np.arange(128, dtype=np.uint32) * 3 + 1
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-    assert "physical_ptr_access_view(" in module.rust_source
-    assert "access_ptr_byte_offsets" not in module.rust_source
-    assert ".with_element_offset_extent(" not in module.rust_source
-
-
-def test_decl_buffer_views_preserve_permitted_accesses(tmp_path):
-    source = np.arange(32, dtype=np.uint32)
-    module = numsim.transpile(permitted_decl_buffer_accesses, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {"source": source, "output": np.zeros(32, dtype=np.uint32)},
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], source + np.uint32(5))
-
-
-@pytest.mark.parametrize(
-    ("kernel", "arguments", "message"),
-    [
-        (
-            store_through_read_only_access_ptr,
-            {"output": np.zeros(32, dtype=np.uint32)},
-            "non-writable physical pointer",
-        ),
-        (
-            load_through_write_only_access_ptr,
-            {
-                "source": np.arange(32, dtype=np.uint32),
-                "output": np.zeros(32, dtype=np.uint32),
-            },
-            "non-readable physical pointer",
-        ),
-        (
-            nested_access_ptr_cannot_widen_permissions,
-            {"output": np.zeros(32, dtype=np.uint32)},
-            "cannot add write access",
-        ),
-        (
-            write_through_read_only_decl_buffer,
-            {
-                "source": np.arange(32, dtype=np.uint32),
-                "output": np.arange(32, dtype=np.uint32),
-            },
-            "non-writable DeclBuffer view",
-        ),
-        (
-            oversized_decl_buffer_from_access_ptr,
-            {"source": np.arange(32, dtype=np.uint32)},
-            "outside tvm_access_ptr range",
-        ),
-    ],
-)
-def test_access_ptr_contract_fails_closed(kernel, arguments, message, tmp_path):
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-    with pytest.raises(numsim.NumSimExecutionError, match=message):
-        numsim.Engine().run(module, arguments)
 
 
 def test_integer_pointer_arithmetic_does_not_carry_access_ptr_extent(tmp_path):

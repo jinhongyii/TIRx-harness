@@ -1,5 +1,7 @@
 """Exercise an installed wheel without importing checkout sources or using a GPU."""
 
+import subprocess
+import sys
 from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,7 +10,7 @@ import numpy as np
 
 import tirx_harness
 from tirx_harness import numsim
-from tirx_harness.numsim.transpiler import native_frontend
+from tirx_harness.numsim.v2 import compile as numsim_compile
 from tvm.script import tirx as T
 
 
@@ -25,11 +27,10 @@ def main():
     assert "site-packages" in package.parts, package
     assert tirx_harness.__version__ == version("tirx-harness")
     assert callable(tirx_harness.racecheck) and callable(tirx_harness.synccheck)
-    library = native_frontend.library_path()
-    assert library.is_relative_to(package), library
-    assert native_frontend._library() is not None
-    for name in ("LICENSE", "NOTICE"):
-        assert (library.parent / "_thirdparty_licenses" / "tvm-rust-ext" / name).is_file()
+    # The compiled engine ships inside the package and loads.
+    extensions = list((package / "numsim" / "v2").glob("numsim_core_py*.so"))
+    assert len(extensions) == 1, extensions
+    assert numsim_compile.native() is not None
 
     source = np.arange(32, dtype=np.float32)
     with TemporaryDirectory() as temporary:
@@ -38,7 +39,25 @@ def main():
             module, {"source": source, "output": np.zeros_like(source)}
         )
         np.testing.assert_array_equal(result.outputs["output"], source + 1)
-    print(f"tirx-harness {version('tirx-harness')}: installed native frontend and NumSim OK")
+
+        skills_dir = Path(temporary) / "skills"
+        # The console script sits beside the interpreter of the test venv.
+        subprocess.run(
+            [
+                str(Path(sys.executable).with_name("tirx-harness")),
+                "skills",
+                "install",
+                "--dest",
+                str(skills_dir),
+                "--no-fetch",
+            ],
+            check=True,
+        )
+        for name in ("tirx-debug-kernel", "tirx-profile-kernel", "tirx-wiki"):
+            assert (skills_dir / name / "SKILL.md").is_file(), name
+    print(
+        f"tirx-harness {version('tirx-harness')}: installed NumSim engine and skills OK"
+    )
 
 
 if __name__ == "__main__":

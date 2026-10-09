@@ -1,0 +1,37 @@
+{
+ "case": "flashinfer_rmsnorm_fp4quant",
+ "diagnostics": [
+  {
+   "anchors": [
+    "tirx_kernels/ported/flashinfer/norm/rmsnorm_fp4quant.py:800:1-800:38"
+   ],
+   "bytes": {
+    "shared": "128-2048"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "shared",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "scales": {
+   "dtype": "uint8",
+   "sha256": "80b1fed821ea88f0e46b96640b13aae900aa2ba11b151ccb6f05342c47cbbf19",
+   "shape": [
+    4
+   ]
+  },
+  "y": {
+   "dtype": "uint8",
+   "sha256": "c4cc48f752511921e5bc7e23df1f5e52e739f77d20958532e7a6ea6ea0bb545a",
+   "shape": [
+    32
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "review"
+}

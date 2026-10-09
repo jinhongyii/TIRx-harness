@@ -1,0 +1,1206 @@
+---
+orphan: true
+---
+
+# NumSim engine review: interpreter and scheduler (HEAD fff0479)
+
+## Status (W13, 2026-10-09, engine df585e9)
+
+**v2 vs legacy today.** See `perf-same-verdict.md`, "v2 now (243f9f4)" columns. NumSim is 7.5x / 6.7x / 6.7x faster than legacy at 1 / 8 / 32 workers (geometric mean over 30 rows), and no row is >10% slower. Racecheck is 5.9x / 3.6x / 3.6x and synccheck 6.7x / 5.9x / 6.1x. What remains are two multi-worker Mega MoE gaps:
+
+| Workload | Legacy | v2 now |
+|---|---|---|
+| medium, 16 workers | 5.0 s | 5.75 s (1.15x slower) |
+| medium, 32 workers | 3.7 s | 6.92 s (1.87x slower) |
+| max config | 185 s (at load 40–50) | 271.6 s (1.47x slower) |
+
+Medium at 1 worker is now 1.61x faster than legacy (22.2 s against 35.7 s).
+
+**CPU split now.** Measured on a private instrumented build of df585e9:
+- Per-partition and main-thread phases use thread CPU time; `run_cta`, `land` by kind and slices use rdtsc.
+- One run each, at host load 7–9.
+- The max config is `test_mega_moe_numsim_max_config` (16 workers).
+- The W2-era column is from the "Mega MoE max config" section below.
+
+| | Max config, 16 workers | W2-era | Medium, 1 worker | Medium, 16 workers | Medium, 32 workers |
+|---|---|---|---|---|---|
+| Rust work outside the round loop | 26.0 s, of which input allocation 8.8–9.3 s, output copies 14.5 s and drops 1.7 s | 9.2 s (input allocation only) | 0.85 s | 0.76 s | 0.78 s |
+| Round loop wall | 211.9 s | — | 21.3 s | 3.04 s | 4.20 s |
+| Parallel phase wall | 207.9 s | — | 21.1 s | 2.89 s | 3.98 s |
+| Critical path (sum over rounds of the slowest partition) | 122.7 s | 203 s | 1.42 s | 1.72 s | 3.01 s |
+| Partition CPU, total | 2,136 s | 3,460–3,712 s | 20.8 s | 28.6 s | 50.1 s |
+| `run_cta` | 1,001 s | 1,326 s | 7.6 s | 11.6 s | 19.9 s |
+| of which blocked warps re-polled | 203 s (32.2 M slices; 118 M repeats applied without re-running) | 288 s (151 M slices) | 0.13 s | 0.20 s | 0.34 s |
+| `land` | 1,136 s | 2,074 s | 13.1 s | 17.0 s | 30.1 s |
+| of which MMA | 700 s | 1,309–1,356 s | 6.7 s | 8.5 s | 15.1 s |
+| of which TcgenCp | 174 s | 131 s | 2.7 s | 3.4 s | 6.1 s |
+| of which Copy | 177 s | 114 s | 2.1 s | 2.8 s | 4.7 s |
+| of which landing scan | 79 s | 75 s | 1.6 s | 2.2 s | 4.0 s |
+| Merge and replay (main thread) | 12.5 s | — | 0.09 s | 0.16 s | 0.23 s |
+| Serial phase | 3.1 s | 0.5 s | 0.12 s | 0.09 s | 0.15 s |
+| Turnover | 0.7 s | 0.9 s | 0.02 s | 0.03 s | 0.04 s |
+
+Medium's `Engine.run` wall is 1.8–1.9 s above `run_with_config` at every worker count: Python-side binding and report. At 16 workers that is a third of the 5.7 s.
+
+**What the remaining gaps are.**
+1. **Per-round overhead.**
+   - The max config's parallel-phase wall exceeds the critical path and CPU/16. A better lower bound is the per-round sum of max(slowest partition, partition CPU / workers), measured at 125 s against a 170 s wall in the same run (174 s in a second run, 208 s at load 7–9).
+   - The remaining 45 s (26%) is about 0.6 ms per round over 74,478 rounds:
+     - 12 s is the main thread's merge and replay;
+     - the rest is the pool's park/wake and the dynamic handout.
+   - **Longest-first handout: measured, declined (negative).** Partitions were handed out in descending order of their previous round's wall time.
+     - Max config parallel-phase wall: 187.2 → 187.8 s (same load).
+     - Medium at 16 workers: 2.92–3.21 → 2.81–2.99 s.
+     - Medium at 32 workers: 3.91–4.09 → 3.84 s.
+     - At most about 5%, far below the 1.5x bar, so the gap is not ordering imbalance.
+   - Lever if it matters: a cheaper round handoff, e.g. spin-before-park, measured 1.40x at 32 workers on 2026-10-08 (below the bar then), or fewer rounds.
+   - Owner: W13 / W2 (sched).
+2. **Per-partition CPU inflation with worker count.**
+   - Medium partition CPU is 20.8 s at 1 worker, 28.6 s at 16 (1.37x) and 50.1 s at 32 (2.4x). At 32 workers the critical path itself grows to 3.0 s.
+   - This is user-mode CPU in the partitions' own code, and its cause is not attributed (below).
+3. **MMA landing** (700 s on the max config, 33% of partition CPU). Oplib, W4.
+4. **Fixed costs outside the round loop.**
+   - Max config: the 26 s was not growth since the W2 split. W2's 9.2 s counted input allocation only, which is still 8.8–9.3 s. The rest was the Rust output step copying every argument buffer out of the arena (14.5 s), plus drops (1.7 s).
+   - Output buffers now move out of the arena instead (W13, `sched/mod.rs` `run_with_config`). Output copies drop from 14.5 to 1.25 s on the max config and from 0.43 to 0.08 s on medium.
+   - Medium also has about 1.9 s of Python-side binding and report per run. Owner: W8 (numsim-py).
+5. **Parked spin-loop re-polls** (203 s on the max config). These polls emit Access events. A skip would therefore be observer-selected, which the one-execution-path rule forbids; see the 2026-10-08 decision below. Blocked `mbarrier.try_wait` / `bar.sync` retries are already applied without re-execution (`BlockedWait`).
+
+**Proven not to be the cause** (see "Mega MoE medium: per-worker CPU inflation" and the allocation sections):
+- locks and atomics on the partition path;
+- page faults, TLB shootdowns and system calls;
+- NUMA placement and L3 capacity at 16 workers;
+- false sharing of engine structs;
+- data hand-off between the main thread and workers;
+- register-file footprint;
+- shared mutable arena state (code audit);
+- allocator volume, cut 79 → 31 GB per medium run without closing the gap;
+- glibc tcache;
+- partition-to-thread migration: sticky assignment was measured and declined, and static assignment with pinned threads was also tried.
+
+16 or 32 independent single-worker processes do not inflate.
+
+**Missing diagnostic.** Hardware counters (cache and TLB misses, frequency, IPC per partition thread) are unavailable: `perf_event_paranoid=4` on this host, and `/usr/bin/perf` is installed but blocked. Attributing the multi-worker CPU inflation (item 2) needs them. That requires `perf_event_paranoid ≤ 2`, or a host where perf is allowed, and is the one measurement still outstanding.
+
+Scope: `numsim-core/src/{interp,sched,arena.rs}`, tests, and benches. Line numbers refer to HEAD. Programs use `testutil::ProgramBuilder` (`b.`).
+
+Each finding is labelled as follows:
+- **C**: confirmed. Either it was traced through the code end to end, or it was reproduced with a scratch probe built from HEAD; the repository was not touched.
+- **L**: likely. It comes from reading the code but was not executed.
+
+## Critical / high
+
+**H1. A named barrier that is waiting only on exited warps is reported as `Deadlock` (C).** `sync.rs:78-81`, `control.rs:275-317`, `sched/mod.rs:1096-1123`
+- A `bar.sync` with no count expects `warps_per_cta*32` threads.
+- `exit` reports to the cluster barrier only, and the deadlock classifier exempts only divergent warps.
+- sync-semantics §3 G8 requires this hang to be *incomplete*. PTX §9.7.14.7 releases the barrier.
+- Trigger: 64 threads; `b.compare(Ge, U32, p, warp, 1); b.if_(p); b.exit(); b.end_if(); b.bar_sync(0); b.exit();`. The result is `RunStatus::Deadlock`, which is a false error.
+- Fix: in the deadlock classifier, return `Incomplete("G8")` when a blocked `Named{cta}` CTA has an exited warp (or implement exit release).
+
+**H2. A bounded loop with a failed poll is spin-parked and becomes a false `Deadlock` (C).** `control.rs:209-213`, `mod.rs:1096`
+- Parking assumes that any iteration with a failed poll and no progress is a spin.
+- A `for k<3: r = mbar_test_wait(bar, 0)` probe (bar initialised, never arrived) parks in round 2 with no progress. The run is declared Deadlock even though the next retry would exit the loop.
+- sync-semantics §1.4 says "a single spinning warp is not proof".
+- Fix: park only if the register file hash at this `LoopEnd` equals the hash at the previous parked `LoopEnd` of the same frame (a true fixed point). Otherwise treat the parked retry as possible progress.
+
+**H3. `cp.async.bulk.wait_group.read N` publishes the read milestone for the N younger, uncovered groups (C, probe).** `async_copy.rs:270-282`
+- `retired || read` covers every member group of the resource.
+- Trigger: lane 0 issues two s2g `BulkCopy{completion: Group}`, each followed by `AsyncCommit{Bulk}`, then `AsyncWait{Bulk, n:1, read:true}`. Both ops get `AsyncComplete{Read}`, which creates a false HB edge and hides a WAR race on the TMA-store source.
+- Fix: cover only the ordinals of `wait_prefix_len(state, n)`.
+
+**H4. `mbar_arrive` gives every target's `Arrive` event the full active mask (C, probe).** `sync.rs:333` (the multicast path is the same)
+- Trigger: `b.binary(Shr,U32,i,lane,4); b.smem_addr(m,bar,i); b.mbar_init(m,16); b.mbar_arrive(m,None); b.mbar_wait_parity(m,0)`. Both `Arrive` events show `lanes=0xffffffff`.
+- Effect: lanes are credited with releasing on barriers they never touched, so racecheck misses races.
+- Fix: pass each target's own lane mask to `sync_event`.
+
+**H5. `atom` / `red` on `.b128` panics (C, probe).** `mem.rs:331-333`
+- `rmw_bytes` copies `eb=16` bytes into `[u8;8]`.
+- Trigger: `Instr::Atom{op: Exch, ty: B128, ..}`. The result is `Internal: panic` from a validated program.
+- Fix: do a byte-wise exch/cas for `eb>8`, or fail closed as `Unsupported`.
+
+**H6. The serial phase lands every ready async op every round, so `CompletionPolicy::Seeded` behaves like `Eager` (C).** `partition.rs:324-335` → `land(None, .., all=true)`
+- `run_serial` runs for every partition every round, including the single-partition path.
+- No async op survives past the end of the round that issued it, so seed-dependent missing-wait bugs no longer surface. This is a regression in fff0479.
+- Trigger: `cp_async_copy` with the `commit/wait_all` removed and a few register ops before the `ld`; `quantum:1`, `ValidityPolicy::Error`, seeds 0..32. No seed fails.
+- Fix: in `run_serial`, land only the deferred global reductions, and only in shard mode.
+
+## Medium
+
+**M1. An inner loop clears the poll record when it exits by `break`, so the enclosing spin never parks (C).** `control.rs:204-207`
+- Trigger: `while(!ok){ for s<2 { p=test_wait(bar[s]); if(!p){break} } }` on barriers that never complete.
+- The inner `LoopEnd` (all lanes broken) resets `poll`, so the outer iteration has no failed poll. The result is a livelock until `loop_budget` (2^24 outer iterations), reported as Budget, not Deadlock.
+- Separately, an inner loop's per-iteration `take(poll)` parks *inside* a bounded `for` loop (one round per stage).
+- Fix: on loop exit, merge the inner `PollState` into the parent iteration instead of clearing it.
+
+**M2. Spinning on a plain or acquire `Load` never parks (C).** `program.rs:1654` (`Load` is non-progress but never calls `note_failed_poll`)
+- `while(ld.acquire(flag)==0)` (stream-K semaphores, hand-rolled grid barriers) burns 64 iterations per round per warp.
+- A flag that is never set ends as `Budget` after about 16M iterations, not as `Deadlock`.
+- Fix: have `ld.acquire` / `ld.volatile` / `ld.relaxed.{gpu,sys}` in a loop note a failed poll on `Word{alloc, span}`.
+
+**M3. A lane-varying `mbar_wait` / `test_wait` emits one `Protocol` per target (C, probe).** `sync.rs:409-412`, called at `:470` and `:501`
+- W2-5 says one event per instruction. Each extra event bumps `sync_seq`, so synccheck sees two committed instructions.
+- Fix: collect `ProtocolCmd`s with per-target `observed_parity`, then emit once via `protocol_cmds`.
+
+**M4. A lane-varying `mbar_wait` does not latch completed targets (L).** `sync.rs:494-498`
+- Target A is Ready and target B blocks, so the whole warp retries. If A advances two phases meanwhile, A's lanes re-block (and set `armed`), although on hardware they already left. This can give a false deadlock or strict-consumption error.
+- Fix: latch per-lane completion in `resume`, as `wait_until` does.
+
+**M5. `st.async` / `red.async` drop `sem` and `scope` (C).** `async_copy.rs:682-735`, `partition.rs:579-588`
+- The landing `Access` is `Weak` with no release head, so a peer's `ld.acquire.cluster` gets no edge. The result is a false race or `WaitExitUnproven`.
+- Fix: carry `sem`/`scope` in `AsyncMeta` and emit the landing as an atomic release.
+
+**M6. The fast-path `load` skips `capture_reads` (C).** `mem.rs:92-128` vs `support.rs:490`
+- A `wait_until` predicate that loads from a bound buffer never records its reads, so `WaitPredicateReadsUnstable` cannot fire. Fast and slow paths diverge.
+- Fix: `fast_target` returns `None` when `aux.capture_reads.is_some()`.
+
+**M7. Direct `tcgen05.ld` / `tcgen05.st` never check that the TMEM columns are allocated (L).** `tcgen.rs:395-501`
+- The buffer path fails closed (`support.rs:416`), but a direct `st` to deallocated columns writes silently.
+- Fix: call `tmem_live(col, ncols)` per plan piece.
+
+**M8. A panic on the main thread with `workers>1` hangs the process (C).** `sched/mod.rs:891-897`, `pool.rs:55-60`
+- Only a normal return reaches `pool.shutdown()`; `thread::scope` then joins workers that are blocked on `work`.
+- Reachable panic sources:
+  - observer panics during replay;
+  - `partition.rs:451` `expect`;
+  - arena asserts in `admit`.
+- Fix: put `shutdown` in a drop guard.
+
+**M9. Divergent-switch limits (C, by design but unreported).** `mod.rs:671-674`
+- `if lane!=0 { wait(A) }; if lane==0 { arrive(A) }` (no `Else`), and loop-exit divergence (`for i<lane { wait }`), both end as `divergent_block` Incomplete.
+- Swap-blocked warps report the *other* arm's resource in `Blocked(r)`, which misattributes deadlock evidence.
+- Fix: when swapping, record `Blocked` with the resumed arm's resource. Document the no-`Else` gap in README.
+
+**M10. The observer stream's reads-from order disagrees with the values actually read (C).** `partition.rs:79-107`
+- Partition k+1's same-round `ld.acquire flag` read the round-start snapshot (0), but replay places it after P0's `st.release flag=1`. Racecheck credits an edge that was never observed.
+- Fix: emit a per-round marker; checkers ignore same-round cross-partition writes for reads-from.
+
+**M11. Declared-word history silently truncates at `MAX_WORD_HISTORY` (65 536) (C).** `aux.rs:173`
+- After that many writes, later writes are not logged, so `wait_until` verdicts are computed on stale history. This can cause a false hang or a wrong verdict, e.g. for a tile-scheduler counter in a persistent kernel.
+- Fix: on overflow set a flag and fail closed (`Unsupported`) at the next verdict.
+
+## Low
+
+- **L1.** `tcgen05.alloc` re-emits `WarpSync` on every blocked retry (`tcgen.rs:125-147`). Fix: emit only on the committing attempt.
+- **L2.** `wait_until` predicate loads emit an `Access` on every failed poll (`sync.rs:729`). Fix: buffer them and emit only on latch.
+- **L3.** `tcgen_ld` / `tcgen_st` emit `AsyncIssue` / `Access` before `step_all` (`tcgen.rs:414-454`); `mbar_tx` Complete (`sync.rs:~370`) and `cp_async_mbar_arrive` (`async_copy.rs:319-346`) step targets one at a time, so a later failure leaves earlier commits unlogged. Fix: step first, with `step_all`.
+- **L4.** Event order is inconsistent: `bar.sync` emits `Arrive` before `Protocol`, while `mbar_arrive` / `cluster_arrive` emit it after. Fix: always emit after the `Protocol`.
+- **L5.** `isspacep.shared::cta` is true for a peer CTA's DSMEM generic address (`mem.rs:502`). Fix: also require `rank == own`.
+- **L6.** `own_shared` masks offsets ≥ 2^24 instead of erroring (`support.rs:261`), so `addr_of(smem, 1<<24 + k)` silently aliases offset `k`. Fix: use `shared_addr(..)` and return `BadAddress` on `None`.
+- **L7.** The budget is checked before the all-broken exit (`control.rs:195`), so a loop that breaks out on iteration `budget+1` errors. Fix: test `next.is_empty()` first.
+- **L8.** A serial-point `atom` runs `begin_instr` twice (instrs, epoch, clock) and its parked `Yield` counts as progress (`mem.rs:369-376`, `partition.rs:262`). Fix: do the shard check before `begin_instr`, and treat the yield as non-progress.
+- **L9.** On a partition error, later partitions' private state and stats have already advanced (`sched/mod.rs:1007-1024`). Fix: exclude them from `finish()`.
+- **L10.** `exit` contains a dead `let _ = SyncKind::WarpSync{..}` (`control.rs:311-313`), so no event is emitted. Fix: delete it, or emit as intended.
+- **L11.** `%globaltimer` / `%clock` are per-warp `steps`, so the global timer is not monotonic across warps (`alu.rs:103-105`). Fix: derive the global timer from `counters.instrs`.
+- **L12.** TMA resolves its smem destination with `len=1`, and `cp.async` does no alignment check (`async_copy.rs:~560`, `:172-187`). Fix: resolve the full box and check alignment.
+- **L13.** Rank-tagged `shared::cta` addresses (W2-2) mean any kernel arithmetic on high address bits (an unmasked `addr>>4` placed into a UMMA descriptor, `addr < limit`) differs from hardware on rank > 0. Fix: lint lowering constants and descriptor builders for unmasked use.
+
+## Robustness and performance
+
+- **P1.** `async_wait` scans the launch-wide `groups.members` map once per lane, twice (`async_copy.rs:270`, `:307`). In non-observing mode, and for `.read` waits, `members` is never pruned, so the map grows without bound and each scan is O(n²). Fix: nest the map by resource and prune on every wait.
+- **P2.** `emit_verdicts` clones the whole word history on every successful wait (`sync.rs:783`). Fix: borrow a tail slice.
+- **P3.** Vecs are allocated on every instruction even when `!observing`:
+  - `emit_accesses` `spans` / `raw` (`support.rs:612,624`);
+  - mbarrier `pcmds` / `all_cmds.clone()` (`sync.rs:309`);
+  - `read_words` / `write_words` per lane (`warp.rs:156,173`);
+  - `step` / `protocol` `vec![]` arguments.
+
+  Fix: use `SmallVec`, or gate on `observing`.
+- **P4.** `uninit_seen`, `mbar_reports`, `bar_red`, `bar_aligned`, `wg_credited` and `verdicts` are keyed by generation or span and are never pruned. Fix: retire entries when their generation completes.
+- **P5.** The single-thread round still pays `run_serial` and `land(all)` on every partition every round (see H6).
+- **Codegen parity:** no issue found. `if_` / `loop_begin` read `ctx.warp.pc`, which `end_instr` keeps current in both backends; the verdict cache key `(warp, pc)` is backend-independent.
+- **Fast paths in `mem.rs`:** OOB, uninit and shard bailout match the slow path; the only gap is M6.
+- **Stale documentation:** `sched/mod.rs:42-73` still says "parallel: not implemented" and describes re-execution on stripe conflicts, which contradicts W2-11.
+
+## Scheduler soundness answers
+
+- **Same-stripe writes:** sound. `written` is a per-byte bitset; for the same bytes the later partition wins, per W2-11. Validity is merged per byte (`arena.rs:813-837`).
+- **RMW routing:** `atom` / `red` / `cas` (one handler), bulk and tensor reductions (`is_global_reduce`, `partition.rs:412`) are all serial points. `red.async` targets DSMEM and stays private. `multimem` is rejected by lowering. No bypass found.
+- **Replay determinism:** deterministic and independent of the worker count. It is *not* single-partition order; see M10.
+- **Fallback:** a cluster is a whole partition, so cluster barriers, DSMEM, remote arrives and `cta_group::2` pairs stay inside one partition. Nothing else needs single mode. (The inbox/outbox routing and its silent drop of unroutable messages are deleted; cross-CTA effects apply at issue.)
+- **Pool:** the rotation is seeded by (seed, round, CTA); there is no dependence on thread identity.
+
+## Test gaps: the 10 most valuable scenarios
+
+The existing `workers_do_not_change_results_or_streams` test compares 1 worker with 2/8/33, but shards are created whenever there is more than one partition, regardless of the worker count. Both sides therefore run the same shard model, and the test cannot catch shard-semantics bugs.
+
+1. **G8 exit barrier.** Warps ≥ 1 exit, then `bar_sync(0)`. Expect Incomplete or Completed, never Deadlock (H1).
+2. **Bounded probe loop.** `for k<3 { test_wait }` on an unarrived barrier, then `exit`. Expect Completed (H2).
+3. **Nested spin with break.** M1's program with an unreachable barrier. Expect Deadlock in fewer than 10 rounds, not Budget.
+4. **Load-flag spin.** CTA 0 sets a flag after a long loop; CTA 1 spins on `ld.acquire`. Run once with the flag never set (expect Deadlock) and once with a different cluster per CTA (expect cross-partition visibility one round late) (M2, M10).
+5. **Seeded latency survives rounds.** Missing `wait_all` before an `ld` of cp.async data. Expect some seed in 0..32 to see uninit (H6).
+6. **`wait_group.read 1` with two bulk groups.** Assert exactly one `AsyncComplete{Read}` (H3).
+7. **Lane-split mbarrier.** `bar[lane>>4]`, arrive and wait. Assert per-target `Arrive` lanes and a single `Protocol` (H4, M3). Add a variant where target A advances two phases while B blocks (M4).
+8. **Divergent nesting stress.**
+   - `if lane<8 { wait A; arrive B } else { if lane<16 { arrive A; wait C } else { arrive C; wait B } }`, which needs a three-way swap.
+   - The same body inside a loop with `continue` in one arm.
+   - Assert completion, each arm running exactly once, and stores in order.
+9. **Shard semantics vs single.** Run a race-free multi-cluster program with and without forced single mode. Assert identical outputs. Add an observer that panics with `workers:2` and assert it does not hang (M8).
+10. **Robustness pack.**
+    - `atom.exch.b128` (H5);
+    - `tcgen05.st` after dealloc (M7);
+    - more than 65 536 writes to a declared word followed by `wait_until` (M11);
+    - `addr_of(smem, 1<<24)` (L6);
+    - a loop that breaks out on iteration `budget+1` (L7).
+
+## Engine `incomplete` reasons (inventory, 2026-10-08)
+
+A run is `incomplete` when coverage cannot be established. This is never `clean`, and never an error, because nothing provable is wrong with the kernel. `sched::classify` turns every `ExecErrorKind::Budget`, `ExecErrorKind::Unsupported` and `Op(OpErrorKind::Unsupported)` into `RunStatus::Incomplete { reason: "<kind>: <message>", site }`. The scheduler also emits three reasons of its own.
+
+| reason (prefix / text) | emitted by | when |
+| --- | --- | --- |
+| `round budget of N exhausted` | `sched::Scheduler::run` | `RunConfig::max_rounds` reached |
+| `named_barrier_after_exit (G8): …` | deadlock classifier | no progress while a warp waits on a named barrier of a CTA with exited warps; explicit-count release by exit is not modelled |
+| `divergent_block: …` | deadlock classifier | no progress while a warp is blocked with a divergent mask that structured SIMT cannot interleave |
+| `cross_cluster_same_round_cycle` (finding attr `reason`) | `Scheduler::stream_cycle` | two clusters each read global bytes the other wrote in one round; the observer stream cannot be ordered faithfully, so checker verdicts are incomplete |
+| `Budget: loop exceeded its iteration budget of N (raise loop_budget)` | `control::loop_end` | per-loop `RunConfig::loop_budget` exceeded |
+| `Unsupported: <reason>` | `Instr::Unsupported` (`control::unsupported`) | the lowering emitted an explicit unsupported form; the reason string comes from the module |
+| `Unsupported: not modeled: <what>` | `support::unsupported` | see the next table |
+| `Unsupported: <op> <mods>: <msg>` | `alu::ptx` | an oplib generic op rejected at load or at run (`unresolved generic op`, unmodelled carrier/form) |
+| `Op(Unsupported): <msg>` | every `support::op_err` | an oplib form that is not modelled (W4 domain): tcgen/TMA/MMA descriptors, tensor-map fields, cvt forms, … |
+| `Unsupported: launch bounds cannot provide the minimum 24 registers per thread required by setmaxnreg` | `Scheduler::initial_regs_per_thread` | launch bounds too tight for the register pool model |
+| `Unsupported: declared-word history exceeded N writes; …` | `sync::wait_until` | `MAX_WORD_HISTORY` overflow under a history-consuming observer |
+| `subset_execution` | checkers (`RunOutcome::subset` echoed) | a `RunConfig::subset` run covers only part of the grid |
+
+`support::unsupported` call sites (`Unsupported: not modeled: …`):
+
+| what | site |
+| --- | --- |
+| `const state space` | `support::resolve_buf` |
+| `<buf>[i]: a sub-word tmem vector spanning cells is not modelled` / `<bits>-bit tmem elements are not modelled` / `tmem access crosses a lane row` | `support::resolve_buf` (TMEM buffer views) |
+| `address of a non-addressable buffer` / `… tensor-memory buffer` / `… register-space buffer` | `support::buf_generic_addr` (`AddrOf`) |
+| `sub-byte atomics` | `mem::atom` |
+| `cvta of const/tmem` / `cvta to const/tmem` | `mem::cvta` |
+| `mapa in this state space` | `mem::mapa` |
+| `copy report .per_16bytes without its pattern (lower to Per16BytesPattern, W2-8)` | `async_copy::check_report` |
+| `tcgen05.ld .spcompress without its max/min op` | `tcgen::tcgen_ld` |
+| `tcgen05.mma .lut_b address outside a live TMEM allocation` | `tcgen::tcgen_mma` |
+| `wait_until on a word wider than 64 bits` | `sync::wait_until` |
+
+## `Report.meta.timing` phases (milliseconds)
+
+| key | measured by | covers |
+| --- | --- | --- |
+| `lower` | `v2.compile` (`CompiledModule.lower_ms`, cache miss) | TIR -> module lowering + validation |
+| `module_cache` | `v2.compile` (`lower_ms`, `cache_hit`) | module load from the module cache (exactly one of `lower` / `module_cache` is non-zero) |
+| `bind` | `v2.run` | input canonicalization and binding (host prelude, descriptor patching, address planning) |
+| `build` | `numsim-py::execute` (`backend_for`) | backend selection, i.e. codegen build or cache load for `Backend::Codegen` (about 0 for the interpreter) |
+| `run` | `numsim-py::execute` | engine execution. **Includes online racecheck**: `RaceObserver` consumes events during the run |
+| `check` | `numsim-py::execute` | post-run checker work: synccheck exploration, racecheck `finish` |
+| `report` | `v2.run` | Python report assembly |
+
+### Host-side binding and readback on Mega MoE medium (W15, 2026-10-09)
+
+Test case: Mega MoE medium (`t64_h2048_i1536_e96_k4_g1`, 148 SMs), numsim mode, `Engine(max_workers=16,
+native_loop_iteration_budget=10_000_000).run` with the case's `outputs` (`y`,
+`cumulative_local_expert_recv_stats`). It binds 95 arguments: 13 buffers, 680 MB. The figures below
+are the time outside `run_with_config`: `bind` plus the wall-clock time of the native call minus
+`run`. No `timing` key covers the native-call boundary, so it was split with temporary timers in
+`numsim-py`.
+
+| piece | before | after |
+| --- | --- | --- |
+| `bind`: `ndarray.tobytes()` of every buffer (`canonicalize_inputs`) | 470-630 ms | 60-65 ms (now a `memoryview`; the rest is the host-alias region copy and checks) |
+| `numsim_core_py.run` argument conversion (`object_bytes`, copy into `ArgValue::Buffer`) | 240-290 ms | same: one copy, now read through the buffer protocol |
+| readback: all 13 buffers to `PyBytes` (680 MB), plus drop | 460-580 ms | about 0: only the selected outputs (and the regions behind selected views) are returned |
+| `outcome_result` / dropping the inputs | 70-100 ms | about 70 ms |
+| **bind + outside `run` (min / max of 4 runs)** | **1295 / 1640 ms** | **423 / 482 ms (3.1x)** |
+| wall (min of 4) | 4911 ms | 4007 ms |
+
+The runs were interleaved: before = HEAD bf0e9c6, after = HEAD plus this change, both private builds.
+The 1-minute load average was 12-14 on 256 CPUs. The output digests are identical (`y` 8a39d2ab...,
+stats fd587ef8...). Conformance passes (304) and so do `tests/numsim/v2`.
+
+How it works:
+- `v2/run.py` binds buffers as a `memoryview` of the C-contiguous host array.
+- `numsim-py` copies that view once, through the buffer protocol.
+- `Engine.run` passes `outputs=` with the selected names to `numsim_core_py.run`.
+- Checker phases pass `outputs=()`.
+
+What remains:
+- The single copy into `ArgValue::Buffer { bytes: Vec<u8> }`. A borrowed variant would remove it, and that is a contract change in `sched/mod.rs`.
+- The arena binding copy inside `run`.
+- In checker modes, the phase memo key `_input_digest` still SHA-256-hashes every input byte.
+
+## Partitioning and the single-partition fallback (2026-10-08)
+
+Every launch runs as CTA-lockstep partitions, one per resident cluster. Each partition has its own copy-on-write overlay (stripes) of global memory, and the partitions are merged deterministically at the end of each round (redesign.md §2.3). A global word written by another cluster becomes visible one round later. That includes `wait_until` polls and `sync_words` words. Results and observer streams do not depend on the worker count: `partitioned_wait_until_is_deterministic_across_workers` checks this at 1, 8 and 32 workers.
+
+**Declared-word history (`wait_until` verdicts).**
+- The launch-wide `WordTable` is authoritative. A partition runs each phase on a copy and logs its own writes.
+- `Scheduler::merge_words` appends each partition's new entries, rebased onto the launch table's last image, after:
+  - the parallel phase, in event replay order;
+  - the serial phase, in partition order;
+  - `drain_all`, in partition order.
+  It then refreshes the partitions' copies.
+- Verdict indices equal the delivery order because the replay order puts a reader of bytes another partition wrote this round before that writer. A read/write cycle is reported as `incomplete` (`cross_cluster_same_round_cycle`).
+- The history exists only for history-consuming observers. Nothing program-visible depends on it (`partitioned_words_do_not_depend_on_the_observer`).
+
+**Single-partition fallback.** These forms run the whole launch as one partition. The merge/replay protocol cannot order them yet; they are documented, not `incomplete`.
+
+| form | why one partition |
+| --- | --- |
+| `cooperative` topology / any `grid.sync` | the grid barrier is launch-wide state that all CTAs must reach in one schedule |
+| `RunConfig::max_resident_ctas == 0` | every CTA resident at once (cooperative launches) |
+| kernels mixing `tcgen05` `cta_group::1` and `::2` | the kernel-wide tcgen05 `cta_group` rule is checked across all CTAs |
+| `RunConfig::single_partition` | explicit request (tests, debugging) |
+
+**Decision: CTA-level (intra-cluster) partitioning is cancelled (2026-10-08, coordinator).** The design existed: peer shared memory as copy-on-write shared state, remote mbarrier ops applied in (sender rank, issue seq) order, and `shared::cluster` atomics as serial points. It is not implemented, because HEAD is already faster than legacy on the headline kernel. `cudnn_sm100_gemm_proj_rope_mxfp8_bf16in`, NumSim `Engine.run`, interp backend; host load 67–131, so absolute times are noisy:
+
+| workers | v2 (HEAD e6dafca + worktree) | legacy |
+| --- | --- | --- |
+| 32 | 4.79 s | 12.63 s |
+| 8 | 9.31 s | 17.80 s |
+| 1 | 53.4 s | 73.2 s |
+
+W10's earlier 73 s at 32 workers came from an engine 84 commits older. Large single-cluster kernels therefore keep the cluster-level partition.
+
+## Mega MoE max config: where the time goes, and the spin-poll skip decision (2026-10-08)
+
+Case `t8192_m8192_h7168_i3072_e384_k6_g1`, `Engine(max_workers=16)`, NumSim mode. Measured with temporary counters on private builds; the numbers are CPU-seconds summed over threads.
+- **Partitioning.** 74 partitions in every one of 74,478 rounds, so no single-partition fallback. The serial phase is 0.5 s, turnover 0.9 s, host allocation of inputs 9.2 s.
+- **Balanced load.** Partition time totals 3,460–3,712 CPU-s over balanced partitions (about 53 s each for the busiest), against a 203 s critical path. The run is throughput-bound, not serialized.
+- **Split of partition time.** Warp execution (`run_cta`) 1,326. `land` 2,074, of which:
+  - MMA arithmetic (`run_mma` → `oplib::tc_mma_ctas`, block-scaled mxf8f6f4): 1,309–1,356 (W4);
+  - TcgenCp landing: 324 → 131 after the direct-byte fast path;
+  - Copy landing: 163 → 114 after gathering without a `Vec` per span;
+  - landing scan: 86 → 75 with the lazy live-id set.
+  `apply_completions` is 4.
+- **Spin polls.**
+  - 72% of partition-rounds start with every warp blocked, but only 11% make no progress at all (48 CPU-s).
+  - 151 M slices re-poll a parked warp that stays blocked (288 CPU-s).
+
+**Decision: no spin-poll skip (coordinator).**
+- A partition-level skip would save at most 48 CPU-s.
+- A per-warp resource-version skip (≤ 288 CPU-s, about 9%) would have to be disabled whenever an observer is attached, because parked retries emit poll events. That makes it an execution path that exists only without an observer, which the one-execution-path rule forbids.
+- The lever is the MMA arithmetic (W4) and interpreter hot paths (W13).
+
+### Mega MoE medium: per-worker CPU inflation (W2 split, W13 follow-up)
+
+**W2's phase split (NumSim mode).**
+
+| Workers | Outside partition work | Partition critical path |
+| --- | --- | --- |
+| 1 | ~0.3 s | 3.1 s |
+| 16 | ~0.3 s | ~1.5x the 1-worker partition CPU |
+| 32 | ~0.3 s | 5.7 s (~2.3x the 1-worker partition CPU) |
+
+Everything outside partition work stays at ~0.3 s for every worker count. The scheduler is not the cost; the partitions' own CPU is.
+
+**Hypothesis tested: register-file footprint (~910 KB per warp) causes the inflation. Not confirmed.**
+
+Measurement setup:
+- private build of HEAD 65a1be1, NoopObserver;
+- "partition CPU" = thread CPU time summed inside `Partition::run_round`;
+- host load 3–6; min of several runs.
+
+Partition CPU at 16 and 32 workers, relative to 1 worker:
+
+| Case | Register file per warp | 16 workers | 32 workers |
+| --- | --- | --- | --- |
+| synthetic loop, 128 CTAs × 4 warps, 16 registers live | 4 KB | 1.33x | 1.37x |
+| synthetic, 256 registers live | 64 KB | 1.39x | 1.71x |
+| synthetic, 4,096 registers live | 1 MB | 1.30x | 1.65x |
+| recurrent_kda_decode_one_warp (2,048 one-warp CTAs) | 280 KB | 1.45x | 1.55x |
+| gdn_decode_bf16_wide_vec_mtp (128 CTAs × 4 warps) | 370 KB | 1.45x | 1.54x |
+| mega_moe e24 | 910 KB | 1.84x | 3.0x |
+
+Kernels with 4–370 KB register files inflate about as much as 1 MB ones at 16 workers. Footprint is therefore not the main driver; it at most adds to e24 at 32 workers.
+
+Ruled out:
+- **Shared frequency or bandwidth limits:** 16 or 32 independent single-worker processes running concurrently show no inflation (1.00–1.05x).
+- **Partition-to-thread migration:** static partition-to-thread assignment and/or pinned threads leave recurrent_kda at 1.4–1.6x.
+- **Allocator trimming / munmap:** `GLIBC_TUNABLES` mmap and trim thresholds at 4 GiB change nothing.
+- **System time:** it is small (e24: +0.27 s at 16 workers, against +1.4 s of inflation).
+
+Partly explained:
+- **Worker sleep between rounds.** Busy-waiting up to 2 ms for the next round instead of sleeping on the condvar cuts e24 at 32 workers from 5.0 to 3.2 CPU-s (wall 0.46 → 0.33 s), but leaves recurrent_kda unchanged.
+
+Open: the remaining ~1.3–1.5x is an intra-run effect: it is absent across processes and independent of footprint. Hardware counters are unavailable on this host (`perf_event_paranoid=4`), so it is not attributed yet. Compact register storage stays a noted, unstarted lever (see "Interpreter hot paths"), not a fix for this inflation.
+
+**Spin-before-park in the worker pool: measured, not landed (below the 1.5x bar).**
+
+Prototype (private build of a6c5202, `sched/pool.rs` only; the tree is untouched):
+- Before parking on the condvar, a worker busy-polls a lock-free copy of the round generation for up to a fixed budget. The caller does the same for the round's end.
+- Variants: pure `spin_loop` for 500/1000/2000/5000 µs, or `yield_now` polling for 1000 µs.
+- Results do not depend on it: it only changes when a thread notices the next round.
+- A 1-worker run has no pool and never spins (e24 at 1 worker: 1.64 → 1.60 s).
+
+Measurements:
+- Wall and process CPU, min of 1–5 runs per variant, interleaved with the baseline.
+- Host load 6–20 (not near-idle), NoopObserver.
+- Medium = `mega_moe_t64_h2048_i1536_e96_k4_g1`.
+
+| Case | Workers | Baseline wall / CPU | Best spin variant wall / CPU | Wall gain |
+| --- | --- | --- | --- | --- |
+| mega_moe medium | 32 | 8.15 s / 103 s | yield 1 ms: 5.83 s / 140 s; spin 500 µs: 5.92 s / 113 s | 1.40x |
+| mega_moe medium | 16 | 7.12 s / 67 s | spin 2 ms: 7.24 s / 98 s | 1.0x |
+| mega_moe e24 | 32 | 0.364 s / 4.05 s | yield 1 ms: 0.288 s / 7.05 s | 1.26x |
+| mega_moe e24 | 16 | 0.364 s / 2.98 s | spin 500 µs: 0.359 s / 4.12 s | 1.0x |
+| recurrent_kda_decode_one_warp | 16 / 32 | 0.128 / 0.084 s | spin: 0.129 / 0.091 s; yield: 0.124 / 0.088 s | 1.0x (pure spin up to 8% slower) |
+| gdn_decode_bf16_wide_vec_mtp | 16 / 32 | 0.027 / 0.025 s | spin: 0.030 / 0.029 s; yield: 0.029 / 0.029 s | 0.9x |
+
+Conclusions:
+- Only 32-worker Mega MoE gains: up to 1.40x wall on medium.
+- With spinning, medium at 32 workers (5.8 s) beats the 16-worker baseline (7.1 s). Without it, 32 workers is slower than 16.
+- Every spin variant raises process CPU by 10–90%.
+- Pure spinning makes the small kernels 5–15% slower at 16 and 32 workers, likely by stealing SMT-sibling cycles; polling with `yield_now` keeps them neutral.
+- No criterion reaches 1.5x, so `pool.rs` stays as is.
+- The loaded-host check (another 16-worker job running alongside) was not run, because the change does not land.
+- **Lever, if 32-worker Mega MoE matters:** a per-round handoff that avoids the condvar park/wake. For example, workers that stay on a partition across rounds until the serial phase. That is a scheduler design question, not a spin budget.
+
+### Mega MoE medium: allocation volume (landed) and sticky partition assignment (declined) (W13, 2026-10-08)
+
+**Allocation sites.** A counting global allocator with sampled backtraces (allocations of 8 KB or more) puts medium at 26.5 M allocations and 79 GB per run at e06f874, the same at 1 and 16 workers:
+
+| GB per run | Site | Owner |
+|---|---|---|
+| 11.5 | `Partition::fire_op` landing buffers | sched |
+| 9.6 | `coalesce_dense` bitmap, allocated on every call | sched |
+| 8.7 + 1.4 | `run_mma::note` span Vec growth | sched |
+| 5.6 + 3.6 + 1.9 + 1.7 | oplib block-scaled MMA gathers (`per_cta`, `gather_f8_rows`, `mxf8_scale_locations`, `Window::read`) | oplib |
+| 5.5 | interp (unresolved frames) | interp |
+| 4.2 | `log_async_writes` sort scratch | interp |
+| 3.6 | oplib `fma_f32_abt_increasing_k` buffers | oplib |
+| 2.3 | `zeroed_regs` | interp |
+| 2 x 2.1 | `tcgen_cp` src/dst Vec growth | interp |
+| 1.4 | TMA `push_span` Vec growth | interp |
+| 1.4 | `merge_runs` (`copy_spans`) | sched |
+
+**Allocator tcache test: no effect.** Raising glibc's per-thread cache (`tcache_max=65536`, `tcache_count=1024`) first looked like a win (medium, 16 workers, fixed assignment and pinned threads: 75.9 -> 50.1 s round CPU). On repeat the baseline itself measured 49.8-50.0 s, the same as with the larger cache, and at 32 workers or with dynamic assignment it never helped. What reproduces: with fixed assignment, round CPU is ~1.2x the 1-worker figure at 16 workers and 1.75-2x at 32; dynamic assignment adds ~20% CPU from frees of another thread's allocations.
+
+**Landed: reusable buffers** (`sched/partition.rs`, `interp/support.rs`, `interp/handlers/tcgen.rs`, `interp/handlers/async_copy.rs`, plus oplib scratch buffers in `numsim-oplib/src/fpenv.rs`, `numsim-oplib/src/mma/backend.rs`, `numsim-core/src/oplib/tc/mma/mod.rs`):
+- a thread-local span-list pool (`take_spans` / `give_spans`) for `run_mma`'s read/uninit/write lists and `fire_op`'s landing lists;
+- `coalesce_sorted` in place; `coalesce_dense` with one thread-local bitmap sliced per range;
+- `copy_spans` with pooled run lists (`merge_runs_into`) and a thread-local byte buffer;
+- `log_async_writes` skips the sort when already ordered;
+- `tcgen_cp` and the TMA load payload pre-size their Vecs;
+- oplib: `per_cta` starts from its first gather; thread-local scratch for the fma pre-MMA accumulator copy and for the transposed B. No numerics change.
+- Not changed: `zeroed_regs`, TMA `push_span`, `gather_f8_rows`, `mxf8_scale_locations`, `Window::read` (the remaining levers, mostly what keeps e24 at 1.41x).
+
+Allocated bytes per run (counting allocator, 16 workers; deterministic):
+
+| Case | e06f874 | sched/interp only | Landed (sched/interp + oplib) |
+|---|---|---|---|
+| medium | 79.29 GB, 26.5 M allocs | 34.61 GB, 21.4 M (2.29x) | 30.65 GB, 21.0 M (2.59x) |
+| e24 | 4.66 GB, 1.29 M allocs | 3.42 GB (1.36x) | 3.31 GB, 1.14 M (1.41x) |
+
+Wall / process CPU / voluntary switches, landed tree against e06f874, interleaved A/B, min of 5 (e24) or 4 (medium; 2 at 1 worker):
+
+| Case | Workers | e06f874 | Landed |
+|---|---|---|---|
+| e24 | 1 | 1.849 s | 1.701 s |
+| e24 | 16 | 0.402 s / 3.02 s / 10.7 k | 0.405 s / 2.98 s / 5.9 k |
+| e24 | 32 | 0.549 s / 5.77 s / 18.1 k | 0.488 s / 5.00 s / 12.7 k |
+| medium | 1 | 39.69 s | 34.39 s |
+| medium | 16 | 7.04 s / 66.7 s / 305 k | 6.10 s / 55.5 s / 141 k |
+| medium | 32 | 9.13 s / 125.1 s / 343 k | 7.19 s / 90.4 s / 180 k |
+
+Small kernels (sched/interp part, min of 3): flat or faster (recurrent_kda w16 0.123 -> 0.106 s, fp16_bf16_gemm w8 0.0425 -> 0.0394 s, kda_backward_packed w8 0.112 -> 0.107 s; radix_topk, rmsnorm, selective_state, gdn_decode within noise). Digests identical to e06f874 at 1/8/32 on the usual set plus medium.
+
+**Remaining sites: recorded, not pursued (e24 cannot clear 2x by buffer reuse).** Byte-weighted backtrace sampling (one sample per MiB allocated) on b36e44e, 16 workers:
+
+| Site | e24 (3.39 GB sampled) | medium (31.3 GB sampled) |
+|---|---|---|
+| `zeroed_regs` (register files, ~910 KiB per warp) | 2.26 GB | 2.34 GB |
+| oplib `gather_f8_rows` + `per_cta` (block-scaled gathers) | 0.21 GB | 7.71 GB |
+| oplib `mxf8_scale_locations` | 0.06 GB | 2.07 GB |
+| oplib TMA `push_span` + `ByteRun::to_vec` | 0.09 GB | 3.29 GB |
+| oplib `Window::read` | 0.06 GB | 1.85 GB |
+| oplib `mma_f32_abt_increasing_k` output | 0.05 GB | 1.85 GB |
+| interp TMA payload, `tcgen_cp` src/dst and plan pairs | 0.17 GB | 5.67 GB |
+
+- The 2x bar for e24 (4.66 GB at e06f874) means at most 2.33 GB. Register files alone are 2.26 GB, so 93% of everything else would have to go. Buffer reuse cannot get there.
+- The register files cannot be reused. Mega MoE launches a persistent grid, so every warp's file is live at once, and no CTA retires while another is waiting to be admitted.
+  - A process-wide pool of retired files (≥ 128 KiB, re-zeroed on reuse) changed neither e24 (3.31 GB) nor medium (30.65 GB).
+  - Most of those bytes are `calloc`'d zero pages a warp never touches, so they cost address space rather than CPU.
+- What would reduce them is compact register storage (narrower lanes for 32-bit registers). That is the `RegFile` encoding in `value.rs`, a design change, not a buffer fix.
+- The medium-only oplib sites (about 17 GB) remain open if medium CPU matters. They would not move the e24 criterion.
+**Declined (negative result): sticky partition assignment.** Do not re-try without new data.
+- Design: pool participants get stable ids; `par_for_sticky` first claims the partitions the participant ran last round (`Partition::last_worker`), then steals the rest from a per-participant offset. Only the running thread changes; merge and serial-phase order stay in partition order, so digests were identical at 1/8/32 and `every_scenario_is_observer_and_worker_independent` passed.
+- Bar: voluntary switches (the cross-thread-free signal) down 5x and no wall regression. Measured on top of the buffers (interleaved, min of 5; wall / CPU / switches):
+
+| Case | Workers | Buffers only | Buffers + sticky |
+|---|---|---|---|
+| e24 | 16 | 0.391 s / 2.85 s / 6.8 k | 0.372 s / 2.58 s / 5.5 k |
+| e24 | 32 | 0.501 s / 4.97 s / 11.8 k | 0.454 s / 4.21 s / 10.2 k |
+| medium | 16 | 5.729 s / 51.4 s / 132 k | 5.481 s / 47.4 s / 126 k |
+| medium | 32 | 7.401 s / 90.5 s / 178 k | 5.917 s / 69.5 s / 167 k |
+
+- Switches fell only 5% more than with the buffers alone (which already halve them); the remaining switches are probably the per-round condvar park/wake, not cross-thread frees.
+- Its best criterion is medium at 32 workers, 1.25x wall (1.3x CPU), under the 1.5x rule. gdn_decode at 16 workers measured min 0.0278 s against 0.0261 s (spread overlapping, 1.7 ms kernel).
+- The prototype is kept as a patch in W13's scratchpad (`sticky_saved/sticky.patch`, plus the `last_worker` field).
+
+### Partition lookahead (workers keep partitions across rounds): design and verdict (W13, 2026-10-08)
+
+**Question.** Mega MoE at 32 workers is slower than at 16 (medium: 8.15 s against 7.12 s). Would a scheduler where each worker keeps its partitions and runs them through several rounds help? That means no park/wake and no barrier between rounds, until a partition needs merged state.
+
+**Answer: no, not as an exact protocol.** In Mega MoE nearly every round carries cross-partition state through the serial phase. A lookahead that must fall back whenever a partition needs merged state would fall back almost every round. Measured below; not built.
+
+#### 1. What the round boundary does today (`sched/mod.rs` `run_loop`)
+
+One round, in order:
+1. **`parallel_phase`:**
+   - Each partition gets an arena shard: a copy-on-write overlay of the shared allocations, with reads tracked when observing. `Partition::run_round` runs each partition on the pool; `par_for` hands out partition indices dynamically.
+   - **Barrier:** the caller waits until every partition is done.
+   - The first failing partition discards the later ones.
+   - When observing, `Arena::shard_replay_order` computes the replay order: a partition that read bytes another wrote this round goes first; a read/write cycle reports `incomplete`.
+   - Readonly-proxy conflicts are checked, then shards are merged in partition order: last writer wins, byte granularity.
+2. **`merge_words(order)`:** each partition's new declared-word history entries are appended in delivery order, buffered `WaitVerdicts` indices are renumbered to the merged history (W6-P1), and every partition gets the merged table back.
+3. **`replay_partitions(order)`:**
+   - `Access::seq` is assigned in replay order.
+   - Partitions are offered to `Observer::fork`; children replay on the pool, are joined in replay order, and the rest replay serially.
+   - Then one `phase_end`.
+4. **`serial_phase`:**
+   - Partition by partition, on the main arena, run the work parked at a serial point: global read-modify-writes inside a shard (atomics, reductions, CLC `try_cancel`) and deferred landings.
+   - Each partition's events are replayed and its words merged before the next partition runs (W6 S-b), then `phase_end`.
+5. **`turnover`:**
+   - Retire finished clusters and their partitions; collect leftover sync state.
+   - Admit pending clusters: new partitions, register files allocated or deferred, declared words, register-pool configuration.
+   - CLC claims are drawn from the launch-wide `Arc<ClcTasks>` queue during step 4.
+6. Bump `round`. If nothing made progress: `drain_all` (land everything ready); otherwise the deadlock/stuck diagnosis.
+
+**What a partition's round r+1 depends on, other than its own state:**
+- the shared allocations as merged after round r: other partitions' parallel-phase writes, plus every serial-phase write;
+- the declared-word table: only for observer verdict bookkeeping, never program-visible;
+- the CLC queue and admission (turnover).
+- Event replay and `phase_end` do not feed back into execution.
+
+#### 2. The design that was considered
+
+- **Execution.** A worker owns a fixed set of partitions and runs them round after round. Each partition buffers its round-r events and shard overlay under the round index.
+- **Commit.** Round r of partition p is committed (merged, words merged, replayed) by a sequencer thread in the same order as today: partition order, `shard_replay_order`, delivery-order history.
+- **Lookahead condition.** p may start round r+1 before the others finish round r only if nothing it will read in round r+1 can be changed by others' round-r work:
+  - no other partition wrote, in its round-r shard, a stripe p reads;
+  - the serial phase of round r did not run;
+  - turnover changed nothing p reads.
+- **Validation.** The first condition can only be checked after the fact: p's round r+1 read set against the others' round-r write sets. A failed check therefore needs a rollback of p's round r+1, i.e. a snapshot of p's warps, register files, private allocations and sync table taken before every speculative round. That is ~15 MB of register files per CTA on Mega MoE, too much for ~177 k partition-rounds. Without rollback, the protocol must be conservative: stop and wait whenever round r had a serial phase or p polls any shared word.
+- **Invariant (why results and streams would not depend on the worker count).**
+  - Every committed round is the lockstep round: p's round r+1 inputs are, by the lookahead condition, byte-identical to what the lockstep scheduler would give it.
+  - Commits, replay order, `seq` numbering, history delivery order and `phase_end` placement are produced by the sequencer exactly as today, from per-round buffers.
+  - Only *when* a partition computes changes, never *what* it computes or the order in which it is published.
+  - **Fallback:** when the condition fails, p waits for round r's commit, exactly today's barrier.
+
+#### 3. Dependency census (scratch instrumentation, private build of a6c5202)
+
+- **Memory dependencies:** every shard tracked its reads. For each partition-round, I counted whether it read a stripe byte that another partition wrote in the previous round's parallel phase.
+- **Serial dependencies:** I counted rounds whose serial phase ran.
+
+| Case | Rounds | Partition-rounds | Read another partition's round r-1 shard writes | Rounds with a serial phase |
+| --- | --- | --- | --- | --- |
+| mega_moe e24 (t8_h1024_i512_e24_k2_g1) | 174 | 12,876 | 0 | 126 (72%) |
+| mega_moe medium (t64_h2048_i1536_e96_k4_g1) | 2,391 | 176,934 | 0 | 2,148 (90%) |
+| gdn_decode_bf16_wide_vec_mtp | 10 | 1,280 | 0 | 0 |
+| recurrent_kda_decode_one_warp | 10 | 10,240 | 0 | 0 |
+
+- In Mega MoE, all cross-partition communication goes through global read-modify-writes: dispatch/combine counters and flags. Those run in the serial phase, which ran in 72–90% of rounds. The partitions that wait on those words poll them every round.
+- The conservative protocol would therefore resynchronize in 72–90% of rounds.
+- The kernels with no dependencies (gdn_decode, recurrent_kda) finish in 10 rounds and are not barrier-bound.
+
+#### 4. Cost model
+
+Phase timings (scratch counters; wall of `par_for`, CPU per partition-round, NoopObserver; host load 10–15):
+
+| Case | Workers | Wall | `par_for` wall | Σ partition CPU | Σ over rounds of max partition | Serial + turnover |
+| --- | --- | --- | --- | --- | --- | --- |
+| mega_moe medium | 16 | 6.5 s | 5.33 s | 59.4 s | 3.25 s | 0.11 s |
+| mega_moe medium | 32 | 7.3 s | 6.05 s | 89.5 s | 5.11 s | 0.20 s |
+| mega_moe e24 | 1 | 1.84 s | 1.80 s | 1.78 s | 0.15 s | 0.02 s |
+| mega_moe e24 | 16 | 0.36 s | 0.27 s | 2.85 s | 0.18 s | 0.02 s |
+| mega_moe e24 | 32 | 0.40 s | 0.32 s | 4.25 s | 0.27 s | 0.02 s |
+
+Upper bounds for the parallel phase:
+- **Lockstep:** each round costs at least its slowest partition, so `par_for` ≥ Σ over rounds of the max partition: 3.25 s at 16 workers and 5.11 s at 32 on medium.
+- **Barrier-free, no dependencies:** `par_for` ≥ Σ partition CPU / workers: 3.71 s at 16 and 2.80 s at 32.
+- **Best possible gain:** about 1.4x at 16 workers (5.33 → 3.71) and about 2.2x at 32 (6.05 → 2.80), and only if no round needed a resync.
+
+With resyncs in 90% (medium) or 72% (e24) of rounds:
+- Only the dependency-free rounds can overlap.
+- Expected gain is at most about 1.1x on medium (10% of rounds) and about 1.3x on e24 (28%), before the sequencer and snapshot costs.
+
+**Gate.** Not built: no criterion reaches ≥1.5x. The criterion would be `mega_moe medium` wall at 32 workers, min of 3 runs on a near-idle host, with digests identical at 1/8/32 workers.
+
+#### 5. What would help instead (measured or estimated)
+
+- **Cheaper barrier.** Spin-before-park, measured above: medium at 32 workers 8.15 → 5.83 s (1.40x), +10–90% CPU, small kernels neutral with `yield_now` polling. Below the bar on its own.
+- **Per-partition CPU inflation.** This is the bigger factor: Σ partition CPU is 59.4 s at 16 workers and 89.5 s at 32, against ~36–40 s at 1 worker. Its cause is unattributed: it is not register-file footprint, migration or the allocator (previous section). Hardware counters (`perf_event_paranoid` ≤ 2) would be the next step.
+- **Parallel serial phase.** Serial RMWs on disjoint words could run partition-parallel. The serial phase plus turnover is only 0.11–0.20 s on medium, so this would not move wall time.
+- **Choice of worker count.** For Mega MoE medium, 16 workers already beats 32 (7.12 s against 8.15 s). A default of at most about partitions/4 workers costs nothing in correctness.
+
+## tcgen05.mma cost: arithmetic, not the callback boundary (2026-10-08)
+
+**Decision (coordinator): borrowed-view MMA I/O is not landed.** Rule: no optimization without a measured gain.
+- **Background.** oplib calls the engine about 2,200 times per block-scaled MMA on Mega MoE e24 (544 shared-memory reads, 1,397 TMEM reads, 256 TMEM writes; about 41 KB). Stubbing those callbacks once seemed to halve `run_mma` (250 → 105–165 µs). That experiment was flawed: the stubs zero-filled the operands, which let oplib take cheaper arithmetic paths.
+- **Measured with a correct A/B.** Whole-allocation borrowed views (`TcViews`, W2/W4) were bit-identical to the callbacks (all scenarios × 3 validity policies × 1/16 workers, plus the e24 and radix streams) but gave:
+  - e24: 207–271 µs per MMA without views, 244–262 µs with them;
+  - max config, same-moment A/B: MMA landing 1,530 → 1,412 CPU-s, but untouched Copy and TcgenCp also fell about 7%, which is host drift.
+- **Also neutral, measured:**
+  - a validated-run validity cache (2× worse);
+  - moving TMEM out of the arena so callbacks are slices;
+  - fixed-size small copies.
+- **Conclusion.** The MMA cost is oplib's arithmetic per MMA. Engine-side callback work is not the lever. Don't retry views or callback micro-optimizations without a new profile that attributes time below `tc_mma_ctas` correctly (py-spy's native unwinding truncates there).
+
+
+## Interpreter hot paths (W13, 2026-10-08)
+
+**Results.** Every change keeps outputs, `RunStatus`, stats and observer streams bit-identical. That was checked by a digest of outputs plus every observer callback, with and without word history, over all `testutil` scenarios and the corpus fixtures, at 1, 8 and 32 workers. Each change has a criterion row in `numsim-core/benches/interp_hot.rs`; corpus rows read `examples/record_race_fixtures.py` fixtures. Exactness tests are in `tests/interp_hot_equivalence.rs`, plus unit tests beside `coalesce` and `subtract_spans`.
+
+Single worker, before → after the whole series:
+
+| Kernel | Before | After | Speedup |
+| --- | --- | --- | --- |
+| rmsnorm | 0.97 ms | 0.64 ms | 1.4x |
+| deepgemm_sm100_fp8_gemm_1d1d | 9.5 ms | 5.4 ms | 1.7x |
+| fp16_bf16_gemm | 75 ms | 57 ms | 1.3x |
+
+Mega MoE e24 (`mega_moe_t8_h1024_i512_e24_k2_g1`) at 16 workers:
+
+| Mode | Before | After |
+| --- | --- | --- |
+| Engine only, no observer | 652 ms | 379 ms |
+| Observed (counting observer) | 1.85 s | 0.61 s |
+
+The cost of being observed on e24 fell from ~1.2 s to ~230 ms.
+
+| Change | Where | Bench row | Before → after |
+| --- | --- | --- | --- |
+| Exact memo of `WarpState::spin_hash` (memcmp against the last hashed state) and an 8-chain multiply-rotate hash | interp/mod.rs | `spin_wait_regs/pad768_iters4096` | 7.35 → 2.19 ms |
+| Register file from one zeroed allocation (`vec![[0u64;32]; n]` cloned slot by slot) | interp/mod.rs | `admit_regs/ctas64_pad256` | 1.56 → 1.48 ms; 765 slots per warp 100 → 65 µs |
+| Lane-parallel `read_special` / `read_param` (`%tid` stepped, not divided; one masked write) | alu.rs, support.rs | `read_special/iters256` | 66.2 → 17.5 ms |
+| `tcgen_ld` register-major writes from the run images, with run offsets cached per map; chosen by data shape only | tcgen.rs | `tcgen_ld/x64_iters64` | 16.8 → 4.15 ms |
+| Warp-uniform index fast path for register arrays | alu.rs | `reg_indexed/iters2048` | 12.0 → 4.74 ms |
+| Vector stores up to 32 bytes on the store fast path | mem.rs | `store_v4/iters2048` | 14.6 → 5.1 ms |
+| Resident-CTA count kept, not re-summed per admission | sched/mod.rs `turnover` | `corpus_numsim/rmsnorm` | 6.5% of rmsnorm removed |
+| `run_mma` span `coalesce`: unstable sort, plus a bitmap union when spans are dense | partition.rs | `corpus_numsim/deepgemm_sm100_fp8_gemm_1d1d` | `coalesce` 14.7% → 7.6% of 1d1d |
+| `subtract_spans` without quadratic splitting (union walk, empty-span cuts kept) | partition.rs | `observed_overhead/*/counting` | e24 observed, 1 worker: 9.0 → 2.3 s |
+| Process-wide MMA shared-A footprint cache (each miss ran two MMAs) | tcgen.rs | `observed_overhead/fp16_bf16_gemm/counting` | 91 → 73 ms |
+| In-place tcgen access items; event-buffer lane-span pool; sorted-input sort skip | tcgen.rs, partition.rs, support.rs | `observed_overhead/*/counting` | fp16_bf16_gemm 73 → 62.5 ms; e24 at 16 workers 845 → 606 ms |
+| Register files ≥ 128 KiB zeroed at the warp's first step, on the worker | interp/mod.rs, sched/mod.rs `admit` | `observed_overhead/mega_moe…/noop` | 652 → 379 ms at 16 workers; small files unchanged |
+| Unstable key sort in `emit_accesses`; event-buffer access counter | support.rs, partition.rs | `observed_overhead/fp16_bf16_gemm/counting` | ~1.5% |
+| Incremental `spin_hash`: sum of per-slot hashes, re-hashing only slots written since the last call; every write goes through `WarpState::reg_mut` / `reg_write_raw`, and debug builds recompute the hash from scratch on every call | interp/mod.rs, alu.rs, support.rs, tcgen.rs, mem.rs | `corpus_numsim/kda_backward_packed`, `spin_wait_regs/pad32768_iters1024` | kda_backward_packed (34,649 registers, 8.7 MB per warp) 1.02 s → 0.121 s at 1 worker (legacy: 1.007 s); spin row 27.3 → 16.3 ms; 1d1d 4.24 → 3.97 ms |
+| Worker pool capped at the partitions that can be resident at once, `min(workers, partitions)`; extra threads only woke and joined every round. Results never depend on the thread count | sched/mod.rs `run` | `few_partitions_w8/{kda_backward_packed, radix_topk_multi_cta}` | 8 workers: kda 206 → 158 ms (interleaved min 130 → 110 ms; median 188–216 → 116–146 ms), radix_topk 53 → 44 ms; cases with ≥ 8 partitions unchanged |
+
+Observer-gated fast paths were made observer-independent, so each path is selected by data shape alone and emits the same events: `tcgen_ld` direct copy, `RunImages` under predicate capture, load/store fast paths under word history, `tcgen_st`. The audit table is in the W13 reports.
+
+**Rejected or deferred, measured.**
+- **Register-file pool across runs** (zero on reuse): 3–5% on rmsnorm for 64 MB held per process. Not landed.
+- **Deferring every register file to the first step:** e24 at 16 workers improved 1.4x, but `corpus_numsim/rmsnorm` went 0.66 → 3.37 ms and `admit_regs` 1.40 → 7.8 ms. Zeroing at admission gets fresh heap, so untouched pages are never faulted. Zeroing at first step interleaves with other allocations and becomes a full memset plus brk churn. Landed only for files of at least 128 KiB.
+- **Malloc churn:**
+  - sharing one `Arc<[BufBinding]>` across CTAs (3% of rmsnorm allocations): no measurable gain;
+  - `partitions.reserve` in `turnover`: no measurable gain.
+  Neither landed. Malloc is now 2–7% of a run.
+
+**What remains on the observed path** (e24, 16 workers):
+- `SyncEvent` clones into `EventBuffer` and their drop at replay: ~4.4%. Contract-bound: the observer receives an owned `SyncEvent`.
+- `merge_shard` and `shard_replay_order`: ~3%, on W5's replay/fork-join path.
+- `emit_accesses` copying lane spans into each `Access`: ~5%.
+
+Engine-side, mega_moe is bounded by MMA arithmetic (previous section). The per-poll register-file scan of `spin_hash` is gone: polls now cost O(written slots).
+
+**Noted, not started: compact register storage.** Mega MoE medium loses per-partition CPU as workers increase: 1.5x at 16 workers and 2.3x at 32 (W2's phase split). The likely cause is cache pressure from ~910 KB per-warp register files: one 64-bit × 32-lane slot per SSA register, with no reuse. Compact register storage (paged or sparse `RegFile`) or slot reuse in lowering would address it. Either needs a `RegFile`/lowering contract change.
+
+## Warp execution (`run_cta`) per handler, and the run_mma read notes (W13, 2026-10-09)
+
+**How it was measured.**
+- Case: Mega MoE medium (`mega_moe_t64_h2048_i1536_e96_k4_g1`), 1 worker, NoopObserver.
+- Each instruction is timed with rdtsc around dispatch plus the epilogue; slices, `run_cta`, `land` and `run_mma` are timed the same way.
+- The probe costs about 40–50 cycles per instruction. That is why `mov` shows about 100 and `endif` about 50.
+- Builds were private scratch copies. The tree was not instrumented.
+
+**Handler table, before (e06f874 + b36e44e) and after this batch.** Cycles are per executed instruction. Retries the scheduler applies without re-executing (below) are not timed.
+
+| Handler | Executions before | Cycles before | Executions after | Cycles after | Owner of the remaining cost |
+|---|---|---|---|---|---|
+| mbar_wait | 3.61 M | 2,224 | 0.32 M (+3.29 M applied) | 1,471 | sync |
+| tma | 168 k | 22,598 | 168 k | 22,724 | 82% `tma_plan_dir` (oplib) |
+| binary | 17.0 M | 212 | 17.0 M | 209 | `oplib::binary` |
+| store | 380 k | 6,027 | 380 k | 1,218 | interp |
+| load | 465 k | 4,524 | 465 k | 1,158 | interp |
+| tcgen_cp | 55 k | 23,751 | 55 k | 24,143 | plan + per-cell spans (oplib) |
+| cast | 3.0 M | 347 | 3.0 M | 358 | oplib |
+| barrier | 1.68 M | 410 | 0.17 M (+1.5 M applied) | 1,131 | sync |
+| compare | 2.3 M | 249 | 2.3 M | 257 | oplib |
+| wait_until / async_wait / stmatrix / tcgen_ld | 41 k / 33 k / 15 k / 31 k | 13.7 k / 16.1 k / 34.4 k / 14.4 k | unchanged | unchanged | — |
+
+Instruction cycles fell from 3.06e10 to 1.91e10, and `run_cta` from 3.52e10 to 2.28e10 (1.55x in the instrumented build).
+
+**Fixes (interp/, sched/).**
+1. **`mbar_wait` resolves the mbarrier once.** It used to resolve the address in every lane: about 62 cycles per lane, 75% of a failed retry.
+   - Now, when every retried lane names one address and phase (`support::same_val`), one resolution and one (target, command) entry cover all lanes. Otherwise a per-lane memo (`mbar_res_memo`) is used. `mbar_collapse` and `test_wait` use the memo as well.
+   - This is exact: an address that resolves for one lane resolves to the same mbarrier for every lane. Only local addresses depend on the lane, and a local mbarrier is always an error.
+2. **Repeated blocked retries are applied, not executed** (`interp::BlockedWait`).
+   - A blocked `mbarrier.try_wait` on one mbarrier with no lane latched, or a named-barrier `Resume`, records the resource's state right after the attempt.
+   - A blocked step is deterministic and idempotent: it commits nothing, or only `armed`. The warp cannot change while it does not run (same epoch), and with no suspended arm `divergent_switch` decides from the warp alone. So while the resource still equals the recorded state, the retry would re-block with no effect besides `steps`, `epoch` and `instrs`, and it emits no event, because blocked attempts are not delivered.
+   - The scheduler applies exactly those counters. The decision depends only on engine state, not on the observer.
+   - Debug builds execute the retry anyway and assert the prediction: same status, counters and resource state. This held on all scenarios, e24, kda_backward_packed, fp16_bf16_gemm and the other corpus fixtures.
+   - Medium: 3.29 M mbarrier retries and 1.5 M barrier retries are applied rather than executed.
+3. **Per-lane local and register arrays take the buffer fast path.** `fast_target` now covers `Local`/`Reg` bindings with a per-lane stride; they are the warp's own allocations and never overlaid. Vector loads up to 32 bytes now have a fast path too.
+4. **Declared-word logging is checked once per instruction per allocation** (`WordTable::tracks`), instead of three hash lookups per lane. On medium every store paid them, because the kernel declares sync words, even though the stored arrays carry none.
+5. **`run_mma` read notes.**
+   - Every NumSim MMA tracked its reads (ZeroAndReport): about 1,940 unmerged spans per MMA, 214 M pushes per run, and `coalesce` alone was about 25% of `run_mma`.
+   - Without an observer the notes only feed `report_async_uninit`. A piece every byte of which was valid when read contributes nothing there: a landing only makes bytes valid, and the maximal invalid runs over the merged spans are the same with or without such pieces.
+   - So fast-path and window-served pieces are noted only when observing; pieces read through the general path are always noted.
+   - Guarded by `mma_uninit_findings_do_not_depend_on_the_observer`. Without the general-path notes the test fails.
+   - This was combined with the oplib window path (contract W4-mma-window), which built the windows in `run_mma`.
+
+**Measured.**
+- `benches/interp_hot.rs`:
+
+  | Row | Before | After | Speed-up |
+  |---|---|---|---|
+  | `blocked_wait/ctas8_waiters15_iters1024` | 5.60 ms | 2.48 ms | 2.26x |
+  | `local_array/iters512` | 18.35 ms | 9.48 ms | 1.94x |
+
+  `spin_wait_regs` and `store_v4` are flat.
+- Medium, interp fixes 1–4 only, interleaved min of 3–5, wall / CPU:
+
+  | Workers | Before | After |
+  |---|---|---|
+  | 1 | 35.0 s | 29.5 s |
+  | 16 | 5.71 s / 51.3 s | 4.91 s / 41.8 s |
+  | 32 | 5.80 s / 70.9 s | 5.07 s / 58.1 s |
+
+  e24 at 32 workers went from 0.479 s / 4.63 s to 0.394 s / 3.29 s.
+- Medium `run_mma` CPU, 1 worker, this batch with W4's window types before W4's later oplib additions: 12.71 to 8.85 s (1.44x). Wall went from 34.5 to 24.7 s.
+- Max config, private ext with this batch, one run at load 7.5–13.5: metric 279.3 s (test call 284.2 s), against 337.5 s for b36e44e.
+
+**Checked and not changed.**
+- **Register-file layout.** Each slot is `[u64; 32]`, lane-contiguous and 256 bytes. Handlers read and write whole slot rows, so access is not strided per lane. A 910 KB file is mostly SSA temporaries, and a slice touches a few slots. Cache effects could not be measured: perf is blocked on this host.
+- **Dispatch and predicates.** `mov`, `if`, `loop_if` and `endif` cost 50–130 cycles including the probe. Neither is a lever.
+- **Address computation.** `addr_of` is 1%. The address cost was in load and store resolution (fixed above).
+- **Spin-parked loops.** Medium has none; its blocked retries were `mbarrier.try_wait` and `bar.sync` (fixed above). The max config's 151 M parked re-polls are loops whose polls emit Access events, so they still cannot be skipped observer-independently.
+- **Open, outside interp/sched.** TMA plan building (`tma_plan_dir`, about 82% of a TMA issue) and `tcgen_cp` payload construction (per-cell spans) are oplib's. Elementwise ALU (`binary`, `cast`, `compare`, ptx ops, about 30% of instruction cycles) is `oplib::binary` and its relatives.
+
+**Rulings (coordinator, 2026-10-09).**
+- Recording `run_mma` read notes only when observing stands as a recording path: the test is that observed and NoopObserver outcomes (diagnostics included), the I8 run, and the Access-stream hashes stay identical, and they do.
+- Applying a repeated blocked retry instead of executing it (`BlockedWait`) is accepted for the same reason: the retry would emit no observer event, and debug builds assert the prediction.
+
+## Element-wise ALU path: interp side (W13, 2026-10-09)
+
+**Measurement.** 4 warps, a loop of 16 identical instructions plus 4 loop-control instructions per iteration. The cost per instruction is the time above a `Nop` body, which costs about 12 ns per instruction including loop control.
+
+| Kind | Extra cost per instruction |
+|---|---|
+| `mov` | 13 ns |
+| u32 `binary` | 43 ns |
+| f32 `binary` | 66 ns |
+| `compare` | 49 ns |
+| `cast` | 50 ns |
+| `ptx` `uint_as_float` | 92 ns |
+
+**`binary` / `ternary` / `compare`: not a copy problem.** Three experiments isolated the cost:
+- Writing straight into the destination slot, with no operand copies and no result copy, gained nothing (prototype, not landed).
+- Replacing `oplib::binary` with an inline add saved about 13 ns.
+- An add of two constants costs the same as an add of two registers.
+
+So the cost is the oplib call plus the fixed per-handler work over 256-byte `[u64; 32]` slots. W4 owns the op bodies.
+
+**`unary` / `cast`, landed.** One-slot shapes no longer build two zeroed four-slot buffers (1 KB each) and gather/scatter. Per instruction this is 1.4x.
+
+**`ptx` generic ops, landed.**
+- Ops with one single-slot destination and up to three single-slot sources use stack buffers instead of the thread-local scratch vectors.
+- Write-back is one masked pass instead of per-lane loops.
+- Per op this is about 1.5x (92 to 60 ns). About 50 of the remaining cycles are in the op body (`each_lane`), which is W4's.
+
+**Rows.**
+
+| Row | Before | After | Speed-up |
+|---|---|---|---|
+| `convert_chain/iters2048` (generic op, unary, cast) | 12.53 ms | 8.99 ms | 1.39x |
+| `alu_chain/iters2048` | — | — | flat (within noise) |
+
+Digests at 1/8/32 are identical with and without an observer.
+
+## Per-partition CPU inflation: allocator and huge-page experiments (W13, 2026-10-09)
+
+**Setup.**
+- Scratch build of HEAD 8ab6a62 with the CPU-split counters; medium fixture, NoopObserver, `run_with_config`.
+- Partition CPU is thread CPU summed over `run_round`. Each cell below is the minimum of 3 interleaved runs.
+- The host was loaded: 1-minute load 6–40 (one outlier at 57), so treat differences under about 10% as noise.
+- `/sys/kernel/mm/transparent_hugepage/enabled` is `[madvise]`, so neither threads nor processes get THP unless the allocator calls madvise. The process-vs-thread difference therefore cannot come from THP.
+
+**Partition CPU (s) at 1 / 16 / 32 workers, and inflation relative to 1 worker:**
+
+| Allocator | 1 | 16 | 32 | Inflation at 16 | Inflation at 32 | AnonHugePages | Minor faults (16 workers) |
+|---|---|---|---|---|---|---|---|
+| glibc | 19.3 | 32.8 | 42.6 | 1.69x | 2.20x | 0 | 1.16 M |
+| glibc, `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` | 18.9 | 27.5 | 44.6 | 1.46x | 2.36x | 1.4–3.5 GB | 0.19–0.26 M |
+| mimalloc | 17.3 | 25.6 | 41.5 | 1.48x | 2.40x | 3.8–3.9 GB | 8–10 k |
+| mimalloc, large OS pages | 17.2 | 26.5 | 42.9 | 1.54x | 2.50x | 3.7–3.9 GB | 8–11 k |
+| jemalloc | 18.7 | 28.9 | 43.7 | 1.54x | 2.33x | 0 | 1.07 M |
+| jemalloc, `thp:always` | 18.6 | 28.6 | 44.0 | 1.53x | 2.36x | 1.5–2.3 GB | 13–15 k |
+
+Medium wall at 32 workers, minimum: glibc 4.06 s, mimalloc 3.62 s (1.12x), glibc with hugetlb 3.78 s.
+
+**Reading.**
+- Huge pages and per-thread heaps cut minor faults by 100x and absolute partition CPU by up to about 10% at 1 worker and up to about 20% at 16 workers.
+- They do not change the inflation: about 1.5x at 16 workers and 2.2–2.5x at 32, with or without huge pages. With mimalloc nearly all anonymous memory is on 2 MB pages, including the warp register files. Experiment (c), a pre-faulted huge-page pool for the register files, is therefore already covered, and TLB misses or page-table walks are not the cause.
+- No variant closes half the inflation, and none reaches 1.5x on medium wall at 32 workers. Nothing lands.
+- mimalloc is a standalone candidate worth roughly 10% CPU. That would be a separate decision: a new dependency, and the allocator choice of the Python extension.
+
+**Attribution: partitions migrating across CCDs (W13, 2026-10-09, after W14's lead).**
+
+Medium, process pinned with `taskset`, partition CPU, min of 3 interleaved runs (load 13–37):
+
+| Placement | glibc partition CPU | Parallel-phase wall | mimalloc partition CPU | mimalloc wall |
+|---|---|---|---|---|
+| 1 worker, core 0 | 21.9 s | 22.2 s | 17.2 s | 17.4 s |
+| 8 workers, one CCD (cores 0–7) | 22.7 s (1.04x) | 3.58 s | 20.8 s (1.21x) | 3.22 s |
+| 8 workers, one per CCD, one NUMA node | 27.0 s (1.23x) | 4.95 s | 24.4 s (1.42x) | 4.17 s |
+| 8 workers, 4 CCDs on each NUMA node | 33.1 s (1.51x) | 6.39 s | 28.2 s (1.64x) | 5.11 s |
+
+Bisect, on the one-per-CCD placement:
+
+| Variant | Partition CPU | Parallel-phase wall |
+|---|---|---|
+| Dynamic handout (today) | 26.4–27.9 s | 4.5–5.4 s |
+| Static assignment (partition k on participant k mod 8) | 23.3–23.9 s | 6.4–6.7 s (load imbalance) |
+| `Partition` aligned to 256 bytes (no false sharing between neighbours) | 25.5–28.1 s | — (unchanged) |
+| Reference: one CCD | 22.6 s | 3.6 s |
+
+- **Cause:** a partition's working set (warp register files, shared memory, TMEM) moves between CCD L3s under dynamic handout. Static assignment removes 80–90% of the cross-CCD inflation.
+- **Not the cause:** false sharing between neighbouring partitions, which W14 found in its racecheck children (shared written lines).
+- **NUMA correction:** spreading over both NUMA nodes adds another 1.2x on top. The earlier "NUMA ruled out" was measured unpinned and is withdrawn.
+- **Lever:** CCD-aware sticky handout with pool threads pinned one per core.
+
+**CCD-aware sticky handout with pinned pool threads: measured, declined (W13, 2026-10-09).**
+
+The prototype, in scratch tree `w13/st/`:
+- Pool participants are pinned one per CPU, filling an L3 (CCD) with physical cores before moving to the next. SMT siblings are used only after every core is taken. The calling thread is pinned for the launch and its affinity restored afterwards.
+- Each partition is first offered to the participant that ran it last round; idle participants steal the rest.
+
+Only placement changes: digests and streams are unaffected by construction. Interleaved measurements:
+
+| Case | Base (94eccc4) | Pin + sticky | Pin only | Sticky only |
+|---|---|---|---|---|
+| Medium wall, 16 workers | 3.39 s | 3.19 s | 3.19 s | 3.59 s |
+| Medium wall, 32 workers | 3.75 s | 3.11 s (1.21x) | 4.36 s | 4.28 s |
+| Max config parallel-phase wall, 16 workers | 155.3 / 156.2 s | 142.2 / 140.6 s (1.10x) | — | — |
+| Max config partition CPU | 1,514 / 1,519 s | 1,369 / 1,363 s | — | — |
+| Max config perf metric | 173.5 / 174.0 s | 162.5 / 160.7 s | — | — |
+
+Pinning and stickiness only help together, and both are below the 1.5x rule, so nothing landed. Pinning also gives up the kernel's freedom to move threads off busy cores on a shared host. The bounded remaining lever is static or near-static assignment with work stealing only when idle, but its imbalance cost showed in the static test (wall 6.4 s against 4.5–5.4 s).
+
+**Cost-balanced static assignment, and pin + sticky re-measured: both declined (W13, 2026-10-09).**
+
+The static variant (scratch tree `w13/st2/` on 76d45e1):
+- Partitions get fixed owners by LPT over their running-average round wall time.
+- New partitions go to the least-loaded participant.
+- A full rebalance runs only after max/mean load stays above 1.25 for 8 consecutive rounds.
+- Participants are pinned one per core, filling one CCD at a time, with no stealing.
+
+Medium, host load about 3, min of 3 interleaved runs (wall / process CPU):
+
+| Workers | HEAD (dynamic, unpinned) | LPT static + pin | LPT static, unpinned |
+|---|---|---|---|
+| 8 | 4.94 s / 28.3 s | 4.31 s / 19.5 s | 5.36 s / 24.0 s |
+| 16 | 3.92 s / 32.9 s | 5.46 s / 35.4 s | 7.12 s / 48.6 s |
+| 32 | 4.94 s / 54.4 s | 5.13 s / 46.0 s | 6.68 s / 63.4 s |
+
+Rebalancing churn is not the cause. At 16 workers, 194 rebalances took 6.3 s, 4 rebalances 6.0 s, and none 5.9 s.
+
+Pin + sticky (`w13/st/`) against HEAD, 5 interleaved rounds, load 4–8. Min, with all samples in parentheses:
+
+| Variant | 16 workers | 32 workers |
+|---|---|---|
+| HEAD | 3.93 s (3.93–4.10) | 5.20 s (5.20, 6.43, 6.55, 7.35, 7.77) |
+| Pin + dynamic | 3.27 s (3.27–3.67) | 4.61 s (4.61–4.66) |
+| Pin + sticky | 3.07 s (3.07–3.53) | 4.30 s (4.30–4.41) |
+
+By the project's statistic (min of interleaved runs), pin + sticky is 1.25x at 16 workers and 1.21x at 32. On the max config's parallel-phase wall it is 1.10x. Pinning also costs something on shared hosts, including the CI runners, because threads cannot move off busy cores. Not landed as the default. It later landed as the opt-in `pin_workers` (next paragraph).
+
+Two facts to keep:
+- **Unpinned 32-worker runs on this host are bimodal:** 5.2–8.0 s for the same binary, while pinned runs stay within 4.30–4.41 s. Medium 32-worker measurements must report every sample, not a single min.
+- **Static assignment keeps partition CPU at the 1-worker level at 8 workers** (19.5 s against 28.3 s for HEAD), confirming cross-CCD migration as the source of the inflation. Round costs swing too much from round to round for any fixed assignment to hold wall time; dynamic handout balances each round.
+
+**Status of the medium 16/32-worker gap:** closed out as bounded by cross-CCD migration. Further attribution needs hardware counters, which require `perf_event_paranoid` at 2 or lower.
+
+**Pin + sticky landed as an option, default off (W13, 2026-10-09).** `RunConfig::pin_workers` / `Engine(pin_workers=...)` / `NUMSIM_PIN_WORKERS`.
+
+Behaviour when on, in `sched/pool.rs`:
+- Participants are pinned one per CPU of the inherited mask, an L3 group at a time with SMT siblings last. A narrower mask than the participant count wraps round-robin.
+- The caller is pinned for the launch and restored afterwards.
+- Handout is `par_for_sticky` with stealing (`Partition::last_worker`).
+
+When off, the code makes no affinity calls and uses today's `par_for`.
+
+Equivalence:
+- `sched_partition_review::every_scenario_is_pin_independent`.
+- Digests: every scenario plus 10 recorded fixtures, including medium. 1/8/32 workers, with and without an observer, pinned against unpinned: all identical.
+- Conformance passed in all modes, with the option off and with it on.
+
+The trade-off:
+- **Dedicated host:** 2b124bc + option, 3 interleaved rounds, load 3-8 (`perf-same-verdict.md`):
+  - Medium at 32 workers went from 3.36-4.24 s unpinned to 3.25-3.51 s pinned. The prototype session (load 4-8) had 5.20-7.77 s against 4.30-4.41 s.
+  - By min: 1.28x at 16 workers, 1.03x at 32. Large was 1.32x and 1.36x.
+- **Shared host:** pinned threads cannot leave busy cores. It therefore stays off by default, and CI never sets it (`dev-loop.md`).
+
+**Declined (final negative): L3-group-local stealing under `pin_workers` (W13, 2026-10-09).** Do not re-try without new data.
+
+The variant (scratch tree `w13/hgl/`, on 5d98955):
+- Each pinned participant knows its dense L3 group.
+- A partition's home is the group of the participant that ran it last round.
+- An idle participant takes, in order: its own sticky partitions, then partitions homed in its group, then anything else.
+- New partitions are homed either in blocks of partition index ("fill") or round-robin over the groups in use ("rr").
+
+Results do not change:
+- `every_scenario_is_pin_independent` passes under both homing variants.
+- Digests at 8 and 32 workers, with and without an observer, over every scenario and the 10 fixtures (including medium and e24), are identical to unpinned.
+
+Setup: `bench_backends.py mega`, wall and process CPU of the run call. 6 interleaved rounds of {unpinned, pinned global steal (5d98955), group-local fill, group-local rr} at 32 workers, 3 at 16 workers. Load was 3-12. Every run was `clean` and matched the reference. Min / median, with all 32-worker samples as wall s (process CPU s):
+
+| case | unpinned | pinned, global steal | group-local fill | group-local rr |
+|---|---|---|---|---|
+| medium 16 | 3.26 | 2.53 | 2.48 | 2.49 |
+| medium 32 | 3.58 / 3.94: 4.23 (50.0), 3.87 (48.7), 4.01 (47.7), 3.93 (44.5), 3.94 (46.4), 3.58 (40.4) | 2.40 / 3.75: 3.21 (34.1), 3.75 (44.1), 3.75 (43.9), 2.40 (27.3), 3.76 (44.1), 2.74 (30.2) | 2.41 / 3.47: 2.88 (31.1), 2.41 (27.2), 3.70 (43.3), 3.47 (39.7), 3.75 (44.1), 3.20 (33.8) | 2.32 / 3.50: 2.32 (26.2), 3.71 (43.5), 3.50 (38.5), 3.12 (34.2), 3.28 (35.3), 3.77 (43.9) |
+| large 16 | 5.84 | 4.43 | 4.27 | 4.34 |
+| large 32 | 7.44 / 8.46: 9.07 (114.1), 8.46 (105.0), 7.44 (90.5), 7.71 (93.9), 7.49 (91.9), 9.23 (122.8) | 4.21 / 5.89: 4.67 (53.9), 6.57 (77.9), 4.21 (48.9), 5.00 (57.1), 5.89 (67.0), 6.64 (79.8) | 5.67 / 6.56: 6.57 (78.6), 6.55 (79.3), 6.61 (79.8), 6.56 (79.4), 5.71 (65.3), 5.67 (61.2) | 4.24 / 6.41: 6.60 (79.7), 6.08 (70.8), 6.70 (80.3), 6.41 (75.6), 4.24 (48.7), 6.37 (75.7) |
+
+Max config (16-worker perf test, worker count overridden in scratch), one run each, load 4-15:
+
+| variant | 16 workers | 32 workers |
+|---|---|---|
+| Group-local rr | 129.3 s | 191.6 s |
+| Global steal | 132.8 s | 193.9 s |
+
+The 16-worker reference is 154.3 s unpinned at a4c7157.
+
+Reading:
+- **The bar is met only through the pinning that already landed.**
+  - Group-local rr over unpinned, by min at 32 workers: 1.54x on medium and 1.75x on large.
+  - Pinned global steal alone already gives 1.49x and 1.77x.
+  - Group-local over global steal: 1.03x on medium by min, 0.99x on large by min. By median it is slower on large: 6.41-6.56 s against 5.89 s.
+  - On the max config the gain is 1.03x at 16 workers and 1.01x at 32.
+- **The hypothesis fails.**
+  - All pinned variants are still bimodal at 32 workers: a fast mode (medium 2.3-2.9 s / 26-31 s CPU, large 4.2-5.0 s / 49-57 s) and a slow mode (medium 3.5-3.8 s / 39-44 s CPU, large 6.4-6.7 s / 76-80 s).
+  - Process CPU tracks wall in both modes, so the slow mode is CPU inflation that keeping partitions inside one L3 does not remove.
+  - Large at 32 does not beat large at 16 in any variant.
+- **Max config:** 32 workers is ~1.45x slower than 16 whether pinned or not.
+- **Open:** what selects the slow mode per run. It is not cross-group stealing. Candidates are run-to-run memory placement (NUMA node of first touch, transparent huge pages) and co-tenant load on the pinned cores. Both need hardware counters (`perf_event_paranoid` ≤ 2) or a dedicated host to separate.
+- **Not landed:** `pin_workers` keeps the global-steal sticky handout of 5d98955.
+
+**The pinned slow mode is not NUMA placement (W13, 2026-10-09).** Recorded; the investigation stops here.
+
+Setup: `pin_workers=on`, medium and large at 32 workers, 6 interleaved rounds of three placements of the whole driver process. Build: 5d98955 behaviour (scratch `w13/hgl/`, variant switches unset). Every run was `clean` and matched the reference. Load was 1.7-14.8.
+- (a) As is.
+- (b) `numactl --cpunodebind=0 --membind=0`.
+- (c) `numactl --cpunodebind=0`.
+
+Background:
+- This host has 2 sockets, 1 NUMA node each. Node 0 is CPUs 0-63 and 128-191; node 1 is 64-127 and 192-255.
+- Pinned placement fills physical cores in order, so the 32 participants already sit on CPUs 0-31 of node 0 in (a).
+- What (a) does not control is memory. One `numastat` sample of an (a) medium run showed 3.0 GB on node 0 and 1.65 GB on node 1.
+
+Wall s (process CPU s) per sample, in run order:
+
+| case | (a) as is | (b) CPUs + memory on node 0 | (c) CPUs on node 0 |
+|---|---|---|---|
+| medium | 2.43 (27.7), 2.74 (29.9), 3.73 (43.9), 2.89 (31.7), 3.67 (42.8), 3.70 (43.2) | 3.42 (38.5), 3.75 (44.0), 3.76 (44.3), 3.85 (45.1), 2.38 (26.8), 3.76 (44.0) | 2.38 (26.9), 3.78 (44.3), 3.67 (42.8), 3.77 (44.1), 3.12 (34.9), 3.16 (35.4) |
+| medium min / median | 2.43 / 3.67 | 2.38 / 3.76 | 2.38 / 3.67 |
+| large | 5.75 (64.1), 6.60 (79.5), 6.57 (79.4), 6.68 (80.5), 5.74 (62.8), 6.37 (76.0) | 4.85 (54.2), 6.62 (79.2), 6.76 (81.4), 6.71 (81.0), 6.00 (70.9), 6.30 (75.4) | 6.72 (80.5), 6.12 (73.0), 5.52 (63.1), 6.87 (83.0), 6.72 (80.5), 4.05 (46.6) |
+| large min / median | 5.74 / 6.57 | 4.85 / 6.62 | 4.05 / 6.72 |
+
+Reading:
+- Neither (b) nor (c) removes the slow mode. With CPUs and memory both on node 0, medium still has 5 of 6 samples at 3.4-3.9 s.
+- So the selector is neither cross-node memory or first-touch placement nor CPU placement across sockets. The NUMA-first placement fix is not implemented.
+- Competing load does not explain it either: the 1-minute load average at each sample does not track the mode. Medium slow samples ran at load 1.8-2.9, and fast samples at load up to 9.1.
+- Process CPU tracks wall in every sample: 26-35 s fast, 38-45 s slow. Each run inflates or it does not.
+- The selector stays unidentified. Separating it needs hardware counters (`perf_event_paranoid` ≤ 2) or a dedicated host. `pin_workers` is unchanged.
+
+**The pinned slow mode is not transparent huge pages either (W13, 2026-10-09).** Recorded; nothing landed.
+
+Setup: `pin_workers=on`, medium at 32 workers, 8 interleaved rounds of four mimalloc settings. Build: 5d98955 behaviour (scratch `w13/hgl/`). At the end of each run the driver read `Rss` and `AnonHugePages` from `/proc/self/smaps_rollup`. Every run was `clean` and matched the reference. Load was 0.4-8.0.
+- **default:** mimalloc v3 defaults.
+- **never:** `MIMALLOC_ALLOW_LARGE_OS_PAGES=0 MIMALLOC_ALLOW_THP=0`.
+- **always:** `MIMALLOC_ALLOW_LARGE_OS_PAGES=1`.
+- **reserve:** `always` plus `MIMALLOC_RESERVE_HUGE_OS_PAGES=4`. This has no effect here: the host's 1 GB hugetlb pool is empty (`nr_hugepages=0`, not changeable without root), so it equals `always`.
+
+Host THP policy:
+- `transparent_hugepage/enabled = madvise` and `defrag = madvise`.
+- `khugepaged/defrag = 1`, `pages_to_scan = 4096`, `max_ptes_none = 511`.
+
+Wall s (process CPU s, AnonHugePages MB), in run order:
+
+| setting | samples | min / median |
+|---|---|---|
+| default | 3.73 (43.7, 3778), 2.78 (30.7, 3774), 2.39 (27.3, 3774), 3.69 (42.8, 3768), 3.81 (44.9, 3776), 2.75 (31.2, 3756), 3.74 (44.0, 3768), 3.77 (44.2, 3748) | 2.39 / 3.73 |
+| never | 3.62 (34.4, 452), 3.43 (33.4, 454), 3.99 (39.6, 454), 3.70 (34.7, 452), 3.96 (40.6, 452), 4.10 (42.4, 452), 4.18 (44.3, 454), 2.76 (26.6, 452) | 2.76 / 3.96 |
+| always | 3.80 (44.5, 3760), 3.73 (43.8, 3764), 3.25 (37.5, 3672), 2.49 (27.8, 3764), 3.00 (33.2, 3772), 3.75 (44.1, 3772), 3.73 (43.7, 3758), 2.40 (27.0, 3762) | 2.40 / 3.73 |
+| reserve (= always) | 2.44 (27.5, 3770), 2.39 (26.8, 3772), 2.39 (27.0, 3758), 3.77 (44.0, 3742), 3.23 (34.6, 3408), 3.14 (34.9, 3770), 3.75 (44.0, 3766), 3.74 (43.8, 3760) | 2.39 / 3.23 |
+
+Rss was 4.4-4.6 GB, and 2.4-2.7 GB with `never`.
+
+Reading:
+- **Huge-page coverage does not separate the modes.** Under default, fast runs (2.39-2.78 s) and slow runs (3.69-3.81 s) both ended with 3.75-3.78 GB on 2 MB pages.
+- **Forcing the mode does not force the band.**
+  - With 2 MB pages forced off (`never`, 452 MB left, from the non-mimalloc heap), runs stay bimodal (2.76 s once, otherwise 3.43-4.18 s), and the median is ~6% worse.
+  - With large pages always requested, runs are as bimodal as default.
+- **Ruled out so far:** transparent huge pages, NUMA placement, cross-L3 stealing and the 1-minute load average.
+- **Still open:** the per-run selector. CPU tracks wall in every mode: fast runs take 26-31 s of CPU, slow ones 42-45 s. Hardware counters (`perf_event_paranoid` ≤ 2) are the next step.
+
+## Parked spin-loop replay: validated prototype, not landed (W13, 2026-10-09)
+
+**Why not landed.** The design below was implemented in scratch and validated. No corpus case parks on a spin loop in a way that matters: medium spends 0.1–0.3 s in re-polls, and the max config has 0 replays. The max config's re-polls are blocked retries at `mbar_wait` (107 M checks, most already applied by `BlockedWait`), `wait_until` (29.5 M) and `barrier` (19.1 M), with no parked loops. Landing would add a recorder and replayer to the interpreter for no corpus gain. It can be revived if a spinning kernel shows up.
+
+**Prototype.** Scratch tree `w13/sa/` (on 40bc7f1):
+- `sched/partition.rs`: `SpinRecording`, and `spin_repeats` / `spin_replay` / `spin_record` in `run_cta`; the switch `SPIN_REPLAY` and the counter `SPIN_REPLAYS`.
+- `interp/aux.rs`: `SpinCapture`.
+- `interp/mod.rs`: `spin_replayable`, the instruction whitelist.
+- `interp/handlers/sync.rs`: `test_wait` query recording.
+- `benches/interp_hot.rs`: the `spin_flag` rows.
+
+**W6's six conditions, all met.**
+1. Reads are re-read live through `Arena::read`, in recorded order and stopping at the first changed span, so the shard read set is re-derived.
+2. A replay requires n ≤ quantum and a loop budget that allows the iteration.
+3. Interp handlers keep no side records beyond `warp.poll`, which is merged idempotently. Loads with `.nc` or `.uniform` and report forms of `test_wait` are not replayable.
+4. The recording's epoch advances on every replay.
+5. Interp handlers draw nothing from the RNG.
+6. Debug builds replay into a scratch `EventBuffer`, interpret, and compare events, counters, recording and result.
+
+**Validation.**
+- W6's `interp_spin_apply`, including the apply arm, passes in release and debug; `sched_partition_review` and `interp_hot_equivalence` pass in debug.
+- Digests at 1/8/32, with and without an observer, on all scenarios, 10 fixtures and medium: identical.
+- W16's racecheck hashes on 11 fixtures at 1/8/32: identical.
+- Bench `spin_flag/ctas8_spinners7_iters4096`: 34.0–35.5 ms interpreting vs 15.3–16.0 ms replaying. After the producer's share (7.3 ms) is subtracted, the re-poll cost drops from 27 to 8.3 ms (3.2x).
+
+## Parked spin-loop replay: design for W6 review (W13, 2026-10-09; no code)
+
+**Problem.** A warp parks at a spin loop's `LoopEnd` (`control::loop_end`). It parks when the iteration made only failed polls, completed no progress instruction, and left `WarpState::spin_hash` (registers plus active/live masks) equal to the previous parked iteration's.
+- Every retry re-interprets one whole iteration: `LoopEnd` with `resume == PARKED` → `Jump(head)` → body → `LoopEnd` → fixed point → `Blocked` again.
+- On the max config that is 32.2 M slices and 203 CPU-s of `run_cta` (df585e9 split).
+- `BlockedWait` already applies blocked `try_wait` / `bar.sync` retries without re-execution. It cannot cover these loops, because their bodies emit observer events: weak or acquire loads emit `Access` events, and acquire loads also call `note_load_poll`.
+- The rejected 2026-10-08 skip would have dropped those events only when no observer is attached.
+
+**Proposal.** When the retried iteration is provably identical to the recorded one, apply its recorded effects instead of interpreting it, in every mode:
+- the counter and frame updates;
+- the read and poll bookkeeping;
+- when observing, the recorded events, re-stamped.
+
+The decision depends only on engine state, so the execution path does not depend on the observer. With an observer the stream is byte-identical; without one, nothing is emitted, as today.
+
+**What a recording captures.** It is taken while interpreting the iteration that parks, from the `Jump(head)` after the previous `LoopEnd` to the parking `LoopEnd`. It is kept on the `WarpState`, like `BlockedWait`.
+1. **Identity.** `epoch` at the end of the iteration, `pc` (the `LoopEnd`), the loop frame's depth, and `spin_hash`.
+2. **Counter deltas.**
+   - `steps`, `epoch` and `LaunchCounters::instrs` each advance by n, the number of instructions in the iteration.
+   - `progress` advances by 0 (a parked iteration has none).
+   - The loop frame's `iteration` advances by 1. Replay re-checks the loop budget and raises the same `Budget` error at the same iteration.
+3. **Poll state.** The iteration's `PollState` (`failed_on`, `also`, `overflow`, `progressed = false`). It is merged into the frame's `outer` exactly as `loop_end` does, and the returned `Blocked(failed_on)` must be the same.
+4. **Reads.** Every `(alloc, span)` the iteration read, through the existing `aux.capture_reads` hook, which loads already feed, with the bytes and validity bits seen. These serve two purposes:
+   - the unchanged-inputs check;
+   - re-applying the reads' side records on replay: the shard read set (`track_shard_reads`, which feeds `shard_replay_order`) and the readonly-proxy read notes (`note_readonly_read`).
+   - Uninitialized-read findings are deduplicated per (site, alloc, span) and were already recorded by the original iteration, so replay adds none. The debug check below asserts this.
+5. **Sync queries.** For each `try_wait` / `test_wait` / named-barrier query in the body: (resource, command, the resource's state). Like `BlockedWait`, the queries are pure functions of the state.
+6. **Events, only when observing.**
+   - The `Access` events: everything except `seq`, with `actor.epoch` stored as an offset from the iteration's first epoch.
+   - Any sync events the iteration emitted. A failed poll emits none; one that did emit would be a successful operation, i.e. progress, so the iteration would not have parked.
+   - The `round_boundary` events are not part of the iteration.
+7. **Register writes: none.** `spin_hash` equality before and after the recorded iteration means the iteration leaves registers and masks as it found them. The unchanged-inputs condition then implies the replayed iteration does the same. Replay writes no registers and leaves the spin memo untouched.
+
+**Unchanged-inputs condition.** Replay applies only if all of the following hold:
+- `warp.epoch == recording.epoch` (the warp ran nothing since), `warp.pc` is the recorded `LoopEnd`, and `resume == PARKED`;
+- `warp.suspended` is empty, and the frame stack depth and the loop frame's identity (`begin`) are unchanged;
+- every recorded read span's current bytes and validity equal the recorded ones, read through the same arena or shard view execution would use;
+- every recorded sync query's resource state equals the recorded state.
+- **Why this is sufficient.**
+  - The iteration is a deterministic function of: warp state (registers, masks and frames, all unchanged since the warp has not run); program constants; the bytes it reads (checked); sync states it queries (checked); and launch-constant context (CTA id and shape).
+  - Instructions that read anything else make the iteration non-repeatable. Examples are `%clock` / `%globaltimer`, which change registers, so `spin_hash` differs and the loop never parks, and async-group queries, which are recorded as sync queries.
+  - Any instruction not covered by the recorder sets "not replayable" for that iteration, so it is executed normally.
+- **Cost.** The checks are a few word compares plus one state compare per query, against interpreting the whole body.
+
+**Applying a replay.**
+- Bump `steps`, `epoch` and `instrs` by n.
+- Bump the frame's `iteration` and check the budget.
+- Merge the recorded poll state into `outer`.
+- Re-record the reads in the shard read set and the readonly tracking.
+- When observing, emit the recorded events in order: each `Access` with a fresh `counters.next_access_seq()` and its epoch rebased onto the warp's current epoch; each sync event with the warp's current `sync_seq` handling.
+- Return `Blocked(failed_on)` through the normal `settle`.
+
+**Debug assertion.** In debug builds, never replay. Execute the iteration and assert that:
+- the result is `Blocked(recorded failed_on)`;
+- the counter deltas match;
+- the poll state matches;
+- `spin_hash` is unchanged;
+- the shard read set gained exactly the recorded spans;
+- the emitted events equal the recording modulo `seq` and the epoch base (captured with a tee into the partition `EventBuffer`).
+
+This is the same pattern as `BlockedWait`'s debug check. Equivalence also needs digests at 1/8/32 with and without an observer, the W16 racecheck hashes, and `every_scenario_is_observer_and_worker_independent`.
+
+**Expected saving.** The max config's 203 CPU-s of re-polls becomes the check plus the replay. The check is a handful of word compares. Replaying events costs a few hundred ns per `Access` when observing, and nothing otherwise.
+- NumSim mode: estimated 150–190 CPU-s saved (7–9% of the 2,136 partition CPU-s). The wall effect is smaller, because re-polls are spread across partitions.
+- Racecheck mode: proportionally less, since the checker still consumes the replayed events.
+- Medium spends only 0.13–0.34 s in re-polls, so the max config is the target.
+
+**Files, if approved.**
+- `interp/mod.rs`: the recording on `WarpState`, the condition and the apply.
+- `interp/handlers/control.rs`: start, finish and invalidate the recording at `LoopEnd`.
+- `interp/handlers/mem.rs` and `interp/support.rs`: feed reads and events to the recorder.
+- `interp/handlers/sync.rs`: record sync queries.
+- `sched/partition.rs`: the apply in `run_cta`, beside `BlockedWait`.
+
+**Open questions for W6.**
+- Whether replayed `Access` events need any marker. Proposed: none, since the stream is identical.
+- Whether the racecheck checker relies on per-iteration `round_boundary` interleaving that replay preserves. Replay happens at the same point in `run_cta` as execution, so it should.
+
+## Racecheck checker-partition CPU: release-head joins, lane storage and the allocator (W14, 2026-10-09)
+
+**Setup.** e24 recorded stream, fork/join on. A forked child's CPU is thread CPU (`/proc/thread-self/schedstat`) summed over its replay. The "forked 1-worker" figure offers forks with no pool, so the same child work runs on one thread. Profiles are stack samples taken by attaching gdb (the driver calls `prctl(PR_SET_PTRACER)`; `perf` is blocked by `perf_event_paranoid=4`), plus per-event-kind timers in a scratch copy.
+
+**Where the child time went (at 75e9dda's predecessor 8ab6a62).**
+
+1. **WaitVerdicts: 11.5 s of the 18 s of child CPU at 1 worker.**
+   - Each RMW on a counter inherits every earlier head, so 2,772 waits acquired about 88 release heads each, at 4.2 ms per wait.
+   - Fix: `knowledge::HeadList` keeps the join of its `.gpu`-or-wider heads and grows it by one join per RMW. An acquirer at `.gpu` or wider takes that join once.
+   - This is exact (racecheck-semantics row 25). The guard is `tuning::JOINED_HEADS` with bench `joined_heads`: chains of 64 and 256 heads cost 3.7 vs 1.2 ms (3.1x) and 30.8 vs 5.4 ms (5.8x).
+2. **Lane-entry code in `Clock::join`: 59% of child samples at 16 workers, 36% at 1.**
+   - Each block rebuild cloned the `Arc` of every lane vector and copied a ~470-entry top slice of `Arc`s. The lane vectors were shared by every partition, so the refcount writes bounced between CCDs.
+   - Joins that touched lane entries: 642 K, carrying 181 entries in 74 blocks on average.
+   - Fix (`clock.rs`):
+     - lane vectors stored inline with their maximum;
+     - two-level lane groups;
+     - normalisation after a scalar change that visits only blocks whose 32-actor chunk changed;
+     - a randomized model test (`clock::tests`).
+3. **glibc arena locks** (`futex_wait` in `_int_free` on `main_arena`): threads free clock storage that other threads allocated.
+
+**The inflation is cross-CCD sharing of written lines, not migration.** 8 workers on 8 cores of one CCD:
+- one CCD: child CPU 20.1 s, wall 5.6 s;
+- spread over 8 CCDs: 31.0 s, 8.1 s;
+- spread over 8 CCDs with fixed partition→thread assignment, pinned: 28.0 s;
+- 1 worker: 17–21 s.
+
+Aligning `Chunk` to a cache line changed nothing measurable.
+
+**A/B** on 75e9dda (a39756d, the current base, changes no racecheck code). "Heads + lanes" is this change.
+- Instrumented scratch builds, min of 3 interleaved runs for e24 and one run each for medium.
+- Load average was 5.8–12.7 for e24 and 5.9–13.9 for medium.
+- Payload hash identical across all builds, modes and worker counts.
+
+| | e24 wall, 1 worker | e24 wall, 16 workers | e24 child CPU, 16 workers / forked 1-worker | medium, 2000 rounds, 16 workers: wall / child CPU |
+| --- | --- | --- | --- | --- |
+| HEAD, glibc | 18.03 s | 8.21 s | 43.3 / 15.6 s (2.8x) | 380 s / 610 s |
+| HEAD, mimalloc | 14.24 s | 5.89 s | 29.8 / 13.6 s (2.2x) | 291 s / 510 s |
+| heads + lanes, glibc | 9.75 s | 6.06 s | 21.2 / 6.3 s (3.4x) | 200 s / 441 s |
+| heads + lanes, mimalloc | **7.88 s** | **4.02 s** | 12.9 / 5.5 s (2.4x) | **135 s** / 303 s |
+
+- With heads + lanes, mimalloc is worth 1.5x on e24 at 16 workers and on medium; on HEAD it was worth 1.3–1.4x.
+- The engine alone gains about 10% CPU from mimalloc ("allocator and huge-page experiments" above).
+- Overall, e24 at 16 workers goes from 8.21 s to 4.02 s (2.04x); against the 8ab6a62 figure of 6.5 s it is 1.6x. Medium goes from 380 s to 135 s (2.8x).
+
+**Child-CPU bar not met.** The bar was child CPU at 16 workers within 1.5x of the 1-worker figure. The result is 2.4x (12.9 vs 5.5 s), against 2.8x at HEAD. The ratio barely moved because the heads fix removed mostly work that does not inflate.
+- The remaining inflation is the lane storage, still shared between partitions through `Arc` groups and blocks, together with clock-group adoption on joins.
+- The landing criterion is the wall time.
+
+**mimalloc dependency.**
+- `numsim-py` feature `mimalloc`, default on. `numsim-core` stays allocator-agnostic, so its tests and benches use the system allocator.
+- To build without a C compiler: `cargo build -p numsim-py --no-default-features --features extension-module`.
+- The wheel (`setup.py`: `cargo build --release --locked -p numsim-py --features extension-module`) gets it by default. It needs the `cc` crate and a C compiler, which manylinux_2_28 has.
+- `--locked` passes with the new lock entries: mimalloc 0.1.52, libmimalloc-sys 0.1.49, cc 1.6.0, find-msvc-tools 0.1.14, shlex 2.0.1.
+- The extension still links only libc, libm and libgcc_s (mimalloc is static).
+- Not verified here: the CI toolchain 1.89.0 and the aarch64 image (W8).
+
+**mimalloc TLS mode (c3e214e, `local_dynamic_tls`): no measurable cost.** The extension was built from archives of 1581dfe (initial-exec TLS; `readelf` shows `STATIC_TLS`) and c3e214e (local-dynamic, no `STATIC_TLS`). Both were timed through the dlopen'ed extension (`numsim_core_py.run` on the recorded fixtures). A static Rust driver would relax the TLS model to local-exec and hide the difference.
+
+| | 1581dfe (initial-exec) | c3e214e (local-dynamic) |
+| --- | --- | --- |
+| e24, 1 worker (min of 3) | 7.95 s (7.95–7.98) | 7.93 s (7.93–8.23) |
+| e24, 16 workers (min of 3) | 4.18 s (4.18–4.77) | 4.14 s (4.14–4.93) |
+| medium, 2000 rounds, 16 workers (one run each) | 148.9 s (load 23 → 8) | 128.7 s (load 6 → 23) |
+
+Load average was 5.5–8.7 for e24. The medium difference is within the load swing.

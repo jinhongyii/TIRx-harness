@@ -1,0 +1,31 @@
+{
+ "case": "deepgemm_sm100_m_grouped_fp8_gemm_contiguous",
+ "diagnostics": [
+  {
+   "anchors": [
+    "tirx_kernels/ported/deepgemm/_sm100_fp8_fp4_gemm_1d1d/kernel.py:1393:1-1393:67"
+   ],
+   "bytes": {
+    "shared": "189312-189440"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "shared",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "D": {
+   "dtype": "uint16",
+   "sha256": "85e614bc2ef17bec493b849dbeea34687ba52d7b1fedc4e5fc3729b0fb059aad",
+   "shape": [
+    1344,
+    384
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "review"
+}

@@ -1,0 +1,11 @@
+{
+ "case": "msa_sparse_prepare_fwd_split_atomic_sm100",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

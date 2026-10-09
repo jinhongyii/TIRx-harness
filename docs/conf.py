@@ -35,10 +35,12 @@ nitpick_ignore = [
     ("py:class", "collections.abc.Callable"),
     ("py:class", "collections.abc.Iterable"),
     ("py:class", "collections.abc.Mapping"),
+    ("py:class", "collections.abc.Sequence"),
     ("py:class", "numpy.ndarray"),
     ("py:class", "pathlib.Path"),
     ("py:class", "tvm.tir.PrimFunc"),
     ("py:class", "Finding"),
+    ("py:class", "AnalysisResult"),
 ]
 
 

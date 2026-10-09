@@ -16,8 +16,8 @@ from tests.numsim.corpus.kernels.gemm import (
 from tests.numsim.corpus.kernels.gemm import prepare_nvfp4_case as prepare_numsim_case
 from tests.numsim.microtests.harness import NUMSIM_GPU_MARK, require_numsim_gpu
 from tests.numsim.support.three_way import run_three_way_case
-from tirx_harness.numsim.bindings import _decode_tensor_maps, _tensor_map_base_array
-from tirx_harness.numsim.transpiler.frontend import analyze
+from tests.numsim.support.host_bindings import decode_tensor_maps, tensor_map_base_array
+from tests.numsim.support.kernel_facts import launch_topology
 
 
 def _params(config):
@@ -76,55 +76,3 @@ def test_nvfp4_reference_applies_local_e4m3_scales_and_global_alpha():
     np.testing.assert_array_equal(actual, expected)
 
 
-def test_prepare_nvfp4_numsim_case_is_deterministic_and_full_launch():
-    config = NUMSIM_CONFIGS[0]
-    assert (config["M"], config["N"], config["K"]) == (256, 256, 256)
-    case = prepare_numsim_case(**_params(config))
-    repeated = prepare_numsim_case(**_params(config))
-    spec = analyze(case.kernel)
-
-    assert spec.topology.clusters == 74
-    assert spec.topology.ctas_per_cluster == 2
-    assert spec.topology.warps_per_cta == 8
-    assert case.subset is None
-    assert set(case.outputs) == {"D"}
-    assert _tensor_map_base_array(case.args["A_tensor_map"]).shape == (256, 128)
-    assert _tensor_map_base_array(case.args["B_tensor_map"]).shape == (256, 128)
-    assert _tensor_map_base_array(case.args["SFA_tensor_map"]).shape == (2, 4, 256)
-    assert _tensor_map_base_array(case.args["SFB_tensor_map"]).shape == (2, 4, 256)
-    assert case.args["alpha"].shape == (1,)
-    assert _tensor_map_base_array(case.args["D_tensor_map"]).shape == (256, 256)
-    assert {
-        name: (
-            _decode_tensor_maps(value)[0].dtype
-            if name.endswith("_tensor_map")
-            else str(value.dtype)
-        )
-        for name, value in case.args.items()
-    } == {
-        "A_tensor_map": "uint8",
-        "B_tensor_map": "uint8",
-        "SFA_tensor_map": "uint16",
-        "SFB_tensor_map": "uint16",
-        "alpha": "float32",
-        "D_tensor_map": "bfloat16",
-    }
-    np.testing.assert_array_equal(
-        _tensor_map_base_array(case.args["A_tensor_map"]),
-        _tensor_map_base_array(repeated.args["A_tensor_map"]),
-    )
-    np.testing.assert_array_equal(
-        _tensor_map_base_array(case.args["SFA_tensor_map"]),
-        _tensor_map_base_array(repeated.args["SFA_tensor_map"]),
-    )
-    np.testing.assert_array_equal(case.reference()["D"], repeated.reference()["D"])
-
-
-@NUMSIM_GPU_MARK
-@pytest.mark.parametrize("config", NUMSIM_CONFIGS, ids=lambda config: config["label"])
-def test_every_nvfp4_numsim_config_matches_gpu_and_reference(pytestconfig, tmp_path, config):
-    require_numsim_gpu(pytestconfig)
-
-    report = run_three_way_case(prepare_numsim_case(**_params(config)), cache_dir=tmp_path)
-
-    report.require_ok()

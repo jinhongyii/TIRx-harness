@@ -1,0 +1,38 @@
+case	mode	workers	legacy_s	interp_s	ratio	owner_guess	under_load	engine
+mega_moe:medium (timeout)	racecheck	16	21.0855	900.8333+	42.72	racecheck/W5	no	6ba4190
+mega_moe:large (timeout)	racecheck	16	34.5753	901.7081+	26.08	racecheck/W5	no	6ba4190
+mega_moe:twenty_four_experts (verdict differs)	racecheck	32	2.4979	19.6184	7.85	racecheck/W5	no	6ba4190
+mega_moe:twenty_four_experts (verdict differs)	racecheck	16	2.7241	19.4778	7.15	racecheck/W5	no	6ba4190
+mega_moe:medium (timeout)	racecheck	1	224.1995	901.1350+	4.02	racecheck/W5	no	6ba4190
+cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in	racecheck	32	6.7093	18.9834	2.83	numsim/W2	yes	6ba4190
+cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant	racecheck	32	0.1082	0.2965	2.74	scheduler/W2	no	6ba4190
+kda_decode_multishape	racecheck	8	0.1229	0.3117	2.54	scheduler/W2	yes	6ba4190
+kda_decode_multishape	racecheck	32	0.1287	0.3245	2.52	scheduler/W2	yes	6ba4190
+cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant	racecheck	8	0.1099	0.2748	2.50	scheduler/W2	no	6ba4190
+cudnn_sm100_gemm_proj_rope_mxfp8_mxfp8in	racecheck	8	9.0720	20.0471	2.21	numsim/W2	yes	6ba4190
+mega_moe:medium	numsim	32	3.6844	7.6524	2.08	numsim/W2	no	6ba4190
+mega_moe:small (verdict differs)	racecheck	16	2.1166	4.3452	2.05	racecheck/W5	no	6ba4190
+mega_moe:small (verdict differs)	racecheck	32	2.1672	4.1949	1.94	racecheck/W5	no	6ba4190
+cudnn_sm100_dense_gemm_persistent_swiglu	racecheck	32	0.1692	0.3055	1.80	scheduler/W2	yes	6ba4190
+mega_moe:twenty_four_experts (verdict differs)	racecheck	1	12.8233	23.1019	1.80	racecheck/W5	no	6ba4190
+mega_moe:medium	numsim	16	4.9959	8.1628	1.63	numsim/W2	no	6ba4190
+gdn_decode_bf16_wide_vec_mtp	racecheck	32	0.6727	1.0364	1.54	numsim/W2	no	6ba4190
+cudnn_sm100_dense_gemm_persistent_swiglu	racecheck	8	0.2044	0.2931	1.43	scheduler/W2	yes	6ba4190
+flash_attention4	racecheck	32	1.6352	2.3326	1.43	numsim/W2	yes	6ba4190
+gdn_decode_bf16_wide_vec_mtp	racecheck	8	0.7843	1.0854	1.38	numsim/W2	no	6ba4190
+deepgemm_sm100_m_grouped_fp8_gemm_contiguous	synccheck	32	0.7187	0.9680	1.35	scheduler/W2	yes	6ba4190
+kda_backward_packed	numsim	1	1.0074	1.2697	1.26	numsim/W2	yes	6ba4190
+deepgemm_sm100_m_grouped_fp8_gemm_contiguous	racecheck	32	2.1519	2.6402	1.23	scheduler/W2	yes	6ba4190
+cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant	synccheck	32	0.0786	0.0885	1.13	scheduler/W2	no	6ba4190
+deepgemm_sm100_fp4_mqa_logits	synccheck	32	0.5356	0.5924	1.11	scheduler/W2	yes	6ba4190
+cudnn_sm100_dense_blockscaled_gemm_persistent_swiglu_interleaved_quant	racecheck	1	0.2750	0.3017	1.10	racecheck/W5	no	6ba4190
+cudnn_sm100_moe_blockscaled_grouped_gemm_dglu_dbias	racecheck	8	0.9503	1.0214	1.07	numsim/W2	no	6ba4190
+kda_backward_packed	racecheck	8	1.4387	1.5407	1.07	numsim/W2	yes	6ba4190
+kda_backward_packed	numsim	32	0.9637	1.0311	1.07	numsim/W2	yes	6ba4190
+cudnn_sm100_dense_blockscaled_gemm_persistent_srelu_quant	synccheck	32	0.1447	0.1546	1.07	scheduler/W2	yes	6ba4190
+kda_backward_packed	synccheck	1	1.2527	1.3123	1.05	numsim/W2	yes	6ba4190
+deepgemm_sm100_m_grouped_fp8_gemm_contiguous	racecheck	8	2.1200	2.2093	1.04	scheduler/W2	yes	6ba4190
+kda_backward_packed	numsim	8	0.9051	0.9168	1.01	numsim/W2	yes	6ba4190
+mega_moe:medium	numsim	1	35.7297	36.0048	1.01	numsim/W2	no	6ba4190
+recurrent_kda_decode_one_warp (fork/join vs serial checker; legacy_s = serial; prof harness, min of 3)	racecheck	32	1.1200	1.4200	1.27	racecheck/W5	no	bf0e9c6
+# retired at the FORK_JOIN default-on commit (HEAD bf0e9c6 + W5/W14 batch): the 6cfabec fork/join 1-worker rows (recurrent_kda_decode_one_warp, selective_state_update_stp_simple, radix_topk_multi_cta, mega_moe:twenty_four_experts, gdn_decode_bf16_wide_vec_mtp); since W5-17a (df280f3) no fork is offered at 1 worker, measured serial vs fork/join 0.98-1.03x (min of 3); stp w32 retired too (0.02 vs 0.01 s); kda w32 re-measured at bf0e9c6 and kept (1.27x)

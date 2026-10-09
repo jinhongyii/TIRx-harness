@@ -1,0 +1,38 @@
+{
+ "case": "stable_sort_topk_by_value",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/utils/topk_radix.py:29:1-29:55",
+      "tirx_kernels/ported/flashinfer/utils/topk_radix.py:44:1-44:57"
+     ],
+     "bytes": {
+      "shared": "128-130,512-514,898-900,902-904,906-908,910-912,914-916,918-920,922-924,926-928,930-932,934-936,938-940,942-944,946-948,950-952,954-956,958-960,962-964,966-968,970-972,974-976,978-980,982-984,986-988,990-992,994-996,998-1000,1002-1004,1006-1008,1010-1012,1014-1016,1018-1020,1022-1024"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    },
+    {
+     "anchors": [
+      "tirx_kernels/ported/flashinfer/utils/topk_radix.py:34:1-34:57",
+      "tirx_kernels/ported/flashinfer/utils/topk_radix.py:39:1-39:55"
+     ],
+     "bytes": {
+      "shared": "128-130,512-514,898-900,902-904,906-908,910-912,914-916,918-920,922-924,926-928,930-932,934-936,938-940,942-944,946-948,950-952,954-956,958-960,962-964,966-968,970-972,974-976,978-980,982-984,986-988,990-992,994-996,998-1000,1002-1004,1006-1008,1010-1012,1014-1016,1018-1020,1022-1024"
+     },
+     "category": "advisories",
+     "kind": "alias_stale_read",
+     "space": "shared",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

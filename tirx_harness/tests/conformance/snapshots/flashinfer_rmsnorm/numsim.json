@@ -1,0 +1,30 @@
+{
+ "case": "flashinfer_rmsnorm",
+ "diagnostics": [
+  {
+   "anchors": [
+    "tirx_kernels/ported/flashinfer/norm/rmsnorm.py:205:1-205:34"
+   ],
+   "bytes": {
+    "shared": "256-2048"
+   },
+   "category": "diagnostics",
+   "kind": "uninitialized_read",
+   "space": "shared",
+   "status": "review"
+  }
+ ],
+ "mode": "numsim",
+ "outputs": {
+  "y": {
+   "dtype": "float16",
+   "sha256": "72ae0314d9498fe5e4fb29feb65fdf1280eeb07c5493a71a3d89e97e8361bdb3",
+   "shape": [
+    128
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "review"
+}

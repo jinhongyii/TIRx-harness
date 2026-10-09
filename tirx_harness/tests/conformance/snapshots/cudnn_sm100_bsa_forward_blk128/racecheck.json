@@ -1,0 +1,25 @@
+{
+ "case": "cudnn_sm100_bsa_forward_blk128",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/cudnn/bsa/block_sparse_attention_forward_sm100_blk128.py:473:1-473:83",
+      "tirx_kernels/ported/cudnn/bsa/block_sparse_attention_forward_sm100_blk128.py:481:1-481:83"
+     ],
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

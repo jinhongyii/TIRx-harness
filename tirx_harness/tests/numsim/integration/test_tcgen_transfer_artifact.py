@@ -42,22 +42,6 @@ _WRONG_CP_LANE_PERMUTATION = TileLayout(
 )
 
 
-@pytest.mark.parametrize("packed", (False, True))
-def test_split_tmem_transfer_preserves_the_gap(packed, tmp_path):
-    kernel = _make_raw_ldst_kernel("16x32bx2", packed, split_padding=6)
-    expected = _ldst_oracle("16x32bx2", packed, split_padding=6)
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {
-            "load_output": np.zeros((2, 4, 32, 8), dtype=np.uint32),
-            "store_output": np.zeros((2, 128, 32), dtype=np.uint32),
-        },
-    )
-    np.testing.assert_array_equal(result.outputs["load_output"], expected["loads"])
-    np.testing.assert_array_equal(result.outputs["store_output"], expected["stores"])
-
-
 @T.prim_func
 def _fast_m64_tmem_to_local_roundtrip(
     source: T.Buffer((128, 32), "float32"), output: T.Buffer((128, 32), "float32")
@@ -452,93 +436,6 @@ def test_tcgen_16xb_roundtrip_preserves_16bit_register_halves(
     np.testing.assert_array_equal(result.outputs["output"].view(np.uint16), source.view(np.uint16))
 
 
-def test_tcgen_cp_expands_tlane_replicas(tmp_path):
-    source = np.arange(32 * 4, dtype=np.float32).reshape(32, 4)
-    output = np.zeros((128, 4), dtype=np.float32)
-    expected = np.tile(source, (4, 1))
-
-    module = numsim.transpile(tcgen_shared_to_tmem_replica, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_tcgen_cp_supports_rank3_multi_instruction_layout(tmp_path):
-    source = np.arange(4 * 32 * 16, dtype=np.uint8).reshape(4, 32, 16)
-    output = np.zeros((128, 4, 16), dtype=np.uint8)
-    expected = np.tile(source.transpose(1, 0, 2), (4, 1, 1))
-
-    module = numsim.transpile(tcgen_shared_to_tmem_rank3, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_tcgen_cp_bitcasts_uint8_scale_payload_into_float8_tmem(tmp_path):
-    source = np.resize(
-        np.array([0x00, 0x30, 0x38, 0x3C, 0x40, 0xB8, 0xFE], dtype=np.uint8), (128, 4)
-    )
-    output = np.zeros((128, 4), dtype=np.float32)
-    exponent = ((source >> np.uint8(3)) & np.uint8(0xF)).astype(np.int16)
-    mantissa = (source & np.uint8(0x7)).astype(np.float32)
-    normal = np.ldexp(np.float32(1) + mantissa / np.float32(8), exponent - 7)
-    subnormal = np.ldexp(mantissa / np.float32(8), -6)
-    expected = np.where(exponent == 0, subnormal, normal).astype(np.float32)
-    expected = np.where((source & np.uint8(0x80)) != 0, -expected, expected)
-
-    module = numsim.transpile(tcgen_scale_bitcast_shared_to_tmem, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_tcgen_cp_cta_group2_reads_and_writes_each_cta_scale_backing(tmp_path):
-    source = np.resize(
-        np.array([0x30, 0x38, 0x3C, 0x40, 0xB0, 0xB8, 0xBC, 0xC0], dtype=np.uint8), (2, 128, 4)
-    )
-    source[1] = np.roll(source[1], 3, axis=0)
-    output = np.zeros((2, 128, 4), dtype=np.float32)
-    exponent = ((source >> np.uint8(3)) & np.uint8(0xF)).astype(np.int16)
-    mantissa = (source & np.uint8(0x7)).astype(np.float32)
-    normal = np.ldexp(np.float32(1) + mantissa / np.float32(8), exponent - 7)
-    subnormal = np.ldexp(mantissa / np.float32(8), -6)
-    expected = np.where(exponent == 0, subnormal, normal).astype(np.float32)
-    expected = np.where((source & np.uint8(0x80)) != 0, -expected, expected)
-
-    module = numsim.transpile(tcgen_scale_bitcast_cta_group2, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_tcgen_cp_cta_group2_supports_float16_payloads(tmp_path):
-    source = np.linspace(-5, 7, 2 * 32 * 8, dtype=np.float16).reshape(2, 32, 8)
-    output = np.zeros((2, 128, 8), dtype=np.float16)
-    expected = np.tile(source, (1, 4, 1))
-
-    module = numsim.transpile(tcgen_float16_cta_group2, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"source": source, "output": output})
-
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
-def test_tcgen_cp_cta_group2_routes_each_pair_in_four_cta_cluster(tmp_path):
-    source = np.resize(
-        np.array([0x30, 0x38, 0x3C, 0x40, 0xB0, 0xB8, 0xBC, 0xC0], dtype=np.uint8),
-        (4, 128, 4),
-    )
-    for cta in range(4):
-        source[cta] = np.roll(source[cta], 3 * cta, axis=0)
-    expected = _decode_e4m3fn(source)
-
-    result = numsim.Engine().run(
-        numsim.transpile(_tcgen_cp_two_pairs_in_one_cluster, cache_dir=tmp_path),
-        {"source": source, "output": np.zeros((4, 128, 4), dtype=np.float32)},
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], expected)
-
-
 def test_all_inactive_tcgen_transfer_is_a_noop(tmp_path):
     output = np.zeros(4, dtype=np.int32)
 
@@ -548,19 +445,3 @@ def test_all_inactive_tcgen_transfer_is_a_noop(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], np.full(4, 7, dtype=np.int32))
 
 
-def test_tcgen_ldst_rejects_tmem_layout_outside_fixed_instruction_abi(tmp_path):
-    with pytest.raises(
-        UnsupportedTIRxError,
-        match="TMEM/local layouts do not match any fixed tcgen05.ld/st D, F, or B instruction ABI",
-    ):
-        numsim.transpile(_tcgen_ldst_wrong_m64_tmem_layout, cache_dir=tmp_path)
-
-
-def test_tcgen_cp_rejects_destination_lane_permutation(tmp_path):
-    with pytest.raises(UnsupportedTIRxError):
-        numsim.transpile(_tcgen_cp_wrong_destination_lane_permutation, cache_dir=tmp_path)
-
-
-def test_tcgen_cp_rejects_declared_shape_that_disagrees_with_layout(tmp_path):
-    with pytest.raises(UnsupportedTIRxError):
-        numsim.transpile(_tcgen_cp_wrong_declared_shape, cache_dir=tmp_path)

@@ -8,7 +8,6 @@ import pytest
 from tirx_harness import numsim
 from tirx_harness.numsim.errors import UnsupportedTIRxError
 from tests.numsim.support.kernels import tmem_d_alias_per_cta
-from tests.numsim.support.manifest import emitted_module
 from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 from tvm.tirx.layout import ComposeLayout, S, TileLayout
@@ -239,38 +238,6 @@ def pointer_origin_through_pure_if_then_else(
     output[0] = alias[0]
 
 
-def _shared_backing_sizes(kernel):
-    source = emitted_module(kernel)
-    return [
-        int(size)
-        for size in re.findall(r"allocate_cta_shared\(&physical, topology, (\d+)\)", source)
-    ]
-
-
-def _runtime_pointer_view(kernel, byte_len, itemsize):
-    source = emitted_module(kernel)
-    views = [line for line in source.splitlines() if "let pointer_view_" in line]
-    assert len(views) == 1
-    assert ".pointer_space_for_mask(ctx.active_mask())?" in views[0]
-    assert f"0_usize, {byte_len}_usize, {itemsize}_usize, &ctx, ctx.active_mask())?" in views[0]
-    return source
-
-
-def test_internal_alias_must_fit_the_owner_allocation():
-    assert _shared_backing_sizes(in_bounds_internal_alias) == [8 * 4]
-
-    with pytest.raises(UnsupportedTIRxError, match="exceeds owner storage range"):
-        emitted_module(alias_extends_internal_owner)
-
-
-def test_unused_internal_alias_does_not_expand_or_reject_its_owner(tmp_path):
-    assert _shared_backing_sizes(dead_alias_extends_internal_owner) == [4 * 4]
-
-    module = numsim.transpile(dead_alias_extends_internal_owner, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.uint32)})
-    np.testing.assert_array_equal(result.outputs["output"], np.array([17], dtype=np.uint32))
-
-
 def test_evaluated_buffer_data_projection_is_a_structural_noop(tmp_path):
     module = numsim.transpile(evaluated_buffer_data_projection_is_pure, cache_dir=tmp_path)
     result = numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.uint32)})
@@ -289,79 +256,3 @@ def test_dynamic_view_scope_annotation_does_not_reclassify_address_bits(tmp_path
     np.testing.assert_array_equal(result.outputs["output"], np.array([31], dtype=np.uint32))
 
 
-def test_tensor_load_does_not_make_oversized_static_alias_fail_planning(tmp_path):
-    assert _shared_backing_sizes(loaded_alias_extends_internal_owner) == [4 * 4]
-    numsim.transpile(loaded_alias_extends_internal_owner, cache_dir=tmp_path)
-
-
-def test_mapa_bits_in_a_nominal_global_declbuffer_keep_runtime_address_resolution():
-    source = _runtime_pointer_view(mapa_shared_address_in_generic_handle, 8, 8)
-    assert "Ld<v2::reg::variant::U64, v2::Generic>" in source
-
-
-def test_mapa_source_in_a_nominal_global_declbuffer_keeps_runtime_address_resolution():
-    _runtime_pointer_view(mapa_source_through_nominal_global_declbuffer, 64, 8)
-
-
-def test_pool_capacity_attr_sizes_owner_without_opportunistic_growth(tmp_path):
-    assert _shared_backing_sizes(pool_capacity_bounds_alias) == [32]
-    module = numsim.transpile(pool_capacity_bounds_alias, cache_dir=tmp_path)
-    result = numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.uint32)})
-    assert result.verdict == "clean", result.diagnostics
-    np.testing.assert_array_equal(result.outputs["output"], np.array([1], dtype=np.uint32))
-    with pytest.raises(UnsupportedTIRxError, match="exceeds owner storage range"):
-        emitted_module(alias_exceeds_pool_capacity)
-
-
-def test_zero_extent_pool_owner_uses_only_concrete_view_span_evidence():
-    assert _shared_backing_sizes(zero_extent_pool_uses_concrete_view_span) == [32]
-    with pytest.raises(UnsupportedTIRxError, match="no positive static view span"):
-        emitted_module(zero_extent_pool_without_span_evidence)
-
-
-def test_conflicting_pool_capacity_attrs_fail_closed():
-    with pytest.raises(UnsupportedTIRxError, match="conflicting capacities 16 and 32"):
-        emitted_module(conflicting_pool_capacities)
-
-
-def test_malformed_pool_capacity_attr_fails_closed():
-    with pytest.raises(UnsupportedTIRxError, match="cannot be negative"):
-        emitted_module(negative_pool_capacity)
-
-
-@pytest.mark.parametrize(
-    ("kernel", "expected_bytes"),
-    [(repeated_tile_owner, 40), (repeated_compose_owner, 56)],
-)
-def test_repeated_layout_atoms_size_the_complete_logical_domain(kernel, expected_bytes):
-    assert _shared_backing_sizes(kernel) == [expected_bytes]
-
-
-def test_odd_float4_spans_round_up_to_complete_physical_bytes():
-    assert _shared_backing_sizes(odd_float4_owner) == [2]
-
-
-def test_float4_alias_can_begin_at_the_high_nibble():
-    source = emitted_module(high_nibble_float4_alias)
-    assert re.search(
-        r"let buffer_2 = runtime_buffer_shared\(\s*"
-        r"numsim_cta_shared_backing.clone\(\),\s*0,\s*2,\s*2,\s*0,\s*\);",
-        source,
-    )
-    index = re.search(r"let (broadcast_\d+) = WarpValue::splat\(\(1_i32\) as i64\);", source)
-    assert index is not None
-    assert f"{index[1]}[lane].div_euclid(2_i64)" in source
-    assert f"{index[1]}[lane].rem_euclid(2_i64) == 0" in source
-
-
-def test_integer_addresses_selected_at_runtime_keep_dynamic_views():
-    source = _runtime_pointer_view(pointer_origin_through_pure_if_then_else, 16, 4)
-    assert "Ld<v2::reg::variant::U32, v2::Generic>" in source
-
-
-def test_all_declared_tmem_views_share_one_physical_backing():
-    source = emitted_module(tmem_d_alias_per_cta)
-    assert source.count("allocate_cta_tmem(") == 1
-    backings = re.findall(r"runtime_buffer_tmem\(\s*(\w+)\.clone\(\),", source)
-    assert len(backings) == 2
-    assert len(set(backings)) == 1

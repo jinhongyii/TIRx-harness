@@ -1,0 +1,17 @@
+{
+ "case": "dense_blockscaled_gemm_sm107",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "c": {
+   "dtype": "uint8",
+   "sha256": "3ab7d9e8e1f64c5f20dfa7aa5d0afed021ad2156199254b4614e084c5368e548",
+   "shape": [
+    16384
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

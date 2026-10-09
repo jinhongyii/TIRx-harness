@@ -7,13 +7,18 @@ Install the components for your own agent workflow or a kcoral GPU server.
 For [optimization runs](optimization-runs.md), setup prepares the packages and
 skills automatically.
 
+To run an exported kernel with `tvm-ffi`, follow
+[Export a kernel](development/export-kernel.md) for the consumer dependencies.
+
 ## Before you start
 
 - Linux x86_64, Python 3.12 or 3.13, and pip 25.1 or later.
 - The CUDA Toolkit (`nvcc`, `ptxas`) where GPU kernels are compiled, and a
   compatible NVIDIA driver where they are run.
-- Cargo, **Rust 1.89.0 or later**, and a C linker for numerical simulation and
-  correctness checks with either installation method.
+- To build from source: Cargo, **Rust 1.89.0 or later**, and a C linker. The
+  NumSim engine (`numsim_core_py`) is compiled once, when the package is
+  built; it does not compile each kernel, so running NumSim, Synccheck, or
+  Racecheck needs no Rust toolchain.
 
 ## Install Python packages
 
@@ -27,20 +32,39 @@ Install the released package without cloning this repository:
 python -m pip install tirx-harness
 ```
 
-Wheels include the native frontend. If pip builds from a source distribution,
-the build tools below are required.
+Wheels include the compiled NumSim engine. If pip builds from a source
+distribution, the build tools below are required.
 
 ### Build from source
 
-Source builds require Git, C/C++ build tools, Python development headers, and
-the Rust toolchain listed above.
+Source builds require Git, a C linker, Python development headers, and the
+Rust toolchain listed above.
 
 ```bash
 git clone https://github.com/mlc-ai/TIRx-harness.git
 cd TIRx-harness
-git submodule update --init thirdparty/tvm-rust-ext
 python -m pip install .
 ```
+
+`pip install .` compiles the NumSim engine, the Rust workspace
+`tirx_harness/src/tirx_harness/numsim/core-rs`, into the Python extension
+`tirx_harness.numsim.v2.numsim_core_py` (`cargo build --release --locked`; the
+first build takes a few minutes).
+
+#### Rebuild the engine in an editable checkout
+
+An editable checkout, such as the uv one below, does not run that build step.
+Build the extension into the source tree, and rerun the script after changing
+anything under `core-rs`:
+
+```bash
+bash tirx_harness/src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh
+```
+
+Pass `--debug` for a debug build, and set `PY` to choose another Python
+interpreter. To keep a private build next to a shared checkout, pass
+`--out <dir>` with `CARGO_TARGET_DIR=<dir>/target`
+([development loop](development/dev-loop.md)).
 
 #### Optional: install with uv
 
@@ -53,10 +77,12 @@ source .venv/bin/activate
 
 ### Verify the installation
 
-After any of these methods, check imports (this does not run checks or GPU kernels):
+After any of these methods, check imports and that the engine loads (this
+does not run checks or GPU kernels):
 
 ```bash
 python -c "import tvm.tirx, tvm_ffi, tirx_kernels.tirx_lite, tirx_harness; print('Core imports OK')"
+python -c "from tirx_harness.numsim.v2.compile import native; native(); print('Engine OK')"
 ```
 
 ## Install kcoral server dependencies
@@ -74,17 +100,16 @@ to start the server.
 | {repo}`tirx-debug-kernel <skills/tirx-debug-kernel/SKILL.md>` | Check correctness, investigate findings, and verify fixes. |
 | {repo}`tirx-profile-kernel <skills/tirx-profile-kernel/SKILL.md>` | Measure performance and use profiler evidence to guide changes. |
 
-Clone this repository if needed, then copy the skills to your agent's directory
-(such as `.agents/skills` or `.claude/skills`). Run from the repository root:
+The package bundles the skills. Install them into the directory your agent
+reads, such as `.agents/skills` or `.claude/skills`:
 
 ```bash
-skills_dir=/absolute/path/to/your/project/.agents/skills
-mkdir -p "$skills_dir"
-cp -R skills/tirx-wiki skills/tirx-debug-kernel skills/tirx-profile-kernel "$skills_dir/"
-(cd "$skills_dir/tirx-wiki" && python scripts/fetch_references.py)
+tirx-harness skills install --dest /absolute/path/to/your/project/.agents/skills
 ```
 
-The fetcher needs network access to download the wiki manuals and reference
-repositories, including `tirx-kernels`.
+The command also downloads the wiki manuals and reference repositories,
+including `tirx-kernels`. Use `--no-fetch` to skip the download and `--force`
+to replace an earlier installation. Editable installs, such as `uv sync`, do
+not bundle the skills; copy them from `skills/` in the checkout instead.
 
 Continue to [Quick Start](quick-start.md) for a concrete example.

@@ -1,0 +1,25 @@
+{
+ "case": "cudnn_sm103_flex_attention_forward",
+ "mode": "racecheck",
+ "phases": [
+  {
+   "diagnostics": [
+    {
+     "access_pair": "read_write",
+     "anchors": [
+      "tirx_kernels/ported/cudnn/flex_attention/forward_sm103.py:760:1-760:102",
+      "tirx_kernels/ported/cudnn/flex_attention/forward_sm103.py:768:1-768:83"
+     ],
+     "category": "findings",
+     "kind": "tmem_lifetime_review",
+     "ordering_domain": "completion",
+     "ordering_failure": "async_lifetime_not_drained",
+     "space": "tmem",
+     "status": "review"
+    }
+   ],
+   "verdict": "review"
+  }
+ ],
+ "schema": 4
+}

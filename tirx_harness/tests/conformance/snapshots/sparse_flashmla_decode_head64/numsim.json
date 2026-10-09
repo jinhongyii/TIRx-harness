@@ -1,0 +1,24 @@
+{
+ "case": "sparse_flashmla_decode_head64",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "k1:lse": {
+   "dtype": "float32",
+   "sha256": "bb239ad2ad24de9350ec1de684143d140b731e0f205d39b81ff2c617c183c808",
+   "shape": [
+    64
+   ]
+  },
+  "k1:out": {
+   "dtype": "uint16",
+   "sha256": "6837360dcaca284ae6259ffa9474d75edf28c30a5a4750fd66e9c02734dfbc1d",
+   "shape": [
+    32768
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

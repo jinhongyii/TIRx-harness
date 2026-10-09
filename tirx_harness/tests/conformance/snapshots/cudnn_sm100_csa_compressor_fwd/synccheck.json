@@ -1,0 +1,11 @@
+{
+ "case": "cudnn_sm100_csa_compressor_fwd",
+ "mode": "synccheck",
+ "phases": [
+  {
+   "diagnostics": [],
+   "verdict": "clean"
+  }
+ ],
+ "schema": 4
+}

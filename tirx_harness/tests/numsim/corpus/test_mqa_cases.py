@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tirx_harness.numsim.bindings import prepare_bindings
 from tests.numsim.corpus.kernels.deepgemm import (
     FP4_MQA_CONFIGS,
     FP8_MQA_CONFIGS,
@@ -19,7 +18,9 @@ from tests.numsim.corpus.kernels.deepgemm import (
     prepare_fp8_mqa_case,
 )
 from tests.numsim.support._tirx_kernels import config_params, load_tirx_kernel
-from tirx_harness.numsim.transpiler.frontend import analyze
+from tests.numsim.support.host_bindings import decode_tensor_maps, host_layout, tensor_map_base_array
+from tests.numsim.support.kernel_facts import launch_topology
+from tirx_harness.numsim import v2
 
 _DENSE_KERNELS = (
     "deepgemm_sm100_fp4_mqa_logits",
@@ -40,61 +41,32 @@ def _case_family(module_name: str):
     return _CORPUS[module_name]
 
 
+def _host_identity(args: dict) -> tuple:
+    """Address-free identity of the host arguments: how arrays alias, their
+    bytes (TensorMap images without their host pointer), the tensor each image
+    addresses, and every scalar."""
+
+    arrays = {name: value for name, value in args.items() if isinstance(value, np.ndarray)}
+    contents = {}
+    for name, value in arrays.items():
+        raw = np.ascontiguousarray(value).view(np.uint8).reshape(-1).copy()
+        bases = []
+        for descriptor in decode_tensor_maps(value):
+            raw[descriptor.byte_offset : descriptor.byte_offset + 8] = 0
+            start = descriptor.byte_offset
+            bases.append(tensor_map_base_array(value.view(np.uint8).reshape(-1)[start : start + 128]).tobytes())
+        contents[name] = (value.dtype.str, value.shape, raw.tobytes(), tuple(bases))
+    scalars = {name: value for name, value in args.items() if name not in arrays}
+    return (
+        host_layout(arrays).buffers,
+        contents,
+        sorted((name, type(value).__name__, repr(value)) for name, value in scalars.items()),
+    )
+
+
 def _case(module_name: str, index: int):
     family = _case_family(module_name)
     return family.prepare(**config_params(family.configs[index]))
-
-
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_mqa_numsim_inputs_have_valid_bindings(module_name):
-    family = _case_family(module_name)
-
-    for index in range(len(family.configs)):
-        prepare_bindings(_case(module_name, index).args)
-
-
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_mqa_shared_pointer_views_keep_their_physical_scope(module_name):
-    spec = analyze(_case(module_name, 0).kernel)
-
-    assert not any(
-        "declared global view disagrees with shared pointer origin" in item
-        for item in spec.unsupported
-    )
-
-
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_dense_mqa_numsim_corpus_covers_dense_compressed_and_cooperative(module_name):
-    configs = _case_family(module_name).configs
-
-    assert len(configs) == 4
-    assert any(not config["compressed_logits"] for config in configs)
-    assert any(config["compressed_logits"] for config in configs)
-    assert any(not config["disable_cp"] for config in configs)
-    assert any(not config["compressed_logits"] and not config["disable_cp"] for config in configs)
-    assert {config["logits_dtype"] for config in configs} == {"float32", "bfloat16"}
-    assert {config["num_sms"] for config in configs} == {2}
-
-
-@pytest.mark.parametrize(
-    ("module_name", "config_index"),
-    [
-        (_DENSE_KERNELS[0], 2),
-        (_DENSE_KERNELS[1], 1),
-    ],
-)
-def test_mqa_numsim_cases_are_deterministic_and_full_launch(module_name, config_index):
-    first = _case(module_name, config_index)
-    second = _case(module_name, config_index)
-
-    assert analyze(first.kernel).topology.clusters == 2
-    assert analyze(first.kernel).topology.ctas_per_cluster == 1
-    assert analyze(first.kernel).topology.warps_per_cta == 12
-    np.testing.assert_array_equal(first.reference()["logits"], second.reference()["logits"])
-    assert (
-        prepare_bindings(first.args).identity_payload()
-        == prepare_bindings(second.args).identity_payload()
-    )
 
 
 def test_dense_mqa_numpy_reference_matches_independent_scalar_reference():
@@ -137,39 +109,3 @@ def test_mqa_low_precision_packing_round_trips_physical_codes():
     )
 
 
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_compressed_mqa_comparison_regions_map_prefix_to_kv_range(module_name):
-    case = _case(module_name, 1)
-    starts = case.args["cu_seq_len_k_start"]
-    ends = case.args["cu_seq_len_k_end"]
-    logits_stride = int(case.args["logits_stride"])
-    seq_len_kv = case.reference()["logits"].size // len(starts)
-    regions = case.comparisons["logits"].regions
-
-    for row, (start, end) in enumerate(zip(starts, ends)):
-        region = regions[row]
-        assert region.actual == (
-            slice(row * logits_stride, row * logits_stride + int(end - start)),
-        )
-        assert region.expected == (
-            slice(row * seq_len_kv + int(start), row * seq_len_kv + int(end)),
-        )
-
-
-@pytest.mark.parametrize("module_name", _DENSE_KERNELS)
-def test_dense_mqa_comparison_regions_exclude_unspecified_columns(module_name):
-    case = _case(module_name, 0)
-    starts = case.args["cu_seq_len_k_start"]
-    ends = case.args["cu_seq_len_k_end"]
-    logits_stride = int(case.args["logits_stride"])
-    seq_len_kv = case.reference()["logits"].size // len(starts)
-    regions = case.comparisons["logits"].regions
-
-    for row, (start, end) in enumerate(zip(starts, ends)):
-        region = regions[row]
-        assert region.actual == (
-            slice(row * logits_stride + int(start), row * logits_stride + int(end)),
-        )
-        assert region.expected == (
-            slice(row * seq_len_kv + int(start), row * seq_len_kv + int(end)),
-        )

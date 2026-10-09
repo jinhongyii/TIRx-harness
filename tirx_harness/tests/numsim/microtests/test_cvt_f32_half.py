@@ -1,12 +1,31 @@
-"""Scalar half CVT uses a value-grid oracle independent of native ULP correction."""
+"""Scalar half CVT uses a value-grid oracle independent of native ULP correction.
+
+Mode 2 rows (``pred=lane % 2 == 0`` without ``preserve_dst``): on the v2 engine
+the guarded-off (odd) lanes keep the destination's previous value, the sentinel
+fill (numsim-behaviour-deltas P8). TVM binds that form write-only, so the GPU
+value is unspecified, and legacy wrote 0. Until the legacy engine is deleted
+the expectation follows whichever engine ``numsim.Engine`` resolves to.
+"""
 
 import math
 
 import numpy as np
 from tvm.backend.cuda.ptx.table import TABLE, mods, operand_dtypes, variants
 
-from tests.numsim.support.cvt_cases import append_cvt_mode, scalar_cvt_kernel
+from tests.numsim.support.cvt_cases import append_cvt_mode as _append_cvt_mode
+from tests.numsim.support.cvt_cases import scalar_cvt_kernel
 from tests.numsim.support.execution import run_checked
+from tirx_harness import numsim
+
+# The v2 engine keeps the old value on guarded-off lanes (delta P8); the
+# deleted legacy engine wrote 0.
+_KEEPS_GUARDED_OFF_DESTINATION = numsim.Engine.__module__.startswith("tirx_harness.numsim.v2")
+
+
+def append_cvt_mode(lines, expected, row, spelling, dtype, operand, converted, sentinel):
+    _append_cvt_mode(lines, expected, row, spelling, dtype, operand, converted, sentinel)
+    if _KEEPS_GUARDED_OFF_DESTINATION and row % 4 == 2:
+        expected[row, 1::2] = sentinel  # numsim P8: guarded-off lanes keep the destination
 
 
 def _grid(destination):

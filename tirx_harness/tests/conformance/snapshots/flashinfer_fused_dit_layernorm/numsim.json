@@ -1,0 +1,24 @@
+{
+ "case": "flashinfer_fused_dit_layernorm",
+ "diagnostics": [],
+ "mode": "numsim",
+ "outputs": {
+  "norm_output_buffer": {
+   "dtype": "uint16",
+   "sha256": "ecfbeaaf418c4e5bb33076927208a46b32388e7802dfd6d72096579d7b63d867",
+   "shape": [
+    3072
+   ]
+  },
+  "residual_output_buffer": {
+   "dtype": "uint16",
+   "sha256": "d9ee5e655cf1d907fca064d5ba13cb211682cac52c848458f2fbbcd57cfd7ed2",
+   "shape": [
+    3072
+   ]
+  }
+ },
+ "reference_ok": true,
+ "schema": 4,
+ "verdict": "clean"
+}

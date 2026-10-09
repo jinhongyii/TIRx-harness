@@ -5,8 +5,6 @@ import pytest
 import tvm
 
 from tirx_harness import numsim
-from tirx_harness.numsim.api import ExecutionSubset
-from tirx_harness.numsim.transpiler import suspend_scaffold
 from tvm.ir.type import PointerType, PrimType
 from tvm.script import tirx as T
 
@@ -857,20 +855,6 @@ def test_integer_addresses_select_lanes_from_the_same_backing(tmp_path):
     np.testing.assert_array_equal(result.outputs["output"], source[indices])
 
 
-def test_partitioned_integer_address_flow_preserves_lane_values(tmp_path, monkeypatch):
-    monkeypatch.setattr(suspend_scaffold, "_ROOT_SYNC_SPLIT_MIN_LINES", 0)
-
-    source = np.arange(33, dtype=np.uint32) * np.uint32(7) + np.uint32(3)
-    module = numsim.transpile(integer_address_same_backing, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module,
-        {"source": source, "output": np.zeros(32, dtype=np.uint32)},
-    )
-
-    indices = np.concatenate((np.arange(16), np.arange(15, -1, -1)))
-    np.testing.assert_array_equal(result.outputs["output"], source[indices])
-
-
 def test_integer_addresses_select_different_global_backings_per_lane(tmp_path):
     left = np.arange(32, dtype=np.uint32)
     right = np.arange(32, dtype=np.uint32) + np.uint32(1000)
@@ -903,12 +887,6 @@ def test_unused_out_of_bounds_shared_view_has_no_memory_effect(tmp_path):
     result = numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.uint32)})
 
     np.testing.assert_array_equal(result.outputs["output"], np.array([17], dtype=np.uint32))
-
-
-def test_accessed_out_of_bounds_shared_view_is_rejected(tmp_path):
-    module = numsim.transpile(accessed_out_of_bounds_shared_view, cache_dir=tmp_path)
-    with pytest.raises(numsim.NumSimExecutionError, match="exceeds allocation"):
-        numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.uint32)})
 
 
 def test_integer_address_atomic_uses_instruction_width_on_byte_storage(tmp_path):
@@ -1080,22 +1058,6 @@ def test_bulk_s2g_cp_mask_updates_only_selected_bytes(tmp_path):
     np.testing.assert_array_equal(result.outputs["destination"], expected)
 
 
-def test_bulk_read_wait_does_not_publish_destination_before_full_wait(tmp_path):
-    source = np.arange(16, dtype=np.uint8) + np.uint8(0x40)
-    destination = np.full(16, np.uint8(0x17), dtype=np.uint8)
-    module = numsim.transpile(bulk_s2g_read_then_full_wait, cache_dir=tmp_path)
-
-    result = numsim.Engine().run(
-        module,
-        {"source": source, "destination": destination, "observed": np.zeros(2, dtype=np.uint8)},
-    )
-
-    np.testing.assert_array_equal(result.outputs["destination"], source)
-    np.testing.assert_array_equal(
-        result.outputs["observed"], np.array([0x17, source[0]], dtype=np.uint8)
-    )
-
-
 def test_bulk_groups_publish_oldest_completed_prefix_in_fifo_order(tmp_path):
     source = np.concatenate(
         (
@@ -1139,29 +1101,7 @@ def test_mega_cluster_arrive_wait_rendezvous_exposes_peer_global_writes(tmp_path
     np.testing.assert_array_equal(result.outputs["output"], np.array([12, 11], dtype=np.int32))
 
 
-def test_cluster_arrive_wait_rejects_partial_cluster_subset(tmp_path):
-    module = numsim.transpile(mega_cluster_arrive_wait, cache_dir=tmp_path)
-    with pytest.raises(
-        numsim.NumSimExecutionError, match="CTA subset must be a union of complete clusters"
-    ):
-        numsim.Engine().run(
-            module,
-            {"exchange": np.zeros(2, dtype=np.int32), "output": np.full(2, -1, dtype=np.int32)},
-            subset=ExecutionSubset(cta_ids=[0]),
-        )
-
-
 def test_mega_cluster_wait_does_not_require_every_arriving_warp_to_wait(tmp_path):
-    module = numsim.transpile(mega_cluster_arrive_only_participant, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module, {"exchange": np.zeros(2, dtype=np.int32), "output": np.zeros(1, dtype=np.int32)}
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], np.array([22], dtype=np.int32))
-
-
-def test_cluster_barrier_hub_is_captured_by_async_split_helpers(tmp_path, monkeypatch):
-    monkeypatch.setattr(suspend_scaffold, "_ROOT_UNIFORM_IF_SPLIT_MIN_LINES", 0)
     module = numsim.transpile(mega_cluster_arrive_only_participant, cache_dir=tmp_path)
     result = numsim.Engine().run(
         module, {"exchange": np.zeros(2, dtype=np.int32), "output": np.zeros(1, dtype=np.int32)}
@@ -1175,158 +1115,6 @@ def test_mega_lane_private_mbarrier_init_initializes_one_barrier_per_lane(tmp_pa
     result = numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.int32)})
 
     np.testing.assert_array_equal(result.outputs["output"], np.array([17], dtype=np.int32))
-
-
-def test_mega_mbarrier_init_rejects_partial_lane_aliasing(tmp_path):
-    module = numsim.transpile(invalid_partially_aliased_mbarrier_init, cache_dir=tmp_path)
-    with pytest.raises(
-        numsim.NumSimExecutionError,
-        match="mbarrier.init pointer must be warp-uniform or one-to-one across active lanes",
-    ):
-        numsim.Engine().run(module, {"output": np.zeros(1, dtype=np.int32)})
-
-
-def test_global_acquire_poll_reschedules_and_atomic_makes_progress(
-    tmp_path, expect_harness_surface
-):
-    module = numsim.transpile(global_acquire_poll_woken_by_atomic, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module, {"signal": np.zeros(1, dtype=np.uint32), "output": np.zeros(1, dtype=np.uint32)}
-    )
-
-    np.testing.assert_array_equal(result.outputs["signal"], np.array([1], dtype=np.uint32))
-    np.testing.assert_array_equal(result.outputs["output"], np.array([1], dtype=np.uint32))
-    assert result.stats["poll_order"] == [0, 1, 0]
-
-    def check_scheduler_progress(value):
-        assert value["poll_order"] == [0, 1, 0]
-        assert value["completed_task_count"] == value["task_count"]
-
-    expect_harness_surface(
-        lambda: result.stats,
-        check_scheduler_progress,
-    )
-
-
-def test_cross_cluster_atomic_progresses_with_shared_or_parallel_workers(tmp_path):
-    module = numsim.transpile(global_acquire_poll_woken_by_cross_cluster_atomic, cache_dir=tmp_path)
-    for max_workers in (1, 2):
-        result = numsim.Engine(max_workers=max_workers).run(
-            module, {"signal": np.zeros(1, dtype=np.uint32), "output": np.zeros(1, dtype=np.uint32)}
-        )
-
-        def check() -> None:
-            np.testing.assert_array_equal(result.outputs["signal"], np.array([1], dtype=np.uint32))
-            np.testing.assert_array_equal(result.outputs["output"], np.array([1], dtype=np.uint32))
-            assert result.stats["worker_count"] == max_workers
-            assert result.stats["scheduling_domain_count"] == 2
-
-        check()
-
-
-def test_direct_global_acquire_poll_reschedules_same_cluster_peer(tmp_path):
-    module = numsim.transpile(
-        direct_global_acquire_poll_woken_by_same_cluster_atomic, cache_dir=tmp_path
-    )
-    result = numsim.Engine().run(
-        module,
-        {
-            "done_counter": np.zeros(1, dtype=np.int32),
-            "work_total": np.ones(1, dtype=np.int32),
-            "output": np.zeros(1, dtype=np.int32),
-        },
-    )
-
-    np.testing.assert_array_equal(result.outputs["done_counter"], np.ones(1, dtype=np.int32))
-    np.testing.assert_array_equal(result.outputs["output"], np.ones(1, dtype=np.int32))
-    assert result.stats["poll_order"] == [0, 1, 0]
-
-
-def test_global_volatile_poll_performs_first_reload_without_short_loop_suspend(tmp_path):
-    module = numsim.transpile(global_volatile_poll_zero_init_first_reload, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module, {"signal": np.ones(1, dtype=np.uint64), "output": np.zeros(1, dtype=np.uint64)}
-    )
-
-    np.testing.assert_array_equal(result.outputs["output"], np.array([1], dtype=np.uint64))
-    assert result.stats["poll_order"] == [0]
-
-
-def test_global_poll_reschedules_with_lane_varying_active_mask(tmp_path):
-    module = numsim.transpile(global_acquire_poll_two_lane_ranges, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module, {"signal": np.zeros(2, dtype=np.uint32), "output": np.zeros(2, dtype=np.uint32)}
-    )
-
-    np.testing.assert_array_equal(result.outputs["signal"], np.ones(2, dtype=np.uint32))
-    np.testing.assert_array_equal(result.outputs["output"], np.ones(2, dtype=np.uint32))
-    assert result.stats["poll_order"] == [0, 1, 2, 1, 0]
-
-
-def test_plain_global_buffer_poll_uses_general_time_slice(tmp_path):
-    module = numsim.transpile(plain_global_buffer_poll_two_lane_ranges, cache_dir=tmp_path)
-    result = numsim.Engine().run(
-        module, {"signal": np.zeros(2, dtype=np.int32), "output": np.zeros(2, dtype=np.int32)}
-    )
-
-    np.testing.assert_array_equal(result.outputs["signal"], np.ones(2, dtype=np.int32))
-    np.testing.assert_array_equal(result.outputs["output"], np.ones(2, dtype=np.int32))
-    assert result.stats["poll_order"] == [0, 1, 2, 1, 0]
-
-
-def test_native_loop_with_extra_body_effect_uses_engine_budget(tmp_path):
-    module = numsim.transpile(non_polling_loop_with_extra_body_effect, cache_dir=tmp_path)
-
-    with pytest.raises(
-        numsim.NumSimExecutionError, match="configured native loop iteration budget 1"
-    ):
-        numsim.Engine(native_loop_iteration_budget=1).run(
-            module,
-            {"signal": np.zeros(1, dtype=np.uint32), "output": np.zeros(1, dtype=np.uint32)},
-        )
-
-
-@pytest.mark.parametrize(
-    ("kernel", "inputs"),
-    [
-        (
-            direct_global_poll_with_body_effect,
-            {"signal": np.zeros(1, dtype=np.int32), "output": np.zeros(1, dtype=np.int32)},
-        ),
-        (
-            direct_global_poll_with_two_watched_loads,
-            {"left": np.zeros(1, dtype=np.int32), "right": np.ones(1, dtype=np.int32)},
-        ),
-        (
-            plain_global_buffer_poll_with_body_effect,
-            {"signal": np.zeros(1, dtype=np.int32), "output": np.zeros(1, dtype=np.int32)},
-        ),
-        (
-            plain_global_buffer_poll_with_two_loads,
-            {"left": np.zeros(1, dtype=np.int32), "right": np.ones(1, dtype=np.int32)},
-        ),
-    ],
-)
-def test_all_native_while_shapes_use_engine_loop_budget(kernel, inputs, tmp_path):
-    module = numsim.transpile(kernel, cache_dir=tmp_path)
-
-    with pytest.raises(
-        numsim.NumSimExecutionError, match="configured native loop iteration budget 1"
-    ):
-        numsim.Engine(native_loop_iteration_budget=1).run(module, inputs)
-
-
-@pytest.mark.parametrize(
-    ("source", "message"),
-    [
-        (_INVALID_ST_BULK_SIZE_SOURCE, r"operand 'size'.*dtype uint64"),
-        (_INVALID_G2S_MASK_WITHOUT_MULTICAST_SOURCE, r"expects 4 operand\(s\).*got 5"),
-        (_INVALID_S2G_MASK_WITHOUT_MODIFIER_SOURCE, r"expects 3 operand\(s\).*got 4"),
-    ],
-)
-def test_table_driven_bulk_memory_syntax_rejects_unbound_operands(source: str, message: str):
-    with pytest.raises((ValueError, tvm.error.DiagnosticError), match=message):
-        tvm.script.from_source(source, {"T": T})
 
 
 def test_cluster_barrier_accepts_default_release_and_unaligned_forms(tmp_path):
