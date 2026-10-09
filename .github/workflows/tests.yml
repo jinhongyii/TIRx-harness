@@ -97,6 +97,15 @@ jobs:
         env:
           PY: ${{ github.workspace }}/.venv/bin/python
         run: bash tirx_harness/src/tirx_harness/numsim/core-rs/numsim-py/build_dev.sh
+      # Host fingerprint for cross-host conformance diffs (CPU ISA, numpy's
+      # dispatched SIMD targets, prepared-input digests of a sensitive case);
+      # compare with a dev host's output of the same commands.
+      - name: Host and input fingerprint
+        working-directory: tirx_harness
+        run: |
+          lscpu | grep -E '^(Model name|Flags):'
+          ../.venv/bin/python -c "import numpy; numpy.show_runtime()"
+          ../.venv/bin/python ../scripts/numsim-v2/case_input_digest.py
       # No NUMSIM_IMPL: v2 is the only implementation and the conformance oracle.
       # GPU microtests need a device; performance markers run on dedicated hosts.
       - name: Run the test suite
