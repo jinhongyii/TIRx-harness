@@ -555,9 +555,7 @@ pub fn execute_owned(module: &Module, inputs: Inputs, request: &RunRequest) -> R
 fn run_inputs(module: &Module, inputs: std::borrow::Cow<'_, Inputs>, observer: &mut dyn Observer, config: &RunConfig) -> Result<RunOutcome, RunError> {
     match inputs {
         std::borrow::Cow::Borrowed(i) => sched::run_with_config(module, i, observer, config),
-        // W15-1 (owned inputs into the arena) is not landed yet: run the owned
-        // form through the borrowing entry point until sched provides it.
-        std::borrow::Cow::Owned(i) => sched::run_with_config(module, &i, observer, config),
+        std::borrow::Cow::Owned(i) => sched::run_with_config_owned(module, i, observer, config),
     }
 }
 

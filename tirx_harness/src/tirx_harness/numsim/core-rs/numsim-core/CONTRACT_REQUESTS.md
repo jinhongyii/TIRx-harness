@@ -3334,3 +3334,13 @@ checks the `shard_replay_order` guarantee and should never fire.
 **Guards.**
 - The oplib tc harness runs every MMA test on the callback path and on the window path under four validity/overlay mixes: all valid, sparse invalid, overlaid, none valid. It requires the same result or error, the same final TMEM and the same multiset of pieces.
 - The engine half and its observer-equality guards are W13's. W13's read-note fix ("notes taken only when observing") lands in the same batch.
+
+## W15-1 (applied by W13, 2026-10-09, coordinator sign-off): owned buffer inputs, one host copy per buffer
+
+- **Problem.** `run_with_config` borrows `&Inputs`, so binding a global buffer argument copied its bytes (and validity) into the arena: `Init::Bytes(bytes.clone())`, a second full host copy of every input.
+- **Applied: option A.**
+  - New entry point `sched::run_with_config_owned(module, inputs: Inputs, observer, config)`. It moves each `ArgValue::Buffer`'s `bytes` and `valid` out of `inputs`, and the global-buffer binding (`host_buffer`) moves them into `Init::Bytes` / `Init::BytesWithValidity` instead of cloning.
+  - Implicit-shape parameters, evaluated in `resolve_launch` and again while writing parameters, use the recorded lengths of the moved buffers.
+  - `run_with_config(&Inputs)` is unchanged and still copies. Tests, `plan_global_addresses` and other callers that reuse an `Inputs` keep using it.
+  - `numsim-py`: new `execute_owned(module, Inputs, request)`; the `run` binding calls it (its inputs were dropped after the run anyway). `execute(&Inputs)` is unchanged.
+- **Unchanged.** `Inputs` and `ArgValue`; results, observer streams and digests (bytes identical, only ownership moves).

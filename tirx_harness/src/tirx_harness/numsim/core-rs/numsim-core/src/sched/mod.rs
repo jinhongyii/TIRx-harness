@@ -1823,7 +1823,12 @@ fn write_param(arena: &mut Arena, params: AllocId, off: u64, bytes: &[u8]) {
 
 /// Resolve a declared launch against inputs (`DimExpr` over scalar params).
 pub fn resolve_launch(program: &Program, inputs: &Inputs) -> Result<LaunchShape, RunError> {
-    let param = |p: crate::program::ParamId| -> Option<i64> { scalar_param(program, inputs, p) };
+    resolve_launch_moved(program, inputs, &Moved::default())
+}
+
+/// [`resolve_launch`] with the lengths of buffers moved out of `inputs`.
+fn resolve_launch_moved(program: &Program, inputs: &Inputs, moved: &Moved) -> Result<LaunchShape, RunError> {
+    let param = |p: crate::program::ParamId| -> Option<i64> { scalar_param_moved(program, inputs, p, moved) };
     let eval = |e: &crate::program::DimExpr, what: &str| -> Result<u32, RunError> {
         let v = e.eval(&param).ok_or_else(|| RunError::BadArg {
             name: what.to_string(),
@@ -1840,10 +1845,20 @@ pub fn resolve_launch(program: &Program, inputs: &Inputs) -> Result<LaunchShape,
     })
 }
 
+/// Buffer arguments moved out of an owned `Inputs` (W15-1): name ->
+/// (bytes, validity), consumed when the buffer is bound, and every moved
+/// buffer's byte length (implicit shapes still need it after the move).
+#[derive(Default)]
+struct Moved {
+    bytes: BTreeMap<String, (Vec<u8>, Option<crate::arena::BitSet>)>,
+    lens: BTreeMap<String, usize>,
+}
+
 /// Value of a scalar-like parameter: a bound `Scalar`, or an
 /// `ImplicitShape` derived from its buffer argument (1-D buffers: byte
 /// length / element size; otherwise the shape must be bound by name).
-fn scalar_param(program: &Program, inputs: &Inputs, p: crate::program::ParamId) -> Option<i64> {
+/// Buffers moved out of `inputs` count with their recorded lengths.
+fn scalar_param_moved(program: &Program, inputs: &Inputs, p: crate::program::ParamId, moved: &Moved) -> Option<i64> {
     let slot = program.host_abi.get(p.0 as usize)?;
     match lookup(inputs, slot) {
         // Scalar bits are the parameter's raw bits: sign- or zero-extend by
@@ -1864,9 +1879,9 @@ fn scalar_param(program: &Program, inputs: &Inputs, p: crate::program::ParamId) 
     }
     let ParamKind::ImplicitShape { buffer, axis } = slot.kind else { return None };
     let b = program.host_abi.get(buffer.0 as usize)?;
-    let nbytes = match lookup(inputs, b) {
-        Some(ArgValue::Buffer { bytes, .. }) => bytes.len(),
-        Some(ArgValue::View { len, .. }) => *len as usize,
+    let nbytes = match lookup_named(inputs, b) {
+        Some((name, ArgValue::Buffer { bytes, .. })) => moved.lens.get(name).copied().unwrap_or(bytes.len()),
+        Some((_, ArgValue::View { len, .. })) => *len as usize,
         _ => return None,
     };
     let elem = b.dtype.map(|t| t.mem_bytes() as usize).unwrap_or(1).max(1);
@@ -1885,6 +1900,11 @@ fn scalar_param(program: &Program, inputs: &Inputs, p: crate::program::ParamId) 
         return None;
     }
     Some((nbytes / elem) as i64 / other)
+}
+
+/// [`lookup`] with the argument's name.
+fn lookup_named<'a>(inputs: &'a Inputs, slot: &crate::program::ParamSlot) -> Option<(&'a str, &'a ArgValue)> {
+    std::iter::once(&slot.name).chain(slot.aliases.iter()).find_map(|n| inputs.args.get_key_value(n)).map(|(k, v)| (k.as_str(), v))
 }
 
 /// Argument bound to a parameter slot (by name, then aliases).
@@ -1910,13 +1930,14 @@ fn host_region(
     arena: &mut Arena,
     globals: &mut BTreeMap<String, AllocId>,
     inputs: &Inputs,
+    moved: &mut Moved,
     name: &str,
 ) -> Result<(AllocId, u64, u64), RunError> {
     if let Some(ArgValue::View { target, offset, len }) = inputs.args.get(name) {
         if matches!(inputs.args.get(target), Some(ArgValue::View { .. })) {
             return Err(RunError::BadArg { name: name.into(), message: format!("view target {target} must be a buffer, not a view") });
         }
-        let a = host_buffer(arena, globals, inputs, target)?;
+        let a = host_buffer(arena, globals, inputs, moved, target)?;
         let size = arena.get(a).size;
         if offset.checked_add(*len).is_none_or(|e| e > size) {
             return Err(RunError::BadArg {
@@ -1926,7 +1947,7 @@ fn host_region(
         }
         return Ok((a, *offset, *len));
     }
-    let a = host_buffer(arena, globals, inputs, name)?;
+    let a = host_buffer(arena, globals, inputs, moved, name)?;
     Ok((a, 0, arena.get(a).size))
 }
 
@@ -1934,6 +1955,7 @@ fn host_buffer(
     arena: &mut Arena,
     globals: &mut BTreeMap<String, AllocId>,
     inputs: &Inputs,
+    moved: &mut Moved,
     name: &str,
 ) -> Result<AllocId, RunError> {
     if let Some(&a) = globals.get(name) {
@@ -1941,15 +1963,21 @@ fn host_buffer(
     }
     match inputs.args.get(name) {
         Some(ArgValue::Buffer { bytes, valid }) => {
+            // A buffer moved out of an owned `Inputs` is bound by move
+            // (W15-1); otherwise copied from the borrowed one.
+            let (bytes, valid) = match moved.bytes.remove(name) {
+                Some(b) => b,
+                None => (bytes.clone(), valid.clone()),
+            };
             let size = bytes.len() as u64;
             let init = match valid {
                 Some(v) => {
                     if v.len() != size {
                         return Err(RunError::BadArg { name: name.into(), message: "validity length differs from bytes".into() });
                     }
-                    Init::BytesWithValidity(bytes.clone(), v.clone())
+                    Init::BytesWithValidity(bytes, v)
                 }
-                None => Init::Bytes(bytes.clone()),
+                None => Init::Bytes(bytes),
             };
             // V2C-35 ruling: a top-level buffer is a fresh device
             // allocation (aligned like cudaMalloc); the host pointer's bits
@@ -1971,6 +1999,7 @@ fn host_buffer(
 fn allocate_host(
     module: &Module,
     inputs: &Inputs,
+    moved: &mut Moved,
     arena: &mut Arena,
     globals: &mut BTreeMap<String, AllocId>,
     views: &mut BTreeMap<String, (u64, u64)>,
@@ -1983,7 +2012,7 @@ fn allocate_host(
                 } else {
                     slot.aliases.iter().find(|a| inputs.args.contains_key(*a)).cloned().unwrap_or(slot.name.clone())
                 };
-                let (a, off, len) = host_region(arena, globals, inputs, &name)?;
+                let (a, off, len) = host_region(arena, globals, inputs, moved, &name)?;
                 globals.entry(slot.name.clone()).or_insert(a);
                 if matches!(inputs.args.get(&name), Some(ArgValue::View { .. })) {
                     views.insert(slot.name.clone(), (off, len));
@@ -1993,16 +2022,16 @@ fn allocate_host(
         for slot in &program.host_abi {
             match (slot.kind, lookup(inputs, slot)) {
                 (ParamKind::Pointer, Some(ArgValue::Pointer { target, .. })) => {
-                    host_region(arena, globals, inputs, target)?;
+                    host_region(arena, globals, inputs, moved, target)?;
                 }
                 (ParamKind::Pointer, Some(ArgValue::View { target, .. })) => {
-                    host_buffer(arena, globals, inputs, target)?;
+                    host_buffer(arena, globals, inputs, moved, target)?;
                 }
                 (ParamKind::Pointer, Some(ArgValue::Buffer { .. })) => {
-                    host_buffer(arena, globals, inputs, &slot.name)?;
+                    host_buffer(arena, globals, inputs, moved, &slot.name)?;
                 }
                 (ParamKind::TensorMap, Some(ArgValue::TensorMapOf { base, .. })) => {
-                    host_region(arena, globals, inputs, base)?;
+                    host_region(arena, globals, inputs, moved, base)?;
                 }
                 _ => {}
             }
@@ -2014,10 +2043,10 @@ fn allocate_host(
     for (name, arg) in &inputs.args {
         match arg {
             ArgValue::Buffer { .. } => {
-                host_buffer(arena, globals, inputs, name)?;
+                host_buffer(arena, globals, inputs, moved, name)?;
             }
             ArgValue::View { .. } => {
-                host_region(arena, globals, inputs, name)?;
+                host_region(arena, globals, inputs, moved, name)?;
             }
             _ => {}
         }
@@ -2036,7 +2065,7 @@ pub fn plan_global_addresses(module: &Module, inputs: &Inputs) -> Result<BTreeMa
     for program in &module.kernels {
         program.validate().map_err(|e| RunError::InvalidProgram(e.to_string()))?;
     }
-    allocate_host(module, inputs, &mut arena, &mut globals, &mut views)?;
+    allocate_host(module, inputs, &mut Moved::default(), &mut arena, &mut globals, &mut views)?;
     let mut out = BTreeMap::new();
     for (name, arg) in &inputs.args {
         match arg {
@@ -2130,6 +2159,36 @@ pub fn run_with_config(
     observer: &mut dyn Observer,
     config: &RunConfig,
 ) -> Result<RunOutcome, RunError> {
+    run_with_moved(module, inputs, Moved::default(), observer, config)
+}
+
+/// [`run_with_config`] taking `inputs` by value (CONTRACT_REQUESTS W15-1):
+/// every buffer argument's bytes and validity move into the engine's
+/// allocation instead of being copied, so each buffer has one host copy.
+/// Same results as the borrowed form.
+pub fn run_with_config_owned(
+    module: &Module,
+    mut inputs: Inputs,
+    observer: &mut dyn Observer,
+    config: &RunConfig,
+) -> Result<RunOutcome, RunError> {
+    let mut moved = Moved::default();
+    for (name, arg) in inputs.args.iter_mut() {
+        if let ArgValue::Buffer { bytes, valid } = arg {
+            moved.lens.insert(name.clone(), bytes.len());
+            moved.bytes.insert(name.clone(), (std::mem::take(bytes), valid.take()));
+        }
+    }
+    run_with_moved(module, &inputs, moved, observer, config)
+}
+
+fn run_with_moved(
+    module: &Module,
+    inputs: &Inputs,
+    mut moved: Moved,
+    observer: &mut dyn Observer,
+    config: &RunConfig,
+) -> Result<RunOutcome, RunError> {
     let mut arena = Arena::new(config.validity);
     let mut globals: BTreeMap<String, AllocId> = BTreeMap::new();
     // Buffer slots bound to an `ArgValue::View`: (offset, len) in the
@@ -2148,14 +2207,16 @@ pub fn run_with_config(
     let mut prepared = Vec::with_capacity(module.kernels.len());
     for program in &module.kernels {
         program.validate().map_err(|e| RunError::InvalidProgram(e.to_string()))?;
-        prepared.push(resolve_launch(program, inputs)?);
+        prepared.push(resolve_launch_moved(program, inputs, &moved)?);
     }
-    allocate_host(module, inputs, &mut arena, &mut globals, &mut views)?;
+    allocate_host(module, inputs, &mut moved, &mut arena, &mut globals, &mut views)?;
     for (k, program) in module.kernels.iter().enumerate() {
         let shape = prepared[k];
         let loaded = Loaded::new(program);
         let params = arena.alloc(Space::Param, Owner::Launch, &format!("params[k{k}]"), loaded.param_bytes, Init::Zeroed);
-        let scalar = |p: crate::program::ParamId| -> Option<i64> { scalar_param(program, inputs, p) };
+        // Implicit shapes need only the moved buffers' lengths.
+        let lens = Moved { bytes: BTreeMap::new(), lens: moved.lens.clone() };
+        let scalar = |p: crate::program::ParamId| -> Option<i64> { scalar_param_moved(program, inputs, p, &lens) };
         for (i, slot) in program.host_abi.iter().enumerate() {
             let off = loaded.param_offsets[i];
             let arg = lookup(inputs, slot);
@@ -2166,7 +2227,7 @@ pub fn run_with_config(
                 }
                 (ParamKind::Scalar, Some(ArgValue::Scalar(v))) => v.to_le_bytes().to_vec(),
                 (ParamKind::Scalar, None) => return Err(RunError::MissingArg(slot.name.clone())),
-                (ParamKind::ImplicitShape { .. }, _) => match scalar_param(program, inputs, crate::program::ParamId(i as u32)) {
+                (ParamKind::ImplicitShape { .. }, _) => match scalar_param_moved(program, inputs, crate::program::ParamId(i as u32), &lens) {
                     Some(v) => v.to_le_bytes().to_vec(),
                     None => {
                         return Err(RunError::BadArg {
@@ -2176,15 +2237,15 @@ pub fn run_with_config(
                     }
                 },
                 (ParamKind::Pointer, Some(ArgValue::Pointer { target, offset })) => {
-                    let (a, base_off, _) = host_region(&mut arena, &mut globals, inputs, target)?;
+                    let (a, base_off, _) = host_region(&mut arena, &mut globals, inputs, &mut moved, target)?;
                     (arena.get(a).base + base_off + offset).to_le_bytes().to_vec()
                 }
                 (ParamKind::Pointer, Some(ArgValue::View { target, offset, .. })) => {
-                    let a = host_buffer(&mut arena, &mut globals, inputs, target)?;
+                    let a = host_buffer(&mut arena, &mut globals, inputs, &mut moved, target)?;
                     (arena.get(a).base + offset).to_le_bytes().to_vec()
                 }
                 (ParamKind::Pointer, Some(ArgValue::Buffer { .. })) => {
-                    let a = host_buffer(&mut arena, &mut globals, inputs, &slot.name)?;
+                    let a = host_buffer(&mut arena, &mut globals, inputs, &mut moved, &slot.name)?;
                     arena.get(a).base.to_le_bytes().to_vec()
                 }
                 (ParamKind::Pointer, Some(ArgValue::Scalar(v))) => v.to_le_bytes().to_vec(),
@@ -2196,7 +2257,7 @@ pub fn run_with_config(
                     b.clone()
                 }
                 (ParamKind::TensorMap, Some(ArgValue::TensorMapOf { base, offset, desc })) => {
-                    let (a, base_off, _) = host_region(&mut arena, &mut globals, inputs, base)?;
+                    let (a, base_off, _) = host_region(&mut arena, &mut globals, inputs, &mut moved, base)?;
                     let mut d = desc.clone();
                     d.global_address = arena.get(a).base + base_off + offset;
                     d.encode().to_vec()
