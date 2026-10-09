@@ -2263,23 +2263,36 @@ pub fn run_with_config(
             break;
         }
     }
+    // Views first (copies of their ranges), then whole buffers, which move
+    // out of the arena (W13: it is dropped right after; copying multi-GB
+    // buffers was 14.5 s of the Mega MoE max config). A buffer allocation
+    // bound to more than one name is copied.
     for (name, arg) in &inputs.args {
-        match arg {
-            ArgValue::Buffer { .. } => {
-                if let Some(&a) = globals.get(name) {
-                    let al = arena.get(a);
-                    outcome.outputs.buffers.insert(name.clone(), (al.bytes.clone(), al.valid.clone()));
-                }
+        if let ArgValue::View { target, offset, len } = arg {
+            if let Some(&a) = globals.get(target) {
+                let al = arena.get(a);
+                let (lo, hi) = (*offset as usize, (*offset + *len) as usize);
+                let valid = al.valid.slice(*offset, *len);
+                outcome.outputs.buffers.insert(name.clone(), (al.bytes[lo..hi].to_vec(), valid));
             }
-            ArgValue::View { target, offset, len } => {
-                if let Some(&a) = globals.get(target) {
-                    let al = arena.get(a);
-                    let (lo, hi) = (*offset as usize, (*offset + *len) as usize);
-                    let valid = al.valid.slice(*offset, *len);
-                    outcome.outputs.buffers.insert(name.clone(), (al.bytes[lo..hi].to_vec(), valid));
-                }
-            }
-            _ => {}
+        }
+    }
+    let mut uses: BTreeMap<AllocId, usize> = BTreeMap::new();
+    for (name, arg) in &inputs.args {
+        if let (ArgValue::Buffer { .. }, Some(&a)) = (arg, globals.get(name)) {
+            *uses.entry(a).or_default() += 1;
+        }
+    }
+    for (name, arg) in &inputs.args {
+        if let (ArgValue::Buffer { .. }, Some(&a)) = (arg, globals.get(name)) {
+            let value = if uses[&a] == 1 {
+                let al = arena.get_mut(a);
+                (std::mem::take(&mut al.bytes), std::mem::take(&mut al.valid))
+            } else {
+                let al = arena.get(a);
+                (al.bytes.clone(), al.valid.clone())
+            };
+            outcome.outputs.buffers.insert(name.clone(), value);
         }
     }
     Ok(outcome)
