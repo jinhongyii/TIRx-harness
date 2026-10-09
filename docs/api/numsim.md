@@ -43,6 +43,7 @@ or loading took.
 | --- | --- |
 | `max_workers=1` | Threads that run independent clusters in parallel. Results and checker findings do not depend on it. `"auto"` currently selects one thread (pending: `"auto"` should use the detected CPU count). |
 | `seed=None` | Scheduler seed for warp rotation and asynchronous-completion timing. `None` reads `NUMSIM_SEED`, default `0`. A fixed module, inputs, and seed always give the same result. |
+| `pin_workers=None` | Pin worker threads to CPUs, one L3 group at a time, with sticky partition handout. Faster on a dedicated host; it can be slower on a shared one, so it is off by default. `None` reads `NUMSIM_PIN_WORKERS`. Results do not depend on it. |
 | `native_loop_iteration_budget=None` | Maximum iterations of one loop instance per warp before the run stops as `incomplete`. `None` uses the engine default, 2^24. |
 | `native_loop_reschedule_quantum=None` | Maximum instructions a warp runs before the scheduler moves to the next warp. `None` uses the engine default, 256. |
 
@@ -124,6 +125,7 @@ precedence.
 | `NUMSIM_CACHE_DIR` | Cache root. Lowered modules are stored under `v2-modules/`. Delete the directory to force re-lowering. | `~/.cache/tirx-harness/numsim` |
 | `NUMSIM_SEED` | Default scheduler seed. | `0` |
 | `NUMSIM_NO_CACHE` | `1` disables the module cache. | unset |
+| `NUMSIM_PIN_WORKERS` | `1` pins worker threads (`Engine(pin_workers=...)`). For dedicated hosts only; CI never sets it. | unset (off) |
 
 The former `NUMSIM_V2_` names are still accepted as aliases for one release.
 

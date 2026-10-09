@@ -147,6 +147,15 @@ pub struct RunConfig {
     pub max_resident_ctas: u32,
     /// Resident cluster ids (W8-4): only these clusters run; `None` = all.
     pub subset: Option<Vec<u32>>,
+    /// Pin the worker threads (default `false`): one CPU of the inherited
+    /// affinity mask per participant, an L3 group (CCD) at a time with SMT
+    /// siblings last, the calling thread pinned for the launch and restored
+    /// afterwards, and sticky partition handout with stealing
+    /// (`pool` module). Off, no affinity calls are made. Results and
+    /// observer streams do not depend on it. Faster on a dedicated host
+    /// (Mega MoE medium/large at 32 workers); on a shared host pinned
+    /// threads cannot move off busy cores (docs/development/dev-loop.md).
+    pub pin_workers: bool,
 }
 
 impl Default for RunConfig {
@@ -163,6 +172,7 @@ impl Default for RunConfig {
             single_partition: false,
             max_resident_ctas: 1024,
             subset: None,
+            pin_workers: false,
         }
     }
 }
@@ -1018,7 +1028,10 @@ impl<'p> Scheduler<'p> {
         let _fp = pool::FpEnvGuard::enter();
         let result = if workers > 1 && !self.single {
             // A launch-lifetime pool; the calling thread is one of the workers.
-            let pool = pool::Pool::new(workers - 1);
+            let pool = pool::Pool::new(workers - 1, self.config.pin_workers);
+            // Pinned: the calling thread is participant 0 for the launch,
+            // its affinity restored afterwards (also on unwind).
+            let _restore = pool.pin_caller();
             std::thread::scope(|scope| {
                 for _ in 0..workers - 1 {
                     scope.spawn(|| pool.worker());
@@ -1199,6 +1212,8 @@ impl<'p> Scheduler<'p> {
                 observing: self.observing,
             };
             let kernel = self.kernel_index;
+            let sticky = pool.is_some_and(|p| p.pinned());
+            let prefs: Vec<u32> = if sticky { self.partitions.iter().map(|p| p.last_worker).collect() } else { Vec::new() };
             let items: Vec<std::cell::UnsafeCell<RoundItem<'_>>> = self
                 .partitions
                 .iter_mut()
@@ -1220,6 +1235,9 @@ impl<'p> Scheduler<'p> {
             let run_one = |i: usize| {
                 // SAFETY: see `Items`.
                 let (p, a, r) = unsafe { items.item(i) };
+                if sticky {
+                    p.last_worker = pool::participant();
+                }
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.run_round(env, a)));
                 **r = Some(out.unwrap_or_else(|payload| {
                     Err(sched_error(
@@ -1232,6 +1250,7 @@ impl<'p> Scheduler<'p> {
                 }));
             };
             match pool {
+                Some(pool) if sticky => pool.par_for_sticky(&prefs, &run_one),
                 Some(pool) => pool.par_for(n, &run_one),
                 None => (0..n).for_each(run_one),
             }

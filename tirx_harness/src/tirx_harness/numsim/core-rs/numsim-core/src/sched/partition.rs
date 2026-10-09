@@ -213,6 +213,10 @@ impl Observer for EventBuffer {
 
 /// One partition.
 pub struct Partition {
+    /// Pool participant that ran this partition last (`u32::MAX`: none);
+    /// a scheduling preference for pinned pools only, never read by the
+    /// simulation.
+    pub(crate) last_worker: u32,
     /// Clusters (linear ids) whose CTAs this partition owns, in order.
     pub clusters: Vec<u32>,
     /// Resident CTAs (cluster-contiguous, in admission order).
@@ -236,6 +240,7 @@ pub struct Partition {
 impl Partition {
     pub(crate) fn new(first_cluster: u32, sync: SyncTable, aux: LaunchAux, seed: u64, observing: bool, history: bool) -> Partition {
         Partition {
+            last_worker: u32::MAX,
             clusters: vec![first_cluster],
             ctas: Vec::new(),
             sync,

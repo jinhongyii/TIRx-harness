@@ -821,11 +821,13 @@ mod py {
     /// `reports` (one `report::Report` JSON str per launch) and `payloads`
     /// (the checker's legacy-shaped payload dict per launch). `outputs`
     /// names the buffers to return in `outputs`/`invalid` (default: all).
+    /// `pin_workers`: `RunConfig::pin_workers` (default off).
     #[pyfunction]
     #[pyo3(signature = (module, inputs, *, mode="numsim", workers=1, seed=0,
                         loop_budget=None, quantum=None, max_rounds=None,
                         validity=None, state_budget=None, transition_budget=None, max_findings=0,
-                        subset=None, synccheck_limits=None, host_addrs=None, outputs=None))]
+                        subset=None, synccheck_limits=None, host_addrs=None, outputs=None,
+                        pin_workers=false))]
     fn run<'py>(
         py: Python<'py>,
         module: &PyModuleHandle,
@@ -844,6 +846,7 @@ mod py {
         synccheck_limits: Option<BTreeMap<String, u64>>,
         host_addrs: Option<BTreeMap<String, u64>>,
         outputs: Option<Vec<String>>,
+        pin_workers: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         let mode = Mode::parse(mode).ok_or_else(|| PyValueError::new_err(format!("unknown mode {mode:?}")))?;
         let mut args = BTreeMap::new();
@@ -858,6 +861,7 @@ mod py {
         let mut request = RunRequest::new(mode);
         request.workers = workers;
         request.config.workers = workers.max(1) as usize;
+        request.config.pin_workers = pin_workers;
         request.state_budget = state_budget;
         request.transition_budget = transition_budget;
         request.max_findings = max_findings;

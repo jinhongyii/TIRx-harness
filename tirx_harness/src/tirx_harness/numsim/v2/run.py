@@ -865,7 +865,12 @@ class Engine:
     ``max_workers`` (default 8, ``"auto"`` = detected CPU count) is the
     scheduler's worker-thread count (``RunConfig.workers``; results do not
     depend on it). ``native_loop_iteration_budget`` / ``native_loop_reschedule_quantum``
-    map to the loop budget and slice quantum. The engine has one executor,
+    map to the loop budget and slice quantum. ``pin_workers`` (default off;
+    ``None`` reads ``NUMSIM_PIN_WORKERS``) pins the worker threads to CPUs
+    of the inherited affinity mask, one L3 group at a time, with sticky
+    partition handout (``RunConfig.pin_workers``; results do not depend on
+    it). It helps on a dedicated host and can hurt on a shared one, where a
+    pinned thread cannot move off a busy core. The engine has one executor,
     the interpreter (backend decision: docs/development/backend-comparison.md)."""
 
     def __init__(
@@ -875,6 +880,7 @@ class Engine:
         native_loop_iteration_budget: int | None = None,
         native_loop_reschedule_quantum: int | None = None,
         seed: int | None = None,
+        pin_workers: bool | None = None,
     ):
         opts = options()
         if not (isinstance(max_workers, str) and max_workers == "auto"):
@@ -892,6 +898,9 @@ class Engine:
         self.loop_budget = native_loop_iteration_budget
         self.quantum = native_loop_reschedule_quantum
         self.seed = opts.seed if seed is None else int(seed)
+        if pin_workers is not None and not isinstance(pin_workers, bool):
+            raise TypeError(f"pin_workers must be a bool or None, got {pin_workers!r}")
+        self.pin_workers = opts.pin_workers if pin_workers is None else pin_workers
         self._phase_memo: dict[tuple, list[dict[str, Any]]] = {}
 
     # -- core call ---------------------------------------------------------
@@ -923,6 +932,7 @@ class Engine:
             mode=mode,
             workers=self.max_workers,
             seed=self.seed,
+            pin_workers=self.pin_workers,
             loop_budget=self.loop_budget,
             quantum=self.quantum,
             host_addrs=host_addresses(bound),

@@ -391,6 +391,35 @@ def test_engine_worker_defaults():
         v2.Engine(max_workers=0)
 
 
+def test_engine_pin_workers_is_off_by_default_and_result_neutral(module, monkeypatch):
+    """``pin_workers`` defaults off; ``NUMSIM_PIN_WORKERS=1`` (read only by
+    v2/options.py) turns it on unless the argument says otherwise; pinned
+    and unpinned runs give the same outputs, stats and verdicts."""
+
+    monkeypatch.delenv("NUMSIM_PIN_WORKERS", raising=False)
+    assert v2.Engine().pin_workers is False
+    monkeypatch.setenv("NUMSIM_PIN_WORKERS", "1")
+    assert v2.Engine().pin_workers is True
+    assert v2.Engine(pin_workers=False).pin_workers is False
+    monkeypatch.delenv("NUMSIM_PIN_WORKERS")
+    with pytest.raises(TypeError, match="pin_workers"):
+        v2.Engine(pin_workers=1)
+    inputs = _inputs()
+    runs = {
+        pin: _skip_if_unimplemented(lambda pin=pin: v2.Engine(max_workers=4, pin_workers=pin).run(module, inputs, outputs=("c",)))
+        for pin in (False, True)
+    }
+    np.testing.assert_array_equal(runs[True].outputs["c"], runs[False].outputs["c"])
+    assert runs[True].status == runs[False].status
+    assert runs[True].stats == runs[False].stats
+    for checker in ("racecheck", "synccheck"):
+        verdicts = {
+            pin: getattr(v2.Engine(max_workers=4, pin_workers=pin), f"run_{checker}_phase")(module, inputs, phase_index=0).to_dict()["verdict"]
+            for pin in (False, True)
+        }
+        assert verdicts[True] == verdicts[False]
+
+
 def test_require_clean_raises_check_failed():
     from tirx_harness._report import CheckFailed
 

@@ -250,6 +250,35 @@ fn every_scenario_is_observer_and_worker_independent() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// `RunConfig::pin_workers` (W13): pinned threads with sticky partition
+/// handout give the same outputs, stats and observer stream as the
+/// unpinned scheduler, for every scenario and worker count.
+#[test]
+fn every_scenario_is_pin_independent() {
+    let mut failures = Vec::new();
+    for s in scenarios::all() {
+        for seed in [0u64, 3] {
+            let mut o_ref = WordOracle::default();
+            let reference = run_seed(&s, 8, seed, &mut o_ref);
+            let reference_plain = run_seed(&s, 8, seed, &mut NoopObserver);
+            let key = |o: &RunOutcome| (format!("{:?}", o.status), o.outputs.clone(), o.stats.clone(), format!("{:?}", o.diagnostics));
+            for workers in [1usize, 8, 32] {
+                let cfg = RunConfig { workers, seed, pin_workers: true, ..s.config.clone() };
+                let mut o = WordOracle::default();
+                let pinned = sched::run_with_config(&s.module, &s.inputs, &mut o, &cfg).expect("run starts");
+                if key(&pinned) != key(&reference) || o.h != o_ref.h {
+                    failures.push(format!("{} seed {seed}: pinned at {workers} workers differs from unpinned (stream equal: {})", s.name, o.h == o_ref.h));
+                }
+                let plain = sched::run_with_config(&s.module, &s.inputs, &mut NoopObserver, &cfg).expect("run starts");
+                if key(&plain) != key(&reference_plain) {
+                    failures.push(format!("{} seed {seed}: pinned at {workers} workers without an observer differs", s.name));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 const MAX: u32 = numsim_core::interp::aux::MAX_WORD_HISTORY as u32;
 const SENTINEL: u32 = 0xFFFF_FFFF;
 

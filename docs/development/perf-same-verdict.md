@@ -40,21 +40,35 @@ Source: `backend-comparison.json` (`head.cases`, engine wall, min of the samples
 
 Separate configuration set (148 SMs, `native_loop_iteration_budget=10_000_000`, one run each, 900 s cap; `backend-comparison.md` "Mega-MoE perf workloads"). Only numsim verdicts agree (both `clean`); every racecheck row differs (legacy `review`, v2 `error` per B7/T19, or v2 timed out at 6ba4190) and is excluded.
 
-| config | mode | workers | legacy | v2 (6ba4190) | v2 vs legacy (6ba4190) | v2 now (243f9f4) | now vs legacy | v2 now (a4c7157) | a4c7157 vs legacy |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| small | numsim | 1 / 16 / 32 | 3.1 / 1.5 / 1.5 s | 0.6 / 0.4 / 0.4 s | **5.2x / 3.8x / 3.8x faster** | 0.50 / 0.19 / 0.23 s | **6.2x / 7.9x / 6.5x faster** | 0.34 / 0.15 / 0.16 s (32: 0.17, 0.16, 0.16) | **9.1x / 10.0x / 9.4x faster** |
-| twenty_four_experts | numsim | 1 / 16 / 32 | 4.8 / 1.8 / 1.7 s | 1.7 / 0.7 / 0.7 s | **2.8x / 2.6x / 2.4x faster** | 1.27 / 0.45 / 0.48 s | **3.8x / 4.0x / 3.5x faster** | 0.84 / 0.24 / 0.25 s (32: 0.27, 0.26, 0.25) | **5.7x / 7.5x / 6.8x faster** |
-| medium | numsim | 1 | 35.7 s | 36.0 s | 1.01x (even) | 22.2 s | **1.61x faster** | 15.97 s | **2.24x faster** |
-| medium | numsim | 16 / 32 | 5.0 / 3.7 s | 8.2 / 7.7 s | 1.6x / 2.1x slower | 5.75 / 6.92 s | 1.15x / 1.87x slower | 3.08 / 3.75 s (32: 3.75, 3.89, 6.00) | **1.62x faster** / 1.01x slower (even by min; 6.00 s sample 1.62x slower) |
-| large | numsim | 1 / 16 / 32 | not measured | 75.1 / 14.0 / 13.6 s | — | 40.4 / 10.3 / 11.2 s | — | 28.88 / 5.44 / 6.79 s (32: 7.75, 6.79, 6.95) | — |
-| max config (`test_mega_moe_numsim_max_config`) | numsim | 16 | 185 s (load 40-50) | 366 s (before b36e44e, load 17-21) | 1.98x slower | 271.6 s (load 7-18) | 1.47x slower | 154.3 s (test call 158.9 s, load 3.0-7.7) | **1.20x faster** |
+| config | mode | workers | legacy | v2 (6ba4190) | v2 vs legacy (6ba4190) | v2 now (243f9f4) | now vs legacy | v2 now (a4c7157) | a4c7157 vs legacy | v2 now, pin_workers=on |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| small | numsim | 1 / 16 / 32 | 3.1 / 1.5 / 1.5 s | 0.6 / 0.4 / 0.4 s | **5.2x / 3.8x / 3.8x faster** | 0.50 / 0.19 / 0.23 s | **6.2x / 7.9x / 6.5x faster** | 0.34 / 0.15 / 0.16 s (32: 0.17, 0.16, 0.16) | **9.1x / 10.0x / 9.4x faster** | — |
+| twenty_four_experts | numsim | 1 / 16 / 32 | 4.8 / 1.8 / 1.7 s | 1.7 / 0.7 / 0.7 s | **2.8x / 2.6x / 2.4x faster** | 1.27 / 0.45 / 0.48 s | **3.8x / 4.0x / 3.5x faster** | 0.84 / 0.24 / 0.25 s (32: 0.27, 0.26, 0.25) | **5.7x / 7.5x / 6.8x faster** | — |
+| medium | numsim | 1 | 35.7 s | 36.0 s | 1.01x (even) | 22.2 s | **1.61x faster** | 15.97 s | **2.24x faster** | — |
+| medium | numsim | 16 / 32 | 5.0 / 3.7 s | 8.2 / 7.7 s | 1.6x / 2.1x slower | 5.75 / 6.92 s | 1.15x / 1.87x slower | 3.08 / 3.75 s (32: 3.75, 3.89, 6.00) | **1.62x faster** / 1.01x slower (even by min; 6.00 s sample 1.62x slower) | 2.52 / 3.25 s (16: 2.61, 2.52, 2.59; 32: 3.51, 3.38, 3.25): **1.98x / 1.14x faster** |
+| large | numsim | 1 / 16 / 32 | not measured | 75.1 / 14.0 / 13.6 s | — | 40.4 / 10.3 / 11.2 s | — | 28.88 / 5.44 / 6.79 s (32: 7.75, 6.79, 6.95) | — | — / 4.38 / 5.30 s (16: 4.38, 4.38, 4.41; 32: 5.30, 6.16, 6.52) |
+| max config (`test_mega_moe_numsim_max_config`) | numsim | 16 | 185 s (load 40-50) | 366 s (before b36e44e, load 17-21) | 1.98x slower | 271.6 s (load 7-18) | 1.47x slower | 154.3 s (test call 158.9 s, load 3.0-7.7) | **1.20x faster** | not measured |
 
 v2 now: `bench_backends.py mega --impls interp` on the 243f9f4 build (148 SMs, `native_loop_iteration_budget=10_000_000`), min of 2 runs per cell (load 4.6-15). The max config is one run of the perf test (its `perf_metrics` engine time). Mega-MoE numsim at 16 and 32 workers stays slower than legacy on medium: the remaining gap is per-partition CPU inflation at 16+ workers and the MMA landing (see engine-review.md).
 
 v2 now (a4c7157) (W13, 2026-10-09): same driver and settings on a private release build of a `git archive a4c7157` copy (mimalloc default). Each cell is the min of 3 runs interleaved over configs and worker counts; all three samples are shown for the 32-worker cells, because unpinned 32-worker runs are bimodal. Every run was `clean` and matched the reference. Host load was 1.4-6.6 during the runs. The max config is one run of the perf test: 154.3 s `perf_metrics` engine time, 158.9 s test call, load 3.0-7.7. Its legacy figure (185 s) was taken at load 40-50.
 - At or above legacy: every row except medium at 32 workers. That includes medium at 16 workers (1.62x faster; it was 1.15x slower at 243f9f4) and the max config (1.20x faster; it was 1.47x slower).
 - Still behind: medium at 32 workers. By min it is even (3.75 s against 3.7 s, 1.01x slower), but one of the three samples landed in the slow mode (6.00 s, 1.62x slower). Large shows the same 32-worker spread (6.79-7.75 s), and there 32 workers are slower than 16 (5.44 s).
-- Attribution: the 32-worker spread and slowdown come from cross-CCD sharing of partition working sets under dynamic handout (engine-review.md). Pin + sticky handout and cost-balanced static assignment were measured and declined. Further attribution needs hardware counters, which require `perf_event_paranoid` ≤ 2 (this host has 4).
+- Attribution: the 32-worker spread and slowdown come from cross-CCD sharing of partition working sets under dynamic handout (engine-review.md). Cost-balanced static assignment was measured and declined. Pin + sticky handout is available as the opt-in `pin_workers` (next note), and is off by default. Further attribution needs hardware counters, which require `perf_event_paranoid` ≤ 2 (this host has 4).
+
+v2 now, pin_workers=on (W13, 2026-10-09): `Engine(pin_workers=True)` (`NUMSIM_PIN_WORKERS=1`), on a private release build of 2b124bc plus the option. The driver and settings are the same as above, medium and large at 16 and 32 workers only. Each pinned run was interleaved with an unpinned run of the same build: 3 rounds of {unpinned, pinned}. Every run was `clean` and matched the reference. Load was 3.0-8.4, so this was not a dedicated host. All samples are shown.
+
+| config | workers | unpinned, same session | pinned | pinned vs unpinned (min) |
+| --- | --- | --- | --- | --- |
+| medium | 16 | 3.23 s (3.24, 3.23, 3.30) | 2.52 s (2.61, 2.52, 2.59) | 1.28x |
+| medium | 32 | 3.36 s (3.79, 4.24, 3.36) | 3.25 s (3.51, 3.38, 3.25) | 1.03x |
+| large | 16 | 5.77 s (5.81, 5.77, 5.78) | 4.38 s (4.38, 4.38, 4.41) | 1.32x |
+| large | 32 | 7.19 s (8.78, 8.36, 7.19) | 5.30 s (5.30, 6.16, 6.52) | 1.36x |
+
+- Pinned, every medium and large cell is faster than unpinned. Medium is ahead of legacy at both worker counts (1.98x at 16, 1.14x at 32).
+- The pinned 32-worker spread is narrower than the unpinned one on medium (3.25-3.51 s against 3.36-4.24 s). On large it is not tight (5.30-6.52 s), but every pinned sample beats every unpinned one. The 4.30-4.41 s medium figure in engine-review.md comes from the prototype session at load 4-8.
+- 16 workers still beat 32 on large, pinned or not.
+- Off is the default and CI never sets it. Pinned threads cannot move off busy cores, so on a shared host the option can be slower (dev-loop.md, "Pinned worker threads").
 
 v2 racecheck on medium, absolute (not a comparison row: the racecheck verdict still differs from legacy): **163.4 s** at 16 workers on 8e3ff95. This uses the default configuration (fork/join, phase-end GC on 16 threads, mimalloc) on the prof harness over the recorded fixture, one run at host load 4.4-8.4. The verdict is Error with 1508 findings, peak RSS is 12.3 GB, and `phase_end` is 41% of wall. The earlier serial run took 1433 s (54d0f94), so this is 8.8x faster. Details are in racecheck-parallel-design.md §16.
 

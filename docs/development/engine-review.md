@@ -905,13 +905,33 @@ Pin + sticky (`w13/st/`) against HEAD, 5 interleaved rounds, load 4–8. Min, wi
 | Pin + dynamic | 3.27 s (3.27–3.67) | 4.61 s (4.61–4.66) |
 | Pin + sticky | 3.07 s (3.07–3.53) | 4.30 s (4.30–4.41) |
 
-By the project's statistic (min of interleaved runs), pin + sticky is 1.25x at 16 workers and 1.21x at 32. On the max config's parallel-phase wall it is 1.10x. Pinning also costs something on shared hosts, including the CI runners, because threads cannot move off busy cores. Not landed.
+By the project's statistic (min of interleaved runs), pin + sticky is 1.25x at 16 workers and 1.21x at 32. On the max config's parallel-phase wall it is 1.10x. Pinning also costs something on shared hosts, including the CI runners, because threads cannot move off busy cores. Not landed as the default. It later landed as the opt-in `pin_workers` (next paragraph).
 
 Two facts to keep:
 - **Unpinned 32-worker runs on this host are bimodal:** 5.2–8.0 s for the same binary, while pinned runs stay within 4.30–4.41 s. Medium 32-worker measurements must report every sample, not a single min.
 - **Static assignment keeps partition CPU at the 1-worker level at 8 workers** (19.5 s against 28.3 s for HEAD), confirming cross-CCD migration as the source of the inflation. Round costs swing too much from round to round for any fixed assignment to hold wall time; dynamic handout balances each round.
 
 **Status of the medium 16/32-worker gap:** closed out as bounded by cross-CCD migration. Further attribution needs hardware counters, which require `perf_event_paranoid` at 2 or lower.
+
+**Pin + sticky landed as an option, default off (W13, 2026-10-09).** `RunConfig::pin_workers` / `Engine(pin_workers=...)` / `NUMSIM_PIN_WORKERS`.
+
+Behaviour when on, in `sched/pool.rs`:
+- Participants are pinned one per CPU of the inherited mask, an L3 group at a time with SMT siblings last. A narrower mask than the participant count wraps round-robin.
+- The caller is pinned for the launch and restored afterwards.
+- Handout is `par_for_sticky` with stealing (`Partition::last_worker`).
+
+When off, the code makes no affinity calls and uses today's `par_for`.
+
+Equivalence:
+- `sched_partition_review::every_scenario_is_pin_independent`.
+- Digests: every scenario plus 10 recorded fixtures, including medium. 1/8/32 workers, with and without an observer, pinned against unpinned: all identical.
+- Conformance passed in all modes, with the option off and with it on.
+
+The trade-off:
+- **Dedicated host:** 2b124bc + option, 3 interleaved rounds, load 3-8 (`perf-same-verdict.md`):
+  - Medium at 32 workers went from 3.36-4.24 s unpinned to 3.25-3.51 s pinned. The prototype session (load 4-8) had 5.20-7.77 s against 4.30-4.41 s.
+  - By min: 1.28x at 16 workers, 1.03x at 32. Large was 1.32x and 1.36x.
+- **Shared host:** pinned threads cannot leave busy cores. It therefore stays off by default, and CI never sets it (`dev-loop.md`).
 
 ## Parked spin-loop replay: validated prototype, not landed (W13, 2026-10-09)
 

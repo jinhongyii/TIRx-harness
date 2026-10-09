@@ -247,6 +247,25 @@ New relative checks use `tests/perf/perf_baseline.py` with per-host-class
 files in `tests/perf/baselines/` (see the README there). The two legacy
 absolute-threshold tests stay unchanged until the legacy engine is deleted.
 
+### Pinned worker threads (`pin_workers`)
+
+`Engine(pin_workers=True)`, or `NUMSIM_PIN_WORKERS=1` (read only in `v2/options.py`), sets `RunConfig::pin_workers`. It is off by default.
+
+When on (`sched/pool.rs`):
+- Each scheduler participant is pinned to one CPU of the inherited affinity mask.
+- Participants fill one L3 group (CCD) before the next, with SMT siblings last.
+- With fewer allowed CPUs than participants, they wrap round-robin inside the mask. Pinning never fails a run.
+- The calling thread is pinned for the launch, and its affinity is restored afterwards.
+- Partitions are handed out sticky: first to the participant that ran them last round, with idle participants stealing the rest.
+
+Off, the pool makes no affinity calls. Results and observer streams are identical either way. This is covered by `sched_partition_review::every_scenario_is_pin_independent` and by digests at 1/8/32 workers.
+
+The trade-off:
+- **Dedicated host:** it keeps each partition's working set in one L3. The 2026-10-09 run had load 3-8 (`perf-same-verdict.md`). Mega MoE medium was 3.23 → 2.52 s at 16 workers. At 32 workers it was 3.36-4.24 → 3.25-3.51 s, which narrows the unpinned spread. Large was 1.3x faster at 16 and 32 workers.
+- **Shared host:** a pinned thread cannot move off a core another process is using, so one busy core stalls every round.
+
+Use it for measurements and long runs on a machine you have to yourself. CI and the perf gate never set it.
+
 ### v2 performance gate
 
 `tests/perf/test_corpus_perf.py` (marker `performance`, interp backend) times the Mega
