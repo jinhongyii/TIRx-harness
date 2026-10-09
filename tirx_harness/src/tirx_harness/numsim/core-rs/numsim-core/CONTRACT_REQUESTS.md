@@ -3344,3 +3344,41 @@ checks the `shard_replay_order` guarantee and should never fire.
   - `run_with_config(&Inputs)` is unchanged and still copies. Tests, `plan_global_addresses` and other callers that reuse an `Inputs` keep using it.
   - `numsim-py`: new `execute_owned(module, Inputs, request)`; the `run` binding calls it (its inputs were dropped after the run anyway). `execute(&Inputs)` is unchanged.
 - **Unchanged.** `Inputs` and `ArgValue`; results, observer streams and digests (bytes identical, only ownership moves).
+
+### W4-tcgen-cp-spans (coordinator round, 2026-10-09; requested by W13)
+
+**New oplib entry.** `oplib::tcgen_cp_spans(rows, bits, multicast, decompress_bits, sdesc, taddr, cta_group, arch) -> OpResult<Rc<[TcgenCpSpan]>>`, with `TcgenCpSpan = (u64, u64, u32)`. It returns `tcgen_cp_plan`'s pairs in `pairs()` order, with the issuing handler's offsets already applied:
+- the source's shared-window offset `addr::decode_shared(src.start).1`;
+- its length;
+- the destination cell's TMEM byte offset `addr::tmem_byte_offset(lane, column)`.
+
+**Behaviour.**
+- Results are memoized per thread on the plan key. Errors are not cached.
+- `tcgen_cp_plan` and `TcgenCpPlan::pairs` are unchanged.
+- The handler adopts the entry at W13's discretion.
+
+**Measured.** Bench `tcgen_cp/issue_spans_memoized_32x128b_warpx4` is 76 ns, against 1.66 µs for plan, pairs and mapping (21.8x).
+
+**Guard.** `memoized_cp_spans_equal_mapped_plan_pairs`.
+
+## W6-P2 (for W2, 2026-10-09): a word declared at its first `wait_until` misses other partitions' same-round writes
+
+Found while reviewing W16's child-side `DeclareWord` (patch 02). The bug is in the engine on base (40bc7f1) and on W16's series, which leaves it unchanged.
+
+- **Cause.** `wait_until` declares an undeclared word at first use (`sync.rs`, `aux.words.declare`) in the waiting partition's local `WordTable` only.
+  - Another partition that writes the same word in the same round has no region in its table, so the write is not logged.
+  - `merge_words` then adds the new region with only the declarer's entries.
+  - Racecheck numbers the word's history by overlap with its declared regions in delivery order. When the declarer replays first (it read the round-start bytes), the other partition's write is entry 1 there.
+- **Scenario.** `tests/racecheck_parallel_review.rs::w16_first_wait_declare_numbering_follows_the_delivery` (`#[ignore]`, xfail).
+  - Two clusters, and `w` is not a `sync_words` buffer.
+  - CTA 1: `wait_until(w == 7)`, which is the first use and declares `w`, then reads `data`.
+  - CTA 0, in the same round: `data = 5`, then `st.release.gpu w = 7` (or a plain store).
+  - The DeclaredWordOracle sees `observed 0` against 1 delivered write.
+- **Effect.**
+  - With `st.release`, racecheck reports a false DataRace on `data`: the verdict has no entry for the release, so there is no edge.
+  - With a plain store, the SignalProtocolError is expected either way.
+- **Fix options.**
+  - (a) When `merge_words` adds a region declared this phase, append the same-phase writes of partitions replayed after the declarer, from their event buffers in delivery order. Each partition's buffer has the write `Access` events, but the post-images would have to be reconstructed per write.
+  - (b) Log writes to *any* global 4/8-byte location into a per-partition pending log while word history is wanted, and fold the entries for regions declared this phase at merge. This costs memory.
+  - (c) Make a first-use declaration of a global word end the round's partition parallelism for that word: mark it so that other partitions' writes that phase go through the serial phase.
+  - (d) Declare at first use with history starting at the *end* of the declaring phase, so writes in the declaring round count as pre-declaration. Racecheck then also has to start the word's history at the merge point, not at the `DeclareWord` event; that is a contract change.

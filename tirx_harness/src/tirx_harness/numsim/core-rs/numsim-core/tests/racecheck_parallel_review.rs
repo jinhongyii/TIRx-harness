@@ -683,3 +683,156 @@ fn cycle_scenarios_are_replay_cycles() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// W16 child-side DeclareWord (patch 02): a word declared at its first
+// `wait_until` in one partition, written by another partition in the same
+// round.
+// ---------------------------------------------------------------------------
+
+/// Two single-CTA clusters. `w` is NOT a `sync_words` buffer, so it is
+/// declared at its first `wait_until`.
+/// - CTA 1 lane 0: `wait_until(w == 7)` (the first use declares `w`), then
+///   reads `data`.
+/// - CTA 0 lane 0, in the same round: stores `data = 5`, then `w = 7` with
+///   `st.release.gpu` (`hb`) or a plain store (no publication edge).
+fn first_wait_declare(hb: bool) -> Scenario {
+    let mut b = ProgramBuilder::new("first_wait_declare", 32);
+    b.grid(2, 1, 1);
+    let w = b.global("w", Dtype::U32);
+    let data = b.global("data", Dtype::U32);
+    let out = b.global("out", Dtype::U32);
+    let cta = b.reg(Ty::U32);
+    let lane = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let wa = b.reg(Ty::U64);
+    let got = b.reg(Ty::U32);
+    let v = b.reg(Ty::U32);
+    let arg = b.reg(Ty::U32);
+    let res = b.reg(Ty::PRED);
+    b.read_special(cta, SpecialReg::CtaLinear);
+    b.lane_id(lane);
+    let k0 = b.k_u32(0);
+    let k5 = b.k_u32(5);
+    let k7 = b.k_u32(7);
+    b.addr_of(wa, w, k0);
+    b.compare(CmpOp::Eq, Ty::U32, p, lane, k0);
+    b.if_(p);
+    b.compare(CmpOp::Eq, Ty::U32, p, cta, k0);
+    b.if_(p);
+    b.site("data_store", 1);
+    st(&mut b, data, k0, k5, Sem::Weak);
+    b.site("w_publish", 2);
+    st(&mut b, w, k0, k7, if hb { Sem::Release } else { Sem::Weak });
+    b.no_site();
+    b.else_();
+    b.site("tirx.cuda.wait_until", 3);
+    let placeholder = b.push(Instr::Nop);
+    b.site("data_load", 4);
+    b.ld_u32(v, data, k0);
+    b.no_site();
+    b.add_u32(v, v, got);
+    b.st_u32(out, k0, v);
+    b.end_if();
+    b.end_if();
+    b.exit();
+    let mut prog = b.build();
+    let start = Pc(prog.code.len() as u32);
+    prog.code.push(Instr::Compare { op: CmpOp::Eq, ty: Ty::U32, dst: res, a: arg.into(), b: k7 });
+    prog.code_sites.push(numsim_core::site::SiteId::NONE);
+    prog.preds.push(PredProgram { arg, start, end: Pc(start.0 + 1), result: res, reads_memory: false });
+    prog.code[placeholder.0 as usize] =
+        Instr::WaitUntil { dst: got, addr: wa.into(), ty: Ty::U32, space: AddrSpace::Generic, sem: Sem::Acquire, scope: Scope::Gpu, pred: PredId(0), captures: vec![] };
+    prog.validate().expect("valid");
+    Scenario {
+        name: if hb { "first_wait_declare_hb" } else { "first_wait_declare_plain" },
+        module: Module::new(vec![prog]),
+        inputs: inputs(vec![("w", u32_buf([0])), ("data", u32_buf([0])), ("out", u32_buf([0]))]),
+        config: RunConfig { loop_budget: 1 << 40, ..RunConfig::default() },
+    }
+}
+
+/// I10 oracle for words declared mid-run: per declared span, the writes
+/// delivered since its `DeclareWord` (overlap, as racecheck numbers them);
+/// each `WaitVerdicts.observed` must equal that count at delivery.
+#[derive(Default)]
+struct DeclaredWordOracle {
+    words: Vec<(numsim_core::arena::AllocId, numsim_core::arena::ByteSpan, u32)>,
+    mismatches: Vec<String>,
+    verdicts: usize,
+}
+
+impl numsim_core::observe::Observer for DeclaredWordOracle {
+    fn wants_word_history(&self) -> bool {
+        true
+    }
+    fn access(&mut self, a: &numsim_core::observe::Access<'_>) {
+        if !a.writes() {
+            return;
+        }
+        for (alloc, span, n) in &mut self.words {
+            if *alloc == a.alloc {
+                *n += a.spans.iter().filter(|s| s.span.overlaps(*span)).count() as u32;
+            }
+        }
+    }
+    fn sync(&mut self, e: &numsim_core::observe::SyncEvent) {
+        use numsim_core::observe::SyncKind;
+        match &e.kind {
+            SyncKind::DeclareWord { alloc, span } => self.words.push((*alloc, *span, 0)),
+            SyncKind::WaitVerdicts { alloc, span, verdicts, .. } => {
+                let n = self.words.iter().find(|(a, s, _)| a == alloc && s.overlaps(*span)).map(|w| w.2);
+                for v in verdicts {
+                    self.verdicts += 1;
+                    if Some(v.observed) != n {
+                        self.mismatches.push(format!("observed {} vs delivered writes {:?}", v.observed, n));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn declared_word_numbering(s: &Scenario, workers: usize) -> DeclaredWordOracle {
+    let mut o = DeclaredWordOracle::default();
+    let cfg = RunConfig { workers, ..s.config.clone() };
+    sched::run_with_config(&s.module, &s.inputs, &mut o, &cfg).expect("run starts");
+    o
+}
+
+#[test]
+fn w16_first_wait_declare_serial_is_worker_independent() {
+    for hb in [true, false] {
+        let (status, _) = serial_is_worker_independent(&first_wait_declare(hb), &RacecheckConfig::default());
+        assert_eq!(status, format!("{:?}", RunStatus::Completed));
+    }
+}
+
+#[test]
+fn w16_first_wait_declare_fork_join_matches_serial() {
+    for hb in [true, false] {
+        fork_join_matches_serial(&first_wait_declare(hb), &RacecheckConfig::default());
+    }
+}
+
+/// The verdict of a wait whose word was declared in the same round in which
+/// another partition wrote it must be numbered like the delivered history.
+/// Today the engine's history misses CTA 0's same-round write: the
+/// declaration lives only in CTA 1's partition table that round, so the
+/// write is not logged. The verdict says `observed 0` while one write has
+/// been delivered since the `DeclareWord`, and with `hb` racecheck reports
+/// a false DataRace on `data`. This is an engine bug, the same on base and
+/// on W16's series (CONTRACT_REQUESTS W6-P2).
+#[test]
+#[ignore = "xfail: CONTRACT_REQUESTS W6-P2 (W2) -- first-wait declaration misses other partitions' same-round writes"]
+fn w16_first_wait_declare_numbering_follows_the_delivery() {
+    for hb in [true, false] {
+        for w in [1usize, 8] {
+            let o = declared_word_numbering(&first_wait_declare(hb), w);
+            assert!(o.verdicts > 0, "hb={hb} workers={w}: no verdict");
+            assert!(o.mismatches.is_empty(), "hb={hb} workers={w}: {:?}", o.mismatches);
+        }
+    }
+}
+
