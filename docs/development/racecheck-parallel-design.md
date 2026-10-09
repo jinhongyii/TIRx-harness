@@ -1013,8 +1013,14 @@ F1–F6 review.
 - **Correctness.** Exact.
   - Findings byte-identical on the 7 fixtures at 1/8/16/32 workers.
   - `racecheck_reattribution` 7/7 and `racecheck_retirement` 11/11.
-  - The fresh-source slot guard improved from 128 to 26 but missed its bar
-    (same-source 21 + 2).
+  - The fresh-source slot guard improved from 128 to 26 against same-source
+    21. That missed the original bar (+2), but the gap is constant (11/26/47
+    against 7/21/46 at 32/128/256 iterations), so the bar is now +8
+    (27df6cc), which v1 meets. The guard stays ignored while no
+    re-attribution is in the tree.
+  - W6's later guard `a3_read_from_release_carries_the_observation` (the
+    observation travels through a strong release/acquire read-from, not a
+    barrier payload) also passes against v1 (8/8).
 - **It does not pay.**
   - On e24 it re-attributed nothing: every candidate still had shared-memory
     witnesses at each collection. Wall was 19.0 s against 16.6 s.
@@ -1046,3 +1052,51 @@ in its own right.
   per op. They need their own soundness case, in particular waits on a phase
   after it has been pruned from the record list. W6 should review before any
   code.
+
+**Acceptance list for (B) (W6).** Whoever resumes (B) must cover each case
+below with a guard in `tests/racecheck_reattribution.rs` (contract events,
+run with `gc_every = 1` and the default period, identical payloads) before
+building. The token must never order something the raw completion would
+not, and must order everything it would.
+
+1. **Wait after pruning.** A wait on a phase whose record has left the
+   retained list is `BarrierPayloadUnavailable` (incomplete) today. The token
+   must not turn it into "ordered".
+2. **Parity aliasing.** A wait at generation g+2 with the same parity as g.
+   Tokens are per generation, never per parity.
+3. **Relaxed wait, later acquire fence.** A relaxed `test_wait`/`try_wait`
+   parks the completion in `pending_acq` until a later `fence.acquire`.
+   `pending_acq` is a carrier, so the token must ride it and be acquired only
+   at the fence.
+4. **Multicast.** One multicast completion lands in several CTAs' records.
+   Each record's token is separate, and acquiring one says nothing about the
+   others.
+5. **Remote and cluster-barrier arrivals.** Remote `mbarrier.arrive` into a
+   record, and a `barrier.cluster` record shared by many CTAs: the token is
+   acquired exactly where today's phase payload is.
+6. **tcgen05 commit forwarding.** A commit completion forwards its preds'
+   `hb`/`tcgen_rel` into a record. The token covers what the commit
+   forwarded, and nothing about uncommitted work.
+7. **Fork/join.** A record's token is owned by the record's partition
+   (its cluster), and the observation log merges in tag order (§11 D4).
+8. **Scope-filtered arrivals.** A `.cta` waiter does not acquire a remote
+   `.release.cluster` arrival (R4, `ScopeMismatch`). It must not acquire the
+   token either.
+
+Existing guards that must keep passing:
+- `racecheck_reattribution` (C1, F1, F2, C3, a3);
+- `racecheck_retirement`, with the fresh-source slot guard un-ignored;
+- `racecheck_parallel_review`;
+- the 7-fixture byte-identity check at 1/8/16/32 workers.
+
+**Skipped: lane-entry normalisation (iii)(b).** In the medium late-run profile
+(memo fix in, MAX_ROUNDS=2000), all lane-entry work adds up to about 12% of
+samples:
+
+- 8.8% self: `Clock::join`'s per-entry "already known?" scan over the
+  incoming lane blocks;
+- about 3% inclusive: `Lanes::with_blocks` and drop glue;
+- under 0.5%: `raise_lanes` and `normalize_actor`.
+
+Even removing all of it caps the gain at about 1.13x on the medium window,
+below the 1.5x case criterion, so it was not built.
