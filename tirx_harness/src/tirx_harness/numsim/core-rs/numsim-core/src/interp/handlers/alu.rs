@@ -191,10 +191,21 @@ pub fn unary(ctx: &mut ExecCtx<'_>, op: UnOp, ty: Ty, dst: Reg, a: Operand) -> H
     active_or_next!(ctx);
     let n = ty.slots();
     let mask = ctx.warp.active;
-    let mut sa = zero_slots();
-    support::gather(ctx, a, n, &mut sa);
     // Output sized by the destination type (`Is*` write predicates).
     let nd = reg_ty(ctx, dst).slots();
+    if n == 1 && nd == 1 {
+        // W13: one slot each way, without the four-slot zeroed buffers and
+        // gather/scatter (same values: `scatter` of one slot is this masked
+        // write).
+        let sa = [ctx.read_slot(a, 0)];
+        let mut out = [[0u64; 32]];
+        oplib::unary(op, ty, &sa, &mut out, mask).map_err(|e| support::op_err(ctx, e))?;
+        let s = ctx.slot(dst);
+        support::write_masked(ctx.warp.reg_mut(s), &out[0], mask);
+        return Ok(Flow::Next);
+    }
+    let mut sa = zero_slots();
+    support::gather(ctx, a, n, &mut sa);
     let mut out = zero_slots();
     oplib::unary(op, ty, &sa[..n as usize], &mut out[..nd as usize], mask).map_err(|e| support::op_err(ctx, e))?;
     support::scatter(ctx, dst, nd, &out, mask);
@@ -353,6 +364,15 @@ pub fn cast(ctx: &mut ExecCtx<'_>, from: Ty, to: Ty, dst: Reg, src: Operand, rnd
     let mask = ctx.warp.active;
     let n1 = from.slots();
     let n2 = reg_ty(ctx, dst).slots();
+    if n1 == 1 && n2 == 1 {
+        // W13: one slot each way (see `unary`).
+        let sa = [ctx.read_slot(src, 0)];
+        let mut out = [[0u64; 32]];
+        oplib::cast(from, to, rnd, sat, &sa, &mut out, mask).map_err(|e| support::op_err(ctx, e))?;
+        let s = ctx.slot(dst);
+        support::write_masked(ctx.warp.reg_mut(s), &out[0], mask);
+        return Ok(Flow::Next);
+    }
     let mut s = zero_slots();
     support::gather(ctx, src, n1, &mut s);
     let mut out = zero_slots();
@@ -401,6 +421,21 @@ pub fn ptx(ctx: &mut ExecCtx<'_>, op: OpId, dsts: &[Reg], srcs: &[Operand], pred
         crate::interp::OpEffect::None => {}
         effect => op_effect(ctx, effect, srcs, exec)?,
     }
+    // W13: one single-slot destination and up to three single-slot sources
+    // (most generic ops) go through stack buffers instead of the scratch
+    // vectors; same values, same call, same writes.
+    if let [d] = dsts {
+        let dty = reg_ty(ctx, *d);
+        if dty.slots() == 1 {
+            let one = |s: Operand| operand_ty(ctx, s).slots() == 1;
+            match *srcs {
+                [a] if one(a) => return ptx_small(ctx, op, f, *d, dty, [a], exec, active, keep_dst),
+                [a, b] if one(a) && one(b) => return ptx_small(ctx, op, f, *d, dty, [a, b], exec, active, keep_dst),
+                [a, b, c] if one(a) && one(b) && one(c) => return ptx_small(ctx, op, f, *d, dty, [a, b, c], exec, active, keep_dst),
+                _ => {}
+            }
+        }
+    }
     PTX_SCRATCH.with(|cell| {
         let mut sc = cell.borrow_mut();
         let sc = &mut *sc;
@@ -440,19 +475,58 @@ pub fn ptx(ctx: &mut ExecCtx<'_>, op: OpId, dsts: &[Reg], srcs: &[Operand], pred
             let ty = reg_ty(ctx, d);
             let base = ctx.slot(d);
             for i in 0..ty.slots() {
-                let v = sc.dsts[k];
+                let v = &sc.dsts[k];
                 k += 1;
                 let r = ctx.warp.reg_mut(base + i);
-                for l in exec.lanes() {
-                    r[l] = v[l];
-                }
-                for l in zero_lanes.lanes() {
-                    r[l] = 0;
+                // W13: one masked pass (same lanes as the per-lane loops).
+                support::write_masked(r, v, exec);
+                if !zero_lanes.is_empty() {
+                    support::write_masked(r, &[0u64; 32], zero_lanes);
                 }
             }
         }
         Ok(Flow::Next)
     })
+}
+
+/// [`ptx`] for one single-slot destination and `N` single-slot sources:
+/// the scratch-vector path with stack buffers.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn ptx_small<const N: usize>(
+    ctx: &mut ExecCtx<'_>,
+    op: OpId,
+    f: crate::interp::PtxFn,
+    d: Reg,
+    dty: Ty,
+    srcs: [Operand; N],
+    exec: WarpMask,
+    active: WarpMask,
+    keep_dst: bool,
+) -> HResult {
+    let mut dv = [*ctx.reg_slot(d, 0)];
+    let dtys = [dty];
+    let sv: [WarpValue<u64>; N] = srcs.map(|s| ctx.read_slot(s, 0));
+    let stys: [Ty; N] = srcs.map(|s| operand_ty(ctx, s));
+    if !exec.is_empty() {
+        let mut io = PtxIo { dsts: &mut dv, dst_tys: &dtys, srcs: &sv, src_tys: &stys, mask: exec };
+        if let Err(e) = f.call(&mut io) {
+            let key = &ctx.program.ops[op.0 as usize];
+            let operation = std::iter::once(key.name.as_str()).chain(key.mods.iter().map(String::as_str)).collect::<Vec<_>>().join(".");
+            let mut tmp = [*ctx.reg_slot(d, 0)];
+            return Err(narrow(ctx, e, exec, operation, |l| sv.iter().map(|s| s[l]).collect(), |m| {
+                f.call(&mut PtxIo { dsts: &mut tmp, dst_tys: &dtys, srcs: &sv, src_tys: &stys, mask: m })
+            }));
+        }
+    }
+    let zero_lanes = if keep_dst { WarpMask::NONE } else { active.and_not(exec) };
+    let s = ctx.slot(d);
+    let r = ctx.warp.reg_mut(s);
+    support::write_masked(r, &dv[0], exec);
+    if !zero_lanes.is_empty() {
+        support::write_masked(r, &[0u64; 32], zero_lanes);
+    }
+    Ok(Flow::Next)
 }
 
 fn reg_index(ctx: &ExecCtx<'_>, base: Reg, len: u32, idx: Operand, lane: usize) -> Result<Reg, crate::interp::ExecError> {

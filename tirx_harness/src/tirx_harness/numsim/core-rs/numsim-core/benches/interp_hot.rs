@@ -20,6 +20,11 @@
 //!   `alu::load_reg_indexed` / `store_reg_indexed`.
 //! * `store_v4` — 16-byte vector stores into shared memory (a GEMM
 //!   epilogue's staging): `mem::store`.
+//! * `alu_chain` — straight-line element-wise ALU work (u32/f32 binary,
+//!   fma, compare, cast): the per-instruction cost of `alu`.
+//! * `convert_chain` — one-slot conversions: generic ops
+//!   (`uint_as_float` / `float_as_uint`), casts and a unary op:
+//!   `alu::ptx` / `cast` / `unary`.
 //! * `local_array` — per-lane local-array stores and scalar/vector loads
 //!   in a kernel with declared sync words: `mem::store` / `mem::load` on a
 //!   per-lane binding.
@@ -367,6 +372,96 @@ pub fn store_v4(iters: u32) -> Scenario {
     s
 }
 
+/// 4 warps, `iters` iterations of straight-line ALU work: u32 add/xor/mul,
+/// f32 add/mul/fma, compares and casts on distinct registers (the
+/// element-wise share of a corpus kernel): `alu::binary` / `ternary` /
+/// `compare` / `cast`.
+pub fn alu_chain(iters: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("alu_chain", 128);
+    let out = b.global("out", Dtype::U32);
+    let tid = b.reg(Ty::U32);
+    let k = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let q = b.reg(Ty::PRED);
+    let u: Vec<Reg> = (0..8).map(|_| b.reg(Ty::U32)).collect();
+    let f: Vec<Reg> = (0..6).map(|_| b.reg(Ty::F32)).collect();
+    b.thread_rank(tid);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let k3 = b.k_u32(3);
+    let kh = b.k_f32(0.5);
+    let kn = b.k_u32(iters);
+    for &r in &u {
+        b.mov(r, tid);
+    }
+    for &r in &f {
+        b.cast(Ty::U32, Ty::F32, r, tid);
+    }
+    b.mov(k, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, kn);
+    b.loop_if(p);
+    b.add_u32(u[0], u[0], u[1]);
+    b.binary(BinOp::Xor, Ty::U32, u[1], u[1], u[2]);
+    b.mul(Ty::U32, u[2], u[2], k3);
+    b.add_u32(u[3], u[3], u[0]);
+    b.binary(BinOp::And, Ty::U32, u[4], u[3], u[1]);
+    b.add_u32(u[5], u[4], k1);
+    b.add_f32(f[0], f[0], f[1]);
+    b.mul_f32(f[1], f[1], kh);
+    b.fma(Ty::F32, f[2], f[0], f[1], f[2]);
+    b.cast(Ty::U32, Ty::F32, f[3], u[5]);
+    b.add_f32(f[4], f[3], f[2]);
+    b.compare(CmpOp::Lt, Ty::F32, q, f[4], f[0]);
+    b.cast(Ty::F32, Ty::U32, u[6], f[4]);
+    b.add_u32(u[7], u[7], u[6]);
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.st_u32(out, tid, u[7]);
+    b.exit();
+    let mut s = Scenario { name: "alu_chain", module: b.build_module(), inputs: inputs(vec![("out", u32_buf([0; 128]))]), config: Default::default() };
+    s.config.completions = CompletionPolicy::Eager;
+    s
+}
+
+/// 4 warps, `iters` iterations of one-slot element-wise conversions:
+/// generic ops (`uint_as_float` / `float_as_uint`), casts and a unary op,
+/// each a register in, a register out (a corpus epilogue's packing and
+/// conversion share): `alu::ptx` / `cast` / `unary`.
+pub fn convert_chain(iters: u32) -> Scenario {
+    let mut b = ProgramBuilder::new("convert_chain", 128);
+    let out = b.global("out", Dtype::U32);
+    let tid = b.reg(Ty::U32);
+    let k = b.reg(Ty::U32);
+    let p = b.reg(Ty::PRED);
+    let u: Vec<Reg> = (0..4).map(|_| b.reg(Ty::U32)).collect();
+    let f: Vec<Reg> = (0..4).map(|_| b.reg(Ty::F32)).collect();
+    b.thread_rank(tid);
+    let k0 = b.k_u32(0);
+    let k1 = b.k_u32(1);
+    let kn = b.k_u32(iters);
+    for &r in &u {
+        b.mov(r, tid);
+    }
+    b.mov(k, k0);
+    b.loop_begin();
+    b.compare(CmpOp::Lt, Ty::U32, p, k, kn);
+    b.loop_if(p);
+    for i in 0..4 {
+        b.ptx("tirx.cuda.uint_as_float", &[], &[f[i]], &[u[i].into()]);
+        b.push(Instr::Unary { op: UnOp::Neg, ty: Ty::F32, dst: f[i], a: f[i].into() });
+        b.ptx("tirx.cuda.float_as_uint", &[], &[u[i]], &[f[i].into()]);
+        b.cast(Ty::U32, Ty::F32, f[(i + 1) % 4], u[i]);
+    }
+    b.add_u32(k, k, k1);
+    b.loop_end();
+    b.st_u32(out, tid, u[3]);
+    b.exit();
+    let mut s = Scenario { name: "convert_chain", module: b.build_module(), inputs: inputs(vec![("out", u32_buf([0; 128]))]), config: Default::default() };
+    s.config.completions = CompletionPolicy::Eager;
+    s
+}
+
 /// A per-lane local array (`Space::Local`, lane-major) written and read
 /// back every iteration, scalar and 16-byte vector, in a kernel that also
 /// declares sync words (the Mega MoE epilogue's spilled locals):
@@ -483,6 +578,8 @@ fn bench(c: &mut Criterion) {
     group(c, "store_v4", "iters2048", &store_v4(2048));
     group(c, "blocked_wait", "ctas8_waiters15_iters1024", &blocked_wait(8, 15, 1024));
     group(c, "local_array", "iters512", &local_array(512));
+    group(c, "alu_chain", "iters2048", &alu_chain(2048));
+    group(c, "convert_chain", "iters2048", &convert_chain(2048));
 }
 
 /// Events on, history off, no checker: only the cost of building and

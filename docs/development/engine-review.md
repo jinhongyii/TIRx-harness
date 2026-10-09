@@ -658,3 +658,43 @@ Instruction cycles fell from 3.06e10 to 1.91e10, and `run_cta` from 3.52e10 to 2
 - **Address computation.** `addr_of` is 1%. The address cost was in load and store resolution (fixed above).
 - **Spin-parked loops.** Medium has none; its blocked retries were `mbarrier.try_wait` and `bar.sync` (fixed above). The max config's 151 M parked re-polls are loops whose polls emit Access events, so they still cannot be skipped observer-independently.
 - **Open, outside interp/sched.** TMA plan building (`tma_plan_dir`, about 82% of a TMA issue) and `tcgen_cp` payload construction (per-cell spans) are oplib's. Elementwise ALU (`binary`, `cast`, `compare`, ptx ops, about 30% of instruction cycles) is `oplib::binary` and its relatives.
+
+**Rulings (coordinator, 2026-10-09).**
+- Recording `run_mma` read notes only when observing stands as a recording path: the test is that observed and NoopObserver outcomes (diagnostics included), the I8 run, and the Access-stream hashes stay identical, and they do.
+- Applying a repeated blocked retry instead of executing it (`BlockedWait`) is accepted for the same reason: the retry would emit no observer event, and debug builds assert the prediction.
+
+## Element-wise ALU path: interp side (W13, 2026-10-09)
+
+**Measurement.** 4 warps, a loop of 16 identical instructions plus 4 loop-control instructions per iteration. The cost per instruction is the time above a `Nop` body, which costs about 12 ns per instruction including loop control.
+
+| Kind | Extra cost per instruction |
+|---|---|
+| `mov` | 13 ns |
+| u32 `binary` | 43 ns |
+| f32 `binary` | 66 ns |
+| `compare` | 49 ns |
+| `cast` | 50 ns |
+| `ptx` `uint_as_float` | 92 ns |
+
+**`binary` / `ternary` / `compare`: not a copy problem.** Three experiments isolated the cost:
+- Writing straight into the destination slot, with no operand copies and no result copy, gained nothing (prototype, not landed).
+- Replacing `oplib::binary` with an inline add saved about 13 ns.
+- An add of two constants costs the same as an add of two registers.
+
+So the cost is the oplib call plus the fixed per-handler work over 256-byte `[u64; 32]` slots. W4 owns the op bodies.
+
+**`unary` / `cast`, landed.** One-slot shapes no longer build two zeroed four-slot buffers (1 KB each) and gather/scatter. Per instruction this is 1.4x.
+
+**`ptx` generic ops, landed.**
+- Ops with one single-slot destination and up to three single-slot sources use stack buffers instead of the thread-local scratch vectors.
+- Write-back is one masked pass instead of per-lane loops.
+- Per op this is about 1.5x (92 to 60 ns). About 50 of the remaining cycles are in the op body (`each_lane`), which is W4's.
+
+**Rows.**
+
+| Row | Before | After | Speed-up |
+|---|---|---|---|
+| `convert_chain/iters2048` (generic op, unary, cast) | 12.53 ms | 8.99 ms | 1.39x |
+| `alu_chain/iters2048` | — | — | flat (within noise) |
+
+Digests at 1/8/32 are identical with and without an observer.
