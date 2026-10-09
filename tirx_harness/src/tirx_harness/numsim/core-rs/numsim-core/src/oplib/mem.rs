@@ -27,8 +27,8 @@ pub use matrix::{
     StMatrixPlan,
 };
 pub use tcgen::{
-    tcgen_cp_decode, tcgen_cp_plan, tcgen_ld_dst_count, tcgen_ld_reduce, tcgen_ld_spcompress,
-    tcgen_ldst_map, tcgen_ldst_registers, TcgenCpPlan, TcgenCpWord, TcgenLdRed, TcgenLdstMap,
+    tcgen_cp_decode, tcgen_cp_plan, tcgen_cp_spans, tcgen_ld_dst_count, tcgen_ld_reduce, tcgen_ld_spcompress,
+    tcgen_ldst_map, tcgen_ldst_registers, TcgenCpPlan, TcgenCpSpan, TcgenCpWord, TcgenLdRed, TcgenLdstMap,
     TcgenCellRun, TcgenLdstPiece,
 };
 

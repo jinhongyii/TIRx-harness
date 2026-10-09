@@ -400,16 +400,26 @@ fn gather_f8_rows_k_major(
 pub struct AtomDecoder {
     format: NarrowFormat,
     table: &'static [u32; 256],
-    e2m1: [f32; 16],
+    /// E2M1: byte -> (low nibble value bits, high nibble value bits).
+    e2m1_pairs: &'static [[u32; 2]; 256],
+}
+
+/// `byte -> [decode(byte & 0xf), decode(byte >> 4)]` (f32 bits) for E2M1,
+/// built once from `float4_e2m1fn_bits_to_f32` (perf, W4: one lookup per
+/// byte instead of per nibble).
+fn e2m1_pair_table() -> &'static [[u32; 2]; 256] {
+    static TABLE: std::sync::OnceLock<[[u32; 2]; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|byte| {
+            let byte = byte as u8;
+            [float4_e2m1fn_bits_to_f32(byte & 0x0f).to_bits(), float4_e2m1fn_bits_to_f32(byte >> 4).to_bits()]
+        })
+    })
 }
 
 impl AtomDecoder {
     pub fn new(format: NarrowFormat) -> Self {
-        Self {
-            format,
-            table: format.decode_table(),
-            e2m1: std::array::from_fn(|code| float4_e2m1fn_bits_to_f32(code as u8)),
-        }
+        Self { format, table: format.decode_table(), e2m1_pairs: e2m1_pair_table() }
     }
 
     /// `out[i] = decode_shared_atom(bits)[i]`, negated when `negate`.
@@ -419,8 +429,9 @@ impl AtomDecoder {
         match self.format {
             NarrowFormat::E2M1 => {
                 for (pair, &byte) in out.as_chunks_mut::<2>().0.iter_mut().zip(bits) {
-                    pair[0] = f32::from_bits(self.e2m1[usize::from(byte & 0x0f)].to_bits() ^ sign);
-                    pair[1] = f32::from_bits(self.e2m1[usize::from(byte >> 4)].to_bits() ^ sign);
+                    let [low, high] = self.e2m1_pairs[usize::from(byte)];
+                    pair[0] = f32::from_bits(low ^ sign);
+                    pair[1] = f32::from_bits(high ^ sign);
                 }
             }
             _ if self.format.format().width_bits == 8 => {

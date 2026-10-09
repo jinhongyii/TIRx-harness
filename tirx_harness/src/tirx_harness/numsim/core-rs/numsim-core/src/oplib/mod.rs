@@ -871,9 +871,27 @@ impl TcWindow<'_> {
         if end > self.bytes.len() as u64 || self.valid.first_clear(offset, len).is_some() {
             return false;
         }
-        out.copy_from_slice(&self.bytes[offset as usize..end as usize]);
+        let source = &self.bytes[offset as usize..end as usize];
+        // Fixed-size copies for the common piece sizes (perf, W4: operand
+        // atoms, scale runs and accumulator rows); the same bytes as
+        // `copy_from_slice`, without the variable-length `memcpy` call.
+        match out.len() {
+            4 => copy_fixed::<4>(source, out),
+            8 => copy_fixed::<8>(source, out),
+            16 => copy_fixed::<16>(source, out),
+            32 => copy_fixed::<32>(source, out),
+            64 => copy_fixed::<64>(source, out),
+            _ => out.copy_from_slice(source),
+        }
         true
     }
+}
+
+#[inline(always)]
+fn copy_fixed<const N: usize>(source: &[u8], out: &mut [u8]) {
+    let source: &[u8; N] = source.try_into().expect("window piece length");
+    let out: &mut [u8; N] = out.try_into().expect("window piece length");
+    *out = *source;
 }
 
 /// Window-served reads `(space, cta, offset, len)` in request order.
@@ -910,6 +928,23 @@ impl TcMmaIo<'_> {
             reads.borrow_mut().push((space, cta, offset, out.len() as u64));
         }
         true
+    }
+
+    /// Run `f` with the live window of `(space, cta)` (`None` when there is
+    /// none or the windows were released) and the read-note list, borrowing
+    /// the window set once for a whole run of pieces (perf, W4). `f` serves
+    /// each piece exactly as [`Self::try_read`] would and notes window-served
+    /// pieces itself.
+    #[inline]
+    pub(crate) fn with_window<R>(
+        &self,
+        space: TcSpace,
+        cta: u32,
+        f: impl FnOnce(Option<&TcWindow<'_>>, Option<&std::cell::RefCell<TcWindowReads>>) -> R,
+    ) -> R {
+        let windows = self.windows.borrow();
+        let window = windows.as_ref().and_then(|w| w[space as usize].get(cta as usize)).and_then(Option::as_ref);
+        f(window, self.reads)
     }
 
     /// Drop every window (before a TMEM write).
@@ -952,8 +987,8 @@ mod mem;
 
 pub use mem::{
     ldmatrix_fragments, ldmatrix_plan, stmatrix_plan, stmatrix_writes, tcgen_cp_decode,
-    tcgen_cp_plan, tcgen_ld_dst_count, tcgen_ld_reduce, tcgen_ld_spcompress, tcgen_ldst_map,
-    tcgen_ldst_registers, LdMatrixPlan, MatrixAccess, StMatrixPlan, TcgenCpPlan, TcgenCpWord,
+    tcgen_cp_plan, tcgen_cp_spans, tcgen_ld_dst_count, tcgen_ld_reduce, tcgen_ld_spcompress, tcgen_ldst_map,
+    tcgen_ldst_registers, LdMatrixPlan, MatrixAccess, StMatrixPlan, TcgenCpPlan, TcgenCpSpan, TcgenCpWord,
     TcgenCellRun, TcgenLdRed, TcgenLdstMap, TcgenLdstPiece,
 };
 

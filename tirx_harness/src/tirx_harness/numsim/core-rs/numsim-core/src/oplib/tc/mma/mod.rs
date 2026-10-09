@@ -23,7 +23,7 @@ mod dense;
 
 use std::cell::RefCell;
 
-use super::super::{OpError, OpResult, TcArch, TcMmaIo, TcMmaOptions, TcSmemRead, TcSpace, TcTmemRead, TcTmemWrite};
+use super::super::{OpError, OpResult, TcArch, TcMmaIo, TcMmaOptions, TcSmemRead, TcSpace, TcTmemRead, TcTmemWrite, TcWindow, TcWindowReads};
 use crate::arena::addr;
 use super::mxf4_spellings;
 use crate::program::{TcA, TcMmaKind};
@@ -95,11 +95,16 @@ struct Io<'a> {
     windows: Option<&'a dyn Windows>,
 }
 
+/// A visitor of one live window and the read-note list ([`TcMmaIo::with_window`]).
+type WindowVisit<'f> = dyn FnMut(Option<&TcWindow<'_>>, Option<&RefCell<TcWindowReads>>) + 'f;
+
 /// [`TcMmaIo`] with its arena lifetime erased (it is invariant in it), so
 /// `Io` keeps one lifetime.
 trait Windows {
     fn try_read(&self, space: TcSpace, cta: u32, offset: u64, out: &mut [u8]) -> bool;
     fn release(&self);
+    /// [`TcMmaIo::with_window`] through the erased lifetime.
+    fn with_window_dyn(&self, space: TcSpace, cta: u32, f: &mut WindowVisit<'_>);
 }
 
 impl Windows for TcMmaIo<'_> {
@@ -110,6 +115,10 @@ impl Windows for TcMmaIo<'_> {
     #[inline]
     fn release(&self) {
         TcMmaIo::release(self)
+    }
+    #[inline]
+    fn with_window_dyn(&self, space: TcSpace, cta: u32, f: &mut WindowVisit<'_>) {
+        TcMmaIo::with_window(self, space, cta, |window, reads| f(window, reads))
     }
 }
 
@@ -150,6 +159,36 @@ impl Io<'_> {
             }
             (self.smem)(cta as u32, address, buf).map_err(|error| self.fail(error))
         }
+    }
+
+    /// Run `f` with CTA `cta`'s shared reader: the same per-piece behaviour
+    /// as [`Self::shared`] (window when in bounds and valid, noted when
+    /// observing; else the callback), with the window set borrowed once for
+    /// the whole gather instead of once per piece (perf, W4). Gathers never
+    /// write, so no window is released while `f` runs.
+    fn shared_with<R>(&self, cta: usize, f: impl FnOnce(&mut dyn FnMut(usize, &mut [u8]) -> LibResult<()>) -> R) -> R {
+        let Some(windows) = self.windows else {
+            return f(&mut self.shared(cta));
+        };
+        let mut f = Some(f);
+        let mut out = None;
+        windows.with_window_dyn(TcSpace::Shared, cta as u32, &mut |window, reads| {
+            let mut reader = |offset: usize, buf: &mut [u8]| -> LibResult<()> {
+                let address = self.index(offset, "shared address")?;
+                let window_offset = u64::from(addr::decode_shared(address).1);
+                if window.is_some_and(|window| window.try_read(window_offset, buf)) {
+                    if let Some(reads) = reads {
+                        reads.borrow_mut().push((TcSpace::Shared, cta as u32, window_offset, buf.len() as u64));
+                    }
+                    return Ok(());
+                }
+                (self.smem)(cta as u32, address, buf).map_err(|error| self.fail(error))
+            };
+            if let Some(f) = f.take() {
+                out = Some(f(&mut reader));
+            }
+        });
+        out.expect("with_window_dyn runs its closure once")
     }
 
     fn cell(&self, cta: usize, lane: usize, column: usize) -> LibResult<[u8; 4]> {
@@ -233,6 +272,8 @@ impl Io<'_> {
     ) -> OpResult<Vec<T>> {
         // One CTA: its gather is the result (no second copy).
         let mut values = self.lib(gather(0))?;
+        // One allocation for the group (the CTAs' gathers have equal length).
+        values.reserve(values.len() * cta_group.saturating_sub(1));
         for cta in 1..cta_group {
             values.extend(self.lib(gather(cta))?);
         }
@@ -677,8 +718,76 @@ impl Window {
         Ok(values)
     }
 
+    /// The CTA-pair layout-D lane walk of `cta2_runs`, when no step of it can
+    /// fail: `Some(base_lane, base_column)` iff the layout checks pass, every
+    /// lane is below 128 and every lane's cell run ends inside TMEM, so
+    /// `cta2_runs` + `read_run_f32`/`write_run_f32` would visit `(target,
+    /// base_lane + row, base_column)` with `n` contiguous values for every
+    /// target and row, in that order, without an error (perf, W4: the
+    /// per-lane index vectors and cell checks were ~30 ns per lane).
+    fn cta2_d_lanes(&self, mask: Option<[u32; 8]>) -> Option<(usize, usize)> {
+        if self.cta_group != 2 || mask.is_some_and(|mask| mask.iter().any(|&word| word != 0)) {
+            return None;
+        }
+        let (m, n, layout) = (self.m, self.n, self.layout);
+        if layout != DenseTmemLayout::D || n == 0 || !(m == 128 || m == 256) {
+            return None;
+        }
+        let (base_lane, base_column) = tmem_address(self.taddr, 0, 0).ok()?;
+        let rows_per_cta = m / 2;
+        layout.physical_columns(n).ok()?;
+        layout.location(rows_per_cta - 1, n - 1, rows_per_cta, n).ok()?;
+        (base_lane + rows_per_cta <= addr::TMEM_LANES as usize && base_column + n <= addr::TMEM_COLS as usize)
+            .then_some((base_lane, base_column))
+    }
+
+    /// [`Self::read_f32`] over [`Self::cta2_d_lanes`]: each lane's run is
+    /// served from the CTA's window exactly as `Io::read_tmem` would (window
+    /// when in bounds and valid, noted when observing; else the callback for
+    /// that run), with the window set borrowed once per CTA.
+    fn read_f32_cta2_d(&self, io: &Io<'_>, windows: &dyn Windows, (base_lane, base_column): (usize, usize)) -> OpResult<Vec<f32>> {
+        let (rows, n) = (self.m / 2, self.n);
+        let mut values = vec![f32::NAN; self.m * n];
+        for (target, block) in values.chunks_exact_mut(rows * n).enumerate() {
+            let mut result = Ok(());
+            windows.with_window_dyn(TcSpace::Tmem, target as u32, &mut |window, reads| {
+                for (row, cells) in block.chunks_exact_mut(n).enumerate() {
+                    let (lane, column) = ((base_lane + row) as u32, base_column as u32);
+                    let offset = addr::tmem_byte_offset(lane, column);
+                    let bytes = f32_bytes_mut(cells);
+                    if window.is_some_and(|window| window.try_read(offset, bytes)) {
+                        if let Some(reads) = reads {
+                            reads.borrow_mut().push((TcSpace::Tmem, target as u32, offset, bytes.len() as u64));
+                        }
+                    } else if let Err(error) = (io.tmem_read)(target as u32, lane, column, bytes) {
+                        result = Err(io.fail(error));
+                        return;
+                    }
+                }
+            });
+            io.lib(result)?;
+        }
+        Ok(values)
+    }
+
+    /// [`Self::write_f32`] over [`Self::cta2_d_lanes`]: one write per lane
+    /// in `cta2_runs` order through `Io::write_tmem`.
+    fn write_f32_cta2_d(&self, io: &Io<'_>, tmem_write: TmemWrite<'_>, values: &[f32], (base_lane, base_column): (usize, usize)) -> OpResult {
+        let (rows, n) = (self.m / 2, self.n);
+        for (target, block) in values.chunks_exact(rows * n).enumerate() {
+            for (row, cells) in block.chunks_exact(n).enumerate() {
+                io.lib(io.write_tmem(tmem_write, target as u32, (base_lane + row) as u32, base_column as u32, f32_bytes(cells)))?;
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::read`] of F32 cells (bit-exact `f32::from_le_bytes`), read in place.
     fn read_f32(&self, io: &Io<'_>) -> OpResult<Vec<f32>> {
+        #[cfg(target_endian = "little")]
+        if let (Some(windows), Some(at)) = (io.windows, self.cta2_d_lanes(None)) {
+            return self.read_f32_cta2_d(io, windows, at);
+        }
         let mut values = vec![f32::NAN; self.m * self.n];
         let mut buf = Vec::new();
         if self.cta_group == 1 {
@@ -695,6 +804,10 @@ impl Window {
 
     /// [`Self::write`] of F32 cells (bit-exact `f32::to_le_bytes`), written in place.
     fn write_f32(&self, io: &Io<'_>, tmem_write: TmemWrite<'_>, values: &[f32]) -> OpResult {
+        #[cfg(target_endian = "little")]
+        if let Some(at) = self.cta2_d_lanes(Some(self.mask)).filter(|_| values.len() == self.m * self.n) {
+            return self.write_f32_cta2_d(io, tmem_write, values, at);
+        }
         let mut buf = Vec::new();
         if self.cta_group == 1 {
             io.lib(cta1_runs(self.taddr, self.m, self.n, self.layout, Some(self.mask4()), |lane, column, indices| {

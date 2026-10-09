@@ -423,6 +423,57 @@ pub fn tcgen_cp_plan(
     Ok(plan)
 }
 
+/// One copied `tcgen05.cp` cell in `TcgenCpPlan::pairs` order: the source
+/// span as a shared-window offset (`addr::decode_shared(src.start).1`) and
+/// length, and the destination cell's TMEM byte offset
+/// (`addr::tmem_byte_offset(lane, column)`, always 4 bytes).
+pub type TcgenCpSpan = (u64, u64, u32);
+
+/// [`tcgen_cp_plan`] in the engine's issue form (W13 request, W4): the
+/// plan's pairs with the shared-window and TMEM offsets already applied,
+/// memoized per thread on the same key as the plan (errors are not cached;
+/// a failing request recomputes and fails the same way). The issuing handler
+/// only attaches the per-rank allocations.
+#[allow(clippy::too_many_arguments)]
+pub fn tcgen_cp_spans(
+    rows: u16,
+    bits: u16,
+    multicast: u8,
+    decompress_bits: u8,
+    sdesc: u64,
+    taddr: u32,
+    cta_group: u8,
+    arch: TcArch,
+) -> OpResult<std::rc::Rc<[TcgenCpSpan]>> {
+    type Key = (u16, u16, u8, u8, u64, u32, u8, TcArch);
+    thread_local! {
+        static SPANS: std::cell::RefCell<std::collections::HashMap<Key, std::rc::Rc<[TcgenCpSpan]>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key: Key = (rows, bits, multicast, decompress_bits, sdesc, taddr, cta_group, arch);
+    if let Some(hit) = SPANS.with(|spans| spans.borrow().get(&key).cloned()) {
+        return Ok(hit);
+    }
+    let plan = tcgen_cp_plan_uncached(rows, bits, multicast, decompress_bits, sdesc, taddr, cta_group, arch)?;
+    let (sources, cells) = plan.pairs();
+    let spans: std::rc::Rc<[TcgenCpSpan]> = sources
+        .iter()
+        .zip(&cells)
+        .map(|(source, &(lane, column))| {
+            let offset = u64::from(crate::arena::addr::decode_shared(source.start as u32).1);
+            (offset, source.len, crate::arena::addr::tmem_byte_offset(lane, column) as u32)
+        })
+        .collect();
+    SPANS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key, std::rc::Rc::clone(&spans));
+    });
+    Ok(spans)
+}
+
 /// [`tcgen_cp_plan`] without the per-thread memo.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tcgen_cp_plan_uncached(
@@ -579,6 +630,63 @@ mod cp_plan_cache_tests {
             }
         }
         assert!(ok > 300 && err > 100, "ok {ok} err {err}");
+    }
+
+    /// `tcgen_cp_spans` is the plan's pairs with the handler's offsets
+    /// applied (shared-window offset of the source, TMEM byte offset of the
+    /// cell), first call and repeats, or the plan's error; every key field
+    /// varied in turn (W13's issue form).
+    #[test]
+    fn memoized_cp_spans_equal_mapped_plan_pairs() {
+        let mut seed = 0x5eed_cafe_u64;
+        let mut next = move |bound: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let shapes = [(32_u16, 128_u16, 3_u8), (64, 128, 1), (64, 128, 2), (128, 128, 0), (128, 256, 0), (4, 256, 0), (64, 256, 1)];
+        let mapped = |plan: &TcgenCpPlan| -> Vec<TcgenCpSpan> {
+            let (sources, cells) = plan.pairs();
+            sources
+                .iter()
+                .zip(&cells)
+                .map(|(s, &(lane, column))| {
+                    (u64::from(crate::arena::addr::decode_shared(s.start as u32).1), s.len, crate::arena::addr::tmem_byte_offset(lane, column) as u32)
+                })
+                .collect()
+        };
+        let (mut ok, mut err) = (0, 0);
+        for _ in 0..2000 {
+            let (rows, bits, multicast) = shapes[next(shapes.len() as u64) as usize];
+            let decompress = [0_u8, 0, 4, 6, 5][next(5) as usize];
+            let sdesc = numsim_oplib::tcgen05::encode::encode_matrix_descriptor((next(1 << 10) as u32) << 4, next(64) as i64, next(128) as i64, next(5) as i64);
+            let lane = [0_u32, 0, 32, 64, 96, 100][next(6) as usize];
+            let taddr = (lane << 16) | (next(520) as u32);
+            let group = [1_u8, 2, 1, 3][next(4) as usize];
+            let arch = [TcArch::Sm100, TcArch::Sm103, TcArch::Sm107][next(3) as usize];
+            let base = (rows, bits, multicast, decompress, sdesc, taddr, group, arch);
+            let variants = [
+                base,
+                (rows, bits, multicast ^ 1, decompress, sdesc, taddr, group, arch),
+                (rows, bits, multicast, decompress ^ 4, sdesc, taddr, group, arch),
+                (rows, bits, multicast, decompress, sdesc + 0x10, taddr, group, arch),
+                (rows, bits, multicast, decompress, sdesc, taddr ^ 4, group, arch),
+                (rows, bits, multicast, decompress, sdesc, taddr ^ (32 << 16), group, arch),
+                (rows, bits, multicast, decompress, sdesc, taddr, 3 - group.min(2), arch),
+                (rows, bits, multicast, decompress, sdesc | (1 << 14), taddr, group, TcArch::Sm107),
+                (rows, bits, multicast, decompress, sdesc | (1 << 14), taddr, group, TcArch::Sm100),
+                (rows, bits ^ 384, multicast, decompress, sdesc, taddr, group, arch),
+                (rows ^ 96, bits, multicast, decompress, sdesc, taddr, group, arch),
+            ];
+            for (r, b, m, d, sd, t, g, a) in variants {
+                let want = tcgen_cp_plan_uncached(r, b, m, d, sd, t, g, a).map(|plan| mapped(&plan)).map_err(|e| e.to_string());
+                for _ in 0..2 {
+                    let got = tcgen_cp_spans(r, b, m, d, sd, t, g, a).map(|spans| spans.to_vec()).map_err(|e| e.to_string());
+                    assert_eq!(got, want, "{r}x{b} mc{m} dc{d} sdesc {sd:#x} taddr {t:#x} group {g} {a:?}");
+                }
+                if want.is_ok() { ok += 1 } else { err += 1 }
+            }
+        }
+        assert!(ok > 1000 && err > 1000, "ok {ok} err {err}");
     }
 }
 

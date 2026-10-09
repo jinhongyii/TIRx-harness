@@ -242,6 +242,99 @@ fn tc(c: &mut Criterion) {
     g.finish();
 }
 
+/// The Mega MoE medium MMA through the engine's window path (W4): block-scaled
+/// `kind::mxf8f6f4`, A = e2m1 (padded 16-byte atoms), B = e4m3, cta_group::2,
+/// M=256 N=16 K=32, accumulate. Operands are read through `TcMmaIo` windows
+/// over all-valid allocations (as `sched::run_mma` builds them per MMA, no
+/// observer), the accumulator is written through the callback.
+fn tc_window(c: &mut Criterion) {
+    use numsim_core::arena::{AllocId, BitSet};
+    use numsim_core::program::{CollectorOp, ConstId, Operand, TcA, TcMmaKind as K, TcgenMmaArgs};
+    use numsim_core::sync::completion::TcgenMmaPayload;
+    use numsim_oplib::tcgen05::encode::{encode_block_scaled_instr_descriptor_fields, encode_matrix_descriptor};
+    let (m, n, k) = (256usize, 16usize, 32usize);
+    let row_bytes = 32;
+    let mut smem = vec![0u8; 1 << 16];
+    let mut place = |start: usize, rows: usize, fp4: bool| -> u64 {
+        let (lbo, sbo) = (128usize, 256usize);
+        for row in 0..rows {
+            for b in 0..row_bytes {
+                let v = ((row * 7 + b * 3) % 5) as u8;
+                smem[start + (row % 8) * 16 + (row / 8) * sbo + (b / 16) * lbo + b % 16] = if fp4 { v | (v << 4) } else { v };
+            }
+        }
+        encode_matrix_descriptor(start as u32, (lbo >> 4) as i64, (sbo >> 4) as i64, 0)
+    };
+    let a_desc = place(0x1000, m / 2, true);
+    let b_desc = place(0x9000, n / 2, false);
+    let idesc = encode_block_scaled_instr_descriptor_fields(
+        "float32", "float4_e2m1fn", "float8_e4m3fn", "float8_e8m0fnu", "float8_e8m0fnu", m as i64, n as i64, k as i64, false, false, 2, false, false, false,
+    )
+    .unwrap() as u32;
+    let op = Operand::Const(ConstId(0));
+    let payload = TcgenMmaPayload {
+        args: TcgenMmaArgs {
+            kind: K::MxF8f6f4, cta_group: 2, d: op, a: TcA::Smem(op), b_desc: op, idesc: op, enable_input_d: op,
+            ws: false, ws_b_buffer: 0, block_scale: Some((op, op, 32)), scale_input_d: None, sparse_meta: None,
+            disable_output_lane: Vec::new(), collector_a: CollectorOp::None, collector_b: CollectorOp::None,
+            ashift: false, lut_b: false, lut_b_addr: None, declared: None,
+        },
+        d_taddr: 0, a: a_desc, b_desc, idesc, enable_input_d: true,
+        scale_taddrs: Some((320, 352)), scale_input_d: None, sparse_meta: None, disable_output_lane: Vec::new(),
+        smem: vec![AllocId(0), AllocId(1)], tmem: vec![AllocId(2), AllocId(3)],
+    };
+    let tmem_bytes = 128 * 512 * 4;
+    let smems = [smem.clone(), smem];
+    let smem_valid = BitSet::new(smems[0].len() as u64, true);
+    // Scale tables (columns 320.. and 352..) hold UE8M0 127 = 2^0 in every
+    // byte, so the accumulator stays in the normal range like the real run's.
+    let mut tmem0 = vec![0u8; tmem_bytes];
+    for lane in 0..128 {
+        for col in 320..384 {
+            let off = (lane * 512 + col) * 4;
+            tmem0[off..off + 4].fill(127);
+        }
+    }
+    let tmems = [std::cell::RefCell::new(tmem0.clone()), std::cell::RefCell::new(tmem0)];
+    let tmem_valid = BitSet::new(tmem_bytes as u64, true);
+    let smem_cells: [std::cell::RefCell<Vec<u8>>; 2] = [std::cell::RefCell::new(smems[0].clone()), std::cell::RefCell::new(smems[1].clone())];
+    let valid_cells = [std::cell::RefCell::new(smem_valid), std::cell::RefCell::new(tmem_valid)];
+    let smem_read = |cta: u32, a: u32, out: &mut [u8]| -> oplib::OpResult {
+        let s = a as usize;
+        out.copy_from_slice(&smems[cta as usize][s..s + out.len()]);
+        Ok(())
+    };
+    let tmem_read = |cta: u32, lane: u32, col: u32, out: &mut [u8]| -> oplib::OpResult {
+        let off = (lane as usize * 512 + col as usize) * 4;
+        out.copy_from_slice(&tmems[cta as usize].borrow()[off..off + out.len()]);
+        Ok(())
+    };
+    let options = oplib::TcMmaOptions::default();
+    let mut g = c.benchmark_group("tc_mma_window");
+    g.bench_function("mxf8f6f4_e2m1_e4m3_cta2_m256_n16_k32_mega_moe", |bench| {
+        bench.iter(|| {
+            fn window<'b>(bytes: &'b std::cell::RefCell<Vec<u8>>, valid: &'b std::cell::RefCell<BitSet>) -> oplib::TcWindow<'b> {
+                oplib::TcWindow { bytes: std::cell::Ref::map(bytes.borrow(), |v| &v[..]), valid: valid.borrow() }
+            }
+            let io = oplib::TcMmaIo {
+                windows: std::cell::RefCell::new(Some([
+                    [Some(window(&smem_cells[0], &valid_cells[0])), Some(window(&smem_cells[1], &valid_cells[0]))],
+                    [Some(window(&tmems[0], &valid_cells[1])), Some(window(&tmems[1], &valid_cells[1]))],
+                ])),
+                reads: None,
+            };
+            let mut tmem_write = |cta: u32, lane: u32, col: u32, data: &[u8]| -> oplib::OpResult {
+                let off = (lane as usize * 512 + col as usize) * 4;
+                tmems[cta as usize].borrow_mut()[off..off + data.len()].copy_from_slice(data);
+                Ok(())
+            };
+            oplib::tc_mma_ctas(black_box(&payload), &options, &smem_read, &tmem_read, &mut tmem_write, Some(&io))
+                .unwrap_or_else(|e| panic!("mega moe window mma: {e}"));
+        })
+    });
+    g.finish();
+}
+
 /// `resolve_ptx` itself (load-time cost per op), warp collectives the
 /// dispatched tile reductions use (`shfl.sync`, `redux`).
 fn dispatch(c: &mut Criterion) {
@@ -345,6 +438,31 @@ fn tma(c: &mut Criterion) {
             black_box(plan.pairs())
         })
     });
+    // The issue form W13's handler builds today (plan + pairs + per-pair
+    // shared-window / TMEM offsets) against the memoized `tcgen_cp_spans`.
+    g.bench_function("issue_spans_via_plan_pairs_32x128b_warpx4", |b| {
+        b.iter(|| {
+            stage = (stage + 1) % 8;
+            let sdesc = numsim_oplib::tcgen05::encode::encode_matrix_descriptor((0x2000 + stage * 0x800) as u32, 8, 64, 0);
+            let plan = oplib::tcgen_cp_plan(32, 128, 3, 0, sdesc, 0x40 + 4 * stage as u32, 1, oplib::TcArch::Sm100).unwrap();
+            let (sources, cells) = plan.pairs();
+            let spans: Vec<(u64, u64, u32)> = sources
+                .iter()
+                .zip(&cells)
+                .map(|(s, &(lane, col))| {
+                    (u64::from(numsim_core::arena::addr::decode_shared(s.start as u32).1), s.len, numsim_core::arena::addr::tmem_byte_offset(lane, col) as u32)
+                })
+                .collect();
+            black_box(spans)
+        })
+    });
+    g.bench_function("issue_spans_memoized_32x128b_warpx4", |b| {
+        b.iter(|| {
+            stage = (stage + 1) % 8;
+            let sdesc = numsim_oplib::tcgen05::encode::encode_matrix_descriptor((0x2000 + stage * 0x800) as u32, 8, 64, 0);
+            black_box(oplib::tcgen_cp_spans(32, 128, 3, 0, sdesc, 0x40 + 4 * stage as u32, 1, oplib::TcArch::Sm100).unwrap())
+        })
+    });
     g.finish();
     let mut g = c.benchmark_group("tcgen_ldst");
     g.bench_function("map_32x32b_x64", |b| {
@@ -353,5 +471,5 @@ fn tma(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, tir, ptx, tc, tma, dispatch);
+criterion_group!(benches, tir, ptx, tc, tc_window, tma, dispatch);
 criterion_main!(benches);

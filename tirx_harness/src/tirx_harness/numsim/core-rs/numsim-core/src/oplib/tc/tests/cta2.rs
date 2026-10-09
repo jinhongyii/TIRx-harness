@@ -311,3 +311,64 @@ fn cta2_mxf4_block_scaled() {
     }
     assert_eq!(read_pair(&mut machine, m, n, f32::from_le_bytes), expected);
 }
+
+/// The CTA-pair layout-D accumulator lane walk (W4 fast path): accumulate
+/// over a D whose lanes are partly absent in each CTA (those pieces are not
+/// window-servable and go to the callback), the same MMA with D placed so
+/// its run would cross the TMEM end (error, both paths), and at a non-zero
+/// base column. `run` checks the window path against the callbacks under
+/// every validity mix; the values are checked against the hand reference.
+#[test]
+fn cta2_mxf8f6f4_accumulates_over_partial_d() {
+    let (m, n, k) = (256, 16, 32);
+    let rows = m / 2;
+    let mut machine = Machine::new();
+    let (mut a_desc, mut b_desc) = (0, 0);
+    for cta in 0..2 {
+        machine.on(cta as u32);
+        a_desc = machine.place(0x1000, rows, k, |r, kk| f32_to_float8_e4m3fn_bits(a_val(cta * rows + r, kk)));
+        b_desc = machine.place(0x8000, n / 2, k, |r, kk| f32_to_float8_e4m3fn_bits(b_val(cta * n / 2 + r, kk)));
+        place_replicated_scales(&mut machine, SFA_COL, rows, |_| 127);
+        place_replicated_scales(&mut machine, SFB_COL, n, |_| 127);
+    }
+    let idesc = encode_block_scaled_instr_descriptor_fields(
+        "float32", "float8_e4m3fn", "float8_e4m3fn", "float8_e8m0fnu", "float8_e8m0fnu",
+        m as i64, n as i64, k as i64, false, false, 2, false, false, false,
+    )
+    .unwrap() as u32;
+    let mut p = cta2(payload(TcMmaKind::MxF8f6f4, TcA::Smem(op()), a_desc, b_desc, idesc, true));
+    p.args.block_scale = Some((op(), op(), 32));
+    p.scale_taddrs = Some((SFA_COL, SFB_COL));
+    let product = reference(m, n, k, |_, _| 0.0);
+    for base_column in [D_COL, D_COL + 8] {
+        p.d_taddr = base_column;
+        // Initial D: element (i, j) = i - j, except lanes 3, 40 and 77 of
+        // CTA 0 and lane 100 of CTA 1, which are absent (read as zero).
+        let absent = |cta: usize, lane: usize| matches!((cta, lane), (0, 3 | 40 | 77) | (1, 100));
+        for cta in 0..2 {
+            machine.on(cta as u32);
+            for lane in 0..rows {
+                for j in 0..n {
+                    let at = (lane as u32, base_column + j as u32);
+                    if absent(cta, lane) {
+                        machine.tmem.remove(&(cta as u32, at.0, at.1));
+                    } else {
+                        machine.set(at.0, at.1, ((cta * rows + lane) as f32 - j as f32).to_le_bytes());
+                    }
+                }
+            }
+        }
+        machine.run(&p).unwrap();
+        for i in 0..m {
+            let (cta, lane) = (i / rows, i % rows);
+            for j in 0..n {
+                let initial = if absent(cta, lane) { 0.0 } else { i as f32 - j as f32 };
+                let got = f32::from_le_bytes(machine.on(cta as u32).get(lane as u32, base_column + j as u32).unwrap());
+                assert_eq!(got.to_bits(), (initial + product[i * n + j]).to_bits(), "column {base_column} ({i}, {j})");
+            }
+        }
+    }
+    // D crossing the TMEM end: the general walk's error, on both paths.
+    p.d_taddr = addr::TMEM_COLS - 8;
+    assert_eq!(machine.run(&p).unwrap_err().kind, OpErrorKind::Invalid);
+}

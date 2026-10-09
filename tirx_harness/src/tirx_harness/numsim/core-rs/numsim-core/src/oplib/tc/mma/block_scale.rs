@@ -340,21 +340,37 @@ fn replicated_scales_fast(
         served.clear();
         served.resize(rows * replicas, false);
         let mut run = [0_u8; 4 * 64];
-        for l in 0..lanes_used {
-            let count = (rows - l).div_ceil(32);
-            if count > 64 {
-                continue;
-            }
-            for replica in 0..replicas {
-                let lane = base_lane + 32 * replica + l;
-                if io.try_window_tmem(cta as u32, lane as u32, base_column as u32, &mut run[..4 * count]) {
-                    for t in 0..count {
-                        let index = (l + 32 * t) * replicas + replica;
-                        bytes[index] = run[4 * t + scale_id];
-                        served[index] = true;
+        // Every `(lane, replica)` run as `Io::try_window_tmem` would serve it,
+        // with the window set borrowed once (perf, W4).
+        let mut serve = |window: Option<&TcWindow<'_>>, reads: Option<&RefCell<TcWindowReads>>| {
+            let Some(window) = window else { return };
+            for l in 0..lanes_used {
+                let count = (rows - l).div_ceil(32);
+                if count > 64 {
+                    continue;
+                }
+                for replica in 0..replicas {
+                    let lane = base_lane + 32 * replica + l;
+                    let piece = &mut run[..4 * count];
+                    let in_lane = lane < addr::TMEM_LANES as usize
+                        && base_column < addr::TMEM_COLS as usize
+                        && base_column * 4 + piece.len() <= addr::TMEM_COLS as usize * 4;
+                    let offset = addr::tmem_byte_offset(lane as u32, base_column as u32);
+                    if in_lane && window.try_read(offset, piece) {
+                        if let Some(reads) = reads {
+                            reads.borrow_mut().push((TcSpace::Tmem, cta as u32, offset, piece.len() as u64));
+                        }
+                        for t in 0..count {
+                            let index = (l + 32 * t) * replicas + replica;
+                            bytes[index] = run[4 * t + scale_id];
+                            served[index] = true;
+                        }
                     }
                 }
             }
+        };
+        if let Some(windows) = io.windows {
+            windows.with_window_dyn(TcSpace::Tmem, cta as u32, &mut serve);
         }
         for row in 0..rows {
             for replica in 0..replicas {
@@ -457,8 +473,8 @@ fn gather_mxf8f6f4(
         None => {
             io.lib(validate_f8_gather(cg, k, format, transpose))?;
             io.per_cta(cg, |cta| {
-                gather_f8_rows(
-                    &mut io.shared(cta),
+                io.shared_with(cta, |mut read| gather_f8_rows(
+                    &mut read,
                     WINDOW,
                     descriptor,
                     rows_per_cta,
@@ -468,7 +484,7 @@ fn gather_mxf8f6f4(
                     transpose,
                     None,
                     padded_atoms,
-                )
+                ))
             })?
         }
     };

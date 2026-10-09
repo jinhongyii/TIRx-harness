@@ -373,3 +373,59 @@ Whole-run CPU A/B at this size is within host noise (about +/-1 s).
   (22 -> 34 ns).
 - *Floor-division fast path.* A pre-checked check-free floor div/mod was slower than the
   per-active-lane checked loop (75 -> 119 ns).
+
+## Mega MoE MMA re-profile and window walk (W4, 2026-10-09, HEAD 8ab6a62)
+
+**Profile.** The Mega MoE medium MMA was profiled at 1 worker; the max config is too slow to instrument at 1 worker. Every medium MMA has the same shape: `kind::mxf8f6f4` block-scaled, cta_group::2, M=256 N=16 K=32, A = e2m1 (shared, padded atoms), B = e4m3, accumulate on 98%.
+
+**Fallbacks.** Per-piece window fallback counters show 0 fallbacks: all 60.2 M shared and 70.3 M TMEM pieces are window-served. The remaining cost is per-piece code and memory, not callback fallbacks.
+
+**New bench row.** `tc_mma_window/mxf8f6f4_e2m1_e4m3_cta2_m256_n16_k32_mega_moe` runs this MMA through `TcMmaIo` windows over all-valid allocations. Its piece counts match medium (544 shared and 640 TMEM pieces per MMA). The scale tables hold 2^0, so the accumulator stays normal. Before this fix the all-zero scales made it subnormal.
+
+**Attribution method.** Cumulative stubbing with a minimum-of-6000 timer pinned to one core. The host alternates between two speed states, about 39 and 44 µs for HEAD, so A/Bs compare runs in the same state.
+
+HEAD split (44 µs state):
+
+| part | time |
+| --- | --- |
+| A element gather | about 12 µs |
+| A scale reads | about 7 µs |
+| D read | about 8 µs, compute-bound: about 30 ns per lane of index vectors, cell checks and per-piece window borrow |
+| FMA kernel | about 3 µs, at throughput |
+| D write | about 3.5 µs |
+| B gather | the rest |
+
+**Changes.** All are exact.
+1. **CTA-pair layout-D accumulator walk.** It is used only when every check of the general walk passes. Each lane run is served exactly as `Io::read_tmem` would serve it (window when in bounds and valid, noted when observing; else the callback for that run), with the window set borrowed once per CTA. Writes go one call per lane through `Io::write_tmem`.
+2. **Gather shared reader.** `Io::shared_with` borrows the shared window once per CTA gather. Each piece behaves as `Io::shared`.
+3. **Replicated scale runs.** These are served under one window borrow.
+4. **Fixed-size window copies.** `TcWindow::try_read` uses fixed-size copies for 4/8/16/32/64-byte pieces.
+5. **E2M1 decode.** It uses a byte -> pair-of-values table built from `float4_e2m1fn_bits_to_f32`.
+6. **`Io::per_cta`.** It reserves the group's output once.
+
+**Guards.**
+- The window/callback equality harness covers every mix: same result, TMEM and coalesced pieces. The new test is `cta2_mxf8f6f4_accumulates_over_partial_d`: lanes absent in either CTA, a non-zero base column, and D crossing the TMEM end.
+- `atom_decoder_matches_decode_shared_atom` covers decode.
+- These mutations fail the tests: no read note on the D walk or in `shared_with`; a wrong fallback column or address; a weakened precheck; ignoring validity in the D walk or in the scale runs; a wrong E2M1 high nibble. A wrong write column is caught too.
+
+**Results.**
+
+| | HEAD | after |
+| --- | --- | --- |
+| bench row, min-of-N pinned (fast state) | 38.9-39.1 us | 25.0-25.4 us (1.55x) |
+| bench row, min-of-N pinned (slow state) | 44.0-44.2 us | 28.5-29.0 us (1.53x) |
+| medium `run_mma`, 1 worker, median of 3 interleaved | 6.31 s | 4.75 s (1.33x) |
+| of which D read / D write | 1.16 / 1.13 s | 0.40 / 0.48 s |
+| of which operand gather | 1.93 s | 1.67 s |
+| process wall | 21.0 s | 19.7 s |
+
+In the engine, the scale reads did not move: 1.17 s -> 1.23 s, within noise. They are bound by TMEM's lane-strided layout, where every scale run is its own 2 KB-apart line plus validity word.
+
+**Measured negatives, not kept.**
+- **8-row FMA tiles for N < 64.** Within noise; the AVX-512 kernel is at throughput.
+- **A warm-up pass touching the D lanes before the read.** No gain; D read was compute-bound.
+- **Malloc trim and top-pad settings.** No per-call page faults.
+
+Conformance 304 passed. Output digests of 16 MMA-heavy cases are identical to 8ab6a62 at 1/8/32.
+
+**`tcgen_cp_spans`.** The memoized issue form W13 asked for: the plan's pairs with the shared-window and TMEM offsets applied. Bench `tcgen_cp/issue_spans_memoized_32x128b_warpx4` is 76 ns, against 1.66 µs for `..._via_plan_pairs_...`, which is plan + pairs + mapping as the handler does it today (21.8x). The handler adopts it at W13's discretion. The guard is `memoized_cp_spans_equal_mapped_plan_pairs`, which varies every key field.
