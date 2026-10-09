@@ -1082,6 +1082,11 @@ not, and must order everything it would.
 8. **Scope-filtered arrivals.** A `.cta` waiter does not acquire a remote
    `.release.cluster` arrival (R4, `ScopeMismatch`). It must not acquire the
    token either.
+9. **Tensormap path.** `fence.proxy.tensormap::generic.release` snapshots
+   `hb` into `tmap_rel`, and the acquire moves it into `g2t` ranges. That
+   path carries the raw completion, so the token must travel with it.
+   Re-attribution v1's a2g/hb stamp rules were checked on barrier payloads
+   and release heads only (`c3_*`, `a3_*`), not on this path.
 
 Existing guards that must keep passing:
 - `racecheck_reattribution` (C1, F1, F2, C3, a3);
