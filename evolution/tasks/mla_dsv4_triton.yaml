@@ -1,0 +1,70 @@
+name: mla_dsv4_triton
+# Ablation language cell: mla_dsv4 written in Triton.
+workload_dir: candidates/mla_dsv4
+kernel_authoring: task
+sota_baseline:
+  name: trtllm_batch_decode_sparse_mla_dsv4
+bench_timeout_s: 300
+banned_paths:
+  # tirx_kernels ships this workload's own TIRx solution.
+  - tirx-kernels/tirx_kernels/mla/**
+  - tirx-kernels/tirx_kernels/bench_suite/config/mla/**
+  - tirx-kernels/tests/test_mla_numerics.py
+spec: |
+  Implement DeepSeek-V4 sparse MLA on B200 (sm_100) and beat the packaged
+  flashinfer.decode.trtllm_batch_decode_sparse_mla_dsv4 baseline with PDL
+  disabled.
+
+  A single 512-dimensional latent is both key and value. Inputs, in order:
+    query [Q,H,512] for packed varlen queries, or [B,L,H,512] for dense queries;
+    swa_kv_cache [Ps,1,256,512] in HND or [Ps,256,1,512] in NHD;
+    compressed_kv_cache [Pc,1,C,512] in HND or [Pc,C,1,512] in NHD,
+      with C in {64,2}, or None when compressed tokens are absent;
+    sparse_indices int32[Q,K], sparse_topk_lens int32[Q],
+    seq_lens int32[B], cum_seq_lens_q int32[B+1], max_q_len int32 scalar,
+    sinks fp32[H], bmm1_scale fp32 scalar, bmm2_scale fp32 scalar,
+    kv_layout string ('HND' or 'NHD').
+  Query and latent pools share bf16 or fp8_e4m3fn dtype; fp8 values use no
+  additional tensor scale. Q is the total number of query tokens, B*L in
+  dense mode, where cum_seq_lens_q and max_q_len are both None. Output is
+  bf16 in query's shape, including the four-dimensional dense case.
+
+  Columns 0..127 of sparse_indices address flattened SWA token rows;
+  columns 128..K-1 address flattened compressed rows. A slot participates
+  only if its index is nonnegative and its column is below
+  sparse_topk_lens[t], which includes the 128 SWA slots. A flattened index
+  maps to page=index//page_size and offset=index%page_size. The index table
+  already encodes each request's SWA window; -1 is padding.
+  For each token/head, score_j=bmm1_scale*dot(query,latent_j). Normalize
+  exp(score_j) by sum_j exp(score_j)+exp(sinks[h]); the sink contributes no
+  value. Return bmm2_scale times the probability-weighted latent sum,
+  cast to bf16. No active slots means zeros. Official scales are
+  bmm1_scale=512**-0.55 and bmm2_scale=1.
+
+  The pinned task contains 94 rows: 84 decode rows covering H in
+  {8,16,32,64,128}, SWA-only and two compressed-pool modes, both dtypes
+  and layouts; two guard rows including dense queries; and eight varlen
+  prefill-style rows. Follow the combinations in workload.jsonl.
+  Query, KV noise and sink random amplitudes are 0.05. SWA/compressed KV
+  values add offsets -0.20/+0.25 and are clamped to [-1,1] before the
+  row's dtype/layout conversion. Each row keeps its published seed.
+
+  Version contract: solution.py exports setup(data, Q, K) -> callable. data
+  contains all twelve inputs and preallocated output. setup may compile,
+  allocate scratch, and execute one warmup call. Every timed invocation
+  must consume current indices, lengths, pools and sinks, perform any
+  data-dependent preparation, and overwrite output. The adapter returns
+  (data['output'],). Do not call FlashInfer, PyTorch tensor operators,
+  or existing solutions for production computation.
+
+  Correctness uses the independent fp32 sparse-attention oracle's bf16
+  output. Both outputs are cast to fp32 for PyTorch's additive
+  atol+rtol*abs(reference) comparison on every element: bf16 inputs use
+  atol=8e-4, rtol=2e-2; fp8 inputs use atol=rtol=0.1.
+  Normalized RMS error must also be below 0.2, unless the maximum
+  absolute error is at most 1e-6.
+  Repeated checks and output poisoning
+  remain enabled. The adapter scores all 94 official rows. Scoring is
+  baseline latency / candidate latency, higher is better.
+
+  Implementation language: write the kernels in Triton.

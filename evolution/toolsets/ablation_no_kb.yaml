@@ -1,0 +1,13 @@
+name: ablation_no_kb
+# Ablation: our tools without the knowledge base. Setup also removes every
+# installed tirx_kernels entry except the TIRx-lite language package; the
+# agent may still read the TIRx-lite and TIRx compiler sources directly.
+our_tools: true
+knowledge_base: false
+skills:
+  - ncu-report-skill
+  - tirx-debug-kernel
+  - tirx-profile-kernel
+banned_paths:
+  - tools/tests/**
+  - docs/**

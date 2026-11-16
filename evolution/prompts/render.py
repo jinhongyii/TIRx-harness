@@ -37,7 +37,22 @@ def kernel_authoring_contract(task: Task) -> str:
     raise ValueError(f"unsupported kernel authoring mode: {task.kernel_authoring!r}")
 
 
-def kernel_search_references(task: Task) -> str:
+def _uses_our_tools(task: Task, toolset: Toolset) -> bool:
+    """Our tools (NumSim, Synccheck, Racecheck, dump-source) only apply to TIRx-lite."""
+    return task.kernel_authoring == "TIRx-lite" and toolset.our_tools
+
+
+def _require_knowledge_base_for_task_language(task: Task, toolset: Toolset) -> None:
+    if task.kernel_authoring == "task" and not toolset.knowledge_base:
+        raise ValueError("a task-defined language requires the knowledge base")
+
+
+def kernel_search_references(task: Task, toolset: Toolset) -> str:
+    _require_knowledge_base_for_task_language(task, toolset)
+    if task.kernel_authoring == "TIRx-lite" and not toolset.knowledge_base:
+        return """\
+The installed `tirx_kernels.tirx_lite` package and the TIRx compiler sources
+are the reference for the language; read them directly when needed."""
     if task.kernel_authoring == "TIRx-lite":
         return """\
 One deliberate source of invention: survey the PTX ISA manual in
@@ -59,11 +74,24 @@ a kernel written in another authoring stack."""
     raise ValueError(f"unsupported kernel authoring mode: {task.kernel_authoring!r}")
 
 
-def kernel_research_debugging_contract(task: Task) -> str:
-    if task.kernel_authoring == "TIRx-lite":
-        return """\
-- Proactively use `tirx-wiki` to research relevant TIRx-lite/TIRx APIs, canonical
-  kernels, optimization guidance, and PTX/GPU semantics.
+def kernel_research_debugging_contract(task: Task, toolset: Toolset) -> str:
+    _require_knowledge_base_for_task_language(task, toolset)
+    if task.kernel_authoring not in ("TIRx-lite", "task"):
+        raise ValueError(f"unsupported kernel authoring mode: {task.kernel_authoring!r}")
+    bullets = []
+    if task.kernel_authoring == "TIRx-lite" and toolset.knowledge_base:
+        bullets.append(
+            "- Proactively use `tirx-wiki` to research relevant TIRx-lite/TIRx APIs, canonical\n"
+            "  kernels, optimization guidance, and PTX/GPU semantics."
+        )
+    elif task.kernel_authoring == "task":
+        bullets.append(
+            "- Proactively use `KernelWiki` to research the selected implementation stack,\n"
+            "  permitted canonical examples, optimization guidance, and PTX/GPU semantics."
+        )
+    if _uses_our_tools(task, toolset):
+        bullets.append(
+            """\
 - For each major optimization direction, invoke `tirx-profile-kernel`; benchmark
   and profile with IKET, add NCU when needed, preserve artifacts, and rerun after
   the change.
@@ -72,35 +100,40 @@ def kernel_research_debugging_contract(task: Task) -> str:
   applicable TIRx correctness tools and the normal benchmark correctness check.
 - If a performance change affects synchronization or shared state, use both
   operational skills. Reading guides or suggesting commands is not evidence."""
-    if task.kernel_authoring == "task":
-        return """\
-- Proactively use `KernelWiki` to research the selected implementation stack,
-  permitted canonical examples, optimization guidance, and PTX/GPU semantics.
+        )
+    else:
+        bullets.append(
+            """\
 - For each major optimization direction, benchmark and profile the authored
   kernel directly with IKET. Add `ncu-report-skill` and NCU when hardware
-  counters are needed. Preserve artifacts and rerun after the change."""
-    raise ValueError(f"unsupported kernel authoring mode: {task.kernel_authoring!r}")
+  counters are needed. Preserve artifacts and rerun after the change.
+- Use Compute Sanitizer and the normal benchmark correctness check for
+  failures, suspect results, or changes affecting synchronization,
+  cross-thread-visible memory, or numerical behavior."""
+        )
+    return "\n".join(bullets)
 
 
-def kernel_remote_gpu_work(task: Task) -> str:
-    if task.kernel_authoring == "TIRx-lite":
+def kernel_remote_gpu_work(task: Task, toolset: Toolset) -> str:
+    if _uses_our_tools(task, toolset):
         return (
             "your own correctness runs and timing experiments, the IKET and NCU\n"
             "profiles `tirx-profile-kernel` prescribes, device-side debugging such as\n"
             "Compute Sanitizer"
         )
-    if task.kernel_authoring == "task":
+    if task.kernel_authoring in ("TIRx-lite", "task"):
         return (
             "your own correctness runs and timing experiments, direct IKET profiles,\n"
-            "and NCU profiles requested through `ncu-report-skill`"
+            "NCU profiles requested through `ncu-report-skill`, device-side debugging\n"
+            "such as Compute Sanitizer"
         )
     raise ValueError(f"unsupported kernel authoring mode: {task.kernel_authoring!r}")
 
 
-def kernel_remote_local_checks(task: Task) -> str:
-    if task.kernel_authoring == "TIRx-lite":
+def kernel_remote_local_checks(task: Task, toolset: Toolset) -> str:
+    if _uses_our_tools(task, toolset):
         return "Pre-GPU checks (Synccheck, Racecheck, NumSim) need no GPU and stay local."
-    if task.kernel_authoring == "task":
+    if task.kernel_authoring in ("TIRx-lite", "task"):
         return "Checks that do not execute CUDA work stay local."
     raise ValueError(f"unsupported kernel authoring mode: {task.kernel_authoring!r}")
 

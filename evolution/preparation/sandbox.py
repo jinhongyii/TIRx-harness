@@ -105,14 +105,14 @@ def up(
     environment = Environment.create(worktree)
     # Check now: the reference fetch below also removes these paths from the venv.
     _warn_unmatched_bans(environment.site_packages, environment.kernel_bans(effective.banned_paths))
+    installed_bans = environment.kernel_bans(effective.banned_paths) + environment.ablation_bans(
+        our_tools=effective.our_tools, knowledge_base=effective.knowledge_base
+    )
     effective = replace(
         effective,
         # Hooks match paths inside the worktree relative to that root.
         banned_paths=effective.banned_paths
-        + [
-            str(Path(path).relative_to(worktree))
-            for path in environment.kernel_bans(effective.banned_paths)
-        ],
+        + [str(Path(path).relative_to(worktree)) for path in installed_bans],
     )
     install_skills(worktree, effective)
     install_toolsets(worktree, effective)

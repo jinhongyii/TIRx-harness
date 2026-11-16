@@ -1,0 +1,13 @@
+name: ablation_no_tools
+# Ablation: knowledge base without our tools. Used by the TIRx-lite "no tools"
+# cell and by every non-TIRx language cell (our tools apply only to TIRx).
+# Setup also removes tirx_harness and its console script from the run venv.
+# NCU, Compute Sanitizer and IKET stay available.
+our_tools: false
+knowledge_base: true
+skills:
+  - KernelWiki
+  - ncu-report-skill
+  - tirx-wiki
+banned_paths:
+  - tools/**

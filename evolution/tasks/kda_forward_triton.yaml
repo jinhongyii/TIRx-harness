@@ -1,0 +1,109 @@
+name: kda_forward_triton
+# Ablation language cell: kda_forward written in Triton.
+workload_dir: candidates/kda/forward
+kernel_authoring: task
+sota_baseline:
+  name: flash_kda_chunk_kda
+bench_timeout_s: 600
+banned_paths:
+  - tirx-kernels/tirx_kernels/kda/**
+  - tirx-kernels/tirx_kernels/ported/flashinfer/kda/**
+  - tirx-kernels/.agents/sketch/flashinfer/kda/**
+  # Same-language near-solutions for this cell.
+  - .claude/skills/tirx-wiki/references/repos/flash-linear-attention/fla/ops/kda/**
+  - .agents/skills/tirx-wiki/references/repos/flash-linear-attention/fla/ops/kda/**
+  - .claude/skills/tirx-wiki/references/repos/flash-linear-attention/fla/layers/kda.py
+  - .agents/skills/tirx-wiki/references/repos/flash-linear-attention/fla/layers/kda.py
+  - site-packages/fla/ops/kda/**
+  - site-packages/fla/layers/kda.py
+spec: |
+  Implement Kimi Delta Attention FORWARD on B200 (sm_100) and beat
+  FlashKDA's fused CUTLASS backend on GPU-only latency.
+
+  This is packed-varlen KDA with outer batch B=1, total tokens T=8192,
+  H heads, and K=V=128. The benchmark uses KDA-internal's six shapes:
+  H is 96 or 64, and each head count is crossed with
+    - fixed: one sequence of 8192 tokens (cu_seqlens=None),
+    - mixed_varlen: lengths [1300, 547, 2048, 963, 271, 3063], and
+    - uniform_varlen: eight sequences of 1024 tokens.
+  Each shape is scored with two input configurations, for 12 cases total:
+    - standard: the original random gate inputs, with A_log=log(U(1,16))
+      and dt_bias derived from log-uniform dt in [0.001, 0.1];
+    - saturated: A_log=log(16), dt_bias=0, and g=3 in every element.
+  Both configurations use identical q/k/v, beta, and initial_state inputs.
+  All 12 cases must pass correctness. The score is the geometric mean of
+  their 12 speedups against the live FlashKDA baseline on the same inputs.
+
+  Inputs are q/k/v/g bf16[1,T,H,128], raw update logits beta bf16[1,T,H],
+  A_log fp32[H], flattened dt_bias fp32[H*128], scalar fp32
+  scale=1/sqrt(128), per-sequence initial_state fp32[N,H,128,128], and
+  cu_seqlens int64[N+1] for packed varlen cases or None for the fixed case.
+  There are two scored outputs: output bf16[1,T,H,128], and final_state
+  fp32[N,H,128,128] holding each packed sequence's recurrent state after its
+  last token, in the same V-first layout as initial_state. Each packed sequence
+  starts from its own supplied state; state must never cross a cu_seqlens
+  boundary. The timed baseline also produces the final state, so the state
+  epilogue is work both sides pay for.
+
+  Immutable math, independently for each sequence n and head h, in fp32
+  conceptually, starts from the corresponding initial_state[n,h]:
+    qhat_t = q_t / sqrt(sum_k(q_t[k]^2) + 1e-6)
+    khat_t = k_t / sqrt(sum_k(k_t[k]^2) + 1e-6)
+    log_decay_t[k] =
+        -5 * sigmoid(exp(A_log[h]) * (fp32(g_t[k]) + dt_bias[h*128+k]))
+    update_t = sigmoid(fp32(beta_t))
+    decayed_t[k,v] = exp(log_decay_t[k]) * state_{t-1}[k,v]
+    residual_t[v] = fp32(v_t[v]) - sum_k(khat_t[k] * decayed_t[k,v])
+    state_t[k,v] =
+        decayed_t[k,v] + update_t * khat_t[k] * residual_t[v]
+    output_t[v] = bf16(scale * sum_k(qhat_t[k] * state_t[k,v]))
+  Tokens are causally ordered within each sequence. Physical state layout,
+  chunk size, fusion, recomputation, and number of kernels are implementation
+  choices.
+
+  Version contract: solution.py exports setup(data, B, T, H) -> callable, where
+  B is always 1 and T is total packed tokens. data contains
+  q/k/v/g/beta/A_log/dt_bias/scale/initial_state/cu_seqlens and preallocated
+  output and final_state buffers. setup may compile, allocate scratch, and
+  execute one complete warmup call. Every returned-callable invocation must
+  consume the raw inputs, overwrite every element of BOTH output and
+  final_state, and include all normalization, gate, beta,
+  recurrent-state initialization, packed-sequence boundary handling, and
+  recurrence work in the timed path. No PyTorch, FlashKDA, FLA, or host-side
+  tensor transformation may perform production computation.
+
+  Correctness matches KDA-internal's authoritative judge. The reference is
+  FLA's Triton chunk_kda (FLA_FLASH_KDA=0), independently of the timed
+  FlashKDA baseline. Every element of both outputs must pass rtol=0.05 and an
+  absolute tolerance of 0.5 times that output's reference RMS, so the bf16
+  output and the order-one fp32 state
+  are held to the same relative standard. The normalized RMS error ratio
+  RMS(candidate-reference)/(RMS(reference)+1e-8) must stay below 0.03 for each
+  output. Returned tensors must be densely materialized with the reference's
+  dtype, device and count: a candidate that returns only output fails outright.
+  The suite also uses repeated output-poisoning checks.
+
+  Beyond the 12 scored cases the suite gates on correctness-only probes that
+  are never timed and never enter the geomean. They must all pass:
+    - ten stress probes across seven regimes at the operator's numerical edge:
+      saturated (every channel at the -5 gate floor, 461.7 bits of decay per
+      64-token chunk),
+      strong (A_log=dt_bias=0, about 231 bits per chunk), mixed_depth (half the
+      channels of every head saturated), switch (alternating saturated and
+      realistic 128-token bands), boundary (a constant 2.72 bits per token, 174
+      bits per chunk), correlated (one repeated unit key and query with
+      beta~0.95 and no decay), and random_depth (FLA's own KDA test recipe);
+    - two exact probes checked against an fp64 token-by-token recurrence rather
+      than any production kernel, on sequence lengths that are not multiples of
+      the 64-token chunk;
+    - a salted private holdout whose shapes, deep-gate modes and key modes
+      follow the judge's, on token counts that are not 64-aligned.
+  The correlated and repeated-key probes are ill-conditioned by construction
+  and use a looser 0.15 relative-L2 bound.
+
+  An optimization must therefore be correct for the whole operator, not only
+  for realistic gate inputs: a factorisation whose exponents overflow at deep
+  decay fails these probes even when all 12 scored cases pass.
+  The adapter fixes this task to all 12 cases plus every probe above.
+
+  Implementation language: write the kernels in Triton.

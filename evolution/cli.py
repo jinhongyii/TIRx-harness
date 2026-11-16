@@ -47,7 +47,7 @@ RUNS_ROOT = REPO_ROOT / "kda_flow_runs"
 PROMPT_TEMPLATE = PACKAGE_DIR / "prompts" / "PROMPT.md"
 REMOTE_TEMPLATE = PACKAGE_DIR / "prompts" / "PROMPT_remote.md"
 BENCH_SERVER_URL = "http://127.0.0.1:61886"
-TOOLSET_NAME = "kda_flow"
+DEFAULT_TOOLSET = "kda_flow"
 FLOWVERSE_CONFIG_NAME = "flowverse.yaml"
 
 
@@ -80,8 +80,8 @@ def _prompt(
             REMOTE_TEMPLATE,
             bench_server_url=remote_url,
             worktree=str(worktree),
-            remote_gpu_work=kernel_remote_gpu_work(task),
-            remote_local_checks=kernel_remote_local_checks(task),
+            remote_gpu_work=kernel_remote_gpu_work(task, toolset),
+            remote_local_checks=kernel_remote_local_checks(task, toolset),
         ).rstrip("\n")
     else:
         environment_blocks.append("2. " + blocks["gpu"])
@@ -93,8 +93,8 @@ def _prompt(
         workload_dir=task.workload_dir,
         worktree=str(worktree),
         kernel_authoring_contract=kernel_authoring_contract(task),
-        kernel_search_references=kernel_search_references(task),
-        kernel_research_debugging_contract=kernel_research_debugging_contract(task),
+        kernel_search_references=kernel_search_references(task, toolset),
+        kernel_research_debugging_contract=kernel_research_debugging_contract(task, toolset),
         bench_command=bench_command,
         bench_environment=bench_environment,
         bench_remote_section=remote_section,
@@ -107,6 +107,7 @@ def setup(
     task_name: str,
     remote_url: str | None = None,
     run_name: str | None = None,
+    toolset_name: str = DEFAULT_TOOLSET,
 ) -> Path:
     if run_name is None:
         stem = f"{task_name}-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -124,7 +125,7 @@ def setup(
         raise SystemExit(f"run directory already exists: {run_dir}")
 
     task = load_task(task_path(REPO_ROOT, task_name))
-    toolset = load_toolset(toolset_path(REPO_ROOT, TOOLSET_NAME))
+    toolset = load_toolset(toolset_path(REPO_ROOT, toolset_name))
     effective = effective_guard_toolset(
         toolset, task, extra_banned=outside_run_bans(REPO_ROOT, RUNS_ROOT)
     )
@@ -154,7 +155,9 @@ def setup(
         "run_id": run_id,
         "flow": "kda_flow",
         "task": task_name,
-        "toolset": TOOLSET_NAME,
+        "toolset": toolset_name,
+        "our_tools": effective.our_tools,
+        "knowledge_base": effective.knowledge_base,
         "workload_dir": task.workload_dir,
         "pinned_commit": pinned,
         "kernel_authoring": task.kernel_authoring,
@@ -199,6 +202,11 @@ def _parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         f"(default {BENCH_SERVER_URL})",
     )
     init.add_argument(
+        "--toolset",
+        default=DEFAULT_TOOLSET,
+        help=f"toolset under evolution/toolsets/ (default {DEFAULT_TOOLSET})",
+    )
+    init.add_argument(
         "--name",
         dest="run_name",
         help="exact run directory name (default: <task>-<timestamp>)",
@@ -220,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             task_name=args.task,
             remote_url=args.remote,
             run_name=args.run_name,
+            toolset_name=args.toolset,
         )
     except ValueError as error:
         init.error(str(error))

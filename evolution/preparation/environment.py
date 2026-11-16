@@ -12,6 +12,10 @@ from pathlib import Path
 
 from .guards import CANONICAL_KERNELS_SOURCE_DIR, _sanitize_banned_paths
 
+SITE_PACKAGES_PREFIX = "site-packages/"
+# With the knowledge base off, only the TIRx-lite language survives in tirx_kernels.
+KB_OFF_KERNEL_KEEP = frozenset({"__init__.py", "__pycache__", "tirx_lite"})
+
 
 @dataclass(frozen=True)
 class Environment:
@@ -89,7 +93,31 @@ class Environment:
                 normalized = normalized.removeprefix(f"{CANONICAL_KERNELS_SOURCE_DIR}/")
             if normalized == "tirx_kernels" or normalized.startswith("tirx_kernels/"):
                 package_bans.append(str(self.site_packages / normalized))
+            elif normalized.startswith(SITE_PACKAGES_PREFIX):
+                # Any other installed package, e.g. ``site-packages/fla/ops/kda/**``.
+                package_bans.append(
+                    str(self.site_packages / normalized.removeprefix(SITE_PACKAGES_PREFIX))
+                )
         return package_bans
+
+    def ablation_bans(self, *, our_tools: bool, knowledge_base: bool) -> list[str]:
+        """Installed-package bans implied by the toolset's ablation switches.
+
+        Without our tools, ``tirx_harness`` (NumSim, Synccheck, Racecheck,
+        dump-source) and its console script are removed from the venv. Without
+        the knowledge base, everything in ``tirx_kernels`` except the TIRx-lite
+        language package is removed, so no canonical kernel remains readable.
+        """
+        bans: list[str] = []
+        if not our_tools:
+            bans.append(str(self.site_packages / "tirx_harness") + "/**")
+            bans.append(str(self.prefix / "bin" / "tirx-harness"))
+        if not knowledge_base:
+            for entry in sorted(self.kernels.iterdir()):
+                if entry.name in KB_OFF_KERNEL_KEEP:
+                    continue
+                bans.append(str(entry) + ("/**" if entry.is_dir() else ""))
+        return bans
 
     def sanitize(self, banned_paths: list[str]) -> None:
         """Remove task-banned kernel sources and the wheel's skill copies from this venv."""

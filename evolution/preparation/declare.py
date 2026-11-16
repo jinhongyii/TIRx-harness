@@ -25,6 +25,12 @@ class Toolset:
     name: str
     skills: list[str]
     banned_paths: list[str] = field(default_factory=list)
+    # Ablation switches. ``our_tools`` covers the TIRx Harness tools
+    # (``tirx_harness``: NumSim, Synccheck, Racecheck, dump-source) and their
+    # operational skills. ``knowledge_base`` covers the reference skills; when
+    # off, every installed ``tirx_kernels`` entry except TIRx-lite is banned.
+    our_tools: bool = True
+    knowledge_base: bool = True
 
     @property
     def effective_skills(self) -> list[str]:
@@ -99,12 +105,21 @@ def _string_list(data: dict, key: str, path: Path) -> list[str]:
     return [item.strip() for item in value]
 
 
+def _bool(data: dict, key: str, path: Path, default: bool) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{path}: '{key}' must be a boolean")
+    return value
+
+
 def load_toolset(path: Path) -> Toolset:
     data = _load_yaml(path)
     return Toolset(
         name=_required_string(data, "name", path),
         skills=_string_list(data, "skills", path),
         banned_paths=_string_list(data, "banned_paths", path),
+        our_tools=_bool(data, "our_tools", path, True),
+        knowledge_base=_bool(data, "knowledge_base", path, True),
     )
 
 
