@@ -318,6 +318,11 @@ def _any_banned_ref_not_allowed(cmd: str) -> str | None:
         # Drop bash backslash escapes so `tirx_kernels/g\\emm/foo.py` is
         # detected as `tirx_kernels/gemm/foo.py`.
         tok = _shell_unescape(tok_raw)
+        # A lone `~` is far more often C/CUDA bitwise NOT in a heredoc than a
+        # path; as a path it only names the home directory itself, while
+        # `~/...` reads below it and stays checked.
+        if tok == "~":
+            continue
         # Build the candidate set: the unescaped token PLUS, if it has
         # shell wildcards, every path it expands to. bash will read
         # whatever it expands to, so the hook must vet expansions.
