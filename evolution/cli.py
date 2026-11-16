@@ -127,7 +127,11 @@ def setup(
     task = load_task(task_path(REPO_ROOT, task_name))
     toolset = load_toolset(toolset_path(REPO_ROOT, toolset_name))
     effective = effective_guard_toolset(
-        toolset, task, extra_banned=outside_run_bans(REPO_ROOT, RUNS_ROOT)
+        toolset,
+        task,
+        # The home directory holds other checkouts, prior solutions and other
+        # runs' agent transcripts; only this run's own directory stays readable.
+        extra_banned=outside_run_bans(REPO_ROOT, RUNS_ROOT, Path.home()),
     )
     effective = replace(
         effective,
