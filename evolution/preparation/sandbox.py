@@ -72,7 +72,7 @@ def install_skills(worktree: Path, effective) -> None:
     shutil.rmtree(worktree / "skills")
 
 
-def install_toolsets(worktree: Path, effective) -> None:
+def install_toolsets(worktree: Path, effective, interpreter_root: Path | None = None) -> None:
     """Install the same KDA skill set and guards for Claude and Codex.
 
     The run directory holding the worktree is allowed alongside it.
@@ -85,6 +85,11 @@ def install_toolsets(worktree: Path, effective) -> None:
     the worktree-relative form.
     """
     run_dir = [str(worktree.parent.resolve())]
+    # The venv's python is a symlink into its base interpreter installation, which
+    # may sit under a banned ancestor such as the home directory; the hook resolves
+    # symlinks, so the interpreter itself must stay allowed.
+    if interpreter_root is not None:
+        run_dir.append(str(interpreter_root))
     claude.install_toolset(worktree, effective, extra_allowed_prefixes=run_dir)
     codex.install_toolset(worktree, effective, extra_allowed_prefixes=run_dir)
 
@@ -115,7 +120,10 @@ def up(
         + [str(Path(path).relative_to(worktree)) for path in installed_bans],
     )
     install_skills(worktree, effective)
-    install_toolsets(worktree, effective)
+    # <root>/bin/python3.x -> <root>
+    install_toolsets(
+        worktree, effective, interpreter_root=environment.python.resolve().parents[1]
+    )
     fetch_live_references(worktree, effective.banned_paths)
     environment.sanitize(effective.banned_paths)
     scrub_worktree_git(worktree)
