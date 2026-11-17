@@ -10,10 +10,6 @@ banned_paths:
   - tirx-kernels/tirx_kernels/mla/**
   - tirx-kernels/tirx_kernels/bench_suite/config/mla/**
   - tirx-kernels/tests/test_mla_numerics.py
-  # Same-language near-solutions for this cell.
-  - .claude/skills/tirx-wiki/references/repos/flashinfer/include/flashinfer/attention/sparse_mla_sm120/**
-  - .agents/skills/tirx-wiki/references/repos/flashinfer/include/flashinfer/attention/sparse_mla_sm120/**
-  - site-packages/flashinfer/data/include/flashinfer/attention/sparse_mla_sm120/**
 spec: |
   Implement DeepSeek-V4 sparse MLA on B200 (sm_100) and beat the packaged
   flashinfer.decode.trtllm_batch_decode_sparse_mla_dsv4 baseline with PDL

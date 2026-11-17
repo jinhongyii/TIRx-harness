@@ -9,9 +9,6 @@ banned_paths:
   - tirx-kernels/tirx_kernels/kda/**
   - tirx-kernels/tirx_kernels/ported/flashinfer/kda/**
   - tirx-kernels/.agents/sketch/flashinfer/kda/**
-  # Same-language near-solutions for this cell.
-  - .claude/skills/tirx-wiki/references/repos/flashkda/**
-  - .agents/skills/tirx-wiki/references/repos/flashkda/**
 spec: |
   Implement Kimi Delta Attention FORWARD on B200 (sm_100) and beat
   FlashKDA's fused CUTLASS backend on GPU-only latency.

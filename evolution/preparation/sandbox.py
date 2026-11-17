@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import replace
@@ -90,6 +91,14 @@ def install_toolsets(worktree: Path, effective, interpreter_root: Path | None = 
     # symlinks, so the interpreter itself must stay allowed.
     if interpreter_root is not None:
         run_dir.append(str(interpreter_root))
+    # The agent's own session state lives under the home directory, keyed by the
+    # worktree path: Claude Code saves large tool outputs and auto-memory under
+    # ~/.claude/projects/<key>/ and tells the agent to read them back, and
+    # Humanize keeps the run's sessions under ~/.hmz/epics/<key>/. Only this
+    # run's key is allowed, so other runs' transcripts stay banned.
+    key = re.sub(r"[^A-Za-z0-9]", "-", str(worktree.resolve()))
+    home = Path.home()
+    run_dir += [str(home / ".claude" / "projects" / key), str(home / ".hmz" / "epics" / key)]
     claude.install_toolset(worktree, effective, extra_allowed_prefixes=run_dir)
     codex.install_toolset(worktree, effective, extra_allowed_prefixes=run_dir)
 

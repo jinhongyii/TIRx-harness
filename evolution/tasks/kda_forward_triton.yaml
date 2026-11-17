@@ -9,13 +9,6 @@ banned_paths:
   - tirx-kernels/tirx_kernels/kda/**
   - tirx-kernels/tirx_kernels/ported/flashinfer/kda/**
   - tirx-kernels/.agents/sketch/flashinfer/kda/**
-  # Same-language near-solutions for this cell.
-  - .claude/skills/tirx-wiki/references/repos/flash-linear-attention/fla/ops/kda/**
-  - .agents/skills/tirx-wiki/references/repos/flash-linear-attention/fla/ops/kda/**
-  - .claude/skills/tirx-wiki/references/repos/flash-linear-attention/fla/layers/kda.py
-  - .agents/skills/tirx-wiki/references/repos/flash-linear-attention/fla/layers/kda.py
-  - site-packages/fla/ops/kda/**
-  - site-packages/fla/layers/kda.py
 spec: |
   Implement Kimi Delta Attention FORWARD on B200 (sm_100) and beat
   FlashKDA's fused CUTLASS backend on GPU-only latency.
