@@ -108,6 +108,7 @@ def setup(
     remote_url: str | None = None,
     run_name: str | None = None,
     toolset_name: str = DEFAULT_TOOLSET,
+    extra_bans: list[Path] | None = None,
 ) -> Path:
     if run_name is None:
         stem = f"{task_name}-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -129,9 +130,7 @@ def setup(
     effective = effective_guard_toolset(
         toolset,
         task,
-        # The home directory holds other checkouts, prior solutions and other
-        # runs' agent transcripts; only this run's own directory stays readable.
-        extra_banned=outside_run_bans(REPO_ROOT, RUNS_ROOT, Path.home()),
+        extra_banned=outside_run_bans(REPO_ROOT, RUNS_ROOT, *(extra_bans or [])),
     )
     effective = replace(
         effective,
@@ -160,6 +159,7 @@ def setup(
         "flow": "kda_flow",
         "task": task_name,
         "toolset": toolset_name,
+        "extra_bans": [str(path) for path in extra_bans or []],
         "our_tools": effective.our_tools,
         "knowledge_base": effective.knowledge_base,
         "workload_dir": task.workload_dir,
@@ -215,6 +215,16 @@ def _parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         dest="run_name",
         help="exact run directory name (default: <task>-<timestamp>)",
     )
+    init.add_argument(
+        "--ban",
+        dest="extra_bans",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="DIR",
+        help="also ban DIR outside the run, e.g. another checkout holding prior "
+        "solutions (repeatable)",
+    )
     return parser, init
 
 
@@ -233,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
             remote_url=args.remote,
             run_name=args.run_name,
             toolset_name=args.toolset,
+            extra_bans=args.extra_bans,
         )
     except ValueError as error:
         init.error(str(error))
