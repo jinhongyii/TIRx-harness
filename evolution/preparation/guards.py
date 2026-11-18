@@ -154,6 +154,11 @@ import sys
 BANNED_GLOBS = {patterns_py}
 ALLOWED_PREFIXES = {allowed_py}
 WORKTREE_ROOT = ALLOWED_PREFIXES[0] if ALLOWED_PREFIXES else ""
+# Directory relative paths resolve against: the tool call's working directory
+# (set from the payload, then followed through `cd` inside a shell command).
+# Resolving against the worktree root instead misreads `../x` from a nested
+# directory as a path outside the run.
+CWD = WORKTREE_ROOT
 
 # Literal prefix of each glob (everything before the first wildcard), used as
 # a substring probe for Bash command strings.
@@ -177,8 +182,9 @@ def _abs(p: str) -> str:
     # Expand BEFORE anything else: `$HOME/...` / `~/...` name the same file as
     # the literal path, so a ban that only sees the literal form is bypassable.
     p = os.path.expanduser(os.path.expandvars(p))
-    if WORKTREE_ROOT and not os.path.isabs(p):
-        p = os.path.join(WORKTREE_ROOT, p)
+    base = CWD or WORKTREE_ROOT
+    if base and not os.path.isabs(p):
+        p = os.path.join(base, p)
     try:
         return os.path.realpath(p)
     except Exception:
@@ -212,7 +218,9 @@ def _glob_expansions(tok: str) -> list[str]:
         return []
     try:
         import glob as _glob
-        return _glob.glob(tok)
+        base = CWD or WORKTREE_ROOT
+        pattern = tok if os.path.isabs(tok) or not base else os.path.join(base, tok)
+        return _glob.glob(os.path.expanduser(pattern))
     except Exception:
         return []
 
@@ -296,7 +304,29 @@ def path_matches_any(path: str, globs: list[str]) -> bool:
     return False
 
 
+_SEGMENT_RE = re.compile(r"&&|\\|\\||;|\\n|\\(|\\)")
+_CD_RE = re.compile(r"^\\s*(?:cd|pushd)\\s+(['\\"]?)([^\\s'\\"]+)\\1(?:\\s+\\d?>\\S+)*\\s*$")
+
+
 def _any_banned_ref_not_allowed(cmd: str) -> str | None:
+    \"\"\"Scan each shell segment, following `cd` so relative paths resolve
+    against the directory the segment actually runs in.\"\"\"
+    global CWD
+    start = CWD
+    try:
+        for segment in _SEGMENT_RE.split(cmd):
+            hit = _scan_segment(segment)
+            if hit:
+                return hit
+            m = _CD_RE.match(segment)
+            if m:
+                CWD = _abs(m.group(2))
+    finally:
+        CWD = start
+    return None
+
+
+def _scan_segment(cmd: str) -> str | None:
     \"\"\"Scan a Bash command for references to banned prefixes.
 
     For each shell-ish token in `cmd`:
@@ -387,6 +417,9 @@ def main() -> int:
         workdir = str(
             tool_input.get("cwd") or tool_input.get("workdir") or payload.get("cwd") or ""
         )
+        global CWD
+        if workdir and os.path.isabs(workdir):
+            CWD = workdir
         if workdir and path_matches_any(workdir, BANNED_GLOBS):
             sys.stderr.write(
                 f"[kda-flow] banned path access blocked: tool={{tool_name}} cwd={{workdir!r}}\\n"

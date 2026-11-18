@@ -121,9 +121,32 @@ def iket(archive, arguments, overrides):
         }
 
 
+def _pinned_nvrtc(overrides):
+    """Preload the worker's pip NVRTC so the profiled process compiles like the benchmark.
+
+    NCU's injection makes a later dlopen of libnvrtc.so.13 resolve to the system
+    CUDA toolkit's NVRTC even when the pip library comes first on
+    LD_LIBRARY_PATH, so the profiled process would build different SASS than
+    the benchmark. A preloaded library with that soname wins over both.
+    """
+    if "LD_PRELOAD" in overrides:
+        return {}
+    try:
+        import nvidia
+    except ImportError:
+        return {}
+    for root in nvidia.__path__:
+        library = Path(root) / "cu13" / "lib" / "libnvrtc.so.13"
+        if library.is_file():
+            preload = " ".join(filter(None, [str(library), os.environ.get("LD_PRELOAD")]))
+            return {"LD_PRELOAD": preload}
+    return {}
+
+
 def ncu(archive, ncu_args, application, overrides):
     executable = _resolve_executable("ncu")
     application = _worker_python(application)
+    overrides = {**_pinned_nvrtc(overrides), **overrides}
     with tempfile.TemporaryDirectory(prefix="kcoral_ncu_") as root:
         workdir = Path(root) / "inputs"
         workdir.mkdir()
