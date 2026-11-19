@@ -1,0 +1,196 @@
+{
+  "run": "abl3-kda-full-r4",
+  "task": "kda_forward",
+  "toolset": "kda_flow",
+  "final_total_tokens": 780334715,
+  "final_output_tokens": 4797796,
+  "tool_use": {
+    "dump_kernel": 26,
+    "iket": 105,
+    "ncu": 73,
+    "numsim": 8,
+    "racecheck": 15,
+    "skill:tirx-debug-kernel": 2,
+    "skill:tirx-profile-kernel": 6,
+    "skill:tirx-wiki": 6,
+    "synccheck": 19
+  },
+  "points": [
+    {
+      "t": 1795030379.0,
+      "commit": "1a421a50736be14b99bdddffd54ff3a893c00b9d",
+      "best_speedup": 1.3642,
+      "total_tokens": 87090317,
+      "output_tokens": 520144,
+      "best_so_far": 1.3642
+    },
+    {
+      "t": 1795039096.0,
+      "commit": "f2b7e02b512ee7ac3a529d991cb2ae13fdaeaacb",
+      "best_speedup": 1.4033,
+      "total_tokens": 118423945,
+      "output_tokens": 784417,
+      "best_so_far": 1.4033
+    },
+    {
+      "t": 1795040315.0,
+      "commit": "626fcee0a2c0d763a5a93fa1f3fd66c07b16242c",
+      "best_speedup": 1.5353,
+      "total_tokens": 129508238,
+      "output_tokens": 853425,
+      "best_so_far": 1.5353
+    },
+    {
+      "t": 1795042115.0,
+      "commit": "aa4cdb7d62970f893461142639d1d41ce32a7da1",
+      "best_speedup": 1.6101,
+      "total_tokens": 143776739,
+      "output_tokens": 922444,
+      "best_so_far": 1.6101
+    },
+    {
+      "t": 1795045243.0,
+      "commit": "1fb85213e365caf84147643d36ada14985ba7220",
+      "best_speedup": 1.6462,
+      "total_tokens": 167295276,
+      "output_tokens": 1019142,
+      "best_so_far": 1.6462
+    },
+    {
+      "t": 1795047551.0,
+      "commit": "213d39da4a4678708a3661f850e602427913f9b8",
+      "best_speedup": 1.6784,
+      "total_tokens": 193953838,
+      "output_tokens": 1097453,
+      "best_so_far": 1.6784
+    },
+    {
+      "t": 1795051830.0,
+      "commit": "e698bb803f4d9979fee6719cc66113d5e4e527cf",
+      "best_speedup": 1.9791,
+      "total_tokens": 236961633,
+      "output_tokens": 1464042,
+      "best_so_far": 1.9791
+    },
+    {
+      "t": 1795054930.0,
+      "commit": "26c8d06b5a978d9a8a7d4a7e1abe4488f3cc7e24",
+      "best_speedup": 2.0174,
+      "total_tokens": 287412659,
+      "output_tokens": 1658303,
+      "best_so_far": 2.0174
+    },
+    {
+      "t": 1795055276.0,
+      "commit": "c6202861aa363562ff7c0cbabf59091a48d87175",
+      "best_speedup": 2.2391,
+      "total_tokens": 298716677,
+      "output_tokens": 1683066,
+      "best_so_far": 2.2391
+    },
+    {
+      "t": 1795057943.0,
+      "commit": "72bff16d611a43f01133aaa0ddd29c4999a08e93",
+      "best_speedup": 2.2957,
+      "total_tokens": 341816433,
+      "output_tokens": 1820575,
+      "best_so_far": 2.2957
+    },
+    {
+      "t": 1795060187.0,
+      "commit": "b4d2a1d5d44445c7c6629686d3137d24f1843a1a",
+      "best_speedup": 2.3542,
+      "total_tokens": 354377797,
+      "output_tokens": 1959297,
+      "best_so_far": 2.3542
+    },
+    {
+      "t": 1795061800.0,
+      "commit": "45d301c8cebf79571feb015b6550e8c9734802a4",
+      "best_speedup": 2.4841,
+      "total_tokens": 363190692,
+      "output_tokens": 2050131,
+      "best_so_far": 2.4841
+    },
+    {
+      "t": 1795062476.0,
+      "commit": "456030de91c4067aef890efe7e25435b83d681dd",
+      "best_speedup": 2.5117,
+      "total_tokens": 369494750,
+      "output_tokens": 2086212,
+      "best_so_far": 2.5117
+    },
+    {
+      "t": 1795063879.0,
+      "commit": "9f40fc2b9a76b018fc5a35d7f6d44017beaf61d0",
+      "best_speedup": 2.5448,
+      "total_tokens": 380426620,
+      "output_tokens": 2155019,
+      "best_so_far": 2.5448
+    },
+    {
+      "t": 1795065562.0,
+      "commit": "7053010dc1cf9005f1896a90132c983a94201093",
+      "best_speedup": 2.5523,
+      "total_tokens": 387921991,
+      "output_tokens": 2186785,
+      "best_so_far": 2.5523
+    },
+    {
+      "t": 1795067003.0,
+      "commit": "f3b8a97a3c8a192ed297d85b5237c34f5c9a95c9",
+      "best_speedup": 2.612,
+      "total_tokens": 395919558,
+      "output_tokens": 2226459,
+      "best_so_far": 2.612
+    },
+    {
+      "t": 1795075299.0,
+      "commit": "243b53d16b8930a1815d52ef8898e35dc457ad8a",
+      "best_speedup": 2.6889,
+      "total_tokens": 460752560,
+      "output_tokens": 2700367,
+      "best_so_far": 2.6889
+    },
+    {
+      "t": 1795085496.0,
+      "commit": "18ca665d3909b104a8f798d9de74d37698069c2f",
+      "best_speedup": 2.8001,
+      "total_tokens": 563346684,
+      "output_tokens": 3383815,
+      "best_so_far": 2.8001
+    },
+    {
+      "t": 1795086405.0,
+      "commit": "2570e3211e4908754975443a110c6820c8786215",
+      "best_speedup": 2.8777,
+      "total_tokens": 580775546,
+      "output_tokens": 3419168,
+      "best_so_far": 2.8777
+    },
+    {
+      "t": 1795100176.0,
+      "commit": "d1d8ae731251595d1ff0784dc81b3079eb58e154",
+      "best_speedup": 2.9012,
+      "total_tokens": 682283731,
+      "output_tokens": 4250212,
+      "best_so_far": 2.9012
+    },
+    {
+      "t": 1795103719.0,
+      "commit": "a57daa9675292124bfb44192e265d6f602dd6f6f",
+      "best_speedup": 2.9228,
+      "total_tokens": 714472477,
+      "output_tokens": 4428723,
+      "best_so_far": 2.9228
+    },
+    {
+      "t": 1795107203.0,
+      "commit": "92a810585f3e557cf99068d52566a1b6c0bc8197",
+      "best_speedup": 2.9455,
+      "total_tokens": 753186188,
+      "output_tokens": 4584287,
+      "best_so_far": 2.9455
+    }
+  ]
+}
